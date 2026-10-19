@@ -10,8 +10,8 @@ Run from the repository root::
 The default stores only reducer carry, not a full voltage trace. ``--record``
 adds a Recorder to the callback mapping. CPU inference uses the C++ wrapper by
 default; the first call includes compilation. ``--backend aot_eager`` exercises capture
-without native code generation. Scan requires Dendra's verified PyTorch 2.14.0
-or 2.14.1 implementation. This small model illustrates callback semantics, not
+without native code generation. Both modes use Dendra's PyTorch 2.14+ baseline
+and compiler-contract checks. This small model illustrates callback semantics, not
 physiological excitation thresholds or a performance benchmark.
 """
 

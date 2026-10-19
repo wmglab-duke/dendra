@@ -27,7 +27,7 @@ def _slice_copy(value, dim=0, start=None, end=None, step=1):
 
 
 class _ScanInductorBackend(torch._TorchCompileInductorWrapper):
-    """Keep Inductor's options/lifecycle, adding two local decompositions."""
+    """Keep Inductor's lifecycle with local decompositions and input protection."""
 
     def __eq__(self, other):
         # Do not let Dynamo equate this lowering with ordinary Inductor merely
@@ -42,6 +42,15 @@ class _ScanInductorBackend(torch._TorchCompileInductorWrapper):
         patches = {**self.config, **(config_patches or {})}
         with config.patch(patches):
             decompositions = dict(select_decomp_table())
+            from ._scan_donation import _scan_donation_pass
+
+            donation_receipts = getattr(self, "_donation_receipts", None)
+            if donation_receipts is None:
+                donation_receipts = self._donation_receipts = []
+            patches["_pre_fusion_custom_pass"] = _scan_donation_pass(
+                patches.get("_pre_fusion_custom_pass", config._pre_fusion_custom_pass),
+                receipts=donation_receipts,
+            )
         decompositions[torch.ops.aten.select_copy.int] = _select_copy
         decompositions[torch.ops.aten.slice_copy.Tensor] = _slice_copy
         return compile_fx(
@@ -51,6 +60,11 @@ class _ScanInductorBackend(torch._TorchCompileInductorWrapper):
             decompositions=decompositions,
             compile_region_name=self.name,
         )
+
+    def _donation_diagnostics(self):
+        from copy import deepcopy
+
+        return deepcopy(tuple(getattr(self, "_donation_receipts", ())))
 
 
 def _compile_scan(function, compile_options, *, prefer_cpp_wrapper=False):
@@ -113,4 +127,5 @@ def _compile_scan(function, compile_options, *, prefer_cpp_wrapper=False):
     # Torch's generic callable-backend wrapper forwards reset(), but not the
     # compiler-config provider. Preserve the standard compiled function API.
     compiled.get_compiler_config = backend.get_compiler_config
+    compiled._dendra_scan_donation_diagnostics = backend._donation_diagnostics
     return compiled

@@ -13,6 +13,8 @@ except ImportError:
     dendra_solvers = None
     DENDRA_SOLVERS_AVAILABLE = False
 
+from ._cuda_functional import pcr_solve as _functional_pcr_solve
+from ._cuda_functional import thomas_solve as _functional_thomas_solve
 from .cable import (
     _layered_edge_conductance,
     unbranched_edge_conductance,
@@ -34,6 +36,34 @@ from .triton import (
     solve_bt_spd_cuda_consume_unchecked,
     thomas_solve_cuda_bt,
     thomas_solve_cuda_t,
+)
+
+# Only exact, framework-owned Thomas/PCR solves are authorized to receive a
+# voltage-increment RHS. A custom callable keeps its historical absolute-RHS
+# contract, even when it shares a standard solver's name or wrapped metadata.
+# Capture identities once, so a later monkeypatch cannot authorize itself.
+_BWD_EULER_INCREMENT_SOLVERS = tuple(
+    solve
+    for solve in (
+        pcr_solve_t,
+        pcr_solve_cuda_t,
+        thomas_solve_cuda_t,
+        _functional_pcr_solve,
+        _functional_thomas_solve,
+        (
+            getattr(torch.ops.dendra_solvers, "thomas_solve_t", None)
+            if DENDRA_SOLVERS_AVAILABLE
+            else None
+        ),
+        (
+            getattr(torch.ops.dendra_solvers, "pcr_solve_t", None)
+            if DENDRA_SOLVERS_AVAILABLE
+            else None
+        ),
+        getattr(dendra_solvers, "thomas_solve_t", None),
+        getattr(dendra_solvers, "pcr_solve_t", None),
+    )
+    if callable(solve)
 )
 
 
@@ -128,16 +158,15 @@ class _bwd_euler_sc(Integrator):
 
         denom = self.cmdt + gtot
         if itot is None:
-            rhs = self.cmdt * v + membrane_source
-            if intra is not None:
-                rhs = rhs + intra / self.area
-            v_new = rhs / denom
+            residual = membrane_source - gtot * v
         else:
-            # Preserve the original subtraction and stimulus order for every
-            # unsupported/observed model; direct coefficients opt in above.
-            v_new = v - itot / denom
-            if intra is not None:
-                v_new = v_new + (intra / self.area) / denom
+            residual = -itot
+        if intra is not None:
+            residual = residual + intra / self.area
+        # Cancel the capacitive old-voltage term analytically. Combining the
+        # physical currents first also avoids two separately rounded voltage
+        # updates when membrane and applied currents nearly balance.
+        v_new = v + residual / denom
 
         i_membrane = None
         if self.imem:
@@ -515,13 +544,32 @@ class _bwd_euler_ub(Integrator):
 
         v_flat = _flatten_to_solve(v, self.K, self.base_shape)
         gtot = _flatten_to_solve(gtot, self.K, self.base_shape)
+        solve = self._solve if solver is None else solver
+        # Gradient-clipped Thomas has an intentional surrogate backward; a
+        # shifted RHS must not silently change that policy. The SPD facade can
+        # regularize pivots, so it is also excluded from the exact-solve list.
+        # Unsupported/custom solvers retain the absolute-voltage RHS contract.
+        increment = not self.use_gc_variant and any(
+            solve is standard for standard in _BWD_EULER_INCREMENT_SOLVERS
+        )
         if itot is None:
-            f_n = (
-                _flatten_to_solve(membrane_source, self.K, self.base_shape) * self.scale
-            )
+            source = _flatten_to_solve(membrane_source, self.K, self.base_shape)
+            f_n = (source - gtot * v_flat if increment else source) * self.scale
         else:
             itot = _flatten_to_solve(itot, self.K, self.base_shape)
-            f_n = (gtot * v_flat - itot) * self.scale
+            f_n = (-itot if increment else gtot * v_flat - itot) * self.scale
+
+        if increment and self.K > 1:
+            delta_v = v_flat[..., 1:] - v_flat[..., :-1]
+            left = self.g_edge_Cinv * delta_v
+            right = self.g_edge_Cinv_right * delta_v
+            # Retain the distinct row-capacitance normalization at both ends
+            # of each physical edge. This matrix is generally nonsymmetric.
+            axial = torch.cat(
+                (left[..., :1], left[..., 1:] - right[..., :-1], -right[..., -1:]),
+                dim=-1,
+            )
+            f_n = f_n + axial
 
         if ve is not None:
             ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
@@ -546,13 +594,12 @@ class _bwd_euler_ub(Integrator):
                 _flatten_to_solve(intra, self.K, self.base_shape) * self.cm_inv
             )
 
-        rhs = v_flat + dt_s * f_n
+        rhs = dt_s * f_n if increment else v_flat + dt_s * f_n
         main = 1.0 - dt_s * (self.diag_base - gtot * self.scale)
 
         if self.K == 1:
             v_np1 = rhs / main
         else:
-            solve = self._solve if solver is None else solver
             if self.use_gc_variant:
                 v_np1 = solve(
                     self.lower,
@@ -563,6 +610,9 @@ class _bwd_euler_ub(Integrator):
                 )
             else:
                 v_np1 = solve(self.lower, main, self.upper, rhs)
+
+        if increment:
+            v_np1 = v_flat + v_np1
 
         i_membrane = None
         if self.imem:

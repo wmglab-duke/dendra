@@ -72,27 +72,27 @@ jobs:
         include:
           - os: ubuntu-24.04
             python: "3.11"
-            torch: "torch==2.12.0"
+            torch: "torch==2.14.0"
             distribution: wheel
             solvers: absent
           - os: ubuntu-24.04
             python: "3.13"
-            torch: "torch==2.12.0"
+            torch: "torch==2.14.0"
             distribution: wheel
             solvers: present
           - os: ubuntu-24.04
             python: "3.14"
-            torch: "torch>=2.12,<3"
+            torch: "torch>=2.14,<3"
             distribution: wheel
             solvers: absent
           - os: macos-14
             python: "3.12"
-            torch: "torch==2.12.0"
+            torch: "torch==2.14.0"
             distribution: wheel
             solvers: absent
           - os: ubuntu-24.04
             python: "3.12"
-            torch: "torch==2.12.0"
+            torch: "torch==2.14.0"
             distribution: sdist
             solvers: absent
     runs-on: ${{ matrix.os }}
@@ -141,8 +141,51 @@ jobs:
           cd "$RUNNER_TEMP"
           python -I "$GITHUB_WORKSPACE/scripts/distribution_smoke.py" --expect-solvers "$SOLVERS"
 
+  test_functional_cpu:
+    # Exercise the source's real compiler boundary, not just an install smoke.
+    # No patch-specific skip is allowed to hide a broken scan/while route.
+    strategy:
+      fail-fast: false
+      matrix:
+        torch: ["torch==2.14.0", "torch>=2.14,<2.15", "torch>=2.14,<3"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU compiler baseline or latest compatible release
+        env:
+          TORCH_SPEC: ${{ matrix.torch }}
+        run: python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
+      - name: Install source, test tools and required native solvers
+        run: python -m pip install --only-binary=dendra-solvers ".[dev,solvers]"
+      - name: Require native DHS before running all-eight-gradient checks
+        run: |
+          python - <<'PY'
+          import torch
+          import dendra_solvers._ext
+          from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE
+          assert DENDRA_SOLVERS_AVAILABLE, "Native DHS coverage must not be skipped"
+          print("Functional compiler lane:", torch.__version__)
+          PY
+      - name: Check real scan and while-loop traces, gradients and ownership
+        env:
+          TORCHINDUCTOR_COMPILE_THREADS: "1"
+        run: >-
+          python -m pytest -q
+          tests/func/test_scan_chunk.py
+          tests/func/test_scan_donation.py
+          tests/func/test_scan_donation_workflows.py
+          tests/func/test_scan_recording.py
+          tests/func/test_scan_hh_validation.py
+          tests/func/test_while_inductor.py
+
   check_dist:
-    needs: [build, test_install]
+    needs: [build, test_install, test_functional_cpu]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:

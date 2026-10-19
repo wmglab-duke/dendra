@@ -17,6 +17,7 @@ from ._execution import (
     _capabilities,
     _ExecutionReportState,
 )
+from ._inference import _canonicalize_inference_tree
 from ._lowered import (
     _LoweredCallbackPopulationChunk,
     _LoweredPopulationChunk,
@@ -94,6 +95,10 @@ class CompiledPopulationChunk:
                 compile_options=options,
                 stepwise_stimulation=_stepwise_stimulation,
             )
+        elif execution == "default":
+            from ._while_inductor import _compile_while
+
+            self._compiled = _compile_while(self._lowered.__call__, options)
         else:
             self._compiled = torch.compile(
                 isolate_compilation_callable(self._lowered.__call__), **options
@@ -167,6 +172,10 @@ class CompiledPopulationChunk:
             )
             self._record_execution(strategy, grad_enabled=grad_enabled)
             return result
+        if not self._compile_options.get("disable", False):
+            state = _canonicalize_inference_tree(operands.state)
+            if state is not operands.state:
+                operands = operands._replace(state=state)
         if (
             self._execution == "default"
             and prewarm_structured
@@ -388,6 +397,16 @@ class _CompiledCallbackPopulationChunk:
                 else "eager_forward_ad_fallback"
             )
         else:
+            if not self._compile_options.get("disable", False):
+                state, carries = _canonicalize_inference_tree((state, carries))
+                operands = (
+                    parameters,
+                    prepared,
+                    state,
+                    inputs.ve,
+                    inputs.intra,
+                    carries,
+                )
             while_kernel = None
             if self._recorder_while is not None and not grad_enabled:
                 while_kernel, reason = self._recorder_while.kernel_for(*operands)

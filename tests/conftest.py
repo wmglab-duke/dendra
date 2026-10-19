@@ -9,6 +9,7 @@ import pytest
 # Import Dendra once before test-module collection so process-wide runtime
 # initialization is deterministic. TorchInductor cache configuration is opt-in.
 import dendra  # noqa: F401
+from dendra._bootstrap import reset_torch_compiler
 
 _NEURON_MODULES = {
     "tests/test_io_from_neuron_topology.py",
@@ -21,6 +22,52 @@ _STOCHASTIC_TOKENS = (
     "seed",
     "stochastic",
 )
+# PyTorch's supported JIT APIs emit deprecations, and Dynamo inspects .grad
+# on nonleaf operands while tracing. Match only these known upstream messages
+# at their source modules; user warnings and other compiler warnings remain
+# errors. Per-item filters override the required lane's ``-W error``; config
+# filters do not.
+_UPSTREAM_COMPILER_WARNING_FILTERS = (
+    tuple(
+        r"ignore:^`?torch\.jit\.(script|script_method)`? is deprecated(\.|$).*:"
+        + category
+        + r":^torch\.jit\._script$"
+        for category in ("FutureWarning", "DeprecationWarning")
+    )
+    + tuple(
+        r"ignore:^`?torch\.jit\.trace`? is deprecated(\.|$).*:"
+        + category
+        + r":^torch\.jit\._trace$"
+        for category in ("FutureWarning", "DeprecationWarning")
+    )
+    + (
+        (
+            r"ignore:^The \.grad attribute of a Tensor that is not a leaf Tensor "
+            r"is being accessed\. Its \.grad attribute won't be populated during "
+            r"autograd\.backward\(\)\. If you indeed want the \.grad field to be "
+            r"populated for a non-leaf Tensor, use \.retain_grad\(\) on the non-leaf "
+            r"Tensor\. If you access the non-leaf Tensor by mistake, make sure you "
+            r"access the leaf Tensor instead\. See github\.com/pytorch/pytorch/pull/30531 "
+            r"for more information\.( \(Triggered internally at .*\))?$:"
+            r"UserWarning:^torch\.(_dynamo\.variables\.builder|_subclasses\.meta_utils)$"
+        ),
+    )
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_torch_compiler_cache():
+    """Keep independent tests from sharing Torch's specialization budget.
+
+    Do not reset inside a test: lifecycle and cache-reuse assertions must see
+    every compilation performed by that case under the ordinary cache limits.
+    The helper uses public ``torch.compiler.reset`` with known-warning handling.
+    """
+    reset_torch_compiler()
+    try:
+        yield
+    finally:
+        reset_torch_compiler()
 
 
 def _parameter_uses_cuda(item: pytest.Item) -> bool:
@@ -52,6 +99,8 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """
 
     for item in items:
+        for warning_filter in _UPSTREAM_COMPILER_WARNING_FILTERS:
+            item.add_marker(pytest.mark.filterwarnings(warning_filter))
         module_path = item.nodeid.split("::", 1)[0]
         normalized_path = str(PurePosixPath(module_path))
         nodeid_lower = item.nodeid.lower()

@@ -7341,9 +7341,13 @@ def _structure_ids(population) -> tuple[int, ...]:
 
 
 @torch.compiler.assume_constant_result
-def _compiled_structure_signature_matches(population, fingerprint) -> bool:
-    """Evaluate the Python-only source fingerprint once per compiled graph."""
-    return _structure_signature(population) == fingerprint
+def _compiled_structure_signature_matches(functional) -> bool:
+    """Evaluate the Python-only source fingerprint once per compiled graph.
+
+    Keep the retained fingerprint inside its owner: authored material metadata
+    can contain Python values Dynamo cannot convert into constant arguments.
+    """
+    return _structure_signature(functional._population) == functional._fingerprint
 
 
 @torch.compiler.assume_constant_result
@@ -8338,7 +8342,7 @@ class FunctionalPopulation:
                     "make_functional(); construct and lower a new Cable."
                 )
         structure_matches = (
-            _compiled_structure_signature_matches(self._population, self._fingerprint)
+            _compiled_structure_signature_matches(self)
             if torch.compiler.is_compiling()
             else _structure_signature(self._population) == self._fingerprint
         )
@@ -8902,6 +8906,14 @@ class FunctionalPopulation:
     def prepare(self, parameters, constants):
         """Materialize an eagerly reusable, freshness-checked tensor plan."""
         self._validate_source()
+        return self._prepare_source_validated(parameters, constants)
+
+    def _prepare_source_validated(self, parameters, constants):
+        """Prepare within an owned invocation that just checked its source.
+
+        This is not a reusable validation exemption: independent public
+        prepare, bind and run calls retain their own source checks.
+        """
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         if torch.compiler.is_compiling():
@@ -11360,8 +11372,10 @@ class FunctionalPopulation:
         without statically compiling the complete time horizon.
 
         ``execution="scan"`` opts into a horizon-independent loop graph on
-        supported PyTorch 2.14 installations. Dendra installs a narrowly scoped
-        process-local compatibility fix when this mode is selected. Ordinary
+        PyTorch 2.14 or newer. Dendra qualifies the compiler's correctness
+        interfaces and installs a narrowly scoped process-local repair when
+        this mode is selected; an incompatible contract raises explicitly.
+        Ordinary
         backward is supported; ``create_graph=True`` raises explicitly. Calls
         inside ``torch.func`` or forward AD use the ordinary eager recurrence.
 
@@ -11373,7 +11387,7 @@ class FunctionalPopulation:
         original compiler settings.
 
         The default uses a bounded inference loop when available, including
-        built-in functional callbacks on PyTorch 2.14 or newer. Gradient-enabled or
+        built-in functional callbacks. Gradient-enabled or
         unsupported callback calls retain the unrolled recurrence. Select
         ``execution="unrolled"`` to require that recurrence in inference too.
         Inspect ``execution_report()`` after a call for its actual dispatch.

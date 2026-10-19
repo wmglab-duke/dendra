@@ -10,11 +10,12 @@ Reducer state, crossing latches, and callback phase are explicit loop carry.
 
 from __future__ import annotations
 
+from functools import wraps
+
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
-from dendra._bootstrap import isolate_compilation_callable
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._callbacks import (
@@ -26,7 +27,9 @@ from ._callbacks import (
     _BoundRecorder,
     _update_callback_values,
 )
+from ._carry_packing import _clone_tree_like, _PackedCarryLayout
 from ._types import StepInput
+from ._while_inductor import _compile_while
 
 
 class _RecorderWhileExecutor:
@@ -60,19 +63,9 @@ class _RecorderWhileExecutor:
                 "Inference callback loops require supported built-in functional "
                 "callbacks; use scan for custom callbacks."
             )
-        # Captured-tensor mutation is an inference-only public while_loop
-        # capability on the verified 2.14 series. Older supported Dendra/Torch
-        # combinations keep their existing pure unrolled callback executor.
-        version = str(torch.__version__).split("+", 1)[0].split(".")
-        try:
-            supports_local_buffers = tuple(map(int, version[:2])) >= (2, 14)
-        except ValueError:
-            supports_local_buffers = False
-        if not supports_local_buffers:
-            return (
-                None,
-                "Built-in inference callback loops require Torch 2.14 or newer.",
-            )
+        # Captured-tensor mutation is part of the project's Torch>=2.14
+        # baseline. Compile the selected route rather than choosing behavior
+        # from a patch-version label.
         signature = (ve is not None, intra is not None, MEMBRANE_ASSEMBLY.value)
         if signature in self._capture_errors:
             return None, self._capture_errors[signature]
@@ -105,6 +98,8 @@ class _RecorderWhileExecutor:
             (parameters, prepared, state, ve, intra, carries),
         )
         parameters, prepared, state, ve, intra, carries = examples
+        state = functional._clone_state_tree(state)
+        layout = _PackedCarryLayout.from_tree((state, carries))
 
         def authored(parameters, prepared, state, ve, intra, carries):
             # Deliberately use the accepted-clock step, not vectorized waveform
@@ -115,15 +110,15 @@ class _RecorderWhileExecutor:
             updated, emitted = _update_callback_values(
                 plans, carries, next_state, auxiliary
             )
-            updated = pytree.tree_map_only(
-                torch.Tensor, lambda value: value.clone(), updated
-            )
-            return functional._clone_state_tree(next_state), updated, emitted or {}
+            # This pure transition is composed several times inside one loop
+            # body. Intermediate views and unchanged leaves need no ownership
+            # copy; pack only the actual higher-order loop's returned carry.
+            return next_state, updated, emitted or {}
 
         graph = make_fx(authored)(
             parameters,
             prepared,
-            functional._clone_state_tree(state),
+            state,
             None if ve is None else ve[0],
             None if intra is None else intra[0],
             carries,
@@ -141,10 +136,7 @@ class _RecorderWhileExecutor:
                 torch.empty((steps, *shape), dtype=dtype, device=device)
                 for shape, dtype, device in shapes
             )
-            initial = functional._clone_state_tree(state)
-            initial_carries = pytree.tree_map_only(
-                torch.Tensor, lambda value: value.clone(), carries
-            )
+            initial = layout.pack((functional._clone_state_tree(state), carries))
 
             def apply_step(index, current, current_carries):
                 selector = index.reshape(1)
@@ -165,28 +157,48 @@ class _RecorderWhileExecutor:
                     buffer.index_copy_(0, selector, sample.unsqueeze(0))
                 return next_state, next_carries
 
-            def condition(index, current, current_carries):
+            def condition(index, packed):
                 return index < full_steps
 
-            def body(index, current, current_carries):
+            def body(index, packed):
+                current, current_carries = layout.unpack(packed)
                 for offset in range(block):
                     current, current_carries = apply_step(
                         index + offset, current, current_carries
                     )
-                return index + block, current, current_carries
+                # The HOP sees only one independently owned Tensor per
+                # dtype/device. Duplicate logical leaves occupy separate
+                # regions of a fresh pack, not duplicate output handles.
+                return index + block, layout.pack((current, current_carries))
 
             index = torch.zeros((), dtype=torch.int64, device=functional.device)
-            index, final, final_carries = torch.while_loop(
-                condition, body, (index, initial, initial_carries)
-            )
+            index, packed = torch.while_loop(condition, body, (index, initial))
             # The tail is bounded by block-1, independent of the chunk horizon.
-            for offset in range(steps - full_steps):
-                final, final_carries = apply_step(index + offset, final, final_carries)
+            if steps != full_steps:
+                final, final_carries = layout.unpack(packed)
+                for offset in range(steps - full_steps):
+                    final, final_carries = apply_step(
+                        index + offset, final, final_carries
+                    )
+                packed = layout.pack((final, final_carries))
             observed = pytree.tree_unflatten(list(buffers), emission_spec)
             emitted = {plan.name: observed.get(plan.name) for plan in plans}
+            return packed, emitted
+
+        compiled = _compile_while(execute, self._options)
+
+        @wraps(compiled)
+        def materialize(parameters, prepared, state, ve, intra, carries):
+            packed, emitted = compiled(parameters, prepared, state, ve, intra, carries)
+            final, final_carries = layout.unpack(packed)
+            # Public leaves must not share the private pack or each other.
+            # Keep ownership materialization outside compilation: identical
+            # clones must not be CSE'd into duplicate C++ HOP output handles.
+            final = functional._clone_state_tree(final)
+            final_carries = _clone_tree_like(final_carries, carries)
             return final, {"v": final["integrator"]["v"]}, final_carries, emitted
 
-        return torch.compile(isolate_compilation_callable(execute), **self._options)
+        return materialize
 
 
 __all__ = []

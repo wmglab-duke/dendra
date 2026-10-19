@@ -9,10 +9,16 @@ from types import MappingProxyType
 import torch
 from torch.utils import _pytree as pytree
 
+from ._binding import BoundPopulation
 from ._callbacks import FunctionalCallback
-from ._population import make_functional
-from ._runners import run
+from ._compiled import CompiledPopulationChunk
+from ._population import FunctionalPopulation, make_functional
+from ._runners import _run_source_validated, run
 from ._types import FunctionalizationError
+
+_OWNED_PREPARE = FunctionalPopulation.prepare
+_OWNED_BIND = CompiledPopulationChunk.bind
+_OWNED_RUN = run
 
 
 def _inference_compile_options(functional, inference, backend, options, keywords):
@@ -65,6 +71,10 @@ class CompiledRunner:
     Compilation is lazy. Inference preparation is reused with version checks;
     training and explicit parameter overrides receive fresh preparation. No
     output, live binding, or training preparation is retained between calls.
+    For training scan, ``checkpoint_every=H`` recomputes compiled spans of at
+    most H steps during backward to reduce saved activation storage. This
+    preserves full-horizon gradients and callback history; requested recordings
+    remain retained. Callbacks must be pure, deterministic, and replay-safe.
     This is a host-side convenience object, not a torch.compile/torch.func
     transform target; those uses retain the lower-level functional API.
     """
@@ -78,6 +88,7 @@ class CompiledRunner:
         execution="scan",
         callbacks=None,
         inference=True,
+        checkpoint_every=None,
         trainable=(),
         backend="inductor",
         options=None,
@@ -102,6 +113,17 @@ class CompiledRunner:
             raise ValueError("execution must be 'scan' or 'while'")
         if not isinstance(inference, bool):
             raise TypeError("inference must be a bool")
+        if checkpoint_every is not None:
+            if (
+                isinstance(checkpoint_every, bool)
+                or not isinstance(checkpoint_every, int)
+                or checkpoint_every < 1
+            ):
+                raise ValueError("checkpoint_every must be a positive integer")
+            if execution != "scan" or inference:
+                raise ValueError(
+                    "checkpoint_every requires execution='scan' and inference=False"
+                )
         if callbacks is not None and not isinstance(callbacks, Mapping):
             raise TypeError(
                 "callbacks must be a named mapping of FunctionalCallback configurations"
@@ -130,6 +152,7 @@ class CompiledRunner:
         self._inference = inference
         self._execution = execution
         self._steps = steps
+        self._checkpoint_every = checkpoint_every
         # Versioned snapshots must remain ordinary tensors even when the
         # convenience constructor is called inside inference_mode().
         with torch.inference_mode(False), torch.no_grad():
@@ -182,6 +205,16 @@ class CompiledRunner:
         return self._kernel.execution_report()
 
     def _prepare(self, parameters, *, cache):
+        return self._prepare_with(
+            parameters, cache=cache, prepare=self._functional.prepare
+        )
+
+    def _prepare_source_validated(self, parameters, *, cache):
+        return self._prepare_with(
+            parameters, cache=cache, prepare=self._functional._prepare_source_validated
+        )
+
+    def _prepare_with(self, parameters, *, cache, prepare):
         if cache and self._prepared is not None:
             try:
                 self._functional._validate_prepared_freshness(
@@ -197,7 +230,7 @@ class CompiledRunner:
                     raise
             else:
                 return self._prepared
-        prepared = self._functional.prepare(parameters, self._constants)
+        prepared = prepare(parameters, self._constants)
         if cache:
             self._prepared = prepared
         return prepared
@@ -240,24 +273,60 @@ class CompiledRunner:
                 "functional API for torch.func or forward-mode AD transforms"
             )
         selected_state = self._initial_state if state is None else state
-        selected_parameters = self._parameters if parameters is None else parameters
+        # An external Mapping can execute arbitrary Python while materializing
+        # its entries. Snapshot it before checking source structure, rather than
+        # letting iteration invalidate that check between owned boundaries.
+        selected_parameters = (
+            self._parameters if parameters is None else dict(parameters)
+        )
+        owned_boundaries = (
+            type(self._functional) is FunctionalPopulation
+            and type(self._kernel) is CompiledPopulationChunk
+            and getattr(self._functional.prepare, "__self__", None) is self._functional
+            and getattr(self._functional.prepare, "__func__", None) is _OWNED_PREPARE
+            and getattr(self._kernel.bind, "__self__", None) is self._kernel
+            and getattr(self._kernel.bind, "__func__", None) is _OWNED_BIND
+            and run is _OWNED_RUN
+        )
         context = torch.inference_mode() if self._inference else nullcontext()
         with context:
-            prepared = self._prepare(
-                selected_parameters, cache=self._inference and parameters is None
+            if owned_boundaries:
+                self._functional._validate_source()
+            prepare = (
+                self._prepare_source_validated if owned_boundaries else self._prepare
             )
-            bound = self._kernel.bind(selected_parameters, prepared)
+            prepared = prepare(
+                selected_parameters,
+                cache=self._inference and parameters is None,
+            )
+            bound = (
+                BoundPopulation._from_source_validated(
+                    self._functional,
+                    selected_parameters,
+                    prepared,
+                    compiled_chunk=self._kernel,
+                )
+                if owned_boundaries
+                else self._kernel.bind(selected_parameters, prepared)
+            )
             if self._execution == "while":
                 self._require_while(
                     bound._parameters, prepared, selected_state, inputs, callback_state
                 )
-            return run(
+            schedule = _run_source_validated if owned_boundaries else run
+            schedule_options = (
+                {}
+                if self._checkpoint_every is None
+                else {"checkpoint_every": self._checkpoint_every}
+            )
+            return schedule(
                 bound,
                 selected_state,
                 inputs=inputs,
                 steps=self._steps,
                 callbacks=self._callbacks,
                 callback_state=callback_state,
+                **schedule_options,
             )
 
 
@@ -269,6 +338,7 @@ def compile(
     execution="scan",
     callbacks=None,
     inference=True,
+    checkpoint_every=None,
     trainable=(),
     backend="inductor",
     options=None,
@@ -283,7 +353,10 @@ def compile(
     compartments with ``dn.func.Recorder(..., node_indices=[...])``, not a
     runner argument. CPU inference with ordinary Inductor defaults to
     ``options={'cpp_wrapper': True}``; explicit compiler choices win. Use
-    ``inference=False, trainable=(...)`` for scan gradients. See
+    ``inference=False, trainable=(...)`` for scan gradients. Add
+    ``checkpoint_every=H`` to trade backward recomputation of H-step compiled
+    scans for lower activation memory, without truncating gradients. This is
+    valid only for training scan; requested recording storage remains. See
     :class:`CompiledRunner` for all constructor options.
     """
     return CompiledRunner(
@@ -293,6 +366,7 @@ def compile(
         execution=execution,
         callbacks=callbacks,
         inference=inference,
+        checkpoint_every=checkpoint_every,
         trainable=trainable,
         backend=backend,
         options=options,

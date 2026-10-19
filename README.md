@@ -22,7 +22,7 @@ then see the tutorials and the
 
 ## Installation
 
-Dendra requires Python 3.11 or newer and PyTorch 2.12 or newer. On Windows,
+Dendra requires Python 3.11 or newer and PyTorch 2.14 or newer. On Windows,
 install inside WSL2 because the required NEURON dependency does not publish
 native Windows wheels on PyPI.
 

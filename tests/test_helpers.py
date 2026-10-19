@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import os
-import re
 import subprocess
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -334,43 +334,111 @@ def test_ve_from_s_t_shapes_and_values(multicontact):
 
 
 # --------------------------------------------------------------------------
-#  allow_tf32 (only check when CUDA available)
+#  allow_tf32 (CPU protocol stubs plus optional real CUDA controls)
 # --------------------------------------------------------------------------
+
+
+class _TF32TorchProbe:
+    def __init__(self, backends):
+        self.backends = backends
+        self.version_reads = 0
+
+    @property
+    def __version__(self):
+        self.version_reads += 1
+        raise AssertionError("TF32 controls must not inspect a Torch version label")
+
+
+class _TF32PrecisionProbe:
+    def __init__(self, *, fail=False):
+        object.__setattr__(self, "writes", [])
+        object.__setattr__(self, "legacy_accesses", [])
+        object.__setattr__(self, "fail", fail)
+
+    def __getattr__(self, name):
+        self.legacy_accesses.append(name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        if name != "fp32_precision":
+            self.legacy_accesses.append(name)
+            raise AttributeError(name)
+        self.writes.append(value)
+        if self.fail:
+            raise RuntimeError("This backend control is unavailable")
+
+
+def _tf32_probe(*, failing=None):
+    controls = {
+        name: _TF32PrecisionProbe(fail=name == failing)
+        for name in ("matmul", "conv", "rnn")
+    }
+    backends = SimpleNamespace(
+        cuda=SimpleNamespace(matmul=controls["matmul"]),
+        cudnn=SimpleNamespace(conv=controls["conv"], rnn=controls["rnn"]),
+    )
+    return _TF32TorchProbe(backends), controls
+
+
+@pytest.mark.parametrize("state", [True, False])
+def test_allow_tf32_uses_modern_controls_without_version_or_legacy_access(
+    monkeypatch, state
+):
+    probe, controls = _tf32_probe()
+    monkeypatch.setattr(H, "torch", probe)
+    H.allow_tf32(state)
+    expected = "tf32" if state else "ieee"
+    assert probe.version_reads == 0
+    for control in controls.values():
+        assert control.writes == [expected]
+        assert not control.legacy_accesses
+
+
+@pytest.mark.parametrize("state", [True, False])
+@pytest.mark.parametrize("failing", ["matmul", "conv", "rnn"])
+def test_allow_tf32_retains_independent_best_effort_controls(
+    monkeypatch, state, failing
+):
+    probe, controls = _tf32_probe(failing=failing)
+    monkeypatch.setattr(H, "torch", probe)
+    H.allow_tf32(state)
+    assert probe.version_reads == 0
+    for control in controls.values():
+        assert control.writes == ["tf32" if state else "ieee"]
+        assert not control.legacy_accesses
+
+
+@pytest.mark.parametrize("state", [True, False])
+def test_allow_tf32_without_a_cuda_backend_is_a_noop(monkeypatch, state):
+    class NoCudaBackends:
+        def __getattr__(self, name):
+            if name == "cuda":
+                raise AttributeError(name)
+            raise AssertionError("No other backend should be accessed")
+
+    probe = _TF32TorchProbe(NoCudaBackends())
+    monkeypatch.setattr(H, "torch", probe)
+    H.allow_tf32(state)
+    assert probe.version_reads == 0
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("state", [True, False])
 def test_allow_tf32(state):
-    """H.allow_tf32 should set CUDA matmul/cuDNN precision switches consistently."""
-    match = re.match(r"^(\d+)\.(\d+)\.(\d+)", torch.__version__)
-    version = tuple(map(int, match.groups())) if match else (0, 0, 0)
-
-    if version >= (2, 9, 0):
-        orig_matmul = torch.backends.cuda.matmul.fp32_precision
-        orig_conv = torch.backends.cudnn.conv.fp32_precision
-        orig_rnn = torch.backends.cudnn.rnn.fp32_precision
-        expected = "tf32" if state else "ieee"
-
-        try:
-            H.allow_tf32(state)
-            assert torch.backends.cuda.matmul.fp32_precision == expected
-            assert torch.backends.cudnn.conv.fp32_precision == expected
-            assert torch.backends.cudnn.rnn.fp32_precision == expected
-        finally:
-            torch.backends.cuda.matmul.fp32_precision = orig_matmul
-            torch.backends.cudnn.conv.fp32_precision = orig_conv
-            torch.backends.cudnn.rnn.fp32_precision = orig_rnn
-    else:
-        orig_matmul = torch.backends.cuda.matmul.allow_tf32
-        orig_cudnn = torch.backends.cudnn.allow_tf32
-
-        try:
-            H.allow_tf32(state)
-            assert torch.backends.cuda.matmul.allow_tf32 is state
-            assert torch.backends.cudnn.allow_tf32 is state
-        finally:
-            torch.backends.cuda.matmul.allow_tf32 = orig_matmul
-            torch.backends.cudnn.allow_tf32 = orig_cudnn
+    """Set and restore all three supported fine-grained CUDA precision controls."""
+    orig_matmul = torch.backends.cuda.matmul.fp32_precision
+    orig_conv = torch.backends.cudnn.conv.fp32_precision
+    orig_rnn = torch.backends.cudnn.rnn.fp32_precision
+    expected = "tf32" if state else "ieee"
+    try:
+        H.allow_tf32(state)
+        assert torch.backends.cuda.matmul.fp32_precision == expected
+        assert torch.backends.cudnn.conv.fp32_precision == expected
+        assert torch.backends.cudnn.rnn.fp32_precision == expected
+    finally:
+        torch.backends.cuda.matmul.fp32_precision = orig_matmul
+        torch.backends.cudnn.conv.fp32_precision = orig_conv
+        torch.backends.cudnn.rnn.fp32_precision = orig_rnn
 
 
 # --------------------------------------------------------------------------

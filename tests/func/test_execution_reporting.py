@@ -15,11 +15,6 @@ import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.func._execution import ExecutionCapabilities, ExecutionReport
 
-requires_scan_torch = pytest.mark.skipif(
-    torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-    reason="scan compatibility is validated against PyTorch 2.14.0 and 2.14.1",
-)
-
 
 @pytest.fixture(autouse=True)
 def _known_compiler_warnings():
@@ -197,12 +192,7 @@ def test_runner_tail_and_callback_dispatches_update_parent(with_callbacks):
     assert report.steps == 1
     assert report.callbacks is with_callbacks
     assert report.strategy == "compiled_unrolled"
-    recorder_loop_supported = tuple(
-        int(part) for part in torch.__version__.split(".")[:2]
-    ) >= (2, 14)
-    assert any("while_loop" in targets for targets in observed) == (
-        not with_callbacks or recorder_loop_supported
-    )
+    assert any("while_loop" in targets for targets in observed)
     if with_callbacks:
         callback_ref = weakref.ref(callbacks)
         del callbacks
@@ -227,17 +217,10 @@ def test_recorder_inference_callback_body_uses_prewarmed_while_graph():
             tstop=4 * DT,
             callbacks=callbacks,
         )
-    recorder_loop_supported = tuple(
-        int(part) for part in torch.__version__.split(".")[:2]
-    ) >= (2, 14)
-    assert kernel.execution_report().strategy == (
-        "compiled_while_loop" if recorder_loop_supported else "compiled_unrolled"
-    )
+    assert kernel.execution_report().strategy == "compiled_while_loop"
     assert kernel.execution_report().callbacks
     assert observed
-    assert (
-        any("while_loop" in targets for targets in observed) == recorder_loop_supported
-    )
+    assert any("while_loop" in targets for targets in observed)
 
 
 def test_checkpoint_replay_report_is_the_latest_completed_kernel_dispatch():
@@ -282,7 +265,6 @@ def test_stepwise_bound_stimulation_reports_unrolled_inference(stimulus_kind):
     assert observed and not any("while_loop" in targets for targets in observed)
 
 
-@requires_scan_torch
 @pytest.mark.parametrize("with_callbacks", [False, True])
 def test_scan_reports_dispatched_loop_and_distinct_capabilities(with_callbacks):
     functional, tensors, prepared = _case()

@@ -45,6 +45,56 @@ def solve(self, dt, {states_and_assigned}, **kwargs):
 """
 
 
+def _bounded_phi1(z):
+    """Evaluate ``expm1(z) / z`` for ``|z| <= 0.5`` without a transcendental.
+
+    The Taylor polynomial is evaluated in Horner form, in the input dtype.
+    Its degree is nine for float32 and sixteen for float64. For a polynomial
+    of degree N, the truncation error in derivative r is bounded by
+
+        exp(0.5) * 0.5**(N + 1 - r) / ((N + 1 - r)! * (N + 2)).
+
+    This follows by differentiating ``phi1(z) = integral_0^1 exp(t*z) dt``.
+    For float32 the value, first- and second-derivative bounds are respectively
+    4.1e-11, 8.1e-10 and 1.5e-8, below ordinary rounding error. Float64's
+    second-derivative truncation error is below 2.2e-18. Reduced-precision and
+    other dtypes retain the previous expinv evaluation rather than acquiring
+    an unvalidated approximation or an implicit float32 promotion.
+
+    Callers must mask out-of-range inputs before evaluating this helper.
+    Keeping the polynomial's inactive branch bounded also protects higher AD.
+    """
+    # PyTorch 2.14 func.jvp can promote logical-scalar float32 arithmetic with
+    # Python floats to float64. A singleton view keeps its field arithmetic
+    # vector-shaped without allocating or adding broadcasts to the HH mechanism.
+    scalar = z.ndim == 0
+    if scalar:
+        z = z.unsqueeze(0)
+    if z.dtype == torch.float64:
+        value = z * (1 / 355687428096000) + 1 / 20922789888000
+        value = value * z + 1 / 1307674368000
+        value = value * z + 1 / 87178291200
+        value = value * z + 1 / 6227020800
+        value = value * z + 1 / 479001600
+        value = value * z + 1 / 39916800
+        value = value * z + 1 / 3628800
+        value = value * z + 1 / 362880
+    elif z.dtype == torch.float32:
+        value = z * (1 / 3628800) + 1 / 362880
+    else:
+        value = 1 / expinv(z)
+        return value.squeeze(0) if scalar else value
+    value = value * z + 1 / 40320
+    value = value * z + 1 / 5040
+    value = value * z + 1 / 720
+    value = value * z + 1 / 120
+    value = value * z + 1 / 24
+    value = value * z + 1 / 6
+    value = value * z + 1 / 2
+    value = value * z + 1
+    return value.squeeze(0) if scalar else value
+
+
 def _linear_exact_step(state, rate, source, coefficient, dt):
     """Evaluate the exact affine update without losing small increments.
 
@@ -55,7 +105,10 @@ def _linear_exact_step(state, rate, source, coefficient, dt):
     z = coefficient * dt
     small = z.abs() <= 0.5
     small_z = torch.where(small, z, torch.zeros_like(z))
-    increment = state + dt * rate / expinv(small_z)
+    if z.dtype == torch.float32 or z.dtype == torch.float64:
+        increment = state + dt * rate * _bounded_phi1(small_z)
+    else:
+        increment = state + dt * rate / expinv(small_z)
     # Both where branches are evaluated. Keep the unused denominator and
     # exponential finite at zero rate and in the stiff-decay limit, including
     # under reverse/forward AD and vmap.

@@ -9,6 +9,7 @@ stages:
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
   DEBIAN_FRONTEND: noninteractive
+  TORCH_SPEC: "torch==2.14.0"
 
 cache:
   key: "$CI_JOB_NAME"
@@ -29,7 +30,7 @@ before_script:
   - python -m pip install numpy
 
   # 1) Install PyTorch first
-  - python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
+  - python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
 
   # 2) Include optional native solvers for the full test and documentation lanes.
   # Require the published wheel so CI exercises the distributed artifact.
@@ -93,7 +94,7 @@ test_base_install:
   # Override the full test setup: this lane must never install native solvers.
   before_script:
     - python -m pip install --upgrade pip
-    - python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
+    - python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
     - printf "numpy<2\ndendra-solvers==0\n" > "$CI_PROJECT_DIR/base-constraints.txt"
     - python -m pip install --constraint "$CI_PROJECT_DIR/base-constraints.txt" .
   script:
@@ -150,6 +151,37 @@ test:
         path: coverage.xml
     expire_in: 1 week
 
+test_functional_compatibility:
+  extends: .full_test_rules
+  stage: test
+  parallel:
+    matrix:
+      - TORCH_SPEC: ["torch==2.14.0", "torch>=2.14,<2.15", "torch>=2.14,<3"]
+  variables:
+    OMP_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1"
+    OPENBLAS_NUM_THREADS: "1"
+    TORCHINDUCTOR_COMPILE_THREADS: "1"
+  script:
+    - python -m pip install pytest hypothesis
+    # Do not let a missing optional dependency silently skip DHS gradients.
+    - |
+      python - <<'PY'
+      import torch
+      import dendra_solvers._ext
+      from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE
+      assert DENDRA_SOLVERS_AVAILABLE, "Native DHS coverage must not be skipped"
+      print("Functional compiler lane:", torch.__version__)
+      PY
+    - >-
+      python -m pytest -q
+      tests/func/test_scan_chunk.py
+      tests/func/test_scan_donation.py
+      tests/func/test_scan_donation_workflows.py
+      tests/func/test_scan_recording.py
+      tests/func/test_scan_hh_validation.py
+      tests/func/test_while_inductor.py
+
 build_docs:
   stage: build
   script:
@@ -172,6 +204,9 @@ release_bump:
       optional: true
       artifacts: false
     - job: test
+      optional: true
+      artifacts: false
+    - job: test_functional_compatibility
       optional: true
       artifacts: false
     - job: build_docs

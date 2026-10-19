@@ -21,6 +21,7 @@ NATIVE_SOURCES = (
     "dendra/models/networks/netcon_bitpack_kernel.cpp",
     "dendra/models/networks/netcon_bitpack_kernel.cu",
 )
+TORCH_REQUIREMENT = "torch>=2.14.0"
 
 
 def source_version(root: Path) -> str:
@@ -56,8 +57,10 @@ def check_metadata(data: bytes, version: str, artifact: Path) -> None:
             f"{artifact.name}: Python support metadata is missing or changed."
         )
     dependencies = metadata.get_all("Requires-Dist", [])
-    if not any(item.startswith("torch>=") for item in dependencies):
-        raise ValueError(f"{artifact.name}: runtime dependencies are missing.")
+    if TORCH_REQUIREMENT not in (item.replace(" ", "") for item in dependencies):
+        raise ValueError(
+            f"{artifact.name}: expected runtime dependency {TORCH_REQUIREMENT}."
+        )
     if "solvers" not in metadata.get_all("Provides-Extra", []):
         raise ValueError(f"{artifact.name}: the solvers extra is missing.")
 

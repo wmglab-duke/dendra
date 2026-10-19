@@ -12,10 +12,6 @@ from dendra.func import FunctionalizationError, _scan_compat
 
 pytestmark = [
     pytest.mark.cpu,
-    pytest.mark.skipif(
-        torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-        reason="scan compatibility requires the verified Torch implementation",
-    ),
 ]
 
 

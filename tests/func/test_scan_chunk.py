@@ -5,6 +5,7 @@ import importlib
 import warnings
 import weakref
 from functools import partial
+from types import FunctionType
 
 import pytest
 import torch
@@ -32,10 +33,6 @@ pytestmark = [
         r"ignore:`torch\.jit\.script_method` is deprecated.*:DeprecationWarning"
     ),
 ]
-requires_scan_torch = pytest.mark.skipif(
-    torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-    reason="scan compatibility is validated against PyTorch 2.14.0 and 2.14.1",
-)
 
 
 @pytest.fixture(autouse=True)
@@ -103,7 +100,6 @@ def _evaluate(functional, tensors, ve, intra, chunk, presence=(True, True), offs
     return final, auxiliary, gradients
 
 
-@requires_scan_torch
 @pytest.mark.parametrize(
     "presence", [(False, False), (True, False), (False, True), (True, True)]
 )
@@ -119,7 +115,6 @@ def test_scan_chunk_preserves_independent_first_order_oracles(presence):
     _assert_gradients(actual[2], expected[2])
 
 
-@requires_scan_torch
 def test_scan_chunk_reuses_graphs_with_new_parameter_and_prepared_values():
     model = _model()
     functional, tensors = dn.func.make_functional(model, dt=DT)
@@ -169,7 +164,6 @@ def _callbacks(functional, steps):
     )
 
 
-@requires_scan_torch
 def test_scan_checkpoint_callbacks_preserve_discrete_state_and_gradients():
     steps = 10
     model = _model()
@@ -226,7 +220,6 @@ def test_scan_checkpoint_callbacks_preserve_discrete_state_and_gradients():
             assert not value.requires_grad
 
 
-@requires_scan_torch
 @pytest.mark.parametrize("with_callbacks", [False, True])
 def test_scan_cache_releases_callback_collection_and_live_training_graph(
     with_callbacks,
@@ -288,7 +281,6 @@ class _InitializationOnly(dn.func.FunctionalCallback):
         return emissions
 
 
-@requires_scan_torch
 def test_scan_initialization_only_emissions_have_empty_resumed_schema():
     functional, tensors = dn.func.make_functional(_model(), dt=DT)
     prepared = functional.prepare(tensors.parameters, tensors.constants)
@@ -325,7 +317,6 @@ def test_scan_initialization_only_emissions_have_empty_resumed_schema():
         assert zero["callbacks"].state["initial"].item() == 4
 
 
-@requires_scan_torch
 def test_scan_direct_forward_ad_falls_back_without_compilation():
     functional, tensors = dn.func.make_functional(_model(), dt=DT)
     prepared = functional.prepare(tensors.parameters, tensors.constants)
@@ -357,7 +348,6 @@ def test_scan_direct_forward_ad_falls_back_without_compilation():
     assert not chunk._compiled._kernels
 
 
-@requires_scan_torch
 def test_scan_public_chunk_rejects_recorded_backward_through_preparation():
     model = _model()
     functional, tensors = dn.func.make_functional(model, dt=DT)
@@ -376,36 +366,75 @@ def test_scan_public_chunk_rejects_recorded_backward_through_preparation():
             torch.autograd.grad(loss, constants["diam"], create_graph=True)
 
 
-@pytest.mark.parametrize("version", ["2.99.0", "2.14.2", "2.14.1a0"])
-def test_scan_explicit_version_gate_preserves_default_mode(monkeypatch, version):
+@pytest.mark.parametrize("version", ["2.14.0", "2.14.2", "2.15.0", "2.99.0"])
+def test_scan_uses_the_installed_contract_not_its_version_label(monkeypatch, version):
     functional, _tensors = dn.func.make_functional(_model(), dt=DT)
     monkeypatch.setattr(torch, "__version__", version)
-    with pytest.raises(dn.func.FunctionalizationError, match="verified PyTorch 2.14.0"):
-        functional.compile_rollout_chunk(2, execution="scan", backend="eager")
+    # This checks label independence on the installed contract, not support
+    # for an uninstalled future compiler's implementation.
+    functional.compile_rollout_chunk(2, execution="scan", backend="eager")
     functional.compile_rollout_chunk(2, backend="eager")
     with pytest.raises(ValueError, match="execution must be"):
         functional.compile_rollout_chunk(2, execution="unknown", backend="eager")
 
 
-@requires_scan_torch
-def test_scan_compatibility_rejects_changed_sources_before_mutation(monkeypatch):
+def test_scan_compatibility_rejects_incompatible_signature_before_mutation(monkeypatch):
     partitioner = importlib.import_module("torch._higher_order_ops.partitioner")
     original = partitioner.create_hop_joint_graph
     if _scan_compat._INSTALLED is not None:
         original = original.__wrapped__
     monkeypatch.setattr(partitioner, "create_hop_joint_graph", original)
     monkeypatch.setattr(_scan_compat, "_INSTALLED", None)
-    monkeypatch.setitem(
-        _scan_compat._SOURCE_HASHES, "torch._higher_order_ops.utils", "invalid"
+
+    def wrong_signature(value):
+        return value
+
+    incompatible = FunctionType(
+        wrong_signature.__code__, partitioner.__dict__, "create_hop_joint_graph"
     )
-    with pytest.raises(
-        dn.func.FunctionalizationError, match="source fingerprint differs"
-    ):
+    monkeypatch.setattr(partitioner, "create_hop_joint_graph", incompatible)
+    with pytest.raises(dn.func.FunctionalizationError, match="incompatible signature"):
+        _scan_compat.install_scan_compatibility()
+    assert partitioner.create_hop_joint_graph is incompatible
+    assert _scan_compat._INSTALLED is None
+
+
+def test_scan_compatibility_behavior_failure_is_atomic(monkeypatch):
+    partitioner = importlib.import_module("torch._higher_order_ops.partitioner")
+    original = partitioner.create_hop_joint_graph
+    if _scan_compat._INSTALLED is not None:
+        original = original.__wrapped__
+    monkeypatch.setattr(partitioner, "create_hop_joint_graph", original)
+    monkeypatch.setattr(_scan_compat, "_INSTALLED", None)
+
+    def reject_probe(_entry):
+        raise dn.func.FunctionalizationError("injected joint behavior failure")
+
+    monkeypatch.setattr(_scan_compat, "_probe_scan_contract", reject_probe)
+    with pytest.raises(dn.func.FunctionalizationError, match="joint behavior failure"):
         _scan_compat.install_scan_compatibility()
     assert partitioner.create_hop_joint_graph is original
+    assert _scan_compat._INSTALLED is None
 
 
-@requires_scan_torch
+def test_scan_behavior_probe_is_cpu_local_under_an_ambient_meta_device():
+    _scan_compat.install_scan_compatibility()
+    entry = _scan_compat._INSTALLED[1]
+    original_device = torch.get_default_device()
+    observed = []
+
+    def observe_entry(function, primals, **kwargs):
+        observed.append(tuple(value.device.type for value in primals))
+        return entry(function, primals, **kwargs)
+
+    with torch.device("meta"):
+        assert torch.get_default_device().type == "meta"
+        _scan_compat._probe_scan_contract(observe_entry)
+        assert torch.get_default_device().type == "meta"
+    assert observed == [("cpu", "cpu", "cpu", "cpu")]
+    assert torch.get_default_device() == original_device
+
+
 def test_scan_compatibility_rejects_replaced_callable_before_mutation(monkeypatch):
     utils = importlib.import_module("torch._higher_order_ops.utils")
     partitioner = importlib.import_module("torch._higher_order_ops.partitioner")
@@ -420,7 +449,6 @@ def test_scan_compatibility_rejects_replaced_callable_before_mutation(monkeypatc
     assert partitioner.create_hop_joint_graph is original
 
 
-@requires_scan_torch
 @pytest.mark.parametrize("target", ["entry", "shared_helper", "partitioner_helper"])
 def test_scan_compatibility_rechecks_active_callable_identities(monkeypatch, target):
     utils = importlib.import_module("torch._higher_order_ops.utils")
@@ -441,7 +469,6 @@ def test_scan_compatibility_rechecks_active_callable_identities(monkeypatch, tar
         assert partitioner.create_hop_joint_graph is active
 
 
-@requires_scan_torch
 @pytest.mark.parametrize("multithreading", [False, True])
 @pytest.mark.parametrize("fail", [False, True])
 def test_scan_joint_capture_scopes_autograd_multithreading(multithreading, fail):
@@ -474,7 +501,6 @@ def test_scan_joint_capture_scopes_autograd_multithreading(multithreading, fail)
     assert observed == [False]
 
 
-@requires_scan_torch
 def test_scan_compatibility_preserves_mixed_output_cotangent_positions():
     """Prove the audited upstream bug and that the local repair fixes its cause."""
     from torch.fx.experimental.proxy_tensor import make_fx
@@ -519,7 +545,6 @@ def test_scan_compatibility_preserves_mixed_output_cotangent_positions():
     torch.testing.assert_close(tuple(result[4:]), expected)
 
 
-@requires_scan_torch
 def test_scan_mixed_integer_boolean_carry_and_emissions_match_eager():
     from torch._higher_order_ops.scan import scan
 
@@ -566,7 +591,6 @@ def test_scan_mixed_integer_boolean_carry_and_emissions_match_eager():
     torch.testing.assert_close(actual, expected, rtol=1e-10, atol=1e-12)
 
 
-@requires_scan_torch
 def test_scan_compatibility_is_idempotent_and_preserves_shared_while_backward():
     utils = importlib.import_module("torch._higher_order_ops.utils")
     partitioner = importlib.import_module("torch._higher_order_ops.partitioner")

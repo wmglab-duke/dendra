@@ -36,7 +36,7 @@ class DistributionChecks(unittest.TestCase):
             path.write_bytes(data)
         self.metadata = (
             b"Metadata-Version: 2.4\nName: dendra\nVersion: 0.27.0\n"
-            b"Requires-Python: >=3.11\nRequires-Dist: torch>=2.12.0\n"
+            b"Requires-Python: >=3.11\nRequires-Dist: torch>=2.14.0\n"
             b"Provides-Extra: solvers\n\n"
         )
 
@@ -100,6 +100,13 @@ class DistributionChecks(unittest.TestCase):
     def test_reject_mismatched_wheel_metadata(self):
         self.build_archives(metadata=self.metadata.replace(b"0.27.0", b"0.28.0"))
         with self.assertRaisesRegex(ValueError, "version disagrees"):
+            check_distributions(self.dist, self.root)
+
+    def test_reject_outdated_torch_minimum(self):
+        self.build_archives(
+            metadata=self.metadata.replace(b"torch>=2.14.0", b"torch>=2.12.0")
+        )
+        with self.assertRaisesRegex(ValueError, "expected runtime dependency torch"):
             check_distributions(self.dist, self.root)
 
     def test_reject_extra_distribution(self):

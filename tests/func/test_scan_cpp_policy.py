@@ -166,7 +166,10 @@ def test_scan_capture_selects_cpp_from_original_mode_and_immutable_device(
             {},
             grad_enabled=original_grad_enabled,
         )
-    assert result is marker
+    if original_grad_enabled:
+        assert result.__wrapped__ is marker
+    else:
+        assert result is marker
     assert captured["prefer"] is (device == "cpu" and not original_grad_enabled)
 
 

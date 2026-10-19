@@ -114,6 +114,7 @@ def test_no_stimulus_run_skips_only_empty_noise_walk(monkeypatch, entrypoint):
     not callable(getattr(tree_module.dendra_solvers, "DHSPlan", None)),
     reason="requires the owning-plan native solver candidate",
 )
+@pytest.mark.slow
 def test_compiled_no_stimulus_dhs_trace_and_voltage_gradient():
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)

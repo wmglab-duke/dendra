@@ -10,7 +10,7 @@ and ``torch.compile`` without changing the normal ``Population.step()``,
 ``run()``, or ``longrun()`` paths.
 
 Quick start: compiled scan or while loop
----------------------------------------
+----------------------------------------
 
 For a reusable compiled simulation, ``dn.func.compile`` handles
 functionalization, independent parameter copies, preparation, compilation, and
@@ -70,8 +70,8 @@ wrapper unless ``options={"cpp_wrapper": False}`` overrides it. The first call
 captures and compiles the loop; retain the runner for subsequent calls.
 Explicit compiler modes and alternate code-generation options retain their
 original compiler policy rather than receiving a new wrapper preference.
-Scan currently requires Dendra's verified PyTorch 2.14.0 or 2.14.1 scan
-implementation. While execution requires at least four steps, a nonempty
+Scan and while execution use Dendra's PyTorch 2.14+ baseline; supported features
+are not selected by patch-version number. While execution requires at least four steps, a nonempty
 collection of supported built-in callbacks, and a capturable inference step.
 Supported built-ins are ``Recorder``, ``AnomalyDetector``, ``Raster``, ``APCount``,
 ``Active``, ``ActiveAL``, and ``ActiveALCount``; scan also accepts pure custom
@@ -132,8 +132,49 @@ selected by ``trainable``. A complete replacement mapping may be passed with
 as well. Parameter changes do not reset the captured initial state or perform
 differentiable initialization automatically.
 
+For activation checkpointing, add ``checkpoint_every`` to the same training
+scan configuration:
+
+.. code-block:: python
+
+   train_runner = dn.func.compile(
+       model,
+       dt=0.025,
+       steps=20_000,
+       execution="scan",
+       inference=False,
+       checkpoint_every=256,
+       trainable=("gnabar",),
+       callbacks={"trace": dn.func.Recorder(("v",), node_indices=[0])},
+       options={"cpp_wrapper": True},
+   )
+   final_state, auxiliary = train_runner()
+   loss = auxiliary["callbacks"]["trace"]["v"].square().mean()
+   loss.backward()
+
+``checkpoint_every=H`` is a positive integer controlling the maximum number of
+accepted steps in each checkpoint span, not an alternative execution mode.
+The scheduler runs cached compiled scan chunks and a cached shorter tail when
+needed. Non-reentrant activation checkpointing replays these spans during
+backward; it preserves gradients across the full simulation, initial state,
+parameters, explicit inputs, and callback carry. Steps and custom callbacks must
+be pure, deterministic, and replay-safe. Replay retains source and prepared-input
+freshness checks and the scan donation guard.
+
+Checkpointing exchanges recomputation for lower saved activation memory; it
+does not remove requested recordings. Full voltage/gate trajectories remain a
+memory floor. Final-state objectives or loss/reducer callbacks that do not emit
+trajectories can save more memory than a full-state Recorder. Smaller intervals
+also increase host scheduling overhead, so measure runtime and memory for the
+intended model and loss rather than assuming a universally best interval.
+``None`` (the default) preserves ordinary scan execution. A checkpoint request
+requires ``execution="scan", inference=False``; inference and while-loop
+requests raise an error instead of silently ignoring the policy. If a training
+runner is called inside ``torch.no_grad()``, it uses the same spans without
+activation checkpointing or backward replay.
+
 This is an opt-in convenience layer. The lower-level functional API remains
-available for explicit callback binding, chunking, checkpointing, transforms, and
+available for explicit callback binding, independent kernel chunking, transforms, and
 preparation lifetimes. Imperative ``Population.run`` and ``Population.longrun``
 retain their existing behavior. See ``examples/functional_compiled_runner.py``
 for a complete small-model example, or
@@ -770,7 +811,7 @@ existing ``functools.partial`` forms. A general callable in those legacy forms
 must accept ``(state, StepInput)`` and return exactly
 ``(next_state, auxiliary)`` for one transition from the same model.
 
-On supported PyTorch 2.14.0 and 2.14.1 installations, ``execution="scan"`` offers an
+With PyTorch 2.14 or newer, ``execution="scan"`` offers an
 experimental alternative for first-order training over longer horizons:
 
 .. code-block:: python
@@ -791,17 +832,17 @@ runners use the same scheduling described above. Speed and memory use depend
 on the model and recording requirements; scan does not guarantee an improvement
 over the default compiled chunks.
 
-Scan uses a Dendra-maintained compatibility fix without modifying installed
-PyTorch files. The audited HOP/AOT sources are byte-identical in the supported
-2.14.0 and 2.14.1 builds; both need the same repair to preserve positional
-cotangents for integer and Boolean outputs and retain discrete input values
-during joint-graph capture. Activation verifies the installed source and
-callable fingerprints, not just the version number. It replaces only the HOP
-partitioner's joint-graph entry point with privately bound backward and
-materialization helpers; shared Torch utilities are unchanged. This process-wide activation
-persists for backward and checkpoint replay after forward execution returns.
-Unsupported PyTorch builds raise ``FunctionalizationError``;
-omit ``execution="scan"`` to use the default compiled chunks on those builds.
+Scan uses Dendra-maintained correctness protection without modifying installed
+PyTorch files. It preserves positional cotangents for integer and Boolean
+outputs, discrete input values during joint-graph capture, and ownership of
+backward subgraph inputs. Activation checks the required compiler interfaces
+and behavior instead of exact patch numbers or whole-source-file fingerprints.
+It replaces only the HOP partitioner's joint-graph entry point with privately
+bound backward and materialization helpers; shared Torch utilities are unchanged.
+This process-wide activation persists for backward and checkpoint replay after
+forward execution returns. Incompatible compiler contracts raise a descriptive
+``FunctionalizationError`` rather than silently selecting horizon-unrolled
+execution. Copy scheduling and wrapper-allocation policy are upstream Inductor's.
 
 Scan supports ordinary first-order ``backward()`` and ``autograd.grad``.
 ``create_graph=True`` raises explicitly; use the ordinary functional
@@ -1309,7 +1350,7 @@ Opaque prepared objects cannot be passed through a user-authored
 ``compile_rollout_chunk`` below; its outer Python wrapper keeps the opaque plan
 and freshness checks outside the compiled tensor kernel.
 
-With PyTorch 2.12 or newer, supported no-gradient inference can use bounded
+With PyTorch 2.14 or newer, supported no-gradient inference can use bounded
 ``torch.while_loop`` chunks, so the compiled graph does not grow by one copy of
 the transition per timestep. One-step graph capture is lazy and specific to
 the presence of ``ve`` and ``intra``. When compiling
@@ -1322,7 +1363,7 @@ unrolled fallback, but compilation cost and graph size grow with the rollout.
 ordinary no-gradient call.
 
 Built-in callbacks in compiled inference
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 On PyTorch 2.14 or newer, a default compiled chunk can also use a bounded
 inference loop when every callback is a supported functional built-in:
@@ -1470,8 +1511,8 @@ For example:
    python examples/functional_execution_modes.py --mode checkpointed --backend inductor
    python examples/functional_execution_modes.py --mode scan --backend inductor
 
-Scan modes require a supported PyTorch 2.14.0 or 2.14.1 implementation. ``all`` skips
-them on other versions; requesting one explicitly reports the capability error.
+Scan modes use the same PyTorch 2.14+ baseline as the other examples. ``all``
+executes them instead of silently skipping an unfamiliar patch release.
 The examples hold the extracted initial state fixed. For differentiation through
 initialization as well, see ``examples/functional_gradient_descent.py`` above.
 

@@ -124,7 +124,11 @@ def test_rate_declarations_have_no_compatibility_state_or_override():
     state = gate_state(mhn, 23.0, torch.float64)
     solver_source = state._solve.__source__
     for gate in GATES:
-        assert f"torch.exp(-dt * {gate}_b)" in solver_source
+        # CNEXP delegates the authored affine rate to its shared exact helper.
+        assert (
+            f"_{gate} = _linear_exact_step({gate}, -{gate} * {gate}_b + {gate}_a, "
+            f"{gate}_a, -{gate}_b, dt)"
+        ) in solver_source
         assert f"{gate}tau" not in solver_source
 
 

@@ -131,9 +131,13 @@ def _model(*, dtype=torch.float64, method="pcr", jit=0):
 def test_func_namespace_exports_the_functional_population_api():
     assert "func" in dn.__all__
     assert set(dn.func.__all__) == {
+        "Active",
+        "ActiveAL",
+        "ActiveALCount",
         "APCount",
         "BoundPopulation",
         "CompiledPopulationChunk",
+        "CompiledRunner",
         "AnomalyDetector",
         "ExecutionCapabilities",
         "ExecutionReport",
@@ -152,6 +156,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "RolloutInput",
         "StepInput",
         "StimulusTensors",
+        "compile",
         "longrun",
         "longrun_checkpointed",
         "make_functional",

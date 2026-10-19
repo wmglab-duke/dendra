@@ -10,6 +10,40 @@ log2 = torch.log2
 log1p = torch.log1p
 
 
+def _reciprocal_exprel_even(q):
+    """Even part of the local Bernoulli series, excluding its q**2 factor.
+
+    Thus ``q / expm1(q) = 1 - q/2 + q**2 * result``. The degree is twelve
+    for float32 on |q| <= 1 and eighteen for float64 on |q| <= 0.5. Bounds
+    for the omitted value/first/second derivative terms are respectively
+    1.4e-11/2.0e-10/2.6e-9 and 2.2e-22/8.5e-21/3.3e-19. They follow from
+    |B_(2n)|/(2n)! = 2*zeta(2n)/(2*pi)**(2n), summing the decreasing tail.
+    Floating-point evaluation, not Taylor truncation, dominates the error.
+
+    Callers mask nonlocal inputs before evaluating the polynomial, including
+    its inactive branch. This helper is not a global polynomial approximation.
+    """
+    # Keep scalar field arithmetic vector-shaped: Torch 2.14 func.jvp can
+    # otherwise promote float32 tangents when Python floating constants occur.
+    # These are views only; non-scalar mechanism fields take the unchanged path.
+    scalar = q.ndim == 0
+    if scalar:
+        q = q.unsqueeze(0)
+    q2 = q * q
+    if q.dtype == torch.float64:
+        value = q2 * (43867 / 5109094217170944000) - 3617 / 10670622842880000
+        value = value * q2 + 1 / 74724249600
+        value = value * q2 - 691 / 1307674368000
+        value = value * q2 + 1 / 47900160
+    else:
+        value = q2 * (-691 / 1307674368000) + 1 / 47900160
+    value = value * q2 - 1 / 1209600
+    value = value * q2 + 1 / 30240
+    value = value * q2 - 1 / 720
+    value = value * q2 + 1 / 12
+    return value.squeeze(0) if scalar else value
+
+
 def exprelr(x, y):
     """
     Compute x / (exp(x / y) - 1) with a series fallback for small x / y.
@@ -23,7 +57,13 @@ def exprelr(x, y):
                  = y / (1 + q/2 + q^2/6 + ...)
                  ≈ y (1 - q/2 + q^2/12).
 
-    The implementation switches to this second-order series when |q| < 1e-6.
+    For float32, a degree-twelve Bernoulli series is used when |q| <= 1;
+    float64 uses degree eighteen when |q| <= 0.5. Outside that region the
+    ordinary ``exp(q) - 1`` denominator is bounded away from zero. This compact
+    evaluation targets physiological voltage/rate ranges; it does not extend
+    the historical exponential's nonlocal overflow or underflow range.
+    Reduced-precision and complex inputs retain the historical
+    expm1/second-order-series path.
 
     Parameters
     ----------
@@ -36,12 +76,15 @@ def exprelr(x, y):
     -------
     torch.Tensor
         The value of x / expm1(x / y), using a series approximation
-        when |x / y| < 1e-6.
+        near the removable singularity.
 
     Notes
     -----
     - Exactly: f(x, y) = x / (e^{x / y} - 1).
     - For small q = x / y: f ≈ y - x/2 + x^2/(12 y) - ... .
+    - Either sign of a nonzero scale y is supported. Outside the local series,
+      the ordinary exponential retains its historical representational limits;
+      no extension is promised for an overflowed quotient or exponential.
     - Often this function will be referred to as 'vtrap' in e.g. NMODL files.
 
     Examples
@@ -51,6 +94,23 @@ def exprelr(x, y):
     tensor(1.)
     """
     q = x / y
+    if q.dtype == torch.float32 or q.dtype == torch.float64:
+        threshold = 1.0 if q.dtype == torch.float32 else 0.5
+        small = q.abs() <= threshold
+
+        # x*q, rather than y*q*q, preserves the scale and avoids reconstructing
+        # the numerator. Keep the unused polynomial bounded at nonlocal inputs.
+        small_q = torch.where(small, q, torch.zeros_like(q))
+        small_x = torch.where(small, x, torch.zeros_like(q))
+        small_y = torch.where(small, y, torch.zeros_like(q))
+        even = _reciprocal_exprel_even(small_q)
+        approx = torch.addcmul(small_y - small_x / 2, small_x, small_q * even)
+        # Neither zero nor cancellation-prone small inputs reach exp(q)-1.
+        # q_safe=1 also keeps its inactive branch finite near the singularity.
+        q_safe = torch.where(small, torch.ones_like(q), q)
+        val = x / (torch.exp(q_safe) - 1)
+        return torch.where(small, approx, val)
+
     small = q.abs() < 1e-6
     # ``torch.where`` evaluates both branches. Feeding the exact singular
     # expression ``0 / expm1(0)`` to the inactive branch gives a finite primal
@@ -78,7 +138,9 @@ def expinv(x):
 
         x / expm1(x) = 1 - x/2 + x^2/12 - x^4/720 + ... .
 
-    The implementation switches to a second-order series when |x| < 1e-6.
+    Float32 and float64 use the same dtype-aware local-series evaluation as
+    exprelr(x, 1), retaining the ordinary exponential's nonlocal range limits.
+    Other dtypes retain the second-order series at |x| < 1e-6.
 
     Parameters
     ----------
@@ -94,7 +156,8 @@ def expinv(x):
     Notes
     -----
     - Stable around x = 0 to avoid loss of precision due to cancellation.
-    - The small-input branch retains terms through second order.
+    - The real float32/float64 small-input branches retain terms through
+      degree twelve/eighteen respectively.
 
     Examples
     --------
@@ -102,6 +165,8 @@ def expinv(x):
     >>> expinv(torch.tensor(1e-12))
     tensor(1.)
     """
+    if x.dtype == torch.float32 or x.dtype == torch.float64:
+        return exprelr(x, torch.ones_like(x))
     small = x.abs() < 1e-6
     x_safe = torch.where(small, torch.ones_like(x), x)
     val = x / torch.expm1(x_safe)

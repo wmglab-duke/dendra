@@ -62,7 +62,7 @@ Getting started
 Installation
 ------------
 
-Dendra targets Python 3.11 or newer and PyTorch 2.12 or newer.
+Dendra targets Python 3.11 or newer and PyTorch 2.14 or newer.
 
 On Windows, run these commands inside WSL2 because the required NEURON package does not publish native Windows wheels on PyPI.
 

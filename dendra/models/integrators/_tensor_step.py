@@ -88,7 +88,6 @@ def _stock_instance(value, owner):
         "_affine",
         "_affine_method_owners",
         "_name",
-        "_renamed_aliases",
     }
     for cls in type(value).__mro__:
         if cls is owner:
@@ -105,6 +104,12 @@ def _stock_instance(value, owner):
                 continue
             if name == "t":
                 if type(item) is not staticproperty:
+                    return False
+            elif name == "_renamed_aliases":
+                # Mechanism.__init_subclass__ gives each clock proxy a fresh
+                # rename lookup cache. Warming the stock owner's cache does
+                # not change this instance's declarations or executable hooks.
+                if type(item) is not dict:
                     return False
             elif name.endswith("_defined_here"):
                 if type(item) not in (dict, tuple, list, set) or item:

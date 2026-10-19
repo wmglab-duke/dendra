@@ -9,6 +9,7 @@ from functools import partial
 from typing import Any
 
 import torch
+from torch.utils import _pytree as pytree
 from torch.utils.checkpoint import checkpoint
 
 from dendra.models.core import _duration_step_budget, _validate_time_scalar
@@ -326,6 +327,13 @@ def _validate_duration_remainder(state, *, expected: float | None = None) -> flo
 
 
 def _validate_execution(functional, step, state) -> float:
+    _validate_execution_context(functional, step)
+    functional._validate_source()
+    functional._validate_state(state)
+    return _validate_duration_remainder(state)
+
+
+def _validate_execution_context(functional, step) -> None:
     if not isinstance(functional, FunctionalPopulation):
         raise TypeError("functional must be a FunctionalPopulation")
     if not callable(step):
@@ -341,9 +349,6 @@ def _validate_execution(functional, step, state) -> float:
             "functional host duration scheduling is not a torch.func transform; "
             "transform the supplied step callable instead"
         )
-    functional._validate_source()
-    functional._validate_state(state)
-    return _validate_duration_remainder(state)
 
 
 def _validate_chunklength(chunklength) -> int:
@@ -605,7 +610,12 @@ def _execute_steps_with_callbacks(
             )
             if callbacks._has_emissions(emitted):
                 parts.append(emitted)
-        return state, auxiliary, callback_state, callbacks._concatenate(parts)
+        return (
+            state,
+            auxiliary,
+            callback_state,
+            callbacks._concatenate(parts, borrow_single=True),
+        )
     emissions = []
     for index in range(steps):
         result = step(
@@ -711,17 +721,27 @@ def _validate_returned_state(
 
 
 def _materialize_checkpoint_tree(value):
-    if torch.is_tensor(value):
-        return value.clone() if torch.is_inference(value) else value
-    if isinstance(value, Mapping):
-        return {
-            name: _materialize_checkpoint_tree(item) for name, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_materialize_checkpoint_tree(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_materialize_checkpoint_tree(item) for item in value)
-    return value
+    """Preserve registered PyTrees and AD while making constants saveable.
+
+    Public state and stimulus inputs also admit arbitrary key-addressed
+    Mappings. Normalize only unregistered Mapping leaves to ordinary dicts;
+    registered containers such as FunctionalCallbackState retain their static
+    plan identity and tree structure.
+    """
+
+    def materialize(leaf):
+        if torch.is_tensor(leaf):
+            if torch.is_inference(leaf):
+                with torch.inference_mode(False):
+                    return leaf.clone()
+            return leaf
+        if isinstance(leaf, Mapping):
+            return {
+                name: _materialize_checkpoint_tree(item) for name, item in leaf.items()
+            }
+        return leaf
+
+    return pytree.tree_map(materialize, value)
 
 
 def _execute_chunks(
@@ -851,19 +871,17 @@ def _execute_checkpointed_chunks(
         chunk_steps = stop - start
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
-        chunk_inputs = RolloutInput(
-            ve=(
-                chunk_inputs.ve.clone()
-                if chunk_inputs.ve is not None and torch.is_inference(chunk_inputs.ve)
-                else chunk_inputs.ve
-            ),
-            intra=(
-                chunk_inputs.intra.clone()
-                if chunk_inputs.intra is not None
-                and torch.is_inference(chunk_inputs.intra)
-                else chunk_inputs.intra
-            ),
+        checkpoint_inputs = _materialize_checkpoint_tree(
+            (
+                state,
+                callback_state,
+                chunk_inputs.ve,
+                chunk_inputs.intra,
+                None if extra_tensors is None else extra_tensors.parameters,
+                None if extra_tensors is None else extra_tensors.constants,
+            )
         )
+        flat_inputs, input_spec = pytree.tree_flatten(checkpoint_inputs)
 
         def execute_chunk(
             state_in,
@@ -918,15 +936,17 @@ def _execute_checkpointed_chunks(
                 callback_state_in,
             )
 
+        def execute_flat_chunk(
+            *leaves, input_spec=input_spec, execute_chunk=execute_chunk
+        ):
+            # Freeze both values per span: replay occurs after this host loop
+            # has advanced. Every dynamic Tensor must be a top-level checkpoint
+            # argument so autograd saves its version, not a mutable container.
+            operands = pytree.tree_unflatten(leaves, input_spec)
+            return execute_chunk(*operands)
+
         checkpoint_result = checkpoint(
-            execute_chunk,
-            state,
-            callback_state,
-            chunk_inputs.ve,
-            chunk_inputs.intra,
-            None if extra_tensors is None else extra_tensors.parameters,
-            None if extra_tensors is None else extra_tensors.constants,
-            use_reentrant=False,
+            execute_flat_chunk, *flat_inputs, use_reentrant=False
         )
         if callbacks is None:
             state, auxiliary = checkpoint_result
@@ -985,6 +1005,81 @@ def _run_schedule(
 ):
     """Resolve one horizon and use the shared eager/checkpoint execution engine."""
     expected_remainder = _validate_execution(functional, step, state)
+    return _run_validated_schedule(
+        functional,
+        step,
+        state,
+        inputs,
+        expected_remainder=expected_remainder,
+        duration=duration,
+        steps=steps,
+        span=span,
+        checkpointed=checkpointed,
+        dt=dt,
+        infer_bound_dt=infer_bound_dt,
+        legacy_input_horizon=legacy_input_horizon,
+        duration_name=duration_name,
+        extra=extra,
+        callbacks=callbacks,
+        callback_state=callback_state,
+    )
+
+
+def _run_source_validated(
+    bound,
+    state,
+    *,
+    inputs,
+    steps,
+    callbacks,
+    callback_state,
+    checkpoint_every=None,
+):
+    """Schedule one fixed-horizon convenience invocation after its source check.
+
+    Only CompiledRunner owns this path. It skips no state, schema, parameter,
+    prepared-plan or callback checks, and carries no exemption into replay or
+    any later invocation of a public boundary.
+    """
+    functional = bound.functional
+    _validate_execution_context(functional, bound)
+    functional._validate_state(state)
+    expected_remainder = _validate_duration_remainder(state)
+    return _run_validated_schedule(
+        functional,
+        bound,
+        state,
+        inputs,
+        expected_remainder=expected_remainder,
+        steps=steps,
+        span=checkpoint_every,
+        checkpointed=checkpoint_every is not None,
+        infer_bound_dt=True,
+        callbacks=callbacks,
+        callback_state=callback_state,
+    )
+
+
+def _run_validated_schedule(
+    functional,
+    step,
+    state,
+    inputs,
+    *,
+    expected_remainder,
+    duration=_MISSING,
+    steps=None,
+    span=None,
+    checkpointed=False,
+    dt=None,
+    infer_bound_dt=False,
+    legacy_input_horizon=False,
+    duration_name="duration",
+    extra=None,
+    callbacks=None,
+    callback_state=None,
+):
+    """Execute the common schedule after validating its public entry."""
     execution = _prepare_step_execution(functional, step)
     if infer_bound_dt and dt is None:
         dt = _bound_runner_dt(functional, execution.prepared_values)

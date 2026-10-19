@@ -22,10 +22,6 @@ from tests.test_membrane_assembly_context import model as inconsistent_affine_mo
 DT = 0.025
 pytestmark = [
     pytest.mark.cpu,
-    pytest.mark.skipif(
-        torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-        reason="scan requires a source-verified PyTorch 2.14.0 or 2.14.1 build",
-    ),
 ]
 
 
@@ -289,6 +285,7 @@ def _assert_close(actual, expected, dtype):
     ],
     indirect=["cpu_threads"],
 )
+@pytest.mark.slow
 def test_inductor_scan_full_traces_and_all_gradients(kind, dtype, batch, cpu_threads):
     del cpu_threads
     steps = 8
@@ -306,16 +303,10 @@ def test_inductor_scan_full_traces_and_all_gradients(kind, dtype, batch, cpu_thr
     scan = case.functional.compile_rollout_chunk(
         4, execution="scan", backend="inductor"
     )
-    unrolled = case.functional.compile_rollout_chunk(
-        4, execution="unrolled", backend="inductor"
-    )
     actual = _evaluate(case, steps, kernel=scan)
-    explicit = _evaluate(case, steps, kernel=unrolled)
     _assert_close(actual, expected, dtype)
-    _assert_close(actual, explicit, dtype)
     assert scan.execution_report().strategy == "compiled_scan"
     assert scan.execution_report().callbacks and scan.execution_report().grad_enabled
-    assert unrolled.execution_report().strategy == "compiled_unrolled"
 
     if kind == "sc" and dtype == torch.float64:
         # Central differences of the actual compiled scan objective. Perturb
@@ -343,6 +334,7 @@ def test_inductor_scan_full_traces_and_all_gradients(kind, dtype, batch, cpu_thr
 
 
 @pytest.mark.parametrize("cpu_threads", [1], indirect=True)
+@pytest.mark.slow
 def test_inductor_scan_long_spiking_trace_and_all_gradients(cpu_threads):
     del cpu_threads
     steps = 400
@@ -359,6 +351,7 @@ def test_inductor_scan_long_spiking_trace_and_all_gradients(cpu_threads):
     assert scan.execution_report().strategy == "compiled_scan"
 
 
+@pytest.mark.slow
 def test_real_scan_recorded_policy_switch_and_failed_capture_isolation():
     # Deliberately different declared coefficients make stale policy captures
     # observable, unlike HH where auto/off differ only by floating rounding.

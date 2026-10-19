@@ -38,6 +38,22 @@ class BoundPopulation:
     _eager_step: object
 
     def __init__(self, functional, parameters, prepared, *, compiled_chunk=None):
+        eager_step = self._validate_owner(functional, compiled_chunk)
+        functional._validate_source()
+        self._initialize(functional, parameters, prepared, compiled_chunk, eager_step)
+
+    @classmethod
+    def _from_source_validated(
+        cls, functional, parameters, prepared, *, compiled_chunk
+    ):
+        """Bind inside an owned invocation, never retain a validation token."""
+        eager_step = cls._validate_owner(functional, compiled_chunk)
+        bound = object.__new__(cls)
+        bound._initialize(functional, parameters, prepared, compiled_chunk, eager_step)
+        return bound
+
+    @staticmethod
+    def _validate_owner(functional, compiled_chunk):
         from ._compiled import CompiledPopulationChunk
         from ._population import FunctionalPopulation
 
@@ -66,7 +82,9 @@ class BoundPopulation:
                 raise FunctionalizationError(
                     "compiled chunk belongs to a different FunctionalPopulation plan"
                 )
-        functional._validate_source()
+        return eager_step
+
+    def _initialize(self, functional, parameters, prepared, compiled_chunk, eager_step):
         functional._validate_parameters(parameters)
         snapshot = dict(parameters)
         functional._validate_prepared(prepared, snapshot)

@@ -11,10 +11,7 @@ from test_runner_stimulation_clock import DT, STEPS, _case
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 
-pytestmark = pytest.mark.skipif(
-    torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-    reason="scan compatibility is validated against PyTorch 2.14.0 and 2.14.1",
-)
+pytestmark = pytest.mark.cpu
 
 
 @pytest.fixture(autouse=True)

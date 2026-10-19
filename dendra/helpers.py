@@ -6,7 +6,6 @@ import importlib
 import json
 import logging
 import os
-import re
 import time
 import warnings
 from collections.abc import Mapping
@@ -733,39 +732,28 @@ def detach_vars(obj, vars: list[str]):
 
 def allow_tf32(allow: bool = True) -> None:
     """
-    Toggle TF32 usage for matmul (cuBLAS) and cuDNN (conv/RNN).
-    - PyTorch >= 2.9: use the new fp32_precision API.
-    - 2.7.0 <= PyTorch < 2.9.0: use the legacy allow_tf32 flags.
+    Toggle TF32 for matmul and cuDNN convolution/RNN with fine-grained controls.
 
-    On non-CUDA builds this is a no-op.
+    Without a CUDA backend this is a no-op. Unavailable backend controls retain
+    their existing best-effort behavior and do not block the other controls.
     """
-    # Parse X.Y.Z from versions like "2.9.0+cu121"
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", torch.__version__)
-    ver = tuple(map(int, m.groups())) if m else (0, 0, 0)
-    use_new = ver >= (2, 9, 0)
-
     if not hasattr(torch.backends, "cuda"):  # CPU/MPS build
         return
 
-    if use_new:
-        mode = "tf32" if allow else "ieee"
-        # New fine-grained switches (don’t mix with old ones)
-        try:
-            torch.backends.cuda.matmul.fp32_precision = mode
-        except Exception:
-            pass
-        try:
-            torch.backends.cudnn.conv.fp32_precision = mode
-        except Exception:
-            pass
-        try:
-            torch.backends.cudnn.rnn.fp32_precision = mode
-        except Exception:
-            pass
-    else:
-        # Legacy flags for 2.7–2.8
-        torch.backends.cuda.matmul.allow_tf32 = bool(allow)
-        torch.backends.cudnn.allow_tf32 = bool(allow)
+    mode = "tf32" if allow else "ieee"
+    # Do not mix the fine-grained precision controls with legacy flags.
+    try:
+        torch.backends.cuda.matmul.fp32_precision = mode
+    except Exception:
+        pass
+    try:
+        torch.backends.cudnn.conv.fp32_precision = mode
+    except Exception:
+        pass
+    try:
+        torch.backends.cudnn.rnn.fp32_precision = mode
+    except Exception:
+        pass
 
 
 def ve_from_s_t(space, time, n, device, multicontact=False):

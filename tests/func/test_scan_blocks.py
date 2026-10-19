@@ -24,10 +24,7 @@ from test_scan_chunk import _assert_gradients
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 
-pytestmark = pytest.mark.skipif(
-    torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-    reason="scan compatibility is validated against PyTorch 2.14.0 and 2.14.1",
-)
+pytestmark = pytest.mark.cpu
 
 
 @pytest.fixture(autouse=True)
@@ -324,6 +321,7 @@ def test_forward_scan_graph_size_is_bounded_for_equal_remainders(monkeypatch, bl
 
 
 @pytest.mark.cpu
+@pytest.mark.slow
 def test_inductor_forward_blocks_record_every_hh_state_and_reuse_for_gradients():
     from test_scan_hh_validation import _assert_close, _case, _evaluate
 

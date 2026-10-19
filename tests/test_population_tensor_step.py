@@ -229,6 +229,52 @@ def test_tensor_step_retains_all_eight_gradients(monkeypatch, entrypoint, batch)
 
 
 @pytest.mark.parametrize("entrypoint", ["run", "longrun"])
+def test_stock_rename_cache_does_not_disable_tensor_step(monkeypatch, entrypoint):
+    # Each Referency clock proxy gets a fresh cache. A legitimate alias cached
+    # on the stock owner must not make its unchanged HH declarations look new.
+    monkeypatch.setattr(hh, "_renamed_aliases", dict(hh._renamed_aliases))
+    alias = hh.rename("tensor_step_rename_cache_probe")
+    assert hh._renamed_aliases["tensor_step_rename_cache_probe"] is alias
+    _, _, tensor_calls = _compiler(monkeypatch)
+    candidate, candidate_targets = _gradient_case(enabled=True)
+    reference, reference_targets = _gradient_case(enabled=False)
+    assert type(candidate.mech.hh).__dict__["_renamed_aliases"] == {}
+
+    with _steps(candidate) as selected:
+        actual = _execute_full(candidate, entrypoint)
+    expected = _execute_full(reference, entrypoint)
+    assert selected == [True] * 8
+    assert len(tensor_calls) == 8
+    _assert_traces_equal(actual, expected)
+    actual_gradients = torch.autograd.grad(
+        actual["v"].square().mean(), candidate_targets
+    )
+    expected_gradients = torch.autograd.grad(
+        expected["v"].square().mean(), reference_targets
+    )
+    assert len(actual_gradients) == 8
+    for observed, wanted in zip(actual_gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(observed, wanted, rtol=0, atol=0)
+        assert torch.isfinite(observed).all() and torch.count_nonzero(observed)
+    _assert_idle(candidate)
+    _assert_idle(reference)
+
+
+@pytest.mark.parametrize("cache", [None, []], ids=["missing", "non-dict"])
+def test_malformed_proxy_rename_cache_keeps_general_step(monkeypatch, cache):
+    _, _, tensor_calls = _compiler(monkeypatch)
+    candidate, _ = _model()
+    reference, _ = _model(enabled=False)
+    monkeypatch.setattr(type(candidate.mech.hh), "_renamed_aliases", cache)
+    with _steps(candidate) as selected:
+        actual = _execute_full(candidate, "run")
+    expected = _execute_full(reference, "run")
+    assert not selected and not tensor_calls
+    _assert_traces_equal(actual, expected)
+    _assert_idle(candidate)
+
+
+@pytest.mark.parametrize("entrypoint", ["run", "longrun"])
 def test_aliased_initial_gates_keep_general_execution_until_next_segment(
     monkeypatch, entrypoint
 ):

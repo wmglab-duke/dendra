@@ -6,12 +6,13 @@ Run from the repository root::
     python examples/functional_compiled_runner.py --execution scan
     python examples/functional_compiled_runner.py --execution while --threads 4
     python examples/functional_compiled_runner.py --execution scan --grad
+    python examples/functional_compiled_runner.py --grad --checkpoint-every 3
 
 Recording is selected explicitly through the callback mapping. Inductor uses
 the C++ loop wrapper by default for CPU inference. The first call
 includes compilation; reuse the runner for warm execution. ``--backend
-aot_eager`` exercises capture without native kernel generation. Scan requires
-Dendra's verified PyTorch 2.14.0 or 2.14.1 implementation. This is a usage example,
+aot_eager`` exercises capture without native kernel generation. Both modes use
+Dendra's PyTorch 2.14+ baseline and compiler-contract checks. This is a usage example,
 not a performance benchmark or a convergence demonstration.
 """
 
@@ -50,9 +51,19 @@ def main():
     )
     parser.add_argument("--threads", choices=(1, 4), type=int, default=1)
     parser.add_argument("--grad", action="store_true", help="differentiate scan twice")
+    parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        help="recompute training scan spans of this many steps during backward",
+    )
     args = parser.parse_args()
     if args.grad and args.execution != "scan":
         parser.error("--grad requires --execution scan; while is inference-only")
+    if args.checkpoint_every is not None:
+        if args.checkpoint_every < 1:
+            parser.error("--checkpoint-every must be a positive integer")
+        if not args.grad:
+            parser.error("--checkpoint-every requires --grad")
     torch.set_num_threads(args.threads)
 
     model = make_model(gradients=args.grad)
@@ -64,6 +75,7 @@ def main():
         execution=args.execution,
         callbacks={"trace": dn.func.Recorder(("v", "t"))},
         inference=not args.grad,
+        checkpoint_every=args.checkpoint_every,
         trainable=("gnabar",) if args.grad else (),
         backend=args.backend,
     )

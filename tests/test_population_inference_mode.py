@@ -70,6 +70,7 @@ def _assert_traces(actual, expected):
         torch.testing.assert_close(actual[name], expected[name], rtol=1e-11, atol=1e-10)
 
 
+@pytest.mark.slow
 def test_prewarmed_inference_full_trace_and_gradient_roundtrip():
     with torch.random.fork_rng(devices=[]):
         torch.manual_seed(1471)

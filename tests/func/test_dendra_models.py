@@ -501,6 +501,7 @@ def test_cfiber_balance_initialization_vmap_including_empty_lanes(
         assert value.shape[0] == 0
 
 
+@pytest.mark.slow
 def test_thio_balance_initialization_compile_of_jacrev_matches_eager():
     case = BALANCED_INITIALIZATION_MODEL_CASES[2]
     source = _model(case, method="pcr")
@@ -1089,6 +1090,7 @@ def _bigmrg_bptt_case(functional, tensors, ve, intra, *, compiled):
     not DENDRA_SOLVERS_AVAILABLE,
     reason="bigMRG compiled CPU BPTT requires dendra-solvers",
 )
+@pytest.mark.slow
 def test_bigmrg_compiled_chunks_match_eager_bptt():
     model = _big_mrg()
     functional, tensors = dn.func.make_functional(model, dt=DT)
@@ -1554,6 +1556,7 @@ def test_schild_explicit_batch_matches_imperative_fused_vmap_and_gradient():
     assert gradient.abs() > 0.0
 
 
+@pytest.mark.slow
 def test_schild_no_grad_compiled_rollout_uses_structured_loop_for_full_state():
     case = _ModelCase(
         "Schild1997",
@@ -1591,6 +1594,7 @@ def test_schild_no_grad_compiled_rollout_uses_structured_loop_for_full_state():
     assert len(_while_loop_nodes(graphs[0])) == 1
 
 
+@pytest.mark.slow
 def test_schild_compiled_chunks_match_eager_bptt_through_derived_workspaces():
     case = _ModelCase(
         "Schild1997",

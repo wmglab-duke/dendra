@@ -121,6 +121,38 @@ snapshots of mutable workspace inputs. This uses more time and memory than the
 ordinary fast guard. Construct ordinary tensors and use ``torch.no_grad()`` for
 the lowest-overhead inference loop.
 
+Backward-Euler voltage increments
+---------------------------------
+
+Single-compartment backward Euler, including packed independent compartments,
+assembles the physical membrane and applied-current residual before adding one
+voltage increment. The unbranched backward-Euler path likewise solves for an
+increment with the existing exact Thomas or PCR backend, then
+adds it to the old voltage. Its prepared matrix bands and row-capacitance
+normalization are unchanged; unequal adjacent capacitances still require
+different left- and right-row edge weights.
+
+This formulation cancels the capacitive old-voltage terms analytically rather
+than forming large absolute-voltage products and subtracting them numerically.
+Axial residuals use edge voltage differences before conductance multiplication;
+the old-voltage and externally applied extracellular differences remain
+separate. This improves floating-point behavior near equilibrium and for weak
+drives without changing the backward-Euler discretization or its local current
+linearization. The final addition still rounds to the model voltage dtype; it
+does not promise that every sub-ULP increment is representable.
+
+This is shared Dendra assembly, not a requirement for a fused native solver.
+Custom unbranched solver callables retain their historical absolute-voltage RHS
+contract. The SPD backend also retains legacy assembly because its optional
+pivot regularization need not solve the original matrix exactly; shifting the
+RHS could change that existing numerical policy. The optional gradient-clipped
+Thomas variant likewise retains legacy assembly: its deliberately modified
+backward rule is not an exact linear-solve adjoint, so changing the RHS
+representation could change that surrogate-gradient policy even when the
+forward solutions are mathematically equivalent.
+Membrane-current reporting and ion lifecycle hooks retain their existing
+physical-current conventions.
+
 Compiled kernels across initialization
 --------------------------------------
 
@@ -141,6 +173,40 @@ and failed workspace initialization retain their existing invalidation checks.
 Use ``clear_jit_cache()`` to discard an owner's compiled callables explicitly.
 ``pickleable(reset_global_compiler=True)`` remains an explicit request to reset
 the process-wide compiler cache; ordinary serialization does not require it.
+
+Functional compiled runner boundaries
+-------------------------------------
+
+An ordinary ``dn.func.compile(...)`` runner checks its source Population once
+per invocation. Its internal preparation, binding and scheduling share that
+invocation's source check; they still validate parameters, prepared-plan
+freshness, state, inputs and callbacks. No validation exemption survives into
+the next call. Independent public ``prepare``, ``bind`` and ``dn.func.run``
+calls retain their own source checks. Replacing the public preparation,
+binding or scheduling methods uses the fully checked public path instead.
+
+Compiled callback chunks can borrow a validated single emission internally,
+avoiding a redundant concatenation. The final public recording is still
+materialized into independent storage, including when resuming with a callback
+state. This does not change callback initialization, emitted frame counts or
+gradient propagation, and does not change imperative ``Population.run`` or
+``Population.longrun``.
+
+Functional compiler compatibility
+---------------------------------
+
+Scan and inference-only while-loop execution share Dendra's PyTorch 2.14+
+baseline. Copy scheduling and generated-wrapper allocation are left to upstream
+Inductor; Dendra does not select those performance overrides by patch version.
+Explicit compiler options and user hooks retain their ordinary compiler policy.
+
+Scan retains narrowly scoped correctness protection for joint-graph capture and
+backward subgraph ownership. These checks validate the required compiler
+contract rather than selecting a feature menu from the PyTorch patch number.
+An incompatible correctness contract raises a descriptive error; it does not
+silently substitute a horizon-unrolled simulation. Numerical math, public
+recording-storage ownership and imperative ``Population.run``/``longrun`` are
+unchanged.
 
 Reinitializing the correct owner
 --------------------------------

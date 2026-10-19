@@ -22,10 +22,6 @@ from dendra.func._population import FunctionalPopulation
 
 pytestmark = [
     pytest.mark.cpu,
-    pytest.mark.skipif(
-        torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-        reason="functional scan is audited for PyTorch 2.14.0 and 2.14.1",
-    ),
 ]
 
 

@@ -3,7 +3,9 @@
 The reference disables only direct coefficient eligibility. It retains the same
 HH state updater, original current evaluator, and solver's exact legacy current
 arithmetic. Thus these tests isolate assembly, not the separate HH rate rewrite.
-No historical timing or performance assertion belongs in this suite.
+Broad compiler coverage uses bounded scan graphs; one short-chunk smoke retains
+unrolled compatibility over the same full trajectory and gradient targets. No
+historical timing or performance assertion belongs in this suite.
 """
 
 from __future__ import annotations
@@ -217,7 +219,16 @@ def _initial_state(state, initial):
     return state
 
 
-def _evaluate(kind, dtype, mode, *, gradients=True, backend=None):
+def _evaluate(
+    kind,
+    dtype,
+    mode,
+    *,
+    gradients=True,
+    backend=None,
+    execution="scan",
+    chunk_steps=4,
+):
     model = _model(kind, dtype)
     # This eager discriminator prevents a silently inactive direct branch from
     # making both sides of the numerical test use the legacy evaluator.
@@ -272,7 +283,9 @@ def _evaluate(kind, dtype, mode, *, gradients=True, backend=None):
             kernel = None
             if mode == "chunk":
                 kernel = functional.compile_rollout_chunk(
-                    4, execution="unrolled", backend=backend or "aot_eager"
+                    chunk_steps,
+                    execution=execution,
+                    backend=backend or "aot_eager",
                 )
             elif mode == "while":
                 kernel = functional.compile_rollout_chunk(4, backend=backend or "eager")
@@ -288,9 +301,20 @@ def _evaluate(kind, dtype, mode, *, gradients=True, backend=None):
             )
             trace = auxiliary["callbacks"]["trace"]["v"]
             if mode == "while":
-                assert kernel.execution_report().strategy == "compiled_while_loop"
+                report = kernel.execution_report()
+                assert report.requested_execution == "default"
+                assert report.strategy == "compiled_while_loop"
             if mode == "chunk":
-                assert kernel.execution_report().strategy == "compiled_unrolled"
+                report = kernel.execution_report()
+                assert report.requested_execution == execution
+                expected_strategy = {
+                    "scan": "compiled_scan",
+                    "unrolled": "compiled_unrolled",
+                }[execution]
+                assert report.strategy == expected_strategy
+                assert report.steps == chunk_steps
+                assert report.callbacks
+                assert report.grad_enabled == gradients
         assert trace.shape == (STEPS + 1, *model.shape)
         loss = _loss(trace)
         grads = torch.autograd.grad(loss, targets) if gradients else ()
@@ -341,7 +365,17 @@ def _patch_eligibility(patch, method, *, require_direct_dtype=False):
         )
 
 
-def _compare(monkeypatch, kind, dtype, mode, *, gradients=True, backend=None):
+def _compare(
+    monkeypatch,
+    kind,
+    dtype,
+    mode,
+    *,
+    gradients=True,
+    backend=None,
+    execution="scan",
+    chunk_steps=4,
+):
     eligible = MechanismHandler._can_evaluate_direct_membrane_frame
 
     def require_direct(handler):
@@ -354,13 +388,25 @@ def _compare(monkeypatch, kind, dtype, mode, *, gradients=True, backend=None):
     with monkeypatch.context() as patch:
         _patch_eligibility(patch, require_direct, require_direct_dtype=True)
         direct, used = _evaluate(
-            kind, dtype, mode, gradients=gradients, backend=backend
+            kind,
+            dtype,
+            mode,
+            gradients=gradients,
+            backend=backend,
+            execution=execution,
+            chunk_steps=chunk_steps,
         )
     assert used, f"direct membrane frame inactive for {kind}"
     with monkeypatch.context() as patch:
         _patch_eligibility(patch, lambda self: False)
         legacy, used = _evaluate(
-            kind, dtype, mode, gradients=gradients, backend=backend
+            kind,
+            dtype,
+            mode,
+            gradients=gradients,
+            backend=backend,
+            execution=execution,
+            chunk_steps=chunk_steps,
         )
         assert not used
     _assert_close(direct, legacy, dtype)
@@ -375,8 +421,9 @@ def test_all_implicit_integrators_match_legacy_full_trace_state_and_gradients(
     _compare(monkeypatch, kind, dtype, mode)
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("kind", KINDS)
-def test_compiled_chunk_backward_matches_legacy(monkeypatch, kind):
+def test_compiled_scan_backward_matches_legacy(monkeypatch, kind):
     _compare(monkeypatch, kind, torch.float64, "chunk")
 
 
@@ -386,12 +433,15 @@ def test_compiled_while_full_recorder_matches_legacy(monkeypatch, kind):
 
 
 @pytest.mark.parametrize("kind", ("ub_pcr", "dhs", "block_dhs"))
-@pytest.mark.parametrize("mode", ("population", "chunk", "while"))
+@pytest.mark.parametrize(
+    "mode", ("population", pytest.param("chunk", marks=pytest.mark.slow), "while")
+)
 def test_four_worker_forward_and_backward_match_legacy(monkeypatch, kind, mode):
     torch.set_num_threads(4)
     _compare(monkeypatch, kind, torch.float64, mode, gradients=mode != "while")
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("workers", (1, 4))
 @pytest.mark.parametrize("kind", ("sc", "dhs", "block_dhs"))
 @pytest.mark.parametrize("mode", ("chunk", "while"))
@@ -405,6 +455,20 @@ def test_inductor_generated_numeric_paths(monkeypatch, workers, kind, mode):
         mode,
         gradients=mode != "while",
         backend="inductor",
+    )
+
+
+@pytest.mark.slow
+def test_inductor_unrolled_smoke_matches_legacy(monkeypatch):
+    """Retain genuine repeated-body codegen with the smallest unrolled graph."""
+    _compare(
+        monkeypatch,
+        "dhs",
+        torch.float32,
+        "chunk",
+        backend="inductor",
+        execution="unrolled",
+        chunk_steps=2,
     )
 
 

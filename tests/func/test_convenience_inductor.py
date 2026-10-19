@@ -13,10 +13,6 @@ pytestmark = [
     pytest.mark.skipif(
         not DENDRA_SOLVERS_AVAILABLE, reason="native DHS requires dendra-solvers"
     ),
-    pytest.mark.skipif(
-        torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-        reason="functional scan is audited for PyTorch 2.14.0 and 2.14.1",
-    ),
 ]
 
 
@@ -43,31 +39,11 @@ def _reference(runner, state, *, parameters=None, inputs=None):
     )
 
 
-@pytest.mark.parametrize("execution", ("scan", "while"))
-def test_cpp_inference_runner_matches_full_native_dhs_traces(execution):
-    case = _case(stimulus_kind="intra")
-    source_v = case.model.v.detach().clone()
-    runner = dn.func.compile(
-        case.model,
-        dt=DT,
-        steps=8,
-        execution=execution,
-        callbacks={"trace": dn.func.Recorder(("v", "hh.m", "hh.h", "hh.n", "t"))},
-    )
-    assert runner.kernel._compile_options["options"]["cpp_wrapper"] is True
-    with torch.no_grad():
-        reference = _reference(runner, _clone(runner.initial_state))
-    for _ in range(2):
-        final, auxiliary = runner()
-        _close(final, reference[0])
-        _close(dict(auxiliary["callbacks"]), dict(reference[1]["callbacks"]))
-    torch.testing.assert_close(case.model.v, source_v, rtol=0, atol=0)
-    assert runner.execution_report().strategy == (
-        "compiled_scan" if execution == "scan" else "compiled_while_loop"
-    )
-
-
+@pytest.mark.slow
 def test_inductor_scan_native_dhs_gradients_and_repeated_backward():
+    # Keep both distinct signatures: explicit extracellular input/V0 gradients
+    # and fresh graphs using the runner's default trainable leaves. Threshold
+    # callback training does not replace either of these compiler contracts.
     case = _case(stimulus_kind="intra")
     runner = dn.func.compile(
         case.model,

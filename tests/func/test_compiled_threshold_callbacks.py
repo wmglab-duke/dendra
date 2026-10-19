@@ -21,10 +21,6 @@ from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE
 
 pytestmark = [
     pytest.mark.cpu,
-    pytest.mark.skipif(
-        torch.__version__.split("+")[0] not in ("2.14.0", "2.14.1"),
-        reason="functional scan is audited for PyTorch 2.14.0 and 2.14.1",
-    ),
 ]
 
 TRACE = ("v", "hh.m", "hh.h", "hh.n", "t")
@@ -451,30 +447,60 @@ def test_callback_mapping_validation_and_trace_name_is_ordinary():
 @pytest.mark.skipif(
     not DENDRA_SOLVERS_AVAILABLE, reason="native DHS requires dendra-solvers"
 )
-@pytest.mark.parametrize("threads", (1, 4))
-@pytest.mark.parametrize("execution", ("scan", "while"))
-def test_inductor_native_dhs_mixed_threshold_callbacks(threads, execution):
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("execution", "threads", "steps"),
+    [
+        pytest.param("scan", 1, 8, id="scan-t1-no-tail"),
+        pytest.param("scan", 4, 9, id="scan-t4-tail"),
+        pytest.param("while", 1, 9, id="while-t1-tail"),
+        pytest.param("while", 4, 8, id="while-t4-no-tail"),
+    ],
+)
+def test_inductor_native_dhs_mixed_threshold_callbacks(execution, threads, steps):
+    # Pair modes, thread counts and tail branches orthogonally: each executor
+    # runs on one/four threads and with/without a tail, without duplicating the
+    # same native compile in a separate plain-Recorder convenience test.
     previous = torch.get_num_threads()
     torch.set_num_threads(threads)
     try:
         case = _case(stimulus_kind="intra")
+        source = _clone_state((case.model.v, case.model.t))
         runner = dn.func.compile(
             case.model,
             dt=DT,
-            steps=9,
+            steps=steps,
             execution=execution,
             callbacks={"trace": dn.func.Recorder(TRACE), **_thresholds()},
+        )
+        originals = _clone_state(
+            (runner.initial_state, dict(runner.parameters), dict(runner.constants))
         )
         with torch.no_grad():
             expected = _eager(
                 runner,
                 runner.initial_state,
-                steps=9,
+                steps=steps,
                 specifications={"trace": dn.func.Recorder(TRACE), **_thresholds()},
             )
         actual = runner()
+        saved = _clone_state((actual[0], dict(actual[1]["callbacks"])))
+        repeated = runner()
         _close_result(actual, expected)
+        _close_result(repeated, expected)
         _assert_reductions(actual[1]["callbacks"])
+        _assert_reductions(repeated[1]["callbacks"])
+        _assert_tree_close(
+            (actual[0], dict(actual[1]["callbacks"])), saved, rtol=0, atol=0
+        )
+        _assert_tree_close(
+            (runner.initial_state, dict(runner.parameters), dict(runner.constants)),
+            originals,
+            rtol=0,
+            atol=0,
+        )
+        _assert_tree_close((case.model.v, case.model.t), source, rtol=0, atol=0)
+        assert actual[1]["callbacks"]["trace"]["v"].shape[0] == steps + 1
         assert runner.kernel._compile_options["options"]["cpp_wrapper"] is True
         assert runner.execution_report().strategy == (
             "compiled_scan" if execution == "scan" else "compiled_while_loop"
@@ -486,6 +512,7 @@ def test_inductor_native_dhs_mixed_threshold_callbacks(threads, execution):
 @pytest.mark.skipif(
     not DENDRA_SOLVERS_AVAILABLE, reason="native DHS requires dendra-solvers"
 )
+@pytest.mark.slow
 @pytest.mark.parametrize("threads", (1, 4))
 def test_inductor_native_dhs_threshold_scan_gradients(threads):
     previous = torch.get_num_threads()

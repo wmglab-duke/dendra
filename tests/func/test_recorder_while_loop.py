@@ -15,10 +15,6 @@ DT = 0.01
 pytestmark = [
     pytest.mark.cpu,
     pytest.mark.skipif(
-        tuple(int(part) for part in torch.__version__.split(".")[:2]) < (2, 14),
-        reason="recorded inference loops require PyTorch 2.14 or newer",
-    ),
-    pytest.mark.skipif(
         not DENDRA_SOLVERS_AVAILABLE,
         reason="branched Tree CPU execution requires dendra-solvers",
     ),
@@ -90,9 +86,9 @@ def case():
 
 def _clone(tree):
     return torch.utils._pytree.tree_map(
-        lambda value: value.detach().clone()
-        if isinstance(value, torch.Tensor)
-        else value,
+        lambda value: (
+            value.detach().clone() if isinstance(value, torch.Tensor) else value
+        ),
         tree,
     )
 

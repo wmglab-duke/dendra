@@ -7,12 +7,15 @@ This module is imported only when a caller requests scan execution.
 
 from __future__ import annotations
 
+from functools import wraps
+
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callbacks import _update_callback_values
+from ._carry_packing import _PackedCarryLayout
 from ._scan_autograd import guard_scan_outputs
 from ._scan_compat import install_scan_compatibility
 from ._scan_inductor import _compile_scan
@@ -80,10 +83,24 @@ class _CompiledScanPopulationChunk:
         plans = self._plans
         steps = self._steps
         stepwise = self._stepwise
+        phase_emissions = (
+            not grad_enabled
+            and block > 1
+            and plans is not None
+            and functional.device.type == "cpu"
+        )
         state = functional._clone_state_tree(state)
         parameters, prepared, state, ve, intra, carries = _detach(
             (parameters, prepared, state, ve, intra, carries)
         )
+        packed_training = block == 1 and grad_enabled
+        layout = (
+            _PackedCarryLayout.from_tree((state, carries)) if packed_training else None
+        )
+        if packed_training:
+            # Capture the same private contiguous views used inside the HOP,
+            # including when a caller supplies strided callback carry leaves.
+            state, carries = layout.unpack(layout.pack((state, carries)))
 
         # Atomic rollout samples a bound waveform on start + arange * dt;
         # host runners sample it at each accepted, repeatedly added clock.
@@ -137,12 +154,17 @@ class _CompiledScanPopulationChunk:
                 carries, emitted = _update_callback_values(
                     plans, carries, next_state, auxiliary
                 )
+            if packed_training:
+                # The terminal pack in combine owns carry storage separately
+                # from AD's saved state intermediates. Keep emission ownership
+                # identical to the established single-step training path.
+                return (next_state, carries), _clone(emitted or {})
             if block == 1:
-                # Keep training's established body and partition boundaries.
+                # Keep the established single-step body/partition boundaries.
                 # Unchanged clocks, reducers and Recorder views must not alias
                 # the incoming carry or another output of the scan body.
                 return _clone((next_state, carries)), _clone(emitted or {})
-            # Intermediate steps within a block are ordinary pure transitions;
+            # Intermediate inference steps are ordinary pure transitions;
             # scan's non-aliasing contract applies at the block boundary.
             return (next_state, carries), emitted or {}
 
@@ -161,6 +183,23 @@ class _CompiledScanPopulationChunk:
                     steps, dtype=torch.int64, device=functional.device
                 )
 
+            if packed_training:
+
+                def combine(packed, sample):
+                    state, carries = layout.unpack(packed)
+                    updated, emitted = graph(
+                        parameters, prepared, state, carries, sample
+                    )
+                    return layout.pack(updated), emitted
+
+                packed, emitted = scan(
+                    combine,
+                    layout.pack((functional._clone_state_tree(state), carries)),
+                    samples,
+                )
+                if plans is None:
+                    return packed
+                return packed, {plan.name: emitted.get(plan.name) for plan in plans}
             if block == 1:
 
                 def combine(carry, sample):
@@ -185,6 +224,20 @@ class _CompiledScanPopulationChunk:
                     # Each stack owns its storage, including when callbacks
                     # emit state views or the same Tensor in several leaves.
                     # Carry clones also separate unchanged reducers/clocks.
+                    if phase_emissions:
+                        # The extra singleton step axis separates recording
+                        # output metadata from identical final-carry values.
+                        # Copy each accepted frame, not a four-frame block.
+                        phases = tuple(
+                            pytree.tree_map(
+                                lambda value: value.unsqueeze(0).clone(
+                                    memory_format=torch.contiguous_format
+                                ),
+                                emission,
+                            )
+                            for emission in emissions
+                        )
+                        return _clone(carry), phases
                     return _clone(carry), _stack_steps(emissions)
 
                 blocked_samples = pytree.tree_map(
@@ -194,7 +247,10 @@ class _CompiledScanPopulationChunk:
                     samples,
                 )
                 carry, emitted = scan(combine, carry, blocked_samples)
-                emitted = pytree.tree_map(lambda value: value.flatten(0, 1), emitted)
+                if not phase_emissions:
+                    emitted = pytree.tree_map(
+                        lambda value: value.flatten(0, 1), emitted
+                    )
 
                 # At most block-1 authored steps. Short horizons reduce the
                 # effective block width before capture, retaining a real scan.
@@ -205,12 +261,15 @@ class _CompiledScanPopulationChunk:
                     tail.append(emission)
                 if tail:
                     tail = _stack_steps(tail)
-                    emitted = pytree.tree_map(
-                        lambda prefix, suffix: torch.cat((prefix, suffix), dim=0),
-                        emitted,
-                        tail,
-                    )
+                    if not phase_emissions:
+                        emitted = pytree.tree_map(
+                            lambda prefix, suffix: torch.cat((prefix, suffix), dim=0),
+                            emitted,
+                            tail,
+                        )
                     carry = _clone(carry)
+                elif phase_emissions:
+                    tail = None
                 final, updated = carry
             # Scan's AD wrapper marks every floating output differentiable.
             # Timesteps never change host scheduling carry, which must remain
@@ -219,6 +278,8 @@ class _CompiledScanPopulationChunk:
                 "duration_remainder"
             ].clone()
             auxiliary = {"v": final["integrator"]["v"]}
+            if phase_emissions:
+                return final, updated, emitted, tail
             if plans is None:
                 return final, auxiliary
             return (
@@ -228,11 +289,55 @@ class _CompiledScanPopulationChunk:
                 {plan.name: emitted.get(plan.name) for plan in plans},
             )
 
-        return _compile_scan(
+        compiled = _compile_scan(
             execute,
             self._options,
             prefer_cpp_wrapper=not grad_enabled and functional.device.type == "cpu",
         )
+        if not packed_training and not phase_emissions:
+            return compiled
+
+        @wraps(compiled)
+        def materialize(parameters, prepared, state, ve, intra, carries):
+            result = compiled(parameters, prepared, state, ve, intra, carries)
+            if phase_emissions:
+                final, updated, phases, tail = result
+                # Each phase history is (blocks, 1, *sample_shape). Interleave
+                # once outside the hot compiled loop, in accepted-clock order.
+                emitted = pytree.tree_map(
+                    lambda *values: torch.cat(values, dim=1).flatten(0, 1), *phases
+                )
+                if tail is not None:
+                    emitted = pytree.tree_map(
+                        lambda prefix, suffix: torch.cat((prefix, suffix), dim=0),
+                        emitted,
+                        tail,
+                    )
+                return (
+                    final,
+                    {"v": final["integrator"]["v"]},
+                    updated,
+                    {plan.name: emitted.get(plan.name) for plan in plans},
+                )
+            if plans is None:
+                packed, emitted = result, None
+            else:
+                packed, emitted = result
+            final, updated = layout.unpack(packed)
+            # Private views must not escape as public sibling aliases. Keep
+            # these clones outside compilation so equivalent logical leaves
+            # cannot become duplicate moved C++ HOP output handles.
+            final = functional._clone_state_tree(final)
+            updated = _clone(updated)
+            final["control"]["duration_remainder"] = state["control"][
+                "duration_remainder"
+            ].clone()
+            auxiliary = {"v": final["integrator"]["v"]}
+            if plans is None:
+                return final, auxiliary
+            return final, auxiliary, updated, emitted
+
+        return materialize
 
     def __call__(self, parameters, prepared, state, ve, intra, carries=None):
         grad_enabled = torch.is_grad_enabled()

@@ -931,7 +931,14 @@ def _stack_emissions(values, schema, *, label: str):
     return torch.utils._pytree.tree_unflatten(stacked, schema.spec)
 
 
-def _concatenate_emissions(parts, schema, *, label: str):
+def _concatenate_emissions(parts, schema, *, label: str, borrow_single=False):
+    """Validate stacked emissions and optionally borrow one internal part.
+
+    The host's final assembly must keep the default copying behavior: callback
+    results must not expose a compiled chunk's storage or an earlier result's
+    emissions. Only an intermediate assembly that is subsequently materialized
+    by the host may opt into borrowing. Schema checks are identical either way.
+    """
     if not parts:
         return None if schema is None else _empty_emissions(schema)
     parts = [part for part in parts if part is not None]
@@ -941,6 +948,11 @@ def _concatenate_emissions(parts, schema, *, label: str):
         first_leaves, spec = torch.utils._pytree.tree_flatten(parts[0])
         if not first_leaves:
             raise FunctionalizationError(f"{label} must contain at least one Tensor")
+        for index, leaf in enumerate(first_leaves):
+            if not torch.is_tensor(leaf) or leaf.ndim < 1:
+                raise FunctionalizationError(
+                    f"{label} stacked leaf {index} must be a Tensor with a sample axis"
+                )
         expected_leaves = tuple(
             _TensorLeafSchema(
                 shape=tuple(leaf.shape),
@@ -982,6 +994,8 @@ def _concatenate_emissions(parts, schema, *, label: str):
                     "or trailing shape"
                 )
         flattened.append(leaves)
+    if borrow_single and len(parts) == 1:
+        return parts[0]
     concatenated = [
         torch.cat([leaves[index] for leaves in flattened], dim=0)
         for index in range(len(expected_leaves))
@@ -1364,12 +1378,13 @@ class FunctionalCallbacks:
                     )
         return state
 
-    def _concatenate(self, parts):
+    def _concatenate(self, parts, *, borrow_single=False):
         return {
             plan.name: _concatenate_emissions(
                 [part[plan.name] for part in parts],
                 plan.emission_schema,
                 label=f"functional callback {plan.name!r} emission",
+                borrow_single=borrow_single,
             )
             for plan in self._plans
         }

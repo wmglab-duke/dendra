@@ -9,6 +9,8 @@ Shared utility functions and their existing callers are never replaced.
 Joint capture also keeps fake backward on one autograd thread. Mixed CPU/CUDA
 operands otherwise let engine workers share a FakeTensorMode whose kernel flag
 is not thread-local, racing with the dispatch state on those worker threads.
+Disposable capture saves are isolated from caller activation-checkpoint hooks;
+those hooks must observe real execution, not replay while tracing fake backward.
 
 Discrete operands retain their values during joint materialization. Torch's
 shared helper substitutes uninitialized storage for integer inputs; without a
@@ -21,108 +23,140 @@ Importing this module performs no activation and imports no private Torch HOP.
 
 from __future__ import annotations
 
-import hashlib
+import dis
 import importlib
 import inspect
 import threading
 from functools import update_wrapper
-from pathlib import Path
-from types import FunctionType
+from types import CodeType, FunctionType, SimpleNamespace
 
 import torch
 
+from dendra._bootstrap import torch_compiler_warning_context
+
 from ._types import FunctionalizationError
 
-# These releases have byte-identical audited HOP/AOT sources and callables.
-# Admitting another release requires auditing both the hashes below and the
-# positional-cotangent repair; the release number alone is never sufficient.
-_SUPPORTED_VERSIONS = ("2.14.0", "2.14.1")
-_SOURCE_HASHES = {
-    "torch._higher_order_ops.utils": (
-        "00b426146c9974b8c536703914fa0d4773070ee259b2b05cebd988c43f0c39d8"
-    ),
-    "torch._higher_order_ops.partitioner": (
-        "04da0de4820305b54a679335ec13934942b4f444ed791e0b738ef34b4b7584ea"
-    ),
-    "torch._functorch._aot_autograd.graph_capture_wrappers": (
-        "229d5d5575539f27b199d835d18314e14e99e98c4755d46724dedbb12683d8c8"
-    ),
-    "torch._higher_order_ops.scan": (
-        "6bb980d8ceecf0455a6f45400105fc1d3e524c6c7c1f93af7543aea6ad92d87b"
-    ),
-}
-_FUNCTION_HASHES = {
-    ("torch._higher_order_ops.utils", "create_bw_fn"): (
-        "06d2246919c415d678de23a62ce7bebf027b06d261986f72eb6c9fceac035c04"
-    ),
-    (
-        "torch._higher_order_ops.utils",
-        "prepare_fw_with_masks_all_requires_grad",
-    ): "0f86a3004800d832293a7943b1d74237e47e644b2ca59d0772a87129707335e2",
-    ("torch._higher_order_ops.utils", "_clone_aliasing_output"): (
-        "2008efe666f59d0595914684cf4a00b43c389aa849a529bed56b7c6640b8257f"
-    ),
-    ("torch._higher_order_ops.utils", "_from_fun"): (
-        "0d403226dcf80abb191b9ebc7fdc64acf77f555426a5713b1fecf4bb04dc9e59"
-    ),
-    ("torch._higher_order_ops.utils", "materialize_as_graph"): (
-        "030c9096f180e05ee232106ca661a4347a10c34ba8fee2350ee657537e5216f3"
-    ),
-    ("torch._higher_order_ops.partitioner", "create_hop_joint_graph"): (
-        "b408b50d910adcc5864d73925a4b56034e5be264c5b4417c9e355529e6733cd9"
-    ),
-    (
-        "torch._functorch._aot_autograd.graph_capture_wrappers",
-        "create_joint",
-    ): "317f67a953b4f6260f0daed8c9270c8d194d1b73939ea20553d1dfb6e4c19846",
-    ("torch._higher_order_ops.scan", "scan_autograd"): (
-        "6697a243af15ecfd7a01cc1ae85c25817fc27e6b5f9781b95b57040f50d1517a"
-    ),
-}
 _INSTALL_LOCK = threading.Lock()
 _INSTALLED = None
+_INDUCTOR_LOCK = threading.Lock()
+_INDUCTOR_CONTRACT = None
 
 
 def _unsupported(details):
     return FunctionalizationError(
-        "Dendra scan execution requires the verified PyTorch 2.14.0 or 2.14.1 "
-        f"implementations; {details}. Use the default compiled execution or "
-        "a supported Torch installation."
+        "Dendra scan execution cannot establish the required PyTorch compiler "
+        f"correctness contract: {details}. The selected scan is not replaced "
+        "with an unrolled execution."
     )
 
 
-def _validate_sources():
-    modules = {}
-    for name, expected in _SOURCE_HASHES.items():
+def _owned_callable(module, owner, name, *, args=None, kwargs=None):
+    """Check an owned Python call seam, not a release or source fingerprint."""
+    function = getattr(owner, name, None)
+    if (
+        not isinstance(function, FunctionType)
+        or function.__globals__ is not module.__dict__
+        or function.__module__ != module.__name__
+    ):
+        raise _unsupported(f"{owner.__name__}.{name} has already been replaced")
+    if args is not None:
         try:
-            module = importlib.import_module(name)
-            source = Path(inspect.getsourcefile(module)).read_bytes()
-        except (ImportError, OSError, TypeError) as error:
-            raise _unsupported(f"cannot inspect {name}: {error}") from error
-        actual = hashlib.sha256(source).hexdigest()
-        if actual != expected:
-            raise _unsupported(f"source fingerprint differs for {name}")
-        modules[name] = module
+            inspect.signature(function).bind(*args, **(kwargs or {}))
+        except (TypeError, ValueError) as error:
+            raise _unsupported(
+                f"{owner.__name__}.{name} has an incompatible signature"
+            ) from error
+    return function
 
-    references = []
-    for (name, attribute), expected in _FUNCTION_HASHES.items():
-        module = modules[name]
-        function = getattr(module, attribute, None)
-        if (
-            not isinstance(function, FunctionType)
-            or function.__globals__ is not module.__dict__
+
+def _loads_global(function, name):
+    pending = [function.__code__]
+    while pending:
+        code = pending.pop()
+        if any(
+            instruction.opname == "LOAD_GLOBAL" and instruction.argval == name
+            for instruction in dis.get_instructions(code)
         ):
-            raise _unsupported(f"{name}.{attribute} has already been replaced")
-        try:
-            actual = hashlib.sha256(inspect.getsource(function).encode()).hexdigest()
-        except (OSError, TypeError) as error:
-            raise _unsupported(f"cannot inspect {name}.{attribute}") from error
-        if actual != expected:
-            raise _unsupported(f"callable fingerprint differs for {name}.{attribute}")
-        references.append((module, attribute, function))
+            return True
+        pending.extend(value for value in code.co_consts if isinstance(value, CodeType))
+    return False
+
+
+def _check_references(references):
+    for owner, name, original in references:
+        if getattr(owner, name, None) is not original:
+            raise _unsupported(f"the active helper {owner.__name__}.{name} changed")
+
+
+def _validate_scan_contract():
+    names = (
+        "torch._higher_order_ops.utils",
+        "torch._higher_order_ops.partitioner",
+        "torch._functorch._aot_autograd.graph_capture_wrappers",
+        "torch._higher_order_ops.scan",
+    )
+    try:
+        modules = {name: importlib.import_module(name) for name in names}
+        aot = importlib.import_module("torch._functorch.aot_autograd")
+    except ImportError as error:
+        raise _unsupported(
+            f"required scan/AOT interface is unavailable: {error}"
+        ) from error
 
     utils = modules["torch._higher_order_ops.utils"]
     partitioner = modules["torch._higher_order_ops.partitioner"]
+    wrappers = modules["torch._functorch._aot_autograd.graph_capture_wrappers"]
+    scan = modules["torch._higher_order_ops.scan"]
+    placeholder = object()
+    functions = (
+        (utils, "create_bw_fn", (placeholder, ()), {"return_fw_outputs": True}),
+        (utils, "prepare_fw_with_masks_all_requires_grad", (placeholder,), {}),
+        (utils, "_clone_aliasing_output", ((), ()), {}),
+        (utils, "_from_fun", (placeholder,), {}),
+        (utils, "materialize_as_graph", (placeholder, ()), {"force_enable_grad": True}),
+        (
+            partitioner,
+            "create_hop_joint_graph",
+            (placeholder, ()),
+            {"functionalize": True},
+        ),
+        (wrappers, "create_joint", (placeholder,), {"aot_config": placeholder}),
+        (scan, "scan_autograd", (placeholder, (), (), ()), {}),
+    )
+    references = []
+    for module, name, args, kwargs in functions:
+        function = _owned_callable(module, module, name, args=args, kwargs=kwargs)
+        references.append((module, name, function))
+    partitioner_type = getattr(partitioner, "HopGraphMinCutPartitioner", None)
+    if (
+        not isinstance(partitioner_type, type)
+        or partitioner_type.__module__ != partitioner.__name__
+        or getattr(scan, "HopGraphMinCutPartitioner", None) is not partitioner_type
+    ):
+        raise _unsupported("scan no longer uses the expected joint-graph partitioner")
+    partition = _owned_callable(
+        partitioner,
+        partitioner_type,
+        "create_partitioned_graph",
+        args=(placeholder, ()),
+    )
+    if not _loads_global(partition, "create_hop_joint_graph"):
+        raise _unsupported("the partitioner no longer uses the joint-graph entry point")
+    references.extend(
+        (
+            (partitioner, "HopGraphMinCutPartitioner", partitioner_type),
+            (scan, "HopGraphMinCutPartitioner", partitioner_type),
+            (partitioner_type, "create_partitioned_graph", partition),
+        )
+    )
+    for function, globals_needed in (
+        (partitioner.create_hop_joint_graph, ("create_bw_fn", "materialize_as_graph")),
+        (utils.materialize_as_graph, ("_from_fun",)),
+    ):
+        if not all(_loads_global(function, name) for name in globals_needed):
+            raise _unsupported(
+                f"{function.__name__} no longer exposes the required helper seams"
+            )
     if partitioner.create_bw_fn is not utils.create_bw_fn:
         raise _unsupported("the partitioner's backward helper has already changed")
     references.append((partitioner, "create_bw_fn", partitioner.create_bw_fn))
@@ -131,13 +165,177 @@ def _validate_sources():
     references.append(
         (partitioner, "materialize_as_graph", partitioner.materialize_as_graph)
     )
-    # The implementation below uses exactly this AOT constructor/entry point.
-    aot = importlib.import_module("torch._functorch.aot_autograd")
-    wrappers = modules["torch._functorch._aot_autograd.graph_capture_wrappers"]
     if aot.create_joint is not wrappers.create_joint:
         raise _unsupported("the AOT joint entry point has already changed")
     references.append((aot, "create_joint", aot.create_joint))
+    if not isinstance(getattr(utils, "FunctionalTensor", None), type):
+        raise _unsupported("functional-tensor unwrapping is unavailable")
+    references.append((utils, "FunctionalTensor", utils.FunctionalTensor))
+    config = getattr(aot, "AOTConfig", None)
+    try:
+        inspect.signature(config).bind(
+            fw_compiler=None,
+            bw_compiler=None,
+            partition_fn=None,
+            decompositions={},
+            num_params_buffers=0,
+            aot_id=0,
+            keep_inference_input_mutations=False,
+        )
+    except (TypeError, ValueError) as error:
+        raise _unsupported(
+            "AOTConfig cannot express the required joint capture"
+        ) from error
+    references.append((aot, "AOTConfig", config))
     return modules, tuple(references), aot.AOTConfig, aot.create_joint
+
+
+def _probe_scan_contract(entry):
+    """Qualify the private adapter once, before any process-wide assignment.
+
+    This tiny CPU joint capture tests interleaved cotangent slots, integer
+    index values, Boolean values, gradients and storage independence. It does
+    not compile a simulation or select a release-specific implementation.
+    """
+    try:
+        with (
+            torch.utils._python_dispatch._disable_current_modes(),
+            torch._C._DisableFuncTorch(),
+            torch.inference_mode(False),
+            torch.enable_grad(),
+            torch.autocast("cpu", enabled=False),
+            torch.autograd.set_multithreading_enabled(False),
+            torch_compiler_warning_context(),
+        ):
+            x = torch.tensor(
+                [0.2, -0.4], dtype=torch.float64, device="cpu", requires_grad=True
+            )
+            y = torch.tensor(
+                [0.7, 0.9], dtype=torch.float64, device="cpu", requires_grad=True
+            )
+            index = torch.tensor([1, 0], dtype=torch.int64, device="cpu")
+            flag = torch.tensor([True, False], device="cpu")
+            primals = (x, y, index, flag)
+
+            def forward(x, y, index, flag):
+                return index + 1, x.square() + y.index_select(0, index), ~flag, x * y
+
+            outputs = forward(*primals)
+            tangents = (
+                torch.zeros_like(index),
+                torch.tensor([1.3, -0.6], dtype=x.dtype, device="cpu"),
+                torch.zeros_like(flag),
+                torch.tensor([-0.4, 0.8], dtype=x.dtype, device="cpu"),
+            )
+            joint = entry(forward, primals, functionalize=True)
+            if joint.n_primals != 4 or joint.n_fw_outputs != 4 or joint.n_tangents != 4:
+                raise AssertionError("The joint graph lost positional tensor slots")
+            result = tuple(joint.joint_gm(*primals, *tangents))
+            gradients = (
+                2 * x * tangents[1] + y * tangents[3],
+                tangents[1].flip(0) + x * tangents[3],
+                torch.zeros_like(index),
+                torch.zeros_like(flag),
+            )
+            torch.testing.assert_close(
+                result, (*outputs, *gradients), rtol=1e-12, atol=1e-12
+            )
+            for offset, value in enumerate(result):
+                others = (*primals, *tangents, *result[:offset])
+                if any(torch._C._is_alias_of(value, other) for other in others):
+                    raise AssertionError(
+                        "The joint graph returned aliased output storage"
+                    )
+    except Exception as error:
+        raise _unsupported(
+            f"the mixed-output joint behavior probe failed: {error}"
+        ) from error
+
+
+def validate_inductor_scan_contract():
+    """Validate input-ownership protection, independent of a Torch patch label.
+
+    The reusable-buffer protocol is qualified once. Subsequent calls check
+    saved callable/class identities only. Actual graph fields are checked by
+    the guard before it mutates that graph's input-protection set.
+    """
+    global _INDUCTOR_CONTRACT
+
+    with _INDUCTOR_LOCK:
+        if _INDUCTOR_CONTRACT is not None:
+            _check_references(_INDUCTOR_CONTRACT)
+            return
+        try:
+            graph = importlib.import_module("torch._inductor.graph")
+            scheduler = importlib.import_module("torch._inductor.scheduler")
+            wrapper = importlib.import_module("torch._inductor.codegen.wrapper")
+            virtualized = importlib.import_module("torch._inductor.virtualized")
+            owners = (
+                (graph, "GraphLowering"),
+                (graph, "SubgraphLowering"),
+                (scheduler, "BaseSchedulerNode"),
+                (wrapper, "PythonWrapperCodegen"),
+            )
+            references = []
+            for module, name in owners:
+                owner = getattr(module, name, None)
+                if not isinstance(owner, type) or owner.__module__ != module.__name__:
+                    raise _unsupported(f"{module.__name__}.{name} has changed")
+                references.append((module, name, owner))
+            placeholder = object()
+            methods = (
+                (graph, graph.GraphLowering, "__init__", (placeholder, placeholder)),
+                (graph, graph.GraphLowering, "make_subgraph", (placeholder,) * 4),
+                (graph, graph.GraphLowering, "placeholder", (placeholder,) * 4),
+                (graph, graph.SubgraphLowering, "__init__", (placeholder,) * 2),
+                (
+                    wrapper,
+                    wrapper.PythonWrapperCodegen,
+                    "can_reuse",
+                    (placeholder,) * 2,
+                ),
+                (
+                    scheduler,
+                    scheduler.BaseSchedulerNode,
+                    "decide_inplace_update",
+                    (placeholder,),
+                ),
+            )
+            for module, owner, name, args in methods:
+                function = _owned_callable(module, owner, name, args=args)
+                references.append((owner, name, function))
+            if (
+                "can_reuse"
+                not in scheduler.BaseSchedulerNode.decide_inplace_update.__code__.co_names
+            ):
+                raise _unsupported(
+                    "in-place planning no longer consults the reusable-buffer protocol"
+                )
+            test_graph = SimpleNamespace(
+                removed_buffers=set(),
+                graph_inputs={},
+                constants={},
+                torchbind_constants={},
+                never_reuse_buffers=set(),
+            )
+            test_wrapper = object.__new__(wrapper.PythonWrapperCodegen)
+            test_wrapper.freed = set()
+            buffer = SimpleNamespace(get_name=lambda: "dendra_contract_input")
+            with virtualized.V.set_graph_handler(test_graph):
+                if not test_wrapper.can_reuse(buffer):
+                    raise _unsupported(
+                        "the reusable-buffer behavior probe is not applicable"
+                    )
+                test_graph.never_reuse_buffers.add(buffer.get_name())
+                if test_wrapper.can_reuse(buffer):
+                    raise _unsupported("input protection does not prevent buffer reuse")
+        except FunctionalizationError:
+            raise
+        except (ImportError, AttributeError, TypeError, ValueError) as error:
+            raise _unsupported(
+                f"the input-ownership interface is incompatible: {error}"
+            ) from error
+        _INDUCTOR_CONTRACT = tuple(references)
 
 
 def _make_value_preserving_materializer(utils):
@@ -179,6 +377,10 @@ def _make_value_preserving_materializer(utils):
     return materialize
 
 
+def _capture_saved_tensor_identity(tensor):
+    return tensor
+
+
 def _make_full_output_backward(utils, aot_config_type, create_joint):
     prepare_original = utils.prepare_fw_with_masks_all_requires_grad
     clone_aliases = utils._clone_aliasing_output
@@ -216,7 +418,15 @@ def _make_full_output_backward(utils, aot_config_type, create_joint):
             # workers race its per-mode kernel flag against thread-local Meta
             # dispatch state. Scope serialization to capture, restoring the
             # caller's policy before any real compiled backward can execute.
-            with torch.autograd.set_multithreading_enabled(False):
+            # Checkpoint/save hooks belong to real execution. Letting an outer
+            # hook retain these disposable capture saves can replay real inputs
+            # into FakeTensorMode during the joint's autograd.grad call.
+            with (
+                torch.autograd.set_multithreading_enabled(False),
+                torch.autograd.graph.saved_tensors_hooks(
+                    _capture_saved_tensor_identity, _capture_saved_tensor_identity
+                ),
+            ):
                 outputs, gradients = joint(primals, tangents)
             if len(gradients) != primal_count:
                 raise AssertionError(
@@ -239,19 +449,16 @@ def _make_full_output_backward(utils, aot_config_type, create_joint):
 
 
 def install_scan_compatibility():
-    """Install the verified positional-tangent repair after explicit selection.
+    """Install a contract-qualified positional-tangent repair on selection.
 
-    Repeated calls are idempotent. Unknown Torch versions, changed installed
-    sources, or replaced shared helpers are rejected before installation.
+    Repeated calls are idempotent. Incompatible interfaces, failing behavior
+    qualification or replaced shared helpers are rejected before installation.
     The only assignment into Torch is ``partitioner.create_hop_joint_graph``;
     its cloned function uses private globals, backward helper, and materializer.
     No source files are modified and no source text is executed.
     """
     global _INSTALLED
 
-    version = str(torch.__version__)
-    if version.split("+", 1)[0] not in _SUPPORTED_VERSIONS:
-        raise _unsupported(f"found Torch {version}")
     if torch.compiler.is_compiling():
         raise FunctionalizationError(
             "Select Dendra scan execution before entering torch.compile."
@@ -262,14 +469,10 @@ def install_scan_compatibility():
             partitioner, patched, references = _INSTALLED
             if partitioner.create_hop_joint_graph is not patched:
                 raise _unsupported("the active scan repair has been replaced")
-            for module, name, original in references:
-                if getattr(module, name, None) is not original:
-                    raise _unsupported(
-                        f"the active helper {module.__name__}.{name} changed"
-                    )
+            _check_references(references)
             return
 
-        modules, references, aot_config_type, create_joint = _validate_sources()
+        modules, references, aot_config_type, create_joint = _validate_scan_contract()
         partitioner = modules["torch._higher_order_ops.partitioner"]
         original = partitioner.create_hop_joint_graph
         private_globals = dict(original.__globals__)
@@ -290,6 +493,8 @@ def install_scan_compatibility():
         patched.__kwdefaults__ = (
             None if original.__kwdefaults__ is None else dict(original.__kwdefaults__)
         )
+        _probe_scan_contract(patched)
+        _check_references(references)
         # Retain identities of untouched helpers for repeat-call checks. The
         # overridden entry has its own identity check above.
         references = tuple(

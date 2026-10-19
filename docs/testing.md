@@ -45,6 +45,39 @@ comparisons also carry `slow`, and randomized or property-generated cases
 carry `stochastic`. Marker names are strict, so misspelled or undeclared
 markers fail during test collection.
 
+## Shorter development passes
+
+Run the affected test module first. For a broader portable-CPU pass that omits
+tests classified as slow, use:
+
+```sh
+python -m pytest tests -W error -m "cpu and not slow"
+```
+
+The `slow` compiler tests retain real Inductor/C++ execution, full recordings,
+gradient checks, ownership checks, and repeated calls. They remain part of the
+required CPU/NEURON lane above; the shorter pass is not a replacement for it.
+
+The development dependencies include `pytest-xdist`. With enough memory for two
+independent compiler processes, the complete lane can also use two workers:
+
+```sh
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 MAX_JOBS=1 \
+TORCHINDUCTOR_COMPILE_THREADS=1 \
+python -m pytest tests -n 2 --dist loadfile -W error -m "cpu or (neuron and not cuda)"
+```
+
+Keep worker counts conservative: compiler processes have independent memory
+costs. Tests reset compiler caches between cases, without changing the cache
+limits or reuse behavior being checked within a case.
+
+For new functional tests, use Dynamo/eager capture for interface and scheduling
+contracts, AOT-eager for reusable differentiable graph checks, and actual
+Inductor for code-generation and native-kernel integration contracts. Raw eager
+scan autograd still creates and partitions joint graphs, so it is not always
+the cheaper choice for repeated checkpoint spans. Keep eager-specific coverage
+where that execution path is the contract being tested.
+
 ## Run the CUDA lane
 
 On a CUDA and Triton worker, verify the runtime and run the accelerator lane

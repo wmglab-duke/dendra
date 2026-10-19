@@ -16,7 +16,7 @@ supported in native PowerShell or Command Prompt.
 - Python 3.11 or newer
 - Pip
 
-Dendra requires PyTorch 2.12 or newer and NEURON. Both are declared package
+Dendra requires PyTorch 2.14 or newer and NEURON. Both are declared package
 dependencies and are installed automatically. Git is needed only for source
 and development installations.
 
@@ -59,7 +59,7 @@ and development installations.
 Pip installs a compatible PyTorch release automatically. If you need a
 particular CPU, CUDA, or ROCm build, install it before Dendra using the command
 from the [PyTorch installation selector](https://pytorch.org/get-started/locally/).
-Dendra requires PyTorch 2.12 or newer.
+Dendra requires PyTorch 2.14 or newer.
 
 For example, a CPU-only installation on Linux or WSL2 uses PyTorch's CPU wheel
 index:

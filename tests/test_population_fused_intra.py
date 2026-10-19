@@ -191,7 +191,9 @@ def test_fused_run_dispatches_once_per_step_and_commits_eagerly(monkeypatch):
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
-@pytest.mark.parametrize("backend", ["eager", "inductor"])
+@pytest.mark.parametrize(
+    "backend", ["eager", pytest.param("inductor", marks=pytest.mark.slow)]
+)
 def test_full_traces_and_batched_stimulus_gradients_match_split_path(dtype, backend):
     baseline, baseline_amplitude = _case(dtype=dtype, training=True)
     candidate, candidate_amplitude = _case(dtype=dtype, training=True)
@@ -242,6 +244,7 @@ def test_custom_pre_step_hook_observes_original_scatter_before_hook_order(monkey
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.slow
 def test_branched_dhs_fusion_with_plan_preserves_full_trace_and_batched_gradient():
     solvers = pytest.importorskip("dendra_solvers")
     baseline, baseline_amplitude = _case(dtype=torch.float32, training=True, tree=True)
