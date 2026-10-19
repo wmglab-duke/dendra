@@ -339,6 +339,12 @@ otherwise broadcastable to the owner's ``shape_p``; Dendra stores it in that
 canonical local shape so serialization remains stable before and after timestep
 configuration.
 
+Fresh initialization, including ``dn.compile(initialization="fresh")``, resets
+these buffers to literal zeros before State defaults, initial-value hooks, and
+initial current evaluation. It does not invoke timestep builders, even at
+``dt=0``. Runtime preparation subsequently rebuilds the differentiable values
+at the simulation timestep.
+
 For a population-independent structural workspace, declare an exact shape. The
 empty tuple declares a scalar, while any other tuple consists of non-negative
 Python integers:

@@ -302,8 +302,15 @@ static workspaces declared with ``Mechanism.DERIVED_BUFFER`` or
 temperature, and the mechanism's exact support-local geometry, so they remain
 differentiable without becoming explicit state. Timestep workspaces declared with
 ``Mechanism.TIMESTEP_BUFFER`` or ``State.TIMESTEP_BUFFER`` are rebuilt in the
-same preparation from the explicit ``dt`` constant. State variable names are
-not restricted to those used by the built-in HH mechanism.
+same preparation from the explicit ``dt`` constant. Fresh initialization also
+supports these declarations: just as with ``Population.initialize()``, all
+timestep workspaces start as literal zeros in their declared shapes, before
+ordinary derived buffers, State defaults, initial-value hooks, and the initial
+current frame are evaluated. Timestep builders are not called during this
+initialization phase; in particular, their values at ``dt=0`` need not be zero.
+Runtime preparation then rebuilds the workspaces at the actual timestep,
+preserving gradients through their parameters and the explicit ``dt``. State
+variable names are not restricted to those used by the built-in HH mechanism.
 
 A ``SAVE_CURRENT("i")`` mirror occupies
 ``state["mechanism_buffers"][mechanism_name]["i_"]`` and follows the same raw
@@ -1930,6 +1937,8 @@ compiled loops. On a CUDA machine run:
    python -m pytest -q tests/func/test_cuda_convenience_extra.py -m "cuda and slow"
    python -m pytest -q tests/func/test_cuda_convenience_initialization.py -W error -m "cuda and not slow"
    python -m pytest -q tests/func/test_cuda_convenience_initialization.py -W error -m "cuda and slow"
+   python -m pytest -q tests/func/test_cuda_timestep_initialization.py -W error -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_timestep_initialization.py -W error -m "cuda and slow"
 
 The slow lane includes real Inductor scan/while compilation. Tests are skipped
 when CUDA is unavailable; collecting them on a CPU-only host is not evidence
@@ -2121,7 +2130,7 @@ shared-field shape; callable-module initial sources are not yet supported.
 
 Other functional models can still start from ``tensors.state``. Fresh
 ``initialize`` is unavailable for arbitrary Population or Integrator
-initialization hooks, timestep workspaces, steady-state caches, custom
+initialization hooks, steady-state caches, custom
 Ion/Material initialization behavior, callable-module Material initial
 sources, MaterialProcesses, VoltageProcesses, and other topologies. Transition
 execution from an initialized model remains available wherever normal

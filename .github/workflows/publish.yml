@@ -190,6 +190,7 @@ jobs:
           tests/func/test_population_initialization_transforms.py
           tests/func/test_convenience_extra.py
           tests/func/test_convenience_initialization.py
+          tests/func/test_timestep_initialization.py
           tests/func/test_convenience_runner.py::test_top_level_compile_is_the_exported_functional_compile_alias
 
   check_dist:

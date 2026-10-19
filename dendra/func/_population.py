@@ -2478,7 +2478,15 @@ class _PopulationPreparation(torch.nn.Module):
                 "tensors without modifying parameters, constants, or buffers."
             )
 
-    def forward(self, diam, dx, diameters, diam_original, dt):
+    def forward(
+        self, diam, dx, diameters, diam_original, dt, *, for_initialization=False
+    ):
+        if for_initialization:
+            # INITIAL/defaults and ordinary parameter/derived builders see the
+            # construction-fresh timestep view, even after a previous run.
+            # In particular, a zero workspace is not the result of evaluating
+            # an authored timestep builder at dt=0.
+            self.population.mech._reset_initialization_timestep()
         self.population._buffers["dx"] = dx
         if self.uses_diameter_parametrization:
             if diameters is None or diam_original is None:
@@ -2564,6 +2572,11 @@ class _PopulationPreparation(torch.nn.Module):
 
         for module_path in self.timestep_module_paths:
             owner = _module_at(self.population, module_path)
+            if for_initialization:
+                for entry in self.layout:
+                    if entry.kind == "timestep" and entry.module_path == module_path:
+                        outputs.append((entry.key, owner._buffers[entry.buffer_name]))
+                continue
             bindings = self._builder_input_bindings(celsius, effective_diam, dt)
             values = _evaluate_timestep_buffers(owner, dt)
             self._assert_builder_inputs_unchanged(
@@ -4332,13 +4345,6 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             except FunctionalizationError as exc:
                 failures.append(str(exc))
 
-        if _timestep_buffer_names(mechanism):
-            failures.append(
-                f"mechanism {mechanism_name!r} has TIMESTEP_BUFFER workspaces; "
-                "imperative initialization does not install timestep workspaces "
-                "before State.state_defaults"
-            )
-
         declared_names = {
             name for state in mechanism.DE.values() for name in state._state
         }
@@ -4398,13 +4404,6 @@ def _functional_initialization_failures(population: Population) -> list[str]:
                     "overlap handler-owned shared locals "
                     f"{sorted(shared_state_buffer_overlap)}; use the canonical "
                     "Mechanism shared field through the values mapping"
-                )
-
-            if _timestep_buffer_names(state):
-                failures.append(
-                    f"State {mechanism_name}.{state_name} has TIMESTEP_BUFFER "
-                    "workspaces; imperative initialization does not install them "
-                    "before State.state_defaults"
                 )
 
             missing = set(state._state) - set(mechanism._init_params)
@@ -9067,6 +9066,7 @@ class FunctionalPopulation:
         *,
         preparation=None,
         base_mapping=None,
+        for_initialization=False,
     ):
         preparation = self._preparation if preparation is None else preparation
         base_mapping = (
@@ -9094,6 +9094,7 @@ class FunctionalPopulation:
                 None if diam_original is None else diam_original.clone(),
                 dt.clone(),
             ),
+            {"for_initialization": for_initialization},
             tie_weights=False,
         )
         if preparation.local_geometry_bindings:
@@ -9242,7 +9243,9 @@ class FunctionalPopulation:
             pre_state,
             initialization_transform_values,
         )
-        prepared = self._prepare_values(initialized_parameters, constants)
+        prepared = self._prepare_values(
+            initialized_parameters, constants, for_initialization=True
+        )
         # Imperative Mechanism/State initialization and its final current frame
         # run before the integrator configures a timestep. Preserve that exact
         # zero-dt view even though transition preparation already owns runtime dt.
@@ -9305,6 +9308,7 @@ class FunctionalPopulation:
         *,
         preparation=None,
         preparation_base_mapping=None,
+        for_initialization=False,
     ):
         if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             return self._prepare_multi_values(
@@ -9312,6 +9316,7 @@ class FunctionalPopulation:
                 constants,
                 preparation=preparation,
                 preparation_base_mapping=preparation_base_mapping,
+                for_initialization=for_initialization,
             )
 
         shape = self.shape
@@ -9341,6 +9346,7 @@ class FunctionalPopulation:
                 },
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
+                for_initialization=for_initialization,
             )
         )
         diam = population_values.get("diam", diam)
@@ -9619,6 +9625,7 @@ class FunctionalPopulation:
         *,
         preparation=None,
         preparation_base_mapping=None,
+        for_initialization=False,
     ):
         """Derive one differentiable packed workspace from component sources."""
         dt = constants["dt"]
@@ -9896,6 +9903,7 @@ class FunctionalPopulation:
                 },
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
+                for_initialization=for_initialization,
             )
         )
         for name in (
@@ -10498,7 +10506,14 @@ class FunctionalPopulation:
 
         rng_state = _global_rng_snapshot(self.device)
         class_state = _class_state_snapshot(
-            _authored_workspace_classes(self._initialization)
+            tuple(
+                dict.fromkeys(
+                    (
+                        *_authored_workspace_classes(self._initialization),
+                        *_authored_workspace_classes(self._preparation),
+                    )
+                )
+            )
         )
         mutated_registered = set()
         mutated_read_only = set()
@@ -10510,14 +10525,59 @@ class FunctionalPopulation:
         transform_outputs = {}
         caught_error = None
         audit_initialization = None
+        audit_preparation = None
         registered = {}
         python_state = {}
+
+        def registered_bindings():
+            bindings = {}
+            for prefix, module in (
+                ("", audit_initialization),
+                ("preparation:", audit_preparation),
+            ):
+                if module is not None:
+                    bindings.update(
+                        (f"{prefix}{name}", value)
+                        for name, value in _registered_tensor_bindings(module).items()
+                    )
+            return bindings
+
+        def python_bindings():
+            bindings = {}
+            for prefix, module in (
+                ("", audit_initialization),
+                ("preparation:", audit_preparation),
+            ):
+                if module is not None:
+                    bindings.update(
+                        (f"{prefix}{name}", value)
+                        for name, value in _transition_python_state_snapshot(
+                            module
+                        ).items()
+                    )
+            return bindings
+
         try:
             with torch.inference_mode(False):
                 audit_initialization = _deepcopy_execution_module(self._initialization)
                 _rebind_population_time_references(audit_initialization.population)
-                registered = _registered_tensor_bindings(audit_initialization)
-                python_state = _transition_python_state_snapshot(audit_initialization)
+                # Initialization exposes zero timestep workspaces to ordinary
+                # builders, unlike runtime preparation. Audit that distinct
+                # context too, on a disposable input-audited preparation tree.
+                audit_preparation = _deepcopy_execution_module(self._preparation)
+                _rebind_population_time_references(audit_preparation.population)
+                audit_preparation.audit_builder_inputs = True
+                for component in getattr(
+                    audit_preparation, "component_physical_preparations", ()
+                ):
+                    component.audit_builder_inputs = True
+                preparation_base_mapping = {
+                    name: _clone_tensor(value)
+                    for name, value in _module_tensor_slots(audit_preparation)
+                    if not name.startswith("component_physical_preparations.")
+                }
+                registered = registered_bindings()
+                python_state = python_bindings()
                 parameter_names = tuple(tensors.parameters)
                 constant_names = tuple(tensors.constants)
                 explicit_names = tuple(
@@ -10562,17 +10622,13 @@ class FunctionalPopulation:
                     return cloned
 
                 def record_module_side_effects():
-                    current_registered = _registered_tensor_bindings(
-                        audit_initialization
-                    )
+                    current_registered = registered_bindings()
                     mutated_registered.update(
                         key
                         for key in set(registered) | set(current_registered)
                         if registered.get(key) != current_registered.get(key)
                     )
-                    current_python_state = _transition_python_state_snapshot(
-                        audit_initialization
-                    )
+                    current_python_state = python_bindings()
                     mutated_python_state.update(
                         name
                         for name in set(python_state) | set(current_python_state)
@@ -10655,10 +10711,27 @@ class FunctionalPopulation:
                         _get_path(pre_state, entry.public_path)
                         for entry in self._initialization_state_layout
                     )
-                    prepared = self._prepare_values(
-                        initialized_parameters,
-                        constants,
+                    preparation_modules = (
+                        audit_preparation,
+                        *getattr(
+                            audit_preparation, "component_physical_preparations", ()
+                        ),
                     )
+                    # Storage/version fingerprints are meaningful for the
+                    # ordinary probes, not for hidden vmap/JVP tensor wrappers.
+                    for module in preparation_modules:
+                        module.audit_builder_inputs = track_read_only
+                    try:
+                        prepared = self._prepare_values(
+                            initialized_parameters,
+                            constants,
+                            preparation=audit_preparation,
+                            preparation_base_mapping=preparation_base_mapping,
+                            for_initialization=True,
+                        )
+                    finally:
+                        for module in preparation_modules:
+                            module.audit_builder_inputs = True
                     initialization_dt = torch.zeros_like(prepared["integrator"]["dt"])
                     mapping, _dt, _celsius, _v, _t, _remainder = self._mapping(
                         initialized_parameters,
@@ -10867,17 +10940,13 @@ class FunctionalPopulation:
         finally:
             try:
                 if audit_initialization is not None:
-                    current_registered = _registered_tensor_bindings(
-                        audit_initialization
-                    )
+                    current_registered = registered_bindings()
                     mutated_registered.update(
                         key
                         for key in set(registered) | set(current_registered)
                         if registered.get(key) != current_registered.get(key)
                     )
-                    current_python_state = _transition_python_state_snapshot(
-                        audit_initialization
-                    )
+                    current_python_state = python_bindings()
                     mutated_python_state.update(
                         name
                         for name in set(python_state) | set(current_python_state)
