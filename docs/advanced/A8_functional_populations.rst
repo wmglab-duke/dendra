@@ -83,8 +83,9 @@ functional callbacks. An unsupported while request raises an error
 instead of falling back to an unrolled simulation; it does not silently compile a
 different execution strategy.
 
-State stays explicit. Every ``runner()`` starts from ``runner.initial_state``;
-the runner never advances or commits state to the source Population. To
+State stays explicit. By default, every ``runner()`` starts from the captured
+``runner.initial_state`` snapshot; the runner never advances or commits state
+to the source Population. To
 continue, pass the returned state. Passing the callback state also preserves
 reducer history and its clock without recording a duplicate boundary frame:
 
@@ -129,12 +130,73 @@ the same exact or unambiguous partial parameter names as
        optimizer.step()
 
 Gradient-enabled calls prepare a fresh differentiable workspace for each
-forward/backward graph. Inference calls reuse preparation while its sources are
+forward/backward graph. Snapshot-mode inference calls reuse preparation while its sources are
 unchanged. ``inference=True`` always suppresses gradients, even for leaves
 selected by ``trainable``. A complete replacement mapping may be passed with
 ``runner(parameters=parameters)``; explicit state tensors may carry gradients
-as well. Parameter changes do not reset the captured initial state or perform
-differentiable initialization automatically.
+as well. With the default ``initialization="snapshot"``, parameter changes do
+not reset the captured initial state or perform differentiable initialization.
+
+Opt-in fresh initialization
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``initialization="fresh"`` to recompute initial state from current model
+parameters every time the runner is called **without** explicit state. This
+uses the pure differentiable initializer described in
+:ref:`functional-fresh-initialization`, including Myelinated geometry,
+finite-extracellular circuit state, packed populations, insertion-time initial
+conditions, and registered pre/post initialization transforms. Unsupported
+initialization hooks raise an error; there is no fallback to snapshot state.
+The compiled timestep loop is reused; initialization and preparation are
+invocation-local, and no training graph is retained between calls.
+
+.. code-block:: python
+
+   fresh_runner = dn.compile(
+       model, dt=0.025, steps=800,
+       initialization="fresh",
+       inference=False,
+       trainable=("gnabar",),
+       callbacks={"trace": dn.func.Recorder(("v",))},
+   )
+   initial = fresh_runner.initialization_inputs
+   initial.v_init.requires_grad_()
+   final_state, auxiliary = fresh_runner()
+   auxiliary["callbacks"]["trace"]["v"].square().mean().backward()
+
+``runner.initialization_inputs`` contains independent tensor defaults in an
+``InitializationInput(v_init, states, transforms)``. These initialization-only
+leaves are separate from ``runner.parameters`` and ``trainable``. To optimize
+them, enable their gradients and include the desired leaves in your optimizer.
+An individual fresh call can instead receive
+``runner(initialization=dn.func.InitializationInput(...))``; explicit nonleaf
+tensors retain their autograd connection. State and transform mappings must
+use the complete canonical names and shapes exposed by the defaults.
+
+Explicit state always means continuation and bypasses initialization, even on
+a fresh-policy runner. Every fresh-policy call returns its effective runtime
+parameters at ``auxiliary["parameters"]``. If a pure initialization transform
+replaces parameters (for example, to balance resting current), continuation
+must carry that mapping explicitly:
+
+.. code-block:: python
+
+   continued_state, continued_auxiliary = fresh_runner(
+       final_state,
+       parameters=auxiliary["parameters"],
+       callback_state=auxiliary["callbacks"].state,
+   )
+
+Without parameter-writing transforms, state-only continuation remains valid.
+To replay the originally captured snapshot on a fresh-policy runner, use
+``fresh_runner(fresh_runner.initial_state, parameters=fresh_runner.parameters)``.
+An initialization override cannot be combined with explicit state or used on a
+snapshot-policy runner. A fresh restart cannot accept callback carry without
+state: restart both together, or continue both together. Fresh initialization
+works with scan, checkpointed training scan, inference-only while loops, and
+bound ``extra=`` stimulation; a fresh start resets the accepted simulation
+clock, while explicit continuation preserves it. ``Population.run`` and
+``Population.longrun`` remain unchanged.
 
 For activation checkpointing, add ``checkpoint_every`` to the same training
 scan configuration:
@@ -1866,6 +1928,8 @@ compiled loops. On a CUDA machine run:
    python -m pytest -q tests/func/test_cuda_initialization_parity.py -m "cuda and slow"
    python -m pytest -q tests/func/test_cuda_convenience_extra.py -m "cuda and not slow"
    python -m pytest -q tests/func/test_cuda_convenience_extra.py -m "cuda and slow"
+   python -m pytest -q tests/func/test_cuda_convenience_initialization.py -W error -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_convenience_initialization.py -W error -m "cuda and slow"
 
 The slow lane includes real Inductor scan/while compilation. Tests are skipped
 when CUDA is unavailable; collecting them on a CPU-only host is not evidence

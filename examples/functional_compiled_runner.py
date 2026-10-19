@@ -8,6 +8,7 @@ Run from the repository root::
     python examples/functional_compiled_runner.py --execution scan --grad
     python examples/functional_compiled_runner.py --grad --checkpoint-every 3
     python examples/functional_compiled_runner.py --extra --grad --checkpoint-every 4
+    python examples/functional_compiled_runner.py --initialization fresh --grad --checkpoint-every 4
 
 Recording is selected explicitly through the callback mapping. Inductor uses
 the C++ loop wrapper by default for CPU inference. The first call
@@ -52,6 +53,9 @@ def main():
     )
     parser.add_argument("--threads", choices=(1, 4), type=int, default=1)
     parser.add_argument("--grad", action="store_true", help="differentiate scan twice")
+    parser.add_argument(
+        "--initialization", choices=("snapshot", "fresh"), default="snapshot"
+    )
     parser.add_argument(
         "--extra", action="store_true", help="bind an extracellular field and waveform"
     )
@@ -100,6 +104,7 @@ def main():
         execution=args.execution,
         callbacks={"trace": dn.func.Recorder(("v", "t"))},
         inference=not args.grad,
+        initialization=args.initialization,
         checkpoint_every=args.checkpoint_every,
         trainable=trainable,
         backend=args.backend,
@@ -107,6 +112,9 @@ def main():
 
     if args.grad:
         parameters = [p for p in runner.parameters.values() if p.requires_grad]
+        if args.initialization == "fresh":
+            # Initialization-only leaves are explicit, not runtime parameters.
+            parameters.append(runner.initialization_inputs.v_init.requires_grad_())
         optimizer = torch.optim.SGD(parameters, lr=1e-5)
         for iteration in range(2):
             optimizer.zero_grad()
@@ -125,14 +133,22 @@ def main():
         assert voltage.shape[0] == 9  # Initial frame plus eight accepted steps.
         assert torch.isfinite(voltage).all() and not voltage.requires_grad
 
-        # Repeating runner() restarts from the same captured initial state.
+        # Repeating runner() restarts: snapshot by default, freshly initialized
+        # from the same inputs when initialization='fresh'.
         repeated, _ = runner()
         torch.testing.assert_close(
             repeated["integrator"]["v"], final["integrator"]["v"]
         )
 
         # Explicit continuation leaves the source Population unchanged.
-        continued, _ = runner(final, callback_state=auxiliary["callbacks"].state)
+        continuation_parameters = (
+            auxiliary["parameters"] if args.initialization == "fresh" else None
+        )
+        continued, _ = runner(
+            final,
+            parameters=continuation_parameters,
+            callback_state=auxiliary["callbacks"].state,
+        )
         assert torch.isfinite(continued["integrator"]["v"]).all()
         print(
             f"recorded {voltage.shape[0]} voltage frames; explicit continuation succeeded"

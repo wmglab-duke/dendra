@@ -12,13 +12,40 @@ from torch.utils import _pytree as pytree
 from ._binding import BoundPopulation
 from ._callbacks import FunctionalCallback
 from ._compiled import CompiledPopulationChunk
-from ._population import FunctionalPopulation, make_functional
+from ._population import (
+    FunctionalPopulation,
+    _initialization_transform_hooks,
+    make_functional,
+)
 from ._runners import _run_source_validated, run
-from ._types import FunctionalizationError
+from ._types import FunctionalizationError, InitializationInput
 
 _OWNED_PREPARE = FunctionalPopulation.prepare
 _OWNED_BIND = CompiledPopulationChunk.bind
 _OWNED_RUN = run
+
+
+def _initialization_input_mapping(inputs):
+    """Snapshot external mappings without severing differentiable leaves."""
+    if not isinstance(inputs, InitializationInput):
+        raise TypeError("initialization must be an InitializationInput")
+    mappings = []
+    for name, values in (("states", inputs.states), ("transforms", inputs.transforms)):
+        if values is not None and not isinstance(values, Mapping):
+            raise TypeError(f"initialization {name} must be a mapping")
+        mappings.append(None if values is None else dict(values))
+    return InitializationInput(inputs.v_init, *mappings)
+
+
+def _initialization_writes_parameters(functional):
+    """Continuation must explicitly carry any initialization-adjusted parameters."""
+    population = functional._population
+    return any(
+        reference.startswith("parameters.")
+        for phase in ("pre", "post")
+        for hook in _initialization_transform_hooks(population, phase)
+        for reference in population._initialization_transforms[hook.action_name].writes
+    )
 
 
 def _inference_compile_options(functional, inference, backend, options, keywords):
@@ -57,7 +84,11 @@ class CompiledRunner:
 
     Construct with :func:`dendra.func.compile`. A call returns ``(state, aux)``
     and never commits state or parameters to the source Population. With no
-    state argument, every call restarts from :attr:`initial_state`. Parameters
+    state argument, the default ``initialization='snapshot'`` restarts from
+    :attr:`initial_state`. Opt in to ``initialization='fresh'`` to recompute
+    differentiable initial state from current parameters and
+    :attr:`initialization_inputs` instead. Explicit state always continues
+    without reinitializing. Parameters
     are independent copies; select differentiable leaves with ``trainable``
     and ``inference=False``, or pass an explicit parameter mapping per call.
 
@@ -68,8 +99,9 @@ class CompiledRunner:
     special meaning. Scan accepts pure custom callbacks; while supports the
     built-in callbacks and requires a nonempty mapping.
 
-    Compilation is lazy. Inference preparation is reused with version checks;
-    training and explicit parameter overrides receive fresh preparation. No
+    Compilation is lazy. Snapshot inference reuses preparation with version
+    checks; fresh initialization, training, and explicit parameter overrides
+    receive fresh preparation. No
     output, live binding, or training preparation is retained between calls.
     For training scan, ``checkpoint_every=H`` recomputes compiled spans of at
     most H steps during backward to reduce saved activation storage. This
@@ -84,6 +116,13 @@ class CompiledRunner:
     waveforms follow the accepted simulation clock across continuation and
     checkpoint replay. Explicit ``RolloutInput.ve`` cannot be combined with
     bound ``extra``; use it instead for already assembled time-first voltages.
+
+    Fresh calls accept an ``initialization=InitializationInput(...)`` override;
+    it cannot be combined with explicit state. Fresh-policy outputs include
+    ``aux['parameters']``, the effective parameter mapping after initialization.
+    If initialization transforms write parameters, pass that mapping explicitly
+    when continuing state. Neither it nor its autograd graph is retained by the
+    runner. Initialization-only inputs remain separate from runtime parameters.
     """
 
     def __init__(
@@ -96,6 +135,7 @@ class CompiledRunner:
         execution="scan",
         callbacks=None,
         inference=True,
+        initialization="snapshot",
         checkpoint_every=None,
         trainable=(),
         backend="inductor",
@@ -121,6 +161,8 @@ class CompiledRunner:
             raise ValueError("execution must be 'scan' or 'while'")
         if not isinstance(inference, bool):
             raise TypeError("inference must be a bool")
+        if initialization not in ("snapshot", "fresh"):
+            raise ValueError("initialization must be 'snapshot' or 'fresh'")
         if checkpoint_every is not None:
             if (
                 isinstance(checkpoint_every, bool)
@@ -158,6 +200,7 @@ class CompiledRunner:
             if compile_options.get("disable", False):
                 raise ValueError("execution='while' requires compilation to be enabled")
         self._inference = inference
+        self._initialization = initialization
         self._execution = execution
         self._steps = steps
         self._checkpoint_every = checkpoint_every
@@ -169,6 +212,15 @@ class CompiledRunner:
             self._constants = dict(tensors.constants)
             self._initial_state = pytree.tree_map_only(
                 torch.Tensor, lambda value: value.detach().clone(), tensors.state
+            )
+            self._initialization_inputs = pytree.tree_map_only(
+                torch.Tensor,
+                lambda value: value.detach().clone(),
+                tensors.initialization,
+            )
+            self._initialization_writes_parameters = (
+                initialization == "fresh"
+                and _initialization_writes_parameters(self._functional)
             )
             self._callbacks = (
                 None
@@ -187,8 +239,22 @@ class CompiledRunner:
 
     @property
     def initial_state(self):
-        """Explicit restart state; tensor leaves may be edited by the caller."""
+        """Captured restart snapshot; tensor leaves may be edited by the caller.
+
+        Fresh-policy calls ignore this snapshot unless it is explicitly passed
+        as state, which always bypasses initialization.
+        """
         return self._initial_state
+
+    @property
+    def initialization_inputs(self):
+        """Independent fresh-initialization defaults; tensor leaves are editable.
+
+        Use ``requires_grad_()`` or pass an explicit ``InitializationInput`` per
+        fresh call to differentiate these initialization-only inputs. They are
+        not included in :attr:`parameters` or selected by ``trainable``.
+        """
+        return self._initialization_inputs
 
     @property
     def parameters(self):
@@ -212,17 +278,23 @@ class CompiledRunner:
         """Return the underlying kernel's latest successful execution report."""
         return self._kernel.execution_report()
 
-    def _prepare(self, parameters, *, cache):
+    def _prepare(self, parameters, *, cache, constants=None):
         return self._prepare_with(
-            parameters, cache=cache, prepare=self._functional.prepare
+            parameters,
+            cache=cache,
+            constants=constants,
+            prepare=self._functional.prepare,
         )
 
-    def _prepare_source_validated(self, parameters, *, cache):
+    def _prepare_source_validated(self, parameters, *, cache, constants=None):
         return self._prepare_with(
-            parameters, cache=cache, prepare=self._functional._prepare_source_validated
+            parameters,
+            cache=cache,
+            constants=constants,
+            prepare=self._functional._prepare_source_validated,
         )
 
-    def _prepare_with(self, parameters, *, cache, prepare):
+    def _prepare_with(self, parameters, *, cache, prepare, constants=None):
         if cache and self._prepared is not None:
             try:
                 self._functional._validate_prepared_freshness(
@@ -238,7 +310,9 @@ class CompiledRunner:
                     raise
             else:
                 return self._prepared
-        prepared = prepare(parameters, self._constants)
+        prepared = prepare(
+            parameters, self._constants if constants is None else constants
+        )
         if cache:
             self._prepared = prepared
         return prepared
@@ -268,7 +342,13 @@ class CompiledRunner:
             raise FunctionalizationError(f"execution='while' is unavailable: {reason}")
 
     def __call__(
-        self, state=None, *, parameters=None, inputs=None, callback_state=None
+        self,
+        state=None,
+        *,
+        parameters=None,
+        inputs=None,
+        callback_state=None,
+        initialization=None,
     ):
         if torch.compiler.is_compiling():
             raise FunctionalizationError("call compiled runners outside torch.compile")
@@ -280,6 +360,31 @@ class CompiledRunner:
                 "compiled runners are host-side callables; use the lower-level "
                 "functional API for torch.func or forward-mode AD transforms"
             )
+        fresh_policy = self._initialization == "fresh"
+        if initialization is not None:
+            if not fresh_policy:
+                raise ValueError(
+                    "initialization overrides require initialization='fresh'"
+                )
+            if state is not None:
+                raise ValueError(
+                    "initialization cannot be combined with explicit state"
+                )
+        fresh = fresh_policy and state is None
+        if fresh and callback_state is not None:
+            raise ValueError(
+                "fresh initialization cannot continue callback_state without state"
+            )
+        if (
+            fresh_policy
+            and state is not None
+            and parameters is None
+            and self._initialization_writes_parameters
+        ):
+            raise ValueError(
+                "initialization transforms write parameters; continue with "
+                "parameters=aux['parameters'] from the preceding call"
+            )
         selected_state = self._initial_state if state is None else state
         # An external Mapping can execute arbitrary Python while materializing
         # its entries. Snapshot it before checking source structure, rather than
@@ -287,6 +392,31 @@ class CompiledRunner:
         selected_parameters = (
             self._parameters if parameters is None else dict(parameters)
         )
+        selected_initialization = (
+            _initialization_input_mapping(
+                self._initialization_inputs
+                if initialization is None
+                else initialization
+            )
+            if fresh
+            else None
+        )
+        selected_constants = self._constants
+        if fresh:
+            # Physical preparation requires ordinary, versioned tensors even
+            # for inference. Respect the caller's grad context and never retain
+            # this initialization graph or its parameter replacements.
+            initialization_grad = torch.is_grad_enabled() and not self._inference
+            with (
+                torch.inference_mode(False),
+                torch.set_grad_enabled(initialization_grad),
+            ):
+                initialized = self._functional.initialize(
+                    selected_parameters, selected_constants, selected_initialization
+                )
+            selected_state = initialized.state
+            selected_parameters = initialized.parameters
+            selected_constants = initialized.constants
         owned_boundaries = (
             type(self._functional) is FunctionalPopulation
             and type(self._kernel) is CompiledPopulationChunk
@@ -305,7 +435,8 @@ class CompiledRunner:
             )
             prepared = prepare(
                 selected_parameters,
-                cache=self._inference and parameters is None,
+                cache=self._inference and parameters is None and not fresh_policy,
+                constants=selected_constants,
             )
             bound = (
                 BoundPopulation._from_source_validated(
@@ -327,7 +458,7 @@ class CompiledRunner:
                 if self._checkpoint_every is None
                 else {"checkpoint_every": self._checkpoint_every}
             )
-            return schedule(
+            final, auxiliary = schedule(
                 bound,
                 selected_state,
                 inputs=inputs,
@@ -336,6 +467,10 @@ class CompiledRunner:
                 callback_state=callback_state,
                 **schedule_options,
             )
+            if fresh_policy:
+                auxiliary = dict(auxiliary)
+                auxiliary["parameters"] = dict(selected_parameters)
+            return final, auxiliary
 
 
 def compile(
@@ -347,6 +482,7 @@ def compile(
     execution="scan",
     callbacks=None,
     inference=True,
+    initialization="snapshot",
     checkpoint_every=None,
     trainable=(),
     backend="inductor",
@@ -366,6 +502,13 @@ def compile(
     ``checkpoint_every=H`` to trade backward recomputation of H-step compiled
     scans for lower activation memory, without truncating gradients. This is
     valid only for training scan; requested recording storage remains.
+    By default, calls without state restart the captured initialized snapshot.
+    Use ``initialization='fresh'`` to initialize from current parameters on each
+    such call; explicit state still continues without reinitialization. Edit
+    ``runner.initialization_inputs`` or pass an ``InitializationInput`` as the
+    call's ``initialization=`` override. Fresh-policy results expose effective
+    parameters at ``aux['parameters']`` for explicit continuation after
+    parameter-writing initialization transforms.
     ``extra=(field, waveform)`` or a sequence of such pairs binds extracellular
     stimulation. Select its independent fields and waveform leaves through
     ``trainable``; inspect ``runner.parameters`` for canonical names. See
@@ -379,6 +522,7 @@ def compile(
         execution=execution,
         callbacks=callbacks,
         inference=inference,
+        initialization=initialization,
         checkpoint_every=checkpoint_every,
         trainable=trainable,
         backend=backend,
