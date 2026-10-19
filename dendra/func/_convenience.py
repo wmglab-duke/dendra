@@ -77,6 +77,13 @@ class CompiledRunner:
     remain retained. Callbacks must be pure, deterministic, and replay-safe.
     This is a host-side convenience object, not a torch.compile/torch.func
     transform target; those uses retain the lower-level functional API.
+
+    ``extra`` binds one ``(field, Waveform)`` pair or a sequence of contacts.
+    Field and waveform leaves become independent ``stimulation.extra.*``
+    parameters, selectable with ``trainable`` like model parameters. Bound
+    waveforms follow the accepted simulation clock across continuation and
+    checkpoint replay. Explicit ``RolloutInput.ve`` cannot be combined with
+    bound ``extra``; use it instead for already assembled time-first voltages.
     """
 
     def __init__(
@@ -85,6 +92,7 @@ class CompiledRunner:
         *,
         dt,
         steps,
+        extra=None,
         execution="scan",
         callbacks=None,
         inference=True,
@@ -156,7 +164,7 @@ class CompiledRunner:
         # Versioned snapshots must remain ordinary tensors even when the
         # convenience constructor is called inside inference_mode().
         with torch.inference_mode(False), torch.no_grad():
-            self._functional, tensors = make_functional(population, dt=dt)
+            self._functional, tensors = make_functional(population, dt=dt, extra=extra)
             self._parameters = tensors.independent_parameters(trainable=trainable)
             self._constants = dict(tensors.constants)
             self._initial_state = pytree.tree_map_only(
@@ -335,6 +343,7 @@ def compile(
     *,
     dt,
     steps,
+    extra=None,
     execution="scan",
     callbacks=None,
     inference=True,
@@ -356,13 +365,17 @@ def compile(
     ``inference=False, trainable=(...)`` for scan gradients. Add
     ``checkpoint_every=H`` to trade backward recomputation of H-step compiled
     scans for lower activation memory, without truncating gradients. This is
-    valid only for training scan; requested recording storage remains. See
+    valid only for training scan; requested recording storage remains.
+    ``extra=(field, waveform)`` or a sequence of such pairs binds extracellular
+    stimulation. Select its independent fields and waveform leaves through
+    ``trainable``; inspect ``runner.parameters`` for canonical names. See
     :class:`CompiledRunner` for all constructor options.
     """
     return CompiledRunner(
         population,
         dt=dt,
         steps=steps,
+        extra=extra,
         execution=execution,
         callbacks=callbacks,
         inference=inference,

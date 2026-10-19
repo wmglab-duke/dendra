@@ -188,15 +188,15 @@ Supported models
 ----------------
 
 The topology list below describes functional *transition* support from an
-initialized tensor state. Fresh functional initialization is a narrower
-capability: it currently supports exact ``Population`` and ``SingleCompartment``
-models and structurally canonical ``Unmyelinated`` models, including compatible
-subclasses, with their standard implicit integrators, plus exact scalar ``Tree``
-models with canonical ``dhs``. The compatible-subclass admission applies to
-``Unmyelinated``; ``Tree`` subclasses remain outside fresh-initialization
-support. This includes the Tigerholm/Thio models with registered pure
-resting-balance transforms. Other
-admitted models can still start from the extracted ``tensors.state``.
+initialized tensor state. Fresh functional initialization also supports the
+canonical point, cable, myelinated, Tree, finite-extracellular, and packed
+families with their standard implicit integrators. It has additional lifecycle
+requirements: initialization must be declaration-driven or use registered pure
+transforms, not arbitrary imperative hooks or cached steady states. This
+includes the Tigerholm/Thio models with registered pure resting-balance
+transforms. See :ref:`functional-fresh-initialization` for the exact contract;
+models outside that initializer contract can still start from the extracted
+``tensors.state`` wherever transition admission succeeds.
 
 The current transition API supports initialized models with all of the
 following properties:
@@ -476,8 +476,8 @@ automatically selects ``dhs_bt_multi``:
 
 As for standalone block models, scan supports first-order backward and optional
 ``checkpoint_every``; while-loop execution is inference-only. Fresh functional
-initialization is not supported for packed models: start from the extracted
-state. ``commit_state_`` restores the packed state explicitly. With
+initialization reconstructs the packed parent state without mutating its
+components. ``commit_state_`` restores the packed state explicitly. With
 ``write_back=True`` it also rebinds each component's ``v`` and ``vc`` to its
 packed slice; ``write_back=False`` leaves component states untouched.
 
@@ -761,6 +761,65 @@ multicontact list used by ``Population.step``, ``run``, and ``longrun``:
        steps=100,
        extra=extra,
    )
+
+The compiled convenience entry point accepts this specification directly:
+
+.. code-block:: python
+
+   runner = dn.compile(
+       model,
+       dt=0.025,
+       steps=800,
+       extra=(field, waveform),
+       execution="scan",
+       inference=False,
+       trainable=(
+           "stimulation.extra.contacts.0.field",
+           "stimulation.extra.waveforms.0.amp",
+           "stimulation.extra.waveforms.0.freq",
+           "stimulation.extra.waveforms.0.phase",
+       ),
+       callbacks={"trace": dn.func.Recorder(("v",))},
+   )
+   optimizer = torch.optim.Adam(
+       [p for p in runner.parameters.values() if p.requires_grad],
+       lr=1e-4,
+   )
+   optimizer.zero_grad()
+   final_state, auxiliary = runner()
+   loss = auxiliary["callbacks"]["trace"]["v"].square().mean()
+   loss.backward()
+   optimizer.step()
+
+This example assumes a waveform with ``amp``, ``freq``, and ``phase`` leaves,
+such as ``dn.sin``. Inspect ``runner.parameters`` for the canonical names of
+other waveforms or contacts. ``trainable`` uses exact or unambiguous partial
+names, and may also select model parameters. Even fields originally authored
+as ordinary tensors become selectable stimulation leaves.
+
+Optimize the independent tensors in ``runner.parameters``, not the original
+field or Waveform object: runner construction snapshots and detaches authoring
+inputs. The mapping is read-only, but an optimizer can update its selected
+tensors. Alternatively, pass a complete replacement mapping through
+``runner(parameters=parameters)``. Non-leaf replacements retain their autograd
+history, so a field computed from trainable electrode coordinates can propagate
+gradients to those coordinates. Updating numerical values preserves the bound
+contact structure; changing that structure requires a new runner.
+Omitting ``trainable`` selects no differentiable leaves, and ``inference=True``
+suppresses gradients regardless of that selection. Field values multiplied by
+waveform values must produce mV; analytic unit-current fields in mV/mA pair
+with waveform amplitudes in mA. Hard waveform timing switches remain
+piecewise/discontinuous; selecting their timing leaves does not smooth those
+boundaries.
+
+Bound ``extra`` works with scan, checkpointed training scan, and inference-only
+while execution. Waveforms follow the accepted simulation clock, including
+explicit continuation and checkpoint replay. Do not pass an explicit
+``RolloutInput.ve`` alongside bound ``extra``. Constructor binding requires
+Waveform temporal specifications; for already sampled stimulation, assemble a
+time-first mV tensor and pass ``runner(inputs=dn.func.RolloutInput(ve=ve))``
+instead. Both routes preserve the model's ordinary scalar-cable or
+finite-extracellular interpretation of the supplied potential.
 
 The same ``extra=extra`` keyword is accepted by ``fmodel.step`` and by
 ``dn.func.run``, ``longrun``, and ``longrun_checkpointed``. Dendra evaluates
@@ -1803,6 +1862,10 @@ compiled loops. On a CUDA machine run:
    python -m pytest -q tests/func/test_cuda_plain_population.py -m "cuda and slow"
    python -m pytest -q tests/func/test_cuda_membrane_current.py tests/func/test_cuda_lfp.py -m "cuda and not slow"
    python -m pytest -q tests/func/test_cuda_membrane_current.py tests/func/test_cuda_lfp.py -m "cuda and slow"
+   python -m pytest -q tests/func/test_cuda_initialization_parity.py -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_initialization_parity.py -m "cuda and slow"
+   python -m pytest -q tests/func/test_cuda_convenience_extra.py -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_convenience_extra.py -m "cuda and slow"
 
 The slow lane includes real Inductor scan/while compilation. Tests are skipped
 when CUDA is unavailable; collecting them on a CPU-only host is not evidence
@@ -1834,6 +1897,8 @@ mechanism structure or support, dtype/device, train/eval mode, flags, or State
 integration configuration. Placement should be changed through Population
 insertion, deletion, and rebuilding; directly editing a compiled Mechanism's
 ``key`` is not a supported modeling operation.
+
+.. _functional-fresh-initialization:
 
 Fresh functional initialization
 -------------------------------
@@ -1931,9 +1996,12 @@ Arbitrary callbacks registered with ``register_pre_initialize_hook`` or
 guessed or traced by the functional initializer.
 
 Fresh functional initialization supports exact ``Population`` and
-``SingleCompartment`` models using ``bwd_euler_sc`` and structurally canonical
-``Unmyelinated`` models using ``bwd_euler_ub``, plus exact scalar ``Tree`` models
-using canonical ``dhs``.
+``SingleCompartment`` models using ``bwd_euler_sc``; canonical ``Unmyelinated``,
+``Myelinated``, and native ``Cable`` models using ``bwd_euler_ub``; exact scalar
+``Tree`` models using ``dhs``; and canonical ``ExtCellAxon``/``ExtCellTree``
+models using ``bwd_euler_bt``/``dhs_bt``. Exact ``MultiPopulation`` packs use
+their admitted ``bwd_euler_sc_multi``, ``dhs_multi``, or ``dhs_bt_multi``
+integrator. Transition geometry and integrator restrictions still apply.
 The Tree path reuses its admitted immutable geometry and support maps, copies
 the explicit initial voltage across every solver node, and recomputes mechanism
 state only at each mechanism's declared support. Zero-area junction voltages
@@ -1943,14 +2011,29 @@ other admitted families rather than restoring cached initialized state.
 The plain ``Population`` initializer uses the same pure point-model transaction
 as ``SingleCompartment``; it initializes every ``(N, C)`` slot independently
 and does not introduce cable coupling for ``C > 1``.
-``Tree`` subclasses, block/extracellular Trees, and packed MultiPopulations are
-not admitted by this extension. An ``Unmyelinated`` subclass may define its
-mechanisms, parameterization, and registered pure initialization transforms
-while retaining the standard geometry and lifecycle methods. It accepts multiple
-stateful or stateless mechanisms over dense or regional support when every declared State
+Compatible subclasses, where admitted above, must retain the audited geometry
+and initialization lifecycle; arbitrary subclass hooks are not inferred. The initializer accepts
+multiple stateful or stateless mechanisms over dense or regional support when every declared State
 value is supplied by an insertion-time ``ic``, a canonical shared write seed,
 ``state_defaults``, or ``initial_values``. Dendra resets ``CARRY`` to zero
 before the pure initialization overlays run.
+
+For finite-extracellular models, initialization creates ``vc`` with
+intracellular potential equal to ``v_init`` and both extracellular potentials
+zero, exactly as imperative initialization does. Previous extracellular state
+is not carried into a fresh run. The returned ``v`` and ``vc`` remain separate
+explicit state leaves; registered pre/post transforms follow the same ordering
+and state-write semantics as their imperative counterparts.
+
+Packed initialization runs the consolidated parent's mechanism transaction and
+registered transforms. It does not independently initialize the components or
+run their pre/post hooks. The extracted ``initialization.v_init`` already
+contains the packed component defaults in canonical physical order; replace it
+with a complete packed tensor to differentiate through different initial
+voltages. Component geometry and parameter-derived workspaces are rebuilt from
+the explicit parameter/constant mapping before mechanism state is inferred.
+The result retains the flat packed state schema used by simulation and
+recording, and leaves the source parent and its components unchanged.
 
 Initialization hooks must be deterministic, tensor-native, and free of
 mutation and implicit RNG. Their ``values`` mapping provides support-visible

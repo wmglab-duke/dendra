@@ -2655,6 +2655,19 @@ class Population(P, Sliceable):
         writes,
         inputs,
     ):
+        if "state.integrator.vc" in (*reads, *writes):
+            integrator = (
+                self.integrator
+                if self.integrator is not None
+                else self._integrator_class
+            )
+            if "vc" not in tuple(getattr(integrator, "v_vars", ())):
+                raise ValueError(
+                    "Initialization transforms may reference state.integrator.vc "
+                    "only when the selected integrator declares 'vc' in v_vars. "
+                    "Build custom integrator factories before registering this "
+                    "reference if their voltage contract is not visible yet."
+                )
         shared_state_references = tuple(
             reference
             for reference in (*reads, *writes)
@@ -2718,6 +2731,13 @@ class Population(P, Sliceable):
 
         if reference == "state.integrator.v":
             target = self.v
+        elif reference == "state.integrator.vc":
+            if "vc" not in tuple(getattr(self.integrator, "v_vars", ())):
+                raise KeyError(
+                    "Initialization transform references state.integrator.vc, "
+                    "but the active integrator does not declare 'vc' in v_vars."
+                )
+            target = self._buffers.get("vc")
         elif reference == "state.clock.t":
             target = self.t
         elif reference == "state.control.duration_remainder":

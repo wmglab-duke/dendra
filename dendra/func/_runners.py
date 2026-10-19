@@ -16,7 +16,7 @@ from dendra.models.core import _duration_step_budget, _validate_time_scalar
 
 from ._binding import BoundPopulation
 from ._callbacks import FunctionalCallbackResults, FunctionalCallbacks
-from ._population import FunctionalPopulation
+from ._population import FunctionalPopulation, _tensor_binding
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
@@ -42,6 +42,7 @@ class _StepExecution:
     binding: _OwnedStepBinding | None = None
     prepared_values: Mapping[str, object] | None = None
     compiled_chunks: Mapping[int, object] | None = None
+    checkpoint_parameter_binding: tuple | None = None
 
     def __call__(self, state, inputs: StepInput):
         if self.binding is None:
@@ -177,6 +178,15 @@ def _refresh_checkpoint_execution(execution: _StepExecution, state) -> _StepExec
         binding.prepared,
         binding.parameters,
     )
+    if (
+        execution.checkpoint_parameter_binding is not None
+        and execution.checkpoint_parameter_binding
+        != _tensor_binding(binding.parameters)
+    ):
+        raise FunctionalizationError(
+            "parameters changed after checkpoint forward; run a new forward "
+            "before backward"
+        )
     return replace(execution, prepared_values=prepared_values)
 
 
@@ -865,6 +875,15 @@ def _execute_checkpointed_chunks(
     extra_tensors,
 ):
     """Execute a resolved host schedule with replay-time binding validation."""
+    if execution.binding is not None:
+        # Stimulation leaves do not contribute to physical preparation, but
+        # they are still captured by the compiled transition during replay.
+        # Snapshot every bound parameter once for this checkpointed invocation,
+        # without adding a guard or fingerprint to ordinary run/longrun paths.
+        execution = replace(
+            execution,
+            checkpoint_parameter_binding=_tensor_binding(execution.binding.parameters),
+        )
     auxiliary: Any = None
     for start in range(0, steps, chunklength):
         stop = min(start + chunklength, steps)

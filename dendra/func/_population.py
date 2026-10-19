@@ -39,9 +39,18 @@ from dendra.models.integrators.cable import (
     _layered_edge_conductance,
 )
 from dendra.models.integrators.core import _FunctionalIntegratorSpec
-from dendra.models.integrators.implicit import _bwd_euler_sc, _bwd_euler_ub
-from dendra.models.integrators.tree import _dhs
-from dendra.models.integrators.tree_bt import _tree_layered_edge_conductance
+from dendra.models.integrators.implicit import (
+    _bwd_euler_bt,
+    _bwd_euler_sc,
+    _bwd_euler_sc_multi,
+    _bwd_euler_ub,
+)
+from dendra.models.integrators.tree import _dhs, _dhs_multi
+from dendra.models.integrators.tree_bt import (
+    _dhs_bt,
+    _dhs_bt_multi,
+    _tree_layered_edge_conductance,
+)
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion
 from dendra.models.mechanisms._materials import Material
@@ -201,7 +210,17 @@ _STANDARD_POPULATION_FRESH_INITIALIZATION = {
         name: inspect.getattr_static(population_type, name)
         for name in _POPULATION_FRESH_INITIALIZATION_HOOKS
     }
-    for population_type in (Population, SingleCompartment, Unmyelinated, Tree)
+    for population_type in (
+        Population,
+        SingleCompartment,
+        Unmyelinated,
+        Myelinated,
+        Cable,
+        Tree,
+        ExtCellAxon,
+        ExtCellTree,
+        MultiPopulation,
+    )
 }
 _INTEGRATOR_FRESH_INITIALIZATION_HOOKS = ("init_v",)
 _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
@@ -209,12 +228,21 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
         name: inspect.getattr_static(implementation, name)
         for name in _INTEGRATOR_FRESH_INITIALIZATION_HOOKS
     }
-    for implementation in (_bwd_euler_sc, _bwd_euler_ub, _dhs)
+    for implementation in (
+        _bwd_euler_sc,
+        _bwd_euler_ub,
+        _dhs,
+        _bwd_euler_bt,
+        _dhs_bt,
+        _bwd_euler_sc_multi,
+        _dhs_multi,
+        _dhs_bt_multi,
+    )
 }
 
 
 def _functional_initialization_profile(population):
-    """Return the audited scalar initializer family for ``population``.
+    """Return the audited initializer family for ``population``.
 
     Population and SingleCompartment lowering remain exact-type because general
     subclasses are not admitted by the transition contract. Both use the same
@@ -224,12 +252,38 @@ def _functional_initialization_profile(population):
     checked against the canonical base separately. Canonical scalar Trees use
     the same voltage initialization and support-local mechanism transaction;
     their already-lowered graph supplies immutable geometry and support maps.
+    Myelinated and extracellular families use that same declaration-driven
+    transaction with their own canonical geometry preparation and voltage
+    initializer. A packed model initializes its consolidated parent handler;
+    imperative initialization does not run component initialization hooks.
     """
 
+    if _is_multi(population):
+        operator_kind = getattr(
+            population.integrator,
+            "_FUNCTIONAL_OPERATOR_KIND",
+            None,
+        )
+        implementation = {
+            "scalar_multi_point": _bwd_euler_sc_multi,
+            "scalar_multi": _dhs_multi,
+            "block_multi_tree": _dhs_bt_multi,
+        }.get(operator_kind)
+        if implementation is not None:
+            return MultiPopulation, operator_kind, implementation
+        return None
+    if isinstance(population, ExtCellAxon):
+        return ExtCellAxon, "block_path", _bwd_euler_bt
+    if _is_extcell_tree(population):
+        return ExtCellTree, "block_tree", _dhs_bt
     if _is_scalar_point(population):
         return type(population), "scalar_point", _bwd_euler_sc
+    if isinstance(population, Myelinated):
+        return Myelinated, "scalar_path", _bwd_euler_ub
     if isinstance(population, Unmyelinated):
         return Unmyelinated, "scalar_path", _bwd_euler_ub
+    if _is_native_cable(population):
+        return Cable, "scalar_path", _bwd_euler_ub
     if type(population) is Tree:
         return Tree, "scalar_tree", _dhs
     return None
@@ -3694,7 +3748,7 @@ def _functional_initialization_transform_failures(
         return failures
     all_state_refs = {f"state.{'.'.join(leaf.public_path)}" for leaf in state_layout}
     pre_state_refs = {
-        "state.integrator.v",
+        *(f"state.integrator.{name}" for name in population.integrator.v_vars),
         *(f"state.{'.'.join(entry.public_path)}" for entry in explicit_layout),
     }
     allowed_by_phase = {
@@ -4044,8 +4098,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
 
     Functional transition admission is intentionally broader. This initializer
     supports declared State plus canonical Ion/Material tensor transactions on
-    the exact single-compartment, structurally canonical unmyelinated, and
-    exact scalar Tree implicit-Euler topologies.
+    admitted canonical scalar, extracellular, and packed implicit topologies.
     Authored shared-field hooks and process initialization remain imperative and
     fail closed until their outputs have an explicit pure contract.
     """
@@ -4055,8 +4108,9 @@ def _functional_initialization_failures(population: Population) -> list[str]:
     if profile is None:
         failures.append(
             "functional initialization currently supports exact "
-            "Population, SingleCompartment, and structurally canonical Unmyelinated "
-            "Populations, plus exact scalar Tree Populations"
+            "Population, SingleCompartment, native Cable, and MultiPopulation, "
+            "plus exact scalar Tree and structurally canonical Unmyelinated, "
+            "Myelinated, ExtCellAxon, and ExtCellTree models"
         )
         population_family = None
         operator_kind = None
@@ -4071,9 +4125,9 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         )
         if spec is None or spec.implementation is not implementation:
             failures.append(
-                "functional initialization currently supports bwd_euler_sc "
-                "for Population/SingleCompartment, bwd_euler_ub for Unmyelinated, and "
-                "dhs for scalar Tree"
+                "functional initialization requires the canonical implicit "
+                f"integrator for {population_family.__qualname__}: "
+                f"{implementation.__qualname__}"
             )
 
     population_standards = _STANDARD_POPULATION_FRESH_INITIALIZATION.get(
@@ -4438,6 +4492,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             path = leaf.public_path
             if path in {
                 ("integrator", "v"),
+                ("integrator", "vc"),
                 ("integrator", "i_membrane"),
                 ("clock", "t"),
                 ("control", "duration_remainder"),
@@ -4507,6 +4562,41 @@ def _set_initialization_transform_value(
     )
 
 
+@torch.compiler.assume_constant_result
+def _has_empty_initialization_vmap_axis(value):
+    """Read only transform/shape metadata, never tensor values.
+
+    Dynamo guards the surrounding transform stack and operand shapes but
+    cannot trace these Functorch inspection builtins. Resolve this boolean at
+    capture time; no tensor data or numerical result is constant-folded.
+    """
+
+    unwrapped = value
+    functorch = torch._C._functorch
+    while functorch.is_functorch_wrapped_tensor(unwrapped):
+        is_batched = functorch.is_batchedtensor(unwrapped)
+        batch_axis = functorch.maybe_get_bdim(unwrapped)
+        unwrapped = functorch.get_unwrapped(unwrapped)
+        if is_batched and unwrapped.shape[batch_axis] == 0:
+            return True
+    return False
+
+
+def _initialization_transform_scalar_input(value):
+    """Avoid empty-vmap scalar broadcasting without changing ordinary ranks.
+
+    PyTorch's scalar batching rule selects lane zero when an empty hidden
+    scalar lane meets an unbatched nonscalar tensor. One visible singleton
+    avoids that rule and still permits authored expand_as calls against both
+    physical voltage and circuit-potential payloads. Other inputs retain the
+    exact authored shape, including normal and nonempty-vmap scalar inputs.
+    """
+
+    if value.ndim == 0 and _has_empty_initialization_vmap_axis(value):
+        return value.reshape(1)
+    return value
+
+
 def _apply_initialization_transforms(
     initialization,
     phase: str,
@@ -4533,28 +4623,16 @@ def _apply_initialization_transforms(
             _initialization_transform_value(parameters, state, reference)
             for reference in action.writes
         )
-        # A scalar BatchedTensor cannot currently broadcast against an
-        # unbatched matrix when vmap has zero lanes. Give explicit inputs the
-        # visible rank of this action, then remove only this framework-created
-        # leading singleton padding from lower-rank outputs below.
-        visible_rank = 0
-        for value in (*read_values, *write_targets):
-            if value.ndim > visible_rank:
-                visible_rank = value.ndim
-        padded_explicit_inputs = any(
-            value.ndim < visible_rank for value in explicit_values
+        padded_values = tuple(
+            _initialization_transform_scalar_input(value) for value in explicit_values
         )
-        explicit_values = tuple(
-            (
-                value.reshape((1,) * (visible_rank - value.ndim) + tuple(value.shape))
-                if value.ndim < visible_rank
-                else value
-            )
-            for value in explicit_values
+        padded_explicit_inputs = any(
+            value.ndim != padded.ndim
+            for value, padded in zip(explicit_values, padded_values, strict=True)
         )
         arguments = tuple(
             value.clone(memory_format=torch.preserve_format)
-            for value in (*read_values, *explicit_values)
+            for value in (*read_values, *padded_values)
         )
         versions = (
             None
@@ -4644,6 +4722,29 @@ def _reset_functional_initialization_clock(state):
     return state
 
 
+def _fresh_initialization_pre_state(template, v_init):
+    """Reconstruct init_v's voltage frame before authored pre transforms.
+
+    Extracellular initialization sets intracellular absolute potential to the
+    requested membrane voltage and both shell potentials to zero. Do this
+    before transforms: a pre hook may intentionally replace v and vc
+    independently, just as it can after imperative init_v.
+    """
+
+    state = torch.utils._pytree.tree_map(lambda value: value, template)
+    state["integrator"]["v"] = v_init
+    if "vc" in state["integrator"]:
+        zero = torch.zeros_like(v_init)
+        state["integrator"]["vc"] = torch.stack((v_init, zero, zero), dim=-1)
+    return state
+
+
+def _initialization_voltage_kwargs(state):
+    """Keep the scalar call signature unchanged while passing block init_v."""
+
+    return {"vc_init": state["integrator"]["vc"]} if "vc" in state["integrator"] else {}
+
+
 def _pad_to_visible_rank(value, reference):
     """Right-align a low-rank tensor with a functional shared-field frame."""
 
@@ -4678,7 +4779,7 @@ class _PopulationInitialization(torch.nn.Module):
             if mechanism.DE
         )
 
-    def forward(self, v_init, *explicit_values):
+    def forward(self, v_init, *explicit_values, vc_init=None):
         if len(explicit_values) != len(self.explicit_layout):
             raise FunctionalizationError(
                 "functional initialization received the wrong number of explicit "
@@ -4689,6 +4790,11 @@ class _PopulationInitialization(torch.nn.Module):
         # voltage copy before any Mechanism/State initialization runs. Keep
         # the ownership/layout semantics while retaining the functional graph.
         initial_voltage = v_init.clone(memory_format=torch.contiguous_format)
+        initial_circuit_voltage = (
+            None
+            if vc_init is None
+            else vc_init.clone(memory_format=torch.contiguous_format)
+        )
         state_overrides = {}
         for mechanism_name, override_plan in self.mechanism_plan:
             mechanism = self.population.mech.mechanisms[mechanism_name]
@@ -4718,6 +4824,8 @@ class _PopulationInitialization(torch.nn.Module):
         for leaf in self.layout:
             if leaf.public_path == ("integrator", "v"):
                 value = initial_voltage
+            elif leaf.public_path == ("integrator", "vc"):
+                value = initial_circuit_voltage
             elif leaf.public_path == ("integrator", "i_membrane"):
                 # Integrator.init_v resets this diagnostic before the first
                 # accepted step; it is not an initialized ionic-current sum.
@@ -7877,6 +7985,28 @@ class FunctionalPopulation:
             *self._population_parameter_names,
             *tuple(stimulation_schema),
         )
+        unavailable_initialization_parameters = sorted(
+            {
+                reference.removeprefix("parameters.")
+                for phase in ("pre", "post")
+                for hook in _initialization_transform_hooks(population, phase)
+                for action in (population._initialization_transforms[hook.action_name],)
+                for reference in (*action.reads, *action.writes)
+                if reference.startswith("parameters.")
+                and reference.removeprefix("parameters.")
+                not in self._population_parameter_names
+            }
+        )
+        if unavailable_initialization_parameters:
+            # Packed parents intentionally omit child runtime parameters such
+            # as their private temperature copies. Transforms may address only
+            # canonical public leaves, not discarded component configuration.
+            self._initialization_failures = (
+                *self._initialization_failures,
+                "initialization transforms reference parameters outside the "
+                "canonical functional parameter mapping: "
+                f"{unavailable_initialization_parameters}",
+            )
         self._parameter_shapes = {
             name: _shape_tuple(parameter)
             for name, parameter in population_parameters.items()
@@ -9095,11 +9225,10 @@ class FunctionalPopulation:
         initialization_transform_values = (
             {} if inputs.transforms is None else inputs.transforms
         )
-        pre_state = torch.utils._pytree.tree_map(
-            lambda value: value,
+        pre_state = _fresh_initialization_pre_state(
             self._initialization_state_template,
+            inputs.v_init,
         )
-        _put_path(pre_state, ("integrator", "v"), inputs.v_init)
         for entry in self._initialization_state_layout:
             _put_path(
                 pre_state,
@@ -9135,6 +9264,7 @@ class FunctionalPopulation:
                     for entry in self._initialization_state_layout
                 ),
             ),
+            _initialization_voltage_kwargs(pre_state),
             tie_weights=False,
         )
         state = {}
@@ -10501,11 +10631,10 @@ class FunctionalPopulation:
                             strict=True,
                         )
                     )
-                    pre_state = torch.utils._pytree.tree_map(
-                        lambda value: value,
+                    pre_state = _fresh_initialization_pre_state(
                         self._initialization_state_template,
+                        v_init,
                     )
-                    _put_path(pre_state, ("integrator", "v"), v_init)
                     for entry, value in zip(
                         self._initialization_state_layout,
                         explicit_values,
@@ -10548,6 +10677,7 @@ class FunctionalPopulation:
                         audit_initialization,
                         mapping,
                         (initialized_v, *initialized_explicit),
+                        _initialization_voltage_kwargs(pre_state),
                         tie_weights=False,
                     )
                     state = {}

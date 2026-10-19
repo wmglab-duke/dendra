@@ -7,6 +7,7 @@ Run from the repository root::
     python examples/functional_compiled_runner.py --execution while --threads 4
     python examples/functional_compiled_runner.py --execution scan --grad
     python examples/functional_compiled_runner.py --grad --checkpoint-every 3
+    python examples/functional_compiled_runner.py --extra --grad --checkpoint-every 4
 
 Recording is selected explicitly through the callback mapping. Inductor uses
 the C++ loop wrapper by default for CPU inference. The first call
@@ -52,6 +53,9 @@ def main():
     parser.add_argument("--threads", choices=(1, 4), type=int, default=1)
     parser.add_argument("--grad", action="store_true", help="differentiate scan twice")
     parser.add_argument(
+        "--extra", action="store_true", help="bind an extracellular field and waveform"
+    )
+    parser.add_argument(
         "--checkpoint-every",
         type=int,
         help="recompute training scan spans of this many steps during backward",
@@ -68,15 +72,36 @@ def main():
 
     model = make_model(gradients=args.grad)
     original_voltage = model.v.detach().clone()
-    runner = dn.func.compile(
+    extra = None
+    trainable = ["gnabar"] if args.grad else []
+    if args.extra:
+        field = torch.linspace(
+            -1.0,
+            1.0,
+            model.v.numel(),
+            device=model.v.device,
+            dtype=model.v.dtype,
+        ).reshape(model.shape)  # Toy unit-current field [mV/mA].
+        extra = (field, dn.sin(amp=0.1, freq=0.7, phase=0.2))  # Amplitude [mA].
+        if args.grad:
+            trainable.extend(
+                (
+                    "stimulation.extra.contacts.0.field",
+                    "stimulation.extra.waveforms.0.amp",
+                    "stimulation.extra.waveforms.0.freq",
+                    "stimulation.extra.waveforms.0.phase",
+                )
+            )
+    runner = dn.compile(
         model,
         dt=0.01,
         steps=8,
+        extra=extra,
         execution=args.execution,
         callbacks={"trace": dn.func.Recorder(("v", "t"))},
         inference=not args.grad,
         checkpoint_every=args.checkpoint_every,
-        trainable=("gnabar",) if args.grad else (),
+        trainable=trainable,
         backend=args.backend,
     )
 

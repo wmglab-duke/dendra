@@ -319,6 +319,66 @@ def test_real_unmyelinated_subclass_fresh_initialization_parity_and_grad(case):
     assert torch.count_nonzero(gradient) > 0
 
 
+@pytest.mark.cpu
+@pytest.mark.skipif(
+    not DENDRA_SOLVERS_AVAILABLE,
+    reason="MRG fresh initialization requires the native CPU block solver",
+)
+@pytest.mark.parametrize(
+    ("model_name", "diameter"),
+    (("bigMRG", 8.0), ("smolMRG", 2.0), ("exactMRG", 5.7)),
+)
+def test_real_mrg_fresh_initialization_parity_and_gate_voltage_gradient(
+    model_name, diameter
+):
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        source = _mrg(model_name, diameter)
+        functional, tensors = dn.func.make_functional(source, dt=DT)
+        voltage = torch.linspace(
+            -84.0,
+            -70.0,
+            source.v.numel(),
+            dtype=source.dtype(),
+            device=source.device(),
+        ).reshape(source.shape)
+        initialized = functional.initialize(
+            tensors.parameters,
+            tensors.constants,
+            tensors.initialization._replace(v_init=voltage),
+        )
+        reference = _mrg(model_name, diameter)
+        reference.set_v_init(voltage)
+        reference.initialize()
+        expected = functional.extract(reference)
+        _assert_every_leaf_close(initialized.state, expected.state, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            initialized.state["integrator"]["vc"][..., 0], voltage
+        )
+        assert torch.count_nonzero(initialized.state["integrator"]["vc"][..., 1:]) == 0
+
+        def gate_loss(initial_voltage):
+            state = functional.initialize(
+                tensors.parameters,
+                tensors.constants,
+                tensors.initialization._replace(v_init=initial_voltage),
+            ).state
+            return sum(
+                value.square().mean()
+                for mechanism_state in state["mechanisms"].values()
+                for value in mechanism_state.values()
+            )
+
+        # Gate-only loss excludes the direct returned-voltage identity, so
+        # this checks genuine dependence through fresh physiological gating.
+        gradient = torch.func.grad(gate_loss)(voltage)
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient) > 0
+    finally:
+        torch.set_num_threads(previous)
+
+
 @pytest.mark.parametrize(
     "case",
     BALANCED_INITIALIZATION_MODEL_CASES,
