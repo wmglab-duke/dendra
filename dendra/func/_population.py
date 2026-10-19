@@ -56,6 +56,7 @@ from dendra.models.mechanisms._ions import Ion
 from dendra.models.mechanisms._material_process import (
     ClampProcess,
     ClearanceProcess,
+    ExchangeProcess,
     MaterialProcess,
 )
 from dendra.models.mechanisms._materials import Material
@@ -229,6 +230,33 @@ _MATERIAL_PROCESS_CONTRACTS = (
             "_clamp_domain",
             "_clamp_mask_names",
             "_clamp_operator_keys",
+        ),
+    ),
+    _MaterialProcessContract(
+        ExchangeProcess,
+        "exchange",
+        (
+            "_configure_exchange_material_plan",
+            "_exchange_volume_is_geometry",
+            "_exchange_operand",
+            "_validate_exchange_operand",
+            "_configure_exchange_geometry",
+            "_set_exchange_geometry_buffer",
+            "_validate_exchange_specs",
+            "_effective_exchange_domain",
+            "_geometry_volume_for_domain",
+            "_resolve_exchange_volume",
+        ),
+        ("_exchange_specs",),
+        (
+            "_exchange_material_plan",
+            "_exchange_method",
+            "_exchange_domain",
+            "_exchange_eps",
+            "_exchange_require_volumes",
+            "_exchange_allow_negative_rate",
+            "_exchange_geometry_sources",
+            "_exchange_analytic_area",
         ),
     ),
 )
@@ -1631,6 +1659,20 @@ def _material_process_failures(process, population=None):
         return [f"{family} requires its owning MechanismHandler material resolver"]
     if process.key is not None:
         return [f"functional {family} requires global insertion"]
+    if population is not None:
+        for _buffer_name, source_name in _material_process_geometry_sources(process):
+            if source_name not in {
+                "dx",
+                "area",
+                "canonical_area_cm2",
+                "component_area",
+            } and source_name not in (
+                population._buffers.keys() | population._parameters.keys()
+            ):
+                return [
+                    f"{family} geometry {source_name!r} must be a directly "
+                    "registered population buffer or Parameter"
+                ]
     if not getattr(process, f"_{contract.prefix}_material_plan", ()):
         return [f"{family} is missing its configured material field plan"]
     return []
@@ -1724,6 +1766,27 @@ def _material_process_operand_references(process):
             yield from references
             if mask_name is not None:
                 yield "buffer", mask_name
+    elif isinstance(process, ExchangeProcess):
+        for (
+            _a,
+            _b,
+            kinetic,
+            _conductance,
+            volume_a,
+            volume_b,
+            *_domains,
+        ) in process._exchange_material_plan:
+            yield kinetic
+            yield volume_a
+            yield volume_b
+
+
+def _material_process_geometry_sources(process):
+    """Numerical population dependencies declared by a canonical process."""
+    contract = _material_process_contract(process)
+    if contract is None:
+        return ()
+    return getattr(process, f"_{contract.prefix}_geometry_sources", ())
 
 
 def _prepared_material_advance(self, dt):
@@ -1738,6 +1801,14 @@ def _prepared_material_advance(self, dt):
 def _install_material_preparation(population, dt):
     """Give the private transition fixed tensor slots for pure process outputs."""
     for process in population.mech.material_processes.values():
+        for buffer_name, source_name in _material_process_geometry_sources(process):
+            if source_name in {"area", "canonical_area_cm2", "component_area"}:
+                # Freeze one logical frame for compact canonical geometry and
+                # explicitly batched packed components alike. This affects
+                # only the private lowering clone, not imperative storage.
+                process._buffers[buffer_name] = torch.broadcast_to(
+                    process._buffers[buffer_name], population.shape
+                )
         fields = _material_fields(population, process)
         values = process.prepare_materials(fields, dt)
         leaves, tree_spec = torch.utils._pytree.tree_flatten(values)
@@ -2793,7 +2864,15 @@ class _PopulationPreparation(torch.nn.Module):
             )
 
     def forward(
-        self, diam, dx, diameters, diam_original, dt, *, for_initialization=False
+        self,
+        diam,
+        dx,
+        diameters,
+        diam_original,
+        dt,
+        *,
+        for_initialization=False,
+        material_area=None,
     ):
         if for_initialization:
             # INITIAL/defaults and ordinary parameter/derived builders see the
@@ -2827,6 +2906,28 @@ class _PopulationPreparation(torch.nn.Module):
 
         handler = self.population.mech
         handler._sync_celsius(celsius)
+        # Spatial material weights must follow the explicit live geometry,
+        # not configure-time snapshots. Canonical Tree/Cable areas and packed
+        # component areas are supplied by their physical adapters; analytic
+        # processes derive cylindrical area from the rebound diameter/dx.
+        for process in handler.material_processes.values():
+            for buffer_name, source_name in _material_process_geometry_sources(process):
+                if source_name == "dx":
+                    value = dx
+                elif source_name in {"area", "canonical_area_cm2", "component_area"}:
+                    if material_area is None:
+                        raise FunctionalizationError(
+                            "Material area preparation requires the explicit "
+                            "canonical or packed component area"
+                        )
+                    # Population.area may expose an expanded logical batch
+                    # frame even when its canonical source is compact. Keep
+                    # the established process operand schema without copying
+                    # or severing the source geometry's gradient connection.
+                    value = torch.broadcast_to(material_area, self.population.shape)
+                else:
+                    value = getattr(self.population, source_name)
+                process._buffers[buffer_name] = value
         geometry = {"diam": effective_diam, "dx": dx}
         local_geometry = []
         for binding in self.geometry_bindings:
@@ -5950,6 +6051,15 @@ def _parametrization_constant_layout_for_owners(
                     public_constant_by_identity.setdefault(
                         id(value), f"material_processes.{owner.name}.{name}"
                     )
+        for _buffer_name, source_name in _material_process_geometry_sources(owner):
+            if source_name in {"dx", "area", "canonical_area_cm2", "component_area"}:
+                continue  # explicit physical-adapter inputs
+            route_resident_dependency(
+                population, source_name, role="material process geometry"
+            )
+            value = population._buffers.get(source_name)
+            if torch.is_tensor(value):
+                public_constant_by_identity.setdefault(id(value), source_name)
         for target_name, transforms in owner.in_graph_parametrizations.items():
             if target_name not in available_names:
                 raise FunctionalizationError(
@@ -6142,6 +6252,36 @@ def _in_graph_transform_parameter_names(population) -> set[str]:
     return names
 
 
+def _material_preparation_parameter_names(population) -> set[str]:
+    """Raw leaves with an audited declaration/geometry preparation schema.
+
+    Material coefficients may be scalar, node-, or edge-aligned. Their raw
+    shapes are checked by the shared raw-to-effective builder and the pure
+    process preparation, rather than the scalar-only voltage-mechanism slice.
+    Every accepted shape is still frozen into the resulting tensor schema.
+    """
+    canonical_by_identity = {
+        id(parameter): name for name, parameter in population.named_parameters()
+    }
+    identities = set()
+    handler = getattr(population, "mech", None)
+    if handler is None:
+        return set()
+    for process in handler.material_processes.values():
+        if _material_process_contract(process) is None:
+            continue
+        identities.update(id(parameter) for parameter in process.parameters())
+        for _buffer_name, source_name in _material_process_geometry_sources(process):
+            value = population._parameters.get(source_name)
+            if value is not None:
+                identities.add(id(value))
+    return {
+        canonical_by_identity[identity]
+        for identity in identities
+        if identity in canonical_by_identity
+    }
+
+
 def _shared_initial_parameter_target_shapes(
     population,
     parameter_name_by_identity: Mapping[int, str],
@@ -6224,6 +6364,12 @@ def _parameter_buffer_alias_conflicts(population) -> tuple[tuple, ...]:
             )
 
     consumed_parameter_ids = set()
+    material_parameter_names = _material_preparation_parameter_names(population)
+    consumed_parameter_ids.update(
+        identity
+        for identity, name in parameter_name_by_identity.items()
+        if name in material_parameter_names
+    )
     for _owner_path, owner in _parameterized_owner_paths(population):
         for transforms in owner.in_graph_parametrizations.values():
             for transform, args in transforms:
@@ -6986,6 +7132,7 @@ def _functionalization_failures(
         }
     regional_parameter_names = _additional_parameter_raw_names(population)
     transform_parameter_names = _in_graph_transform_parameter_names(population)
+    transform_parameter_names.update(_material_preparation_parameter_names(population))
     shared_initial_targets = _shared_initial_parameter_target_shapes(
         population,
         parameter_name_by_identity,
@@ -9454,6 +9601,7 @@ class FunctionalPopulation:
         preparation=None,
         base_mapping=None,
         for_initialization=False,
+        material_area=None,
     ):
         preparation = self._preparation if preparation is None else preparation
         base_mapping = (
@@ -9481,7 +9629,12 @@ class FunctionalPopulation:
                 None if diam_original is None else diam_original.clone(),
                 dt.clone(),
             ),
-            {"for_initialization": for_initialization},
+            {
+                "for_initialization": for_initialization,
+                "material_area": (
+                    None if material_area is None else material_area.clone()
+                ),
+            },
             tie_weights=False,
         )
         if preparation.local_geometry_bindings:
@@ -9734,6 +9887,7 @@ class FunctionalPopulation:
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
+                material_area=constants.get("canonical_area_cm2"),
             )
         )
         diam = population_values.get("diam", diam)
@@ -10291,6 +10445,7 @@ class FunctionalPopulation:
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
+                material_area=full_fields["point_area"],
             )
         )
         for name in (

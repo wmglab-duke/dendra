@@ -1261,6 +1261,7 @@ class ExchangeProcess(MaterialProcess):
     floating-point roundoff on compartments with positive volumes.
     """
 
+    _functional_material_family = "exchange"
     _exchange_specs: tuple[ExchangeSpec, ...] = tuple()
     _exchange_declarations = []
 
@@ -1398,6 +1399,7 @@ class ExchangeProcess(MaterialProcess):
                 "ExchangeProcess.EXCHANGE(...)."
             )
         self._validate_exchange_specs()
+        self._configure_exchange_material_plan()
         return None
 
     def _set_exchange_geometry_buffer(self, name: str, value: torch.Tensor) -> None:
@@ -1408,33 +1410,255 @@ class ExchangeProcess(MaterialProcess):
 
     def _configure_exchange_geometry(self, population=None):
         if population is None:
+            if not hasattr(self, "_exchange_geometry_sources"):
+                self._exchange_geometry_sources = ()
+                self._exchange_analytic_area = False
             return None
 
+        sources = []
         for name in ("volume", "volume_um3", "volume_i", "volume_o"):
             if hasattr(population, name):
                 value = getattr(population, name)
                 if torch.is_tensor(value):
-                    self._set_exchange_geometry_buffer(
-                        f"_mp_{name}", value.detach().clone()
-                    )
+                    self._set_exchange_geometry_buffer(f"_mp_{name}", value)
+                    sources.append((f"_mp_{name}", name))
 
         if hasattr(population, "dx"):
             value = getattr(population, "dx")
             if torch.is_tensor(value):
-                self._set_exchange_geometry_buffer("_mp_dx", value.detach().clone())
+                self._set_exchange_geometry_buffer("_mp_dx", value)
+                sources.append(("_mp_dx", "dx"))
 
+        component_area = getattr(population, "_component_area", None)
+        canonical_graph = getattr(population, "compartment_graph", None)
+        graph = getattr(population, "graph", None)
+        # A packed population's area is its exact component area, not the
+        # cylindrical area of the concatenated parent diameter/length arrays.
+        self._exchange_analytic_area = (
+            not torch.is_tensor(component_area)
+            and canonical_graph is None
+            and graph is None
+            and hasattr(population, "diam")
+            and any(name == "_mp_dx" for name, _source in sources)
+        )
         try:
             area = population.area
-            if torch.is_tensor(area):
-                # Population.area is in cm^2; convert to µm^2 for surface-like
-                # material masses.  This is available for future membrane-domain
-                # processes, but ExchangeProcess does not require it.
-                self._set_exchange_geometry_buffer(
-                    "_mp_area_um2", (area.detach().clone() * 1e8)
+            if torch.is_tensor(area) and not self._exchange_analytic_area:
+                # Retain raw geometry inputs, never a detached snapshot or a
+                # converted AD graph that a previous backward might consume.
+                self._set_exchange_geometry_buffer("_mp_area_cm2", area)
+                area_source = (
+                    "component_area"
+                    if torch.is_tensor(component_area)
+                    else "canonical_area_cm2"
+                    if canonical_graph is not None or graph is not None
+                    else "area"
                 )
+                # Area labels identify physical adapters, not necessarily a
+                # same-named Population buffer. Functional preparation supplies
+                # canonical or packed component area explicitly.
+                sources.append(("_mp_area_cm2", area_source))
         except Exception:
             pass
+        previous = getattr(self, "_exchange_geometry_sources", ())
+        current_names = {name for name, _source in sources}
+        for name, _source in previous:
+            if name not in current_names:
+                self._buffers.pop(name, None)
+        self._exchange_geometry_sources = tuple(sources)
         return None
+
+    @staticmethod
+    def _exchange_volume_is_geometry(value):
+        return value is None or (
+            isinstance(value, str)
+            and value.lower()
+            in {
+                "domain",
+                "field",
+                "auto",
+                "i",
+                "inside",
+                "intra",
+                "cytosol",
+                "cytosolic",
+                "intracellular",
+                "o",
+                "outside",
+                "extra",
+                "extracellular",
+                "membrane",
+                "surface",
+                "volume",
+                "volume_i",
+                "volume_um3",
+                "intracellular_volume",
+                "volume_o",
+                "extracellular_volume",
+                "area",
+                "surface_area",
+                "membrane_area",
+            }
+        )
+
+    def _configure_exchange_material_plan(self):
+        entries = []
+        for index, spec in enumerate(type(self)._exchange_specs):
+            uses_conductance = spec.conductance is not None
+            kinetics = spec.conductance if uses_conductance else spec.rate
+            operands = []
+            for role, value in (
+                ("conductance" if uses_conductance else "rate", kinetics),
+                ("volume_a", spec.volume_a),
+                ("volume_b", spec.volume_b),
+            ):
+                if role.startswith("volume_") and self._exchange_volume_is_geometry(
+                    value
+                ):
+                    operands.append(("geometry", value))
+                elif isinstance(value, str):
+                    operands.append(("named", value))
+                elif isinstance(value, Number):
+                    operands.append(("scalar", value))
+                else:
+                    literal = (
+                        value if torch.is_tensor(value) else torch.as_tensor(value)
+                    )
+                    name = f"_exchange_literal_{index}_{role}"
+                    if name in self._buffers:
+                        self._buffers[name] = literal
+                    else:
+                        self.register_buffer(name, literal, persistent=False)
+                    operands.append(("buffer", name))
+            ma = self._get_material(spec.material_a)
+            mb = self._get_material(spec.material_b)
+            key_a = (_canonical_material_name(spec.material_a), spec.field_a)
+            key_b = (_canonical_material_name(spec.material_b), spec.field_b)
+            entries.append(
+                (
+                    key_a,
+                    key_b,
+                    operands[0],
+                    uses_conductance,
+                    operands[1],
+                    operands[2],
+                    self._effective_exchange_domain(ma, spec.field_a, spec.domain_a),
+                    self._effective_exchange_domain(mb, spec.field_b, spec.domain_b),
+                )
+            )
+        self._exchange_material_plan = tuple(entries)
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            dict.fromkeys(
+                key for entry in self._exchange_material_plan for key in entry[:2]
+            )
+        )
+
+    def _exchange_operand(self, reference, like, *, what, volume=False, domain=None):
+        kind, value = reference
+        if kind == "buffer":
+            return self._buffers[value].to(device=like.device, dtype=like.dtype)
+        if volume:
+            return self._resolve_exchange_volume(value, like, domain=domain, what=what)
+        return self._resolve_quantity(value, like, what=what)
+
+    @staticmethod
+    def _validate_exchange_operand(value, like, *, what):
+        if torch.broadcast_shapes(value.shape, like.shape) != like.shape:
+            raise ValueError(
+                f"Exchange {what} shape {tuple(value.shape)} must broadcast to "
+                f"the full material field shape {tuple(like.shape)}."
+            )
+
+    def prepare_materials(self, fields: Mapping[tuple[str, str], torch.Tensor], dt):
+        prepared = []
+        for (
+            key_a,
+            key_b,
+            kinetic,
+            uses_conductance,
+            volume_a,
+            volume_b,
+            domain_a,
+            domain_b,
+        ) in self._exchange_material_plan:
+            a, b = fields[key_a], fields[key_b]
+            if a.shape != b.shape:
+                raise ValueError(
+                    "Exchange fields must have identical full material field shapes."
+                )
+            Va = self._exchange_operand(
+                volume_a, a, volume=True, domain=domain_a, what="exchange volume_a"
+            )
+            Vb = self._exchange_operand(
+                volume_b, a, volume=True, domain=domain_b, what="exchange volume_b"
+            )
+            coefficient = self._exchange_operand(
+                kinetic,
+                a,
+                what="exchange conductance" if uses_conductance else "exchange rate",
+            )
+            dt_t = torch.as_tensor(dt, device=a.device, dtype=a.dtype)
+            for value, what in (
+                (Va, "volume_a"),
+                (Vb, "volume_b"),
+                (coefficient, "coefficient"),
+                (dt_t, "timestep"),
+            ):
+                self._validate_exchange_operand(value, a, what=what)
+            eps_t = torch.as_tensor(self._exchange_eps, device=a.device, dtype=a.dtype)
+            active = (Va > eps_t) & (Vb > eps_t)
+            # Inactive pairs are identities, so use finite dummy weights there.
+            # Tiny clamp-only weights can overflow reciprocal derivatives in
+            # float32 even behind a later, inactive torch.where branch.
+            Va_safe = torch.where(
+                active, torch.clamp_min(Va, eps_t), torch.ones_like(Va)
+            )
+            Vb_safe = torch.where(
+                active, torch.clamp_min(Vb, eps_t), torch.ones_like(Vb)
+            )
+            if not self._exchange_allow_negative_rate:
+                coefficient = torch.clamp_min(coefficient, 0.0)
+            g = coefficient if uses_conductance else coefficient * Va_safe
+            if not self._exchange_allow_negative_rate:
+                g = torch.clamp_min(g, 0.0)
+            prepared.append((dt_t, Va_safe, Vb_safe, active, g))
+        return tuple(prepared)
+
+    def material_updates(
+        self, fields: Mapping[tuple[str, str], torch.Tensor], prepared
+    ):
+        if len(prepared) != len(self._exchange_material_plan):
+            raise ValueError(
+                "Exchange preparation does not match its declared field plan."
+            )
+        updates = {}
+        for entry, (dt_t, Va_safe, Vb_safe, active, g) in zip(
+            self._exchange_material_plan, prepared
+        ):
+            key_a, key_b = entry[:2]
+            a = updates.get(key_a, fields[key_a])
+            b = updates.get(key_b, fields[key_b]).to(device=a.device, dtype=a.dtype)
+            diff = a - b
+            if self._exchange_method == "explicit":
+                flux = g * diff
+                a_new = a - dt_t * flux / Va_safe
+                b_new = b + dt_t * flux / Vb_safe
+            else:
+                lam = g * (1.0 / Va_safe + 1.0 / Vb_safe)
+                if self._exchange_method == "implicit":
+                    diff_new = diff / (1.0 + dt_t * lam)
+                else:
+                    diff_new = diff * torch.exp(-dt_t * lam)
+                total = Va_safe * a + Vb_safe * b
+                denom = Va_safe + Vb_safe
+                a_new = (total + Vb_safe * diff_new) / denom
+                b_new = (total - Va_safe * diff_new) / denom
+            updates[key_a] = torch.where(active, a_new, a)
+            updates[key_b] = torch.where(active, b_new, b)
+        return updates
 
     def _validate_exchange_specs(self):
         for spec in type(self)._exchange_specs:
@@ -1450,7 +1674,7 @@ class ExchangeProcess(MaterialProcess):
                     f"Material {spec.material_b!r} has no field {spec.field_b!r}. "
                     f"Available fields: {mb.fields}."
                 )
-            if spec.material_a == spec.material_b and spec.field_a == spec.field_b:
+            if ma is mb and spec.field_a == spec.field_b:
                 raise ValueError("ExchangeProcess cannot exchange a field with itself.")
             self._effective_exchange_domain(ma, spec.field_a, spec.domain_a)
             self._effective_exchange_domain(mb, spec.field_b, spec.domain_b)
@@ -1488,8 +1712,12 @@ class ExchangeProcess(MaterialProcess):
                 return _buf("_mp_volume_o")
 
         if domain == "membrane":
-            if "_mp_area_um2" in self._buffers:
-                return _buf("_mp_area_um2")
+            if self._exchange_analytic_area and "_mp_dx" in self._buffers:
+                return (
+                    torch.pi * self.diam.to(device=device, dtype=dtype) * _buf("_mp_dx")
+                )
+            if "_mp_area_cm2" in self._buffers:
+                return _buf("_mp_area_cm2") * 1e8
 
         if self._exchange_require_volumes:
             raise NotImplementedError(
@@ -1507,32 +1735,6 @@ class ExchangeProcess(MaterialProcess):
 
         if isinstance(value, str):
             lower = value.lower()
-            domain_words = {
-                "domain",
-                "field",
-                "auto",
-                "i",
-                "inside",
-                "intra",
-                "cytosol",
-                "cytosolic",
-                "intracellular",
-                "o",
-                "outside",
-                "extra",
-                "extracellular",
-                "membrane",
-                "surface",
-                "volume",
-                "volume_i",
-                "volume_um3",
-                "intracellular_volume",
-                "volume_o",
-                "extracellular_volume",
-                "area",
-                "surface_area",
-                "membrane_area",
-            }
             if lower in {"domain", "field", "auto"}:
                 return self._geometry_volume_for_domain(domain, like, what=what)
             if lower in {"volume", "volume_um3"}:
@@ -1554,7 +1756,7 @@ class ExchangeProcess(MaterialProcess):
                 )
             if lower in {"area", "surface_area", "membrane_area"}:
                 return self._geometry_volume_for_domain("membrane", like, what=what)
-            if lower in domain_words:
+            if self._exchange_volume_is_geometry(value):
                 return self._geometry_volume_for_domain(value, like, what=what)
             # Otherwise interpret the string as a RANGE/GLOBAL parameter/buffer name.
             return self._resolve_quantity(value, like, what=what)
@@ -1562,75 +1764,6 @@ class ExchangeProcess(MaterialProcess):
         if torch.is_tensor(value):
             return value.to(device=like.device, dtype=like.dtype)
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
-
-    def _exchange_conductance(
-        self, spec: ExchangeSpec, a: torch.Tensor, Va: torch.Tensor
-    ):
-        if spec.conductance is not None:
-            g = self._resolve_quantity(spec.conductance, a, what="exchange conductance")
-        else:
-            rate = self._resolve_quantity(spec.rate, a, what="exchange rate")
-            if not self._exchange_allow_negative_rate:
-                rate = torch.clamp_min(rate, 0.0)
-            g = rate * Va
-        if not self._exchange_allow_negative_rate:
-            g = torch.clamp_min(g, 0.0)
-        return g
-
-    def advance_materials(self, dt):
-        dt_t = None
-        transaction = _MaterialFieldTransaction()
-        for spec in type(self)._exchange_specs:
-            ma = self._get_material(spec.material_a)
-            mb = self._get_material(spec.material_b)
-            a = transaction.read(ma, spec.field_a)
-            b = transaction.read(mb, spec.field_b)
-
-            if dt_t is None:
-                dt_t = torch.as_tensor(dt, device=a.device, dtype=a.dtype)
-            else:
-                dt_t = dt_t.to(device=a.device, dtype=a.dtype)
-
-            domain_a = self._effective_exchange_domain(ma, spec.field_a, spec.domain_a)
-            domain_b = self._effective_exchange_domain(mb, spec.field_b, spec.domain_b)
-
-            Va = self._resolve_exchange_volume(
-                spec.volume_a, a, domain=domain_a, what="exchange volume_a"
-            )
-            Vb = self._resolve_exchange_volume(
-                spec.volume_b, b, domain=domain_b, what="exchange volume_b"
-            ).to(device=a.device, dtype=a.dtype)
-            b = b.to(device=a.device, dtype=a.dtype)
-
-            eps_t = torch.as_tensor(self._exchange_eps, device=a.device, dtype=a.dtype)
-            Va_safe = torch.clamp_min(Va, eps_t)
-            Vb_safe = torch.clamp_min(Vb, eps_t)
-            active = (Va > eps_t) & (Vb > eps_t)
-
-            g = self._exchange_conductance(spec, a, Va_safe)
-            diff = a - b
-
-            if self._exchange_method == "explicit":
-                flux = g * diff
-                a_new = a - dt_t * flux / Va_safe
-                b_new = b + dt_t * flux / Vb_safe
-            else:
-                lam = g * (1.0 / Va_safe + 1.0 / Vb_safe)
-                if self._exchange_method == "implicit":
-                    diff_new = diff / (1.0 + dt_t * lam)
-                else:  # exact
-                    diff_new = diff * torch.exp(-dt_t * lam)
-                total = Va_safe * a + Vb_safe * b
-                denom = Va_safe + Vb_safe
-                a_new = (total + Vb_safe * diff_new) / denom
-                b_new = (total - Va_safe * diff_new) / denom
-
-            a_new = torch.where(active, a_new, a)
-            b_new = torch.where(active, b_new, b)
-
-            transaction.write(ma, spec.field_a, a_new)
-            transaction.write(mb, spec.field_b, b_new)
-        transaction.commit()
 
 
 class DiffusionProcess(MaterialProcess):

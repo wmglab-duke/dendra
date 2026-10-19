@@ -28,7 +28,10 @@ from tests.func.test_functional_initialization import (
     _module_snapshot,
 )
 from tests.func.test_material_processes import (
+    RESERVOIR,
     _arguments,
+    _canonical_exchange_geometry,
+    _exchange_continuation,
     _exercise,
     _gradients,
     _material_oracle,
@@ -49,7 +52,7 @@ def _compiler_warnings():
         yield
 
 
-def _assert_coverage(recorded, gradients, *, block, dtype, steps=STEPS):
+def _assert_coverage(recorded, gradients, *, block, dtype, steps=STEPS, family="clamp"):
     assert {
         "v",
         "i_membrane",
@@ -76,8 +79,7 @@ def _assert_coverage(recorded, gradients, *, block, dtype, steps=STEPS):
         )
         assert torch.count_nonzero(recorded["vc"][0, ..., 1:]) == 0
     if gradients:
-        assert len(gradients) == 18
-        assert {
+        expected = {
             "stimulus",
             "initial_voltage",
             "gnabar",
@@ -92,11 +94,36 @@ def _assert_coverage(recorded, gradients, *, block, dtype, steps=STEPS):
             "initial_nai",
             "_BeforeClamp.rate",
             "_BeforeClamp.target",
-            "_BathClamp.value",
-            "_BathClamp.lower",
-            "_BathClamp.upper",
-            "_BathClamp.sodium",
-        } == gradients.keys()
+        }
+        if family == "clamp":
+            expected |= {
+                "_BathClamp.value",
+                "_BathClamp.lower",
+                "_BathClamp.upper",
+                "_BathClamp.sodium",
+            }
+        else:
+            assert RESERVOIR in recorded
+            expected.add("initial_reservoir")
+            if family == "exchange_geometry":
+                expected |= {"dx", "_GeometryExchange.conductance"}
+            elif family == "exchange_inactive":
+                expected |= {
+                    "_InactiveExchange.rate",
+                    "_InactiveExchange.volume_a",
+                    "_InactiveExchange.volume_b",
+                }
+            else:
+                owner = {
+                    "exchange": "_ExactExchange",
+                    "exchange_implicit": "_ImplicitExchange",
+                    "exchange_explicit": "_ExplicitExchange",
+                }[family]
+                expected |= {
+                    f"{owner}.{name}"
+                    for name in ("rate", "conductance", "volume_a", "volume_b")
+                }
+        assert expected == gradients.keys()
         for name, value in gradients.items():
             assert value.device.type == "cuda", name
             assert torch.isfinite(value).all() and torch.count_nonzero(value), name
@@ -220,6 +247,189 @@ def test_cuda_inductor_clamp_checkpointed_scan_and_while_full_traces(
     )
     _assert_coverage(
         recorded, gradients, block=kind == "multi_block", dtype=torch.float32
+    )
+    if execution == "while":
+        assert not gradients and not recorded["v"].requires_grad
+
+
+@pytest.mark.parametrize(
+    ("kind", "checkpoint_every"), (("path", None), ("multi_block", 2))
+)
+def test_cuda_exchange_full_traces_fresh_initialization_and_all_gradients(
+    kind, checkpoint_every
+):
+    recorded, gradients = _exercise(
+        kind,
+        family="exchange",
+        device="cuda",
+        dtype=torch.float64,
+        shell_resistance_scale=100.0,
+        checkpoint_every=checkpoint_every,
+    )
+    _assert_coverage(
+        recorded,
+        gradients,
+        family="exchange",
+        block=kind == "multi_block",
+        dtype=torch.float64,
+    )
+
+
+@pytest.mark.parametrize("family", ("exchange_implicit", "exchange_explicit"))
+def test_cuda_exchange_methods_and_conservation(family):
+    recorded, gradients = _exercise(
+        "point", family=family, device="cuda", dtype=torch.float64
+    )
+    _assert_coverage(
+        recorded, gradients, family=family, block=False, dtype=torch.float64
+    )
+
+
+@pytest.mark.parametrize("kind", ("path", "multi_block"))
+def test_cuda_exchange_float32_matches_cpu_float64_traces_and_all_gradients(kind):
+    pytest.importorskip("dendra_solvers")
+    expected, actual = [
+        _exercise(
+            kind,
+            family="exchange",
+            device=device,
+            dtype=dtype,
+            shell_resistance_scale=100.0,
+            checkpoint_every=2,
+        )
+        for device, dtype in (("cpu", torch.float64), ("cuda", torch.float32))
+    ]
+    _assert_coverage(
+        actual[0],
+        actual[1],
+        family="exchange",
+        block=kind == "multi_block",
+        dtype=torch.float32,
+    )
+    _cross_precision_close(actual[0], expected[0])
+    assert actual[1].keys() == expected[1].keys()
+    for name, value in actual[1].items():
+        reference = expected[1][name].detach().to(device="cpu", dtype=torch.float64)
+        value = value.detach().to(device="cpu", dtype=torch.float64)
+        scale = reference.abs().amax()
+        assert torch.isfinite(scale) and scale > 0, name
+        torch.testing.assert_close(
+            value / scale,
+            reference / scale,
+            rtol=5e-3,
+            atol=5e-4,
+            msg=lambda message: f"{name}: {message}",
+        )
+
+
+@pytest.mark.parametrize("kind", ("path", "multi_block"))
+def test_cuda_exchange_checkpointed_continuation_full_traces_and_all_gradients(kind):
+    recorded, gradients = _exchange_continuation(
+        kind, device="cuda", dtype=torch.float64, shell_resistance_scale=100.0
+    )
+    _assert_coverage(
+        recorded,
+        gradients,
+        family="exchange",
+        block=kind == "multi_block",
+        dtype=torch.float64,
+        steps=2 * STEPS,
+    )
+
+
+def test_cuda_exchange_zero_volume_identity_and_gradients_are_finite():
+    recorded, gradients = _exercise(
+        "point", family="exchange_inactive", device="cuda", dtype=torch.float32
+    )
+    _assert_coverage(
+        recorded,
+        gradients,
+        family="exchange_inactive",
+        block=False,
+        dtype=torch.float32,
+    )
+    for name in ("volume_a", "volume_b"):
+        derivative = gradients[f"_InactiveExchange.{name}"]
+        assert torch.count_nonzero(derivative[..., :2]) == 0
+        assert torch.count_nonzero(derivative[..., 2:]) > 0
+
+
+def test_cuda_exchange_differentiable_analytic_geometry():
+    recorded, gradients = _exercise(
+        "path", family="exchange_geometry", device="cuda", dtype=torch.float64
+    )
+    _assert_coverage(
+        recorded,
+        gradients,
+        family="exchange_geometry",
+        block=False,
+        dtype=torch.float64,
+    )
+
+
+@pytest.mark.parametrize("kind", ("tree", "multi_block"))
+def test_cuda_exchange_canonical_and_packed_area_constants_are_live(kind):
+    recorded, gradients = _canonical_exchange_geometry(
+        kind, device="cuda", dtype=torch.float64, shell_resistance_scale=100.0
+    )
+    assert {
+        "v",
+        "i_membrane",
+        "t",
+        POOL,
+        NAI,
+        RESERVOIR,
+        "hh.m",
+        "hh.h",
+        "hh.n",
+    } <= recorded.keys()
+    assert {
+        "stimulus",
+        "initial_voltage",
+        "gnabar",
+        "gkbar",
+        "gl",
+        "ena",
+        "ek",
+        "el",
+        "canonical_area",
+    } <= gradients.keys()
+    if kind == "tree":
+        assert "exact_volume" in gradients
+    else:
+        assert "vc" in recorded
+    for name, value in gradients.items():
+        assert (
+            value.device.type == "cuda"
+            and torch.isfinite(value).all()
+            and torch.count_nonzero(value)
+        ), name
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("kind", "execution", "checkpoint_every"),
+    (("path", "scan", 2), ("multi_block", "while", None)),
+)
+def test_cuda_inductor_exchange_checkpointed_scan_and_while_full_traces(
+    kind, execution, checkpoint_every
+):
+    recorded, gradients = _exercise(
+        kind,
+        family="exchange",
+        device="cuda",
+        dtype=torch.float32,
+        shell_resistance_scale=100.0,
+        backend="inductor",
+        execution=execution,
+        checkpoint_every=checkpoint_every,
+    )
+    _assert_coverage(
+        recorded,
+        gradients,
+        family="exchange",
+        block=kind == "multi_block",
+        dtype=torch.float32,
     )
     if execution == "while":
         assert not gradients and not recorded["v"].requires_grad

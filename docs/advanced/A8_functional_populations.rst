@@ -340,8 +340,8 @@ duplicate-slot multiplicity.
 Unsupported features raise ``dendra.func.FunctionalizationError`` during
 lowering. Current limitations include non-injective regional concentration or
 Material replacement writes, the reserved compact rowwise support encoding,
-TABLE lookups, MaterialProcesses outside the admitted ``ClearanceProcess``/``ClampProcess``
-family, mechanism-owned waveform injections, delayed or stochastic state,
+TABLE lookups, MaterialProcesses outside the admitted Clearance/Clamp/Exchange
+families, mechanism-owned waveform injections, delayed or stochastic state,
 VoltageProcesses, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
@@ -368,8 +368,9 @@ remaining Python configuration immutable.
 Functional processes over Material fields
 -----------------------------------------
 
-Globally inserted, declaration-only ``ClearanceProcess`` and ``ClampProcess`` subclasses support
-functional transitions, fresh initialization, and explicit-state continuation.
+Globally inserted, declaration-only ``ClearanceProcess``, ``ClampProcess``, and
+``ExchangeProcess`` subclasses support functional transitions, fresh
+initialization, and explicit-state continuation.
 The existing ``CLEAR``/``DECAY``/``RELAX``, ``METHOD``, and ``PHASE`` declarations
 are unchanged; no extra functional annotations or voltage-local State are
 required. ``METHOD("exact")`` uses exponential relaxation,
@@ -435,8 +436,8 @@ uses explicit field inputs and returned replacements instead. Functional
 preparation runs outside the accepted-step loop and may depend on parameters,
 geometry, timestep, and field schemas, not evolving concentrations.
 State-dependent algebra belongs in the field-update computation.
-``ExchangeProcess``, ``DiffusionProcess``, regional process insertion, and
-custom process lifecycle/update overrides remain unsupported by functional
+``DiffusionProcess``, regional process insertion, and custom process
+lifecycle/update overrides remain unsupported by functional
 lowering. They retain their existing imperative execution paths.
 
 ``ClampProcess`` uses the same pipeline for hard assignments, lower/upper
@@ -459,6 +460,19 @@ conventions. Fresh initialization does not apply a clamp at t=0; it runs in
 the selected process phase after each accepted step. Packed models retain the
 same selector semantics as imperative execution; explicit masks allow precise
 selection of packed compartments.
+
+``ExchangeProcess`` conservatively couples two modeled fields, unlike
+Clearance's fixed reservoir. ``EXCHANGE``/``COUPLE``/``TRANSFER`` retain their
+existing rate or conductance and volume arguments, with exact, implicit, and
+explicit updates. Named parameters and tensor literals remain differentiable;
+inferred volumes follow live geometry, including exact Tree/Cable volumes and
+packed component membrane areas. Functional preparation does not reuse a
+detached geometry snapshot. Pairs with either volume at or below ``eps`` are
+identities, with finite zero coefficient/volume gradients on that inactive
+branch. The active-set boundary itself is not smooth.
+For packed Exchange, supply explicit weights when exact component
+intracellular volumes are needed: the packed parent's established volume
+inference is unchanged.
 
 Basic use
 ---------

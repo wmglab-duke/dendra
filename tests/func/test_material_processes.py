@@ -14,7 +14,7 @@ from torch.utils import _pytree as pytree
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
-from dendra.models.mechanisms import ClampProcess, ClearanceProcess
+from dendra.models.mechanisms import ClampProcess, ClearanceProcess, ExchangeProcess
 from tests.func.test_clearance_process import (
     DT,
     NAI,
@@ -25,7 +25,9 @@ from tests.func.test_clearance_process import (
     _close,
     _explicit_reference,
     _key,
-    _loss,
+)
+from tests.func.test_clearance_process import _loss as _base_loss
+from tests.func.test_clearance_process import (
     _MaterialSourceCurrent,
     _runner,
 )
@@ -44,6 +46,7 @@ from tests.func.test_membrane_current import CHANNELS
 from tests.func.test_membrane_current import _model as _membrane_model
 
 pytestmark = pytest.mark.cpu
+RESERVOIR = "reservoir_material.amount"
 
 
 class _BeforeClamp(ClearanceProcess):
@@ -58,6 +61,87 @@ class _BathClamp(ClampProcess):
     # The second write must read the result of the first, not the old field.
     ClampProcess.BOUNDS("pool", field="amount", lower="lower", upper="upper")
     ClampProcess.SET("na", field="nai", value="sodium", where=-1)
+
+
+class _ExactExchange(ExchangeProcess):
+    ExchangeProcess.GLOBAL(rate=0.35, conductance=0.27, volume_a=1.5, volume_b=2.25)
+    ExchangeProcess.METHOD("exact")
+    ExchangeProcess.PHASE("transport")
+    ExchangeProcess.EXCHANGE(
+        "pool.amount",
+        "reservoir.amount",
+        rate="rate",
+        volume_a="volume_a",
+        volume_b="volume_b",
+    )
+    # Repeated paired writes must see the first update on both fields.
+    ExchangeProcess.EXCHANGE(
+        "pool.amount",
+        "reservoir.amount",
+        conductance="conductance",
+        volume_a="volume_a",
+        volume_b="volume_b",
+    )
+
+
+class _ImplicitExchange(_ExactExchange):
+    ExchangeProcess.METHOD("implicit")
+
+
+class _ExplicitExchange(_ExactExchange):
+    ExchangeProcess.METHOD("explicit")
+
+
+class _GeometryExchange(ExchangeProcess):
+    ExchangeProcess.GLOBAL(conductance=0.7)
+    ExchangeProcess.METHOD("exact", require_volumes=True)
+    ExchangeProcess.PHASE("transport")
+    ExchangeProcess.EXCHANGE(
+        "pool.amount",
+        "reservoir.amount",
+        conductance="conductance",
+        volume_a="intracellular",
+        volume_b="membrane",
+    )
+
+
+class _AreaExchange(ExchangeProcess):
+    ExchangeProcess.GLOBAL(conductance=0.7, volume_a=1.5)
+    ExchangeProcess.METHOD("exact", require_volumes=True)
+    ExchangeProcess.PHASE("transport")
+    ExchangeProcess.EXCHANGE(
+        "pool.amount",
+        "reservoir.amount",
+        conductance="conductance",
+        volume_a="volume_a",
+        volume_b="membrane",
+    )
+
+
+class _InactiveExchange(ExchangeProcess):
+    ExchangeProcess.GLOBAL(rate=0.35)
+    # Distinct inactive endpoints plus one positive-volume site. These active
+    # set boundaries are not smooth volume finite-difference points.
+    ExchangeProcess.RANGE(volume_a=1.5, volume_b=2.25)
+    ExchangeProcess.METHOD("exact")
+    ExchangeProcess.PHASE("transport")
+    ExchangeProcess.EXCHANGE(
+        "pool.amount",
+        "reservoir.amount",
+        rate="rate",
+        volume_a="volume_a",
+        volume_b="volume_b",
+    )
+
+
+EXCHANGE_TYPES = {
+    "exchange": _ExactExchange,
+    "exchange_implicit": _ImplicitExchange,
+    "exchange_explicit": _ExplicitExchange,
+    "exchange_geometry": _GeometryExchange,
+    "exchange_area": _AreaExchange,
+    "exchange_inactive": _InactiveExchange,
+}
 
 
 @pytest.fixture(params=(1, 4), ids=("threads1", "threads4"))
@@ -85,7 +169,7 @@ def _model(
     shell_resistance_scale=1.0,
     process=None,
 ):
-    assert family == "clamp"
+    assert family == "clamp" or family in EXCHANGE_TYPES
     model = _membrane_model(kind, device=device, dtype=dtype, batch=None)
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, IMEM=True, DEVICE=device, DTYPE=dtype):
         components = (
@@ -103,15 +187,34 @@ def _model(
             min_values={"amount": 0.0},
             domain="intracellular",
         )
+        if family in EXCHANGE_TYPES:
+            model.material(
+                "reservoir",
+                fields={"amount": torch.nn.Parameter(model.v.new_tensor(0.45))},
+                min_values={"amount": 0.0},
+                domain="membrane",
+            )
         model.concentrations(nai0=torch.nn.Parameter(model.v.new_tensor(9.25)))
         model.ion_style("na", 1, 1)
         model.insert(_MaterialSourceCurrent)
         # Reverse insertion order catches accidental insertion-order execution.
-        model.insert(_BathClamp if process is None else process)
+        selected = _BathClamp if family == "clamp" else EXCHANGE_TYPES[family]
+        model.insert(selected if process is None else process)
         model.insert(_BeforeClamp)
         model.batch(2)
         model.train()
         model.initialize()
+        if family == "exchange_inactive":
+            # Own these spatial raw Parameters per instance. Tensor declaration
+            # defaults can share storage across independently built models.
+            exchange = model.mech.material_processes[_InactiveExchange.__name__]
+            exchange.volume_a_param = torch.nn.Parameter(
+                model.v.new_tensor([[0.0, 1.5, 1.5]])
+            )
+            exchange.volume_b_param = torch.nn.Parameter(
+                model.v.new_tensor([[2.25, 0.0, 2.25]])
+            )
+            model.initialize()
         model.t.fill_(1.25)
     model._material_test_kind = kind
     model._material_test_family = family
@@ -137,6 +240,10 @@ def _arguments(runner, model):
         ("initial_nai", "ions.na.i_init"),
     ):
         targets[label] = parameters[_key(parameters, suffix)].requires_grad_()
+    if model._material_test_family in EXCHANGE_TYPES:
+        targets["initial_reservoir"] = parameters[
+            _key(parameters, "materials.reservoir._initial_sources.amount")
+        ].requires_grad_()
     if "noded2" in parameters:
         targets["geometry"] = parameters["noded2"].requires_grad_()
     else:
@@ -150,6 +257,11 @@ def _arguments(runner, model):
         )
         targets["geometry"] = runner.constants[geometry].requires_grad_()
     targets["dt"] = runner.constants["dt"].requires_grad_()
+    if (
+        model._material_test_family == "exchange_geometry"
+        and model._material_test_kind not in {"cable", "tree", "block_tree"}
+    ):
+        targets["dx"] = runner.constants["dx"].requires_grad_()
     voltage = torch.linspace(
         -72.0, -52.0, model.v.numel(), device=model.device(), dtype=model.dtype()
     ).reshape(model.shape)
@@ -171,8 +283,17 @@ def _arguments(runner, model):
     )
 
 
-def _gradients(recorded, targets):
-    values = torch.autograd.grad(_loss(recorded), tuple(targets.values()))
+def _loss(recorded):
+    value = _base_loss(recorded)
+    if RESERVOIR in recorded:
+        value = value + 0.07 * recorded[RESERVOIR].square().mean()
+    return value
+
+
+def _gradients(recorded, targets, *, retain_graph=False):
+    values = torch.autograd.grad(
+        _loss(recorded), tuple(targets.values()), retain_graph=retain_graph
+    )
     gradients = dict(zip(targets, values, strict=True))
     for name, value in gradients.items():
         assert torch.isfinite(value).all() and torch.count_nonzero(value), name
@@ -228,7 +349,13 @@ def _parameter(parameters, owner, name):
     return parameters[_key(parameters, f"material_processes.{owner}.{name}_param")]
 
 
-def _material_oracle(recorded, parameters, dt, *, family="clamp"):
+def _material_oracle(
+    recorded, parameters, dt, *, family="clamp", constants=None, model=None
+):
+    if family in EXCHANGE_TYPES:
+        weights = _independent_exchange_weights(model, parameters, constants, family)
+        _exchange_oracle(recorded, parameters, dt, family=family, weights=weights)
+        return
     assert family == "clamp"
     pool, sodium = recorded[POOL][0], recorded[NAI][0]
     pools, ions = [pool], [sodium]
@@ -257,6 +384,132 @@ def _material_oracle(recorded, parameters, dt, *, family="clamp"):
         {POOL: torch.stack(pools), NAI: torch.stack(ions)},
         dtype=recorded[POOL].dtype,
     )
+
+
+def _exchange_update(a, b, dt, conductance, va, vb, method):
+    """Flux-form oracle, independent of the production weighted-total form."""
+    active = (va > 1e-30) & (vb > 1e-30)
+    va_safe = torch.where(active, va, torch.ones_like(va))
+    vb_safe = torch.where(active, vb, torch.ones_like(vb))
+    if method == "explicit":
+        transfer = dt * conductance * (a - b)
+    else:
+        decay_rate = conductance * (1 / va_safe + 1 / vb_safe)
+        fraction = (
+            dt * decay_rate / (1 + dt * decay_rate)
+            if method == "implicit"
+            else -torch.expm1(-dt * decay_rate)
+        )
+        transfer = (a - b) * va_safe * vb_safe / (va_safe + vb_safe) * fraction
+    result = (
+        torch.where(active, a - transfer / va_safe, a),
+        torch.where(active, b + transfer / vb_safe, b),
+    )
+    torch.testing.assert_close(va * result[0] + vb * result[1], va * a + vb * b)
+    return result
+
+
+def _analytic_path_weights(constants):
+    """Physical cylindrical weights from explicit raw geometry, not caches."""
+    diam, dx = constants["diam"], constants["dx"]
+    return torch.pi * (0.5 * diam).square() * dx, torch.pi * diam * dx
+
+
+def _independent_material_area(model, constants):
+    if model._material_test_kind.startswith("multi_"):
+        pieces = []
+        for name, component in model.populations.items():
+            prefix = f"populations.{name}."
+            canonical = prefix + "canonical_area_cm2"
+            area = (
+                constants[canonical]
+                if canonical in constants
+                else torch.pi
+                * constants[prefix + "diam"]
+                * constants[prefix + "dx"]
+                * 1e-8
+            )
+            pieces.append(
+                torch.broadcast_to(area, component.core_shape()).reshape(1, -1)
+            )
+        return torch.cat(pieces, dim=-1)
+    if "canonical_area_cm2" in constants:
+        return constants["canonical_area_cm2"]
+    return torch.pi * constants["diam"] * constants["dx"] * 1e-8
+
+
+def _independent_exchange_weights(model, parameters, constants, family):
+    if family == "exchange_area":
+        return (
+            _parameter(parameters, "_AreaExchange", "volume_a"),
+            _independent_material_area(model, constants) * 1e8,
+        )
+    if family == "exchange_geometry":
+        if model is not None and model._material_test_kind in {
+            "cable",
+            "tree",
+            "block_tree",
+        }:
+            return (
+                constants["volume_i"],
+                _independent_material_area(model, constants) * 1e8,
+            )
+        return _analytic_path_weights(constants)
+    return None
+
+
+def _exchange_oracle(recorded, parameters, dt, *, family, weights=None):
+    owner = EXCHANGE_TYPES[family].__name__
+    method = {"exchange_implicit": "implicit", "exchange_explicit": "explicit"}.get(
+        family, "exact"
+    )
+    va, vb = (
+        weights
+        if weights is not None
+        else (
+            _parameter(parameters, owner, "volume_a"),
+            _parameter(parameters, owner, "volume_b"),
+        )
+    )
+    pool, sodium, reservoir = (
+        recorded[POOL][0].clone(),
+        recorded[NAI][0].clone(),
+        recorded[RESERVOIR][0].clone(),
+    )
+    pools, ions, reservoirs = [pool], [sodium], [reservoir]
+    for _ in range(recorded[POOL].shape[0] - 1):
+        pool = pool + dt * PRODUCTION * (1 + 0.01 * sodium)
+        target = _parameter(parameters, "_BeforeClamp", "target")
+        rate = _parameter(parameters, "_BeforeClamp", "rate")
+        pool = target + (pool - target) * torch.exp(-rate * dt)
+        sodium = 8.1 + (sodium - 8.1) * torch.exp(-0.23 * dt)
+        if family in {"exchange_geometry", "exchange_area"}:
+            couplings = (_parameter(parameters, owner, "conductance"),)
+        else:
+            couplings = (_parameter(parameters, owner, "rate") * va,)
+            if family != "exchange_inactive":
+                couplings += (_parameter(parameters, owner, "conductance"),)
+        for conductance in couplings:
+            pool, reservoir = _exchange_update(
+                pool, reservoir, dt, conductance, va, vb, method
+            )
+        pools.append(pool)
+        ions.append(sodium)
+        reservoirs.append(reservoir)
+    _close(
+        {POOL: recorded[POOL], NAI: recorded[NAI], RESERVOIR: recorded[RESERVOIR]},
+        {
+            POOL: torch.stack(pools),
+            NAI: torch.stack(ions),
+            RESERVOIR: torch.stack(reservoirs),
+        },
+        dtype=recorded[POOL].dtype,
+    )
+    return {
+        POOL: torch.stack(pools),
+        NAI: torch.stack(ions),
+        RESERVOIR: torch.stack(reservoirs),
+    }
 
 
 def _exercise(
@@ -308,20 +561,40 @@ def _exercise(
             _gradients(dict(expected[1]["callbacks"]["trace"]), reference_targets),
             dtype=dtype,
         )
-        assert len(gradients) == 18
+        count = {
+            "clamp": 18,
+            "exchange_geometry": 17 if "dx" in targets else 16,
+            "exchange_area": 17,
+            "exchange_inactive": 18,
+        }.get(family, 19)
+        assert len(gradients) == count
     if imperative:
         _close(
             actual,
             _imperative_reference(model, runner, parameters, initialization, inputs),
             dtype=dtype,
         )
-    _material_oracle(actual, parameters, runner.constants["dt"], family=family)
+    _material_oracle(
+        actual,
+        parameters,
+        runner.constants["dt"],
+        family=family,
+        constants=runner.constants,
+        model=model,
+    )
     torch.testing.assert_close(
         actual[POOL][0],
         parameters[
             _key(parameters, "materials.pool._initial_sources.amount")
         ].expand_as(actual[POOL][0]),
     )
+    if family in EXCHANGE_TYPES:
+        torch.testing.assert_close(
+            actual[RESERVOIR][0],
+            parameters[
+                _key(parameters, "materials.reservoir._initial_sources.amount")
+            ].expand_as(actual[RESERVOIR][0]),
+        )
     torch.testing.assert_close(
         actual[NAI][0],
         parameters[_key(parameters, "ions.na.i_init")].expand_as(actual[NAI][0]),
@@ -707,4 +980,350 @@ def test_inductor_clamp_scan_gradients_and_while_full_traces(
 ):
     _exercise(
         kind, backend="inductor", execution=execution, checkpoint_every=checkpoint_every
+    )
+
+
+@pytest.mark.parametrize(
+    "kind", ("point", "path", "block_path", "multi_scalar", "multi_block")
+)
+def test_exchange_full_traces_and_all_gradients(kind, cpu_threads):
+    _exercise(kind, family="exchange")
+
+
+@pytest.mark.parametrize("family", ("exchange_implicit", "exchange_explicit"))
+def test_exchange_methods_duplicate_paired_writes_and_conservation(family, cpu_threads):
+    _exercise("point", family=family)
+
+
+@pytest.mark.parametrize(
+    "kind", ("myelinated", "cable", "tree", "block_tree", "multi_point")
+)
+def test_exchange_other_admitted_topologies(kind):
+    _exercise(kind, family="exchange")
+
+
+def _exchange_continuation(
+    kind, *, device="cpu", dtype=torch.float64, shell_resistance_scale=1.0
+):
+    model = _model(
+        kind,
+        family="exchange",
+        device=device,
+        dtype=dtype,
+        shell_resistance_scale=shell_resistance_scale,
+    )
+    runner = _runner(model, checkpoint_every=2)
+    source = _module_snapshot(model)
+    parameters, initialization, inputs, targets = _arguments(runner, model)
+    state, auxiliary = runner(
+        parameters=parameters, initialization=initialization, inputs=inputs
+    )
+    final, continued = runner(
+        state,
+        parameters=auxiliary["parameters"],
+        inputs=inputs,
+        callback_state=auxiliary["callbacks"].state,
+    )
+    recorded = {
+        name: torch.cat((value, continued["callbacks"]["trace"][name]))
+        for name, value in auxiliary["callbacks"]["trace"].items()
+    }
+    gradients = _gradients(recorded, targets)
+    (
+        reference_parameters,
+        reference_initialization,
+        reference_inputs,
+        reference_targets,
+    ) = _arguments(runner, model)
+    doubled = dn.func.RolloutInput(
+        *(torch.cat((value, value)) for value in reference_inputs)
+    )
+    expected = _explicit_reference(
+        runner, reference_parameters, reference_initialization, doubled, steps=2 * STEPS
+    )
+    _assert_tree_close(final, expected[0], rtol=3e-9, atol=3e-10)
+    reference_recorded = dict(expected[1]["callbacks"]["trace"])
+    _close(recorded, reference_recorded, dtype=dtype)
+    _close(gradients, _gradients(reference_recorded, reference_targets), dtype=dtype)
+    _material_oracle(recorded, parameters, runner.constants["dt"], family="exchange")
+    doubled_inputs = dn.func.RolloutInput(
+        *(torch.cat((value, value)) for value in inputs)
+    )
+    _close(
+        recorded,
+        _imperative_reference(
+            model, runner, parameters, initialization, doubled_inputs, steps=2 * STEPS
+        ),
+        dtype=dtype,
+    )
+    _assert_module_snapshot(model, source)
+    return recorded, gradients
+
+
+@pytest.mark.parametrize("kind", ("path", "multi_block"))
+def test_exchange_checkpointed_continuation_full_traces_and_all_gradients(
+    kind, cpu_threads
+):
+    _exchange_continuation(kind)
+
+
+def test_exchange_snapshot_restarts_do_not_advance_initial_fields(cpu_threads):
+    model = _model("point", family="exchange")
+    source = _module_snapshot(model)
+    runner = _runner(model, initialization="snapshot")
+    first, second = runner(), runner()
+    _assert_tree_close(first[0], second[0])
+    _close(dict(first[1]["callbacks"]["trace"]), dict(second[1]["callbacks"]["trace"]))
+    trace = first[1]["callbacks"]["trace"]
+    assert trace["t"][0].item() == 1.25
+    for name, material in ((POOL, "pool"), (RESERVOIR, "reservoir")):
+        torch.testing.assert_close(
+            trace[name][0], model.mech.materials[material].amount
+        )
+    _assert_module_snapshot(model, source)
+
+
+def _finite_differences(model, runner, labels):
+    parameters, initialization, inputs, targets = _arguments(runner, model)
+    actual = dict(
+        runner(parameters=parameters, initialization=initialization, inputs=inputs)[1][
+            "callbacks"
+        ]["trace"]
+    )
+    gradients = _gradients(actual, targets)
+    for label in labels:
+        leaf = targets[label]
+        step = 1e-5 if label != "dt" else 1e-6
+        values = []
+        for sign in (1, -1):
+            with torch.no_grad():
+                leaf.add_(sign * step)
+            values.append(
+                _loss(
+                    _imperative_reference(
+                        model, runner, parameters, initialization, inputs
+                    )
+                )
+            )
+            with torch.no_grad():
+                leaf.sub_(sign * step)
+        torch.testing.assert_close(
+            gradients[label].sum(),
+            (values[0] - values[1]) / (2 * step),
+            rtol=3e-5,
+            atol=2e-7,
+            msg=lambda message: f"{label}: {message}",
+        )
+    return actual, gradients
+
+
+def test_exchange_coefficients_positive_volumes_and_fields_match_central_differences(
+    cpu_threads,
+):
+    model = _model("point", family="exchange")
+    _finite_differences(
+        model,
+        _runner(model),
+        (
+            "_ExactExchange.rate",
+            "_ExactExchange.conductance",
+            "_ExactExchange.volume_a",
+            "_ExactExchange.volume_b",
+            "initial_pool",
+            "initial_reservoir",
+            "initial_voltage",
+            "geometry",
+            "dt",
+        ),
+    )
+
+
+def test_exchange_analytic_geometry_preparation_and_gradients(cpu_threads):
+    _exercise("path", family="exchange_geometry")
+    model = _model("path", family="exchange_geometry")
+    runner = _runner(model)
+    actual, _ = _finite_differences(
+        model, runner, ("geometry", "dx", "_GeometryExchange.conductance", "dt")
+    )
+    parameters = dict(runner.parameters)
+    _exchange_oracle(
+        actual,
+        parameters,
+        runner.constants["dt"],
+        family="exchange_geometry",
+        weights=_analytic_path_weights(runner.constants),
+    )
+
+
+def _canonical_exchange_geometry(
+    kind, *, device="cpu", dtype=torch.float64, shell_resistance_scale=1.0
+):
+    family = "exchange_area" if kind.startswith("multi_") else "exchange_geometry"
+    # Baseline complete state and every gradient also match a genuinely
+    # imperative run before perturbing immutable canonical geometry inputs.
+    _exercise(
+        kind,
+        family=family,
+        device=device,
+        dtype=dtype,
+        shell_resistance_scale=shell_resistance_scale,
+    )
+    model = _model(
+        kind,
+        family=family,
+        device=device,
+        dtype=dtype,
+        shell_resistance_scale=shell_resistance_scale,
+    )
+    source = _module_snapshot(model)
+    runner = _runner(model)
+    parameters, initialization, inputs, _targets = _arguments(runner, model)
+    baseline = _clone(
+        dict(
+            runner(parameters=parameters, initialization=initialization, inputs=inputs)[
+                1
+            ]["callbacks"]["trace"]
+        )
+    )
+    area_name = next(
+        name for name in runner.constants if name.endswith("canonical_area_cm2")
+    )
+    geometric = {"canonical_area": runner.constants[area_name].requires_grad_()}
+    if not kind.startswith("multi_"):
+        geometric["exact_volume"] = runner.constants["volume_i"].requires_grad_()
+    with torch.no_grad():
+        geometric["canonical_area"].mul_(1.2)
+        if "exact_volume" in geometric:
+            geometric["exact_volume"].mul_(1.15)
+    parameters, initialization, inputs, targets = _arguments(runner, model)
+    targets.update(geometric)
+    actual = dict(
+        runner(parameters=parameters, initialization=initialization, inputs=inputs)[1][
+            "callbacks"
+        ]["trace"]
+    )
+    gradients = _gradients(actual, targets, retain_graph=True)
+
+    def chemical_loss(recorded):
+        return (
+            0.2 * recorded[POOL].square().mean()
+            + 0.07 * recorded[RESERVOIR].square().mean()
+        )
+
+    physical_gradients = torch.autograd.grad(
+        chemical_loss(actual), tuple(geometric.values())
+    )
+    (
+        reference_parameters,
+        reference_initialization,
+        reference_inputs,
+        reference_targets,
+    ) = _arguments(runner, model)
+    reference_targets.update(geometric)
+    expected = _explicit_reference(
+        runner, reference_parameters, reference_initialization, reference_inputs
+    )
+    expected_recorded = dict(expected[1]["callbacks"]["trace"])
+    _close(actual, expected_recorded, dtype=dtype)
+    _close(gradients, _gradients(expected_recorded, reference_targets), dtype=dtype)
+    weights = _independent_exchange_weights(model, parameters, runner.constants, family)
+    expected_chemical = _exchange_oracle(
+        {name: actual[name].detach() for name in (POOL, NAI, RESERVOIR)},
+        parameters,
+        runner.constants["dt"],
+        family=family,
+        weights=weights,
+    )
+    expected_gradients = torch.autograd.grad(
+        chemical_loss(expected_chemical), tuple(geometric.values())
+    )
+    for value, reference in zip(physical_gradients, expected_gradients, strict=True):
+        torch.testing.assert_close(value, reference, rtol=3e-7, atol=2e-9)
+        assert torch.isfinite(value).all() and torch.count_nonzero(value)
+    assert (actual[RESERVOIR] - baseline[RESERVOIR]).abs().max() > 1e-12
+    # Relative perturbations keep zero-area/zero-volume branchpoints fixed and
+    # never cross the inactive-set boundary. This is independent of source
+    # area properties, which canonical Tree intentionally keeps immutable.
+    for (name, leaf), derivative in zip(
+        geometric.items(), physical_gradients, strict=True
+    ):
+        original = leaf.detach().clone()
+        step = 1e-4
+        losses = []
+        for sign in (1, -1):
+            with torch.no_grad():
+                leaf.copy_(original * (1 + sign * step))
+            trace = dict(
+                runner(
+                    parameters=parameters, initialization=initialization, inputs=inputs
+                )[1]["callbacks"]["trace"]
+            )
+            losses.append(chemical_loss(trace).detach())
+        with torch.no_grad():
+            leaf.copy_(original)
+        torch.testing.assert_close(
+            (derivative * original).sum(),
+            (losses[0] - losses[1]) / (2 * step),
+            rtol=4e-4,
+            atol=1e-9,
+            msg=lambda message: f"{kind} {name}: {message}",
+        )
+    _assert_module_snapshot(model, source)
+    return actual, gradients
+
+
+@pytest.mark.parametrize("kind", ("cable", "tree", "multi_scalar", "multi_block"))
+def test_exchange_canonical_and_packed_area_constants_are_live(kind, cpu_threads):
+    _canonical_exchange_geometry(kind)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+def test_exchange_zero_volume_identity_and_gradients_are_finite(dtype, cpu_threads):
+    _, gradients = _exercise("point", family="exchange_inactive", dtype=dtype)
+    for name in ("volume_a", "volume_b"):
+        derivative = gradients[f"_InactiveExchange.{name}"]
+        assert torch.count_nonzero(derivative[..., :2]) == 0
+        assert torch.count_nonzero(derivative[..., 2:]) > 0
+
+
+@pytest.mark.parametrize("kind", ("path", "multi_block"))
+def test_exchange_commit_then_imperative_continuation(kind, cpu_threads):
+    model = _model(kind, family="exchange")
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
+    state, _ = functional.step(tensors.parameters, prepared, tensors.state)
+    expected, _ = functional.step(tensors.parameters, prepared, state)
+    target = _model(kind, family="exchange")
+    functional.commit_state_(target, state)
+    dt = tensors.constants["dt"]
+    target.integrator._initialize(target, dt, force=True, compile_scope="population")
+    target.integrator.step(target, dt, None, None)
+    target.t = target.t + dt
+    _assert_tree_close(_live_state(functional, target), expected, rtol=3e-9, atol=3e-10)
+
+
+def test_custom_exchange_preparation_fails_closed():
+    class CustomExchange(_ExactExchange):
+        def prepare_materials(self, fields, dt):
+            return super().prepare_materials(fields, dt)
+
+    model = _model("point", family="exchange", process=CustomExchange)
+    with pytest.raises(dn.func.FunctionalizationError):
+        dn.func.make_functional(model, dt=DT)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("kind", "execution", "checkpoint_every"),
+    (("path", "scan", 2), ("multi_block", "while", None)),
+)
+def test_inductor_exchange_scan_gradients_and_while_full_traces(
+    kind, execution, checkpoint_every, cpu_threads
+):
+    _exercise(
+        kind,
+        family="exchange",
+        backend="inductor",
+        execution=execution,
+        checkpoint_every=checkpoint_every,
     )
