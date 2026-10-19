@@ -5,6 +5,7 @@ from typing import List, Tuple
 import networkx as nx
 import torch
 
+from .cable import _layered_edge_conductance, unbranched_edge_conductance
 from .core import (
     Integrator,
     _as_solve_block,
@@ -658,3 +659,221 @@ class _dhs_bt(Integrator):
         model.v = model.v.detach()
         if self.imem:
             model.i_membrane = torch.zeros_like(model.v).detach()
+
+
+def _packed_block_topology(model, threads):
+    """Build a disconnected block-DHS forest in composite storage order.
+
+    Every core replica is an independent tree. Explicit leading batch axes are
+    numerical solve rows, not additional topology nodes. Keeping storage order
+    makes the compact edges follow increasing child index even when a Tree's
+    root is not its first storage slot.
+    """
+    from ..extcell import ExtCellAxon, ExtCellTree
+
+    parent_parts = []
+    depth_parts = []
+    offset = 0
+    for name, component in model.populations.items():
+        replicas, width = map(int, component.core_shape())
+        if isinstance(component, ExtCellTree):
+            graph = _compiled_tree_graph_view(component)
+            if isinstance(graph, list):
+                if len(graph) != 1:
+                    raise ValueError(
+                        f"Packed ExtCellTree component {name!r} requires one "
+                        "shared compiled morphology."
+                    )
+                graph = graph[0]
+            parent, depth, node_order = _topo_parent_depth(graph)
+            storage_order = torch.as_tensor(node_order, dtype=torch.int64)
+            parent_storage = torch.full((width,), -1, dtype=torch.int64)
+            non_root = parent >= 0
+            parent_storage[storage_order[non_root]] = storage_order[parent[non_root]]
+            depth_storage = torch.empty_like(depth)
+            depth_storage[storage_order] = depth
+        elif isinstance(component, ExtCellAxon):
+            parent_storage = torch.arange(width, dtype=torch.int64) - 1
+            depth_storage = torch.arange(width, dtype=torch.int64)
+        else:
+            raise TypeError(
+                "Packed block-DHS requires ExtCellAxon or ExtCellTree "
+                f"components; got {type(component).__name__} for {name!r}."
+            )
+        if int(getattr(component, "n_layers", 0)) != 2:
+            raise ValueError(
+                "Packed block-DHS requires exactly two extracellular layers."
+            )
+        for _ in range(replicas):
+            parent_parts.append(
+                torch.where(
+                    parent_storage >= 0, parent_storage + offset, parent_storage
+                )
+            )
+            depth_parts.append(depth_storage)
+            offset += width
+
+    parent = torch.cat(parent_parts)
+    depth = torch.cat(depth_parts)
+    order, layer_ptr = _build_layers(depth, threads)
+    storage_order = torch.arange(offset, dtype=torch.int64)
+    child = storage_order[parent >= 0]
+    return {
+        "parent_idx": parent,
+        "parent_idx_orig": parent.clone(),
+        "order": order,
+        "layer_ptr": layer_ptr,
+        "solver_order": storage_order,
+        "inv_solver_order": storage_order.clone(),
+        "edge_child_orig": child,
+        "edge_parent_orig": parent.index_select(0, child),
+    }
+
+
+def _packed_block_edge_conductances(model):
+    """Retain each component's native intracellular and shell edge physics."""
+    from ..extcell import ExtCellTree
+
+    planes = model.v.numel() // model.shape[-1]
+    intracellular_parts = []
+    extracellular_parts = []
+    for component in model.populations.values():
+        width = int(component.shape[-1])
+        if isinstance(component, ExtCellTree):
+            graph = _compiled_tree_graph_view(component)
+            if isinstance(graph, list):
+                graph = graph[0]
+            parent, _, node_order = _topo_parent_depth(graph)
+            storage_order = torch.as_tensor(
+                node_order, device=model.device(), dtype=torch.int64
+            )
+            parent = parent.to(device=model.device())
+            parent_storage = torch.full(
+                (width,), -1, device=model.device(), dtype=torch.int64
+            )
+            non_root = parent >= 0
+            parent_storage[storage_order[non_root]] = storage_order[parent[non_root]]
+            child = torch.arange(width, device=model.device())[parent_storage >= 0]
+            edge_parent = parent_storage.index_select(0, child)
+            scale = _as_solve_matrix(component.rhoa_scale, component)
+            canonical_resistance = getattr(component, "edge_resistance_ohm", None)
+            if canonical_resistance is not None:
+                resistance = _as_solve_matrix(canonical_resistance, component)
+                intracellular = (
+                    resistance.index_select(1, child) * scale.index_select(1, child)
+                ).reciprocal()
+            else:
+                # Preserve the standalone block solver's low-level Tree graph
+                # fallback. Graph conductance is topological-order, whereas
+                # packed edges use increasing child storage index.
+                _, graph_conductance, _ = graph_to_parent_and_axial(
+                    graph, dtype_axial=model.dtype()
+                )
+                graph_conductance = graph_conductance.to(
+                    device=model.device(), dtype=model.dtype()
+                ).expand(scale.shape[0], -1)
+                storage_conductance = graph_conductance.index_select(
+                    1, torch.argsort(storage_order)
+                )
+                intracellular = storage_conductance.index_select(
+                    1, child
+                ) / scale.index_select(1, child)
+            extracellular = _tree_layered_edge_conductance(
+                _as_solve_block(component.xraxial, component, (2,)),
+                _as_solve_matrix(component.dx, component),
+                child,
+                edge_parent,
+            )
+        else:
+            intracellular = unbranched_edge_conductance(component)
+            extracellular = _layered_edge_conductance(
+                _as_solve_block(component.xraxial, component, (2,)),
+                _as_solve_matrix(component.dx, component),
+            )
+        intracellular_parts.append(intracellular.reshape(planes, -1))
+        extracellular_parts.append(extracellular.reshape(planes, -1, 2))
+    return (
+        torch.cat(intracellular_parts, dim=1),
+        torch.cat(extracellular_parts, dim=1),
+    )
+
+
+def _write_back_block_components(model):
+    """Publish both solved state views without introducing component edges."""
+    start = 0
+    for component in model.populations.values():
+        width = component.numelc()
+        component.v = model.v[..., start : start + width].reshape(component.shape)
+        vc = model.vc[..., start : start + width, :].reshape(*component.shape, 3)
+        if "vc" in component._buffers:
+            component.vc = vc
+        else:
+            component.register_buffer("vc", vc)
+        start += width
+
+
+class _dhs_bt_multi(_dhs_bt):
+    r"""Packed block-DHS for independent two-layer extracellular populations.
+
+    ExtCellAxon paths and ExtCellTree morphologies, including different core
+    replica counts, share one disconnected forest solve. No padding, synthetic
+    connecting edges, or per-component solver calls are required. ``write_back``
+    publishes both membrane voltage ``v`` and absolute circuit potentials ``vc``
+    to component populations; mechanism states remain composite-owned.
+    """
+
+    _FUNCTIONAL_OPERATOR_KIND = "block_multi_tree"
+
+    def __init__(self, model, mech, imem=None, threads=16, write_back=True):
+        super().__init__(model, mech, imem=imem, threads=threads)
+        self.write_back = bool(write_back)
+
+    def initialize(self, model, dt):
+        topology_contract = _topology_initialization_contract(self, model)
+        preserve = topology_contract == getattr(
+            self, "_topology_initialization_contract", None
+        )
+        self.to(model.device())
+        self._select_solver(model.device())
+        self._refresh_solver_shape(model, block_dim=self.M)
+        for name, value in _packed_block_topology(model, self.threads).items():
+            _install_topology_buffer(
+                self, name, value.to(device=model.device()), preserve=preserve
+            )
+        intracellular, extracellular = _packed_block_edge_conductances(model)
+        workspace = self._derive_prepared_workspace(
+            dt,
+            cm=_as_solve_matrix(model.cm, model)
+            * _as_solve_matrix(model.cm_scale, model),
+            area=_as_solve_matrix(model.area, model)
+            * _as_solve_matrix(model.area_scale, model),
+            intracellular_edge_conductance=intracellular,
+            extracellular_edge_conductance=extracellular,
+            xc=_as_solve_block(model.xc, model, (2,)),
+            xg=_as_solve_block(model.xg, model, (2,)),
+            edge_child_orig=self.edge_child_orig,
+            solver_order=self.solver_order,
+        )
+        self._install_prepared_workspace(workspace)
+        self._refresh_cpu_topology_plan()
+        self._topology_initialization_contract = topology_contract
+        expected = tuple(model.shape) + (self.M,)
+        if not hasattr(model, "vc") or tuple(model.vc.shape) != expected:
+            vc = torch.zeros(expected, device=model.device(), dtype=model.dtype())
+            vc[..., 0] = model.v
+            if "vc" in model._buffers:
+                model.vc = vc
+            else:
+                model.register_buffer("vc", vc)
+        if self.write_back:
+            _write_back_block_components(model)
+
+    def init_v(self, model):
+        super().init_v(model)
+        if self.write_back:
+            _write_back_block_components(model)
+
+    def step(self, model, dt, ve=None, intra=None):
+        super().step(model, dt, ve=ve, intra=intra)
+        if self.write_back:
+            _write_back_block_components(model)

@@ -185,29 +185,32 @@ Supported models
 
 The topology list below describes functional *transition* support from an
 initialized tensor state. Fresh functional initialization is a narrower
-capability: it currently supports exact ``SingleCompartment`` and structurally
-canonical ``Unmyelinated`` models, including compatible subclasses, with their
-standard implicit integrators, plus exact scalar ``Tree`` models with canonical
-``dhs``. The compatible-subclass admission applies to ``Unmyelinated``;
-``Tree`` subclasses remain outside fresh-initialization support. This includes
-the Tigerholm/Thio models with registered pure resting-balance transforms. Other
+capability: it currently supports exact ``Population`` and ``SingleCompartment``
+models and structurally canonical ``Unmyelinated`` models, including compatible
+subclasses, with their standard implicit integrators, plus exact scalar ``Tree``
+models with canonical ``dhs``. The compatible-subclass admission applies to
+``Unmyelinated``; ``Tree`` subclasses remain outside fresh-initialization
+support. This includes the Tigerholm/Thio models with registered pure
+resting-balance transforms. Other
 admitted models can still start from the extracted ``tensors.state``.
 
 The current transition API supports initialized models with all of the
 following properties:
 
-* either an exact ``SingleCompartment`` topology with standard Population
-  area geometry, an ``Unmyelinated`` topology with standard cylindrical cable
-  geometry, a ``Myelinated`` model with Dendra's standard geometry and
-  parameter transforms, an ``ExtCellAxon`` model with standard cylindrical
-  membrane and extracellular-layer geometry, an exact ``Cable`` built from a
+* either an exact ``Population`` or ``SingleCompartment`` topology with standard
+  Population area geometry, an ``Unmyelinated`` topology with standard
+  cylindrical cable geometry, a ``Myelinated`` model with Dendra's standard
+  geometry and parameter transforms, an ``ExtCellAxon`` model with standard
+  cylindrical membrane and extracellular-layer geometry, an exact ``Cable`` built from a
   canonical Morphology, a scalar ``Tree`` built from a canonical
   ``CompartmentGraph``, or an ``ExtCellTree`` built from a canonical
   ``CompartmentGraph`` with Dendra's standard finite-extracellular geometry,
-  or an exact scalar ``MultiPopulation`` returned by ``dn.concat_models``
-  whose components each satisfy one of the admitted scalar topology contracts
-  above. Point-only packs use ``bwd_euler_sc_multi`` and mixed point, path,
-  and Tree packs use ``dhs_multi``;
+  or an exact ``MultiPopulation`` returned by ``dn.concat_models`` whose
+  components each satisfy an admitted scalar topology contract above, or
+  whose components are all admitted ``ExtCellAxon``/``ExtCellTree`` models.
+  Point-only packs use ``bwd_euler_sc_multi``, mixed scalar point, path, and
+  Tree packs use ``dhs_multi``, and finite-extracellular packs use
+  ``dhs_bt_multi``;
 * zero or more explicit leading axes created with ``Population.batch()``;
 * whole-Population or regional distributed mechanisms and current-producing
   ``PointProcess`` mechanisms using rectangular, shared-column, or packed
@@ -217,12 +220,12 @@ following properties:
   duplicate placements; concentration and Material replacement writes require
   injective support;
 * deterministic CPU or CUDA execution in float32 or float64;
-* ``bwd_euler_sc`` for ``SingleCompartment``, ``bwd_euler_ub`` for
-  ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
+* ``bwd_euler_sc`` for plain ``Population`` and ``SingleCompartment``,
+  ``bwd_euler_ub`` for ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
   ``bwd_euler_bt(method="thomas")`` for ``ExtCellAxon``, ``dhs`` for scalar
   ``Tree``, ``dhs_bt`` for ``ExtCellTree``, or the automatically selected
-  ``bwd_euler_sc_multi``/``dhs_multi`` integrator for ``MultiPopulation``, with
-  membrane-current recording disabled; and
+  ``bwd_euler_sc_multi``/``dhs_multi``/``dhs_bt_multi`` integrator for
+  ``MultiPopulation``, with membrane-current recording disabled; and
 * for ``bwd_euler_ub``, a transform-compatible Thomas or PCR solver.
 
 Solver tensors declared by nested ``State.STATE``, direct Mechanism and State
@@ -269,8 +272,10 @@ or stochastic state, VoltageProcesses, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
 Population topologies
-(including nested ``MultiPopulation`` and packed finite-extracellular block
-state), Cable/Axon/Tree subclasses with unrecognized custom geometry, stateful
+(including generic ``Axon``, custom ``Population``/``SingleCompartment``
+subclasses, nested ``MultiPopulation``, and mixtures of scalar and
+finite-extracellular components), Cable/Axon/Tree subclasses with unrecognized
+custom geometry, stateful
 or unregistered parameter transforms, custom integrator subclasses, the SPD
 block solver, non-CUDA accelerators (including MPS), and ``i_membrane`` recording. Row-regular
 selectors authored through the normal Population indexing API are already
@@ -314,11 +319,18 @@ timestep:
        dn.func.StepInput(ve=ve, intra=intra),
    )
 
-``SingleCompartment`` uses the same functional calls with
-``dn.bwd_euler_sc(imem=False)``. As in ordinary Population execution,
-intracellular current affects its voltage, while an extracellular ``ve`` input
-has no effect because there is no spatial voltage difference to drive axial
-current.
+Exact plain ``Population`` and ``SingleCompartment`` models use the same
+functional calls with ``dn.bwd_euler_sc(imem=False)``, their default solver.
+Every ``(N, C)`` slot is an independent membrane compartment, including when
+``C > 1``: for example, ``dn.Population(N=2, C=3)`` contains six independent
+compartments, not two three-compartment cables. Intracellular current affects
+each compartment's voltage, while an extracellular ``ve`` input has no effect
+because there are no axial connections. Use an admitted cable or Tree model
+when spatial voltage coupling is intended. Both exact point-model classes
+support fresh functional initialization; custom subclasses and generic
+``Axon`` models are not admitted. Compatible extraction and commit retain the
+same concrete model class rather than treating ``Population`` and
+``SingleCompartment`` as interchangeable plans.
 
 ``Myelinated`` and compatible subclasses use the same calls as
 ``Unmyelinated``. Their canonical fiber diameters and node spacing remain
@@ -380,15 +392,22 @@ CPU block-DHS solver supplied by ``dendra-solvers``, or the three-component
 Triton block-DHS solver on CUDA. It does not currently support ``i_membrane``
 recording.
 
-Packed scalar MultiPopulations
+Packed MultiPopulations
 ------------------------------
 
 An exact ``MultiPopulation`` produced by ``dn.concat_models`` uses the same
-functional API. Every component must independently satisfy an admitted scalar
-contract: ``SingleCompartment``, ``Unmyelinated``/``Myelinated`` and their
-admitted subclasses, exact native ``Cable``, or canonical scalar ``Tree``.
-Finite-extracellular components and nested ``MultiPopulation`` objects remain
-unsupported because they require a packed block-state solver.
+functional API. A scalar pack contains independently admitted exact
+``Population`` or ``SingleCompartment``, ``Unmyelinated``/``Myelinated`` and
+their admitted subclasses, exact native ``Cable``, or canonical scalar ``Tree``
+components.
+A finite-extracellular pack instead contains only admitted ``ExtCellAxon``
+and/or canonical ``ExtCellTree`` components, each with two extracellular
+layers. Mixing scalar and finite-extracellular components, and nesting
+``MultiPopulation`` objects, remain unsupported and raise an error.
+
+A plain ``Population(N, C)`` component contributes ``N * C`` independent
+point compartments even when packed alongside cables or Trees. Concatenation
+does not reinterpret its ``C`` axis as an axially connected path.
 
 Functional execution preserves the purpose of concatenation: the composite is
 advanced as one packed system, not as a Python loop over components. Its state
@@ -398,6 +417,15 @@ geometry and physical parameters remain explicit preparation inputs, so a
 gradient can still reach, for example, one component's capacitance or axial
 resistivity without changing the packed runtime representation.
 
+Finite-extracellular packs additionally carry ``vc`` with shape
+``(*batch, 1, total_width, 3)``. Each compartment retains its intracellular,
+inner-shell, and outer-shell potentials, with
+``v == vc[..., 0] - vc[..., 1]``. The packed block-DHS solve treats the
+components and their neuron replicas as a disconnected forest: concatenation
+does not add axial connections between models or merge their extracellular
+layers. Public membrane voltage and all three circuit potentials can be
+recorded through ``dn.func.Recorder(("v", "vc"))``.
+
 Component physical parameters keep names such as
 ``populations.<component>.*``. Packed mechanism parameters retain their normal
 ``integrator.*`` names, and the common temperature appears once. Geometry
@@ -406,6 +434,13 @@ constants are likewise component-namespaced, for example
 ``populations.tree.canonical_area_cm2``. Calling ``prepare`` assembles those
 sources into one differentiable packed workspace; it does not run the
 component transitions.
+
+For finite-extracellular components this includes the component-namespaced
+``xraxial``, ``xc``, and ``xg`` tensors. ``ExtCellTree`` retains its exact
+canonical area and intracellular edge resistance; ``ExtCellAxon`` retains its
+cylindrical geometry. These tensors remain differentiable preparation inputs
+and are shared across explicit leading batch axes, just as in the standalone
+functional models.
 
 Call ``batch`` on the composite after concatenation, as in imperative code:
 
@@ -421,6 +456,27 @@ Call ``batch`` on the composite after concatenation, as in imperative code:
    fmodel, tensors = dn.func.make_functional(packed, dt=0.01)
    prepared = fmodel.prepare(tensors.parameters, tensors.constants)
 
+The same workflow applies to a finite-extracellular pack; ``concat_models``
+automatically selects ``dhs_bt_multi``:
+
+.. code-block:: python
+
+   packed = dn.concat_models({"axon": extcell_axon, "tree": extcell_tree})
+   packed.batch(8)
+   packed.initialize()
+   runner = dn.func.compile(
+       packed, dt=0.01, steps=100, execution="scan",
+       callbacks={"trace": dn.func.Recorder(("v", "vc"))},
+   )
+   final_state, auxiliary = runner()
+
+As for standalone block models, scan supports first-order backward and optional
+``checkpoint_every``; while-loop execution is inference-only. Fresh functional
+initialization is not supported for packed models: start from the extracted
+state. ``commit_state_`` restores the packed state explicitly. With
+``write_back=True`` it also rebinds each component's ``v`` and ``vc`` to its
+packed slice; ``write_back=False`` leaves component states untouched.
+
 Registered intracellular injection and bound extracellular stimulation use the
 same authored forms described below and are projected onto the flat composite.
 The packed transition supports the ordinary functional runners,
@@ -429,6 +485,10 @@ Heterogeneous packs require the transform-compatible native CPU ``dhs_multi``
 solver supplied by a current ``dendra-solvers`` installation, or the existing
 packed Triton DHS kernel on CUDA. The CUDA functional facade explicitly zeros
 inactive padded slots and preserves gradients only for active morphology nodes.
+Finite-extracellular packs instead use the three-component block-DHS solver
+on their disconnected forest, requiring the transform-compatible native CPU
+``dhs_bt_solve`` facade or the existing Triton block-DHS kernel on CUDA. They
+do not require a new packed native extension or introduce padded circuit rows.
 
 Current native builds let scalar DHS, block DHS, and heterogeneous packed DHS
 reuse an owning, validated CPU topology plan. Initialization snapshots topology
@@ -456,11 +516,11 @@ The extracted ``PopulationTensors`` contains:
    ``RANGE`` and ``BATCH`` overrides.
 
 ``constants``
-   Independent geometry and timestep tensors. ``SingleCompartment``,
-   ``Unmyelinated``, native ``Cable``, and scalar ``Tree`` expose ``diam`` and
-   ``dx``; ``Myelinated`` exposes canonical ``diameters``, ``diam_original``, and
-   ``dx``; and ``ExtCellAxon`` and ``ExtCellTree`` expose ``diam``, ``dx``,
-   ``xraxial``, ``xc``, and ``xg``. Every topology exposes scalar ``dt`` in
+   Independent geometry and timestep tensors. Plain ``Population``,
+   ``SingleCompartment``, ``Unmyelinated``, native ``Cable``, and scalar ``Tree``
+   expose ``diam`` and ``dx``; ``Myelinated`` exposes canonical ``diameters``,
+   ``diam_original``, and ``dx``; and ``ExtCellAxon`` and ``ExtCellTree`` expose
+   ``diam``, ``dx``, ``xraxial``, ``xc``, and ``xg``. Every topology exposes scalar ``dt`` in
    milliseconds. Registered tensor buffers read by an admitted in-graph
    parameter transform are exposed under ``parametrizations.*`` so preparation
    has no hidden numerical inputs. A native ``Cable``, scalar ``Tree``, or
@@ -496,7 +556,8 @@ The extracted ``PopulationTensors`` contains:
 
    ``MultiPopulation`` state follows the flat composite runtime rather than a
    component tree. The packed parent owns voltage, mechanism/Ion/Material
-   carry, clock, and duration remainder.
+   carry, clock, and duration remainder. Finite-extracellular packs carry both
+   flat ``v`` and flat ``vc``.
 
 ``initialization``
    Initialization-only tensor inputs. ``v_init`` is the independent, fully
@@ -1523,8 +1584,9 @@ Native CPU Thomas and PCR execution requires a ``dendra-solvers`` release that
 exports the transform-compatible ``thomas_solve_t`` and ``pcr_solve_t`` Python
 functions. ``ExtCellAxon`` additionally requires the transform-compatible
 ``solve_bt`` block-Thomas facade, scalar ``Tree`` requires ``dhs_solve``, and
-``ExtCellTree`` requires ``dhs_bt_solve``. Heterogeneous scalar
-``MultiPopulation`` requires ``dhs_multi_solve``. The pure-PyTorch PCR
+``ExtCellTree`` and finite-extracellular ``MultiPopulation`` require
+``dhs_bt_solve``. Heterogeneous scalar ``MultiPopulation`` requires
+``dhs_multi_solve``. The pure-PyTorch PCR
 implementations remain available as correctness fallbacks without the
 extension where the topology supports them; the admitted Tree and
 heterogeneous packed paths have no extension-free CPU fallback.
@@ -1535,7 +1597,9 @@ CUDA execution
 CUDA functional execution is experimental. It uses the existing CUDA/Triton
 kernels, not a CPU fallback: scalar Thomas/PCR for unbranched cables, scalar DHS
 for Trees, three-component block Thomas/DHS for finite-extracellular models,
-and packed DHS for heterogeneous scalar MultiPopulations. Single-compartment
+and packed DHS for heterogeneous scalar MultiPopulations. Finite-extracellular
+MultiPopulations use block DHS on a disconnected forest with the same complete
+``v``/``vc`` state as CPU execution. Plain ``Population``, ``SingleCompartment``,
 and point-only packed updates are ordinary PyTorch tensor operations. A CUDA
 PyTorch runtime and Triton are required for the spatial solvers; the CPU
 ``dendra-solvers`` extension is not required for CUDA execution.
@@ -1610,6 +1674,10 @@ compiled loops. On a CUDA machine run:
 
    python -m pytest -q tests/func/test_cuda_solver_kernels.py tests/func/test_cuda_population.py -m "cuda and not slow"
    python -m pytest -q tests/func/test_cuda_population.py -m "cuda and slow"
+   python -m pytest -q tests/func/test_cuda_extcell_multi_population.py -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_extcell_multi_population.py -m "cuda and slow"
+   python -m pytest -q tests/func/test_cuda_plain_population.py -m "cuda and not slow"
+   python -m pytest -q tests/func/test_cuda_plain_population.py -m "cuda and slow"
 
 The slow lane includes real Inductor scan/while compilation. Tests are skipped
 when CUDA is unavailable; collecting them on a CPU-only host is not evidence
@@ -1737,15 +1805,19 @@ Arbitrary callbacks registered with ``register_pre_initialize_hook`` or
 ``register_post_initialize_hook`` remain available imperatively but are not
 guessed or traced by the functional initializer.
 
-Fresh functional initialization supports exact ``SingleCompartment`` models
-using ``bwd_euler_sc`` and structurally canonical ``Unmyelinated`` models using
-``bwd_euler_ub``, plus exact scalar ``Tree`` models using canonical ``dhs``.
+Fresh functional initialization supports exact ``Population`` and
+``SingleCompartment`` models using ``bwd_euler_sc`` and structurally canonical
+``Unmyelinated`` models using ``bwd_euler_ub``, plus exact scalar ``Tree`` models
+using canonical ``dhs``.
 The Tree path reuses its admitted immutable geometry and support maps, copies
 the explicit initial voltage across every solver node, and recomputes mechanism
 state only at each mechanism's declared support. Zero-area junction voltages
 therefore remain part of the voltage state without acquiring an undeclared
 membrane mechanism. It performs the same initialization transaction as the
 other admitted families rather than restoring cached initialized state.
+The plain ``Population`` initializer uses the same pure point-model transaction
+as ``SingleCompartment``; it initializes every ``(N, C)`` slot independently
+and does not introduce cable coupling for ``C > 1``.
 ``Tree`` subclasses, block/extracellular Trees, and packed MultiPopulations are
 not admitted by this extension. An ``Unmyelinated`` subclass may define its
 mechanisms, parameterization, and registered pure initialization transforms

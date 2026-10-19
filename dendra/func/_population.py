@@ -201,7 +201,7 @@ _STANDARD_POPULATION_FRESH_INITIALIZATION = {
         name: inspect.getattr_static(population_type, name)
         for name in _POPULATION_FRESH_INITIALIZATION_HOOKS
     }
-    for population_type in (SingleCompartment, Unmyelinated, Tree)
+    for population_type in (Population, SingleCompartment, Unmyelinated, Tree)
 }
 _INTEGRATOR_FRESH_INITIALIZATION_HOOKS = ("init_v",)
 _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
@@ -216,8 +216,9 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
 def _functional_initialization_profile(population):
     """Return the audited scalar initializer family for ``population``.
 
-    SingleCompartment lowering remains exact-type because general subclasses are
-    not admitted by the transition contract. Unmyelinated subclasses may add
+    Population and SingleCompartment lowering remain exact-type because general
+    subclasses are not admitted by the transition contract. Both use the same
+    independent-compartment equations. Unmyelinated subclasses may add
     mechanisms and construction-time parameterization while retaining the same
     scalar-path voltage and lifecycle semantics; their inherited hooks are
     checked against the canonical base separately. Canonical scalar Trees use
@@ -225,8 +226,8 @@ def _functional_initialization_profile(population):
     their already-lowered graph supplies immutable geometry and support maps.
     """
 
-    if type(population) is SingleCompartment:
-        return SingleCompartment, "scalar_point", _bwd_euler_sc
+    if _is_scalar_point(population):
+        return type(population), "scalar_point", _bwd_euler_sc
     if isinstance(population, Unmyelinated):
         return Unmyelinated, "scalar_path", _bwd_euler_ub
     if type(population) is Tree:
@@ -2544,7 +2545,7 @@ class _PopulationPreparation(torch.nn.Module):
 
 
 class _ComponentPhysicalPreparation(_PopulationPreparation):
-    """Narrow pure physical preparation for one packed scalar component.
+    """Narrow pure physical preparation for one packed component.
 
     The packed parent owns mechanisms, state, stimulation, and numerical
     execution.  Retaining any of those child runtime trees here would make
@@ -2559,6 +2560,7 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
         population: Population,
         *,
         edge_child_orig: torch.Tensor | None = None,
+        edge_parent_orig: torch.Tensor | None = None,
         solver_order: torch.Tensor | None = None,
     ):
         torch.nn.Module.__init__(self)
@@ -2569,10 +2571,12 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             "myelinated",
             "native_cable",
             "scalar_tree",
+            "extcell_axon",
+            "extcell_tree",
         }:
             raise FunctionalizationError(
                 "A packed component physical adapter requires an admitted "
-                "scalar Population topology."
+                "Population topology."
             )
 
         self.topology_kind = topology_kind
@@ -2596,6 +2600,18 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
                 _clone_tensor(solver_order),
                 persistent=False,
             )
+        elif topology_kind == "extcell_tree":
+            if edge_child_orig is None or edge_parent_orig is None:
+                raise FunctionalizationError(
+                    "ExtCellTree component preparation requires immutable "
+                    "storage-order edge endpoints."
+                )
+            self.register_buffer(
+                "edge_child_orig", _clone_tensor(edge_child_orig), persistent=False
+            )
+            self.register_buffer(
+                "edge_parent_orig", _clone_tensor(edge_parent_orig), persistent=False
+            )
 
         # The candidate is already an isolated, initialized clone admitted by
         # the scalar functional contract.  Remove the runtime-owned subtrees
@@ -2607,6 +2623,9 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             "diam",
             "diameters",
             "dx",
+            "xraxial",
+            "xc",
+            "xg",
             *_declared_parameter_names(population),
             *population.in_graph_parametrizations,
         }
@@ -4028,7 +4047,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
     if profile is None:
         failures.append(
             "functional initialization currently supports exact "
-            "SingleCompartment and structurally canonical Unmyelinated "
+            "Population, SingleCompartment, and structurally canonical Unmyelinated "
             "Populations, plus exact scalar Tree Populations"
         )
         population_family = None
@@ -4045,7 +4064,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         if spec is None or spec.implementation is not implementation:
             failures.append(
                 "functional initialization currently supports bwd_euler_sc "
-                "for SingleCompartment, bwd_euler_ub for Unmyelinated, and "
+                "for Population/SingleCompartment, bwd_euler_ub for Unmyelinated, and "
                 "dhs for scalar Tree"
             )
 
@@ -4938,6 +4957,16 @@ def _uses_standard_single_compartment_geometry(population) -> bool:
     )
 
 
+def _is_scalar_point(population) -> bool:
+    """Admit the two exact containers for independent scalar compartments.
+
+    ``SingleCompartment`` is a convenience subclass of ``Population``; their
+    geometry and electrical equations are identical. Do not use ``isinstance``
+    here: it would also admit Cable, Axon, Tree, and arbitrary custom models.
+    """
+    return type(population) in (Population, SingleCompartment)
+
+
 def _is_native_cable(population) -> bool:
     """Return whether ``population`` is an exact canonical generic Cable."""
     return type(population) is Cable and population.compartment_graph is not None
@@ -4964,27 +4993,29 @@ def _is_canonical_tree(population) -> bool:
     return _is_scalar_tree(population) or _is_extcell_tree(population)
 
 
-def _is_scalar_multi(population) -> bool:
-    """Return whether ``population`` is the exact packed scalar container."""
+def _is_multi(population) -> bool:
+    """Return whether ``population`` is the exact packed population container."""
     return type(population) is MultiPopulation
 
 
 def _functional_topology_kind(population) -> str | None:
     """Return the exact audited functional topology implemented by a model."""
-    if _is_scalar_multi(population):
+    if _is_multi(population):
         operator_kind = getattr(
             population.integrator,
             "_FUNCTIONAL_OPERATOR_KIND",
             None,
         )
-        return (
-            "multi_point" if operator_kind == "scalar_multi_point" else "multi_scalar"
-        )
+        return {
+            "scalar_multi_point": "multi_point",
+            "scalar_multi": "multi_scalar",
+            "block_multi_tree": "multi_block",
+        }.get(operator_kind)
     if isinstance(population, ExtCellAxon):
         return "extcell_axon"
     if _is_extcell_tree(population):
         return "extcell_tree"
-    if type(population) is SingleCompartment:
+    if _is_scalar_point(population):
         return "single_compartment"
     if _is_scalar_tree(population):
         return "scalar_tree"
@@ -4999,7 +5030,7 @@ def _functional_topology_kind(population) -> str | None:
 
 def _functional_geometry_constant_names(topology_kind: str) -> tuple[str, ...]:
     """Return the explicit immutable geometry leaves for one topology."""
-    if topology_kind in {"multi_point", "multi_scalar"}:
+    if topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
         names = ["diam", "dx"]
     elif topology_kind == "native_cable":
         names = ["diam", "dx"]
@@ -5059,6 +5090,15 @@ def _multi_component_topology_signature(population: MultiPopulation) -> tuple:
                 component.device().type,
                 component.dtype(),
                 canonical,
+                (
+                    int(component.n_layers),
+                    tuple(
+                        (field, _shape_tuple(getattr(component, field)))
+                        for field in ("xraxial", "xc", "xg")
+                    ),
+                )
+                if isinstance(component, (ExtCellAxon, ExtCellTree))
+                else None,
                 tuple(
                     (parameter_name, _shape_tuple(parameter))
                     for parameter_name, parameter in component.named_parameters()
@@ -5858,8 +5898,8 @@ def _functionalization_failures(
         return ["expected an initialized dendra Population"]
     if not population.initialized:
         failures.append("Population must be initialized before functionalization")
-    is_multi = _is_scalar_multi(population)
-    is_single_compartment = type(population) is SingleCompartment
+    is_multi = _is_multi(population)
+    is_single_compartment = _is_scalar_point(population)
     is_extcell_axon = isinstance(population, ExtCellAxon)
     is_extcell_tree = _is_extcell_tree(population)
     is_unmyelinated = isinstance(population, Unmyelinated)
@@ -5927,7 +5967,7 @@ def _functionalization_failures(
     elif is_single_compartment:
         if not _uses_standard_single_compartment_geometry(population):
             failures.append(
-                "SingleCompartment area overrides are not supported; standard "
+                "Population/SingleCompartment area overrides are not supported; standard "
                 "Population cylindrical area semantics are required"
             )
     elif is_unmyelinated:
@@ -5965,7 +6005,7 @@ def _functionalization_failures(
             failures.append(canonical_failure)
     else:
         failures.append(
-            "the current supported topologies are exact SingleCompartment and "
+            "the current supported topologies are exact Population, exact SingleCompartment, and "
             "Unmyelinated or Myelinated with standard geometry, plus exact "
             "native Cable, scalar Tree, or ExtCellTree instances built from a "
             "canonical morphology"
@@ -6032,17 +6072,41 @@ def _functionalization_failures(
             population.integrator,
             "scalar_multi",
         )
-        if point_spec is None and packed_spec is None:
+        block_spec = _resolve_functional_integrator_spec(
+            population.integrator,
+            "block_multi_tree",
+        )
+        block_components = [
+            isinstance(component, (ExtCellAxon, ExtCellTree))
+            for component in population.populations.values()
+        ]
+        if any(block_components) and not all(block_components):
+            failures.append(
+                "MultiPopulation cannot mix scalar and finite-extracellular components"
+            )
+        if bool(block_spec is not None) != bool(
+            block_components and all(block_components)
+        ):
+            failures.append(
+                "MultiPopulation component voltage states do not match the "
+                "selected scalar or block multi-integrator"
+            )
+        if block_spec is not None and getattr(population, "n_layers", None) != 2:
+            failures.append(
+                "block MultiPopulation requires exactly two extracellular layers"
+            )
+        if point_spec is None and packed_spec is None and block_spec is None:
             failures.append(
                 "MultiPopulation functionalization requires exactly "
-                "bwd_euler_sc_multi or dhs_multi"
+                "bwd_euler_sc_multi, dhs_multi, or dhs_bt_multi"
             )
         elif population.integrator.imem:
             failures.append("i_membrane recording is not supported yet")
-        if tuple(population.integrator.v_vars) != ("v",):
+        voltage_names = ("v", "vc") if block_spec is not None else ("v",)
+        if tuple(population.integrator.v_vars) != voltage_names:
             failures.append(
-                "functional MultiPopulation integrators must declare exactly "
-                "the ('v',) voltage-state contract"
+                "functional MultiPopulation integrator voltage-state contract "
+                f"must be exactly {voltage_names}"
             )
     elif is_extcell_axon:
         if (
@@ -6091,7 +6155,7 @@ def _functionalization_failures(
             is None
         ):
             failures.append(
-                "SingleCompartment functionalization requires exactly bwd_euler_sc"
+                "Population/SingleCompartment functionalization requires exactly bwd_euler_sc"
             )
         elif population.integrator.imem:
             failures.append("i_membrane recording is not supported yet")
@@ -7154,7 +7218,7 @@ def _structure_signature(population) -> tuple:
     handler = population.mech
     multi_components = (
         _multi_component_topology_signature(population)
-        if _is_scalar_multi(population)
+        if _is_multi(population)
         else None
     )
     canonical_cable_identity = None
@@ -7443,7 +7507,7 @@ class FunctionalPopulation:
         self._geometry_constant_shapes = {
             name: (
                 self._shape
-                if self._topology_kind in {"multi_point", "multi_scalar"}
+                if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
                 else (
                     _shape_tuple(population.diameters)
                     if name == "diameters"
@@ -7472,7 +7536,7 @@ class FunctionalPopulation:
         )
         self._canonical_source_binding = (
             _multi_canonical_source_binding(population)
-            if self._topology_kind in {"multi_point", "multi_scalar"}
+            if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             else (
                 _native_cable_source_binding(population)
                 if self._topology_kind == "native_cable"
@@ -7481,7 +7545,7 @@ class FunctionalPopulation:
         )
         self._multi_canonical_values = (
             _multi_canonical_value_signature(population)
-            if self._topology_kind in {"multi_point", "multi_scalar"}
+            if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             else None
         )
         self._prepared_token = object()
@@ -7540,7 +7604,7 @@ class FunctionalPopulation:
                 "timestep-buffer materialization failed while lowering the "
                 f"Population: {exc}"
             ) from exc
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             # The packed integrator and consolidated MechanismHandler now own
             # the complete transition. Component Populations are source-side
             # configuration/commit objects only; retaining their registered
@@ -7554,6 +7618,7 @@ class FunctionalPopulation:
             "scalar_tree": "scalar_tree",
             "multi_point": "scalar_multi_point",
             "multi_scalar": "scalar_multi",
+            "multi_block": "block_multi_tree",
         }.get(self._topology_kind, "scalar_path")
         integrator_spec = _resolve_functional_integrator_spec(
             execution_population.integrator,
@@ -7716,7 +7781,7 @@ class FunctionalPopulation:
                 "materialization; initialization-time parameter transforms need "
                 "an explicit pure output contract",
             )
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             self._build_multi_component_plans(
                 population,
                 candidates=_multi_component_candidates,
@@ -7726,7 +7791,7 @@ class FunctionalPopulation:
             for name, value in _module_tensor_slots(self._preparation)
             if not name.startswith("component_physical_preparations.")
         }
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             leaked_component_runtime = sorted(
                 name
                 for mapping in (self._base_mapping, self._preparation_base_mapping)
@@ -7926,7 +7991,8 @@ class FunctionalPopulation:
                 if self._topology_kind == "multi_scalar"
                 else math.prod(source_component.core_shape())
             )
-            if topology_kind == "scalar_tree":
+            edge_parent_orig = None
+            if topology_kind in {"scalar_tree", "extcell_tree"}:
                 parent_index = torch.as_tensor(
                     source_component.compartment_graph.topology.parent_index,
                     device=source_component.device(),
@@ -7936,9 +8002,14 @@ class FunctionalPopulation:
                     parent_index >= 0,
                     as_tuple=False,
                 ).flatten()
-                solver_order = packed_integrator.SOLVER_cat[
-                    solver_cursor : solver_cursor + group_k
-                ]
+                edge_parent_orig = parent_index.index_select(0, edge_child_orig)
+                solver_order = (
+                    packed_integrator.SOLVER_cat[
+                        solver_cursor : solver_cursor + group_k
+                    ]
+                    if topology_kind == "scalar_tree"
+                    else None
+                )
             else:
                 edge_child_orig = None
                 solver_order = None
@@ -7946,6 +8017,7 @@ class FunctionalPopulation:
             component_preparation = _ComponentPhysicalPreparation(
                 component,
                 edge_child_orig=edge_child_orig,
+                edge_parent_orig=edge_parent_orig,
                 solver_order=solver_order,
             )
             physical_preparations.append(component_preparation)
@@ -8319,7 +8391,7 @@ class FunctionalPopulation:
                     "changed after make_functional(); lower it again."
                 )
         if (
-            self._topology_kind in {"multi_point", "multi_scalar"}
+            self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             and not torch.compiler.is_compiling()
         ):
             if (
@@ -8393,10 +8465,10 @@ class FunctionalPopulation:
                 "Population in-graph parametrization buffer layout does not match "
                 "this functional execution plan."
             )
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
-            if not _is_scalar_multi(population):
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
+            if not _is_multi(population):
                 raise FunctionalizationError(
-                    "Population is not an exact scalar MultiPopulation."
+                    "Population is not an exact MultiPopulation."
                 )
             if _multi_component_topology_signature(
                 population
@@ -8494,7 +8566,7 @@ class FunctionalPopulation:
                 *(entry.key for entry in self._parametrization_constants),
                 "dt",
             }
-            if self._topology_kind in {"multi_point", "multi_scalar"}
+            if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             else {
                 *self._geometry_constant_names,
                 *(entry.key for entry in self._parametrization_constants),
@@ -8517,7 +8589,7 @@ class FunctionalPopulation:
                 )
                 for name in self._multi_public_constant_shapes
             )
-            if self._topology_kind in {"multi_point", "multi_scalar"}
+            if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             else (
                 (
                     name,
@@ -8711,7 +8783,7 @@ class FunctionalPopulation:
             # execution-time tensor inputs. Keep them beside raw parameters so
             # changing stimulation never invalidates the prepared dynamics.
             parameters.update(stimulation.constants)
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             constants = {}
             for component_record in self._multi_component_plans:
                 component = population.populations[component_record.name]
@@ -9091,7 +9163,7 @@ class FunctionalPopulation:
         preparation=None,
         preparation_base_mapping=None,
     ):
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             return self._prepare_multi_values(
                 parameters,
                 constants,
@@ -9432,6 +9504,9 @@ class FunctionalPopulation:
         }
         axial_rows = []
         compact_edges = []
+        block_shell_edges = []
+        block_xc = []
+        block_xg = []
 
         for index, component_record in enumerate(self._multi_component_plans):
             component_preparation = physical_preparations[index]
@@ -9507,6 +9582,7 @@ class FunctionalPopulation:
             if component_record.topology_kind in {
                 "native_cable",
                 "scalar_tree",
+                "extcell_tree",
             }:
                 point_area = expanded(geometry_values["canonical_area_cm2"])
             else:
@@ -9532,6 +9608,54 @@ class FunctionalPopulation:
                 )
 
             if self._topology_kind == "multi_point":
+                continue
+
+            if self._topology_kind == "multi_block":
+                # The packed block system is a disconnected forest. Component
+                # cell/fiber replicas become separate roots within K, whereas
+                # explicit Population.batch() axes remain solver batch lanes.
+                cells, nodes = component_record.core_shape
+                node_shape = (planes, cells, nodes)
+                shell_shape = (*component_shape, 2)
+                dx_solve = dx.reshape(node_shape)
+                shell = {
+                    name: torch.broadcast_to(
+                        geometry_values[name], shell_shape
+                    ).reshape(*node_shape, 2)
+                    for name in ("xraxial", "xc", "xg")
+                }
+                if component_record.topology_kind == "extcell_tree":
+                    edge_child = component_preparation.edge_child_orig
+                    edge_parent = component_preparation.edge_parent_orig
+                    resistance = expanded(
+                        geometry_values["canonical_edge_resistance_ohm"]
+                    ).reshape(node_shape)
+                    intracellular_edge = (
+                        resistance.index_select(-1, edge_child)
+                        * rhoa_scale.reshape(node_shape).index_select(-1, edge_child)
+                    ).reciprocal()
+                    extracellular_edge = _tree_layered_edge_conductance(
+                        shell["xraxial"], dx_solve, edge_child, edge_parent
+                    )
+                else:
+                    intracellular_edge = _cylindrical_edge_conductance(
+                        diam.reshape(node_shape),
+                        dx_solve,
+                        (rhoa * rhoa_scale).reshape(node_shape),
+                    )
+                    extracellular_edge = _layered_edge_conductance(
+                        shell["xraxial"], dx_solve
+                    )
+                # Explicit sizes also admit an empty hidden vmap lane: an
+                # inferred -1 is ambiguous when the physical tensor is empty.
+                edge_count = cells * intracellular_edge.shape[-1]
+                node_count = cells * nodes
+                compact_edges.append(intracellular_edge.reshape(planes, edge_count))
+                block_shell_edges.append(
+                    extracellular_edge.reshape(planes, edge_count, 2)
+                )
+                block_xc.append(shell["xc"].reshape(planes, node_count, 2))
+                block_xg.append(shell["xg"].reshape(planes, node_count, 2))
                 continue
 
             group_b = int(packed_integrator.group_B[index])
@@ -9645,6 +9769,20 @@ class FunctionalPopulation:
                 dt,
                 cm=full_fields["cm"] * full_fields["cm_scale"],
                 area=full_fields["area"],
+            )
+        elif self._topology_kind == "multi_block":
+            integrator_workspace = packed_integrator._derive_prepared_workspace(
+                dt,
+                cm=(full_fields["cm"] * full_fields["cm_scale"]).reshape(
+                    self._solve_shape
+                ),
+                area=full_fields["area"].reshape(self._solve_shape),
+                intracellular_edge_conductance=torch.cat(compact_edges, dim=-1),
+                extracellular_edge_conductance=torch.cat(block_shell_edges, dim=-2),
+                xc=torch.cat(block_xc, dim=-2),
+                xg=torch.cat(block_xg, dim=-2),
+                edge_child_orig=packed_integrator.edge_child_orig,
+                solver_order=packed_integrator.solver_order,
             )
         else:
             a_geom_flat = torch.cat(axial_rows, dim=-2)
@@ -11422,30 +11560,35 @@ class FunctionalPopulation:
         staged_population.mech.read_from_ions()
         staged_population.mech.read_from_materials()
         checkpoint = staged_population.state_dict_for_checkpoint()
-        if self._topology_kind not in {"multi_point", "multi_scalar"}:
+        if self._topology_kind not in {"multi_point", "multi_scalar", "multi_block"}:
             population.restore_dict_from_checkpoint(checkpoint)
             return population
 
         write_back = bool(population.integrator.write_back)
         component_voltages = []
+        voltage_names = ("v", "vc") if self._topology_kind == "multi_block" else ("v",)
         if write_back:
-            packed_voltage = _get_path(state, ("integrator", "v"))
             offset = 0
             for name, component in population.populations.items():
                 width = math.prod(component.core_shape())
-                value = packed_voltage[..., 0, offset : offset + width].reshape(
-                    component.shape
-                )
-                if (
-                    _shape_tuple(value) != tuple(component.shape)
-                    or value.device != component.device()
-                    or value.dtype != component.dtype()
-                ):
-                    raise FunctionalizationError(
-                        f"Committed voltage for component {name!r} does not match "
-                        "its shape, device, or dtype."
-                    )
-                component_voltages.append((component, value))
+                for voltage_name in voltage_names:
+                    packed_voltage = _get_path(state, ("integrator", voltage_name))
+                    tail = (3,) if voltage_name == "vc" else ()
+                    value = packed_voltage[
+                        (..., 0, slice(offset, offset + width), slice(None))
+                        if tail
+                        else (..., 0, slice(offset, offset + width))
+                    ].reshape(*component.shape, *tail)
+                    if (
+                        _shape_tuple(value) != (*component.shape, *tail)
+                        or value.device != component.device()
+                        or value.dtype != component.dtype()
+                    ):
+                        raise FunctionalizationError(
+                            f"Committed {voltage_name} for component {name!r} "
+                            "does not match its shape, device, or dtype."
+                        )
+                component_voltages.append(component)
                 offset += width
             if offset != self.shape[-1]:  # pragma: no cover - structure preflight
                 raise FunctionalizationError(
@@ -11479,7 +11622,9 @@ class FunctionalPopulation:
             module_path, _separator, buffer_name = relative_slot.rpartition(".")
             remember_binding(_module_at(population, module_path), buffer_name)
         for component in population.populations.values():
-            remember_binding(component, "v")
+            for voltage_name in voltage_names:
+                if hasattr(component, voltage_name):
+                    remember_binding(component, voltage_name)
 
         def restore_previous_bindings():
             for owner, name, registered, value in previous_bindings.values():
@@ -11492,11 +11637,15 @@ class FunctionalPopulation:
             population.restore_dict_from_checkpoint(checkpoint)
             if write_back:
                 offset = 0
-                for component, _value in component_voltages:
+                for component in component_voltages:
                     width = math.prod(component.core_shape())
                     component.v = population.v[..., 0, offset : offset + width].reshape(
                         component.shape
                     )
+                    if self._topology_kind == "multi_block":
+                        component.vc = population.vc[
+                            ..., 0, offset : offset + width, :
+                        ].reshape(*component.shape, 3)
                     offset += width
         except Exception:
             try:
@@ -11533,7 +11682,7 @@ def make_functional(
     class_state = {}
     try:
         class_state = _class_state_snapshot(_authored_workspace_classes(population))
-        multi_component_candidates = {} if _is_scalar_multi(population) else None
+        multi_component_candidates = {} if _is_multi(population) else None
         failures = _functionalization_failures(
             population,
             dt_value,

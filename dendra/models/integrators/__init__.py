@@ -21,7 +21,7 @@ from .implicit import (
     _bwd_euler_ub,
 )
 from .tree import _dhs, _dhs_multi
-from .tree_bt import _dhs_bt
+from .tree_bt import _dhs_bt, _dhs_bt_multi
 
 
 def partial_class(cls: Type[Any], /, **kwargs):
@@ -60,6 +60,7 @@ scnv = make_partial_integrator(_bwd_euler_sc_skip)
 dhs = make_partial_integrator(_dhs)
 dhs_multi = make_partial_integrator(_dhs_multi)
 dhs_bt = make_partial_integrator(_dhs_bt)
+dhs_bt_multi = make_partial_integrator(_dhs_bt_multi)
 
 df = dufort_frankel
 dfh = dufort_frankel_homogeneous
@@ -80,6 +81,7 @@ __all__ = [
     "dhs",
     "dhs_multi",
     "dhs_bt",
+    "dhs_bt_multi",
     "df",
     "dfh",
     "scnv",

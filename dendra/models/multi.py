@@ -13,7 +13,7 @@ from .core import (
     _mechanism_global_parameter_names,
     _unpack_mechanism_insertion_record,
 )
-from .integrators import bwd_euler_sc_multi, dhs_multi
+from .integrators import bwd_euler_sc_multi, dhs_bt_multi, dhs_multi
 from .tree import Tree
 
 _MISSING = object()
@@ -143,20 +143,35 @@ def _multi_solver_capability(population):
     return "unsupported"
 
 
-def _reject_block_populations(populations):
-    """Fail closed while no block-state multi-solver is implemented."""
+def _validate_block_populations(populations):
+    """Admit two-layer extracellular packs without mixing voltage contracts."""
     block = [
         name
         for name, population in populations.items()
         if _multi_solver_capability(population) == "block"
     ]
-    if block:
+    if block and len(block) != len(populations):
         names = ", ".join(repr(name) for name in block)
         raise TypeError(
             "Block-state population(s) "
-            f"{names} require a block multi-solver; scalar dhs_multi and "
-            "bwd_euler_sc_multi cannot evolve their extracellular circuit state."
+            f"{names} require a block multi-solver and cannot be mixed with "
+            "scalar components; their extracellular circuit states differ."
         )
+    if block:
+        from .extcell import ExtCellAxon, ExtCellTree
+
+        for name, population in populations.items():
+            if not isinstance(population, (ExtCellAxon, ExtCellTree)):
+                raise TypeError(
+                    "Custom block-state populations require a block multi-solver "
+                    "with a supported topology. Packed components must be ExtCellAxon or "
+                    f"ExtCellTree; got {type(population).__name__} for {name!r}."
+                )
+            if int(getattr(population, "n_layers", 0)) != 2:
+                raise ValueError(
+                    "All packed extracellular components require exactly two layers."
+                )
+    return bool(block)
 
 
 def _assess_type_and_make_integrator(populations, threads=16, write_back=True):
@@ -185,7 +200,8 @@ def _assess_type_and_make_integrator(populations, threads=16, write_back=True):
     """
     if not populations:
         raise ValueError("At least one population is required.")
-    _reject_block_populations(populations)
+    if _validate_block_populations(populations):
+        return dhs_bt_multi(threads=threads, write_back=write_back)
     capabilities = {_multi_solver_capability(pop) for pop in populations.values()}
     if capabilities == {"scalar_independent"}:
         return bwd_euler_sc_multi(write_back=write_back)
@@ -241,7 +257,7 @@ def concat_models(
     celsius=37.0,
     v_init=None,
 ):
-    """Pack independent scalar populations into one :class:`MultiPopulation`.
+    """Pack independent populations into one :class:`MultiPopulation`.
 
     Ordinary :class:`~dendra.models.core.Population` and
     :class:`~dendra.models.core.SingleCompartment` models, branched
@@ -252,6 +268,10 @@ def concat_models(
     containing only independent point compartments keeps the optimized
     single-compartment multi-integrator.
 
+    Alternatively, two-layer :class:`~dendra.models.extcell.ExtCellAxon` and
+    :class:`~dendra.models.extcell.ExtCellTree` components can be combined in a
+    block-DHS pack. Scalar and finite-extracellular components cannot be mixed.
+
     Concatenation does not create axial edges between component populations.
     It packs their independent electrical systems into one launch and exposes
     each component name as a labelled Slice on the composite model.
@@ -259,12 +279,12 @@ def concat_models(
     Parameters
     ----------
     populations : dict[str, Population]
-        Mapping of unique component names to unbatched scalar populations. All
+        Mapping of unique component names to unbatched populations. All
         components must share a device and dtype.
     threads : int, optional
         DHS lane count for packed Tree/Cable groups. Must divide 32.
     write_back : bool, optional
-        If ``True``, write solved voltage views back to every component after
+        If ``True``, write solved ``v`` (and block ``vc``) views to components after
         each step. If ``False``, only the composite voltage is updated.
     celsius : float, optional
         Common simulation temperature.
@@ -282,11 +302,9 @@ def concat_models(
 
     Notes
     -----
-    Finite-extracellular :class:`~dendra.models.extcell.ExtCellTree` and
-    :class:`~dendra.models.extcell.ExtCellAxon` models carry block-valued
-    voltage state and are intentionally rejected until a packed block-DHS
-    solver is available. Nested ``MultiPopulation`` objects are likewise
-    unsupported.
+    A packed extracellular system retains both membrane voltage ``v`` and
+    absolute circuit potentials ``vc``. Concatenation still creates no edges
+    between components. Nested ``MultiPopulation`` objects are unsupported.
     """
     _check_celsius(celsius, populations)
     integrator = _assess_type_and_make_integrator(
@@ -365,6 +383,29 @@ def _concat_component_field(populations, name):
 
     flattened = torch.cat(parts, dim=-1)
     return flattened.unsqueeze(-2).contiguous()
+
+
+def _concat_component_shell_field(populations, name):
+    """Flatten component cores while retaining their two extracellular layers."""
+    parts = []
+    batch_shape = None
+    for component_name, population in populations.items():
+        component_batch = tuple(population.shape[:-2])
+        if batch_shape is None:
+            batch_shape = component_batch
+        elif batch_shape != component_batch:
+            raise ValueError("Packed components must share their leading batch shape.")
+        value = getattr(population, name)
+        target_shape = tuple(population.shape) + (2,)
+        try:
+            value = torch.broadcast_to(value, target_shape)
+        except RuntimeError as error:
+            raise ValueError(
+                f"Component field {name!r} on {component_name!r} must "
+                f"broadcast to {target_shape}; got {tuple(value.shape)}."
+            ) from error
+        parts.append(value.reshape(*component_batch, -1, 2))
+    return torch.cat(parts, dim=-2).unsqueeze(-3).contiguous()
 
 
 def flatten_key(n, shape, key):
@@ -505,10 +546,10 @@ def _concat_population_v_init(populations, v_init=None):
 
 
 class MultiPopulation(Population):
-    """One packed model composed of independent scalar sub-populations.
+    """One packed model composed of independent scalar or extracellular models.
 
     Prefer :func:`concat_models` so Dendra can select the appropriate packed
-    scalar integrator. Component topology, geometry, physical scale factors,
+    integrator. Component topology, geometry, physical scale factors,
     mechanisms, injections, initial voltages, and structural labels remain
     component-specific; temperature is shared by the composite.
 
@@ -527,13 +568,14 @@ class MultiPopulation(Population):
     **populations
         Mapping of population names to unbatched instances on one device and
         dtype. Supported public components are ordinary Population,
-        SingleCompartment, Tree, Cable, Unmyelinated, and Myelinated models.
+        SingleCompartment, Tree, Cable, Unmyelinated, and Myelinated models, or
+        a collection containing only ExtCellAxon and ExtCellTree models.
 
     Notes
     -----
     ``write_back=True`` is an integrator-factory option supplied by
-    :func:`concat_models`, not a constructor argument here. ExtCell block
-    states and nested MultiPopulation components are rejected fail-closed.
+    :func:`concat_models`, not a constructor argument here. Scalar/block mixtures
+    and nested MultiPopulation components are rejected fail-closed.
     """
 
     def __init__(self, integrator=None, celsius=37.0, v_init=None, **populations):
@@ -542,10 +584,14 @@ class MultiPopulation(Population):
         if any(b.is_batched() for b in populations.values()):
             raise ValueError("All populations must be unbatched.")
 
-        # There is not yet a packed block-tree solver.  Check this even when a
-        # caller supplies an explicit integrator so a scalar multi-integrator
-        # cannot silently discard the extracellular circuit state.
-        _reject_block_populations(populations)
+        is_block = _validate_block_populations(populations)
+        if any(
+            isinstance(population, MultiPopulation)
+            for population in populations.values()
+        ):
+            raise TypeError("Nested MultiPopulation components are unsupported.")
+        if is_block:
+            self.n_layers = 2
 
         # Check all populations are on the same device/dtype before composing
         # tensor-valued v_init values from them.
@@ -555,6 +601,17 @@ class MultiPopulation(Population):
 
         if integrator is None:
             integrator = _assess_type_and_make_integrator(populations)
+        if (
+            is_block
+            and getattr(integrator, "_FUNCTIONAL_OPERATOR_KIND", None)
+            != "block_multi_tree"
+        ):
+            raise TypeError(
+                "Extracellular components require a block multi-solver; "
+                "use dhs_bt_multi so independent component circuits remain disconnected."
+            )
+        if not is_block and "vc" in tuple(getattr(integrator, "v_vars", ())):
+            raise TypeError("Scalar components cannot use a block multi-solver.")
 
         C = sum(math.prod(pop.shape) for pop in populations.values())
         composite_v_init = (
@@ -599,6 +656,11 @@ class MultiPopulation(Population):
         self.register_buffer("_component_area", component_area)
 
         self.populations = torch.nn.ModuleDict(populations)
+        if is_block:
+            for name in ("xraxial", "xc", "xg"):
+                self.register_buffer(
+                    name, _concat_component_shell_field(self.populations, name)
+                )
 
         for pop in self.populations.values():
             self._equilibria.update(pop._equilibria)
@@ -608,6 +670,10 @@ class MultiPopulation(Population):
         # device()/dtype() methods resolve to the component population device.
         self.set_v_init(composite_v_init)
         self.v = self.expanded_v_init((1, C)).clone().contiguous()
+        if is_block:
+            vc = torch.zeros(*self.shape, 3, device=self.device(), dtype=self.dtype())
+            vc[..., 0] = self.v
+            self.register_buffer("vc", vc)
         self._sync_core_buffers_to_population_device()
 
         if all(hasattr(pop, "names") for pop in self.populations.values()):
@@ -661,17 +727,7 @@ class MultiPopulation(Population):
     def _integrator_workspace_contract_signature(self):
         """Track packed copies and every component solver dependency."""
         local = []
-        for name in (
-            "cm",
-            "rhoa",
-            "cm_scale",
-            "rhoa_scale",
-            "area_scale",
-            "diam",
-            "dx",
-            "_component_area",
-        ):
-            value = getattr(self, name, None)
+        for name, value in self._workspace_contract_inputs().items():
             if not torch.is_tensor(value):
                 return None
             try:
@@ -698,13 +754,28 @@ class MultiPopulation(Population):
         )
         return tuple(local), components
 
-    def _record_unversioned_integrator_workspace_values(self, signature):
-        """Snapshot packed inference-tensor inputs that expose no versions."""
-        local_signature, component_signatures = signature
-        local_snapshots = None
-        if any(entry[2] is None for entry in local_signature):
-            local_snapshots = tuple(
-                (name, getattr(self, name).detach().clone())
+    def _workspace_contract_inputs(self):
+        """Include block child physics: packed copies refresh at initialization."""
+        names = (
+            "cm",
+            "rhoa",
+            "cm_scale",
+            "rhoa_scale",
+            "area_scale",
+            "diam",
+            "dx",
+            "_component_area",
+        )
+        inputs = {name: getattr(self, name, None) for name in names}
+        if getattr(self, "n_layers", 0):
+            for name in ("xraxial", "xc", "xg"):
+                inputs[name] = getattr(self, name, None)
+            for component_name, population in self.populations.items():
+                # Legacy ExtCellAxon has no canonical Cable workspace signature.
+                # Changes to any child field used by the packed block workspace
+                # must therefore be observed here, not only shell changes. Area
+                # is derived from diam/dx for those axons; tracking that property
+                # itself would manufacture a new tensor identity on every check.
                 for name in (
                     "cm",
                     "rhoa",
@@ -713,8 +784,37 @@ class MultiPopulation(Population):
                     "area_scale",
                     "diam",
                     "dx",
-                    "_component_area",
-                )
+                    "xraxial",
+                    "xc",
+                    "xg",
+                ):
+                    parametrizations = getattr(population, "parametrizations", None)
+                    if parametrizations is not None and name in parametrizations:
+                        # Parametrized public values may be fresh views on every
+                        # access. Their stable original/parameter/buffer inputs
+                        # carry the actual storage/version invalidation contract.
+                        owner = parametrizations[name]
+                        for path, value in (
+                            *owner.named_parameters(remove_duplicate=False),
+                            *owner.named_buffers(remove_duplicate=False),
+                        ):
+                            inputs[
+                                f"populations.{component_name}.parametrizations.{name}.{path}"
+                            ] = value
+                    else:
+                        inputs[f"populations.{component_name}.{name}"] = getattr(
+                            population, name, None
+                        )
+        return inputs
+
+    def _record_unversioned_integrator_workspace_values(self, signature):
+        """Snapshot packed inference-tensor inputs that expose no versions."""
+        local_signature, component_signatures = signature
+        local_snapshots = None
+        if any(entry[2] is None for entry in local_signature):
+            local_snapshots = tuple(
+                (name, value.detach().clone())
+                for name, value in self._workspace_contract_inputs().items()
             )
 
         component_snapshots = {}
@@ -763,7 +863,7 @@ class MultiPopulation(Population):
         if local_needs_values and (
             local_snapshots is None
             or not all(
-                torch.equal(getattr(self, name), expected)
+                torch.equal(self._workspace_contract_inputs()[name], expected)
                 for name, expected in local_snapshots
             )
         ):
@@ -830,6 +930,10 @@ class MultiPopulation(Population):
             "y",
             "z",
             "_component_area",
+            "vc",
+            "xraxial",
+            "xc",
+            "xg",
         ):
             if hasattr(self, name):
                 setattr(self, name, getattr(self, name).to(device=device, dtype=dtype))
@@ -860,6 +964,11 @@ class MultiPopulation(Population):
         ):
             setattr(self, name, _concat_component_field(self.populations, name))
         self._component_area = _concat_component_field(self.populations, "area")
+        if getattr(self, "n_layers", 0):
+            for name in ("xraxial", "xc", "xg"):
+                setattr(
+                    self, name, _concat_component_shell_field(self.populations, name)
+                )
         self._sync_core_buffers_to_population_device()
 
     def populate_parameter_buffers(self, random_generation=None):
