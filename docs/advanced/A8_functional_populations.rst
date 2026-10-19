@@ -340,7 +340,7 @@ duplicate-slot multiplicity.
 Unsupported features raise ``dendra.func.FunctionalizationError`` during
 lowering. Current limitations include non-injective regional concentration or
 Material replacement writes, the reserved compact rowwise support encoding,
-TABLE lookups, MaterialProcesses outside the admitted ``ClearanceProcess``
+TABLE lookups, MaterialProcesses outside the admitted ``ClearanceProcess``/``ClampProcess``
 family, mechanism-owned waveform injections, delayed or stochastic state,
 VoltageProcesses, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
@@ -365,10 +365,10 @@ remaining Python configuration immutable.
 
 .. _functional-material-processes:
 
-Functional clearance over Material fields
+Functional processes over Material fields
 -----------------------------------------
 
-Globally inserted, declaration-only ``ClearanceProcess`` subclasses support
+Globally inserted, declaration-only ``ClearanceProcess`` and ``ClampProcess`` subclasses support
 functional transitions, fresh initialization, and explicit-state continuation.
 The existing ``CLEAR``/``DECAY``/``RELAX``, ``METHOD``, and ``PHASE`` declarations
 are unchanged; no extra functional annotations or voltage-local State are
@@ -435,10 +435,30 @@ uses explicit field inputs and returned replacements instead. Functional
 preparation runs outside the accepted-step loop and may depend on parameters,
 geometry, timestep, and field schemas, not evolving concentrations.
 State-dependent algebra belongs in the field-update computation.
-``ClampProcess``,
 ``ExchangeProcess``, ``DiffusionProcess``, regional process insertion, and
 custom process lifecycle/update overrides remain unsupported by functional
 lowering. They retain their existing imperative execution paths.
+
+``ClampProcess`` uses the same pipeline for hard assignments, lower/upper
+bounds, and bounded ranges. Its existing ``where=`` masks/selectors are
+prepared outside the loop and remain explicit, nondifferentiable boolean
+inputs. Clamp values and bounds can be named trainable parameters. Add a
+process before initializing/lowering the model, for example:
+
+.. code-block:: python
+
+   from dendra.models.mechanisms import ClampProcess
+
+   class BathBounds(ClampProcess):
+       ClampProcess.GLOBAL(lower=0.1, upper=2.0)
+       ClampProcess.BOUNDS("solute", field="c", lower="lower", upper="upper")
+
+Hard clamps are piecewise differentiable, not smooth at their switching
+points. Dendra retains PyTorch's ``minimum``/``maximum`` tie-gradient
+conventions. Fresh initialization does not apply a clamp at t=0; it runs in
+the selected process phase after each accepted step. Packed models retain the
+same selector semantics as imperative execution; explicit masks allow precise
+selection of packed compartments.
 
 Basic use
 ---------

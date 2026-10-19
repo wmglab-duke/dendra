@@ -53,7 +53,11 @@ from dendra.models.integrators.tree_bt import (
 )
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion
-from dendra.models.mechanisms._material_process import ClearanceProcess, MaterialProcess
+from dendra.models.mechanisms._material_process import (
+    ClampProcess,
+    ClearanceProcess,
+    MaterialProcess,
+)
 from dendra.models.mechanisms._materials import Material
 from dendra.models.mechanisms._mechanism import Mechanism, PointProcess
 from dendra.models.mechanisms._numerical import (
@@ -161,26 +165,79 @@ _STANDARD_FUNCTIONAL_HANDLER_HOOKS = {
     name: inspect.getattr_static(MechanismHandler, name)
     for name in _FUNCTIONAL_HANDLER_HOOKS
 }
-_CLEARANCE_FUNCTIONAL_HOOKS = (
+_MATERIAL_FUNCTIONAL_COMMON_HOOKS = (
     "material_fields",
     "prepare_materials",
     "material_updates",
     "advance_materials",
     "configure_process",
-    "_configure_clearance_material_plan",
-    "_clearance_operand",
-    "_validate_clearance_operand",
-    "_validate_clearance_specs",
-    "_effective_clearance_domain",
     "_resolve_quantity",
     "_get_material",
     "_bind_materials",
     "set_dt",
     "_reset_initialization_timestep",
 )
-_STANDARD_CLEARANCE_FUNCTIONAL_HOOKS = {
-    name: inspect.getattr_static(ClearanceProcess, name)
-    for name in _CLEARANCE_FUNCTIONAL_HOOKS
+
+
+@dataclass(frozen=True)
+class _MaterialProcessContract:
+    family: type
+    prefix: str
+    hooks: tuple[str, ...]
+    declarations: tuple[str, ...]
+    configuration: tuple[str, ...]
+    spatial: bool = False
+
+
+_MATERIAL_PROCESS_CONTRACTS = (
+    _MaterialProcessContract(
+        ClearanceProcess,
+        "clearance",
+        (
+            "_configure_clearance_material_plan",
+            "_clearance_operand",
+            "_validate_clearance_operand",
+            "_validate_clearance_specs",
+            "_effective_clearance_domain",
+        ),
+        ("_clearance_specs",),
+        (
+            "_clearance_material_plan",
+            "_clearance_method",
+            "_clearance_allow_negative_rate",
+            "_clearance_domain",
+        ),
+    ),
+    _MaterialProcessContract(
+        ClampProcess,
+        "clamp",
+        (
+            "_configure_clamp_material_plan",
+            "_clamp_operand",
+            "_validate_clamp_operand",
+            "_effective_clamp_domain",
+            "_effective_clamp_mode",
+            "_validate_and_configure_clamp_specs",
+            "_build_where_mask",
+            "_terminal_mask",
+            "_root_mask",
+        ),
+        ("_clamp_specs",),
+        (
+            "_clamp_material_plan",
+            "_clamp_method",
+            "_clamp_domain",
+            "_clamp_mask_names",
+            "_clamp_operator_keys",
+        ),
+    ),
+)
+_STANDARD_MATERIAL_FUNCTIONAL_HOOKS = {
+    contract.family: {
+        name: inspect.getattr_static(contract.family, name)
+        for name in (*_MATERIAL_FUNCTIONAL_COMMON_HOOKS, *contract.hooks)
+    }
+    for contract in _MATERIAL_PROCESS_CONTRACTS
 }
 _STANDARD_MATERIAL_RESOLVER = inspect.getattr_static(MechanismHandler, "_get_material")
 _HANDLER_INITIALIZATION_HOOKS = (
@@ -1531,21 +1588,36 @@ def _timestep_buffer_names(module) -> tuple[str, ...]:
     return tuple(sorted(getattr(module, "_timestep_buffers", ())))
 
 
+def _material_process_contract(process):
+    return next(
+        (
+            contract
+            for contract in _MATERIAL_PROCESS_CONTRACTS
+            if isinstance(process, contract.family)
+        ),
+        None,
+    )
+
+
 def _material_process_failures(process, population=None):
-    """Admit declaration-only Clearance families, not effectful custom hooks."""
-    if not isinstance(process, ClearanceProcess):
+    """Admit canonical declaration-driven families, not effectful custom hooks."""
+    contract = _material_process_contract(process)
+    if contract is None:
         return [
-            "MaterialProcesses other than canonical ClearanceProcess have "
+            "MaterialProcesses outside the admitted canonical families have "
             "workspaces or update contracts that are not lowered yet"
         ]
+    family = contract.family.__name__
     changed = [
         name
-        for name, standard in _STANDARD_CLEARANCE_FUNCTIONAL_HOOKS.items()
+        for name, standard in _STANDARD_MATERIAL_FUNCTIONAL_HOOKS[
+            contract.family
+        ].items()
         if name in process.__dict__
         or inspect.getattr_static(type(process), name) is not standard
     ]
     if changed:
-        return [f"ClearanceProcess replaces canonical pure process hooks {changed}"]
+        return [f"{family} replaces canonical pure process hooks {changed}"]
     resolver = getattr(process, "_material_resolver", None)
     if getattr(resolver, "__func__", None) is not _STANDARD_MATERIAL_RESOLVER or (
         population is not None
@@ -1556,32 +1628,33 @@ def _material_process_failures(process, population=None):
             is not _STANDARD_MATERIAL_RESOLVER
         )
     ):
-        return [
-            "ClearanceProcess requires its owning MechanismHandler material resolver"
-        ]
+        return [f"{family} requires its owning MechanismHandler material resolver"]
     if process.key is not None:
-        return ["functional ClearanceProcess requires global insertion"]
-    if not getattr(process, "_clearance_material_plan", ()):
-        return ["ClearanceProcess is missing its configured material field plan"]
+        return [f"functional {family} requires global insertion"]
+    if not getattr(process, f"_{contract.prefix}_material_plan", ()):
+        return [f"{family} is missing its configured material field plan"]
     return []
 
 
 def _material_process_signature(process, handler):
-    if not isinstance(process, ClearanceProcess):
+    contract = _material_process_contract(process)
+    if contract is None:
         return None
     return (
-        _material_configuration_signature(
-            getattr(type(process), "_clearance_specs", ())
+        contract.family,
+        tuple(
+            (name, _material_configuration_signature(getattr(type(process), name, ())))
+            for name in contract.declarations
         ),
-        _configuration_signature(getattr(process, "_clearance_material_plan", ())),
+        tuple(
+            (name, _material_configuration_signature(getattr(process, name, None)))
+            for name in contract.configuration
+        ),
         _configuration_signature(
             getattr(type(process), "_material_process_method_kwargs", {})
         ),
         getattr(type(process), "_material_process_method", None),
         getattr(type(process), "_material_process_phase", None),
-        getattr(process, "_clearance_method", None),
-        getattr(process, "_clearance_allow_negative_rate", None),
-        _configuration_signature(getattr(process, "_clearance_domain", None)),
         (
             getattr(process._material_resolver, "__self__", None) is handler,
             id(
@@ -1593,7 +1666,7 @@ def _material_process_signature(process, handler):
         ),
         tuple(
             (name, _effective_hook_identity(process, name))
-            for name in _CLEARANCE_FUNCTIONAL_HOOKS
+            for name in _STANDARD_MATERIAL_FUNCTIONAL_HOOKS[contract.family]
         ),
     )
 
@@ -1641,6 +1714,18 @@ def _material_fields(population, process):
     }
 
 
+def _material_process_operand_references(process):
+    """Registered numerical/mask dependencies, independent of module aliases."""
+    if isinstance(process, ClearanceProcess):
+        for _key, *references in process._clearance_material_plan:
+            yield from references
+    elif isinstance(process, ClampProcess):
+        for _key, _mode, references, mask_name in process._clamp_material_plan:
+            yield from references
+            if mask_name is not None:
+                yield "buffer", mask_name
+
+
 def _prepared_material_advance(self, dt):
     """Private adapter: returned replacements publish only to explicit carry."""
     values = tuple(self._buffers[name] for name in self._functional_material_slots)
@@ -1667,17 +1752,12 @@ def _install_material_preparation(population, dt):
             process.register_buffer(name, _clone_tensor(value), persistent=False)
         process._functional_material_slots = slots
         process._functional_material_tree_spec = tree_spec
-        # Clearance returns three operands for every declaration. Keep logical
-        # scalar workspaces scalar publicly, padding only the execution binding
-        # to avoid the empty-vmap scalar/spatial broadcast limitation.
+        # Pointwise families use full-field arithmetic. Keep scalar operands
+        # scalar publicly and pad only their private execution binding, avoiding
+        # the empty-vmap scalar/spatial broadcast limitation outside model math.
+        visible_rank = max(value.ndim for value in fields.values())
         process._functional_material_visible_ranks = {
-            name: fields[entry[0]].ndim
-            for entry, names in zip(
-                process._clearance_material_plan,
-                (slots[i : i + 3] for i in range(0, len(slots), 3)),
-                strict=True,
-            )
-            for name in names
+            name: visible_rank for name in slots
         }
         process.advance_materials = types.MethodType(
             _prepared_material_advance, process
@@ -5862,20 +5942,14 @@ def _parametrization_constant_layout_for_owners(
                     record(value, (f"{transform_path}.{buffer_name}",))
         available_names = _parameter_materialization_output_names(owner)
         available_names.update({"diam", "diameters", "dx", "celsius"})
-        if isinstance(owner, ClearanceProcess):
-            for _key, *operands in owner._clearance_material_plan:
-                for kind, name in operands:
-                    if kind == "buffer" or (
-                        kind == "named" and name not in available_names
-                    ):
-                        route_resident_dependency(
-                            owner, name, role="material process operand"
-                        )
-                        value = owner._buffers.get(name)
-                        if torch.is_tensor(value):
-                            public_constant_by_identity.setdefault(
-                                id(value), f"material_processes.{owner.name}.{name}"
-                            )
+        for kind, name in _material_process_operand_references(owner):
+            if kind == "buffer" or (kind == "named" and name not in available_names):
+                route_resident_dependency(owner, name, role="material process operand")
+                value = owner._buffers.get(name)
+                if torch.is_tensor(value):
+                    public_constant_by_identity.setdefault(
+                        id(value), f"material_processes.{owner.name}.{name}"
+                    )
         for target_name, transforms in owner.in_graph_parametrizations.items():
             if target_name not in available_names:
                 raise FunctionalizationError(
@@ -11235,14 +11309,35 @@ class FunctionalPopulation:
                     value[0].detach().clone() for value in vmapped_outputs
                 )
 
-                # A joint forward-mode probe through every explicit tensor input
-                # establishes that initialization has the same primal result
-                # inside JVP. The tangent may legitimately be zero or nonzero.
+                # Structural integer/bool inputs (for example material masks)
+                # remain explicit in the probe but cannot acquire AD tangents.
+                # Vmap above still exercises independent lanes for all inputs.
+                differentiable_indices = tuple(
+                    index
+                    for index, value in enumerate(flat_inputs)
+                    if value.is_floating_point() or value.is_complex()
+                )
+
+                def evaluate_differentiable(*values):
+                    full_inputs = list(flat_inputs)
+                    for index, value in zip(
+                        differentiable_indices, values, strict=True
+                    ):
+                        full_inputs[index] = value
+                    return evaluate_flat(*full_inputs)
+
+                differentiable_inputs = tuple(
+                    flat_inputs[index] for index in differentiable_indices
+                )
+                # A joint forward-mode probe establishes primal consistency;
+                # individual tangents may legitimately be zero or nonzero.
                 with torch.set_grad_enabled(True):
                     jvp_outputs, _tangents = torch.func.jvp(
-                        evaluate_flat,
-                        flat_inputs,
-                        tuple(torch.ones_like(value) for value in flat_inputs),
+                        evaluate_differentiable,
+                        differentiable_inputs,
+                        tuple(
+                            torch.ones_like(value) for value in differentiable_inputs
+                        ),
                     )
                 record_module_side_effects()
                 transform_outputs["jvp"] = tuple(

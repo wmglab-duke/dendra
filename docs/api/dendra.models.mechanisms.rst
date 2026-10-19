@@ -505,11 +505,11 @@ local synchronization belong to the surrounding framework transaction. This
 protocol does not introduce ordinary Mechanism ``STATE``, ``CARRY``,
 ``DERIVED_BUFFER``, or ``TIMESTEP_BUFFER`` phases for MaterialProcesses.
 
-``ClearanceProcess`` uses this shared numerical path in both imperative and
+``ClearanceProcess`` and ``ClampProcess`` use this shared numerical path in both imperative and
 functional execution. Its imperative ``advance_materials`` still commits bound
 Material state; out-of-place arithmetic alone is not an admission contract for
 custom functional processes. Currently only globally inserted,
-declaration-driven Clearance subclasses with their canonical lifecycle are
+declaration-driven Clearance/Clamp subclasses with their canonical lifecycle are
 admitted by ``dn.func``. Other families and custom process runtime overrides
 remain imperative-only. No process is advanced during fresh initialization.
 See :ref:`functional-material-processes` for recording, gradient, and

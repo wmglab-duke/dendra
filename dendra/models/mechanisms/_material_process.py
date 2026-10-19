@@ -489,7 +489,8 @@ class MaterialProcess(Mechanism):
         :meth:`configure_process`, :meth:`set_dt`, and :meth:`advance_materials`.
         """
         raise NotImplementedError(
-            f"{type(self).__name__} does not declare pure material field inputs."
+            f"{type(self).__name__} does not declare pure material field inputs; "
+            "implement the pure material protocol or override advance_materials(dt)."
         )
 
     def prepare_materials(
@@ -789,6 +790,7 @@ class ClampProcess(MaterialProcess):
     """
 
     _material_process_phase = "post_transport"
+    _functional_material_family = "clamp"
     _clamp_specs: tuple[ClampSpec, ...] = tuple()
     _clamp_declarations = []
 
@@ -971,7 +973,125 @@ class ClampProcess(MaterialProcess):
         )
         self._clamp_mask_names: dict[str, str | None] = {}
         self._validate_and_configure_clamp_specs(population)
+        self._configure_clamp_material_plan()
         return None
+
+    def _configure_clamp_material_plan(self):
+        """Bind authored operands and masks without retaining update graphs."""
+        entries = []
+        for index, (operator_key, spec) in enumerate(
+            zip(self._clamp_operator_keys, type(self)._clamp_specs)
+        ):
+            mode = self._effective_clamp_mode(spec)
+            if mode == "range":
+                # Preserve the existing failure at execution, including malformed
+                # bounds that cannot otherwise be represented as a tensor.
+                values = (
+                    tuple(zip(("lower", "upper"), spec.value))
+                    if isinstance(spec.value, (tuple, list)) and len(spec.value) == 2
+                    else ()
+                )
+            else:
+                values = (("value", spec.value),)
+            operands = []
+            for role, value in values:
+                if isinstance(value, str):
+                    operands.append(("named", value))
+                elif isinstance(value, Number):
+                    operands.append(("scalar", value))
+                else:
+                    literal = (
+                        value if torch.is_tensor(value) else torch.as_tensor(value)
+                    )
+                    name = f"_clamp_literal_{index}_{role}"
+                    if name in self._buffers:
+                        self._buffers[name] = literal
+                    else:
+                        self.register_buffer(name, literal, persistent=False)
+                    operands.append(("buffer", name))
+            key = (_canonical_material_name(spec.material), spec.field)
+            entries.append(
+                (key, mode, tuple(operands), self._clamp_mask_names[operator_key])
+            )
+        self._clamp_material_plan = tuple(entries)
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        return tuple(dict.fromkeys(entry[0] for entry in self._clamp_material_plan))
+
+    def _clamp_operand(self, reference, like, *, what):
+        kind, value = reference
+        if kind == "buffer":
+            return self._buffers[value].to(device=like.device, dtype=like.dtype)
+        return self._resolve_quantity(value, like, what=what)
+
+    @staticmethod
+    def _validate_clamp_operand(value, like, *, what):
+        if torch.broadcast_shapes(value.shape, like.shape) != like.shape:
+            raise ValueError(
+                f"Clamp {what} shape {tuple(value.shape)} must broadcast to "
+                f"the full material field shape {tuple(like.shape)}."
+            )
+
+    def prepare_materials(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        dt,
+    ):
+        del dt  # clamps are algebraic process updates
+        prepared = []
+        for key, mode, references, mask_name in self._clamp_material_plan:
+            c = fields[key]
+            if mode == "range" and len(references) != 2:
+                raise ValueError(
+                    "ClampProcess mode='range' requires value=(lower, upper)."
+                )
+            values = tuple(
+                self._clamp_operand(reference, c, what="clamp value")
+                for reference in references
+            )
+            for value in values:
+                self._validate_clamp_operand(value, c, what="value")
+            if mask_name is None:
+                prepared.append((values,))
+            else:
+                mask = self._buffers[mask_name].to(device=c.device, dtype=torch.bool)
+                self._validate_clamp_operand(mask, c, what="mask")
+                prepared.append((values, mask))
+        return tuple(prepared)
+
+    def material_updates(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        prepared,
+    ) -> dict[tuple[str, str], torch.Tensor]:
+        if len(prepared) != len(self._clamp_material_plan):
+            raise ValueError(
+                "Clamp preparation does not match its declared field plan."
+            )
+        updates = {}
+        for (key, mode, _references, mask_name), operands in zip(
+            self._clamp_material_plan, prepared
+        ):
+            values = operands[0]
+            c = updates.get(key, fields[key])
+            if mode == "range":
+                lower, upper = values
+                c_clamped = torch.maximum(torch.minimum(c, upper), lower)
+            else:
+                (value,) = values
+                if mode == "min":
+                    c_clamped = torch.maximum(c, value)
+                elif mode == "max":
+                    c_clamped = torch.minimum(c, value)
+                else:
+                    c_clamped = value + torch.zeros_like(c)
+            updates[key] = (
+                c_clamped
+                if mask_name is None
+                else torch.where(operands[1], c_clamped, c)
+            )
+        return updates
 
     def _effective_clamp_domain(self, material, spec: ClampSpec) -> str | None:
         domain = spec.domain
@@ -1119,48 +1239,6 @@ class ClampProcess(MaterialProcess):
         if like.shape[-1] > 0:
             mask[..., 0] = True
         return mask
-
-    def _broadcast_mask(self, mask, c: torch.Tensor):
-        if mask is None:
-            return None
-        mask = mask.to(device=c.device, dtype=torch.bool)
-        while mask.ndim < c.ndim:
-            mask = mask.unsqueeze(0)
-        return mask.expand_as(c)
-
-    def _apply_clamp_mode(self, c: torch.Tensor, spec: ClampSpec, mode: str):
-        if mode == "range":
-            if not isinstance(spec.value, (tuple, list)) or len(spec.value) != 2:
-                raise ValueError(
-                    "ClampProcess mode='range' requires value=(lower, upper)."
-                )
-            lower = self._resolve_quantity(spec.value[0], c, what="clamp lower bound")
-            upper = self._resolve_quantity(spec.value[1], c, what="clamp upper bound")
-            return torch.maximum(torch.minimum(c, upper), lower)
-
-        value = self._resolve_quantity(spec.value, c, what="clamp value")
-        if mode == "min":
-            return torch.maximum(c, value)
-        if mode == "max":
-            return torch.minimum(c, value)
-        return value + torch.zeros_like(c)
-
-    def advance_materials(self, dt):
-        del dt  # clamps are algebraic process updates
-        transaction = _MaterialFieldTransaction()
-        for key, spec in zip(self._clamp_operator_keys, type(self)._clamp_specs):
-            material = self._get_material(spec.material)
-            c = transaction.read(material, spec.field)
-            mode = self._effective_clamp_mode(spec)
-            c_clamped = self._apply_clamp_mode(c, spec, mode)
-            mask_name = self._clamp_mask_names.get(key, None)
-            if mask_name is None:
-                c_new = c_clamped
-            else:
-                mask = self._broadcast_mask(self._buffers[mask_name], c)
-                c_new = torch.where(mask, c_clamped, c)
-            transaction.write(material, spec.field, c_new)
-        transaction.commit()
 
 
 class ExchangeProcess(MaterialProcess):
