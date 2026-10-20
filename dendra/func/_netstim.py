@@ -1,0 +1,431 @@
+"""Explicit-state NetStim renewal over the shared network-layer transition."""
+
+from __future__ import annotations
+
+from collections.abc import Mapping
+from typing import NamedTuple
+
+import torch
+
+from dendra.models.networks._netstim_renewal import (
+    NetStimState,
+    broadcast_netstim_time,
+    netstim_initial_state,
+    netstim_renewal,
+)
+from dendra.models.networks.netstim import NetStim
+from dendra.models.parametric import PositiveParam
+
+from ._types import FunctionalizationError
+
+
+class NetStimTensors(NamedTuple):
+    """Independent effective parameters, constants, and clock/RNG snapshots."""
+
+    parameters: dict[str, torch.Tensor]
+    constants: dict[str, torch.Tensor]
+    state: dict[str, torch.Tensor]
+
+
+class NetStimDraw(NamedTuple):
+    """An exponential draw and its matching post-draw generator byte state.
+
+    Sampling helpers produce replayable packets without touching the native
+    NetStim or the input state. Keep the two fields together: manually supplied
+    draws are accepted, but their RNG provenance cannot be inferred from values.
+    """
+
+    exp_rand: torch.Tensor
+    rng_state: torch.Tensor
+
+
+class NetStimOutputs(NamedTuple):
+    """Hard boolean spikes and their differentiable straight-through gates."""
+
+    spikes: torch.Tensor
+    spike_gate: torch.Tensor
+
+
+def _snapshot(value, *, parameter=False):
+    with torch.inference_mode(False):
+        result = value.detach().clone(memory_format=torch.contiguous_format)
+        if parameter:
+            result.requires_grad_(value.requires_grad)
+        return result
+
+
+def _unscheduled(source):
+    return (
+        not any(source._sched_heaps)
+        and source.sched_flat_idx.numel() == 0
+        and source.sched_abs_step.numel() == 0
+        and source.sched_time_ms.numel() == 0
+        and source.sched_weight.numel() == 0
+        and source.sched_weight_idx.numel() == 0
+        and source.sched_time_idx.numel() == 0
+        and source._sched_w_source is None
+        and source._sched_t_source is None
+        and bool(torch.isposinf(source.next_sched_time).all())
+    )
+
+
+def _eligible(source):
+    if type(source) is not NetStim:
+        raise FunctionalizationError("Expected an initialized canonical NetStim.")
+    if not getattr(source, "_renewal_initialized", False):
+        raise FunctionalizationError("Initialize the NetStim before lowering it.")
+    if not _unscheduled(source):
+        raise FunctionalizationError(
+            "Functional NetStim currently requires unscheduled renewal; "
+            "heap/tensor schedules and bound schedule sources are unsupported."
+        )
+    interval = source.interval
+    if (
+        type(interval) is not PositiveParam
+        or "forward" in interval.__dict__
+        or "_compute" in interval.__dict__
+        or interval._forward_hooks
+        or interval._forward_pre_hooks
+        or "forward" in source.__dict__
+        or source._forward_hooks
+        or source._forward_pre_hooks
+    ):
+        raise FunctionalizationError(
+            "Functional NetStim requires its canonical parameter and renewal adapters."
+        )
+
+
+class FunctionalNetStim:
+    """A pure renewal plan with explicit random draws and checkpointable RNG.
+
+    Lower an initialized, unscheduled :class:`~dendra.NetStim`. Effective
+    ``interval``, ``start``, ``noise``, and ``tau`` parameters use the full native
+    state shape; ``max_spikes`` is an explicit integer constant. Parameters are
+    independent leaf snapshots, so gradients never reach the source module.
+
+    :meth:`step` calls the same pure transition as native NetStim. Draw one
+    packet with :meth:`sample_step_draw` outside transformed/compiled code, then
+    pass it into the step. Every native forward consumes one full-shape draw,
+    including deterministic generators and calls that emit no spikes. RNG byte
+    state travels with clock carry, while sampling remains outside the hot
+    graph. ``bptt=False`` detaches the renewed clock as native execution does;
+    emitted surrogate gates retain their current-step gradients.
+
+    :meth:`initial_state` resets clocks using an explicit initialization packet.
+    Its cold sampler reseeds when the lowered native NetStim has a fixed seed;
+    with ``seed=None`` it continues the supplied state's RNG stream. A fully
+    deterministic initialization consumes no draw. Initialization clocks are
+    detached, matching native initialization.
+
+    Configuration changes require lowering again. Runtime carry changes do not
+    invalidate a plan. :meth:`commit_state_` transfers clocks and both RNG states
+    without changing native parameters or constants; those must match explicit
+    values when continuing the same trajectory natively. Schedules remain the
+    responsibility of the native adapter in this first lowering interface.
+    """
+
+    def __init__(self, source):
+        _eligible(source)
+        self._source = source
+        self._generation = source._renewal_generation
+        self._config_generation = source._renewal_config_generation
+        self._training = bool(source.training)
+        self._seed = source.seed
+        self._schedule_mode = (
+            bool(source.diff_scheduled_times),
+            float(source.sched_width),
+        )
+        self.shape = tuple(source.shape)
+        self.device = source.next_stoch_time.device
+        self.dtype = source.next_stoch_time.dtype
+        checkpoint = source.state_dict_for_checkpoint()
+        self._state_schema = {
+            name: (
+                tuple(checkpoint[name].shape),
+                checkpoint[name].dtype,
+                checkpoint[name].device,
+            )
+            for name in (
+                "next_stoch_time",
+                "spike_counts",
+                "t_last",
+                "rng_state",
+                "seeder_state",
+            )
+        }
+        self._validate_compatible(source)
+
+    def _validate_source(self):
+        source = self._source
+        if (
+            type(source) is not NetStim
+            or not source._renewal_initialized
+            or source._renewal_generation != self._generation
+            or source._renewal_config_generation != self._config_generation
+            or bool(source.training) != self._training
+            or source.seed != self._seed
+            or tuple(source.shape) != self.shape
+            or source.next_stoch_time.device != self.device
+            or source.next_stoch_time.dtype != self.dtype
+            or (bool(source.diff_scheduled_times), float(source.sched_width))
+            != self._schedule_mode
+        ):
+            raise FunctionalizationError(
+                "The source NetStim configuration changed; initialize and lower it again."
+            )
+
+    @staticmethod
+    def _validate_tensor(value, *, shape, dtype, device, label):
+        if not torch.is_tensor(value):
+            raise TypeError(f"{label} must be a Tensor")
+        if (
+            tuple(value.shape) != shape
+            or value.dtype != dtype
+            or value.device != device
+        ):
+            raise ValueError(f"{label} must match {device}/{dtype}/{shape}")
+
+    def _validate_parameters(self, parameters, constants):
+        if not isinstance(parameters, Mapping) or set(parameters) != {
+            "interval",
+            "start",
+            "noise",
+            "tau",
+        }:
+            raise ValueError(
+                "NetStim parameters must contain interval, start, noise, and tau"
+            )
+        for name, value in parameters.items():
+            self._validate_tensor(
+                value,
+                shape=self.shape,
+                dtype=self.dtype,
+                device=self.device,
+                label=f"parameters.{name}",
+            )
+        if not isinstance(constants, Mapping) or set(constants) != {"max_spikes"}:
+            raise ValueError("NetStim constants must contain max_spikes")
+        self._validate_tensor(
+            constants["max_spikes"],
+            shape=self.shape,
+            dtype=torch.long,
+            device=self.device,
+            label="constants.max_spikes",
+        )
+
+    def _validate_state(self, state):
+        if not isinstance(state, Mapping) or set(state) != set(self._state_schema):
+            raise ValueError("NetStim state must match its clock/RNG checkpoint schema")
+        for name, (shape, dtype, device) in self._state_schema.items():
+            self._validate_tensor(
+                state[name],
+                shape=shape,
+                dtype=dtype,
+                device=device,
+                label=f"state.{name}",
+            )
+
+    def _validate_draw(self, draw):
+        if not isinstance(draw, NetStimDraw):
+            raise TypeError("draw must be a NetStimDraw packet")
+        self._validate_tensor(
+            draw.exp_rand,
+            shape=self.shape,
+            dtype=self.dtype,
+            device=self.device,
+            label="draw.exp_rand",
+        )
+        shape, dtype, device = self._state_schema["rng_state"]
+        self._validate_tensor(
+            draw.rng_state,
+            shape=shape,
+            dtype=dtype,
+            device=device,
+            label="draw.rng_state",
+        )
+
+    def _validate_compatible(self, source):
+        _eligible(source)
+        if (
+            tuple(source.shape) != self.shape
+            or source.next_stoch_time.device != self.device
+            or source.next_stoch_time.dtype != self.dtype
+            or bool(source.training) != self._training
+            or source.seed != self._seed
+            or (bool(source.diff_scheduled_times), float(source.sched_width))
+            != self._schedule_mode
+        ):
+            raise FunctionalizationError(
+                "NetStim configuration does not match this plan."
+            )
+        checkpoint = source.state_dict_for_checkpoint()
+        self._validate_state({name: checkpoint[name] for name in self._state_schema})
+        if source._rng.device != self.device:
+            raise FunctionalizationError(
+                "Initialize NetStim RNG on its state device first."
+            )
+
+    def extract(self, source=None) -> NetStimTensors:
+        """Snapshot effective values and replayable carry without source mutation."""
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError(
+                "Extract NetStim tensors before torch.compile."
+            )
+        source = self._source if source is None else source
+        self._validate_compatible(source)
+        # Bypass PositiveParam's eval cache, which is mutable derived state.
+        # Materialization is a cold value read: preserve the native parameter's
+        # gradient convention even when extraction runs under no_grad/inference.
+        with torch.inference_mode(False), torch.no_grad():
+            interval = source.interval._compute()
+            interval.requires_grad_(source.interval.rho.requires_grad)
+        values = {
+            "interval": interval,
+            "start": source.start,
+            "noise": source.noise,
+            "tau": torch.as_tensor(source.tau, device=self.device, dtype=self.dtype),
+        }
+        parameters = {
+            name: _snapshot(torch.broadcast_to(value, self.shape), parameter=True)
+            for name, value in values.items()
+        }
+        constants = {"max_spikes": _snapshot(source.max_spikes)}
+        checkpoint = source.state_dict_for_checkpoint()
+        state = {name: _snapshot(checkpoint[name]) for name in self._state_schema}
+        self._validate_parameters(parameters, constants)
+        return NetStimTensors(parameters, constants, state)
+
+    def _generator(self, state):
+        generator = torch.Generator(device=self.device)
+        generator.set_state(state["rng_state"])
+        return generator
+
+    def _sample(self, state, *, initialize=False, parameters=None):
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError("Sample NetStim draws outside torch.compile.")
+        self._validate_source()
+        self._validate_state(state)
+        generator = self._generator(state)
+        if initialize and self._seed is not None:
+            generator.manual_seed(self._seed)
+        consume = not initialize or bool(torch.any(parameters["noise"] > 0))
+        with torch.inference_mode(False), torch.no_grad():
+            if consume:
+                uniform = torch.rand(
+                    self.shape,
+                    generator=generator,
+                    device=self.device,
+                    dtype=self.dtype,
+                ).clamp_min(torch.finfo(self.dtype).tiny)
+                exp_rand = -torch.log(uniform)
+            else:
+                exp_rand = torch.zeros(self.shape, device=self.device, dtype=self.dtype)
+            return NetStimDraw(exp_rand, generator.get_state())
+
+    def sample_step_draw(self, state) -> NetStimDraw:
+        """Draw once from an independent copy of the explicit RNG state."""
+        return self._sample(state)
+
+    def sample_initialization_draw(self, parameters, state) -> NetStimDraw:
+        """Match native initialization's reseeding and conditional draw policy."""
+        if not isinstance(parameters, Mapping) or "noise" not in parameters:
+            raise ValueError("Initialization sampling requires parameters.noise")
+        self._validate_tensor(
+            parameters["noise"],
+            shape=self.shape,
+            dtype=self.dtype,
+            device=self.device,
+            label="parameters.noise",
+        )
+        return self._sample(state, initialize=True, parameters=parameters)
+
+    def initial_state(self, parameters, constants, state, draw):
+        """Reset detached clocks, adopting the initialization packet's RNG state."""
+        self._validate_source()
+        self._validate_parameters(parameters, constants)
+        self._validate_state(state)
+        self._validate_draw(draw)
+        clocks = netstim_initial_state(
+            parameters["interval"],
+            parameters["start"],
+            parameters["noise"],
+            draw.exp_rand,
+        )
+        return {
+            "next_stoch_time": clocks.next_stoch_time,
+            "spike_counts": clocks.spike_counts,
+            "t_last": clocks.t_last,
+            "rng_state": draw.rng_state,
+            "seeder_state": state["seeder_state"],
+        }
+
+    def step(self, parameters, constants, state, t, draw, *, bptt=False):
+        """Return next clock/RNG carry and hard/surrogate outputs for time ``t``."""
+        self._validate_source()
+        self._validate_parameters(parameters, constants)
+        self._validate_state(state)
+        self._validate_draw(draw)
+        time = broadcast_netstim_time(
+            t, self.shape, device=self.device, dtype=self.dtype
+        )
+        transition = netstim_renewal(
+            NetStimState(
+                state["next_stoch_time"], state["spike_counts"], state["t_last"]
+            ),
+            parameters["interval"],
+            parameters["noise"],
+            constants["max_spikes"],
+            time,
+            draw.exp_rand,
+            tau=parameters["tau"],
+            bptt=bptt,
+        )
+        return {
+            "next_stoch_time": (
+                transition.state.next_stoch_time
+                if bptt
+                else transition.state.next_stoch_time.detach()
+            ),
+            "spike_counts": transition.state.spike_counts,
+            "t_last": transition.state.t_last,
+            "rng_state": draw.rng_state,
+            "seeder_state": state["seeder_state"],
+        }, NetStimOutputs(transition.spikes, transition.spike_gate)
+
+    def commit_state_(self, source, state):
+        """Transfer validated clock and RNG carry to a compatible native NetStim.
+
+        Native training restores retain the incoming clock's autograd history;
+        evaluation restores detach the clock, clearing any prior native history.
+        """
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError("Commit NetStim state outside torch.compile.")
+        self._validate_compatible(source)
+        self._validate_state(state)
+        # Validate generator byte contents before native runtime is touched.
+        self._generator(state)
+        torch.Generator().set_state(state["seeder_state"])
+        with torch.inference_mode(False):
+            copied = {
+                name: value.clone(memory_format=torch.contiguous_format)
+                for name, value in state.items()
+            }
+            checkpoint = source.state_dict_for_checkpoint()
+            checkpoint.update(copied)
+            source.restore_dict_from_checkpoint(checkpoint)
+        return source
+
+
+def make_functional_netstim(source) -> tuple[FunctionalNetStim, NetStimTensors]:
+    """Lower one initialized unscheduled NetStim using explicit clock/RNG carry."""
+    plan = FunctionalNetStim(source)
+    return plan, plan.extract()
+
+
+__all__ = [
+    "FunctionalNetStim",
+    "NetStimDraw",
+    "NetStimOutputs",
+    "NetStimTensors",
+    "make_functional_netstim",
+]

@@ -55,7 +55,8 @@ events. This example uses raw gates; finite and mixed thresholds are also
 supported, with explicit detector carry and ordered projection phases as
 described in {doc}`A13_functional_threshold_detection`. Schedules,
 differentiable-delay interpolation, and compact queue backends remain native
-execution modes. `NetStim` generation and its RNG state remain separate work.
+execution modes. Shared pure `NetStim` generation and RNG continuation are
+described in {doc}`A14_functional_netstim_renewal`.
 
 ## Extract the projection and its explicit tensors
 
@@ -147,8 +148,8 @@ functional path uses out-of-place operations so queues, weights, or gates can
 be mapped independently with `vmap`. Its eager execution can need an extra
 temporary ring; native compilation can fuse those operations into one output.
 
-The intended extension is to expose NetStim generation, RNG, and scheduling
-state through similarly explicit transitions, then compose them in a
-Network-level lowering. Users will continue to construct networks through the
-standard Dendra API. See {doc}`A8_functional_populations` for population
+NetStim generation and RNG now use explicit transitions as described in
+{doc}`A14_functional_netstim_renewal`. Functional scheduling and Network-level
+lowering remain future extensions. Users continue to construct networks
+through the standard Dendra API. See {doc}`A8_functional_populations` for population
 execution and {doc}`../synapse_authoring` for authoring a pure receiver.

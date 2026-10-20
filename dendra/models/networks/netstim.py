@@ -11,6 +11,12 @@ from dendra.helpers import _normalize_dtype_value, current_device, current_dtype
 from ..modular import DNModule
 from ..parametric import PositiveParam
 from ..slice import Sliceable
+from ._netstim_renewal import (
+    NetStimState,
+    broadcast_netstim_time,
+    netstim_initial_state,
+    netstim_renewal,
+)
 
 
 def _clone_checkpoint_state(value, memo=None):
@@ -29,14 +35,6 @@ def _clone_checkpoint_state(value, memo=None):
     if isinstance(value, list):
         return [_clone_checkpoint_state(item, memo) for item in value]
     return copy.deepcopy(value)
-
-
-def _ste_gate(x, tau):
-    s_soft = torch.sigmoid(x / tau)  # smooth [0,1]
-    hard_bool = x >= 0
-    hard = hard_bool.to(s_soft.dtype)  # hard 0/1
-    gate = hard + (s_soft - s_soft.detach())  # forward==hard, backward like soft
-    return gate, hard
 
 
 def _causal_step_index(times: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
@@ -74,8 +72,10 @@ class NetStim(DNModule, Sliceable):
 
     where ``Delta = interval``, ``eta = noise`` in ``[0,1]``, and ``E`` is
     unit-rate exponential. When ``eta=0`` firing is periodic; when ``eta=1``
-    firing is Poisson with rate ``1/interval``. Initial spikes occur at
-    ``start``. A straight-through estimator gate provides a hard spike mask for
+    firing is Poisson with rate ``1/interval``. The initial clock is
+    ``start + noise * interval * E``, or ``start`` when ``noise=0``; a sampled
+    call emits the spike at or after that clock. A straight-through estimator
+    gate provides a hard spike mask for
     simulation while preserving gradients through the soft sigmoid surface,
     enabling differentiation w.r.t. interval parameters.
 
@@ -139,6 +139,11 @@ class NetStim(DNModule, Sliceable):
             )
         )
         self.name = "netstim"
+        self._renewal_initialized = False
+        self._renewal_generation = 0
+        # Canonical configuration mutations invalidate frozen lowering plans.
+        # Runtime clock/RNG restores leave this revision alone when unscheduled.
+        self._renewal_config_generation = 0
 
         self.N = int(shape[-1])
         self.tau = tau
@@ -364,29 +369,9 @@ class NetStim(DNModule, Sliceable):
             ) from direct_exc
 
     def _broadcast_time_to_state(self, t) -> torch.Tensor:
-        device, dtype = self.device(), self.dtype()
-        t = torch.as_tensor(t, device=device, dtype=dtype)
-
-        if tuple(t.shape) == self.shape:
-            return t
-        # A time tensor with exactly the leading batch shape is interpreted as
-        # one time per batch element and is broadcast over generators.
-        if len(self.shape) > 1 and tuple(t.shape) == self.shape[:-1]:
-            return t.unsqueeze(-1)
-
-        try:
-            return torch.broadcast_to(t, self.shape)
-        except RuntimeError as direct_exc:
-            if t.ndim > 0:
-                try:
-                    return torch.broadcast_to(t.unsqueeze(-1), self.shape)
-                except RuntimeError:
-                    pass
-            raise ValueError(
-                f"t with shape {tuple(t.shape)} cannot be broadcast to "
-                f"NetStim state shape {self.shape}. Use a scalar, shape "
-                f"{self.shape[:-1]} for per-batch times, or shape {self.shape}."
-            ) from direct_exc
+        return broadcast_netstim_time(
+            t, self.shape, device=self.device(), dtype=self.dtype()
+        )
 
     def _positive_param_from_value(self, value: torch.Tensor):
         threshold = getattr(self.interval, "threshold", None)
@@ -470,6 +455,7 @@ class NetStim(DNModule, Sliceable):
         self.schedule_dt = torch.as_tensor(
             dt, device=self.device(), dtype=self.dtype()
         ).reshape(())
+        self._renewal_config_generation += 1
         return self
 
     def set_diff_config(
@@ -487,6 +473,7 @@ class NetStim(DNModule, Sliceable):
         """
         self.diff_scheduled_times = bool(diff_scheduled_times)
         self.sched_width = float(sched_width)
+        self._renewal_config_generation += 1
         return self
 
     def bind_weight_source(self, source: torch.Tensor):
@@ -494,6 +481,7 @@ class NetStim(DNModule, Sliceable):
         if source.device != self.device():
             raise ValueError("weight source must live on the NetStim device")
         self._sched_w_source = source
+        self._renewal_config_generation += 1
         return self
 
     def bind_time_source(self, source: torch.Tensor):
@@ -501,6 +489,7 @@ class NetStim(DNModule, Sliceable):
         if source.device != self.device():
             raise ValueError("time source must live on the NetStim device")
         self._sched_t_source = source
+        self._renewal_config_generation += 1
         return self
 
     def init_rng(self):
@@ -556,6 +545,7 @@ class NetStim(DNModule, Sliceable):
           distribution used during stepping.
         - Scheduled spikes already enqueued via :meth:`schedule` are retained.
         """
+        self._renewal_initialized = False
         self.init_rng()
         device, dtype = self.device(), self.dtype()
 
@@ -566,9 +556,6 @@ class NetStim(DNModule, Sliceable):
             start = self._broadcast_to_state(
                 self.start, dtype=dtype, device=device, name="start"
             )
-
-            # start time baseline
-            self.next_stoch_time.copy_(start)
 
             if torch.any(noise > 0):
                 eps = torch.finfo(dtype).tiny
@@ -582,18 +569,27 @@ class NetStim(DNModule, Sliceable):
                     device=device,
                     name="interval",
                 )
-                init_offsets = -(noise * interval0) * torch.log(U)
-                self.next_stoch_time.add_(init_offsets)
+                exp_rand = -torch.log(U)
+            else:
+                # Deterministic initialization must not consume an RNG draw.
+                interval0 = torch.zeros_like(start)
+                exp_rand = torch.zeros_like(start)
+
+            state = netstim_initial_state(interval0, start, noise, exp_rand)
+            self.next_stoch_time = self.next_stoch_time.detach()
+            self.next_stoch_time.copy_(state.next_stoch_time)
 
             # recompute next_sched_time from heaps
             self._refresh_next_sched_time_tensor()
 
             # spike_counts: how many spikes each state element has emitted
-            self.spike_counts.zero_()
+            self.spike_counts.copy_(state.spike_counts)
             self.spikes.zero_()
             self.spike_gate = torch.zeros(self.shape, device=device, dtype=dtype)
-            self.t_last.fill_(-float("inf"))
+            self.t_last.copy_(state.t_last)
 
+        self._renewal_generation += 1
+        self._renewal_initialized = True
         return self
 
     # ───────────────────────── scheduling ─────────────────────────
@@ -890,6 +886,7 @@ class NetStim(DNModule, Sliceable):
             weight_idx = weight_idx[keep]
             steps = steps[keep]
 
+        self._renewal_config_generation += 1
         self.sched_flat_idx = torch.cat([self.sched_flat_idx, flat_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
         self.sched_time_ms = torch.cat([self.sched_time_ms, times_ms], dim=0)
@@ -1022,11 +1019,15 @@ class NetStim(DNModule, Sliceable):
 
         with torch.no_grad():
             t_last_flat = self.t_last.detach().reshape(-1).cpu()
+            changed = False
             for spec, t_i in zip(specs, times_list):
                 for flat_i in self._flat_indices_for_spec(spec):
                     t_cut = float(t_last_flat[flat_i].item())
                     if (not allow_past) and not (float(t_i) > t_cut):
                         continue
+                    if not changed:
+                        self._renewal_config_generation += 1
+                        changed = True
                     heapq.heappush(self._sched_heaps[flat_i], float(t_i))
             self._refresh_next_sched_time_tensor()
         return self
@@ -1105,6 +1106,7 @@ class NetStim(DNModule, Sliceable):
             flat_indices = sorted(set(int(i) for i in flat_indices))
             clear_all = False
 
+        self._renewal_config_generation += 1
         for flat_i in flat_indices:
             self._sched_heaps[flat_i].clear()
         self._refresh_next_sched_time_tensor()
@@ -1200,45 +1202,13 @@ class NetStim(DNModule, Sliceable):
         device, dtype = self.device(), self.dtype()
         t = self._broadcast_time_to_state(t)
 
-        # SNAPSHOT (avoid using live buffers directly in the graph)
-        stoch_snap = (
-            self.next_stoch_time if bptt else self.next_stoch_time.detach()
-        ).clone()
-        sched_snap = (
-            self.next_sched_time.detach().clone()
-        )  # treat schedule as constant for grads
-
-        # 1) differentiable gating (keep this under grad!)
-        next_combined = torch.minimum(stoch_snap, sched_snap)
-        x = t - next_combined
-        # Keep the hard event boundary strictly causal. Distinct representable
-        # event times must remain distinct: an ULP-sized tolerance can make a
-        # genuinely later event fire early and consume it at the wrong call.
-        legacy_gate, legacy_hard = _ste_gate(x, tau=self.tau)
-        stoch_due = t >= stoch_snap
-        heap_due = torch.logical_and(t >= sched_snap, torch.isfinite(sched_snap))
-
         max_spikes = self._broadcast_to_state(
             self.max_spikes, dtype=torch.long, device=device, name="max_spikes"
         )
-        can_spike = self.spike_counts < max_spikes
-
         sched_gate, sched_hard = self._scheduled_tensor_gate(t, dt=dt)
-        can_gate = can_spike.to(dtype)
-        legacy_hard = torch.logical_and(
-            torch.logical_or(stoch_due, heap_due), can_spike
-        )
-        sched_hard = torch.logical_and(sched_hard, can_spike)
 
-        # ``spikes`` remains boolean for hard / inference consumers.
-        # ``spike_gate`` is the differentiable amplitude consumed by NetCon when
-        # diff_spiking=True. Tensor-backed scheduled weights live in this gate.
-        self.spikes = torch.logical_or(legacy_hard, sched_hard)
-        legacy_gate = legacy_gate * can_gate
-        sched_gate = sched_gate * can_gate
-        self.spike_gate = legacy_gate + sched_gate
-
-        # 2) stochastic interval draw (grad will flow to interval via this)
+        # Every call consumes one full-shaped draw, including deterministic,
+        # exhausted, or not-yet-due generators. Keep the native RNG cadence.
         eps = torch.finfo(dtype).tiny
         U = torch.rand(
             self.shape, generator=self._rng, device=device, dtype=dtype
@@ -1250,40 +1220,41 @@ class NetStim(DNModule, Sliceable):
         noise = self._broadcast_to_state(
             self.noise, dtype=dtype, device=device, name="noise"
         )
-        next_interval = interval * (1 - noise) + interval * noise * exp_rand
+        transition = netstim_renewal(
+            NetStimState(self.next_stoch_time, self.spike_counts, self.t_last),
+            interval,
+            noise,
+            max_spikes,
+            t,
+            exp_rand,
+            tau=self.tau,
+            bptt=bptt,
+            next_sched_time=self.next_sched_time,
+            scheduled_gate=sched_gate,
+            scheduled_hard=sched_hard,
+        )
+        self.spikes = transition.spikes
+        self.spike_gate = transition.spike_gate
 
-        # Tensor-backed scheduled events are external injections and do not
-        # advance the stochastic renewal clock.
-
-        # 3) advance clocks
-        #    a) stochastic: choose whether to backprop-through-time
-        stoch_fires = torch.logical_and(stoch_due, can_spike)
-        heap_fires = torch.logical_and(heap_due, can_spike)
-        delta = next_interval * legacy_gate * stoch_fires.to(dtype)
-
-        new_stoch = stoch_snap + delta  # <- no in-place on the buffer used in 'minimum'
-
-        # COMMIT state safely (no version-bump hazards)
         if bptt:
-            # keep graph across steps: replace the buffer with the new tensor
-            self.next_stoch_time = new_stoch
+            self.next_stoch_time = transition.state.next_stoch_time
         else:
-            # no BPTT: commit numerically but don't grow graph
+            # A caller may switch from a BPTT step to a detached step. no_grad
+            # copy_ alone would retain the previous buffer's stale grad_fn.
+            self.next_stoch_time = self.next_stoch_time.detach()
             with torch.no_grad():
-                self.next_stoch_time.copy_(new_stoch)  # copy into original storage
+                self.next_stoch_time.copy_(transition.state.next_stoch_time)
 
-        # b) scheduled: heap pops are side-effects; keep them out of the graph
+        # Heap pops remain an adapter side effect, outside the tensor graph.
         torch._dynamo.graph_break()
-        self._consume_scheduled_heaps(heap_fires, t)
+        self._consume_scheduled_heaps(transition.heap_fires, t)
 
-        # 4) counters (not part of the computational graph)
         with torch.no_grad():
-            self.spike_counts.add_(self.spikes.to(torch.long))
-            t_full = torch.broadcast_to(t.detach(), self.shape)
+            self.spike_counts.copy_(transition.state.spike_counts)
             if tuple(self.t_last.shape) == self.shape:
-                self.t_last.copy_(t_full)
+                self.t_last.copy_(transition.state.t_last)
             else:
-                self.t_last = t_full.clone()
+                self.t_last = transition.state.t_last
 
         return self.spikes
 
@@ -1370,6 +1341,7 @@ class NetStim(DNModule, Sliceable):
             device=self.device(), dtype=self.dtype()
         )
         self._refresh_next_sched_time_tensor()
+        self._renewal_generation += 1
         return self
 
     def detach(self):
@@ -1561,7 +1533,10 @@ class NetStim(DNModule, Sliceable):
             # Materialize broadcasted views so later non-BPTT copy_ commits are safe.
             self.next_stoch_time = ns if ns_input_shape == self.shape else ns.clone()
         else:
-            # Eval path: keep the existing buffer object when possible.
+            # Eval path: keep the existing buffer storage when possible.
+            # A preceding training step may have left a differentiable clock.
+            # A no_grad copy alone would retain that unrelated history.
+            self.next_stoch_time = self.next_stoch_time.detach()
             with torch.no_grad():
                 if tuple(self.next_stoch_time.shape) == self.shape:
                     self.next_stoch_time.copy_(ns)
@@ -1591,7 +1566,25 @@ class NetStim(DNModule, Sliceable):
         """Restore a NetStim runtime checkpoint atomically."""
         previous = _clone_checkpoint_state(self.state_dict_for_checkpoint())
         try:
-            return self._restore_dict_from_checkpoint_unchecked(state_dict)
+            result = self._restore_dict_from_checkpoint_unchecked(state_dict)
+            if (
+                any(self._sched_heaps)
+                or any(
+                    getattr(self, name).numel() > 0
+                    for name in (
+                        "sched_flat_idx",
+                        "sched_abs_step",
+                        "sched_time_ms",
+                        "sched_weight",
+                        "sched_weight_idx",
+                        "sched_time_idx",
+                    )
+                )
+                or not bool(torch.isposinf(self.next_sched_time).all())
+            ):
+                self._renewal_config_generation += 1
+            self._renewal_initialized = True
+            return result
         except Exception:
             try:
                 self._restore_dict_from_checkpoint_unchecked(previous)

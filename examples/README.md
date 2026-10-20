@@ -39,6 +39,16 @@ execution. See the [threshold guide](../docs/advanced/A13_functional_threshold_d
 python examples/functional_threshold_detection.py
 ```
 
+[`functional_netstim_renewal.py`](functional_netstim_renewal.py) lowers one
+seeded noisy NetStim, samples explicit draw packets, and shares its output
+between two functional projections. It checks native trajectories, gradients,
+and checkpoint continuation after restoring clocks and both RNG streams.
+See the [NetStim guide](../docs/advanced/A14_functional_netstim_renewal.md).
+
+```bash
+python examples/functional_netstim_renewal.py
+```
+
 [`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
 frequency, delay, and duration from simulated voltage recordings, optionally
 with observation noise, using ordinary `model.run()` and autograd. Try a

@@ -127,7 +127,7 @@ The complete example executes here:
 ```
 
 This interface supports dense fixed-delay connections without schedules.
-NetStim-generated values may still be supplied as explicit gates. They bypass
-threshold detection and retain the native checkpoint schema. Source
-generation, RNG evolution, and scheduling remain native work. Shared NetStim
-transitions and complete Network lowering are later extensions.
+NetStim-generated values bypass threshold detection and retain the native
+checkpoint schema. Shared pure generation with explicit random draws and
+clock/RNG continuation is described in {doc}`A14_functional_netstim_renewal`.
+Functional scheduling and complete Network lowering remain later extensions.

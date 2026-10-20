@@ -63,3 +63,25 @@ for finite thresholds and ordered receive-before-observe execution.
 
 .. autoclass:: dendra.func.NetConTensors
    :members:
+
+Functional NetStim renewal
+--------------------------
+
+Initialized unscheduled NetStims expose the shared pure initialization and
+renewal core through explicit parameters, random draws, and clock/RNG carry.
+See :doc:`../advanced/A14_functional_netstim_renewal` for sampling policy,
+ordered projection composition, and checkpoint continuation.
+
+.. autofunction:: dendra.func.make_functional_netstim
+
+.. autoclass:: dendra.func.FunctionalNetStim
+   :members: initial_state, step, sample_initialization_draw, sample_step_draw, extract, commit_state_
+
+.. autoclass:: dendra.func.NetStimTensors
+   :members:
+
+.. autoclass:: dendra.func.NetStimDraw
+   :members:
+
+.. autoclass:: dendra.func.NetStimOutputs
+   :members:
