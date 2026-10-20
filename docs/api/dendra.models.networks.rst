@@ -49,16 +49,17 @@ NetCon internals
 Functional projection tensors
 -----------------------------
 
-The shared fixed-delay transport core can be used with explicit source gates,
-weights, and queue state. This lowers an existing initialized NetCon; the
-standard Network remains the connectivity declaration. See
+The shared detector and fixed-delay transport core can be used with explicit
+source observations, weights, and carry. This lowers an existing initialized
+NetCon; the standard Network remains the connectivity declaration. See
 :doc:`../advanced/A12_functional_event_delivery` for the supported configuration
-and complete runnable example.
+and complete runnable example. See :doc:`../advanced/A13_functional_threshold_detection`
+for finite thresholds and ordered receive-before-observe execution.
 
 .. autofunction:: dendra.func.make_functional_netcon
 
 .. autoclass:: dendra.func.FunctionalNetCon
-   :members: step, extract, commit_state_
+   :members: read_due, advance, step, extract, commit_state_
 
 .. autoclass:: dendra.func.NetConTensors
    :members:

@@ -621,8 +621,10 @@ including a zero payload. Preserve call order when several NetCons target
 the same mechanism: custom receivers may update timers, gates, or voltage on
 every call. This interface supplies reception only. For a shared dense
 fixed-delay NetCon transition with explicit source gates, weights, and queue
-state, see :ref:`functional-event-delivery`. Event detection, NetStim
-scheduling, and complete connected Network lowering remain separate work.
+state, see :ref:`functional-event-delivery`. Shared finite-threshold detection
+and receive-before-observe phases are described in
+:ref:`functional-threshold-detection`. NetStim generation, schedules, and
+complete connected Network lowering remain separate work.
 
 .. _functional-scnv:
 

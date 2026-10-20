@@ -166,9 +166,10 @@ The gradient of the next conductance with respect to its payload is
 $\exp(-0.1/2) \approx 0.95122942$. Functional reception handles this local
 transition. A shared dense fixed-delay NetCon core supplies explicit queued
 payloads as described in {doc}`advanced/A12_functional_event_delivery`.
-Complete Network execution, source event detection, and NetStim scheduling
-still use the ordinary Network API. See {ref}`functional-event-receive` for
-the full functional receive contract.
+Shared threshold detection and ordered source observation are described in
+{doc}`advanced/A13_functional_threshold_detection`. Complete Network execution,
+NetStim generation, and scheduling still use the ordinary Network API. See
+{ref}`functional-event-receive` for the full functional receive contract.
 
 The complete event example runs here:
 

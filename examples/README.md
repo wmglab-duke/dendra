@@ -30,6 +30,15 @@ gradients. See the [delivery guide](../docs/advanced/A12_functional_event_delive
 python examples/functional_event_delivery.py
 ```
 
+[`functional_threshold_detection.py`](functional_threshold_detection.py) lowers
+a recurrent thresholded connection, receives before observing its source, and
+checks hard/surrogate state, queues, and gradients against ordinary Network
+execution. See the [threshold guide](../docs/advanced/A13_functional_threshold_detection.md).
+
+```bash
+python examples/functional_threshold_detection.py
+```
+
 [`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
 frequency, delay, and duration from simulated voltage recordings, optionally
 with observation noise, using ordinary `model.run()` and autograd. Try a

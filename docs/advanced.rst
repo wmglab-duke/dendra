@@ -20,3 +20,4 @@ Advanced
    advanced/A10_hard_transition_scans.rst
    advanced/A11_event_margin_training.rst
    advanced/A12_functional_event_delivery.md
+   advanced/A13_functional_threshold_detection.md

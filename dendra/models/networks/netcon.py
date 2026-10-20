@@ -18,7 +18,7 @@ from ._event_delivery import (
     gather_source_gates,
 )
 from .netstim import NetStim, _causal_step_index
-from .spiking import update_active, update_active_diff
+from .spiking import threshold_transition
 from .utils import make_getattr
 
 
@@ -3386,23 +3386,14 @@ class NetCon(Referency):
 
         if self._bitpack_mode == "threshold":
             x = x.to(self.pre_dtype)
-            if diff_spiking:
-                ge_hard, _ge_gate, spk_gate = update_active_diff(
-                    self.bitpack_source_has_spiked,
-                    x,
-                    self.bitpack_source_threshold,
-                    tau,
-                )
-                # ``has_spiked`` is the hard above-threshold state used for the next
-                # rising-edge decision; keep it out of the differentiable graph.
-                self.bitpack_source_has_spiked = ge_hard.detach()
-                return spk_gate.to(device=self.device, dtype=self.dtype)
-            self.bitpack_source_has_spiked, spikes = update_active(
-                self.bitpack_source_has_spiked,
+            self.bitpack_source_has_spiked, gate = threshold_transition(
                 x,
+                self.bitpack_source_has_spiked,
                 self.bitpack_source_threshold,
+                diff_spiking=diff_spiking,
+                tau=tau,
             )
-            return spikes.to(device=self.device, dtype=self.dtype)
+            return gate.to(device=self.device, dtype=self.dtype)
 
         raise RuntimeError("source-history training backend is not configured")
 
@@ -3550,9 +3541,9 @@ class NetCon(Referency):
 
         if self._bitpack_mode == "threshold":
             x = x.to(self.pre_dtype)
-            self.bitpack_source_has_spiked, spikes = update_active(
-                self.bitpack_source_has_spiked,
+            self.bitpack_source_has_spiked, spikes = threshold_transition(
                 x,
+                self.bitpack_source_has_spiked,
                 self.bitpack_source_threshold,
             )
             return spikes.to(torch.bool)
@@ -3919,16 +3910,22 @@ class NetCon(Referency):
                 # traffic during an incompatible mode transition.
                 if self.training:
                     self._use_source_history_training_runtime()
-                return
-            # Re-select storage immediately for interactive/training-loop workflows.
-            # This is especially important for ``diff_spiking=True`` source-history
-            # training, which needs floating source-gate history rather than packed
-            # hard spikes.
-            self._refresh_training_advance_after_diff_config(clear_histories=True)
+            else:
+                # Re-select storage immediately for interactive/training-loop workflows.
+                # This is especially important for ``diff_spiking=True`` source-history
+                # training, which needs floating source-gate history rather than packed
+                # hard spikes.
+                self._refresh_training_advance_after_diff_config(clear_histories=True)
         except Exception:
             self.train_delay_backend = previous_backend
             self.train_flags = previous_flags
             raise
+        # A public configuration call invalidates frozen functional plans even
+        # when the values compare equal. It may change storage or replace a
+        # scalar with a Tensor that Dynamo's equality guards treat as equal.
+        self._event_delivery_generation = (
+            getattr(self, "_event_delivery_generation", 0) + 1
+        )
 
     @property
     def w(self):
@@ -5223,28 +5220,14 @@ class NetCon(Referency):
             )
             return
 
-        if diff_spiking:
-            # Surrogate / differentiable spiking
-            self.has_spiked, _, gate = update_active_diff(
-                self.has_spiked, v_selected, self.threshold, tau=tau
-            )
-            # gate is typically float already, but enforce dtype
-            gate = gate.to(self.pre_dtype)
-        else:
-            # Hard threshold spiking; usually returns Bool spikes
-            self.has_spiked, spikes = update_active(
-                self.has_spiked, v_selected, self.threshold
-            )
-            # Turn {False,True} into {0.0,1.0} float gate
-            gate = spikes.to(self.pre_dtype)
-
-        if self.apply_masking:
-            # thresh_is_nan: bool mask; choose between v_selected and gate (both float)
-            gate = torch.where(
-                self.thresh_is_nan,
-                v_selected,
-                gate,
-            )
+        self.has_spiked, gate = threshold_transition(
+            v_selected,
+            self.has_spiked,
+            self.threshold,
+            diff_spiking=diff_spiking,
+            tau=tau,
+            nan_mask=self.thresh_is_nan if self.apply_masking else None,
+        )
 
         self.is_spiking = gate.to(device=self.pre_device, dtype=self.pre_dtype)
 

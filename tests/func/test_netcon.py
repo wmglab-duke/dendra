@@ -347,11 +347,10 @@ def test_inference_mode_commit_publishes_ordinary_native_mutable_storage():
 
 
 @pytest.mark.parametrize(
-    "unsupported", ("threshold", "compact", "schedule", "delay", "uninitialized")
+    "unsupported", ("compact", "schedule", "delay", "uninitialized")
 )
 def test_unsupported_projection_layouts_fail_before_effects(unsupported):
     _, native = _netcon(
-        threshold=-20 if unsupported == "threshold" else None,
         delay_backend="sparse_calendar" if unsupported == "compact" else "dense",
         tracked=False,
     )

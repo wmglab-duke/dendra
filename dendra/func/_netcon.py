@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
+from numbers import Real
 from typing import NamedTuple
 
 import torch
@@ -18,6 +19,7 @@ from dendra.models.networks._event_delivery import (
 )
 from dendra.models.networks.netcon import NetCon
 from dendra.models.networks.netstim import NetStim
+from dendra.models.networks.spiking import threshold_transition
 
 from ._types import FunctionalizationError
 
@@ -58,11 +60,9 @@ def _source_tensor(netcon):
     source = netcon.pre
     if isinstance(source, NetStim):
         return source._buffers["spikes"]
-    if not isinstance(source, Population) or not netcon.skip_thresholding:
+    if not isinstance(source, Population):
         raise FunctionalizationError(
-            "Functional NetCon requires explicit source gates: use a NetStim "
-            "or a Population connection with threshold=None. Threshold-crossing "
-            "history is not represented by this projection."
+            "Functional NetCon requires a Population or NetStim source."
         )
     value = source
     for name in netcon.pre_var.split("."):
@@ -75,7 +75,7 @@ def _source_tensor(netcon):
         if name not in slots:
             raise FunctionalizationError(
                 "Functional NetCon pre_var must name a registered Tensor; "
-                "callbacks and properties are not source gates."
+                "callbacks and properties are not source values."
             )
         value = slots[name]
     if not torch.is_tensor(value):
@@ -84,6 +84,11 @@ def _source_tensor(netcon):
 
 
 def _mode(netcon):
+    if netcon.train_flags is not None and not isinstance(netcon.train_flags[5], Real):
+        raise FunctionalizationError(
+            "Functional NetCon requires scalar real tau metadata. Configure "
+            "set_diff_config(tau=float(...)) before lowering it."
+        )
     return (
         bool(netcon.training),
         netcon.delay_backend,
@@ -148,21 +153,30 @@ def _eligible(netcon):
 class FunctionalNetCon:
     """A frozen routing plan using the same pure transport core as NetCon.
 
-    Supply full source-shaped numerical gates and effective per-connection
-    weights to :meth:`step`. Values retain their signs, amplitudes, and gradients.
-    Gates use ``source_dtype``/``source_device`` (the initialized NetCon's
+    Supply full source-shaped numerical values and effective per-connection
+    weights. Values use ``source_dtype``/``source_device`` (the initialized NetCon's
     presynaptic floating dtype/device), including when a NetStim stores hard
     spikes as booleans. Weights use the target ``dtype``/``device``.
-    This projection performs no threshold detection or source generation. It
-    returns the due payload for exactly one separate Population ``receive`` call,
-    including an all-zero payload, and does not advance any Population clock.
+    Finite thresholds detect rising edges using explicit ``has_spiked`` carry;
+    NaN thresholds retain raw signed values and gradients. Training preserves
+    the initialized hard or surrogate detector configuration. The surrogate
+    temperature ``tau`` is scalar real metadata, rather than an explicit
+    differentiable Tensor input.
+
+    Call :meth:`read_due`, deliver its payload with one Population ``receive``
+    call (including zero payloads), then observe the source and call
+    :meth:`advance`. This preserves native receive-before-observe ordering,
+    including recurrent sources changed by reception. :meth:`step` combines
+    these phases when the supplied source values have already been chosen.
+    Neither phase generates source activity or advances any Population clock.
 
     Routing, quantized delays, timestep, and tensor schemas are copied at
-    lowering. Reinitialization, mode changes, or adding schedules invalidates
-    source-bound calls. Direct edits to source topology do not alter this frozen
-    plan; extraction and commit reject incompatible topology. Lower again to
-    adopt changed routing or delays. Explicit Population batch axes are part of
-    the source/target shapes; additional ``vmap`` axes stay implicit.
+    lowering. Reinitialization, calling ``set_diff_config``, mode changes, or
+    adding schedules invalidates source-bound calls. Direct edits to source
+    topology or detector buffers do not alter this frozen plan; extraction and
+    commit reject incompatible metadata. Lower again to adopt changed routing,
+    delays, or thresholds. Explicit Population batch axes are part of the
+    source/target shapes; additional ``vmap`` axes stay implicit.
     """
 
     def __init__(self, netcon):
@@ -192,6 +206,16 @@ class FunctionalNetCon:
         self._dt = _snapshot(netcon.dt)
         self._physical_delays = _snapshot(_effective_tensor(netcon.delay_ms, "delay"))
         self._track_events = bool(netcon.track_events)
+        # NetStim gates are already generated activity. Its adapter never uses
+        # the NetCon threshold, even when a default finite threshold was stored.
+        self._skip_thresholding = isinstance(netcon.pre, NetStim) or bool(
+            netcon.skip_thresholding
+        )
+        self._threshold = _snapshot(netcon.threshold)
+        self._nan_mask = _snapshot(netcon.thresh_is_nan)
+        self._apply_masking = bool(netcon.apply_masking)
+        self._diff_spiking = bool(netcon.training and netcon.train_flags[2])
+        self._tau = float(netcon.train_flags[5]) if netcon.training else 0.1
         checkpoint = netcon.state_dict_for_checkpoint()
         self._state_schema = {
             name: (tuple(value.shape), value.dtype, value.device)
@@ -257,6 +281,8 @@ class FunctionalNetCon:
         source = _source_tensor(netcon)
         if (
             _mode(netcon) != self._mode
+            or (isinstance(netcon.pre, NetStim) or bool(netcon.skip_thresholding))
+            != self._skip_thresholding
             or tuple(source.shape) != self.source_shape
             or tuple(netcon.syn.shape_f) != self.shape
             or netcon.pre_var != self._pre_var
@@ -271,12 +297,14 @@ class FunctionalNetCon:
             or not torch.equal(netcon.post_idx, self._post_idx)
             or not torch.equal(netcon.inference_delay_steps, self._delay_steps)
             or not torch.equal(netcon.dt, self._dt)
+            or not torch.equal(netcon.threshold, self._threshold)
+            or not torch.equal(netcon.thresh_is_nan, self._nan_mask)
             or not torch.equal(
                 _effective_tensor(netcon.delay_ms, "delay"), self._physical_delays
             )
         ):
             raise FunctionalizationError(
-                "NetCon topology does not match this frozen plan."
+                "NetCon topology or detector does not match this frozen plan."
             )
         self._validate_tensor(
             _effective_tensor(netcon.weight, "weight"),
@@ -311,8 +339,31 @@ class FunctionalNetCon:
             },
         )
 
-    def step(self, weights, state, source_gates):
-        """Return ``(next_state, due_payload)`` without mutating any inputs."""
+    def read_due(self, state):
+        """Return ``(delivery_state, payload)`` for one separate receive call.
+
+        This publishes due tracked events in the returned state without clearing
+        the queue or changing the detector latch, ring slot, or global step.
+        """
+        self._validate_source()
+        self._validate_state(state)
+        due = dense_due(
+            state["delivery_buffer"],
+            state["current_time_step"],
+            state.get("event_queue"),
+        )
+        result = dict(state)
+        if self._track_events:
+            result["events"] = due.event_counts
+        return result, due.payload.reshape(self.shape)
+
+    def advance(self, weights, state, source_values):
+        """Observe the current source, enqueue events, and return next carry.
+
+        Pass the state from :meth:`read_due` after delivering its payload and
+        observing the source. Threshold metadata is frozen; gradients flow
+        through explicit weights, source values, and pending payloads.
+        """
         self._validate_source()
         self._validate_state(state)
         self._validate_tensor(
@@ -323,19 +374,27 @@ class FunctionalNetCon:
             label="weights",
         )
         self._validate_tensor(
-            source_gates,
+            source_values,
             shape=self.source_shape,
             dtype=self.source_dtype,
             device=self.source_device,
-            label="source_gates",
+            label="source_values",
         )
         event_queue = state.get("event_queue")
-        due = dense_due(
-            state["delivery_buffer"], state["current_time_step"], event_queue
-        )
-        gates = gather_source_gates(source_gates, self._pre_idx).to(
-            device=self.device, dtype=self.dtype
-        )
+        selected = gather_source_gates(source_values, self._pre_idx)
+        result = dict(state)
+        if self._skip_thresholding:
+            gates = selected
+        else:
+            result["has_spiked"], gates = threshold_transition(
+                selected,
+                state["has_spiked"],
+                self._threshold,
+                diff_spiking=self._diff_spiking,
+                tau=self._tau,
+                nan_mask=self._nan_mask if self._apply_masking else None,
+            )
+        gates = gates.to(device=self.device, dtype=self.dtype)
         counts = connection_event_counts(gates) if self._track_events else None
         updated = dense_fixed_delay_transition(
             state["delivery_buffer"],
@@ -350,15 +409,24 @@ class FunctionalNetCon:
             event_queue=event_queue,
             event_counts=counts,
         )
-        result = dict(state)
         result.update(
             delivery_buffer=updated.queue,
             current_time_step=updated.slot,
             global_step=updated.global_step,
         )
         if self._track_events:
-            result.update(events=due.event_counts, event_queue=updated.event_queue)
-        return result, due.payload.reshape(self.shape)
+            result["event_queue"] = updated.event_queue
+        return result
+
+    def step(self, weights, state, source_gates):
+        """Return ``(next_state, due_payload)`` using prechosen source values.
+
+        ``source_gates`` retains its original argument name for callers using
+        explicit raw gates; finite thresholds interpret it as source values.
+        Use the separate phases when reception can change those values.
+        """
+        delivery_state, payload = self.read_due(state)
+        return self.advance(weights, delivery_state, source_gates), payload
 
     def commit_state_(self, netcon, state):
         """Commit independent copies of validated carry into a compatible NetCon."""
@@ -375,7 +443,7 @@ class FunctionalNetCon:
 
 
 def make_functional_netcon(netcon) -> tuple[FunctionalNetCon, NetConTensors]:
-    """Lower one initialized dense NetCon with explicit numerical source gates."""
+    """Lower one initialized dense NetCon with explicit numerical source values."""
     projection = FunctionalNetCon(netcon)
     return projection, projection.extract()
 

@@ -50,12 +50,12 @@ already event gates. `diff_delays=False` selects the existing hard-delay
 semantics. Explicitly selecting the dense training backend ensures this
 projection uses a dense delivery ring in both executions.
 
-The first interface accepts the active dense fixed-delay runtime with disabled
-thresholding and no scheduled events. It rejects unrepresented source
-detection, schedules, differentiable-delay interpolation, and compact queue
-backends rather than dropping their state. Those modes remain available in
-ordinary Network execution. `NetStim` generation, threshold history, and other
-backend transitions can be migrated into the shared design independently.
+The interface accepts the active dense fixed-delay runtime without scheduled
+events. This example uses raw gates; finite and mixed thresholds are also
+supported, with explicit detector carry and ordered projection phases as
+described in {doc}`A13_functional_threshold_detection`. Schedules,
+differentiable-delay interpolation, and compact queue backends remain native
+execution modes. `NetStim` generation and its RNG state remain separate work.
 
 ## Extract the projection and its explicit tensors
 
@@ -76,6 +76,7 @@ inside the functional plan.
 `event_queue`. These names match the dense NetCon checkpoint state. Preserve
 this complete tree when splitting or resuming a trajectory: synaptic state
 alone cannot reconstruct pending deliveries.
+Thresholded projections also include the bool `has_spiked` latch.
 
 Source gates have the shape of the initialized source variable and must use
 `projection.source_dtype` and `projection.source_device`. These are NetCon's
@@ -109,9 +110,10 @@ explicit input tensors, so it contains no implicit event detector.
 
 The combined projection step consumes gates already chosen by its caller. If
 a receive changes a field used to observe source activity, that observation
-must occur after reception. A complete Network lowering will use the shared
-core's separate due-row read and queue-update phases to preserve this native
-boundary, rather than precomputing all source gates at the start of a step.
+must occur after reception. Use `projection.read_due`, receive the payload,
+observe the source, then call `projection.advance`. These phases preserve the
+native boundary without precomputing all source values at the start of a step;
+see {doc}`A13_functional_threshold_detection` for a recurrent example.
 
 Hard delays retain NetCon's nearest-step rounding and minimum one-step
 latency. Even a physical delay rounded to zero arrives on the next step,
@@ -145,8 +147,8 @@ functional path uses out-of-place operations so queues, weights, or gates can
 be mapped independently with `vmap`. Its eager execution can need an extra
 temporary ring; native compilation can fuse those operations into one output.
 
-The intended extension is to expose the remaining source and scheduling state
-through similarly explicit transitions, then compose them in a Network-level
-lowering. Users will continue to construct networks through the standard
-Dendra API. See {doc}`A8_functional_populations` for population execution and
-{doc}`../synapse_authoring` for authoring a pure receiver.
+The intended extension is to expose NetStim generation, RNG, and scheduling
+state through similarly explicit transitions, then compose them in a
+Network-level lowering. Users will continue to construct networks through the
+standard Dendra API. See {doc}`A8_functional_populations` for population
+execution and {doc}`../synapse_authoring` for authoring a pure receiver.
