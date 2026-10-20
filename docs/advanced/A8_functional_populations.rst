@@ -450,6 +450,81 @@ declared runtime frame also remain imperative-only: they can retain live
 tensors outside the functional state. Lowering rejects these bindings, and
 adding one invalidates an existing functional plan.
 
+.. _functional-input-bindings:
+
+Explicit inputs between mechanisms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``State.INPUT`` declares read-only tensor inputs for a State's ``values``
+frame. ``Population.bind_input(target, source)`` connects each input to a
+declared field or parameter of another mechanism in the same Population.
+Bindings contain paths rather than Python getters, so the source is read from
+the explicit functional state and parameters:
+
+.. code-block:: python
+
+   import dendra as dn
+   from dendra.models.mechanisms import Mechanism, State, VoltageProcess
+
+   class incoming(State):
+       State.STATE("owned")
+       State.INPUT("g", "e", default=0.0)
+       State.ASSIGNED("slope")
+       State.DERIVATIVE("owned' = slope")
+
+       def state_defaults(self, v, values):
+           return {"owned": v.clone()}
+
+       def assigned_values(self, v, values):
+           return {"slope": -values["g"] * (values["owned"] - values["e"])}
+
+   class driver(VoltageProcess):
+       VoltageProcess.STATE_BUNDLE(incoming)
+
+       def voltage_values(self, v, dt, values):
+           return values["owned"], {}
+
+   class channel(Mechanism):
+       Mechanism.RANGE(g=0.02, e=-85.0)
+
+   with dn.ctx(JIT=0):
+       model = dn.Population(N=1, C=3, integrator=dn.scnv())
+       model.insert(driver)
+       model.insert(channel)
+       model.bind_input("driver.DE.incoming.g", "channel.g")
+       model.bind_input("driver.DE.incoming.e", "channel.e")
+       model.initialize()
+   functional, tensors = dn.func.make_functional(model, dt=0.025)
+   state, auxiliary = functional.prepare_and_step(
+       tensors.parameters, tensors.constants, tensors.state
+   )
+
+Targets name a mechanism, ``DE`` State bundle, and declared input. Sources
+name a declared ``STATE``, ``CARRY``, saved-current, or parameter tensor.
+Input defaults are finite scalar
+configuration; an unbound input uses its declared default broadcast to the
+consumer's local shape. Initialization hooks receive declaration defaults;
+bound reads begin when the consumer State advances. Inputs are ephemeral:
+they are not checkpoint carry,
+initialization state overrides, independent parameters, or writable outputs
+of ``advance`` or ``voltage_values``.
+
+The handler reads each binding immediately before advancing its consumer.
+Voltage processes have already run, and earlier mechanisms in the existing
+advance order may already have updated their source fields. A binding does
+not reorder mechanisms or run an extra source-current evaluation. Put the
+current algebra in ``assigned_values`` when it depends on a consumer's owned
+voltage; binding a previously saved current can otherwise introduce a lag.
+
+Source and consumer supports are matched by physical compartment coordinates,
+retaining explicit batch axes and the consumer's local order. Invalid source
+paths, missing source coverage, and ambiguous source support are rejected.
+Binding configuration survives ordinary Population rebuilds. Changing input
+declarations, bindings, or their support maps invalidates an extracted
+functional plan. Packed populations containing bindings are rejected.
+Arbitrary live getters and connected Network event delivery remain outside
+this interface.
+
 .. _functional-scnv:
 
 Mechanism-owned voltage with scnv

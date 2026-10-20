@@ -627,6 +627,16 @@ def _validate_component_device_and_dtype(populations):
         raise ValueError(f"All populations must be of the same dtype; got {details}.")
 
 
+def _validate_component_input_bindings(populations):
+    """Reject unsupported binding consolidation before touching components."""
+    for name, population in populations.items():
+        if population._input_bindings:
+            raise ValueError(
+                f"Component {name!r} has State input bindings; packed input-binding "
+                "consolidation is not supported yet."
+            )
+
+
 def concat_models(
     populations: dict[str, Population],
     threads=16,
@@ -683,6 +693,7 @@ def concat_models(
     absolute circuit potentials ``vc``. Concatenation still creates no edges
     between components. Nested ``MultiPopulation`` objects are unsupported.
     """
+    _validate_component_input_bindings(populations)
     _check_celsius(celsius, populations)
     integrator = _assess_type_and_make_integrator(
         populations, threads=threads, write_back=write_back
@@ -958,6 +969,7 @@ class MultiPopulation(Population):
     def __init__(self, integrator=None, celsius=37.0, v_init=None, **populations):
         if not populations:
             raise ValueError("At least one population is required.")
+        _validate_component_input_bindings(populations)
         if any(b.is_batched() for b in populations.values()):
             raise ValueError("All populations must be unbatched.")
 

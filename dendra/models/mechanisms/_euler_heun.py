@@ -50,6 +50,7 @@ def build_euler_heun(
     derivative,
     eliminate=None,
     diffusion=None,
+    inputs=(),
     **method_kwargs,
 ):
     """Build an explicit Euler-Heun State solver for Stratonovich SDEs.
@@ -73,7 +74,8 @@ def build_euler_heun(
         )
 
     states = list(states)
-    assigned = list(assigned)
+    inputs = tuple(inputs)
+    assigned = [*assigned, *inputs]
     eliminate = _normalize_eliminate(eliminate)
     derivative_map = match_derivative_to_states(derivative, states)
     diffusion_map = _match_diffusion_to_states(diffusion, states)
@@ -95,7 +97,8 @@ def build_euler_heun(
     lines.append("    __sqrt_dt = torch.sqrt(__dt)")
     lines.append("    __assigned_old = self._derive_assigned_values(v, values)")
     for name in assigned_list_sorted:
-        lines.append(f"    __old_assigned_{name} = __assigned_old[{name!r}]")
+        frame = "values" if name in inputs else "__assigned_old"
+        lines.append(f"    __old_assigned_{name} = {frame}[{name!r}]")
 
     returns = []
     for state in states:
@@ -150,7 +153,8 @@ def build_euler_heun(
     lines.append("    }")
     lines.append("    __assigned_pred = self._derive_assigned_values(v, __pred_values)")
     for name in assigned_list_sorted:
-        lines.append(f"    __pred_assigned_{name} = __assigned_pred[{name!r}]")
+        frame = "__pred_values" if name in inputs else "__assigned_pred"
+        lines.append(f"    __pred_assigned_{name} = {frame}[{name!r}]")
 
     for state in states:
         if state in eliminate:

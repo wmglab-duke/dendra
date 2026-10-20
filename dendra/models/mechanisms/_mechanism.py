@@ -143,6 +143,7 @@ def _mechanism_advance_signature(mech) -> tuple:
                 state_name,
                 tuple(state_module._state),
                 state_carry,
+                tuple(state_module._input_defaults.items()),
                 getattr(type(state_module), "advance", None) is State.advance,
                 getattr(type(state_module), "assigned_values", None)
                 is State.assigned_values,
@@ -181,7 +182,7 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
     func_name = f"_advance_states_{cls_name}_{mech_name}_{id(cls):x}"
 
     lines = [
-        f"def {func_name}(self, v, dt):",
+        f"def {func_name}(self, v, dt, inputs=None):",
         "    __buffers = self._buffers",
     ]
 
@@ -222,6 +223,12 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
             lines.append(
                 f"    __state_values_{idx}[{carry_name!r}] = "
                 f"__state_module_{idx}._buffers[{carry_name!r}]"
+            )
+        if state_module._inputs:
+            lines.append(
+                f"    __state_values_{idx}.update(__state_module_{idx}."
+                f"_input_value_frame(v, None if inputs is None else "
+                f"inputs.get({state_key!r})))"
             )
 
         if uses_default_advance:
@@ -591,6 +598,17 @@ class Mechanism(Parameterized):
                 "names; "
                 f"duplicates: {sorted(duplicate_state_names)}"
             )
+        overlapping_inputs = {
+            name
+            for state_type in new_state
+            for name in state_type._inputs
+            if name in flattened_state_names
+        }
+        if overlapping_inputs:
+            raise ValueError(
+                "State INPUT names conflict with flattened State variables: "
+                f"{sorted(overlapping_inputs)}"
+            )
         for i_list in consume_class_values(
             cls, "mechanism.ion", Mechanism._ion_declarations
         ):
@@ -904,6 +922,22 @@ class Mechanism(Parameterized):
                 "parameters, State variables, CARRY/ASSIGNED values, "
                 "workspaces, currents, shared fields, methods, or reserved "
                 f"execution slots: {sorted(overlap)}"
+            )
+
+        input_names = {name for state_type in new_state for name in state_type._inputs}
+        overlap = input_names & (
+            state_names
+            | set(new_carry)
+            | set(new_assigned)
+            | workspace_buffers
+            | runtime_local_slots
+            | saved_current_buffer_names
+            | reserved_execution_slots
+        )
+        if overlap:
+            raise ValueError(
+                "State INPUT names conflict with parent Mechanism runtime "
+                f"fields: {sorted(overlap)}"
             )
 
         cls.state_classes = {s.__name__: s for s in new_state}
@@ -1884,6 +1918,7 @@ class Mechanism(Parameterized):
                 state_module.celsius, v_init
             )
             state_values["diam"] = state_module.diam
+            state_values.update(state_module._input_value_frame(v_init))
             state_values_out = state_module._derive_initial_values(
                 v_init,
                 state_values,
@@ -2549,7 +2584,7 @@ class Mechanism(Parameterized):
         cls._dendra_monomorphic_advance_signature = signature
         cls._dendra_monomorphic_advance_source = source
 
-    def _advance_states(self, v, dt):
+    def _advance_states(self, v, dt, inputs=None):
         """Advance nested State and Mechanism carry from one shared snapshot.
 
         Parameters
@@ -2571,10 +2606,16 @@ class Mechanism(Parameterized):
             self._evaluate_assigned(v)
         values = self._runtime_value_frame()
         state_updates = []
-        for state_module in self.DE.values():
+        for state_name, state_module in self.DE.items():
             local_values = dict(values)
             for name in state_module._carry:
                 local_values[name] = state_module._buffers[name]
+            if state_module._inputs:
+                local_values.update(
+                    state_module._input_value_frame(
+                        v, None if inputs is None else inputs.get(state_name)
+                    )
+                )
             state_updates.append(
                 (
                     state_module,

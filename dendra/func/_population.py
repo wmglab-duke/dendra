@@ -164,6 +164,8 @@ _FUNCTIONAL_INTEGRATOR_HOOKS = (
 )
 _FUNCTIONAL_HANDLER_HOOKS = (
     "update_v",
+    "configure_input_bindings",
+    "_resolve_state_inputs",
     "_evaluate_current_frame",
     "_evaluate_membrane_frame",
     "_can_evaluate_direct_membrane_frame",
@@ -562,6 +564,7 @@ _STANDARD_STATE_DEFAULTS = inspect.getattr_static(State, "state_defaults")
 _STANDARD_STATE_INITIAL_VALUES = inspect.getattr_static(State, "initial_values")
 _STANDARD_STATE_ASSIGNED_VALUES = inspect.getattr_static(State, "assigned_values")
 _STANDARD_STATE_ADVANCE = inspect.getattr_static(State, "advance")
+_STANDARD_STATE_INPUT_FRAME = inspect.getattr_static(State, "_input_value_frame")
 _ION_INITIALIZATION_HOOKS = (
     "initialize",
     "advance",
@@ -1826,6 +1829,162 @@ def _state_external_input_signature(state, mechanism):
     return tuple(sorted(entries))
 
 
+def _state_input_signature(state):
+    """Keep ephemeral inputs in the contract, outside parameter/runtime trees."""
+
+    return (
+        tuple(getattr(state, "_inputs", ())),
+        _configuration_signature(getattr(state, "_input_defaults", {})),
+        _effective_hook_identity(state, "_input_value_frame"),
+    )
+
+
+def _input_binding_signature(population):
+    handler = population.mech
+    sources = []
+    for plan in getattr(handler, "_input_binding_plan", ()):
+        if not isinstance(plan, tuple) or len(plan) != 10:
+            sources.append(("invalid-plan", _configuration_signature(plan)))
+            continue
+        source_name, state_name, field = plan[3:6]
+        if (
+            not isinstance(source_name, str)
+            or not isinstance(field, str)
+            or (state_name is not None and not isinstance(state_name, str))
+            or source_name not in handler.mechanisms
+        ):
+            sources.append(("invalid-source", _configuration_signature(plan)))
+            continue
+        source = handler.mechanisms[source_name]
+        if state_name is not None and state_name not in source.DE:
+            sources.append(("invalid-source-state", state_name))
+            continue
+        owner = source if state_name is None else source.DE[state_name]
+        descriptor = inspect.getattr_static(type(owner), field, None)
+        value = owner._buffers.get(field, owner._parameters.get(field))
+        sources.append(
+            (
+                source_name,
+                state_name,
+                field,
+                id(descriptor),
+                (
+                    _shape_tuple(value),
+                    value.dtype,
+                    value.device,
+                    value.layout,
+                )
+                if torch.is_tensor(value)
+                else ("missing-source-storage",),
+            )
+        )
+    return (
+        _configuration_signature(getattr(population, "_input_bindings", ())),
+        _configuration_signature(getattr(handler, "_input_bindings", ())),
+        _configuration_signature(getattr(handler, "_input_binding_plan", ())),
+        tuple(sources),
+    )
+
+
+def _input_binding_declarations(owner):
+    """Expose immutable literal paths to Dynamo's ordinary source guards."""
+
+    return tuple(
+        (binding.target, binding.source)
+        for binding in getattr(owner, "_input_bindings", ())
+    )
+
+
+def _input_binding_indices(population):
+    handler = population.mech
+    return tuple(
+        (name, value)
+        for name, value in handler._buffers.items()
+        if name.startswith("_input_binding_index_")
+    )
+
+
+def _input_binding_index_signature(population):
+    """Input placement is immutable; live provider values remain explicit leaves."""
+
+    return tuple(
+        (
+            name,
+            _immutable_source_tensor_binding(value)
+            if torch.is_tensor(value)
+            else ("invalid-index", type(value).__qualname__, id(value)),
+        )
+        for name, value in _input_binding_indices(population)
+    )
+
+
+def _validate_input_binding_indices(population, reference):
+    actual = dict(_input_binding_indices(population))
+    expected = dict(_input_binding_indices(reference))
+    if actual.keys() != expected.keys() or any(
+        not torch.is_tensor(actual[name])
+        or actual[name].dtype != value.dtype
+        or actual[name].device != value.device
+        or _shape_tuple(actual[name]) != _shape_tuple(value)
+        or not torch.equal(actual[name], value)
+        for name, value in expected.items()
+    ):
+        raise FunctionalizationError(
+            "Population input-binding placement does not match this functional "
+            "execution plan; rebuild and lower it again."
+        )
+
+
+def _input_binding_failures(population):
+    """Validate retained plans against declarations before any lowering work."""
+
+    handler = population.mech
+    bindings = getattr(population, "_input_bindings", ())
+    if bindings != getattr(handler, "_input_bindings", ()):
+        return [
+            "Population input-binding declarations differ from the built handler; "
+            "rebuild the Population before functionalization"
+        ]
+    if not bindings:
+        if getattr(handler, "_input_binding_plan", ()) or _input_binding_indices(
+            population
+        ):
+            return ["Population has input-binding storage without declarations"]
+        return []
+    try:
+        # Configuration retains only names/shapes/indices and does not evaluate
+        # source providers. Rebuild it on a disposable owner to detect a stale
+        # or manually edited plan without touching the live Population.
+        candidate = _deepcopy_execution_module(handler)
+        candidate.configure_input_bindings(bindings)
+        if candidate._input_binding_plan != handler._input_binding_plan:
+            return [
+                "Population input-binding plan differs from its declarations; "
+                "rebuild before functionalization"
+            ]
+        expected = {
+            name: value
+            for name, value in candidate._buffers.items()
+            if name.startswith("_input_binding_index_")
+        }
+        actual = dict(_input_binding_indices(population))
+        if actual.keys() != expected.keys() or any(
+            not torch.is_tensor(actual[name])
+            or actual[name].dtype != value.dtype
+            or actual[name].device != value.device
+            or _shape_tuple(actual[name]) != _shape_tuple(value)
+            or not torch.equal(actual[name], value)
+            for name, value in expected.items()
+        ):
+            return [
+                "Population input-binding indices differ from their declarations; "
+                "rebuild before functionalization"
+            ]
+    except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+        return [f"Population input-binding plan is invalid: {exc}"]
+    return []
+
+
 def _voltage_process_signature(process):
     """Fingerprint reset behavior and helper dependencies, not live tensors."""
 
@@ -1892,6 +2051,53 @@ def _install_voltage_process_audits(population):
     for process in population.mech.voltage_processes.values():
         process._voltage_schema_validated = False
         process.voltage_values = checked_hook(process, process.voltage_values)
+
+
+def _install_state_input_audits(population):
+    """Verify ephemeral INPUTs are read-only inside each authored State hook.
+
+    A gather can allocate a fresh Tensor, and a provider may advance later in
+    the same step. Whole-transition input checks cannot detect either a write
+    to that gathered copy or a write hidden by a later provider replacement.
+    """
+
+    def checked_hook(label, names, hook):
+        def evaluate(*arguments):
+            values = arguments[-1]
+            before = {name: _audit_tensor_binding(values[name]) for name in names}
+            try:
+                return hook(*arguments)
+            finally:
+                changed = [
+                    name
+                    for name, binding in before.items()
+                    if name not in values
+                    or not torch.is_tensor(values[name])
+                    or _audit_tensor_binding(values[name]) != binding
+                ]
+                if changed:
+                    raise FunctionalizationError(
+                        f"State {label} mutated read-only INPUT fields {changed}; "
+                        "return declared state or carry updates without modifying "
+                        "the input values frame."
+                    )
+
+        return evaluate
+
+    for mechanism in population.mech.mechanisms.values():
+        for state_name, state in mechanism.DE.items():
+            if not state._inputs:
+                continue
+            for hook_name in ("assigned_values", "advance"):
+                setattr(
+                    state,
+                    hook_name,
+                    checked_hook(
+                        f"{mechanism.name}.{state_name}.{hook_name}()",
+                        state._inputs,
+                        getattr(state, hook_name),
+                    ),
+                )
 
 
 def _material_process_failures(process, population=None):
@@ -7108,6 +7314,12 @@ def _functionalization_failures(
                     "not supported"
                 )
                 continue
+            if getattr(component, "_input_bindings", ()):
+                failures.append(
+                    f"component {name!r} uses same-Population input bindings; "
+                    "packed input-binding consolidation is not supported yet"
+                )
+                continue
             if isinstance(component.integrator, _bwd_euler_sc_skip):
                 failures.append(
                     f"component {name!r} uses scnv; packed scnv components are "
@@ -7393,6 +7605,14 @@ def _functionalization_failures(
                 "functionalization requires the standard MechanismHandler "
                 "current-frame evaluator"
             )
+        else:
+            input_failures = _input_binding_failures(population)
+            failures.extend(input_failures)
+            if input_failures:
+                # Subsequent checkpoint/state inventories read registered
+                # slots through the imperative aliases. A rejected source
+                # descriptor must not get another chance to run there.
+                return failures
         actual_voltage_plan = tuple(
             process for process, _entry in handler._voltage_process_support_plan
         )
@@ -7503,6 +7723,15 @@ def _functionalization_failures(
             failures.append(f"{mechanism.name} uses a registered waveform injection")
         for state_name, state in mechanism.DE.items():
             state_label = f"{mechanism_label}.{state_name}"
+            if (
+                "_input_value_frame" in state.__dict__
+                or inspect.getattr_static(type(state), "_input_value_frame")
+                is not _STANDARD_STATE_INPUT_FRAME
+            ):
+                failures.append(
+                    f"{state_label} replaces the canonical declared-input adapter; "
+                    "read declared INPUT fields from the values frame instead"
+                )
             live_references = _state_external_input_signature(state, mechanism)
             if live_references:
                 failures.append(
@@ -8475,6 +8704,7 @@ def _structure_signature(population) -> tuple:
                     type(state).__module__,
                     type(state).__qualname__,
                     _state_external_input_signature(state, module),
+                    _state_input_signature(state),
                     tuple(state._state),
                     _declared_buffer_layout_signature(
                         state,
@@ -8619,6 +8849,7 @@ def _structure_signature(population) -> tuple:
         ),
         tuple(handler.voltage_processes),
         _voltage_process_plan_signature(handler),
+        _input_binding_signature(population),
         _parametrization_signatures(population),
         _parameter_module_signatures(population),
         tuple(
@@ -8711,6 +8942,12 @@ class FunctionalPopulation:
             )
         _validate_support_keys(population, context="Source Population")
         self._source_support_key_binding = _support_key_runtime_binding(population)
+        self._source_input_binding_indices = _input_binding_index_signature(population)
+        self._source_input_declarations = _input_binding_declarations(population)
+        self._source_handler_input_declarations = _input_binding_declarations(
+            population.mech
+        )
+        self._source_input_binding_plan = population.mech._input_binding_plan
         self._source_additional_parameter_key_binding = (
             _additional_parameter_key_binding(population)
         )
@@ -9611,7 +9848,31 @@ class FunctionalPopulation:
             )
 
     def _validate_source(self) -> None:
-        if not torch.compiler.is_compiling():
+        if torch.compiler.is_compiling():
+            # The general source fingerprint is evaluated once per graph. Keep
+            # public binding paths and their literal plan visible to Dynamo so
+            # a later bind_input() cannot reuse that graph with stale routing.
+            if (
+                _input_binding_declarations(self._population)
+                != self._source_input_declarations
+                or _input_binding_declarations(self._population.mech)
+                != self._source_handler_input_declarations
+                or self._population.mech._input_binding_plan
+                != self._source_input_binding_plan
+            ):
+                raise FunctionalizationError(
+                    "The source Population input bindings changed after "
+                    "make_functional(); rebuild and lower it again."
+                )
+        else:
+            if (
+                _input_binding_index_signature(self._population)
+                != self._source_input_binding_indices
+            ):
+                raise FunctionalizationError(
+                    "The source Population input-binding placement changed after "
+                    "make_functional(); rebuild and lower it again."
+                )
             current_support_binding = _support_key_runtime_binding(self._population)
             if current_support_binding != self._source_support_key_binding:
                 if (
@@ -9735,6 +9996,7 @@ class FunctionalPopulation:
             reference=self._transition.population,
             context="Compatible Population",
         )
+        _validate_input_binding_indices(population, self._transition.population)
         if (
             _additional_parameter_layout_signature(population)
             != self._additional_parameter_layout
@@ -11432,6 +11694,7 @@ class FunctionalPopulation:
                 audit_transition = copy.deepcopy(self._transition)
                 _rebind_population_time_references(audit_transition.population)
                 _install_voltage_process_audits(audit_transition.population)
+                _install_state_input_audits(audit_transition.population)
                 preparation_python_state = _transition_python_state_snapshot(
                     audit_preparation
                 )

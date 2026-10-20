@@ -1,6 +1,9 @@
 import copy
 import hashlib
 import inspect
+import keyword
+import math
+import numbers
 import random
 import textwrap
 from collections.abc import Mapping
@@ -1306,10 +1309,18 @@ def build_integration_func(
     method,
     eliminate=None,
     diffusion=None,
+    inputs=(),
     **method_kwargs,
 ):
     """Build the integration function for a State subclass."""
     method = _canonical_method_name(method)
+    if method == "euler_heun":
+        # Its predictor/corrector recomputes ASSIGNED algebra at each stage.
+        # Read-only INPUT values remain explicit stage inputs, outside that
+        # authored returned-output schema.
+        method_kwargs["inputs"] = tuple(inputs)
+    else:
+        assigned = (*assigned, *inputs)
     try:
         builder = _INTEGRATION_BUILDERS[method]
     except KeyError as exc:
@@ -1460,6 +1471,10 @@ class State(Parameterized):
     _assigned = ()
     _assigned_declarations = []
 
+    _inputs = ()
+    _input_defaults = {}
+    _input_declarations = []
+
     _derived_buffers = set()
     _derived_buffer_specs = {}
     _derived_buffer_declarations = []
@@ -1522,6 +1537,7 @@ class State(Parameterized):
         new_carry_specs = {}
         new_derivative = set()
         new_assigned = []
+        new_inputs = {}
         new_derived_buffers = set()
         new_derived_buffer_specs = {}
         new_timestep_buffers = set()
@@ -1557,6 +1573,8 @@ class State(Parameterized):
                 new_diffusion.update(base._diffusion)
             if "_assigned" in base.__dict__:
                 _extend_unique(new_assigned, base._assigned)
+            if "_input_defaults" in base.__dict__:
+                new_inputs.update(base._input_defaults)
             if "_derived_buffers" in base.__dict__:
                 new_derived_buffers.update(base._derived_buffers)
                 inherited_specs = {
@@ -1623,6 +1641,10 @@ class State(Parameterized):
             cls, "state.assigned", State._assigned_declarations
         ):
             _extend_unique(new_assigned, a_list)
+        for declaration in consume_class_values(
+            cls, "state.inputs", State._input_declarations
+        ):
+            new_inputs.update(declaration)
         for declaration in consume_class_values(
             cls,
             "state.derived_buffers",
@@ -1713,6 +1735,24 @@ class State(Parameterized):
             "_solve",
         }
         execution_slots.update(f"{name}_dW_rng" for name in new_state)
+        input_class_slots = {
+            name
+            for name in new_inputs
+            if any(name in base.__dict__ for base in cls.__mro__)
+        }
+        overlap = set(new_inputs) & (
+            state_names
+            | carry_names
+            | assigned_names
+            | workspace_buffers
+            | execution_slots
+            | input_class_slots
+        )
+        if overlap:
+            raise ValueError(
+                "State INPUT names conflict with declared state, buffers, "
+                f"parameters, methods, or reserved slots: {sorted(overlap)}"
+            )
         class_slots = {
             name
             for name in workspace_buffers
@@ -1758,6 +1798,8 @@ class State(Parameterized):
         cls._kinetic = new_kinetic
         cls._diffusion = new_diffusion
         cls._assigned = tuple(new_assigned)
+        cls._inputs = tuple(new_inputs)
+        cls._input_defaults = new_inputs
         cls._derived_buffers = new_derived_buffers
         cls._derived_buffer_specs = new_derived_buffer_specs
         cls._timestep_buffers = new_timestep_buffers
@@ -1897,6 +1939,7 @@ class State(Parameterized):
             self.method,
             eliminate=cinfo,
             diffusion=self._diffusion,
+            inputs=self._inputs,
             **self.method_kwargs,
         )
         self._solve = MethodType(ifunc, self)
@@ -1999,7 +2042,7 @@ class State(Parameterized):
                 f"unknown states {sorted(unknown_seeds)}"
             )
 
-        visible_values = {}
+        visible_values = self._input_value_frame(v)
         for name, value in (*tuple(seeds.items()), *tuple(overrides.items())):
             value = torch.as_tensor(value, device=v.device, dtype=v.dtype)
             try:
@@ -2107,6 +2150,51 @@ class State(Parameterized):
             Names of state variables advanced by the integrator.
         """
         declare_class_value("state.state", args, State._state_declarations)
+
+    @staticmethod
+    def INPUT(*names, default=0.0):
+        """Declare read-only tensor inputs supplied by Population bindings.
+
+        Inputs are ephemeral values in State hook frames; they allocate no
+        buffers and cannot be returned as state updates. Unbound inputs use a
+        finite scalar default, broadcast to the local voltage shape. During
+        initialization inputs use these defaults; bindings are evaluated only
+        when the consumer State advances.
+        """
+        if not isinstance(default, numbers.Real) or not math.isfinite(default):
+            raise ValueError("State INPUT default must be a finite real scalar.")
+        if not names or any(
+            not isinstance(name, str)
+            or not name.isidentifier()
+            or keyword.iskeyword(name)
+            or name.startswith("_")
+            for name in names
+        ):
+            raise ValueError("State INPUT names must be public Python identifiers.")
+        declare_class_value(
+            "state.inputs",
+            {name: float(default) for name in names},
+            State._input_declarations,
+        )
+
+    def _input_value_frame(self, v, supplied=None):
+        """Build call-local input tensors without retaining source aliases."""
+        supplied = {} if supplied is None else supplied
+        unknown = set(supplied) - set(self._inputs)
+        if unknown:
+            raise KeyError(f"Undeclared State INPUT values: {sorted(unknown)}")
+        frame = {}
+        for name in self._inputs:
+            if name in supplied:
+                value = supplied[name]
+                if value.device != v.device:
+                    raise ValueError(
+                        f"State INPUT {name!r} must use the consumer device."
+                    )
+                frame[name] = torch.broadcast_to(value, v.shape)
+            else:
+                frame[name] = torch.full_like(v, self._input_defaults[name])
+        return frame
 
     @staticmethod
     def CARRY(*args, dtype=None, shape="local"):

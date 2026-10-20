@@ -80,6 +80,7 @@ from dendra.models.integrators.core import (
     _population_runtime_modes_plain,
 )
 from dendra.models.mechanisms._handler import MechanismHandler
+from dendra.models.mechanisms._inputs import InputBinding
 from dendra.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
 from dendra.models.mechanisms._material_process import (
     ClampProcess,
@@ -1292,6 +1293,7 @@ class Population(P, Sliceable):
 
         self.is_built = False
         self._flag_rebuild = False
+        self._input_bindings = ()
         self.key = None
 
         if integrator is None:
@@ -1729,6 +1731,7 @@ class Population(P, Sliceable):
         state.setdefault("_mech_data_ic", {})
         state.setdefault("_mech_data_base_kwargs", {})
         state.setdefault("_material_geometries", {})
+        state.setdefault("_input_bindings", ())
         state.setdefault("_integrator_reinit_pending", False)
 
         # Duration carry was originally a registered model-device buffer. Move
@@ -5981,6 +5984,23 @@ class Population(P, Sliceable):
         self.build()
         return super().to(*args, **kwargs)
 
+    def bind_input(self, target, source):
+        """Route a declared State INPUT from another mechanism in this Population.
+
+        ``target`` has form ``mechanism.DE.State.input``. ``source`` names a
+        declared state, carry, saved current, or parameter tensor as
+        ``mechanism.field`` or ``mechanism.DE.State.field``. Bindings read the
+        source when the consumer advances, preserving mechanism execution
+        order. Initialization uses the INPUT declaration's scalar default.
+        """
+        binding = InputBinding(target, source)
+        bindings = tuple(item for item in self._input_bindings if item.target != target)
+        bindings += (binding,)
+        if self.is_built and not self._flag_rebuild:
+            self.mech.configure_input_bindings(bindings)
+        self._input_bindings = bindings
+        return self
+
     def build(self, force_rebuild=False):
         """
         Compile and register mechanisms, assembling ion bookkeeping.
@@ -6195,6 +6215,7 @@ class Population(P, Sliceable):
                 source_material=self._material_source,
                 currents=self._m_curr,
                 population=self,
+                input_bindings=self._input_bindings,
             )
 
             for m in mech.mechanisms.values():

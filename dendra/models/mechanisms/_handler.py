@@ -1,4 +1,6 @@
 import copy
+import inspect
+import math
 from collections.abc import Mapping
 
 import torch
@@ -7,6 +9,7 @@ import torch._dynamo as dynamo
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ..rng import _validate_rng_checkpoint_payload
+from ._inputs import InputBinding, _input_path
 from ._material_process import DiffusionProcess, MaterialProcess
 from ._materials import _canonical_material_name
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
@@ -480,6 +483,7 @@ class MechanismHandler(torch.nn.Module):
         source_material=None,
         currents=None,
         population=None,
+        input_bindings=(),
     ):
         super().__init__()
         self.mechanisms = torch.nn.ModuleDict()
@@ -553,6 +557,7 @@ class MechanismHandler(torch.nn.Module):
             process._bind_materials(self._get_material, population=population)
 
         self._validate_diffusion_process_overlaps()
+        self.configure_input_bindings(input_bindings)
 
         self._material_process_order = self._ordered_material_process_names()
 
@@ -669,6 +674,7 @@ class MechanismHandler(torch.nn.Module):
     def __setstate__(self, state):
         """Restore synchronization wrappers bound to the restored handler."""
 
+        state.setdefault("_input_bindings", ())
         for method_name in self._SYNC_METHODS:
             state.pop(method_name, None)
         super().__setstate__(state)
@@ -740,6 +746,214 @@ class MechanismHandler(torch.nn.Module):
             self.make_maps()
         return result
 
+    def configure_input_bindings(self, bindings):
+        """Validate immutable paths and compile consumer-local source indices.
+
+        Plans retain names and shapes only. Execution resolves the handler's
+        current registered modules, so deepcopy and functional tensor rebinding
+        cannot leave references to the original Population.
+        """
+        bindings = tuple(bindings)
+        plans = []
+        indices = []
+        targets = set()
+        for binding in bindings:
+            if not isinstance(binding, InputBinding):
+                raise TypeError("Input bindings must be InputBinding declarations.")
+            if binding.target in targets:
+                raise ValueError(f"Duplicate input binding target {binding.target!r}.")
+            targets.add(binding.target)
+            target_name, _, state_name, input_name = _input_path(
+                binding.target, target=True
+            )
+            source_parts = _input_path(binding.source)
+            source_name, field = source_parts[0], source_parts[-1]
+            source_state_name = source_parts[2] if len(source_parts) == 4 else None
+            if target_name not in self.mechanisms or source_name not in self.mechanisms:
+                raise ValueError(
+                    "Input binding sources and targets must name mechanisms in "
+                    f"the same Population: {binding.target!r} <- {binding.source!r}."
+                )
+            target = self.mechanisms[target_name]
+            source = self.mechanisms[source_name]
+            if (
+                state_name not in target.DE
+                or input_name not in target.DE[state_name]._inputs
+            ):
+                raise ValueError(
+                    f"Input binding target {binding.target!r} is not a declared State.INPUT."
+                )
+            if source_state_name is not None:
+                if source_state_name not in source.DE:
+                    raise ValueError(f"Unknown input source State {binding.source!r}.")
+                owner = source.DE[source_state_name]
+                if field in owner._state:
+                    # State variables are registered on their parent Mechanism.
+                    source_state_name = None
+                    owner = source
+            else:
+                owner = source
+            parameters = set(owner.all_parameter_names())
+            allowed = set(owner._carry) | parameters
+            if owner is source:
+                allowed.update(source._all_states)
+                allowed.update(source._saved_current_buffer_names)
+            if field not in allowed:
+                raise ValueError(
+                    f"Input binding source {binding.source!r} must name declared "
+                    "state, carry, saved-current, or parameter tensor storage."
+                )
+            if field in owner._carry_specs and owner._carry_specs[field][1] != "local":
+                raise ValueError(
+                    f"Input source {binding.source!r} requires local carry storage; "
+                    "structural and deferred carry have no physical support mapping."
+                )
+            if inspect.getattr_static(type(owner), field, None) is not None:
+                raise ValueError(
+                    f"Input source {binding.source!r} cannot use authored properties or callbacks."
+                )
+            if field in owner._buffers:
+                value = owner._buffers[field]
+            elif field in owner._parameters:
+                value = owner._parameters[field]
+            else:
+                raise ValueError(
+                    f"Input source {binding.source!r} must be registered Tensor storage."
+                )
+            if not torch.is_tensor(value):
+                raise TypeError(
+                    f"Input binding source {binding.source!r} is not a Tensor."
+                )
+            source_spec = source.support_map.spec
+            target_spec = target.support_map.spec
+            if source_spec.source_core_shape != target_spec.source_core_shape:
+                raise ValueError(
+                    "Input bindings require one common Population support domain."
+                )
+            missing_packed_keys = any(
+                not mechanism.support_map.spec.has_compact_identity
+                and (
+                    not getattr(mechanism, "_support_key_values_valid", True)
+                    or mechanism.key.device.type == "meta"
+                )
+                for mechanism in (source, target)
+            )
+            if missing_packed_keys:
+                if bindings == getattr(self, "_input_bindings", ()) and hasattr(
+                    self, "_input_binding_plan"
+                ):
+                    # Meta conversion and to_empty deliberately discard key
+                    # values. Preserve the established immutable routing plan
+                    # and relocated buffers until state loading restores the
+                    # selectors and reruns make_maps with real values.
+                    return
+                raise ValueError(
+                    "Cannot configure input bindings while packed support keys "
+                    "are unavailable; restore their state before rebinding."
+                )
+            source_slots = source_spec.materialized_flat_indices(
+                source.key, device="cpu"
+            )
+            target_slots = target_spec.materialized_flat_indices(
+                target.key, device="cpu"
+            )
+            if len(set(source_slots.tolist())) != source_slots.numel():
+                raise ValueError(
+                    f"Input source {source_name!r} has ambiguous duplicate support."
+                )
+            scalar = field in parameters and value.numel() == 1
+            positions = {
+                slot: position for position, slot in enumerate(source_slots.tolist())
+            }
+            if not scalar and any(
+                slot not in positions for slot in target_slots.tolist()
+            ):
+                raise ValueError(
+                    f"Input source {source_name!r} does not cover target support {target_name!r}."
+                )
+            index_name = f"_input_binding_index_{len(plans)}"
+            index = torch.tensor(
+                [] if scalar else [positions[slot] for slot in target_slots.tolist()],
+                dtype=torch.long,
+                device=self.celsius.device,
+            )
+            source_shape = (
+                tuple(source_spec.local_core_shape)
+                if source_spec.kind in (SupportKind.DENSE, SupportKind.RECTANGULAR)
+                or source_spec.preserves_population_axis
+                else (source_spec.slot_count,)
+            )
+            target_shape = (
+                tuple(target_spec.local_core_shape)
+                if target_spec.kind in (SupportKind.DENSE, SupportKind.RECTANGULAR)
+                or target_spec.preserves_population_axis
+                else (target_spec.slot_count,)
+            )
+            plans.append(
+                (
+                    target_name,
+                    state_name,
+                    input_name,
+                    source_name,
+                    source_state_name,
+                    field,
+                    index_name,
+                    source_shape,
+                    target_shape,
+                    scalar,
+                )
+            )
+            indices.append((index_name, index))
+        # Commit only after every binding validates, keeping failed rebinding
+        # transactional for an already initialized Population.
+        for name in tuple(self._buffers):
+            if name.startswith("_input_binding_index_"):
+                delattr(self, name)
+        for name, index in indices:
+            self.register_buffer(name, index, persistent=False)
+        self._input_bindings = bindings
+        self._input_binding_plan = tuple(plans)
+
+    def _resolve_state_inputs(self, mechanism_name):
+        """Gather current source values immediately before one consumer visit."""
+        result = {}
+        for (
+            target_name,
+            state_name,
+            input_name,
+            source_name,
+            source_state_name,
+            field,
+            index_name,
+            source_shape,
+            target_shape,
+            scalar,
+        ) in self._input_binding_plan:
+            if target_name != mechanism_name:
+                continue
+            source = self.mechanisms[source_name]
+            owner = (
+                source if source_state_name is None else source.DE[source_state_name]
+            )
+            value = (
+                owner._buffers[field]
+                if field in owner._buffers
+                else owner._parameters[field]
+            )
+            if scalar:
+                value = value.reshape(())
+            else:
+                local_rank = len(source_shape)
+                # Effective RANGE parameters may have broadcast singleton axes;
+                # expand them to source storage before physical-slot projection.
+                source_batch_shape = tuple(value.shape[:-local_rank])
+                value = torch.broadcast_to(value, source_batch_shape + source_shape)
+                value = value.reshape(source_batch_shape + (math.prod(source_shape),))
+                value = value.index_select(-1, self._buffers[index_name])
+                value = value.reshape(source_batch_shape + target_shape)
+            result.setdefault(state_name, {})[input_name] = value
+        return result
+
     def make_maps(self):
         """
         Create the mapping of current indices to mechanisms and their functions.
@@ -749,6 +963,7 @@ class MechanismHandler(torch.nn.Module):
         # invalidate packed key values.  Re-intern from the authored sequence
         # at every existing map-rebuild boundary.
         self._support_registry.rebuild(self.mechanisms.values())
+        self.configure_input_bindings(self._input_bindings)
 
         self._map = []
         self._map_exp = []
@@ -1954,7 +2169,11 @@ class MechanismHandler(torch.nn.Module):
             self._pre_state_support_entries,
         )
         for mech, support_index in self._pre_state_advance_plan:
-            mech._advance_states(local_voltages[support_index], dt)
+            inputs = self._resolve_state_inputs(mech.name)
+            if inputs:
+                mech._advance_states(local_voltages[support_index], dt, inputs)
+            else:
+                mech._advance_states(local_voltages[support_index], dt)
 
     def advance_post_current(self, v, dt, temp, current_frame):
         """Publish the accepted current, advance its readers, and commit state.
@@ -1977,7 +2196,11 @@ class MechanismHandler(torch.nn.Module):
         )
         for mech, support_index in self._post_state_advance_plan:
             local_v = local_voltages[support_index]
-            mech._advance_states(local_v, dt)
+            inputs = self._resolve_state_inputs(mech.name)
+            if inputs:
+                mech._advance_states(local_v, dt, inputs)
+            else:
+                mech._advance_states(local_v, dt)
 
         self._finish_advance(v, dt, temp)
 
@@ -1995,7 +2218,11 @@ class MechanismHandler(torch.nn.Module):
             self._state_support_entries,
         )
         for mech, support_index in self._state_advance_plan:
-            mech._advance_states(local_voltages[support_index], dt)
+            inputs = self._resolve_state_inputs(mech.name)
+            if inputs:
+                mech._advance_states(local_voltages[support_index], dt, inputs)
+            else:
+                mech._advance_states(local_voltages[support_index], dt)
 
         self._finish_advance(v, dt, temp)
 
