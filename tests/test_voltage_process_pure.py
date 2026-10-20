@@ -6,12 +6,42 @@ import pytest
 import torch
 
 import dendra as dn
+from dendra.models.mechanisms import State, VoltageProcess
 from dendra.models.mod import fire, fire_d, fire_r, fire_r_d
 from tests.test_builtin_spike_mechanisms import _instance
 
 FIRE_TYPES = {cls.__name__: cls for cls in (fire, fire_r, fire_d, fire_r_d)}
 DT = 0.05
 STEPS = 6
+
+
+class _ResetState(State):
+    State.STATE("owned", "recovery")
+    State.CARRY("nested")
+    State.DERIVATIVE("owned' = 0.0 * owned", "recovery' = 0.0 * recovery")
+
+
+class _StateReset(VoltageProcess):
+    VoltageProcess.STATE_BUNDLE(_ResetState)
+    VoltageProcess.CARRY("events")
+    VoltageProcess.ASSIGNED("algebraic")
+    VoltageProcess.DERIVED_BUFFER("workspace")
+    VoltageProcess.GLOBAL(threshold=0.0, rest=-2.0, kick=1.25)
+
+    def derive_buffers(self):
+        return {"workspace": torch.zeros_like(self.diam)}
+
+    def voltage_values(self, v, dt, values):
+        del v, dt
+        reset = values["owned"] >= self.threshold
+        owned = torch.where(
+            reset, self.rest.expand_as(values["owned"]), values["owned"]
+        )
+        return owned, {
+            "owned": owned,
+            "recovery": values["recovery"] + reset.to(owned.dtype) * self.kick,
+            "events": values["events"] + reset.to(owned.dtype),
+        }
 
 
 def _reference_fire(kind, voltage, dt, parameters, values):
@@ -181,3 +211,79 @@ def test_hard_fire_smooth_region_voltage_derivative_matches_finite_difference(
         rtol=1e-8,
         atol=1e-8,
     )
+
+
+def test_pure_voltage_reset_reads_and_commits_declared_state_aliases():
+    voltage = torch.tensor([[-11.0, -12.0, -13.0]], dtype=torch.float64)
+    with dn.ctx(DTYPE=voltage.dtype, REQUIRE_GRAD=1):
+        mechanism = _instance(_StateReset, voltage)
+    mechanism._configure_timestep(DT)
+    values = {
+        "owned": voltage.new_tensor([[-1.0, 0.0, 1.0]], requires_grad=True),
+        "recovery": voltage.new_tensor([[0.2, 0.4, 0.6]], requires_grad=True),
+        "events": voltage.new_tensor([[2.0, 3.0, 4.0]]),
+    }
+    before = {name: value.detach().clone() for name, value in values.items()}
+    live_before = {name: getattr(mechanism, name).clone() for name in values}
+    output, updates = mechanism._derive_voltage_values(voltage, DT, values)
+    torch.testing.assert_close(output, voltage.new_tensor([[-1.0, -2.0, -2.0]]))
+    torch.testing.assert_close(
+        updates["recovery"], voltage.new_tensor([[0.2, 1.65, 1.85]])
+    )
+    torch.testing.assert_close(updates["events"], voltage.new_tensor([[2.0, 4.0, 5.0]]))
+    gradients = torch.autograd.grad(
+        (output + updates["recovery"]).sum(), (values["owned"], values["recovery"])
+    )
+    torch.testing.assert_close(gradients[0], voltage.new_tensor([[1.0, 0.0, 0.0]]))
+    torch.testing.assert_close(gradients[1], torch.ones_like(voltage))
+    for name, value in values.items():
+        torch.testing.assert_close(value, before[name], rtol=0, atol=0)
+        torch.testing.assert_close(
+            getattr(mechanism, name), live_before[name], rtol=0, atol=0
+        )
+        mechanism._buffers[name] = value
+    committed = mechanism.update_v(voltage)
+    torch.testing.assert_close(committed, output)
+    for name, value in updates.items():
+        torch.testing.assert_close(getattr(mechanism, name), value)
+
+
+@pytest.mark.parametrize(
+    "name", ("algebraic", "workspace", "celsius", "diam", "nested", "unknown")
+)
+def test_voltage_state_updates_exclude_non_owned_outputs(name):
+    voltage = torch.tensor([[-1.0, 1.0]], dtype=torch.float64)
+    with dn.ctx(DTYPE=voltage.dtype):
+        mechanism = _instance(_StateReset, voltage)
+    mechanism.voltage_values = lambda v, dt, values: (v, {name: torch.zeros_like(v)})
+    with pytest.raises(KeyError, match="undeclared"):
+        mechanism._derive_voltage_values(voltage, DT, mechanism._runtime_value_frame())
+
+
+@pytest.mark.parametrize("invalid", ("shape", "dtype", "nontensor"))
+def test_voltage_state_updates_preserve_declared_tensor_schema(invalid):
+    voltage = torch.tensor([[-1.0, 1.0]], dtype=torch.float64)
+    with dn.ctx(DTYPE=voltage.dtype):
+        mechanism = _instance(_StateReset, voltage)
+    update = {
+        "shape": voltage[..., 0],
+        "dtype": voltage.to(torch.int64),
+        "nontensor": 0.0,
+    }[invalid]
+    mechanism.voltage_values = lambda v, dt, values: (v, {"owned": update})
+    with pytest.raises((TypeError, ValueError), match="owned"):
+        mechanism._derive_voltage_values(voltage, DT, mechanism._runtime_value_frame())
+
+
+def test_voltage_state_updates_can_replace_only_one_declared_variable():
+    voltage = torch.tensor([[-1.0, 1.0]], dtype=torch.float64)
+    with dn.ctx(DTYPE=voltage.dtype):
+        mechanism = _instance(_StateReset, voltage)
+    mechanism._configure_timestep(DT)
+    recovery = mechanism.recovery.clone()
+    events = mechanism.events.clone()
+    mechanism.voltage_values = lambda v, dt, values: (v, {"owned": v + 1})
+    mechanism.update_v(voltage)
+    torch.testing.assert_close(mechanism.owned, voltage + 1)
+    torch.testing.assert_close(mechanism.recovery, recovery)
+    torch.testing.assert_close(mechanism.events, events)

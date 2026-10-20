@@ -4004,8 +4004,9 @@ class VoltageProcess(Mechanism):
     Mechanism subtype that updates the membrane potential ``v``.
 
     Implement :meth:`voltage_values` to return a new voltage and a mapping of
-    declared :meth:`CARRY` replacements. The hook is pure: its voltage, timestep,
-    and ``values`` inputs are read-only, and it must not mutate the module.
+    declared nested :class:`State` variable and :meth:`CARRY` replacements. The
+    hook is pure: its voltage, timestep, and ``values`` inputs are read-only,
+    and it must not mutate the module.
     Dendra uses the same hook in imperative and functional execution.
 
     Voltage processes run in their existing ordered, support-local phase before
@@ -4018,13 +4019,15 @@ class VoltageProcess(Mechanism):
 
     def voltage_values(self, v, dt, values):
         """
-        Return ``(voltage, carry_updates)`` without modifying inputs or ``self``.
+        Return ``(voltage, updates)`` without modifying inputs or ``self``.
 
         ``values`` follows the ordinary Mechanism runtime frame: declared
         persistent/assigned values, prepared workspaces, local shared fields,
         ``celsius``, and ``diam``. Parameters may be read through ``self``.
-        ``carry_updates`` may replace any subset of this process's declared
-        CARRY values, preserving each value's shape, dtype, and device.
+        ``updates`` may replace any subset of this process's declared nested
+        State variables and direct CARRY values, preserving each value's shape,
+        dtype, and device. Nested State CARRY, ASSIGNED values, workspaces, and
+        shared fields cannot be replaced here.
         The returned voltage must match ``v`` in shape, dtype, and device.
         """
         raise NotImplementedError(
@@ -4038,7 +4041,7 @@ class VoltageProcess(Mechanism):
             if not isinstance(result, tuple) or len(result) != 2:
                 raise TypeError(
                     f"{type(self).__qualname__}.voltage_values() must return "
-                    "a (voltage, carry_updates) tuple"
+                    "a (voltage, updates) tuple"
                 )
             voltage, updates = result
             _validate_runtime_outputs(
@@ -4052,13 +4055,16 @@ class VoltageProcess(Mechanism):
                 self,
                 "voltage_values",
                 updates,
-                {name: self._buffers[name] for name in self._carry},
+                {
+                    name: self._buffers[name]
+                    for name in (*self._initial_state_names, *self._initial_carry_names)
+                },
             )
             self._voltage_schema_validated = True
         return result
 
     def update_v(self, v: torch.Tensor) -> torch.Tensor:
-        """Imperative adapter committing the pure hook's declared carry outputs.
+        """Imperative adapter committing the pure hook's declared state outputs.
 
         Functional execution lifts these same buffer replacements into explicit
         state. User-authored voltage algebra belongs in :meth:`voltage_values`,
@@ -4067,7 +4073,7 @@ class VoltageProcess(Mechanism):
         voltage, updates = self._derive_voltage_values(
             v, self.dt, self._runtime_value_frame()
         )
-        for name in self._carry:
+        for name in (*self._initial_state_names, *self._initial_carry_names):
             if name in updates:
                 self._buffers[name] = updates[name]
         return voltage

@@ -431,9 +431,13 @@ remains inference-only.
 
 Custom ``VoltageProcess`` subclasses can implement the pure hook
 ``voltage_values(self, v, dt, values)``. It returns
-``(new_voltage, carry_updates)``, where ``carry_updates`` is a partial mapping
-of declared ``CARRY`` names to replacement tensors. Read trainable parameters
-from ``self`` and evolving carry from ``values``. Return out-of-place results:
+``(new_voltage, updates)``, where ``updates`` is a partial mapping of declared
+nested ``State.STATE`` variables and direct ``CARRY`` names to replacement
+tensors. A reset can therefore replace a mechanism-owned voltage and recovery
+variable before their State equations advance. Nested State ``CARRY``,
+``ASSIGNED`` values, workspaces, and shared fields remain outside this output
+schema. Read trainable parameters from ``self`` and evolving state from
+``values``. Return out-of-place results:
 do not mutate ``self``, ``v``, or tensors in ``values``. The shared base
 ``update_v`` adapter commits these returned replacements during imperative
 execution; functional execution keeps them explicit. Ordinary Mechanism
@@ -441,6 +445,10 @@ declarations and functional eligibility checks still apply, and the pure
 hooks undergo the same mutation/dependency audits as other functional hooks.
 An authored legacy ``update_v`` override remains usable imperatively but is
 rejected during functional lowering; it is not silently interpreted as pure.
+Nested State ``setreference`` properties and Tensor attributes outside the
+declared runtime frame also remain imperative-only: they can retain live
+tensors outside the functional state. Lowering rejects these bindings, and
+adding one invalidates an existing functional plan.
 
 .. _functional-scnv:
 

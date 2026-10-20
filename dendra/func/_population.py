@@ -1788,6 +1788,44 @@ def _voltage_process_failures(process):
     return failures
 
 
+def _state_external_input_signature(state, mechanism):
+    """Describe implicit external State inputs without evaluating getters.
+
+    State runtime frames have no explicit lowering contract for these external
+    references. In contrast to the framework-owned Mechanism clock, a nested
+    State reference can otherwise silently retain another live model's tensors.
+    Registered tensors reside in the module's parameter/buffer dictionaries.
+    The handler also binds declared state/shared-field aliases directly on
+    nested States; those already belong to the explicit runtime frame. Any
+    other tensor stored on the instance would instead be frozen by cloning.
+    """
+    instance_values = vars(state)
+    explicit_names = set(state._state) | set(mechanism._runtime_shared_local_names())
+    effective = {}
+    for cls in type(state).__mro__:
+        for name, descriptor in vars(cls).items():
+            effective.setdefault(name, descriptor)
+    entries = [
+        (name, "setreference", id(descriptor), id(descriptor.func))
+        for name, descriptor in effective.items()
+        if isinstance(descriptor, staticproperty) and name not in instance_values
+    ]
+    entries.extend(
+        (
+            name,
+            "unregistered-tensor",
+            id(value),
+            _shape_tuple(value),
+            str(value.dtype),
+            str(value.device),
+            str(value.layout),
+        )
+        for name, value in instance_values.items()
+        if torch.is_tensor(value) and name not in explicit_names
+    )
+    return tuple(sorted(entries))
+
+
 def _voltage_process_signature(process):
     """Fingerprint reset behavior and helper dependencies, not live tensors."""
 
@@ -1823,9 +1861,9 @@ def _voltage_process_plan_signature(handler):
 def _install_voltage_process_audits(population):
     """Audit authored resets inside, rather than around, the commit adapter.
 
-    Installed only on the disposable lowering probe. A returned CARRY update
-    is legal, but a write to that same slot inside the authored pure hook is
-    not. Whole-transition probes cannot distinguish those two operations.
+    Installed only on the disposable lowering probe. A returned State or CARRY
+    update is legal, but a write to that same slot inside the authored pure hook
+    is not. Whole-transition probes cannot distinguish those two operations.
     """
 
     def checked_hook(process, hook):
@@ -1845,7 +1883,7 @@ def _install_voltage_process_audits(population):
                     raise FunctionalizationError(
                         f"VoltageProcess {process.name!r}.voltage_values() mutated "
                         "its module or read-only voltage, timestep, or values "
-                        "inputs. Return voltage and declared CARRY replacements "
+                        "inputs. Return voltage and declared State/CARRY replacements "
                         "without modifying inputs or self."
                     )
 
@@ -7465,6 +7503,14 @@ def _functionalization_failures(
             failures.append(f"{mechanism.name} uses a registered waveform injection")
         for state_name, state in mechanism.DE.items():
             state_label = f"{mechanism_label}.{state_name}"
+            live_references = _state_external_input_signature(state, mechanism)
+            if live_references:
+                failures.append(
+                    f"{state_label} uses live setreference properties or "
+                    "unregistered Tensor attributes "
+                    f"{[name for name, *_identity in live_references]}; nested "
+                    "State references need explicit functional tensor inputs"
+                )
             class_has_state_assigned_values = (
                 inspect.getattr_static(type(state), "assigned_values")
                 is not _STANDARD_STATE_ASSIGNED_VALUES
@@ -8428,6 +8474,7 @@ def _structure_signature(population) -> tuple:
                     state_name,
                     type(state).__module__,
                     type(state).__qualname__,
+                    _state_external_input_signature(state, module),
                     tuple(state._state),
                     _declared_buffer_layout_signature(
                         state,
