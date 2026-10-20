@@ -132,8 +132,8 @@ required lane installs and exercises NEURON and the CPU solvers. Accelerator
 execution remains outside this measurement, while CPU-testable CUDA and Triton
 interfaces remain covered.
 
-For test-impacting changes, GitLab CI runs the same non-CUDA branch-coverage
-measurement, enforces a ratcheted 84% global minimum, and retains JSON,
+GitLab CI runs the same non-CUDA branch-coverage measurement, enforces a
+ratcheted 84% global minimum, and retains JSON,
 browsable HTML, and Cobertura reports. Critical modules also have individual
 floors in `coverage-floors.toml`. After generating `coverage.json`, validate
 those floors locally with:
@@ -141,3 +141,63 @@ those floors locally with:
 ```sh
 python scripts/check_coverage_floors.py coverage.json
 ```
+
+## Run the full lane as CI shards
+
+GitLab CI splits the required CPU/NEURON lane across four jobs so that each job
+has its own timeout. Together they execute the same selected test set as the
+single-process command above. All four jobs and the coverage aggregation job
+must pass before merging. The functional compiler compatibility matrix remains
+an additional required check.
+
+Merge-request pipelines and pushes to `develop` or `main` always run the full
+checks. Feature-branch push pipelines select them when runtime, tests, build,
+or CI files change. Documentation-only feature-branch pushes run the executable
+documentation build; set the CI/CD variable `RUN_FULL_TESTS=1` to request the
+full checks on those pushes too.
+When a feature branch has an open merge request, its merge-request pipeline
+replaces the duplicate push pipeline.
+
+Each `test_shards` job records its test inventory and durations in
+`ci-results/<index>/manifest.json`, JUnit results in `junit.xml`, and raw coverage
+data in `.coverage` in the same directory. These are retained as CI artifacts.
+The `test_coverage` aggregator verifies that the four inventories form a complete,
+disjoint partition of the selected tests before combining
+coverage. It enforces the same 84% global minimum and the module floors from
+`coverage-floors.toml` against the combined report. Per-shard coverage percentages
+are not meaningful thresholds: each shard exercises only part of the suite.
+
+To reproduce shard 1 locally, use:
+
+```sh
+mkdir -p ci-results/1
+COVERAGE_FILE=ci-results/1/.coverage \
+python -m pytest -p scripts.ci_shard tests -W error \
+  -m "cpu or (neuron and not cuda)" \
+  --ci-shard-index=1 --ci-shard-total=4 --ci-shard-output=ci-results/1 \
+  --junitxml=ci-results/1/junit.xml --durations=25 \
+  --cov=dendra --cov-branch --cov-config=.coveragerc.cpu --cov-report=
+```
+
+Repeat with shard indices 2, 3, and 4, changing each output path to match its
+index. Preserve the same checkout, dependencies, marker expression, and coverage
+configuration across all four runs. Then validate the inventories, combine raw
+coverage data, and generate the reports with:
+
+```sh
+python scripts/combine_ci_coverage.py --shards 4 --input-dir ci-results --fail-under=84
+```
+
+The combined reports are written to `coverage.json`, `coverage.xml`, and
+`htmlcov/` at the checkout root.
+
+Coverage uses relative source paths so data collected in separate CI workspaces
+can be combined. Combining the data preserves statement and branch coverage
+across the entire lane; averaging shard percentages would not.
+
+Sharding does not shorten or remove tests. Initial assignments keep each test
+module together and balance the number of selected cases across jobs; retained
+timings make slow shards visible and allow the allocation to be refined.
+Wall-clock savings depend on runner availability and test durations, so four
+shards do not guarantee a fourfold speedup. The shorter development pass remains
+useful while iterating, but the full CI lane remains mandatory.

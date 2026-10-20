@@ -105,6 +105,16 @@ and non-CUDA NEURON test lane before opening a pull or merge request:
 python -m pytest tests -W error -m "cpu or (neuron and not cuda)"
 ```
 
+GitLab CI divides this complete lane across four jobs, then combines their
+coverage data and enforces the existing global and module coverage floors.
+Every shard and the coverage aggregation job must pass before merging; a
+shorter development pass does not replace them. The [testing and code coverage
+guide](docs/testing.md) explains how to reproduce the shards locally and inspect
+their test inventories and timings. Merge-request pipelines and pushes to
+`develop` or `main` always run the full checks. A documentation-only feature
+branch push runs the documentation checks; set the CI/CD variable
+`RUN_FULL_TESTS=1` to request the full checks on that push as well.
+
 If your change affects CUDA behavior, run the relevant CUDA tests on a machine
 with a supported GPU:
 

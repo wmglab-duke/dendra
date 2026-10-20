@@ -1,4 +1,7 @@
 [run]
+# Store checkout-relative module names so data from separate runners combines.
+source = dendra
+relative_files = True
 # The required CPU/NEURON lane cannot execute these accelerator-only Triton
 # kernel bodies.  Keep this list explicit: contracts, package dispatch,
 # network Triton operations, and GPU diagnostics remain in the CPU report.
