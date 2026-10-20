@@ -198,6 +198,14 @@ class _bwd_euler_sc_skip(Integrator):
     """
 
     v_vars = []
+    # Imperative integration leaves voltage ownership to mechanisms. The
+    # functional transition still carries the externally imposed model voltage
+    # explicitly so recording, continuation and capacitive current retain it.
+    _FUNCTIONAL_STATE_NAMES = ("v",)
+    _PREPARED_WORKSPACE_SCHEMA = _bwd_euler_sc._PREPARED_WORKSPACE_SCHEMA
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_point_skip"
+    _FUNCTIONAL_CRITICAL_METHODS = ()
+    _prepare_workspace = staticmethod(_bwd_euler_sc._prepare_workspace)
 
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
@@ -205,8 +213,12 @@ class _bwd_euler_sc_skip(Integrator):
         self.register_buffer("area", torch.tensor(0.0))
 
     def initialize(self, model, dt):
-        self.cmdt = (1e-6 * model.cm * model.cm_scale) / (1e-3 * dt)
-        self.area = model.area * model.area_scale
+        workspace = self._derive_prepared_workspace(
+            dt,
+            cm=model.cm * model.cm_scale,
+            area=model.area * model.area_scale,
+        )
+        self._install_prepared_workspace(workspace)
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
@@ -216,8 +228,18 @@ class _bwd_euler_sc_skip(Integrator):
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _step(self, v, dt, temp, ve=None, intra=None):
-        del ve
+    def _step(
+        self,
+        v,
+        dt,
+        temp,
+        ve=None,
+        intra=None,
+        *,
+        solver=None,
+        call_local_currents=False,
+    ):
+        del ve, intra, solver
         # apply voltage processes
         # Keep the pre-process voltage independent from the returned tensor.
         # VoltageProcess implementations are documented as out-of-place, but
@@ -228,8 +250,13 @@ class _bwd_euler_sc_skip(Integrator):
         self._advance_pre_current(v_new, dt, temp)
         # No voltage solve/linearization follows, so ``itot`` is the exact
         # mechanism current evaluated at the externally imposed voltage.
-        itot, _ = self.mech.i(v_new)
-        ion_current_frame = self._capture_ion_current_frame()
+        if call_local_currents:
+            _, _, itot, ion_current_frame, _ = self._membrane_frame(
+                v_new, call_local=True, require_current=True
+            )
+        else:
+            itot, _ = self.mech.i(v_new)
+            ion_current_frame = self._capture_ion_current_frame()
 
         i_membrane = None
         if self.imem:

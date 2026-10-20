@@ -203,6 +203,8 @@ jobs:
           tests/func/test_voltage_processes.py
           tests/func/test_voltage_process_guards.py
           tests/func/test_voltage_continuation.py
+          tests/func/test_scnv.py
+          tests/func/test_scnv_guards.py
           tests/func/test_convenience_runner.py::test_top_level_compile_is_the_exported_functional_compile_alias
 
   check_dist:

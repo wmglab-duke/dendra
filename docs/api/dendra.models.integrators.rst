@@ -17,6 +17,16 @@ integrator's per-step discretization. Applied intracellular stimulus and axial
 cable currents affect the reported value through the voltage solution, but are
 not themselves added to or subtracted from it as separate terms.
 
+``scnv`` skips the voltage solve and evaluates actual mechanism currents after
+the voltage-process and pre-current state phases. Its ``i_membrane`` contains
+the evaluated membrane current plus the capacitive current from the imposed
+voltage change. Raw ``intra`` and ``ve`` inputs do not change voltage through this
+integrator. Functional execution admits ``scnv`` on exact standalone
+``Population`` and ``SingleCompartment`` models, including batches; packed
+components and spatial topologies are excluded. See
+:ref:`functional-scnv` for a pure mechanism-owned voltage example
+and the phase and continuation contract.
+
 Shared membrane assembly
 ------------------------
 

@@ -43,6 +43,7 @@ from dendra.models.integrators.implicit import (
     _bwd_euler_bt,
     _bwd_euler_sc,
     _bwd_euler_sc_multi,
+    _bwd_euler_sc_skip,
     _bwd_euler_ub,
 )
 from dendra.models.integrators.tree import _dhs, _dhs_multi
@@ -439,6 +440,7 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
     }
     for implementation in (
         _bwd_euler_sc,
+        _bwd_euler_sc_skip,
         _bwd_euler_ub,
         _dhs,
         _bwd_euler_bt,
@@ -448,6 +450,9 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
         _dhs_bt_multi,
     )
 }
+
+
+_STANDARD_FUNCTIONAL_INTEGRATOR_STATE_NAMES = {_bwd_euler_sc_skip: ("v",)}
 
 
 def _functional_initialization_profile(population):
@@ -486,6 +491,8 @@ def _functional_initialization_profile(population):
     if _is_extcell_tree(population):
         return ExtCellTree, "block_tree", _dhs_bt
     if _is_scalar_point(population):
+        if isinstance(population.integrator, _bwd_euler_sc_skip):
+            return type(population), "scalar_point_skip", _bwd_euler_sc_skip
         return type(population), "scalar_point", _bwd_euler_sc
     if isinstance(population, Myelinated):
         return Myelinated, "scalar_path", _bwd_euler_ub
@@ -2380,6 +2387,28 @@ def _persistent_shared_local_keys(handler) -> dict[str, tuple[str, ...]]:
     return keys
 
 
+def _functional_voltage_state_names(integrator):
+    """Separate functional carry from an integrator's solved voltage unknowns.
+
+    ``scnv`` solves no voltage unknowns, but its exposed voltage still belongs
+    to recording, continuation, initialization transforms, and commit. Other
+    integrators retain their existing ``v_vars`` state declaration.
+    """
+    declared = getattr(integrator, "_FUNCTIONAL_STATE_NAMES", None)
+    names = tuple(integrator.v_vars) if declared is None else declared
+    if (
+        type(names) is not tuple
+        or not names
+        or any(type(name) is not str or not name for name in names)
+        or len(names) != len(set(names))
+    ):
+        raise FunctionalizationError(
+            "Integrator v_vars or functional state names must declare unique "
+            "Population tensor-state names."
+        )
+    return names
+
+
 def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
     """Discover canonical carry leaves through the checkpoint state manifest."""
     handler = population.mech
@@ -2407,13 +2436,7 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
         # first registered path so functional_call receives the same canonical
         # names as named_parameters()/named_buffers().
         module_paths.setdefault(id(module), name)
-    voltage_state_names = tuple(population.integrator.v_vars)
-    if not voltage_state_names or len(voltage_state_names) != len(
-        set(voltage_state_names)
-    ):
-        raise FunctionalizationError(
-            "Integrator v_vars must declare unique Population tensor-state names."
-        )
+    voltage_state_names = _functional_voltage_state_names(population.integrator)
     # Net transmembrane current is an optional accepted-step observable, not a
     # voltage unknown. Carry it explicitly so recording, checkpoint/restart,
     # and committing an already-advanced model preserve the imperative value.
@@ -4618,7 +4641,10 @@ def _functional_initialization_transform_failures(
         return failures
     all_state_refs = {f"state.{'.'.join(leaf.public_path)}" for leaf in state_layout}
     pre_state_refs = {
-        *(f"state.integrator.{name}" for name in population.integrator.v_vars),
+        *(
+            f"state.integrator.{name}"
+            for name in _functional_voltage_state_names(population.integrator)
+        ),
         *(f"state.{'.'.join(entry.public_path)}" for entry in explicit_layout),
     }
     allowed_by_phase = {
@@ -5750,7 +5776,9 @@ class _PopulationTransition(torch.nn.Module):
         self.population = population
         self.solver = solver
         self.layout = layout
-        self.block_voltage_state = tuple(population.integrator.v_vars) == ("v", "vc")
+        self.block_voltage_state = _functional_voltage_state_names(
+            population.integrator
+        ) == ("v", "vc")
         object.__setattr__(
             self,
             "_state_owners",
@@ -6920,6 +6948,7 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
     forbidden_instance_overrides = {
         "_PREPARED_WORKSPACE_SCHEMA",
         "_FUNCTIONAL_OPERATOR_KIND",
+        "_FUNCTIONAL_STATE_NAMES",
         "_FUNCTIONAL_CRITICAL_METHODS",
         *_FUNCTIONAL_INTEGRATOR_HOOKS,
     }
@@ -6962,6 +6991,21 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
     except AttributeError:
         return None
     if not methods_match:
+        return None
+    if implementation is _bwd_euler_sc_skip and tuple(integrator.v_vars):
+        return None
+    declared_state = inspect.getattr_static(
+        integrator_type, "_FUNCTIONAL_STATE_NAMES", None
+    )
+    expected_state = _STANDARD_FUNCTIONAL_INTEGRATOR_STATE_NAMES.get(implementation)
+    if expected_state is None:
+        if declared_state is not None:
+            return None
+    elif (
+        type(declared_state) is not tuple
+        or any(type(name) is not str for name in declared_state)
+        or declared_state != expected_state
+    ):
         return None
     return spec
 
@@ -7024,6 +7068,13 @@ def _functionalization_failures(
                 failures.append(
                     f"component {name!r} is a nested MultiPopulation, which is "
                     "not supported"
+                )
+                continue
+            if isinstance(component.integrator, _bwd_euler_sc_skip):
+                failures.append(
+                    f"component {name!r} uses scnv; packed scnv components are "
+                    "not supported because the packed integrator would solve "
+                    "their voltage"
                 )
                 continue
             if tuple(component.shape[:-2]) != batch_shape:
@@ -7246,15 +7297,21 @@ def _functionalization_failures(
                 "integrator state contract"
             )
     elif is_single_compartment:
+        point_kind = (
+            "scalar_point_skip"
+            if isinstance(population.integrator, _bwd_euler_sc_skip)
+            else "scalar_point"
+        )
         if (
             _resolve_functional_integrator_spec(
                 population.integrator,
-                "scalar_point",
+                point_kind,
             )
             is None
         ):
             failures.append(
-                "Population/SingleCompartment functionalization requires exactly bwd_euler_sc"
+                "Population/SingleCompartment functionalization requires exactly "
+                "bwd_euler_sc or scnv"
             )
     elif is_unmyelinated or is_myelinated or is_native_cable:
         if (
@@ -8464,6 +8521,7 @@ def _structure_signature(population) -> tuple:
             bool(population.integrator.imem),
             bool(getattr(population.integrator, "use_gc_variant", False)),
             tuple(population.integrator.v_vars),
+            getattr(population.integrator, "_FUNCTIONAL_STATE_NAMES", None),
             tuple(population.integrator._PREPARED_WORKSPACE_SCHEMA),
             getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None),
             tuple(
@@ -8737,8 +8795,13 @@ class FunctionalPopulation:
             # runtime trees would make every functional mapping clone unused
             # voltage, mechanism, ion, and child-integrator tensors.
             _strip_packed_component_runtime_aliases(execution_population)
+        point_kind = (
+            "scalar_point_skip"
+            if isinstance(execution_population.integrator, _bwd_euler_sc_skip)
+            else "scalar_point"
+        )
         operator_kind = {
-            "single_compartment": "scalar_point",
+            "single_compartment": point_kind,
             "extcell_axon": "block_path",
             "extcell_tree": "block_tree",
             "scalar_tree": "scalar_tree",
@@ -12838,6 +12901,13 @@ class FunctionalPopulation:
         checkpoint = staged_population.state_dict_for_checkpoint()
         if self._topology_kind not in {"multi_point", "multi_scalar", "multi_block"}:
             population.restore_dict_from_checkpoint(checkpoint)
+            if isinstance(population.integrator, _bwd_euler_sc_skip):
+                # scnv's imperative checkpoint deliberately has no solved
+                # voltage unknowns. Functional continuation nevertheless owns
+                # the exposed voltage separately from mechanism carry. Publish
+                # its staged, validated copy only after checkpoint restoration
+                # succeeds; the remaining assignment cannot invoke authored code.
+                population._buffers["v"] = staged_population._buffers["v"]
             return population
 
         write_back = bool(population.integrator.write_back)

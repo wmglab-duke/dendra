@@ -252,8 +252,9 @@ Supported models
 The topology list below describes functional *transition* support from an
 initialized tensor state. Fresh functional initialization also supports the
 canonical point, cable, myelinated, Tree, finite-extracellular, and packed
-families with their standard implicit integrators. It has additional lifecycle
-requirements: initialization must be declaration-driven or use registered pure
+families with their admitted integrators, including ``scnv`` for standalone
+point models. It has additional lifecycle requirements: initialization must be
+declaration-driven or use registered pure
 transforms, not arbitrary imperative hooks or cached steady states. This
 includes the Tigerholm/Thio models with registered pure resting-balance
 transforms. See :ref:`functional-fresh-initialization` for the exact contract;
@@ -288,7 +289,8 @@ following properties:
 * pure ``VoltageProcess`` updates, including ``fire``, ``fire_r``, ``fire_d``,
   and ``fire_r_d``, with their declared reset and refractory carry;
 * deterministic CPU or CUDA execution in float32 or float64;
-* ``bwd_euler_sc`` for plain ``Population`` and ``SingleCompartment``,
+* ``bwd_euler_sc`` or ``scnv`` for exact standalone ``Population`` and
+  ``SingleCompartment``,
   ``bwd_euler_ub`` for ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
   ``bwd_euler_bt(method="thomas")`` for ``ExtCellAxon``, ``dhs`` for scalar
   ``Tree``, ``dhs_bt`` for ``ExtCellTree``, or the automatically selected
@@ -439,6 +441,71 @@ declarations and functional eligibility checks still apply, and the pure
 hooks undergo the same mutation/dependency audits as other functional hooks.
 An authored legacy ``update_v`` override remains usable imperatively but is
 rejected during functional lowering; it is not silently interpreted as pure.
+
+.. _functional-scnv:
+
+Mechanism-owned voltage with scnv
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``dn.scnv()`` advances mechanisms and evaluates their actual currents while
+skipping the membrane-voltage solve. Functional execution supports this
+integrator on exact standalone ``Population`` and ``SingleCompartment`` models,
+including explicit batches. A pure ``VoltageProcess`` can own the voltage in
+declared ``CARRY`` and return it explicitly:
+
+.. code-block:: python
+
+   import dendra as dn
+   from dendra.models.mechanisms import VoltageProcess
+   from dendra.models.mod import pas
+
+   class voltage_ramp(VoltageProcess):
+       VoltageProcess.RANGE(rate=2.0)  # mV/ms
+       VoltageProcess.CARRY("voltage")
+
+       def initial_values(self, v, values):
+           return {"voltage": v.clone()}
+
+       def voltage_values(self, v, dt, values):
+           voltage = values["voltage"] + self.rate * dt
+           return voltage, {"voltage": voltage}
+
+   with dn.ctx(IMEM=True):
+       model = dn.SingleCompartment(N=1, integrator=dn.scnv())
+       model.insert(pas)
+       model.insert(voltage_ramp)
+   model.set_v_init(-65.0)
+   model.initialize()
+   runner = dn.compile(
+       model, dt=0.025, steps=40, initialization="fresh", inference=False,
+       trainable=("rate",),
+       callbacks={"trace": dn.func.Recorder(("v", "voltage_ramp.voltage", "i_membrane"))},
+   )
+   final_state, auxiliary = runner()
+
+Each accepted step applies voltage processes, advances pre-current mechanism
+states, evaluates actual membrane currents, then advances post-current states.
+No current, capacitance, or raw ``intra``/``ve`` input produces a voltage solve.
+In the example, ``pas`` contributes current but does not change the ramp voltage.
+With ``imem=True``, ``i_membrane`` includes the evaluated current and the
+capacitive current from the imposed voltage change, following the shared
+membrane-current contract. Mechanism-owned waveform injections remain
+unsupported.
+
+The established phase order also applies when a mechanism's ``advance`` hook
+updates its voltage carry: public ``v`` may then contain the value exposed by
+the preceding voltage-process phase, while the carry already holds its next
+value. Record both when that distinction matters; functional execution does
+not synchronize them by adding a second voltage update.
+
+Fresh initialization, snapshot starts, explicit-state continuation, recording,
+and ``commit_state_`` preserve both public voltage and mechanism carry. The
+ordinary functional transforms, compiled scan, checkpointed scan, and
+inference-only while execution use the same contract. Packed ``scnv`` components
+are rejected: concatenation selects a packed integrator and would otherwise
+replace the skipped solve with an ordinary point-voltage solve. Cable, Tree,
+finite-extracellular, and custom integrator subclasses are outside this
+``scnv`` admission.
 
 .. _functional-material-processes:
 
@@ -658,6 +725,8 @@ support fresh functional initialization; custom subclasses and generic
 ``Axon`` models are not admitted. Compatible extraction and commit retain the
 same concrete model class rather than treating ``Population`` and
 ``SingleCompartment`` as interchangeable plans.
+These standalone topologies also admit ``dn.scnv()`` for mechanism-owned
+voltage; see :ref:`functional-scnv` for its skipped-solve semantics.
 
 ``Myelinated`` and compatible subclasses use the same calls as
 ``Unmyelinated``. Their canonical fiber diameters and node spacing remain
@@ -727,6 +796,7 @@ functional API. A scalar pack contains independently admitted exact
 ``Population`` or ``SingleCompartment``, ``Unmyelinated``/``Myelinated`` and
 their admitted subclasses, exact native ``Cable``, or canonical scalar ``Tree``
 components.
+Point components using ``scnv`` are excluded from functional packs.
 A finite-extracellular pack instead contains only admitted ``ExtCellAxon``
 and/or canonical ``ExtCellTree`` components, each with two extracellular
 layers. Mixing scalar and finite-extracellular components, and nesting
@@ -2325,8 +2395,9 @@ Arbitrary callbacks registered with ``register_pre_initialize_hook`` or
 guessed or traced by the functional initializer.
 
 Fresh functional initialization supports exact ``Population`` and
-``SingleCompartment`` models using ``bwd_euler_sc``; canonical ``Unmyelinated``,
-``Myelinated``, and native ``Cable`` models using ``bwd_euler_ub``; exact scalar
+``SingleCompartment`` models using ``bwd_euler_sc`` or ``scnv``; canonical
+``Unmyelinated``, ``Myelinated``, and native ``Cable`` models using
+``bwd_euler_ub``; exact scalar
 ``Tree`` models using ``dhs``; and canonical ``ExtCellAxon``/``ExtCellTree``
 models using ``bwd_euler_bt``/``dhs_bt``. Exact ``MultiPopulation`` packs use
 their admitted ``bwd_euler_sc_multi``, ``dhs_multi``, or ``dhs_bt_multi``
