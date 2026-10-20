@@ -89,6 +89,9 @@ def _carry(source):
             "t_last",
             "rng_state",
             "seeder_state",
+            "heap_cursor",
+            "heap_head_override",
+            "heap_override_active",
         )
     }
 

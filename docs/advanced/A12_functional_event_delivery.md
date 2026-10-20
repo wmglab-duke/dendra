@@ -151,7 +151,8 @@ temporary ring; native compilation can fuse those operations into one output.
 
 NetStim generation and RNG now use explicit transitions as described in
 {doc}`A14_functional_netstim_renewal`; tensor schedule evaluation is shared as
-described in {doc}`A15_functional_tensor_schedules`. Heap schedules and
-Network-level lowering remain future extensions. Users continue to construct networks
+described in {doc}`A15_functional_tensor_schedules`. Consuming heap calendars
+are shared as described in {doc}`A16_functional_heap_schedules`.
+Network-level lowering remains a future extension. Users continue to construct networks
 through the standard Dendra API. See {doc}`A8_functional_populations` for population
 execution and {doc}`../synapse_authoring` for authoring a pure receiver.

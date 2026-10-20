@@ -47,8 +47,8 @@ native source or reach its parameters.
 | Dictionary | Entries |
 | --- | --- |
 | `parameters` | Floating `interval`, `start`, `noise`, and `tau`, broadcast to the full source state shape. |
-| `constants` | Integer `max_spikes`, also with the full state shape. |
-| `state` | `next_stoch_time`, integer `spike_counts`, `t_last`, and CPU byte tensors `rng_state` and `seeder_state`. |
+| `constants` | Integer `max_spikes` with the full state shape, plus non-differentiable `heap_times` and `heap_row_offsets`. |
+| `state` | `next_stoch_time`, integer `spike_counts`, `t_last`, CPU byte tensors `rng_state` and `seeder_state`, and heap cursor/legacy-head carry. |
 
 The last state dimension indexes generators; leading dimensions are native
 batch axes. `interval` is the effective positive interval in milliseconds,
@@ -143,7 +143,10 @@ preserving the ordering described in {doc}`A13_functional_threshold_detection`.
 ## Continue with the ordinary Network
 
 Saving only the next event time does not preserve a noisy source's future.
-Retain the entire explicit state, including both RNG byte tensors.
+Retain the entire explicit state, including both RNG byte tensors and heap
+cursor/legacy-head carry. Keep the source's parameter and constant snapshots
+alongside it, including the fixed calendar described in
+{doc}`A16_functional_heap_schedules`.
 `generator.commit_state_(native_source, state)` restores clocks and RNG using
 the native checkpoint protocol; it resets transient output buffers, which
 the next source invocation recomputes. A training-mode destination preserves
@@ -179,6 +182,7 @@ The complete example executes here:
 ```
 
 Tensor schedules use shared pure evaluation and explicit packets as described
-in {doc}`A15_functional_tensor_schedules`. Native heap schedules retain their
-existing behavior through schedule inputs to the shared renewal core. Heap
-lowering and complete `Network`-level lowering remain future extensions.
+in {doc}`A15_functional_tensor_schedules`. Consuming heap calendars use shared
+pure heads and cursor transitions as described in
+{doc}`A16_functional_heap_schedules`. Complete `Network`-level lowering remains
+a future extension.

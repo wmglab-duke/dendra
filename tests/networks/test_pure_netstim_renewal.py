@@ -412,11 +412,12 @@ def test_checkpoint_configuration_revision_changes_only_for_restored_schedules()
     del legacy["sched_heaps"]
     legacy["next_sched_time"] = torch.tensor([0.25], dtype=DTYPE)
     stim.restore_dict_from_checkpoint(legacy)
-    assert stim._renewal_config_generation == revision + 1
+    # Legacy heads now lower as explicit carry, preserving frozen topology.
+    assert stim._renewal_config_generation == revision
     stim.restore_dict_from_checkpoint(checkpoint)
-    assert stim._renewal_config_generation == revision + 1
+    assert stim._renewal_config_generation == revision
 
     other = NetStim(dtype=DTYPE).initialize()
     other.schedule(0, 0.5)
     stim.restore_dict_from_checkpoint(other.state_dict_for_checkpoint())
-    assert stim._renewal_config_generation == revision + 2
+    assert stim._renewal_config_generation == revision + 1

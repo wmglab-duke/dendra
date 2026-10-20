@@ -131,4 +131,5 @@ schedules described in {doc}`A15_functional_tensor_schedules`.
 NetStim-generated values bypass threshold detection and retain the native
 checkpoint schema. Shared pure generation with explicit random draws and
 clock/RNG continuation is described in {doc}`A14_functional_netstim_renewal`.
-Heap schedule lowering and complete Network lowering remain later extensions.
+Consuming heap calendars are described in {doc}`A16_functional_heap_schedules`.
+Complete Network lowering remains a later extension.

@@ -57,6 +57,9 @@ def _native_carry(source):
             "t_last",
             "rng_state",
             "seeder_state",
+            "heap_cursor",
+            "heap_head_override",
+            "heap_override_active",
         )
     }
 
@@ -339,13 +342,13 @@ def test_configuration_changes_invalidate_plan(change):
         plan.step(tensors.parameters, tensors.constants, tensors.state, 0.0, draw)
 
 
-@pytest.mark.parametrize("kind", ("uninitialized", "schedule", "subclass"))
+@pytest.mark.parametrize("kind", ("uninitialized", "nan_heap", "subclass"))
 def test_unsupported_sources_fail_before_lowering(kind):
     source = _native()
     if kind == "uninitialized":
         source = dn.NetStim()
-    elif kind == "schedule":
-        source.schedule(0, 2.0)
+    elif kind == "nan_heap":
+        source.schedule(0, float("nan"), allow_past=True)
     else:
 
         class CustomNetStim(dn.NetStim):
@@ -563,27 +566,16 @@ def test_unscheduled_runtime_restore_preserves_warm_plan(transfer):
     _close(actual, expected)
 
 
-@pytest.mark.parametrize(
-    "schedule", ("heap", "tensor", "legacy_head", "legacy_nan_head")
-)
+@pytest.mark.parametrize("schedule", ("heap", "tensor"))
 def test_restoring_scheduled_checkpoint_invalidates_warm_plan(schedule):
     source = _native()
     plan, tensors = dn.func.make_functional_netstim(source)
     packet = plan.sample_step_draw(tensors.state)
     compiled = torch.compile(plan.step, backend="eager", fullgraph=True)
     compiled(tensors.parameters, tensors.constants, tensors.state, 0.8, packet)
-    if schedule in ("heap", "tensor"):
-        scheduled_source = _native()
-        scheduled_source.schedule(0, 2.0, weight=0.5 if schedule == "tensor" else 1.0)
-        checkpoint = _clone(scheduled_source.state_dict_for_checkpoint())
-    else:
-        checkpoint = _clone(source.state_dict_for_checkpoint())
-        del checkpoint["sched_heaps"]
-        checkpoint["next_sched_time"] = torch.full(
-            source.shape,
-            float("nan") if schedule == "legacy_nan_head" else 2.0,
-            dtype=torch.float64,
-        )
+    scheduled_source = _native()
+    scheduled_source.schedule(0, 2.0, weight=0.5 if schedule == "tensor" else 1.0)
+    checkpoint = _clone(scheduled_source.state_dict_for_checkpoint())
     source.restore_dict_from_checkpoint(checkpoint)
     with pytest.raises(Exception, match="configuration changed"):
         compiled(tensors.parameters, tensors.constants, tensors.state, 0.8, packet)
@@ -595,9 +587,11 @@ def test_cold_extraction_still_audits_actual_schedule_contents():
     source = _native()
     plan, _ = dn.func.make_functional_netstim(source)
     # Private storage is intentionally outside the hot public lifecycle guard.
-    # Cold transfer still audits every heap rather than trusting its revision.
-    source._sched_heaps[0].append(2.0)
-    with pytest.raises(dn.func.FunctionalizationError, match="heap schedules"):
+    # Cold transfer still audits calendar contents rather than trusting its revision.
+    source.heap_times[0] = 2.0
+    with pytest.raises(
+        (dn.func.FunctionalizationError, ValueError), match="calendar|sentinel"
+    ):
         plan.extract()
 
 

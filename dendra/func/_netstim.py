@@ -7,6 +7,11 @@ from typing import NamedTuple
 
 import torch
 
+from dendra.models.networks._heap_calendar import (
+    heap_calendar_consume,
+    heap_calendar_head,
+    validate_heap_calendar,
+)
 from dendra.models.networks._netstim_renewal import (
     NetStimState,
     broadcast_netstim_time,
@@ -25,7 +30,7 @@ from ._types import FunctionalizationError
 
 
 class NetStimTensors(NamedTuple):
-    """Independent effective parameters, constants, and clock/RNG snapshots."""
+    """Independent parameters, calendar constants, and clock/RNG/cursor snapshots."""
 
     parameters: dict[str, torch.Tensor]
     constants: dict[str, torch.Tensor]
@@ -60,21 +65,15 @@ def _snapshot(value, *, parameter=False):
         return result
 
 
-def _without_heap_schedules(source):
-    return not any(source._sched_heaps) and bool(
-        torch.isposinf(source.next_sched_time).all()
-    )
-
-
 def _eligible(source):
     if type(source) is not NetStim:
         raise FunctionalizationError("Expected an initialized canonical NetStim.")
     if not getattr(source, "_renewal_initialized", False):
         raise FunctionalizationError("Initialize the NetStim before lowering it.")
-    if not _without_heap_schedules(source):
+    if source._heap_nan_heaps is not None:
         raise FunctionalizationError(
-            "Functional NetStim does not support heap schedules or finite legacy "
-            "schedule heads; use tensor schedules instead."
+            "Functional NetStim cannot lower NaN heap calendars; clear or replace "
+            "their events before lowering."
         )
     interval = source.interval
     if (
@@ -95,10 +94,11 @@ def _eligible(source):
 class FunctionalNetStim:
     """A pure renewal plan with explicit random draws and checkpointable RNG.
 
-    Lower an initialized :class:`~dendra.NetStim` with optional tensor schedules. Effective
-    ``interval``, ``start``, ``noise``, and ``tau`` parameters use the full native
-    state shape; ``max_spikes`` is an explicit integer constant. Parameters are
-    independent leaf snapshots, so gradients never reach the source module.
+    Lower an initialized :class:`~dendra.NetStim` with optional heap and tensor
+    schedules. Effective ``interval``, ``start``, ``noise``, and ``tau`` use the
+    full native state shape; ``max_spikes`` is an explicit integer constant.
+    Parameters are independent leaf snapshots, so gradients never reach the
+    source module.
 
     :meth:`step` calls the same pure transition as native NetStim. Draw one
     packet with :meth:`sample_step_draw` outside transformed/compiled code, then
@@ -120,7 +120,12 @@ class FunctionalNetStim:
     values when continuing the same trajectory natively. Tensor schedule values
     are explicit in :class:`TensorScheduleTensors`; routing and source indices
     are frozen at lowering, along with ``schedule_dt``. Set the native timestep
-    before lowering. Heap schedules remain native-only.
+    before lowering. Heap calendars use non-differentiable times (Float64 on
+    CPU/CUDA, simulation dtype on MPS) and CSR row offsets in ``constants``.
+    Their absolute per-row cursors and any legacy head-only override belong to explicit carry.
+    Calendar topology is fixed; changing it requires lowering again.
+    Initialization preserves consumed cursors and clears legacy head overrides,
+    matching native initialization.
     """
 
     def __init__(self, source):
@@ -137,6 +142,10 @@ class FunctionalNetStim:
         self.shape = tuple(source.shape)
         self.device = source.next_stoch_time.device
         self.dtype = source.next_stoch_time.dtype
+        self._heap_times = _snapshot(source.heap_times)
+        self._heap_row_offsets = _snapshot(source.heap_row_offsets)
+        self._heap_rows = source.numel()
+        self._heap_depth = source.heap_depth
         self._dt = _snapshot(source.schedule_dt)
         self._schedule = _TensorSchedulePlan(
             source, index_name="sched_flat_idx", device=self.device, dtype=self.dtype
@@ -154,6 +163,9 @@ class FunctionalNetStim:
                 "t_last",
                 "rng_state",
                 "seeder_state",
+                "heap_cursor",
+                "heap_head_override",
+                "heap_override_active",
             )
         }
         self._validate_compatible(source)
@@ -206,8 +218,14 @@ class FunctionalNetStim:
                 device=self.device,
                 label=f"parameters.{name}",
             )
-        if not isinstance(constants, Mapping) or set(constants) != {"max_spikes"}:
-            raise ValueError("NetStim constants must contain max_spikes")
+        if not isinstance(constants, Mapping) or set(constants) != {
+            "max_spikes",
+            "heap_times",
+            "heap_row_offsets",
+        }:
+            raise ValueError(
+                "NetStim constants must contain max_spikes, heap_times, and heap_row_offsets"
+            )
         self._validate_tensor(
             constants["max_spikes"],
             shape=self.shape,
@@ -215,10 +233,26 @@ class FunctionalNetStim:
             device=self.device,
             label="constants.max_spikes",
         )
+        for name, expected in (
+            ("heap_times", self._heap_times),
+            ("heap_row_offsets", self._heap_row_offsets),
+        ):
+            value = constants[name]
+            self._validate_tensor(
+                value,
+                shape=tuple(expected.shape),
+                dtype=expected.dtype,
+                device=expected.device,
+                label=f"constants.{name}",
+            )
+            if value.requires_grad:
+                raise ValueError(f"constants.{name} must not require gradients")
 
     def _validate_state(self, state):
         if not isinstance(state, Mapping) or set(state) != set(self._state_schema):
-            raise ValueError("NetStim state must match its clock/RNG checkpoint schema")
+            raise ValueError(
+                "NetStim state must match its clock/RNG/calendar checkpoint schema"
+            )
         for name, (shape, dtype, device) in self._state_schema.items():
             self._validate_tensor(
                 state[name],
@@ -263,6 +297,20 @@ class FunctionalNetStim:
             )
         checkpoint = source.state_dict_for_checkpoint()
         self._validate_state({name: checkpoint[name] for name in self._state_schema})
+        validate_heap_calendar(
+            source.heap_times,
+            source.heap_row_offsets,
+            source.heap_cursor,
+            rows=source.numel(),
+            device=self.device,
+            simulation_dtype=self.dtype,
+        )
+        if not torch.equal(source.heap_times, self._heap_times) or not torch.equal(
+            source.heap_row_offsets, self._heap_row_offsets
+        ):
+            raise FunctionalizationError(
+                "NetStim heap calendar does not match this frozen plan."
+            )
         self._schedule.validate_compatible(source)
         if not torch.equal(source.schedule_dt, self._dt):
             raise FunctionalizationError(
@@ -301,7 +349,11 @@ class FunctionalNetStim:
             name: _snapshot(torch.broadcast_to(value, self.shape), parameter=True)
             for name, value in values.items()
         }
-        constants = {"max_spikes": _snapshot(source.max_spikes)}
+        constants = {
+            "max_spikes": _snapshot(source.max_spikes),
+            "heap_times": _snapshot(source.heap_times),
+            "heap_row_offsets": _snapshot(source.heap_row_offsets),
+        }
         checkpoint = source.state_dict_for_checkpoint()
         state = {name: _snapshot(checkpoint[name]) for name in self._state_schema}
         self._validate_parameters(parameters, constants)
@@ -354,7 +406,7 @@ class FunctionalNetStim:
         return self._sample(state, initialize=True, parameters=parameters)
 
     def initial_state(self, parameters, constants, state, draw):
-        """Reset detached clocks, adopting the initialization packet's RNG state."""
+        """Reset clocks/RNG, preserving consumed cursors and clearing legacy heads."""
         self._validate_source()
         self._validate_parameters(parameters, constants)
         self._validate_state(state)
@@ -371,6 +423,11 @@ class FunctionalNetStim:
             "t_last": clocks.t_last,
             "rng_state": draw.rng_state,
             "seeder_state": state["seeder_state"],
+            "heap_cursor": state["heap_cursor"],
+            "heap_head_override": torch.full_like(
+                state["heap_head_override"], torch.inf
+            ),
+            "heap_override_active": torch.zeros_like(state["heap_override_active"]),
         }
 
     def step(self, parameters, constants, state, t, draw, *, bptt=False, schedule=None):
@@ -387,6 +444,15 @@ class FunctionalNetStim:
         self._schedule.validate(schedule)
         time = broadcast_netstim_time(
             t, self.shape, device=self.device, dtype=self.dtype
+        )
+        heap_head = heap_calendar_head(
+            constants["heap_times"],
+            constants["heap_row_offsets"][1:],
+            state["heap_cursor"],
+            dtype=self.dtype,
+        ).reshape(self.shape)
+        heap_head = torch.where(
+            state["heap_override_active"], state["heap_head_override"], heap_head
         )
         scheduled_gate = scheduled_hard = None
         if self._schedule.active:
@@ -428,6 +494,7 @@ class FunctionalNetStim:
             draw.exp_rand,
             tau=parameters["tau"],
             bptt=bptt,
+            next_sched_time=heap_head,
             scheduled_gate=scheduled_gate,
             scheduled_hard=scheduled_hard,
         )
@@ -441,10 +508,22 @@ class FunctionalNetStim:
             "t_last": transition.state.t_last,
             "rng_state": draw.rng_state,
             "seeder_state": state["seeder_state"],
+            "heap_cursor": heap_calendar_consume(
+                constants["heap_times"],
+                constants["heap_row_offsets"][1:],
+                state["heap_cursor"],
+                torch.broadcast_to(time, self.shape).reshape(self._heap_rows),
+                transition.heap_fires.reshape(self._heap_rows),
+                depth=self._heap_depth,
+                dtype=self.dtype,
+            ),
+            "heap_head_override": state["heap_head_override"],
+            "heap_override_active": state["heap_override_active"]
+            & ~transition.heap_fires,
         }, NetStimOutputs(transition.spikes, transition.spike_gate)
 
     def commit_state_(self, source, state):
-        """Transfer validated clock and RNG carry to a compatible native NetStim.
+        """Transfer validated clocks, RNG, and cursors to a compatible native NetStim.
 
         Native training restores retain the incoming clock's autograd history;
         evaluation restores detach the clock, clearing any prior native history.
@@ -455,6 +534,14 @@ class FunctionalNetStim:
             raise FunctionalizationError("Commit NetStim state outside torch.compile.")
         self._validate_compatible(source)
         self._validate_state(state)
+        validate_heap_calendar(
+            self._heap_times,
+            self._heap_row_offsets,
+            state["heap_cursor"],
+            rows=self._heap_row_offsets.numel() - 1,
+            device=self.device,
+            simulation_dtype=self.dtype,
+        )
         # Validate generator byte contents before native runtime is touched.
         self._generator(state)
         torch.Generator().set_state(state["seeder_state"])
@@ -470,7 +557,7 @@ class FunctionalNetStim:
 
 
 def make_functional_netstim(source) -> tuple[FunctionalNetStim, NetStimTensors]:
-    """Lower an initialized NetStim using explicit clock/RNG and schedule tensors."""
+    """Lower NetStim using explicit clocks, RNG, calendar cursors, and event tensors."""
     plan = FunctionalNetStim(source)
     return plan, plan.extract()
 

@@ -626,8 +626,9 @@ and receive-before-observe phases are described in
 :ref:`functional-threshold-detection`. Shared NetStim generation with explicit
 draws and clock/RNG carry is described in :ref:`functional-netstim-renewal`.
 Shared tensor schedules and indexed bindings are described in
-:ref:`functional-tensor-schedules`. Heap schedules and complete connected
-Network lowering remain separate work.
+:ref:`functional-tensor-schedules`. Consuming heap calendars and explicit
+cursor state are described in :ref:`functional-heap-schedules`.
+Complete connected Network lowering remains separate work.
 
 .. _functional-scnv:
 

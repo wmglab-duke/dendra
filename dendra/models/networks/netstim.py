@@ -1,5 +1,6 @@
 import copy
 import heapq
+import math
 from collections.abc import Iterable
 from numbers import Integral
 from typing import Optional
@@ -11,6 +12,13 @@ from dendra.helpers import _normalize_dtype_value, current_device, current_dtype
 from ..modular import DNModule
 from ..parametric import PositiveParam
 from ..slice import Sliceable
+from ._heap_calendar import (
+    heap_calendar_consume,
+    heap_calendar_dtype,
+    heap_calendar_head,
+    pack_heap_calendar,
+    validate_heap_calendar,
+)
 from ._netstim_renewal import (
     NetStimState,
     broadcast_netstim_time,
@@ -64,6 +72,29 @@ def _matching_tensor_schedule_configuration(previous, current):
             if not bool(torch.all((left == right) | (left.isnan() & right.isnan()))):
                 return False
         elif not torch.equal(left, right):
+            return False
+    return True
+
+
+def _matching_heap_configuration(previous, current):
+    """Runtime cursor movement does not change the immutable calendar."""
+    if previous["shape"] != current["shape"]:
+        return False
+    if "heap_times" in previous and "heap_times" in current:
+        return all(
+            previous[name].shape == current[name].shape
+            and previous[name].dtype == current[name].dtype
+            and previous[name].device == current[name].device
+            and torch.equal(previous[name], current[name])
+            for name in ("heap_times", "heap_row_offsets")
+        )
+    if ("heap_times" in previous) != ("heap_times" in current):
+        return False
+    for left, right in zip(previous["sched_heaps"], current["sched_heaps"]):
+        if len(left) != len(right) or any(
+            a != b and not (math.isnan(a) and math.isnan(b))
+            for a, b in zip(left, right)
+        ):
             return False
     return True
 
@@ -202,16 +233,44 @@ class NetStim(DNModule, Sliceable):
             self.shape, device=init_device, dtype=init_dtype
         )  # differentiable spike gate
 
-        # Per-state-element min-heaps of future scheduled times (CPU metadata).
-        # The flat order is row-major over ``self.shape``; the last dimension is
-        # the generator index, all earlier dimensions are batch coordinates.
-        self._sched_heaps: list[list[float]] = [
-            [] for _ in range(self._flat_numel_from_shape(self.shape))
-        ]
+        # A cached compact calendar is shared with functional execution. Cold
+        # heap layouts retain original precision when MPS needs lower precision.
+        rows = self._flat_numel_from_shape(self.shape)
+        self.register_buffer(
+            "heap_times",
+            torch.full(
+                (1,),
+                float("inf"),
+                device=init_device,
+                dtype=heap_calendar_dtype(init_device, init_dtype),
+            ),
+        )
+        self.register_buffer(
+            "heap_row_offsets",
+            torch.zeros(rows + 1, device=init_device, dtype=torch.long),
+        )
+        self.register_buffer(
+            "heap_cursor", torch.zeros(rows, device=init_device, dtype=torch.long)
+        )
+        self.register_buffer(
+            "heap_head_override",
+            torch.full(self.shape, float("inf"), device=init_device, dtype=init_dtype),
+        )
+        self.register_buffer(
+            "heap_override_active",
+            torch.zeros(self.shape, device=init_device, dtype=torch.bool),
+        )
+        self.heap_depth = 0
+        # Cold-only original layout preserves later heapq NaN ordering; the
+        # numerical runtime reads only tensor calendar buffers and cursors.
+        self._heap_legacy_rows = [[] for _ in range(rows)]
+        # heapq has insertion-dependent NaN ordering. Keep that exceptional
+        # legacy path native-only instead of silently sorting away barriers.
+        self._heap_nan_heaps = None
 
-        # Differentiable / weighted scheduled events. The legacy heap above is
-        # retained for backward-compatible exact unit-amplitude schedules using
-        # Python floats. Tensor-backed schedules live here so gradients can flow
+        # Differentiable / weighted scheduled events remain separate from the
+        # consuming exact unit-amplitude calendar above. Tensor schedules let
+        # gradients flow
         # through scheduled times and amplitudes when NetCon consumes
         # ``NetStim.spike_gate`` with ``diff_spiking=True``.
         self.diff_scheduled_times = True
@@ -466,6 +525,36 @@ class NetStim(DNModule, Sliceable):
         self._align_schedule_tensors()
         return self
 
+    def _apply(self, fn, recurse=True):
+        # Parent Network.to()/float()/half() recurse through _apply, bypassing
+        # NetStim.to. Rebuild from original calendar precision on these paths,
+        # including moves to/from MPS, which cannot allocate Float64 tensors.
+        times = self._buffers.pop("heap_times", None)
+        try:
+            result = super()._apply(fn, recurse=recurse)
+            # Value-mode schedule tensors are ordinary attributes so their
+            # graphs still reach caller-owned leaves. Parent module moves and
+            # float()/half() need the same alignment as direct NetStim.to().
+            self._align_schedule_tensors()
+        finally:
+            if times is not None:
+                rows = (
+                    self._heap_legacy_rows
+                    if self._heap_nan_heaps is None
+                    else [[] for _ in self._heap_legacy_rows]
+                )
+                self._buffers["heap_times"] = pack_heap_calendar(
+                    rows,
+                    device=self.next_stoch_time.device,
+                    simulation_dtype=self.dtype(),
+                )[0]
+                # Reconstruct the derived cache from original event precision.
+                # Casting an already-rounded head through float().double()
+                # would otherwise disagree with functional calendar lookup.
+                # Explicit legacy overrides retain their ordinary buffer casts.
+                self._update_heap_head()
+        return result
+
     def set_dt(self, dt):
         """Set the timestep used to interpret differentiable scheduled times."""
         self.schedule_dt = torch.as_tensor(
@@ -609,18 +698,69 @@ class NetStim(DNModule, Sliceable):
         return self
 
     # ───────────────────────── scheduling ─────────────────────────
-    def _refresh_next_sched_time_tensor(self):
-        # Pull heap tops into a device tensor (O(prod(shape))).
-        expected = self._flat_numel()
-        if len(self._sched_heaps) != expected:
-            raise RuntimeError(
-                f"Scheduled heap count ({len(self._sched_heaps)}) does not match "
-                f"NetStim state shape {self.shape} ({expected} elements)."
+    @property
+    def _sched_heaps(self):
+        """Cold compatibility view of remaining legacy heaps (independent lists)."""
+        return self._materialize_heap_rows()
+
+    def _materialize_heap_rows(self):
+        if self._heap_nan_heaps is not None:
+            return [list(row) for row in self._heap_nan_heaps]
+        starts = self.heap_row_offsets[:-1].detach().cpu().tolist()
+        cursors = self.heap_cursor.detach().cpu().tolist()
+        rows = [list(row) for row in self._heap_legacy_rows]
+        # Retaining the original heap layout matters when NaN is inserted
+        # later: heapq's non-total ordering depends on that exact layout.
+        for row, start, cursor in zip(rows, starts, cursors):
+            for _ in range(cursor - start):
+                heapq.heappop(row)
+        return rows
+
+    def _replace_heap_rows(self, rows):
+        """Rebuild after a cold insertion, clear, batch, or legacy import."""
+        rows = [[float(value) for value in row] for row in rows]
+        if len(rows) != self._flat_numel():
+            raise ValueError(
+                f"Checkpoint has {len(rows)} schedule heaps, but current "
+                f"NetStim shape {self.shape} requires {self._flat_numel()}."
             )
-        vals = [h[0] if h else float("inf") for h in self._sched_heaps]
-        self.next_sched_time = torch.as_tensor(
-            vals, device=self.device(), dtype=self.dtype()
-        ).reshape(self.shape)
+        nan_rows = any(math.isnan(float(value)) for row in rows for value in row)
+        self._heap_legacy_rows = [list(row) for row in rows]
+        self._heap_nan_heaps = [list(row) for row in rows] if nan_rows else None
+        packed = [[] for _ in rows] if nan_rows else rows
+        self.heap_times, self.heap_row_offsets, self.heap_cursor, self.heap_depth = (
+            pack_heap_calendar(
+                packed, device=self.device(), simulation_dtype=self.dtype()
+            )
+        )
+        self._refresh_next_sched_time_tensor()
+
+    def _update_heap_head(self):
+        if self._heap_nan_heaps is not None:
+            values = [row[0] if row else float("inf") for row in self._heap_nan_heaps]
+            head = torch.tensor(values, device=self.device(), dtype=self.dtype())
+        else:
+            head = heap_calendar_head(
+                self.heap_times,
+                self.heap_row_offsets[1:],
+                self.heap_cursor,
+                dtype=self.dtype(),
+            )
+        self.next_sched_time = torch.where(
+            self.heap_override_active,
+            self.heap_head_override,
+            head.reshape(self.shape),
+        )
+
+    def _refresh_next_sched_time_tensor(self):
+        # Cold refresh intentionally drops old head-only checkpoint overrides.
+        self.heap_override_active = torch.zeros(
+            self.shape, device=self.device(), dtype=torch.bool
+        )
+        self.heap_head_override = torch.full(
+            self.shape, float("inf"), device=self.device(), dtype=self.dtype()
+        )
+        self._update_heap_head()
 
     @staticmethod
     def _normalize_dim_index(i: int, size: int, label: str) -> int:
@@ -969,14 +1109,19 @@ class NetStim(DNModule, Sliceable):
     ):
         """Add explicit scheduled spikes, optionally with differentiable weights/times.
 
-        The backward-compatible unit-weight path stores Python floats in legacy
-        heaps.  Tensor times, tensor/list weights, non-unit scalar weights, or
-        ``differentiable=True`` use tensor-backed scheduling.  Tensor-backed
-        schedules contribute their amplitude to ``spike_gate``; downstream
+        ``differentiable=True`` selects tensor scheduling; ``False`` selects the
+        consuming unit-amplitude calendar. When omitted, times requiring
+        gradients, tensor/list weights, or non-unit scalar weights select
+        tensor scheduling. Other unit-amplitude events use a cached compact
+        calendar retaining Python-float precision. Calendar events are consumed
+        at the first sampled time at or beyond their head, coalescing overdue
+        events into one spike. Tensor schedules reevaluate on each call and
+        assign hard events causally to the first fixed-step grid point at or
+        after their absolute time.
+
+        Tensor schedules contribute their amplitude to ``spike_gate``; downstream
         NetCons must use ``diff_spiking=True`` to propagate gradients into the
-        scheduled times or weights. Hard events from both storage paths are
-        assigned causally to the first fixed-step grid point at or after their
-        absolute time.
+        scheduled times or weights.
         """
         if times is None:
             times = times_ms
@@ -1014,6 +1159,7 @@ class NetStim(DNModule, Sliceable):
 
         with torch.no_grad():
             t_last_flat = self.t_last.detach().reshape(-1).cpu()
+            heaps = self._materialize_heap_rows()
             changed = False
             for spec, t_i in zip(specs, times_list):
                 for flat_i in self._flat_indices_for_spec(spec):
@@ -1023,8 +1169,11 @@ class NetStim(DNModule, Sliceable):
                     if not changed:
                         self._renewal_config_generation += 1
                         changed = True
-                    heapq.heappush(self._sched_heaps[flat_i], float(t_i))
-            self._refresh_next_sched_time_tensor()
+                    heapq.heappush(heaps[flat_i], float(t_i))
+            if changed:
+                self._replace_heap_rows(heaps)
+            else:
+                self._refresh_next_sched_time_tensor()
         return self
 
     def schedule_ref(
@@ -1102,9 +1251,10 @@ class NetStim(DNModule, Sliceable):
             clear_all = False
 
         self._renewal_config_generation += 1
+        heaps = self._materialize_heap_rows()
         for flat_i in flat_indices:
-            self._sched_heaps[flat_i].clear()
-        self._refresh_next_sched_time_tensor()
+            heaps[flat_i].clear()
+        self._replace_heap_rows(heaps)
 
         device, dtype = self.device(), self.dtype()
         if clear_all:
@@ -1129,18 +1279,35 @@ class NetStim(DNModule, Sliceable):
         return self
 
     @torch.no_grad()
-    @torch._dynamo.disable()  # keep everything here out of Dynamo/Inductor
     def _consume_scheduled_heaps(self, s_sched: torch.Tensor, t: torch.Tensor):
+        if self._heap_nan_heaps is None:
+            self.heap_cursor = heap_calendar_consume(
+                self.heap_times,
+                self.heap_row_offsets[1:],
+                self.heap_cursor,
+                torch.broadcast_to(t.detach(), self.shape).reshape(-1),
+                s_sched.reshape(-1),
+                depth=self.heap_depth,
+                dtype=self.dtype(),
+            )
+            self.heap_override_active = self.heap_override_active & ~s_sched
+            self._update_heap_head()
+            return
+        self._consume_nan_heaps(s_sched, t)
+
+    @torch.no_grad()
+    @torch._dynamo.disable()
+    def _consume_nan_heaps(self, s_sched, t):
+        """Compatibility path for heapq's non-total ordering around NaN."""
         fired_idx = torch.nonzero(s_sched.reshape(-1), as_tuple=True)[0]
         if fired_idx is None or fired_idx.numel() == 0:
             return
 
         idx_list = fired_idx.detach().cpu().tolist()
         t_flat = torch.broadcast_to(t.detach(), self.shape).reshape(-1)
-        next_sched_flat = self.next_sched_time.reshape(-1)
         for flat_i in idx_list:
             cutoff = t_flat[flat_i]
-            heap = self._sched_heaps[flat_i]
+            heap = self._heap_nan_heaps[flat_i]
             # A boolean NetStim source can emit at most one spike per sampled
             # time. Consume every heap event that is already due so duplicate or
             # skipped-over events coalesce now instead of leaking into later
@@ -1150,13 +1317,9 @@ class NetStim(DNModule, Sliceable):
                 and torch.as_tensor(heap[0], device=cutoff.device, dtype=cutoff.dtype)
                 <= cutoff
             ):
-                heapq.heappop(self._sched_heaps[flat_i])
-            head = (
-                self._sched_heaps[flat_i][0]
-                if self._sched_heaps[flat_i]
-                else float("inf")
-            )
-            next_sched_flat[flat_i] = head
+                heapq.heappop(heap)
+        self.heap_override_active = self.heap_override_active & ~s_sched
+        self._update_heap_head()
 
     def forward(self, t, *, bptt: bool = False, dt=None):
         r"""
@@ -1240,8 +1403,7 @@ class NetStim(DNModule, Sliceable):
             with torch.no_grad():
                 self.next_stoch_time.copy_(transition.state.next_stoch_time)
 
-        # Heap pops remain an adapter side effect, outside the tensor graph.
-        torch._dynamo.graph_break()
+        # The normal consuming calendar is a shared pure tensor transition.
         self._consume_scheduled_heaps(transition.heap_fires, t)
 
         with torch.no_grad():
@@ -1315,7 +1477,7 @@ class NetStim(DNModule, Sliceable):
         old_heaps = self._sched_heaps
         repeat_count = self._flat_numel_from_shape(dims)
         old_flat_numel = self._flat_numel_from_shape(old_shape)
-        self._sched_heaps = [list(h) for _ in range(repeat_count) for h in old_heaps]
+        batched_heaps = [list(h) for _ in range(repeat_count) for h in old_heaps]
 
         # Replicate tensor-backed schedules into the new leading batch copies.
         if getattr(self, "sched_flat_idx", torch.empty(0)).numel() > 0:
@@ -1335,7 +1497,7 @@ class NetStim(DNModule, Sliceable):
         self.spike_gate = self._prepend_batch_dims_to_tensor(self.spike_gate, dims).to(
             device=self.device(), dtype=self.dtype()
         )
-        self._refresh_next_sched_time_tensor()
+        self._replace_heap_rows(batched_heaps)
         self._renewal_generation += 1
         return self
 
@@ -1371,9 +1533,9 @@ class NetStim(DNModule, Sliceable):
         - We MUST include the per-instance torch.Generator RNG state, because
           torch.utils.checkpoint can preserve global RNG state, but not custom
           Generator objects passed via `generator=...`.
-        - Scheduled spikes live in Python-side heaps. We store them as an
-          immutable tuple-of-tuples so the returned state object is not
-          accidentally mutated by subsequent simulation steps.
+        - Scheduled spikes use a fixed compact calendar and explicit cursor.
+          Legacy remaining-heap records and full original heap layouts retain
+          compatibility with old checkpoints and later NaN insertions.
         - ``shape`` is stored so batched checkpoint restore can rebuild the
           flat schedule heap layout.
 
@@ -1387,7 +1549,7 @@ class NetStim(DNModule, Sliceable):
         # Store scheduled heaps as immutable data (avoid aliasing/mutation).
         sched_heaps = tuple(tuple(h) for h in self._sched_heaps)
 
-        return {
+        checkpoint = {
             # Shape metadata (needed because leading batch dims are meaningful)
             "shape": self.shape,
             # Differentiable state (needed for BPTT across chunks)
@@ -1410,8 +1572,20 @@ class NetStim(DNModule, Sliceable):
             "rng_state": self._rng.get_state(),
             "seeder_state": self._seeder.get_state(),
         }
+        if self._heap_nan_heaps is None:
+            checkpoint.update(
+                heap_times=self.heap_times,
+                heap_row_offsets=self.heap_row_offsets,
+                heap_cursor=self.heap_cursor,
+                heap_head_override=self.heap_head_override,
+                heap_override_active=self.heap_override_active,
+                heap_layout=tuple(tuple(row) for row in self._heap_legacy_rows),
+            )
+        return checkpoint
 
-    def _restore_dict_from_checkpoint_unchecked(self, state_dict):
+    def _restore_dict_from_checkpoint_unchecked(
+        self, state_dict, *, preserve_heap_layout=False
+    ):
         """Restore NetStim dynamic state from :meth:`state_dict_for_checkpoint`.
 
         Important details for activation checkpointing:
@@ -1448,27 +1622,113 @@ class NetStim(DNModule, Sliceable):
             # Best-effort fallback.
             self.init_rng()
 
-        # 2) Restore scheduled spikes (Python-side heaps) and rebuild
-        #    the derived device tensor ``next_sched_time``.
+        # 2) Modern calendars preserve topology and the consumed prefix. Old
+        # heap snapshots contain only remaining events and are packed cold.
         heaps_in = state_dict.get("sched_heaps", None)
-        if heaps_in is not None:
-            if len(heaps_in) != self._flat_numel():
+        if heaps_in is not None and len(heaps_in) != self._flat_numel():
+            raise ValueError(
+                f"Checkpoint has {len(heaps_in)} schedule heaps, but current "
+                f"NetStim shape {self.shape} requires {self._flat_numel()}."
+            )
+        calendar_keys = ("heap_times", "heap_row_offsets", "heap_cursor")
+        if any(name in state_dict for name in calendar_keys):
+            if not all(name in state_dict for name in calendar_keys):
+                raise ValueError("Checkpoint has an incomplete NetStim heap calendar.")
+            values = tuple(state_dict[name] for name in calendar_keys)
+            if not all(torch.is_tensor(value) for value in values):
+                raise ValueError("Checkpoint heap calendar values must be tensors.")
+            # Validate the saved representation cold before moving it. MPS
+            # cannot receive a Float64 tensor, and a lower-precision MPS checkpoint
+            # needs its original heap layout to recover precision on CPU/CUDA.
+            times, offsets, cursor = (value.to(device="cpu") for value in values)
+            validate_heap_calendar(
+                times,
+                offsets,
+                cursor,
+                rows=self._flat_numel(),
+                device="cpu",
+                dtype=times.dtype,
+            )
+            layout = state_dict.get("heap_layout")
+            if layout is None:
+                raw = times.detach().cpu().tolist()
+                bounds = offsets.detach().cpu().tolist()
+                layout = [
+                    raw[left:right] for left, right in zip(bounds[:-1], bounds[1:])
+                ]
+            if len(layout) != self._flat_numel():
+                raise ValueError("Checkpoint heap layout has the wrong row count.")
+            layout = [[float(value) for value in row] for row in layout]
+            if any(
+                row[(index - 1) // 2] > value
+                for row in layout
+                for index, value in enumerate(row)
+                if index
+            ):
                 raise ValueError(
-                    f"Checkpoint has {len(heaps_in)} schedule heaps, but current "
-                    f"NetStim shape {self.shape} requires {self._flat_numel()}."
+                    "Checkpoint heap layout must satisfy min-heap ordering."
                 )
-            self._sched_heaps = [list(h) for h in heaps_in]
-            for h in self._sched_heaps:
-                heapq.heapify(h)
-            self._refresh_next_sched_time_tensor()
-        elif "next_sched_time" in state_dict:
+            layout_times, layout_offsets, _, _ = pack_heap_calendar(
+                layout, device="cpu", dtype=times.dtype
+            )
+            if not torch.equal(layout_times, times) or not torch.equal(
+                layout_offsets, offsets
+            ):
+                raise ValueError("Checkpoint heap layout does not match its calendar.")
+            self.heap_times, self.heap_row_offsets, _, self.heap_depth = (
+                pack_heap_calendar(layout, device=device, simulation_dtype=dtype)
+            )
+            self.heap_cursor = cursor.to(device=device).clone()
+            self._heap_nan_heaps = None
+            self._heap_legacy_rows = [list(row) for row in layout]
+            self.heap_head_override = (
+                self._broadcast_to_state(
+                    state_dict.get(
+                        "heap_head_override",
+                        torch.full(
+                            self.shape, float("inf"), device=device, dtype=dtype
+                        ),
+                    ),
+                    dtype=dtype,
+                    device=device,
+                    name="heap_head_override",
+                )
+                .detach()
+                .clone()
+            )
+            self.heap_override_active = (
+                self._broadcast_to_state(
+                    state_dict.get(
+                        "heap_override_active",
+                        torch.zeros(self.shape, device=device, dtype=torch.bool),
+                    ),
+                    dtype=torch.bool,
+                    device=device,
+                    name="heap_override_active",
+                )
+                .detach()
+                .clone()
+            )
+            self._update_heap_head()
+        elif heaps_in is not None:
+            heaps = [list(h) for h in heaps_in]
+            if not preserve_heap_layout:
+                for h in heaps:
+                    heapq.heapify(h)
+            self._replace_heap_rows(heaps)
+        if heaps_in is None and "next_sched_time" in state_dict:
             # Backward-compatible path if an older checkpoint stored the tensor.
-            self.next_sched_time = self._broadcast_to_state(
+            # It overrides, rather than merges with, any existing calendar head.
+            self.heap_head_override = self._broadcast_to_state(
                 state_dict["next_sched_time"].detach(),
                 dtype=dtype,
                 device=device,
                 name="next_sched_time",
             ).clone()
+            self.heap_override_active = torch.ones(
+                self.shape, device=device, dtype=torch.bool
+            )
+            self._update_heap_head()
 
         # Restore tensor-backed scheduled events. Bound value sources are
         # intentionally not serialized here; callers should keep them attached
@@ -1560,6 +1820,7 @@ class NetStim(DNModule, Sliceable):
     def restore_dict_from_checkpoint(self, state_dict):
         """Restore a NetStim runtime checkpoint atomically."""
         previous = _clone_checkpoint_state(self.state_dict_for_checkpoint())
+        previous_outputs = self.spikes, self.spike_gate
         try:
             result = self._restore_dict_from_checkpoint_unchecked(state_dict)
             current = self.state_dict_for_checkpoint()
@@ -1567,23 +1828,26 @@ class NetStim(DNModule, Sliceable):
                 previous["sched_flat_idx"].numel() > 0
                 or current["sched_flat_idx"].numel() > 0
             )
-            if (
-                any(self._sched_heaps)
-                or (
-                    tensor_schedule_present
-                    and not _matching_tensor_schedule_configuration(previous, current)
-                )
-                or not bool(torch.isposinf(self.next_sched_time).all())
+            if not _matching_heap_configuration(previous, current) or (
+                tensor_schedule_present
+                and not _matching_tensor_schedule_configuration(previous, current)
             ):
                 self._renewal_config_generation += 1
             self._renewal_initialized = True
             return result
         except Exception:
             try:
-                self._restore_dict_from_checkpoint_unchecked(previous)
+                self._restore_dict_from_checkpoint_unchecked(
+                    previous, preserve_heap_layout=True
+                )
             except Exception as rollback_error:
                 raise RuntimeError(
                     "NetStim checkpoint restore failed and rollback could not "
                     "recover the previous runtime state."
                 ) from rollback_error
+            finally:
+                # Successful restore resets outputs for the next call, whereas
+                # a failed restore must retain the caller's current outputs and
+                # their autograd history as well as the checkpointed carry.
+                self.spikes, self.spike_gate = previous_outputs
             raise

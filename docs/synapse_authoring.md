@@ -171,6 +171,7 @@ Shared threshold detection and ordered source observation are described in
 with explicit draws and clock/RNG state is described in
 {doc}`advanced/A14_functional_netstim_renewal`. Shared tensor schedules and
 indexed bindings are described in {doc}`advanced/A15_functional_tensor_schedules`.
+Consuming heap calendars are described in {doc}`advanced/A16_functional_heap_schedules`.
 Complete Network execution still uses the ordinary Network API. See
 {ref}`functional-event-receive` for the full functional receive contract.
 

@@ -59,6 +59,16 @@ voltages, queues, RNG continuation, and gradients. See the
 python examples/functional_tensor_schedules.py
 ```
 
+[`functional_heap_schedules.py`](functional_heap_schedules.py) lowers consuming
+NetStim calendars alongside renewal and tensor schedules. It resumes cloned
+source, queue, and population carry through functional and native execution,
+checking clocks, cursors, RNG state, voltages, and interval/weight gradients.
+See the [heap calendar guide](../docs/advanced/A16_functional_heap_schedules.md).
+
+```bash
+python examples/functional_heap_schedules.py
+```
+
 [`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
 frequency, delay, and duration from simulated voltage recordings, optionally
 with observation noise, using ordinary `model.run()` and autograd. Try a

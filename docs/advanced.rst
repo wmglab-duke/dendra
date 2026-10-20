@@ -23,3 +23,4 @@ Advanced
    advanced/A13_functional_threshold_detection.md
    advanced/A14_functional_netstim_renewal.md
    advanced/A15_functional_tensor_schedules.md
+   advanced/A16_functional_heap_schedules.md

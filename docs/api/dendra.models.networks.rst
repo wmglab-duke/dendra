@@ -75,6 +75,8 @@ See :doc:`../advanced/A14_functional_netstim_renewal` for sampling policy,
 ordered projection composition, and checkpoint continuation.
 Tensor schedules and indexed bindings are described in
 :doc:`../advanced/A15_functional_tensor_schedules`.
+Consuming heap calendars, explicit cursors, and legacy checkpoint compatibility
+are described in :doc:`../advanced/A16_functional_heap_schedules`.
 
 .. autofunction:: dendra.func.make_functional_netstim
 

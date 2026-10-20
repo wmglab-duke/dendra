@@ -43,8 +43,8 @@ and multiple schedule owners, can use the same source entry.
 NetStim's legacy unit-amplitude Python schedule uses heaps. Select tensor
 storage with `differentiable=True`, tensor-valued trainable times, or
 non-unit/tensor amplitudes. Indexed reference methods also use tensor storage.
-Functional NetStim lowering accepts tensor schedules and rejects pending heap
-events. Native heap execution retains its existing behavior.
+Functional NetStim lowering also accepts consuming heap calendars with explicit
+cursor carry, as described in {doc}`A16_functional_heap_schedules`.
 
 Configure `diff_scheduled_times`, `sched_width`, and the timestep before
 lowering. `Network.initialize(dt)` sets the NetStim schedule timestep;
@@ -182,5 +182,6 @@ The complete example executes here:
 ```
 
 Functional schedules currently use fixed tensor topology and dense fixed-delay
-projections. Heap lowering, dynamic insertion inside transformed loops, other
+projections. Heap calendars are described in {doc}`A16_functional_heap_schedules`.
+Dynamic insertion inside transformed loops, other
 transport backends, and complete Network lowering remain later extensions.
