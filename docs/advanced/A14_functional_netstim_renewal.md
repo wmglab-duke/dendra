@@ -9,11 +9,13 @@ kernelspec:
 (functional-netstim-renewal)=
 # Shared NetStim renewal with explicit random draws
 
-An initialized, unscheduled `dn.NetStim` can be lowered with
+An initialized `dn.NetStim` can be lowered with
 `dn.func.make_functional_netstim`. Native and functional execution use the
 same pure initialization and renewal transitions in the network layer.
 Construct the source and connections through the ordinary Network API;
 functional execution supplies parameters, clocks, and random draws explicitly.
+This example uses unscheduled renewal. Tensor schedules and indexed source
+bindings are supported as described in {doc}`A15_functional_tensor_schedules`.
 
 The complete example uses one noisy, seeded source to drive two projections.
 It checks native trajectories, delivery queues, gradients, and continuation
@@ -40,7 +42,7 @@ native source or reach its parameters.
 :dedent: 4
 ```
 
-`NetStimTensors` contains three dictionaries:
+`NetStimTensors` contains three dictionaries and an optional `schedule` packet:
 
 | Dictionary | Entries |
 | --- | --- |
@@ -167,7 +169,7 @@ and lower again after changing source configuration, seed, training mode,
 batch shape, device, or schedules. Schedule edits and clears, schedule-source
 binding, `set_dt`, and `set_diff_config` invalidate a plan even when reapplying
 the same settings; make these calls before lowering. Ordinary runtime stepping
-and unscheduled checkpoint restoration do not invalidate the plan.
+and compatible checkpoint restoration do not invalidate the plan.
 
 The complete example executes here:
 
@@ -176,7 +178,7 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-This lowering currently accepts unscheduled NetStims. Native heap and tensor
-schedules retain their existing behavior through schedule inputs to the same
-shared renewal core. Functional schedule lowering and complete
-`Network`-level lowering remain future extensions.
+Tensor schedules use shared pure evaluation and explicit packets as described
+in {doc}`A15_functional_tensor_schedules`. Native heap schedules retain their
+existing behavior through schedule inputs to the shared renewal core. Heap
+lowering and complete `Network`-level lowering remain future extensions.

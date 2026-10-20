@@ -339,23 +339,13 @@ def test_configuration_changes_invalidate_plan(change):
         plan.step(tensors.parameters, tensors.constants, tensors.state, 0.0, draw)
 
 
-@pytest.mark.parametrize(
-    "kind", ("uninitialized", "schedule", "tensor_schedule", "bound", "subclass")
-)
+@pytest.mark.parametrize("kind", ("uninitialized", "schedule", "subclass"))
 def test_unsupported_sources_fail_before_lowering(kind):
     source = _native()
     if kind == "uninitialized":
         source = dn.NetStim()
     elif kind == "schedule":
         source.schedule(0, 2.0)
-    elif kind == "tensor_schedule":
-        source.schedule(
-            0,
-            torch.tensor(2.0, dtype=torch.float64),
-            weight=torch.tensor(0.5, dtype=torch.float64),
-        )
-    elif kind == "bound":
-        source.bind_time_source(torch.ones(1, dtype=torch.float64))
     else:
 
         class CustomNetStim(dn.NetStim):
@@ -597,7 +587,7 @@ def test_restoring_scheduled_checkpoint_invalidates_warm_plan(schedule):
     source.restore_dict_from_checkpoint(checkpoint)
     with pytest.raises(Exception, match="configuration changed"):
         compiled(tensors.parameters, tensors.constants, tensors.state, 0.8, packet)
-    with pytest.raises(dn.func.FunctionalizationError, match="unscheduled renewal"):
+    with pytest.raises(dn.func.FunctionalizationError):
         plan.extract()
 
 
@@ -607,7 +597,7 @@ def test_cold_extraction_still_audits_actual_schedule_contents():
     # Private storage is intentionally outside the hot public lifecycle guard.
     # Cold transfer still audits every heap rather than trusting its revision.
     source._sched_heaps[0].append(2.0)
-    with pytest.raises(dn.func.FunctionalizationError, match="unscheduled renewal"):
+    with pytest.raises(dn.func.FunctionalizationError, match="heap schedules"):
         plan.extract()
 
 

@@ -50,11 +50,12 @@ already event gates. `diff_delays=False` selects the existing hard-delay
 semantics. Explicitly selecting the dense training backend ensures this
 projection uses a dense delivery ring in both executions.
 
-The interface accepts the active dense fixed-delay runtime without scheduled
-events. This example uses raw gates; finite and mixed thresholds are also
+The interface accepts the active dense fixed-delay runtime, including tensor
+schedules described in {doc}`A15_functional_tensor_schedules`. This example
+uses raw gates; finite and mixed thresholds are also
 supported, with explicit detector carry and ordered projection phases as
-described in {doc}`A13_functional_threshold_detection`. Schedules,
-differentiable-delay interpolation, and compact queue backends remain native
+described in {doc}`A13_functional_threshold_detection`.
+Differentiable-delay interpolation and compact queue backends remain native
 execution modes. Shared pure `NetStim` generation and RNG continuation are
 described in {doc}`A14_functional_netstim_renewal`.
 
@@ -149,7 +150,8 @@ be mapped independently with `vmap`. Its eager execution can need an extra
 temporary ring; native compilation can fuse those operations into one output.
 
 NetStim generation and RNG now use explicit transitions as described in
-{doc}`A14_functional_netstim_renewal`. Functional scheduling and Network-level
-lowering remain future extensions. Users continue to construct networks
+{doc}`A14_functional_netstim_renewal`; tensor schedule evaluation is shared as
+described in {doc}`A15_functional_tensor_schedules`. Heap schedules and
+Network-level lowering remain future extensions. Users continue to construct networks
 through the standard Dendra API. See {doc}`A8_functional_populations` for population
 execution and {doc}`../synapse_authoring` for authoring a pure receiver.

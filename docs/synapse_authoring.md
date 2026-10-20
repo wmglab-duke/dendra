@@ -169,8 +169,9 @@ payloads as described in {doc}`advanced/A12_functional_event_delivery`.
 Shared threshold detection and ordered source observation are described in
 {doc}`advanced/A13_functional_threshold_detection`. Shared NetStim generation
 with explicit draws and clock/RNG state is described in
-{doc}`advanced/A14_functional_netstim_renewal`. Complete Network execution and
-scheduling still use the ordinary Network API. See
+{doc}`advanced/A14_functional_netstim_renewal`. Shared tensor schedules and
+indexed bindings are described in {doc}`advanced/A15_functional_tensor_schedules`.
+Complete Network execution still uses the ordinary Network API. See
 {ref}`functional-event-receive` for the full functional receive contract.
 
 The complete event example runs here:

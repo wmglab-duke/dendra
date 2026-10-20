@@ -28,6 +28,7 @@ from ._netstim import (
 )
 from ._population import FunctionalPopulation, make_functional
 from ._runners import longrun, longrun_checkpointed, run
+from ._schedules import TensorScheduleTensors
 from ._stimuli import FunctionalExtra, FunctionalIntra, StimulusTensors
 from ._types import (
     FunctionalizationError,
@@ -70,6 +71,7 @@ __all__ = [
     "RolloutInput",
     "StepInput",
     "StimulusTensors",
+    "TensorScheduleTensors",
     "compile",
     "longrun",
     "longrun_checkpointed",

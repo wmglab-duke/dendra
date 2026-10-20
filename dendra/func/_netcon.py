@@ -17,18 +17,24 @@ from dendra.models.networks._event_delivery import (
     dense_fixed_delay_transition,
     gather_source_gates,
 )
+from dendra.models.networks._tensor_schedules import (
+    netcon_tensor_schedule,
+    resolve_schedule_values,
+)
 from dendra.models.networks.netcon import NetCon
 from dendra.models.networks.netstim import NetStim
 from dendra.models.networks.spiking import threshold_transition
 
+from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
 from ._types import FunctionalizationError
 
 
 class NetConTensors(NamedTuple):
-    """Independent effective weights and dense checkpoint state snapshots."""
+    """Independent effective weights, dense carry, and optional schedule values."""
 
     weights: torch.Tensor
     state: dict[str, torch.Tensor]
+    schedule: TensorScheduleTensors | None = None
 
 
 def _snapshot(value, *, parameter=False):
@@ -122,19 +128,17 @@ def _eligible(netcon):
             raise FunctionalizationError(
                 "Configure NetCon training before lowering it."
             )
-        if netcon.train_flags[1] or netcon.train_flags[6]:
+        if netcon.train_flags[1]:
             raise FunctionalizationError(
-                "Functional NetCon requires diff_delays=False and "
-                "diff_scheduled_times=False."
+                "Functional NetCon requires diff_delays=False."
             )
-    if (
-        netcon.sched_con_idx.numel()
-        or netcon._sched_pre
-        or netcon._sched_w_source is not None
-        or netcon._sched_t_source is not None
-    ):
+        if netcon.track_events and (netcon.train_flags[2] or netcon.train_flags[6]):
+            raise FunctionalizationError(
+                "Tracked NetCon events require hard spiking and scheduled-time semantics."
+            )
+    if netcon._sched_pre:
         raise FunctionalizationError(
-            "Functional NetCon does not represent schedules or bound schedule sources."
+            "Functional NetCon does not represent legacy presynaptic schedules."
         )
     allowed = (
         NetCon.advance_non_diff_dense_uniform,
@@ -163,6 +167,13 @@ class FunctionalNetCon:
     temperature ``tau`` is scalar real metadata, rather than an explicit
     differentiable Tensor input.
 
+    Tensor schedule routing and reference indices are frozen in the plan.
+    Pass the extracted :class:`~dendra.func.TensorScheduleTensors` as ``schedule=`` on each
+    advance. Floating times, dimensionless amplitudes, and bound source vectors
+    are explicit independent values. Their hard or triangular timing policy
+    matches the initialized native configuration. Evaluation uses the carry's
+    absolute ``global_step`` and does not consume events.
+
     Call :meth:`read_due`, deliver its payload with one Population ``receive``
     call (including zero payloads), then observe the source and call
     :meth:`advance`. This preserves native receive-before-observe ordering,
@@ -172,9 +183,9 @@ class FunctionalNetCon:
 
     Routing, quantized delays, timestep, and tensor schemas are copied at
     lowering. Reinitialization, calling ``set_diff_config``, mode changes, or
-    adding schedules invalidates source-bound calls. Direct edits to source
-    topology or detector buffers do not alter this frozen plan; extraction and
-    commit reject incompatible metadata. Lower again to adopt changed routing,
+    changing schedule topology or bindings invalidates source-bound calls.
+    Direct edits to source topology or detector buffers do not alter this frozen
+    plan; extraction and commit reject incompatible metadata. Lower again to adopt changed routing,
     delays, or thresholds. Explicit Population batch axes are part of the
     source/target shapes; additional ``vmap`` axes stay implicit.
     """
@@ -188,6 +199,7 @@ class FunctionalNetCon:
         self._post = netcon.post
         self._syn = netcon.syn
         self._generation = netcon._event_delivery_generation
+        self._schedule_generation = netcon._schedule_config_generation
         self._mode = _mode(netcon)
         self._advance = netcon.advance.__func__
         self._pre_var = netcon.pre_var
@@ -216,6 +228,11 @@ class FunctionalNetCon:
         self._apply_masking = bool(netcon.apply_masking)
         self._diff_spiking = bool(netcon.training and netcon.train_flags[2])
         self._tau = float(netcon.train_flags[5]) if netcon.training else 0.1
+        self._diff_scheduled_times = bool(netcon.training and netcon.train_flags[6])
+        self._sched_width = float(netcon.train_flags[7]) if netcon.training else 1.0
+        self._schedule = _TensorSchedulePlan(
+            netcon, index_name="sched_con_idx", device=self.device, dtype=self.dtype
+        )
         checkpoint = netcon.state_dict_for_checkpoint()
         self._state_schema = {
             name: (tuple(value.shape), value.dtype, value.device)
@@ -229,6 +246,7 @@ class FunctionalNetCon:
             type(source) is not self._source_type
             or not source._event_delivery_initialized
             or source._event_delivery_generation != self._generation
+            or source._schedule_config_generation != self._schedule_generation
             or source._mode_requires_initialize
             or _mode(source) != self._mode
             or source.pre is not self._pre
@@ -244,10 +262,7 @@ class FunctionalNetCon:
             or source._syn_numel != self._width
             or tuple(source.syn.shape_f) != self.shape
             or getattr(source.advance, "__func__", None) is not self._advance
-            or source.sched_con_idx.numel() != 0
             or source._sched_pre
-            or source._sched_w_source is not None
-            or source._sched_t_source is not None
         ):
             raise FunctionalizationError(
                 "The source NetCon configuration changed; initialize and lower it again."
@@ -313,6 +328,11 @@ class FunctionalNetCon:
             device=self.device,
             label="effective weights",
         )
+        self._schedule.validate_compatible(netcon)
+        if bool(torch.any(self._schedule.indices >= self._connections)):
+            raise FunctionalizationError(
+                "NetCon schedule connection indices are outside its topology."
+            )
         self._validate_state(netcon.state_dict_for_checkpoint())
         if self._depth < 1 or bool(torch.any(self._delay_steps < 1)):
             raise FunctionalizationError("NetCon needs a nonempty fixed-delay ring.")
@@ -326,7 +346,7 @@ class FunctionalNetCon:
             )
 
     def extract(self, netcon=None) -> NetConTensors:
-        """Snapshot effective weights and checkpoint carry from a compatible NetCon."""
+        """Snapshot effective weights, checkpoint carry, and schedule values."""
         if torch.compiler.is_compiling():
             raise FunctionalizationError("Extract NetCon tensors before torch.compile.")
         netcon = self._source if netcon is None else netcon
@@ -337,6 +357,7 @@ class FunctionalNetCon:
                 name: _snapshot(value)
                 for name, value in netcon.state_dict_for_checkpoint().items()
             },
+            self._schedule.extract(netcon),
         )
 
     def read_due(self, state):
@@ -357,15 +378,17 @@ class FunctionalNetCon:
             result["events"] = due.event_counts
         return result, due.payload.reshape(self.shape)
 
-    def advance(self, weights, state, source_values):
+    def advance(self, weights, state, source_values, *, schedule=None):
         """Observe the current source, enqueue events, and return next carry.
 
         Pass the state from :meth:`read_due` after delivering its payload and
         observing the source. Threshold metadata is frozen; gradients flow
-        through explicit weights, source values, and pending payloads.
+        through explicit weights, source values, pending payloads, and schedule
+        amplitudes. Triangular scheduling also differentiates explicit times.
         """
         self._validate_source()
         self._validate_state(state)
+        self._schedule.validate(schedule)
         self._validate_tensor(
             weights,
             shape=(self._connections,),
@@ -395,13 +418,41 @@ class FunctionalNetCon:
                 nan_mask=self._nan_mask if self._apply_masking else None,
             )
         gates = gates.to(device=self.device, dtype=self.dtype)
-        counts = connection_event_counts(gates) if self._track_events else None
+        scheduled_counts = None
+        if self._schedule.events:
+            times, amplitudes = resolve_schedule_values(
+                schedule.times,
+                schedule.amplitudes,
+                self._schedule.time_idx,
+                self._schedule.amplitude_idx,
+                time_source=schedule.time_source,
+                weight_source=schedule.amplitude_source,
+                time_dtype=self.dtype,
+            )
+            scheduled_gates, scheduled_counts = netcon_tensor_schedule(
+                self._schedule.indices,
+                times,
+                amplitudes,
+                state["global_step"],
+                self._dt,
+                connections=self._connections,
+                differentiable_times=self._diff_scheduled_times,
+                width=self._sched_width,
+            )
+            combined = gates + scheduled_gates
+        else:
+            combined = gates
+        counts = (
+            connection_event_counts(gates, scheduled_counts)
+            if self._track_events
+            else None
+        )
         updated = dense_fixed_delay_transition(
             state["delivery_buffer"],
             state["current_time_step"],
             state["global_step"],
             weights,
-            gates,
+            combined,
             post_idx=self._post_idx,
             delay_steps=self._delay_steps,
             depth=self._depth,
@@ -418,7 +469,7 @@ class FunctionalNetCon:
             result["event_queue"] = updated.event_queue
         return result
 
-    def step(self, weights, state, source_gates):
+    def step(self, weights, state, source_gates, *, schedule=None):
         """Return ``(next_state, due_payload)`` using prechosen source values.
 
         ``source_gates`` retains its original argument name for callers using
@@ -426,10 +477,18 @@ class FunctionalNetCon:
         Use the separate phases when reception can change those values.
         """
         delivery_state, payload = self.read_due(state)
-        return self.advance(weights, delivery_state, source_gates), payload
+        return (
+            self.advance(weights, delivery_state, source_gates, schedule=schedule),
+            payload,
+        )
 
     def commit_state_(self, netcon, state):
-        """Commit independent copies of validated carry into a compatible NetCon."""
+        """Commit independent copies of validated carry into a compatible NetCon.
+
+        This restores queues, counters, detector history, and tracked events.
+        Align effective weights and floating schedule values separately when
+        resuming native execution; they are parameters rather than carry.
+        """
         if torch.compiler.is_compiling():
             raise FunctionalizationError("Commit NetCon state outside torch.compile.")
         self._validate_compatible(netcon)

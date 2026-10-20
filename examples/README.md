@@ -49,6 +49,16 @@ See the [NetStim guide](../docs/advanced/A14_functional_netstim_renewal.md).
 python examples/functional_netstim_renewal.py
 ```
 
+[`functional_tensor_schedules.py`](functional_tensor_schedules.py) lowers value,
+amplitude-reference, and time-reference schedules on a standard NetStim and
+NetCon. It shares explicit source vectors across both packets and checks native
+voltages, queues, RNG continuation, and gradients. See the
+[tensor schedule guide](../docs/advanced/A15_functional_tensor_schedules.md).
+
+```bash
+python examples/functional_tensor_schedules.py
+```
+
 [`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
 frequency, delay, and duration from simulated voltage recordings, optionally
 with observation noise, using ordinary `model.run()` and autograd. Try a

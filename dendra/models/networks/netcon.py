@@ -17,7 +17,9 @@ from ._event_delivery import (
     dense_fixed_delay_transition,
     gather_source_gates,
 )
-from .netstim import NetStim, _causal_step_index
+from ._tensor_schedules import causal_step_index as _causal_step_index
+from ._tensor_schedules import netcon_tensor_schedule, resolve_schedule_values
+from .netstim import NetStim
 from .spiking import threshold_transition
 from .utils import make_getattr
 
@@ -1714,6 +1716,7 @@ class NetCon(Referency):
 
         self._event_delivery_initialized = False
         self._event_delivery_generation = 0
+        self._schedule_config_generation = 0
         self.weight = weight
         self.syn = post_syn
         self.pre = pre
@@ -4133,6 +4136,9 @@ class NetCon(Referency):
             w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
 
         # append (outside compiled loop: changing E is fine)
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
         self.sched_time_ms = torch.cat([self.sched_time_ms, tms], dim=0)
@@ -4185,6 +4191,9 @@ class NetCon(Referency):
         if source.device != self.device:
             raise ValueError("weight source must be on same device")
         self._sched_w_source = source
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
 
     def bind_time_source(self, source: torch.Tensor):
         """
@@ -4225,6 +4234,9 @@ class NetCon(Referency):
         if source.device != self.device:
             raise ValueError("time source must be on same device")
         self._sched_t_source = source
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
 
     def schedule_ref(
         self,
@@ -4342,6 +4354,9 @@ class NetCon(Referency):
             if con_idx.numel() == 0:
                 return
 
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
         self.sched_time_ms = torch.cat([self.sched_time_ms, tms.to(dtype=dtype)], dim=0)
@@ -4501,6 +4516,9 @@ class NetCon(Referency):
         else:
             w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
 
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
         self.sched_time_ms = torch.cat(
@@ -4544,6 +4562,9 @@ class NetCon(Referency):
           to reuse the same ``NetCon`` instance but with a fresh schedule.
         """
         device, dtype = self.device, self.dtype
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
         self.sched_con_idx = torch.empty(0, device=device, dtype=torch.long)
         self.sched_abs_step = torch.empty(0, device=device, dtype=torch.long)
         self.sched_weight = torch.empty(0, device=device, dtype=dtype)
@@ -4593,48 +4614,26 @@ class NetCon(Referency):
                 torch.zeros(n_conn, device=device, dtype=torch.int32),
             )
 
-        # --- scheduled weights (value + ref) ---
-        w_val = self.sched_weight
-        if self._sched_w_source is not None:
-            idxw = torch.clamp(self.sched_weight_idx, min=0)
-            w_src = self._sched_w_source.index_select(0, idxw)
-            w_ref_mask = (self.sched_weight_idx >= 0).to(dtype)
-            w_val = w_val + w_src * w_ref_mask  # combine if both present
-
-        # --- scheduled times (value + ref) -> float ms ---
-        t_val = self.sched_time_ms  # may be zeros if using time-by-ref only
-        if self._sched_t_source is not None:
-            idxt = torch.clamp(self.sched_time_idx, min=0)
-            t_src = self._sched_t_source.index_select(0, idxt).to(dtype=dtype)
-            t_ref_mask = (self.sched_time_idx >= 0).to(t_src.dtype)
-            t_val = t_val + t_src * t_ref_mask
-
-        if use_tri_kernel:
-            # Differentiable triangular kernel in *steps*
-            lam = t_val.to(dtype) / self.dt.to(dtype)  # [E] float
-            # gs_long is int64; cast to float
-            x = lam - gs_long.to(dtype).view(())
-            # width in steps (half-width). <=0 disables contribution
-            _, _, _, _, _, _, _, sched_width = self.train_flags
-            tri = (1.0 - (x.abs() / (sched_width + 1e-6))).clamp(
-                min=0.0, max=1.0
-            )  # [E]
-            amp_evt = w_val * tri  # [E]
-            # counts (bookkeeping): event "active" if tri>0
-            cnt_evt = (tri > 0).to(torch.int32)  # [E]
-        else:
-            # Step-exact, causal firing: first grid step >= event time.
-            abs_step = _causal_step_index(t_val.to(dtype), self.dt.to(dtype))
-            now_mask = abs_step == gs_long.view(())
-            amp_evt = w_val * now_mask.to(dtype)  # [E]
-            cnt_evt = now_mask.to(torch.int32)  # [E]
-
-        # Aggregate to connections
-        sched_wsum_conn = torch.zeros(n_conn, device=device, dtype=dtype)
-        sched_counts_conn = torch.zeros(n_conn, device=device, dtype=torch.int32)
-        sched_wsum_conn.index_add_(0, self.sched_con_idx, amp_evt)
-        sched_counts_conn.index_add_(0, self.sched_con_idx, cnt_evt)
-        return sched_wsum_conn, sched_counts_conn
+        times, weights = resolve_schedule_values(
+            self.sched_time_ms,
+            self.sched_weight,
+            self.sched_time_idx,
+            self.sched_weight_idx,
+            time_source=self._sched_t_source,
+            weight_source=self._sched_w_source,
+            time_dtype=dtype,
+        )
+        width = self.train_flags[7] if use_tri_kernel else 1.0
+        return netcon_tensor_schedule(
+            self.sched_con_idx,
+            times,
+            weights,
+            gs_long,
+            self.dt.to(dtype),
+            connections=n_conn,
+            differentiable_times=use_tri_kernel,
+            width=width,
+        )
 
     def advance_diff_source_history(self):
         """Differentiable source-history training path.
@@ -5467,6 +5466,9 @@ class NetCon(Referency):
             self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
         self.detach()
         self._mode_requires_initialize = False
+        self._schedule_config_generation = getattr(
+            self, "_schedule_config_generation", 0
+        )
         self._event_delivery_generation = (
             getattr(self, "_event_delivery_generation", 0) + 1
         )

@@ -17,6 +17,8 @@ from ._netstim_renewal import (
     netstim_initial_state,
     netstim_renewal,
 )
+from ._tensor_schedules import causal_step_index as _causal_step_index
+from ._tensor_schedules import netstim_tensor_schedule, resolve_schedule_values
 
 
 def _clone_checkpoint_state(value, memo=None):
@@ -37,19 +39,33 @@ def _clone_checkpoint_state(value, memo=None):
     return copy.deepcopy(value)
 
 
-def _causal_step_index(times: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
-    """Map absolute times to the first fixed-step grid point at or after them.
-
-    Computing ``ceil(times / dt)`` directly can move an exact decimal boundary
-    by a complete step when the division rounds just above or below an integer.
-    Use the lower candidate's reconstructed grid time to decide whether one
-    additional step is required.  This also preserves adjacent representable
-    times on opposite sides of a grid boundary.
-    """
-    dt = torch.as_tensor(dt, device=times.device, dtype=times.dtype)
-    lower = torch.floor(times / dt)
-    needs_next = lower * dt < times
-    return (lower + needs_next.to(lower.dtype)).to(torch.long)
+def _matching_tensor_schedule_configuration(previous, current):
+    """Cold comparison used to preserve plans across matching carry restores."""
+    for name in ("diff_scheduled_times", "sched_width"):
+        if previous[name] != current[name]:
+            return False
+    for name in (
+        "sched_flat_idx",
+        "sched_abs_step",
+        "sched_time_ms",
+        "sched_weight",
+        "sched_weight_idx",
+        "sched_time_idx",
+        "schedule_dt",
+    ):
+        left, right = previous[name], current[name]
+        if (
+            left.shape != right.shape
+            or left.dtype != right.dtype
+            or left.device != right.device
+        ):
+            return False
+        if left.is_floating_point():
+            if not bool(torch.all((left == right) | (left.isnan() & right.isnan()))):
+                return False
+        elif not torch.equal(left, right):
+            return False
+    return True
 
 
 class NetStim(DNModule, Sliceable):
@@ -902,65 +918,44 @@ class NetStim(DNModule, Sliceable):
         return torch.as_tensor(dt, device=self.device(), dtype=dtype).reshape(())
 
     def _scheduled_tensor_values(self):
-        """Return value/ref combined scheduled times and weights."""
+        """Resolve value/ref schedules with the canonical NetStim source policy."""
         device, dtype = self.device(), self.dtype()
-        if self.sched_flat_idx.numel() == 0:
-            empty = torch.empty(0, device=device, dtype=dtype)
-            return empty, empty
-
-        times = self.sched_time_ms.to(device=device, dtype=dtype)
-        if self._sched_t_source is not None and bool((self.sched_time_idx >= 0).any()):
-            idx = torch.clamp(self.sched_time_idx, min=0)
-            src = self._sched_t_source.index_select(0, idx).to(
-                device=device, dtype=dtype
+        time_source = self._sched_t_source
+        weight_source = self._sched_w_source
+        if time_source is not None:
+            time_source = (
+                time_source if bool((self.sched_time_idx >= 0).any()) else None
             )
-            times = times + src * (self.sched_time_idx >= 0).to(dtype)
-
-        weights = self.sched_weight.to(device=device, dtype=dtype)
-        if self._sched_w_source is not None and bool(
-            (self.sched_weight_idx >= 0).any()
-        ):
-            idx = torch.clamp(self.sched_weight_idx, min=0)
-            src = self._sched_w_source.index_select(0, idx).to(
-                device=device, dtype=dtype
+        if weight_source is not None:
+            weight_source = (
+                weight_source if bool((self.sched_weight_idx >= 0).any()) else None
             )
-            weights = weights + src * (self.sched_weight_idx >= 0).to(dtype)
-        return times, weights
+        return resolve_schedule_values(
+            self.sched_time_ms.to(device=device, dtype=dtype),
+            self.sched_weight.to(device=device, dtype=dtype),
+            self.sched_time_idx,
+            self.sched_weight_idx,
+            time_source=time_source,
+            weight_source=weight_source,
+            time_dtype=dtype,
+            weight_dtype=dtype,
+            device=device,
+        )
 
     def _scheduled_tensor_gate(self, t: torch.Tensor, *, dt=None):
-        """Aggregate tensor-backed scheduled amplitudes into state-shaped gates."""
+        """Aggregate tensor schedules through the shared pure evaluator."""
         device, dtype = self.device(), self.dtype()
-        flat_n = self._flat_numel()
-        gate_flat = torch.zeros(flat_n, device=device, dtype=dtype)
-        hard_counts = torch.zeros(flat_n, device=device, dtype=torch.int32)
-        if self.sched_flat_idx.numel() == 0:
-            return gate_flat.reshape(self.shape), hard_counts.reshape(self.shape) > 0
-
         times, weights = self._scheduled_tensor_values()
-        flat_idx = self.sched_flat_idx.to(device=device, dtype=torch.long)
-        t_flat = torch.broadcast_to(
-            t.to(device=device, dtype=dtype), self.shape
-        ).reshape(-1)
-        t_evt = t_flat.index_select(0, flat_idx)
-        dt = self._dt_scalar(dtype, dt=dt)
-        x = (times - t_evt) / dt
-
-        if bool(getattr(self, "diff_scheduled_times", True)):
-            width = max(float(getattr(self, "sched_width", 1.0)), 1e-6)
-            kernel = (1.0 - (x.abs() / width)).clamp(min=0.0, max=1.0)
-        else:
-            event_step = _causal_step_index(times, dt)
-            cur_step = _causal_step_index(t_evt, dt)
-            kernel = (event_step == cur_step).to(dtype)
-
-        amp = weights * kernel
-        gate_flat.index_add_(0, flat_idx, amp)
-
-        event_step = _causal_step_index(times, dt)
-        cur_step = _causal_step_index(t_evt, dt)
-        hard_evt = event_step == cur_step
-        hard_counts.index_add_(0, flat_idx, hard_evt.to(torch.int32))
-        return gate_flat.reshape(self.shape), (hard_counts.reshape(self.shape) > 0)
+        return netstim_tensor_schedule(
+            self.sched_flat_idx.to(device=device, dtype=torch.long),
+            times,
+            weights,
+            t.to(device=device, dtype=dtype),
+            self._dt_scalar(dtype, dt=dt),
+            shape=self.shape,
+            differentiable_times=bool(getattr(self, "diff_scheduled_times", True)),
+            width=float(getattr(self, "sched_width", 1.0)),
+        )
 
     def schedule(
         self,
@@ -1567,18 +1562,16 @@ class NetStim(DNModule, Sliceable):
         previous = _clone_checkpoint_state(self.state_dict_for_checkpoint())
         try:
             result = self._restore_dict_from_checkpoint_unchecked(state_dict)
+            current = self.state_dict_for_checkpoint()
+            tensor_schedule_present = (
+                previous["sched_flat_idx"].numel() > 0
+                or current["sched_flat_idx"].numel() > 0
+            )
             if (
                 any(self._sched_heaps)
-                or any(
-                    getattr(self, name).numel() > 0
-                    for name in (
-                        "sched_flat_idx",
-                        "sched_abs_step",
-                        "sched_time_ms",
-                        "sched_weight",
-                        "sched_weight_idx",
-                        "sched_time_idx",
-                    )
+                or (
+                    tensor_schedule_present
+                    and not _matching_tensor_schedule_configuration(previous, current)
                 )
                 or not bool(torch.isposinf(self.next_sched_time).all())
             ):

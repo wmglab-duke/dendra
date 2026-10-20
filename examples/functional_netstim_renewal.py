@@ -99,9 +99,10 @@ def run_demo():
     reference_weights = tuple(
         connection.weight.w for connection in reference.synapses.values()
     )
-    time = model.t.detach().clone()
+    origin = model.t.detach().clone()
 
     for index in range(16):
+        time = origin + origin.new_tensor(index) * DT
         # region sample
         # Cold sampling uses an independent Generator restored from explicit state.
         draw = generator.sample_step_draw(source_state)
@@ -177,7 +178,6 @@ def run_demo():
                 population_states,
                 check_seeder=True,
             )
-        time = time + DT
 
     loss = sum(state["integrator"]["v"].square().sum() for state in population_states)
     gradients = torch.autograd.grad(loss, (parameters["interval"], *weights))

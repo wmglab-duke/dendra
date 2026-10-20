@@ -346,17 +346,13 @@ def test_inference_mode_commit_publishes_ordinary_native_mutable_storage():
     native.advance()
 
 
-@pytest.mark.parametrize(
-    "unsupported", ("compact", "schedule", "delay", "uninitialized")
-)
+@pytest.mark.parametrize("unsupported", ("compact", "delay", "uninitialized"))
 def test_unsupported_projection_layouts_fail_before_effects(unsupported):
     _, native = _netcon(
         delay_backend="sparse_calendar" if unsupported == "compact" else "dense",
         tracked=False,
     )
-    if unsupported == "schedule":
-        native.schedule(con_indices=[0], times_ms=[DT])
-    elif unsupported == "delay":
+    if unsupported == "delay":
         native.set_diff_config(
             diff_weights=True,
             diff_delays=True,

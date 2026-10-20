@@ -22,3 +22,4 @@ Advanced
    advanced/A12_functional_event_delivery.md
    advanced/A13_functional_threshold_detection.md
    advanced/A14_functional_netstim_renewal.md
+   advanced/A15_functional_tensor_schedules.md

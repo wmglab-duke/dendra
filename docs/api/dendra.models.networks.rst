@@ -55,6 +55,8 @@ NetCon; the standard Network remains the connectivity declaration. See
 :doc:`../advanced/A12_functional_event_delivery` for the supported configuration
 and complete runnable example. See :doc:`../advanced/A13_functional_threshold_detection`
 for finite thresholds and ordered receive-before-observe execution.
+Shared tensor schedule evaluation, differentiable values, and indexed source
+bindings are described in :doc:`../advanced/A15_functional_tensor_schedules`.
 
 .. autofunction:: dendra.func.make_functional_netcon
 
@@ -67,10 +69,12 @@ for finite thresholds and ordered receive-before-observe execution.
 Functional NetStim renewal
 --------------------------
 
-Initialized unscheduled NetStims expose the shared pure initialization and
+Initialized NetStims expose the shared pure initialization and
 renewal core through explicit parameters, random draws, and clock/RNG carry.
 See :doc:`../advanced/A14_functional_netstim_renewal` for sampling policy,
 ordered projection composition, and checkpoint continuation.
+Tensor schedules and indexed bindings are described in
+:doc:`../advanced/A15_functional_tensor_schedules`.
 
 .. autofunction:: dendra.func.make_functional_netstim
 
@@ -84,4 +88,7 @@ ordered projection composition, and checkpoint continuation.
    :members:
 
 .. autoclass:: dendra.func.NetStimOutputs
+   :members:
+
+.. autoclass:: dendra.func.TensorScheduleTensors
    :members:

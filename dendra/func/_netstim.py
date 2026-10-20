@@ -13,9 +13,14 @@ from dendra.models.networks._netstim_renewal import (
     netstim_initial_state,
     netstim_renewal,
 )
+from dendra.models.networks._tensor_schedules import (
+    netstim_tensor_schedule,
+    resolve_schedule_values,
+)
 from dendra.models.networks.netstim import NetStim
 from dendra.models.parametric import PositiveParam
 
+from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
 from ._types import FunctionalizationError
 
 
@@ -25,6 +30,7 @@ class NetStimTensors(NamedTuple):
     parameters: dict[str, torch.Tensor]
     constants: dict[str, torch.Tensor]
     state: dict[str, torch.Tensor]
+    schedule: TensorScheduleTensors | None = None
 
 
 class NetStimDraw(NamedTuple):
@@ -54,18 +60,9 @@ def _snapshot(value, *, parameter=False):
         return result
 
 
-def _unscheduled(source):
-    return (
-        not any(source._sched_heaps)
-        and source.sched_flat_idx.numel() == 0
-        and source.sched_abs_step.numel() == 0
-        and source.sched_time_ms.numel() == 0
-        and source.sched_weight.numel() == 0
-        and source.sched_weight_idx.numel() == 0
-        and source.sched_time_idx.numel() == 0
-        and source._sched_w_source is None
-        and source._sched_t_source is None
-        and bool(torch.isposinf(source.next_sched_time).all())
+def _without_heap_schedules(source):
+    return not any(source._sched_heaps) and bool(
+        torch.isposinf(source.next_sched_time).all()
     )
 
 
@@ -74,10 +71,10 @@ def _eligible(source):
         raise FunctionalizationError("Expected an initialized canonical NetStim.")
     if not getattr(source, "_renewal_initialized", False):
         raise FunctionalizationError("Initialize the NetStim before lowering it.")
-    if not _unscheduled(source):
+    if not _without_heap_schedules(source):
         raise FunctionalizationError(
-            "Functional NetStim currently requires unscheduled renewal; "
-            "heap/tensor schedules and bound schedule sources are unsupported."
+            "Functional NetStim does not support heap schedules or finite legacy "
+            "schedule heads; use tensor schedules instead."
         )
     interval = source.interval
     if (
@@ -98,7 +95,7 @@ def _eligible(source):
 class FunctionalNetStim:
     """A pure renewal plan with explicit random draws and checkpointable RNG.
 
-    Lower an initialized, unscheduled :class:`~dendra.NetStim`. Effective
+    Lower an initialized :class:`~dendra.NetStim` with optional tensor schedules. Effective
     ``interval``, ``start``, ``noise``, and ``tau`` parameters use the full native
     state shape; ``max_spikes`` is an explicit integer constant. Parameters are
     independent leaf snapshots, so gradients never reach the source module.
@@ -120,8 +117,10 @@ class FunctionalNetStim:
     Configuration changes require lowering again. Runtime carry changes do not
     invalidate a plan. :meth:`commit_state_` transfers clocks and both RNG states
     without changing native parameters or constants; those must match explicit
-    values when continuing the same trajectory natively. Schedules remain the
-    responsibility of the native adapter in this first lowering interface.
+    values when continuing the same trajectory natively. Tensor schedule values
+    are explicit in :class:`TensorScheduleTensors`; routing and source indices
+    are frozen at lowering, along with ``schedule_dt``. Set the native timestep
+    before lowering. Heap schedules remain native-only.
     """
 
     def __init__(self, source):
@@ -138,6 +137,10 @@ class FunctionalNetStim:
         self.shape = tuple(source.shape)
         self.device = source.next_stoch_time.device
         self.dtype = source.next_stoch_time.dtype
+        self._dt = _snapshot(source.schedule_dt)
+        self._schedule = _TensorSchedulePlan(
+            source, index_name="sched_flat_idx", device=self.device, dtype=self.dtype
+        )
         checkpoint = source.state_dict_for_checkpoint()
         self._state_schema = {
             name: (
@@ -260,6 +263,15 @@ class FunctionalNetStim:
             )
         checkpoint = source.state_dict_for_checkpoint()
         self._validate_state({name: checkpoint[name] for name in self._state_schema})
+        self._schedule.validate_compatible(source)
+        if not torch.equal(source.schedule_dt, self._dt):
+            raise FunctionalizationError(
+                "NetStim schedule timestep does not match this plan."
+            )
+        if bool((self._schedule.indices >= source.numel()).any()):
+            raise FunctionalizationError(
+                "NetStim tensor schedule index is outside its source."
+            )
         if source._rng.device != self.device:
             raise FunctionalizationError(
                 "Initialize NetStim RNG on its state device first."
@@ -293,7 +305,9 @@ class FunctionalNetStim:
         checkpoint = source.state_dict_for_checkpoint()
         state = {name: _snapshot(checkpoint[name]) for name in self._state_schema}
         self._validate_parameters(parameters, constants)
-        return NetStimTensors(parameters, constants, state)
+        return NetStimTensors(
+            parameters, constants, state, self._schedule.extract(source)
+        )
 
     def _generator(self, state):
         generator = torch.Generator(device=self.device)
@@ -359,15 +373,50 @@ class FunctionalNetStim:
             "seeder_state": state["seeder_state"],
         }
 
-    def step(self, parameters, constants, state, t, draw, *, bptt=False):
-        """Return next clock/RNG carry and hard/surrogate outputs for time ``t``."""
+    def step(self, parameters, constants, state, t, draw, *, bptt=False, schedule=None):
+        """Return next clock/RNG carry and hard/surrogate outputs for time ``t``.
+
+        A plan with tensor events or bound sources requires an explicit
+        ``schedule`` packet. Event values may change; routing and source-index
+        maps retain the topology captured at lowering.
+        """
         self._validate_source()
         self._validate_parameters(parameters, constants)
         self._validate_state(state)
         self._validate_draw(draw)
+        self._schedule.validate(schedule)
         time = broadcast_netstim_time(
             t, self.shape, device=self.device, dtype=self.dtype
         )
+        scheduled_gate = scheduled_hard = None
+        if self._schedule.active:
+            times, amplitudes = resolve_schedule_values(
+                schedule.times,
+                schedule.amplitudes,
+                self._schedule.time_idx,
+                self._schedule.amplitude_idx,
+                time_source=(
+                    schedule.time_source if self._schedule.has_time_refs else None
+                ),
+                weight_source=(
+                    schedule.amplitude_source
+                    if self._schedule.has_amplitude_refs
+                    else None
+                ),
+                time_dtype=self.dtype,
+                weight_dtype=self.dtype,
+                device=self.device,
+            )
+            scheduled_gate, scheduled_hard = netstim_tensor_schedule(
+                self._schedule.indices,
+                times,
+                amplitudes,
+                time,
+                self._dt,
+                shape=self.shape,
+                differentiable_times=self._schedule_mode[0],
+                width=self._schedule_mode[1],
+            )
         transition = netstim_renewal(
             NetStimState(
                 state["next_stoch_time"], state["spike_counts"], state["t_last"]
@@ -379,6 +428,8 @@ class FunctionalNetStim:
             draw.exp_rand,
             tau=parameters["tau"],
             bptt=bptt,
+            scheduled_gate=scheduled_gate,
+            scheduled_hard=scheduled_hard,
         )
         return {
             "next_stoch_time": (
@@ -397,6 +448,8 @@ class FunctionalNetStim:
 
         Native training restores retain the incoming clock's autograd history;
         evaluation restores detach the clock, clearing any prior native history.
+        Schedule values and bound sources are left as configured on ``source``;
+        align them with the explicit packet before continuing a changed schedule.
         """
         if torch.compiler.is_compiling():
             raise FunctionalizationError("Commit NetStim state outside torch.compile.")
@@ -417,7 +470,7 @@ class FunctionalNetStim:
 
 
 def make_functional_netstim(source) -> tuple[FunctionalNetStim, NetStimTensors]:
-    """Lower one initialized unscheduled NetStim using explicit clock/RNG carry."""
+    """Lower an initialized NetStim using explicit clock/RNG and schedule tensors."""
     plan = FunctionalNetStim(source)
     return plan, plan.extract()
 
