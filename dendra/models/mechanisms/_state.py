@@ -2399,7 +2399,15 @@ class State(Parameterized):
         return outputs
 
     def advance(self, v, dt, values):
-        """Return the next declared state from a read-only current-value frame."""
+        """Return the next declared state from a read-only current-value frame.
+
+        The default implementation runs the generated solver for this State's
+        equations. An override replaces that transition and must return every
+        declared STATE tensor, plus any optional replacements for this State's
+        CARRY. Runtime outputs preserve their exact shape, dtype, and device.
+        Other bundles and the owning Mechanism advance from the same incoming
+        snapshot; their new values are not visible during this calculation.
+        """
         if self.method == "euler_heun":
             return self._solve(v, dt, values)
         assigned = self._derive_assigned_values(v, values)
@@ -2460,7 +2468,8 @@ class State(Parameterized):
         support-visible ``celsius`` and local ``diam`` inputs, and any
         support-local Ion/Material/current aliases installed by the owning
         Mechanism for this ordered initialization phase.
-        Returned values must be Tensors broadcastable to the local voltage
+        Returned values must be Tensors with the declared dtype/device and
+        shapes broadcastable to each output's local or structural storage
         shape. The hook must not mutate module state or consume implicit RNG.
 
         """

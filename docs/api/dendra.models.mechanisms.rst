@@ -228,6 +228,15 @@ The remaining declarations describe the same lifetimes at either scope:
 * ``TIMESTEP_BUFFER`` is a prepared workspace that additionally depends on
   ``dt``.
 
+``State.INPUT(name, ..., default=0.0)`` has a separate read-only role. It adds
+an ephemeral tensor to that State's value frame without allocating a registered
+buffer or checkpointed carry. ``Population.bind_input(...)`` can supply it
+from a declared tensor on another mechanism in the same Population. Unbound
+inputs, and all inputs during initialization, use their declared defaults.
+An input cannot be returned as an authored update. See
+:ref:`functional-input-bindings` for binding paths, support projection, and
+consumer-phase ordering.
+
 ``Mechanism.SAVE_CURRENT("i")`` is intentionally narrower than ``CARRY``. The
 name must also be declared as a nonspecific or ionic current. Dendra owns the
 checkpointed ``i_`` mirror, initializes it to zero, and refreshes it when that
@@ -246,9 +255,35 @@ than once at different stage voltages. It returns exactly the declared
 ``advance(v, dt, values)``, which runs once per accepted timestep. A custom
 State ``advance`` returns every declared solver tensor and may also update that
 State's ``CARRY``. A Mechanism ``advance`` returns a partial update of its own
-``CARRY`` and writable or additive Ion/Material locals. Every runtime output
-must be a Tensor with the declared shape, dtype, and device. A State's default
-``advance`` is the generated transition for its declared equations.
+``CARRY`` and writable or additive Ion/Material locals; it cannot replace
+private bundle solver state or nested State carry. A solver-state name that
+is also declared as an owned writable shared-field local remains a permitted
+shared-field output. Such Mechanism updates commit after bundle results;
+prefer one owner for a field's transition to avoid overlapping updates.
+Omitted optional fields remain
+unchanged. Every runtime output must be a Tensor with the exact declared
+shape, dtype, and device. Unlike initialization overlays, these runtime
+mappings do not broadcast outputs.
+
+A State's default ``advance`` is the generated transition for its declared
+equations. Replacing ``State.advance`` replaces that transition: Dendra does
+not additionally run the declared ODE solver. Use an equation for continuous
+decay/recovery when its solver should own that dynamics; use a custom
+transition when the full next-state calculation must be authored explicitly.
+
+All State bundles and the owning Mechanism's accepted-step hook read one
+snapshot taken before their transition. Dendra evaluates every returned
+mapping before committing their updates. Thus ``Mechanism.advance`` does not
+see the newly solved bundle state, and separate bundles do not imply one
+joint coupled ODE solve. A State's value frame additionally includes its own
+carry and declared inputs. Treat voltage, the value frame, and module tensors
+as read-only; return new tensors instead of assigning buffers in a hook.
+
+Event reception is a separate invocation phase. A synapse may receive several
+calls within one timestep, including zero payloads. Keep once-per-step work
+in an accepted-step transition rather than repeating it for every receive
+call. See :doc:`../synapse_authoring` for a complete custom synapse and
+:ref:`functional-event-receive` for the event contract.
 
 Authors migrating custom mechanisms from Dendra 0.24 or earlier should follow
 :doc:`Custom-mechanism migration <../upgrading>`.
@@ -273,9 +308,21 @@ and local geometry and then remains fixed between initializations. Implement
            }
 
 Dendra refreshes these tensors before State initial-value inference and
-``initial_values(...)`` hooks. The builder must not
-mutate module tensors or depend on voltage, evolving state, Ion/Material state,
-randomness, or timestep.
+``initial_values(...)`` hooks. The builder must return Tensors on the declared
+device and dtype, with shapes broadcastable to the declared storage. Dendra
+materializes independent storage while preserving autograd. The builder must
+not mutate module tensors or depend on voltage, evolving state, Ion/Material
+state, randomness, or timestep.
+
+Prepared workspaces are not reactive caches of arbitrary tensor edits.
+Ordinary ``Population.initialize()`` refreshes effective parameters and static
+workspaces from the current configured sources. If a parameter, temperature,
+or geometry source changes, initialize again to refresh its dependents.
+Timestep configuration rebuilds timestep workspaces from those prepared
+inputs; it does not rerun static builders. In functional execution, call
+``prepare(parameters, constants)`` again after changing parameters/constants,
+or use a combined ``prepare_and_*`` operation. A prepared plan belongs to the
+inputs from which it was built.
 
 Pure initialization
 -------------------
@@ -302,9 +349,19 @@ state or carry:
 
 For fresh functional initialization, every declared State value must be resolved
 by a shared-field seed, ``state_defaults``, an explicit ``ic``, or an
-``initial_values`` overlay. Mechanism overlays run before ordered State overlays.
-A State overlay may return only its own ``STATE`` and ``CARRY`` names; a
-Mechanism overlay may additionally return its writable Ion/Material locals.
+``initial_values`` overlay. The precedence is shared-field seed, State defaults,
+``ic``, Mechanism overlay, then ordered State overlays. Ordinary carry starts
+from zero before the overlays run. A State overlay may return only its own
+``STATE`` and ``CARRY`` names. A Mechanism overlay may return flattened solver
+state, direct Mechanism ``CARRY``, and its owned writable Ion/Material locals;
+it cannot initialize another State's nested carry through a flat mapping.
+
+These overlays are partial mappings: omitted fields retain their earlier
+values. Returned values must be Tensors on each declared output's dtype and
+device, with shapes broadcastable to that output's local or structural shape.
+Dendra expands and clones them into independent storage. Do not return
+``ASSIGNED``, prepared workspace, read-only shared fields, input names, or
+saved-current mirrors. Initialize algebra through its own builder instead.
 
 Every State bundle registered on one Mechanism must have a unique class name,
 and their flattened ``STATE`` names must be disjoint. This keeps module lookup,
@@ -313,9 +370,14 @@ subclass that replaces a bundle should inherit directly from the intended
 Mechanism base and redeclare the complete replacement bundle rather than
 adding a second State with the same output names.
 
-The hook must return Tensors, remain deterministic, and avoid all mutation and
-implicit RNG. ``values["celsius"]`` is already padded to local voltage rank for
+The hooks must remain deterministic and avoid all mutation and implicit RNG.
+Their value frames expose the available ordered initialized values and local
+shared-field aliases. ``values["celsius"]`` is padded to local voltage rank for
 transform-safe broadcasting; ``values["diam"]`` supplies local geometry.
+Parameters and prepared workspaces can be read through ``self``. Runtime
+State input bindings are not sampled during initialization; their declared
+defaults are used instead. See :ref:`model-initialization` for the complete
+initialization transaction and Population-level hooks/transforms.
 
 Use ``Mechanism.TIMESTEP_BUFFER(...)`` or ``State.TIMESTEP_BUFFER(...)`` when a
 workspace also depends on the simulation timestep. Implement
@@ -364,7 +426,8 @@ throughout its class hierarchy.
 ``TIMESTEP_BUFFER`` already declares the registered buffer, so do not repeat the
 same name with ``CARRY`` or ``ASSIGNED``. The builder must not read evolving
 state, mutate registered tensors, use randomness, or depend on another installed
-timestep workspace.
+timestep workspace. Compute related results together using local variables
+rather than depending on a previously installed buffer from the same family.
 
 Both workspace families are registered buffers and participate in
 ``state_dict`` serialization. Runtime simulation checkpoints do not treat them
@@ -422,24 +485,74 @@ evolving state.
    :members: voltage_values, update_v
    :show-inheritance:
 
-``voltage_values(v, dt, values)`` is the pure voltage-and-carry update hook.
-Its result is ``(new_voltage, carry_updates)``; only declared ``CARRY`` values
-may be replaced. The base ``update_v`` method is the imperative adapter for
-this hook. Existing subclasses overriding ``update_v`` remain imperative-only.
-See :ref:`functional-voltage-processes` for timestep ordering, initialization,
-continuation, and the hard-forward/surrogate-backward semantics of the built-in
-``fire`` family.
+``voltage_values(v, dt, values)`` is the pure voltage/state update hook.
+It returns ``(new_voltage, updates)``. The flat ``updates`` mapping may replace
+any subset of the process's declared bundle ``STATE`` tensors and direct
+Mechanism ``CARRY``, preserving their exact shape, dtype and device. It cannot
+replace nested State carry, ``ASSIGNED``, prepared workspaces, or shared fields.
+The returned voltage must match ``v`` in shape, dtype and device.
+
+The value frame contains ordinary Mechanism runtime values, prepared
+workspaces, local shared fields, ``celsius`` and ``diam``; parameters may be
+read through ``self``. The base ``update_v`` method is the imperative adapter.
+Voltage processes run in their existing ordered support-local phase before
+State advancement and membrane-current assembly; they do not run during
+initialization. Existing subclasses overriding ``update_v`` remain
+imperative-only. See :ref:`functional-voltage-processes` for continuation and
+the hard-forward/surrogate-backward semantics of the built-in ``fire`` family.
 
 .. autoclass:: dendra.models.mechanisms.Synapse
-   :members: net_receive
+   :members: net_receive, net_receive_values
    :show-inheritance:
+
+Implement ``net_receive_values(weights, dt, values)`` for a custom event-driven
+synapse and retain the canonical ``net_receive`` adapter. Before invoking the
+hook, Dendra requires Tensor weights on the mechanism's dtype/device and
+broadcasts them to the actual local runtime shape, including explicit
+Population batch axes. The hook receives ``dt`` in milliseconds as a
+broadcastable one-element Tensor with shape ``(1,)``. A structural scalar
+output must be reshaped back to its declared scalar shape after arithmetic.
+
+The return value is a partial mapping with three optional sections:
+
+* ``"states"`` maps flattened bundle ``STATE`` names to replacements.
+* ``"carry"`` maps direct Mechanism ``CARRY`` names to replacements.
+* ``"state_carry"`` maps bundle class names to mappings of that State's
+  ``CARRY`` replacements.
+
+All replacements must match their exact declared shape, dtype and device.
+Omitted fields remain unchanged. Validation of the complete mapping occurs
+before Dendra commits any returned replacement. Shared fields, continuous
+inputs, ``ASSIGNED``, saved-current mirrors, and prepared workspaces are
+read-only here even if a name also appears in a persistent declaration.
+
+The frame exposes explicit Mechanism state, prepared workspaces, local shared
+fields, read-only saved-current mirrors, ``celsius`` and ``diam``, plus nested
+State carry under ``values["state_carry"][StateName]``. Scalar ``celsius`` is
+exposed with shape ``(1,)`` for transform-safe broadcasting. The flat name
+``state_carry`` is reserved. Ephemeral ``ASSIGNED`` values are excluded; derive
+event algebra inside the hook or declare persistent ``CARRY``. Parameters may
+be read through ``self``. No extra current or assigned-value evaluation is
+performed for a receive call.
+
+One receive call represents one existing connection invocation, even for a
+zero payload; several calls may occur in one timestep. Dendra preserves that
+order. A receive hook does not advance the clock or run State decay.
+Legacy overrides of ``net_receive`` continue to work imperatively, but cannot
+be used for functional event reception. See :doc:`../synapse_authoring` for a
+complete implementation and :ref:`functional-event-receive` for explicit
+functional delivery.
 
 .. autoclass:: dendra.models.mechanisms.ContinuousSynapse
    :members: INPUT, reset_continuous_inputs, continuous_receive
    :show-inheritance:
 
-
-
+``ContinuousSynapse.INPUT`` declares a persistent delivery buffer populated by
+Network continuous connections, with optional previous-input storage. It is
+distinct from ephemeral ``State.INPUT`` values supplied by
+``Population.bind_input(...)`` in the same Population. Qualify the declaration
+with its owning class. See :doc:`../synapse_authoring` for a continuous synapse
+example.
 
 State SDE support
 -----------------

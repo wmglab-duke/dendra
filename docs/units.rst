@@ -212,10 +212,13 @@ and would make the point-process value one million times too small. To express
 50 nS in the required µS coordinate using the conversion scalars, use
 ``50 * nS / uS``.
 
-Connection weights are otherwise target-defined. A custom synapse must document
-the units of the input changed by its ``net_receive`` or ``continuous_receive``
-method. For the built-in density-style ``graded_syn``, a dimensionless release
-gate uses a connection weight and ``g_pre`` in S/cm².
+Connection weights are otherwise target-defined. A custom event synapse must
+document the units of the state changed by its pure ``net_receive_values``
+hook; the standard ``net_receive`` adapter applies those updates. A continuous
+target documents the units of the input filled by ``continuous_receive``.
+For the built-in density-style ``graded_syn``, a dimensionless release gate
+uses a connection weight and ``g_pre`` in S/cm². See :doc:`synapse_authoring`
+for complete implementations of both contracts.
 
 Materials and ions
 ------------------

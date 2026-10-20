@@ -62,7 +62,12 @@ from dendra.models.mechanisms._material_process import (
     MaterialProcess,
 )
 from dendra.models.mechanisms._materials import Material
-from dendra.models.mechanisms._mechanism import Mechanism, PointProcess, VoltageProcess
+from dendra.models.mechanisms._mechanism import (
+    Mechanism,
+    PointProcess,
+    Synapse,
+    VoltageProcess,
+)
 from dendra.models.mechanisms._numerical import (
     validate_declared_numerical_current as _validate_declared_numerical_current,
 )
@@ -547,6 +552,17 @@ _STANDARD_VOLTAGE_FUNCTIONAL_ADAPTERS = {
     for name in ("update_v", "_derive_voltage_values")
 }
 _STANDARD_VOLTAGE_VALUES = inspect.getattr_static(VoltageProcess, "voltage_values")
+_RECEIVE_ADAPTER_NAMES = (
+    "net_receive",
+    "_net_receive_payload_shape",
+    "_net_receive_value_frame",
+    "_derive_net_receive_values",
+    "_apply_net_receive_updates",
+)
+_STANDARD_RECEIVE_ADAPTERS = {
+    name: inspect.getattr_static(Synapse, name) for name in _RECEIVE_ADAPTER_NAMES
+}
+_STANDARD_RECEIVE_VALUES = inspect.getattr_static(Synapse, "net_receive_values")
 _STATE_IMPERATIVE_INITIALIZATION_HOOKS = (
     "populate_parameter_buffers",
     "init_rng",
@@ -1791,6 +1807,77 @@ def _voltage_process_failures(process):
     return failures
 
 
+def _event_receiver_failures(process):
+    if not isinstance(process, Synapse):
+        return ["target is not a Synapse"]
+    failures = []
+    changed = [
+        name
+        for name, standard in _STANDARD_RECEIVE_ADAPTERS.items()
+        if name in process.__dict__
+        or inspect.getattr_static(type(process), name) is not standard
+    ]
+    if changed:
+        failures.append(
+            f"replaces canonical event adapters {changed}; implement "
+            "net_receive_values(weights, dt, values) instead"
+        )
+    if "net_receive_values" in process.__dict__:
+        failures.append("replaces net_receive_values on the instance")
+    elif (
+        inspect.getattr_static(type(process), "net_receive_values")
+        is _STANDARD_RECEIVE_VALUES
+    ):
+        failures.append("does not implement pure net_receive_values")
+    elif not inspect.isfunction(
+        inspect.getattr_static(type(process), "net_receive_values")
+    ):
+        failures.append(
+            "net_receive_values must be a pure method on its Synapse subclass"
+        )
+    else:
+        try:
+            _initialization_callable_dependency_signature(
+                process.net_receive_values,
+                label=f"{process.name}.net_receive_values",
+                owner=process,
+                strict=True,
+                forbidden_receiver_attributes=frozenset(process._assigned)
+                | {"_buffers", "_runtime_value_frame"},
+            )
+        except FunctionalizationError as exc:
+            failures.append(str(exc))
+    return failures
+
+
+def _event_receiver_signature(process):
+    if not isinstance(process, Synapse):
+        return None
+    return (
+        _configuration_signature(getattr(process, "_continuous_inputs", ())),
+        _configuration_signature(getattr(process, "_continuous_input_old", {})),
+        tuple(
+            (name, _effective_hook_identity(process, name))
+            for name in (*_RECEIVE_ADAPTER_NAMES, "net_receive_values")
+        ),
+        (
+            _initialization_callable_dependency_signature(
+                process.net_receive_values,
+                label=f"{process.name}.net_receive_values",
+                owner=process,
+                strict=False,
+                forbidden_receiver_attributes=frozenset(process._assigned)
+                | {"_buffers", "_runtime_value_frame"},
+            )
+            if "net_receive_values" not in process.__dict__
+            and inspect.isfunction(
+                inspect.getattr_static(type(process), "net_receive_values")
+            )
+            else ("unsupported-receive-hook",)
+        ),
+    )
+
+
 def _state_external_input_signature(state, mechanism):
     """Describe implicit external State inputs without evaluating getters.
 
@@ -2098,6 +2185,32 @@ def _install_state_input_audits(population):
                         getattr(state, hook_name),
                     ),
                 )
+
+
+def _install_event_receiver_audit(process):
+    """Observe the pure event hook before its returned updates are committed."""
+    hook = process.net_receive_values
+
+    def evaluate(weights, dt, values):
+        registered = _registered_tensor_bindings(process)
+        python_state = _transition_python_state_snapshot(process)
+        arguments = (weights, dt, values)
+        argument_state = _audit_python_value_signature(arguments, set())
+        try:
+            return hook(weights, dt, values)
+        finally:
+            if (
+                _registered_tensor_bindings(process) != registered
+                or _transition_python_state_snapshot(process) != python_state
+                or _audit_python_value_signature(arguments, set()) != argument_state
+            ):
+                raise FunctionalizationError(
+                    f"Synapse {process.name!r}.net_receive_values() mutated its "
+                    "module or read-only payload, timestep, or values inputs. "
+                    "Return declared event updates without modifying inputs or self."
+                )
+
+    process.net_receive_values = evaluate
 
 
 def _material_process_failures(process, population=None):
@@ -6090,6 +6203,61 @@ class _PopulationTransition(torch.nn.Module):
         return tuple(outputs)
 
 
+class _PopulationReceive(torch.nn.Module):
+    """Apply exactly one event transaction to an explicitly rebound Population."""
+
+    def __init__(self, population, target, layout):
+        super().__init__()
+        self.population = population
+        self.target = target
+        self.layout = layout
+        object.__setattr__(
+            self,
+            "_state_owners",
+            tuple(_module_at(population, entry.module_path) for entry in layout),
+        )
+
+    def forward(self, v, t, duration_remainder, dt, payload):
+        incoming = []
+        for entry, owner in zip(self.layout, self._state_owners, strict=True):
+            if entry.public_path == ("integrator", "v"):
+                value = v
+            elif entry.public_path == ("clock", "t"):
+                value = t
+            elif entry.public_path == ("control", "duration_remainder"):
+                value = duration_remainder
+            else:
+                value = owner._buffers[entry.buffer_name]
+            incoming.append(value)
+        self.population._buffers["t"] = t
+        handler = self.population.mech
+        handler.read_from_ions()
+        handler.read_from_materials()
+        handler._bind_ion_current_fields()
+        mechanism = handler.mechanisms[self.target]
+        updates = mechanism._derive_net_receive_values(
+            payload, dt, mechanism._net_receive_value_frame()
+        )
+        mechanism._apply_net_receive_updates(updates)
+        outputs = []
+        for entry, previous in zip(self.layout, incoming, strict=True):
+            path = entry.public_path
+            value = previous
+            if len(path) > 2 and path[1] == self.target:
+                if path[0] == "mechanisms":
+                    value = updates.get("states", {}).get(path[2], previous)
+                elif path[0] == "mechanism_buffers":
+                    value = updates.get("carry", {}).get(path[2], previous)
+                elif path[0] == "state_buffers":
+                    value = (
+                        updates.get("state_carry", {})
+                        .get(path[2], {})
+                        .get(path[3], previous)
+                    )
+            outputs.append(value)
+        return tuple(outputs)
+
+
 def _uses_standard_unmyelinated_geometry(population) -> bool:
     for name in ("area", "edge_resistance_ohm"):
         if inspect.getattr_static(type(population), name) is not inspect.getattr_static(
@@ -7652,6 +7820,21 @@ def _functionalization_failures(
                 )
     for mechanism in stateful_modules:
         mechanism_label = getattr(mechanism, "name", type(mechanism).__qualname__)
+        if (
+            isinstance(mechanism, Synapse)
+            and "net_receive" not in mechanism.__dict__
+            and inspect.getattr_static(type(mechanism), "net_receive")
+            is _STANDARD_RECEIVE_ADAPTERS["net_receive"]
+            and (
+                "net_receive_values" in mechanism.__dict__
+                or inspect.getattr_static(type(mechanism), "net_receive_values")
+                is not _STANDARD_RECEIVE_VALUES
+            )
+        ):
+            failures.extend(
+                f"Synapse {mechanism_label!r}: {failure}"
+                for failure in _event_receiver_failures(mechanism)
+            )
         class_has_assigned_values = (
             inspect.getattr_static(type(mechanism), "assigned_values")
             is not _STANDARD_MECHANISM_ASSIGNED_VALUES
@@ -8775,6 +8958,7 @@ def _structure_signature(population) -> tuple:
             _membrane_coefficient_signature(module),
             _material_process_signature(module, handler),
             _voltage_process_signature(module),
+            _event_receiver_signature(module),
         )
 
     return (
@@ -9170,6 +9354,37 @@ class FunctionalPopulation:
             solver,
             self._state_layout,
         )
+        self._receiver_failures = {
+            name: tuple(_event_receiver_failures(mechanism))
+            for name, mechanism in execution_population.mech.mechanisms.items()
+        }
+        self._receivers = {
+            name: _PopulationReceive(execution_population, name, self._state_layout)
+            for name, failures in self._receiver_failures.items()
+            if not failures
+        }
+        self._receiver_shapes = {
+            name: tuple(
+                execution_population.mech.mechanisms[name]._net_receive_payload_shape()
+            )
+            for name in self._receivers
+        }
+        self._source_receiver_hooks = {
+            name: tuple(
+                (
+                    hook,
+                    tuple(
+                        (cls, vars(cls).get(hook))
+                        for cls in type(population.mech.mechanisms[name]).__mro__
+                    ),
+                )
+                for hook in (*_RECEIVE_ADAPTER_NAMES, "net_receive_values")
+            )
+            for name in self._receivers
+        }
+        self._source_receiver_types = {
+            name: type(population.mech.mechanisms[name]) for name in self._receivers
+        }
         _validate_support_keys(
             population,
             reference=execution_population,
@@ -11657,6 +11872,100 @@ class FunctionalPopulation:
             state_positionals[("control", "duration_remainder")],
         )
 
+    def _audit_event_receivers(self, tensors: PopulationTensors) -> None:
+        """Exercise each pure receiver on disposable zero/nonzero event frames."""
+        if not self._receivers:
+            return
+        rng_state = _global_rng_snapshot(self.device)
+        class_state = _class_state_snapshot(
+            _authored_workspace_classes(self._transition)
+        )
+        mutated_class_state = set()
+        consumed_rng = set()
+        try:
+            with torch.inference_mode(False), torch.no_grad():
+                parameters = {
+                    name: value.detach().clone()
+                    for name, value in tensors.parameters.items()
+                }
+                constants = {
+                    name: value.detach().clone()
+                    for name, value in tensors.constants.items()
+                }
+                state = self._clone_state_tree(tensors.state)
+                prepared = self._prepare_values(parameters, constants)
+                for target in self._receivers:
+                    population = _deepcopy_execution_module(self._transition.population)
+                    _rebind_population_time_references(population)
+                    process = population.mech.mechanisms[target]
+                    _install_event_receiver_audit(process)
+                    facade = _PopulationReceive(population, target, self._state_layout)
+                    python_state = _transition_python_state_snapshot(facade)
+                    registered = _registered_tensor_bindings(facade)
+                    repeated = []
+                    for weight in (0.0, 0.25, 0.25):
+                        mapping, dt, _celsius, v, t, remainder = self._mapping(
+                            parameters, prepared, state, isolate_read_only=True
+                        )
+                        payload = torch.full(
+                            self._receiver_shapes[target],
+                            weight,
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
+                        payload_before = _audit_tensor_binding(payload)
+                        read_only = {
+                            name: _audit_tensor_binding(value)
+                            for name, value in mapping.items()
+                            if name not in self._mutable_mapping_slots
+                        }
+                        try:
+                            outputs = functional_call(
+                                facade,
+                                mapping,
+                                (v, t, remainder, dt, payload),
+                                tie_weights=False,
+                            )
+                        except Exception as exc:
+                            raise FunctionalizationError(
+                                f"Synapse {target!r} pure event audit failed: {exc}"
+                            ) from exc
+                        if (
+                            _audit_tensor_binding(payload) != payload_before
+                            or any(
+                                name not in mapping
+                                or _audit_tensor_binding(mapping[name]) != binding
+                                for name, binding in read_only.items()
+                            )
+                            or _registered_tensor_bindings(facade) != registered
+                            or _transition_python_state_snapshot(facade) != python_state
+                        ):
+                            raise FunctionalizationError(
+                                f"Synapse {target!r} event receiver mutated read-only "
+                                "inputs or retained hidden module/Python state"
+                            )
+                        if weight:
+                            repeated.append(
+                                tuple(_audit_tensor_value(value) for value in outputs)
+                            )
+                    if repeated[0] != repeated[1]:
+                        raise FunctionalizationError(
+                            f"Synapse {target!r} event receiver returned "
+                            "non-deterministic results from identical explicit inputs"
+                        )
+        finally:
+            try:
+                mutated_class_state.update(_restore_class_state(class_state))
+            finally:
+                consumed_rng.update(_global_rng_changes(rng_state, self.device))
+                _restore_global_rng(rng_state, self.device)
+        if mutated_class_state or consumed_rng:
+            raise FunctionalizationError(
+                "pure event receiver audit observed class mutation or RNG "
+                f"consumption: classes={sorted(mutated_class_state)}, "
+                f"RNG={sorted(consumed_rng)}"
+            )
+
     def _audit_read_only_workspaces(self, tensors: PopulationTensors) -> None:
         """Prove preparation/transition purity before exposing a hot-path plan."""
         # A failed re-audit leaves even directly constructed/internal plans on
@@ -12679,6 +12988,87 @@ class FunctionalPopulation:
             _put_path(cloned, leaf.public_path, value)
         return cloned
 
+    def _validate_receive(self, target, payload):
+        if not isinstance(target, str):
+            raise TypeError("event target must be a mechanism name")
+        if target not in self._receiver_failures:
+            raise ValueError(f"unknown event target {target!r}")
+        failures = self._receiver_failures[target]
+        if failures:
+            raise FunctionalizationError(
+                f"Synapse {target!r} cannot receive functional events: "
+                + "; ".join(failures)
+            )
+        if not torch.is_tensor(payload):
+            raise TypeError("event payload must be a Tensor")
+        if payload.device != self.device or payload.dtype != self.dtype:
+            raise ValueError(f"event payload must use {self.device}/{self.dtype}")
+        shape = self._receiver_shapes[target]
+        try:
+            projected_shape = torch.broadcast_shapes(_shape_tuple(payload), shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"event payload shape {_shape_tuple(payload)} cannot broadcast to "
+                f"target {target!r} shape {shape}"
+            ) from exc
+        if projected_shape != shape:
+            raise ValueError(
+                f"event payload shape {_shape_tuple(payload)} cannot broadcast to "
+                f"target {target!r} shape {shape}"
+            )
+        # Keep source-hook bindings visible to Dynamo, including instance
+        # replacement. The larger structural fingerprint is checked once per
+        # compiled graph, whereas these ordinary guards invalidate warm graphs.
+        source = self._population.mech.mechanisms[target]
+        if type(source) is not self._source_receiver_types[target]:
+            raise FunctionalizationError(
+                f"Synapse {target!r} event receiver changed after make_functional(); "
+                "lower the Population again."
+            )
+        for name, class_bindings in self._source_receiver_hooks[target]:
+            if name in source.__dict__ or any(
+                cls.__dict__.get(name) is not expected
+                for cls, expected in class_bindings
+            ):
+                raise FunctionalizationError(
+                    f"Synapse {target!r} event receiver changed after "
+                    "make_functional(); lower the Population again."
+                )
+            expected = next(
+                value for _cls, value in class_bindings if value is not None
+            )
+            method = getattr(source, name)
+            if getattr(method, "__func__", method) is not expected:
+                raise FunctionalizationError(
+                    f"Synapse {target!r} event receiver changed after "
+                    "make_functional(); lower the Population again."
+                )
+
+    def _receive_values(self, parameters, prepared, state, target, payload):
+        mapping, dt, _celsius, v, t, duration_remainder = self._mapping(
+            parameters, prepared, state
+        )
+        outputs = functional_call(
+            self._receivers[target],
+            mapping,
+            (v, t, duration_remainder, dt, payload),
+            tie_weights=False,
+        )
+        result = {}
+        for leaf, value in zip(self._state_layout, outputs, strict=True):
+            if (
+                not torch.is_tensor(value)
+                or _shape_tuple(value) != leaf.shape
+                or value.dtype != leaf.dtype
+                or value.device != leaf.device
+            ):
+                raise FunctionalizationError(
+                    "functional event receive changed the state schema for "
+                    f"{'.'.join(leaf.public_path)!r}"
+                )
+            _put_path(result, leaf.public_path, value)
+        return result
+
     def _structured_rollout_values(
         self,
         parameters,
@@ -13137,6 +13527,27 @@ class FunctionalPopulation:
             extra=extra,
         )
 
+    def receive(self, parameters, prepared, state, *, target: str, payload):
+        """Apply one ordered event, including zero payloads, without stepping."""
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        self._validate_receive(target, payload)
+        prepared_values = self._validate_prepared(prepared, parameters)
+        return self._receive_values(parameters, prepared_values, state, target, payload)
+
+    def prepare_and_receive(
+        self, parameters, constants, state, *, target: str, payload
+    ):
+        """Derive coefficients and apply one event atomically under compilation."""
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_constants(constants)
+        self._validate_state(state)
+        self._validate_receive(target, payload)
+        prepared = self._prepare_values(parameters, constants)
+        return self._receive_values(parameters, prepared, state, target, payload)
+
     def bind(self, parameters, prepared):
         """Bind one eager step to explicit parameters and reusable preparation.
 
@@ -13378,6 +13789,7 @@ def make_functional(
                 )
             tensors = functional.extract(population)
         functional._audit_read_only_workspaces(tensors)
+        functional._audit_event_receivers(tensors)
         try:
             functional._audit_initialization(tensors)
         except FunctionalizationError as exc:

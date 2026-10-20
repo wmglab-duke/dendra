@@ -2,6 +2,24 @@
 
 Network implementation examples in ./net/
 
+## Write a custom synapse
+
+The [synapse authoring tutorial](../docs/synapse_authoring.md) explains two
+complete examples that also run as standalone scripts:
+
+```bash
+python examples/custom_event_synapse.py
+python examples/custom_continuous_synapse.py
+```
+
+The event example defines conductance state, ODE decay, a current, and a pure
+receive hook, then uses it through a Network and functional receive/step with
+gradients. The continuous example defines an analog input and connects a
+presynaptic gate to its current. Both scripts check their numerical results;
+the documentation build executes the same files.
+
+## Simulate and fit models
+
 [`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
 frequency, delay, and duration from simulated voltage recordings, optionally
 with observation noise, using ordinary `model.run()` and autograd. Try a

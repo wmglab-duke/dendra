@@ -525,6 +525,104 @@ functional plan. Packed populations containing bindings are rejected.
 Arbitrary live getters and connected Network event delivery remain outside
 this interface.
 
+.. _functional-event-receive:
+
+Explicit synaptic event reception
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``FunctionalPopulation.receive`` applies one synapse receive call to explicit
+state. Call it before ``step`` to deliver an already weighted, mechanism-local
+payload before the population advances:
+
+.. code-block:: python
+
+   import torch
+   import dendra as dn
+   from dendra.models.mod import expsyn
+
+   with dn.ctx(JIT=0, REQUIRE_GRAD=1):
+       cells = dn.SingleCompartment(N=1, C=3, dtype=torch.float64)
+       cells.insert(expsyn.rename("syn"), tau=2.0, e=0.0)
+       cells.train()
+       cells.initialize()
+
+   functional, tensors = dn.func.make_functional(cells, dt=0.025)
+   prepared = functional.prepare(tensors.parameters, tensors.constants)
+   payload = torch.full_like(
+       tensors.state["mechanisms"]["syn"]["g"], 0.05, requires_grad=True
+   )
+   received = functional.receive(
+       tensors.parameters, prepared, tensors.state,
+       target="syn", payload=payload,
+   )
+   state, auxiliary = functional.step(tensors.parameters, prepared, received)
+   gradient, = torch.autograd.grad(state["mechanisms"]["syn"]["g"].sum(), payload)
+
+``target`` names an inserted mechanism in this Population. The payload follows
+that mechanism's local slot order, retaining explicit batch axes. Built-in
+``expsyn`` and ``exp2syn`` payloads are numerical conductances in µS, matching
+ordinary NetCon weights. ``expsyn`` adds the payload to ``g``; ``exp2syn``
+multiplies it by its prepared normalization factor and adds it to both ``A``
+and ``B``. The subsequent population step performs the ordinary conductance
+decay and membrane solve.
+
+Reception returns a state tree without advancing the population clock. It
+leaves the caller's state, parameters, prepared values, and original Population
+unchanged. ``prepare_and_receive`` combines preparation and reception when
+parameters or timestep-dependent preparation change. Reception can be composed
+with ordinary functional steps and differentiated or compiled as part of that
+computation.
+
+Custom ``Synapse`` subclasses implement
+``net_receive_values(self, weights, dt, values)``. For example, the pure
+single-exponential receive equation is below. See
+:doc:`../synapse_authoring` for the complete State, current, initialization,
+Network, and functional examples.
+
+.. code-block:: python
+
+   def net_receive_values(self, weights, dt, values):
+       return {"states": {"g": values["g"] + weights}}
+
+The payload must be a Tensor with the target mechanism's dtype and device,
+broadcastable to its actual local runtime shape, including explicit batch
+axes. The receiver sees the broadcast payload; every returned replacement
+must have the exact declared runtime shape.
+
+The hook receives one timestep as a Tensor of shape ``(1,)``, which broadcasts
+against local state and retains empty ``vmap`` lanes. When updating scalar
+structural carry, restore its declared scalar shape after arithmetic, for
+example ``(old.reshape(1) + dt).reshape_as(old)``.
+
+The result is a partial mapping with three optional namespaces:
+
+* ``states`` replaces declared nested ``State.STATE`` variables, keyed by their
+  flattened mechanism names.
+* ``carry`` replaces direct mechanism ``CARRY`` values.
+* ``state_carry`` maps State bundle names to mappings of their declared
+  ``CARRY`` replacements.
+
+Omitted values retain their incoming state. Each replacement must preserve its
+declared shape, dtype, and device. Parameters, prepared workspaces, shared
+fields, and ``State.INPUT`` values cannot be replaced. The input ``values``
+frame contains explicit runtime state, prepared workspaces, geometry, shared
+fields, and nested ``values["state_carry"][state_name]`` carry frames.
+Ephemeral ``ASSIGNED`` scratch is excluded: derive event algebra in the pure
+hook from its explicit inputs, or declare ``CARRY`` when a value must persist
+between phases. Functional receivers also reject implicit reads of
+``ASSIGNED`` scratch through ``self``. Read parameters through ``self`` and
+return out-of-place updates. The standard ``net_receive`` adapter applies
+these same replacements during imperative execution. Legacy authored
+``net_receive`` overrides retain their imperative behavior; explicit functional
+reception requires the pure hook and canonical adapters.
+
+One ``receive`` call represents one existing NetCon receive invocation,
+including a zero payload. Preserve call order when several NetCons target
+the same mechanism: custom receivers may update timers, gates, or voltage on
+every call. This interface supplies reception only. Event detection, delays,
+queues, NetStim schedules, and complete connected Network lowering remain
+separate work.
+
 .. _functional-scnv:
 
 Mechanism-owned voltage with scnv

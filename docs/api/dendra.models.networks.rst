@@ -13,8 +13,10 @@ multiply those weights by ``dendra.units.uS``.
 A density-style continuous target defines its own input unit. For example,
 built-in ``graded_syn`` receives a dimensionless release gate into ``g_pre``,
 so its connection weight and accumulated input are conductance densities in
-S/cm². Custom targets must document the units of the state or input changed by
-``net_receive`` or ``continuous_receive``. See :doc:`../units` and
+S/cm². Custom event targets document the state units expected by the pure
+``net_receive_values`` hook, whose updates the ``net_receive`` adapter commits.
+Continuous targets document the input units expected by ``continuous_receive``.
+See :doc:`../synapse_authoring` for runnable examples, and :doc:`../units` and
 :doc:`dendra.models.mechanisms` for the full mechanism contract.
 
 The ``weight`` accepted by ``NetCon.schedule`` and related scheduled-event

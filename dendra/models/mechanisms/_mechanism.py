@@ -2469,7 +2469,10 @@ class Mechanism(Parameterized):
     @staticmethod
     def EXPLICIT(*args):
         """
-        Mark currents as voltage independent when assembling the RHS.
+        Select explicit treatment of currents when assembling the RHS.
+
+        These currents do not contribute an implicit conductance term. This
+        declaration does not assert that the current is voltage independent.
 
         Parameters
         ----------
@@ -2703,26 +2706,60 @@ class Mechanism(Parameterized):
     def initial_values(self, v, values):
         """Return a pure partial overlay for declared initial values.
 
+        Return flattened bundle STATE names, direct Mechanism CARRY, or owned
+        writable Ion/Material locals. Omitted fields keep their earlier value.
+        State defaults and insertion-time ``ic`` run before this overlay;
+        nested State overlays run afterward. This hook does not advance time.
+        Tensor outputs must use the declared dtype/device and have shapes
+        broadcastable to each declared output's storage shape.
+
         ``values`` includes initialized STATE/CARRY values, support-visible
         ``celsius`` and ``diam``, and the support-local Ion/Material/current
-        aliases installed for this ordered initialization phase.
+        aliases installed for this ordered initialization phase. Treat inputs
+        and module state as read-only; read parameters/workspaces through self.
         """
         return {}
 
     def assigned_values(self, v, values):
-        """Return every ephemeral value declared with :meth:`ASSIGNED`."""
+        """Return exactly the ephemeral values declared with :meth:`ASSIGNED`.
+
+        This pure algebra may be evaluated repeatedly at different solver
+        stages. Outputs must preserve their exact shape, dtype, and device.
+        Persistent timers, counters, and history belong in CARRY and advance.
+        """
         return {}
 
     def advance(self, v, dt, values):
-        """Return a partial accepted-step CARRY/shared-field update mapping."""
+        """Return a partial accepted-step CARRY/shared-field update mapping.
+
+        Runs once per accepted timestep. Update direct Mechanism CARRY and
+        owned writable/additive Ion/Material locals; omitted carry is retained.
+        This hook reads the same incoming snapshot as the State bundles, not
+        their newly solved values, and does not replace their solver. Return
+        new Tensors with each output's exact shape, dtype, and device instead
+        of mutating the value frame or module state.
+        """
         return {}
 
     def derive_buffers(self):
-        """Return initialization-static buffers declared by DERIVED_BUFFER."""
+        """Return exactly the workspaces declared by DERIVED_BUFFER.
+
+        Build from populated parameters, temperature, and local geometry.
+        Do not read evolving state, voltage, timestep, or implicit randomness,
+        or mutate the module. Ordinary initialization refreshes these values;
+        functional preparation builds them from its explicit inputs.
+        """
         return {}
 
     def derive_timestep_buffers(self, dt):
-        """Return timestep workspaces declared by TIMESTEP_BUFFER."""
+        """Return exactly the workspaces declared by TIMESTEP_BUFFER.
+
+        Build from parameters, static derived workspaces, and scalar Tensor
+        ``dt`` in ms when the integrator configures its timestep. Fresh
+        initialization leaves these buffers zero and does not call this hook.
+        Do not read evolving state or another installed timestep workspace,
+        use implicit randomness, or mutate module tensors.
+        """
         return {}
 
     @classmethod
@@ -4176,18 +4213,15 @@ class PointProcess(Mechanism):
 
 
 class Synapse(Mechanism):
-    """
-    A Synapse is a Mechanism that receives spikes and delivers a synaptic current.
-    Synapses implement the `net_receive` method, which is called every timestep
-    and accepts `weights` (the sum of all incoming weighted spike events at that
-    timestep) and `netcon` (the `NetCon` instance for which the synapse is the target)
-    as arguments.
+    """A Mechanism that receives weighted events and delivers synaptic current.
 
-    Note that a given synapse may be the target for multiple `NetCon`s, and as such its
-    `net_receive` method may be executed multiple times per timestep.
+    Implement the pure :meth:`net_receive_values` hook to return declared
+    state/carry replacements. The standard :meth:`net_receive` adapter commits
+    those replacements in existing NetCon delivery order, including calls with
+    a zero payload. Multiple connections may call it during one timestep.
 
-    The `net_receive` method must be overridden in subclasses to implement
-    specific behavior for how the synapse responds to incoming spikes.
+    Legacy subclasses overriding :meth:`net_receive` retain their imperative
+    behavior; they must adopt the pure hook for functional event delivery.
 
     ``NetCon`` weights inherit their units from the target synapse. For the
     built-in point-process ``expsyn`` and ``exp2syn`` mechanisms, weights are
@@ -4195,29 +4229,153 @@ class Synapse(Mechanism):
     different weight contract and should document it explicitly.
     """
 
-    def net_receive(self, weights, netcon):
-        """
-        Handle weighted spike arrivals. Avoid in-place modifications of
-        state buffers to preserve autograd compatibility.
+    def net_receive_values(self, weights, dt, values):
+        """Return event updates without modifying inputs or the module.
 
-        Example: increment an internal synaptic conductance ``g_syn`` by the
-        incoming weight without in-place ops:
+        ``weights`` is a Tensor broadcast to this mechanism's local runtime
+        shape. ``dt`` is the configured timestep as a broadcastable one-element
+        Tensor of shape ``(1,)``. Scalar structural CARRY updates should reshape
+        their result to the declared scalar shape after arithmetic.
+        ``values`` contains the
+        Mechanism state, prepared workspace, and shared-field frame plus a
+        ``state_carry`` mapping from State bundle names to their declared CARRY
+        tensors. Ephemeral ASSIGNED values are excluded: derive event algebra
+        in this hook, or declare CARRY when a value must persist. Parameters
+        may be read through ``self``.
 
-        .. code-block:: python
-
-            def net_receive(self, weights, netcon):
-                self.g_syn = self.g_syn + weights
-
-        Parameters
-        ----------
-        weights : torch.Tensor
-            Aggregate weights of incoming spike events at the current step.
-        netcon : NetCon
-            Connectivity handle delivering the spikes.
+        Return any subset of ``{"states": {...}, "carry": {...},
+        "state_carry": {StateName: {...}}}``. These sections update flat STATE
+        variables, direct Mechanism CARRY, and nested State CARRY respectively.
+        Omitted fields remain unchanged. Every replacement must preserve its
+        declared shape, dtype, and device. Shared fields, ASSIGNED values,
+        prepared workspaces, and INPUT values cannot be updated here.
         """
         raise NotImplementedError(
-            "Synapse.net_receive() must be implemented in subclasses."
+            "Synapse.net_receive_values() must be implemented in subclasses."
         )
+
+    def _net_receive_payload_shape(self):
+        """Return actual local storage shape, including explicit batch axes."""
+        if self._initial_state_names:
+            return tuple(self._buffers[self._initial_state_names[0]].shape)
+        for name in self._carry:
+            if self._carry_specs[name][1] == "local":
+                return tuple(self._buffers[name].shape)
+        return tuple(self.shape_f)
+
+    def _net_receive_value_frame(self):
+        """Build an explicit event frame without retaining runtime aliases."""
+        values = self._runtime_value_frame()
+        if "state_carry" in values:
+            raise ValueError(
+                "Pure Synapse receive frames reserve 'state_carry'; rename the "
+                "conflicting flat runtime field."
+            )
+        for name in self._assigned:
+            values.pop(name, None)
+        values.update(
+            {name: self._buffers[name] for name in self._saved_current_buffer_names}
+        )
+        if values["celsius"].ndim == 0:
+            values["celsius"] = values["celsius"].reshape(1)
+        values["state_carry"] = {
+            state_name: {name: state._buffers[name] for name in state._carry}
+            for state_name, state in self.DE.items()
+        }
+        return values
+
+    def _derive_net_receive_values(self, weights, dt, values):
+        """Evaluate the pure hook and validate all replacements before writes."""
+        if not torch.is_tensor(weights):
+            raise TypeError("Synapse receive weights must be a Tensor.")
+        if weights.dtype != self.diam.dtype or weights.device != self.diam.device:
+            raise ValueError(
+                "Synapse receive weights must match the mechanism dtype and device."
+            )
+        if not torch.is_tensor(dt) or tuple(dt.shape) != ():
+            raise TypeError("Synapse receive dt must be a scalar Tensor.")
+        if dt.dtype != self.diam.dtype or dt.device != self.diam.device:
+            raise ValueError(
+                "Synapse receive dt must match the mechanism dtype and device."
+            )
+        weights = torch.broadcast_to(weights, self._net_receive_payload_shape())
+        updates = self.net_receive_values(weights, dt.reshape(1), values)
+        if not isinstance(updates, Mapping):
+            raise TypeError("Synapse.net_receive_values() must return a mapping.")
+        unknown = set(updates) - {"states", "carry", "state_carry"}
+        if unknown:
+            raise KeyError(
+                f"Synapse.net_receive_values() returned unknown sections {sorted(map(str, unknown))}."
+            )
+        shared_names = set(self._runtime_shared_local_names())
+        shared_names.update(getattr(self, "_continuous_inputs", ()))
+        shared_names.update(getattr(self, "_continuous_input_old", {}).values())
+        _validate_runtime_outputs(
+            self,
+            "net_receive_values.states",
+            updates.get("states", {}),
+            {
+                name: self._buffers[name]
+                for name in self._initial_state_names
+                if name not in shared_names
+            },
+        )
+        _validate_runtime_outputs(
+            self,
+            "net_receive_values.carry",
+            updates.get("carry", {}),
+            {
+                name: self._buffers[name]
+                for name in self._carry
+                if name not in shared_names
+            },
+        )
+        state_carry = updates.get("state_carry", {})
+        if not isinstance(state_carry, Mapping):
+            raise TypeError("Synapse receive state_carry must be a mapping.")
+        unknown_states = set(state_carry) - set(self.DE)
+        if unknown_states:
+            raise KeyError(
+                f"Synapse receive state_carry names unknown States {sorted(map(str, unknown_states))}."
+            )
+        for state_name, outputs in state_carry.items():
+            state = self.DE[state_name]
+            _validate_runtime_outputs(
+                state,
+                "net_receive_values.state_carry",
+                outputs,
+                {
+                    name: state._buffers[name]
+                    for name in state._carry
+                    if name not in shared_names
+                },
+            )
+        return updates
+
+    def _apply_net_receive_updates(self, updates):
+        """Commit a previously validated event transaction in declared slots."""
+        states = updates.get("states", {})
+        for name in self._initial_state_names:
+            if name in states:
+                self._buffers[name] = states[name]
+        carry = updates.get("carry", {})
+        for name in self._carry:
+            if name in carry:
+                self._buffers[name] = carry[name]
+        state_carry = updates.get("state_carry", {})
+        for state_name, state in self.DE.items():
+            local = state_carry.get(state_name, {})
+            for name in state._carry:
+                if name in local:
+                    state._buffers[name] = local[name]
+
+    def net_receive(self, weights, netcon):
+        """Apply a pure receive hook once at the existing NetCon boundary."""
+        del netcon
+        updates = self._derive_net_receive_values(
+            weights, self.dt, self._net_receive_value_frame()
+        )
+        self._apply_net_receive_updates(updates)
 
 
 class ContinuousSynapse(Mechanism):

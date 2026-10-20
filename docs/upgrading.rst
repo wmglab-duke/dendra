@@ -95,6 +95,11 @@ run once per accepted timestep.
 Canonical returned-value hooks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+For a full authoring walkthrough, see the
+:doc:`mechanism guide <advanced/A0_mechanisms_and_ions_materials>` and
+:doc:`synapse_authoring`. The latter demonstrates the pure synaptic receive
+hook alongside ordinary State equations and continuous inputs.
+
 The canonical hooks are:
 
 * ``state_defaults(v, values)`` on ``State`` for fallback solver-state values;
@@ -105,7 +110,11 @@ The canonical hooks are:
 * ``advance(v, dt, values)`` on ``State`` or ``Mechanism`` for accepted-step
   updates;
 * ``derive_buffers()`` and ``derive_timestep_buffers(dt)`` for prepared
-  workspaces.
+  workspaces;
+* ``net_receive_values(weights, dt, values)`` on ``Synapse`` for explicit
+  event-triggered State and carry replacements. Leave the standard
+  ``net_receive`` adapter in place so imperative and functional execution
+  share those equations.
 
 Treat all arguments as read-only and return a mapping of Tensors. Dendra checks
 the declared names, shapes, dtypes, and devices on the first eager evaluation.
