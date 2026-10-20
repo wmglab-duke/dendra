@@ -61,7 +61,7 @@ from dendra.models.mechanisms._material_process import (
     MaterialProcess,
 )
 from dendra.models.mechanisms._materials import Material
-from dendra.models.mechanisms._mechanism import Mechanism, PointProcess
+from dendra.models.mechanisms._mechanism import Mechanism, PointProcess, VoltageProcess
 from dendra.models.mechanisms._numerical import (
     validate_declared_numerical_current as _validate_declared_numerical_current,
 )
@@ -143,6 +143,7 @@ _RUNTIME_SCHEMA_CACHE_STATE = frozenset(
         "_assigned_schema_validated",
         "_advance_schema_validated",
         "_advance_return_names",
+        "_voltage_schema_validated",
     }
 )
 _FUNCTIONAL_INTEGRATOR_HOOKS = (
@@ -161,6 +162,7 @@ _FUNCTIONAL_INTEGRATOR_HOOKS = (
     "step",
 )
 _FUNCTIONAL_HANDLER_HOOKS = (
+    "update_v",
     "_evaluate_current_frame",
     "_evaluate_membrane_frame",
     "_can_evaluate_direct_membrane_frame",
@@ -531,6 +533,11 @@ _STANDARD_MECHANISM_ASSIGNED_VALUES = inspect.getattr_static(
     "assigned_values",
 )
 _STANDARD_MECHANISM_ADVANCE = inspect.getattr_static(Mechanism, "advance")
+_STANDARD_VOLTAGE_FUNCTIONAL_ADAPTERS = {
+    name: inspect.getattr_static(VoltageProcess, name)
+    for name in ("update_v", "_derive_voltage_values")
+}
+_STANDARD_VOLTAGE_VALUES = inspect.getattr_static(VoltageProcess, "voltage_values")
 _STATE_IMPERATIVE_INITIALIZATION_HOOKS = (
     "populate_parameter_buffers",
     "init_rng",
@@ -1727,6 +1734,119 @@ def _material_process_contract(process):
         ),
         None,
     )
+
+
+def _voltage_process_failures(process):
+    """Require the shared returned-output adapter, never an imperative reset."""
+
+    failures = []
+    changed = [
+        name
+        for name, standard in _STANDARD_VOLTAGE_FUNCTIONAL_ADAPTERS.items()
+        if name in process.__dict__
+        or inspect.getattr_static(type(process), name) is not standard
+    ]
+    if changed:
+        failures.append(
+            "replaces canonical pure voltage adapters "
+            f"{changed}; implement voltage_values(v, dt, values) instead"
+        )
+    if "voltage_values" in process.__dict__:
+        failures.append(
+            "replaces voltage_values on the instance; define the pure "
+            "returned-output hook on its VoltageProcess subclass"
+        )
+    elif (
+        inspect.getattr_static(type(process), "voltage_values")
+        is _STANDARD_VOLTAGE_VALUES
+    ):
+        failures.append("does not implement the pure voltage_values hook")
+    else:
+        try:
+            _initialization_callable_dependency_signature(
+                process.voltage_values,
+                label=f"{process.name}.voltage_values",
+                owner=process,
+                strict=True,
+            )
+        except FunctionalizationError as exc:
+            failures.append(str(exc))
+    support_map = getattr(process, "support_map", None)
+    if support_map is not None and not support_map.is_injective(
+        getattr(process, "key", None)
+    ):
+        failures.append(
+            "uses non-injective voltage replacement support, which is not lowered yet"
+        )
+    return failures
+
+
+def _voltage_process_signature(process):
+    """Fingerprint reset behavior and helper dependencies, not live tensors."""
+
+    if not isinstance(process, VoltageProcess):
+        return None
+    return (
+        tuple(
+            (name, _effective_hook_identity(process, name))
+            for name in (*_STANDARD_VOLTAGE_FUNCTIONAL_ADAPTERS, "voltage_values")
+        ),
+        _initialization_callable_dependency_signature(
+            process.voltage_values,
+            label=f"{process.name}.voltage_values",
+            owner=process,
+            strict=False,
+        ),
+    )
+
+
+def _voltage_process_plan_signature(handler):
+    """Retain the actual ordered support-local reset phase in source guards."""
+
+    return tuple(
+        (
+            process.name,
+            entry.support_id,
+            None if entry.spec is None else entry.spec.ordered_signature,
+        )
+        for process, entry in handler._voltage_process_support_plan
+    )
+
+
+def _install_voltage_process_audits(population):
+    """Audit authored resets inside, rather than around, the commit adapter.
+
+    Installed only on the disposable lowering probe. A returned CARRY update
+    is legal, but a write to that same slot inside the authored pure hook is
+    not. Whole-transition probes cannot distinguish those two operations.
+    """
+
+    def checked_hook(process, hook):
+        def evaluate(v, dt, values):
+            registered = _registered_tensor_bindings(process)
+            python_state = _transition_python_state_snapshot(process)
+            arguments = (v, dt, values)
+            argument_state = _audit_python_value_signature(arguments, set())
+            try:
+                return hook(v, dt, values)
+            finally:
+                if (
+                    _registered_tensor_bindings(process) != registered
+                    or _transition_python_state_snapshot(process) != python_state
+                    or _audit_python_value_signature(arguments, set()) != argument_state
+                ):
+                    raise FunctionalizationError(
+                        f"VoltageProcess {process.name!r}.voltage_values() mutated "
+                        "its module or read-only voltage, timestep, or values "
+                        "inputs. Return voltage and declared CARRY replacements "
+                        "without modifying inputs or self."
+                    )
+
+        return evaluate
+
+    for process in population.mech.voltage_processes.values():
+        process._voltage_schema_validated = False
+        process.voltage_values = checked_hook(process, process.voltage_values)
 
 
 def _material_process_failures(process, population=None):
@@ -4833,7 +4953,10 @@ def _initialization_structure_signature(population: Population) -> tuple:
     )
     inspect_final_frame = (
         _functional_initialization_profile(population) is not None
-        and not population.mech.voltage_processes
+        and not any(
+            _voltage_process_failures(process)
+            for process in population.mech.voltage_processes.values()
+        )
         and not any(
             _material_process_failures(process, population)
             for process in population.mech.material_processes.values()
@@ -4955,10 +5078,10 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             f"MaterialProcess {name!r}: {failure}"
             for failure in _material_process_failures(process, population)
         )
-    if handler.voltage_processes:
-        failures.append(
-            "VoltageProcess initialization is not included in the pure "
-            "Ion/Material initializer transaction"
+    for name, process in handler.voltage_processes.items():
+        failures.extend(
+            f"VoltageProcess {name!r}: {failure}"
+            for failure in _voltage_process_failures(process)
         )
 
     for ion_name, ion in handler.ions.items():
@@ -5035,7 +5158,10 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             _material_process_failures(process, population)
             for process in handler.material_processes.values()
         )
-        and not handler.voltage_processes
+        and not any(
+            _voltage_process_failures(process)
+            for process in handler.voltage_processes.values()
+        )
     ):
         try:
             _initialization_final_frame_dependency_signature(
@@ -7172,6 +7298,20 @@ def _functionalization_failures(
                 "functionalization requires the standard MechanismHandler "
                 "current-frame evaluator"
             )
+        actual_voltage_plan = tuple(
+            process for process, _entry in handler._voltage_process_support_plan
+        )
+        expected_voltage_plan = tuple(handler.voltage_processes.values())
+        if len(actual_voltage_plan) != len(expected_voltage_plan) or any(
+            actual is not expected
+            for actual, expected in zip(
+                actual_voltage_plan, expected_voltage_plan, strict=False
+            )
+        ):
+            failures.append(
+                "MechanismHandler replaces the canonical ordered VoltageProcess "
+                "support plan; rebuild the Population before functionalization"
+            )
     mechanisms = () if handler is None else tuple(handler.mechanisms.values())
     if not mechanisms:
         failures.append("at least one membrane mechanism must be inserted")
@@ -7319,8 +7459,12 @@ def _functionalization_failures(
                     f"{mechanism.name} uses stochastic state, which is not supported yet"
                 )
 
-    if handler is not None and handler.voltage_processes:
-        failures.append("VoltageProcesses are not supported yet")
+    if handler is not None:
+        for name, process in handler.voltage_processes.items():
+            failures.extend(
+                f"VoltageProcess {name!r}: {failure}"
+                for failure in _voltage_process_failures(process)
+            )
     if any(getattr(population, "mechanism_injection_accepted", ())):
         failures.append(
             "mechanism-owned waveform injections are not supported yet; only "
@@ -8296,6 +8440,7 @@ def _structure_signature(population) -> tuple:
             tuple(sorted(module._save)),
             _membrane_coefficient_signature(module),
             _material_process_signature(module, handler),
+            _voltage_process_signature(module),
         )
 
     return (
@@ -8368,6 +8513,7 @@ def _structure_signature(population) -> tuple:
             for name, material in handler.materials.items()
         ),
         tuple(handler.voltage_processes),
+        _voltage_process_plan_signature(handler),
         _parametrization_signatures(population),
         _parameter_module_signatures(population),
         tuple(
@@ -11175,6 +11321,7 @@ class FunctionalPopulation:
                     component_preparation.audit_builder_inputs = True
                 audit_transition = copy.deepcopy(self._transition)
                 _rebind_population_time_references(audit_transition.population)
+                _install_voltage_process_audits(audit_transition.population)
                 preparation_python_state = _transition_python_state_snapshot(
                     audit_preparation
                 )
@@ -11805,7 +11952,7 @@ class FunctionalPopulation:
                     # their values or their meaningful derivatives.
                     lane_anchor = local_v_init.sum() * 0.0
                     return tuple(
-                        outputs[index] + lane_anchor
+                        outputs[index] + lane_anchor.to(dtype=outputs[index].dtype)
                         for index in transform_output_indices
                     )
 

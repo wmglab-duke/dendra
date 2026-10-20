@@ -15,6 +15,8 @@ those hooks must observe real execution, not replay while tracing fake backward.
 Discrete operands retain their values during joint materialization. Torch's
 shared helper substitutes uninitialized storage for integer inputs; without a
 FakeTensorMode those examples become invalid callback indices/frame counters.
+Real eager operands also receive a scoped FakeTensorMode during disposable
+materialization, so copied examples cannot execute native resource-owning ops.
 
 Activation is persistent and process-wide at that partitioner entry point:
 backward and checkpoint replay can run after the selecting forward returns.
@@ -94,6 +96,8 @@ def _validate_scan_contract():
         "torch._higher_order_ops.partitioner",
         "torch._functorch._aot_autograd.graph_capture_wrappers",
         "torch._higher_order_ops.scan",
+        "torch._guards",
+        "torch._subclasses.fake_tensor",
     )
     try:
         modules = {name: importlib.import_module(name) for name in names}
@@ -187,6 +191,23 @@ def _validate_scan_contract():
             "AOTConfig cannot express the required joint capture"
         ) from error
     references.append((aot, "AOTConfig", config))
+    guards = modules["torch._guards"]
+    detect = _owned_callable(guards, guards, "detect_fake_mode", args=((),))
+    references.append((guards, "detect_fake_mode", detect))
+    fake_module = modules["torch._subclasses.fake_tensor"]
+    fake_type = getattr(fake_module, "FakeTensorMode", None)
+    if not isinstance(fake_type, type) or fake_type.__module__ != fake_module.__name__:
+        raise _unsupported("the metadata-only materialization mode changed")
+    references.append((fake_module, "FakeTensorMode", fake_type))
+    for name, args, kwargs in (
+        ("__init__", (placeholder,), {"allow_non_fake_inputs": True}),
+        ("__enter__", (placeholder,), {}),
+        ("__exit__", (placeholder, None, None, None), {}),
+    ):
+        function = _owned_callable(
+            fake_module, fake_type, name, args=args, kwargs=kwargs
+        )
+        references.append((fake_type, name, function))
     return modules, tuple(references), aot.AOTConfig, aot.create_joint
 
 
@@ -339,7 +360,7 @@ def validate_inductor_scan_contract():
 
 
 def _make_value_preserving_materializer(utils):
-    """Retain discrete example values only in the scan partitioner's clone."""
+    """Isolate scan examples, retaining discrete values and fake op dispatch."""
     original_from_fun = utils._from_fun
 
     def from_fun_preserving_discrete(value):
@@ -374,7 +395,33 @@ def _make_value_preserving_materializer(utils):
     )
     update_wrapper(materialize, original)
     materialize.__kwdefaults__ = original.__kwdefaults__
-    return materialize
+
+    def materialize_with_fake_examples(*args, **kwargs):
+        from torch._guards import detect_fake_mode
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        # Real eager scan operands need the same metadata-only materialization
+        # as Dynamo's fake operands. Fabricated/copied examples must not execute
+        # native kernels with identity-owned opaque resources (for example a
+        # solver topology token). Reuse the caller's mode when it exists; this
+        # context is confined to disposable graph capture, not real execution.
+        fake_mode = detect_fake_mode((args, kwargs))
+        if fake_mode is None:
+            fake_mode = FakeTensorMode(allow_non_fake_inputs=True)
+        with fake_mode:
+            return materialize(*args, **kwargs)
+
+    # Keep all helper dependencies inside the same private globals inventory.
+    # No shared Torch helper or user tensor is replaced by this adapter.
+    guarded = FunctionType(
+        materialize_with_fake_examples.__code__,
+        private_globals,
+        original.__name__,
+        materialize_with_fake_examples.__defaults__,
+        materialize_with_fake_examples.__closure__,
+    )
+    update_wrapper(guarded, original)
+    return guarded
 
 
 def _capture_saved_tensor_identity(tensor):

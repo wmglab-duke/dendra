@@ -963,6 +963,8 @@ def _reset_runtime_output_validation(module):
     module._assigned_schema_validated = False
     module._advance_schema_validated = False
     module._advance_return_names = ()
+    if hasattr(module, "_voltage_schema_validated"):
+        module._voltage_schema_validated = False
 
 
 def _deferred_resolution_map(module, name):

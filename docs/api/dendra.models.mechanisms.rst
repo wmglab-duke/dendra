@@ -419,8 +419,16 @@ evolving state.
 
 
 .. autoclass:: dendra.models.mechanisms.VoltageProcess
-   :members: update_v
+   :members: voltage_values, update_v
    :show-inheritance:
+
+``voltage_values(v, dt, values)`` is the pure voltage-and-carry update hook.
+Its result is ``(new_voltage, carry_updates)``; only declared ``CARRY`` values
+may be replaced. The base ``update_v`` method is the imperative adapter for
+this hook. Existing subclasses overriding ``update_v`` remain imperative-only.
+See :ref:`functional-voltage-processes` for timestep ordering, initialization,
+continuation, and the hard-forward/surrogate-backward semantics of the built-in
+``fire`` family.
 
 .. autoclass:: dendra.models.mechanisms.Synapse
    :members: net_receive

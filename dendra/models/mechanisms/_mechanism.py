@@ -697,6 +697,7 @@ class Mechanism(Parameterized):
             "_init_params",
             "_injection_specs",
             "_name",
+            "_voltage_schema_validated",
             "_support_key_values_valid",
             "base_ndim",
             "celsius",
@@ -1187,6 +1188,7 @@ class Mechanism(Parameterized):
         self._assigned_schema_validated = False
         self._advance_schema_validated = False
         self._advance_return_names = ()
+        self._voltage_schema_validated = False
 
         self._timestep_buffer_schema = _timestep_buffer_schema(self)
 
@@ -4001,28 +4003,74 @@ class VoltageProcess(Mechanism):
     """
     Mechanism subtype that updates the membrane potential ``v``.
 
-    Subclasses must implement :meth:`update_v` to return a new membrane potential
-    tensor each time step. Both its input and return value are in mV.
+    Implement :meth:`voltage_values` to return a new voltage and a mapping of
+    declared :meth:`CARRY` replacements. The hook is pure: its voltage, timestep,
+    and ``values`` inputs are read-only, and it must not mutate the module.
+    Dendra uses the same hook in imperative and functional execution.
+
+    Voltage processes run in their existing ordered, support-local phase before
+    gating and membrane-current assembly. They do not run during initialization.
+    Both input and returned voltage are in mV.
+
+    Legacy subclasses overriding :meth:`update_v` continue to work imperatively,
+    but need the pure hook to participate in functional execution.
     """
 
-    def update_v(self, v: torch.Tensor) -> torch.Tensor:
+    def voltage_values(self, v, dt, values):
         """
-        Compute the updated membrane potential. Avoid in-place modification
-        to preserve autograd compatibility.
+        Return ``(voltage, carry_updates)`` without modifying inputs or ``self``.
 
-        Parameters
-        ----------
-        v : torch.Tensor
-            Membrane potential tensor in mV to be advanced.
-
-        Returns
-        -------
-        torch.Tensor
-            New membrane potential values in mV.
+        ``values`` follows the ordinary Mechanism runtime frame: declared
+        persistent/assigned values, prepared workspaces, local shared fields,
+        ``celsius``, and ``diam``. Parameters may be read through ``self``.
+        ``carry_updates`` may replace any subset of this process's declared
+        CARRY values, preserving each value's shape, dtype, and device.
+        The returned voltage must match ``v`` in shape, dtype, and device.
         """
         raise NotImplementedError(
-            "VoltageProcess.update_v() must be implemented in subclasses."
+            "VoltageProcess.voltage_values() must be implemented in subclasses."
         )
+
+    def _derive_voltage_values(self, v, dt, values):
+        """Evaluate the pure hook and validate its fixed output schema once."""
+        result = self.voltage_values(v, dt, values)
+        if not torch.compiler.is_compiling() and not self._voltage_schema_validated:
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise TypeError(
+                    f"{type(self).__qualname__}.voltage_values() must return "
+                    "a (voltage, carry_updates) tuple"
+                )
+            voltage, updates = result
+            _validate_runtime_outputs(
+                self,
+                "voltage_values",
+                {"voltage": voltage},
+                {"voltage": v},
+                required=("voltage",),
+            )
+            _validate_runtime_outputs(
+                self,
+                "voltage_values",
+                updates,
+                {name: self._buffers[name] for name in self._carry},
+            )
+            self._voltage_schema_validated = True
+        return result
+
+    def update_v(self, v: torch.Tensor) -> torch.Tensor:
+        """Imperative adapter committing the pure hook's declared carry outputs.
+
+        Functional execution lifts these same buffer replacements into explicit
+        state. User-authored voltage algebra belongs in :meth:`voltage_values`,
+        not in this adapter.
+        """
+        voltage, updates = self._derive_voltage_values(
+            v, self.dt, self._runtime_value_frame()
+        )
+        for name in self._carry:
+            if name in updates:
+                self._buffers[name] = updates[name]
+        return voltage
 
 
 class PointProcess(Mechanism):

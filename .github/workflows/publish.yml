@@ -178,6 +178,9 @@ jobs:
         run: >-
           python -m pytest -q
           tests/func/test_scan_chunk.py
+          tests/func/test_scan_capture_hooks.py
+          tests/func/test_scan_cpp_policy.py
+          tests/func/test_scan_discrete_materialization.py
           tests/func/test_scan_donation.py
           tests/func/test_scan_donation_workflows.py
           tests/func/test_scan_recording.py
@@ -197,6 +200,9 @@ jobs:
           tests/func/test_material_preparation_guards.py
           tests/func/test_material_concatenation.py
           tests/func/test_extcell_material_concatenation.py
+          tests/func/test_voltage_processes.py
+          tests/func/test_voltage_process_guards.py
+          tests/func/test_voltage_continuation.py
           tests/func/test_convenience_runner.py::test_top_level_compile_is_the_exported_functional_compile_alias
 
   check_dist:

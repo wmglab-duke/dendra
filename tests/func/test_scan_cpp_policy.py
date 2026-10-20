@@ -147,9 +147,14 @@ def test_scan_capture_selects_cpp_from_original_mode_and_immutable_device(
     chunk = object.__new__(_scan._CompiledScanPopulationChunk)
     chunk._functional, chunk._steps, chunk._options = functional, 1, {}
     chunk._plans, chunk._stepwise = None, False
+
     # Retain the authored callable without executing it or allocating on the
     # plan's device; these tests inspect compiler selection, not numerical work.
-    monkeypatch.setattr(_scan, "make_fx", lambda function: lambda *examples: function)
+    def make_fx_stub(function, *, pre_dispatch):
+        captured["pre_dispatch"] = pre_dispatch
+        return lambda *examples: function
+
+    monkeypatch.setattr(_scan, "make_fx", make_fx_stub)
 
     def compile_stub(function, options, *, prefer_cpp_wrapper=False):
         captured["prefer"] = prefer_cpp_wrapper
@@ -171,6 +176,7 @@ def test_scan_capture_selects_cpp_from_original_mode_and_immutable_device(
     else:
         assert result is marker
     assert captured["prefer"] is (device == "cpu" and not original_grad_enabled)
+    assert captured["pre_dispatch"] is original_grad_enabled
 
 
 @pytest.mark.parametrize("device,forward_block", [("cpu", 4), ("cuda", 1), ("mps", 1)])

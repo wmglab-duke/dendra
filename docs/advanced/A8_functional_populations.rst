@@ -285,6 +285,8 @@ following properties:
   contributions, PointProcess currents, and additive Material sources support
   duplicate placements; concentration and Material replacement writes require
   injective support;
+* pure ``VoltageProcess`` updates, including ``fire``, ``fire_r``, ``fire_d``,
+  and ``fire_r_d``, with their declared reset and refractory carry;
 * deterministic CPU or CUDA execution in float32 or float64;
 * ``bwd_euler_sc`` for plain ``Population`` and ``SingleCompartment``,
   ``bwd_euler_ub`` for ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
@@ -339,10 +341,11 @@ duplicate-slot multiplicity.
 
 Unsupported features raise ``dendra.func.FunctionalizationError`` during
 lowering. Current limitations include non-injective regional concentration or
-Material replacement writes, the reserved compact rowwise support encoding,
+Material replacement writes and non-injective voltage replacement support,
+the reserved compact rowwise support encoding,
 TABLE lookups, MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
 families, mechanism-owned waveform injections, delayed or stochastic state,
-VoltageProcesses, imperative callback hooks, functional
+legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
 Population topologies
@@ -362,6 +365,80 @@ capacitance and axial-resistivity transforms are evaluated during functional
 preparation, including their explicit tensor dependencies. Custom transforms
 must register numerical dependencies as parameters or buffers and keep any
 remaining Python configuration immutable.
+
+.. _functional-voltage-processes:
+
+Functional voltage resets and refractory state
+-----------------------------------------------
+
+The built-in ``fire``, ``fire_r``, ``fire_d``, and ``fire_r_d`` VoltageProcesses
+support functional transitions, fresh initialization, and explicit-state
+continuation on admitted individual and packed models. Insert them as ordinary
+mechanisms before initialization:
+
+.. code-block:: python
+
+   import dendra as dn
+   from dendra.models.mod import fire_r_d, pas
+
+   model = dn.SingleCompartment(N=1, C=1)
+   model.insert(pas)
+   model.insert(fire_r_d, threshold=-50.0, rest=-65.0, refractory=5.0)
+   model.initialize()
+
+   runner = dn.compile(
+       model, dt=0.025, steps=800,
+       initialization="fresh", inference=False,
+       trainable=("threshold", "rest"),
+       callbacks={"trace": dn.func.Recorder(("v", "fire_r_d.time_refractory"))},
+   )
+   final_state, auxiliary = runner()
+   continued_state, continued = runner(
+       final_state,
+       parameters=auxiliary["parameters"],
+       callback_state=auxiliary["callbacks"].state,
+   )
+
+Each accepted step applies the voltage processes in insertion order, using
+their ordinary regional support, **before** advancing voltage-dependent
+mechanism states and assembling membrane currents. This is the same phase as
+imperative execution; a reset is not an additional post-solve voltage clamp.
+Functional voltage replacement requires injective support, so one process
+cannot supply multiple local replacements for the same physical compartment.
+In finite-extracellular models, the process acts on membrane voltage for this
+phase, while the circuit integrator retains its usual ``vc`` transition.
+
+Refractory flags/countdowns and surrogate gates are declared ``CARRY`` values
+and travel in ``state["mechanism_buffers"][mechanism_name]``. ``Recorder`` can
+select these values through their canonical names, such as
+``"fire_r_d.time_refractory"``. Fresh initialization evaluates their pure
+``initial_values`` hooks but does not perform a reset, decrement a timer, or
+emit a spike at t=0. Snapshot restarts retain the captured carry; explicit-state
+continuation retains the supplied carry without reinitializing it.
+
+``fire`` and ``fire_r`` use hard threshold comparisons. Their voltage reset is
+piecewise differentiable, but the spike decision itself supplies no threshold
+gradient. ``fire_d`` and ``fire_r_d`` have the same hard forward behavior and
+the existing sigmoid straight-through surrogate backward behavior, controlled
+by ``tau_gate`` and ``ste_scale``. These surrogate derivatives are deliberately
+not finite-difference derivatives of the hard forward trajectory. Refractory
+decisions and durations retain their hard bookkeeping semantics; a
+differentiable variant does not make every event-time parameter smooth.
+Scan, including checkpointed scan, supports these gradients; while execution
+remains inference-only.
+
+Custom ``VoltageProcess`` subclasses can implement the pure hook
+``voltage_values(self, v, dt, values)``. It returns
+``(new_voltage, carry_updates)``, where ``carry_updates`` is a partial mapping
+of declared ``CARRY`` names to replacement tensors. Read trainable parameters
+from ``self`` and evolving carry from ``values``. Return out-of-place results:
+do not mutate ``self``, ``v``, or tensors in ``values``. The shared base
+``update_v`` adapter commits these returned replacements during imperative
+execution; functional execution keeps them explicit. Ordinary Mechanism
+declarations and functional eligibility checks still apply, and the pure
+hooks undergo the same mutation/dependency audits as other functional hooks.
+An authored legacy ``update_v`` override remains usable imperatively but is
+rejected during functional lowering; it is not silently interpreted as pure.
 
 .. _functional-material-processes:
 
@@ -2312,6 +2389,6 @@ Other functional models can still start from ``tensors.state``. Fresh
 initialization hooks, steady-state caches, custom
 Ion/Material initialization behavior, callable-module Material initial
 sources, unsupported MaterialProcess families or custom process lifecycle
-hooks, VoltageProcesses, and other topologies. Transition
+hooks, legacy or otherwise impure VoltageProcess hooks, and other topologies. Transition
 execution from an initialized model remains available wherever normal
 functional admission succeeds.

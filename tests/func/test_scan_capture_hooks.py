@@ -1,13 +1,92 @@
 """Disposable scan joint capture must not enter the caller's save hooks."""
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 import torch
 
+from dendra.func import _scan as scan_module
 from dendra.func import _scan_compat
 
 pytestmark = pytest.mark.cpu
+
+
+def test_training_body_capture_preserves_authored_stop_gradients(monkeypatch):
+    """Forward-equivalent alias lowering is not an equivalent AD program."""
+
+    class Functional:
+        device = torch.device("cpu")
+        intra = extra = SimpleNamespace(enabled=False)
+
+        @staticmethod
+        def _clone_state_tree(state):
+            return torch.utils._pytree.tree_map(lambda value: value.clone(), state)
+
+        @staticmethod
+        def _transition_rollout_values(parameters, prepared, state, *args):
+            voltage = state["integrator"]["v"]
+            soft = voltage.sin()
+            updated = voltage.tanh().detach() + parameters["scale"] * (
+                soft - soft.detach()
+            )
+            return {
+                "integrator": {"v": updated},
+                "control": state["control"],
+            }, {}
+
+    captured = []
+    make_fx = scan_module.make_fx
+
+    def record_graph(function, **options):
+        def capture(*examples):
+            graph = make_fx(function, **options)(*examples)
+            captured.append((graph, examples, options))
+            return graph
+
+        return capture
+
+    monkeypatch.setattr(scan_module, "make_fx", record_graph)
+    monkeypatch.setattr(
+        scan_module, "_compile_scan", lambda function, *a, **kw: function
+    )
+    chunk = object.__new__(scan_module._CompiledScanPopulationChunk)
+    chunk._functional = Functional()
+    chunk._steps = 2
+    chunk._options = {}
+    chunk._stepwise = False
+    chunk._plans = None
+    state = {
+        "integrator": {"v": torch.tensor([-0.3, 0.2], dtype=torch.float64)},
+        "control": {"duration_remainder": torch.tensor(0.0, dtype=torch.float64)},
+    }
+    chunk._capture(
+        {"scale": torch.tensor(0.75, dtype=torch.float64)},
+        {},
+        state,
+        None,
+        None,
+        {},
+        grad_enabled=True,
+    )
+    ((graph, examples, options),) = captured
+    assert options["pre_dispatch"] is True
+    assert any(
+        node.target is torch.ops.aten.detach.default for node in graph.graph.nodes
+    )
+    parameters, prepared, state, carries, invariant_carries, sample = examples
+    voltage = state["integrator"]["v"].detach().clone().requires_grad_()
+    scale = parameters["scale"].detach().clone().requires_grad_()
+    state["integrator"]["v"] = voltage
+    parameters["scale"] = scale
+    (updated, _), _ = graph(
+        parameters, prepared, state, carries, invariant_carries, sample
+    )
+    actual = updated["integrator"]["v"]
+    gradients = torch.autograd.grad(actual.sum(), (voltage, scale))
+    torch.testing.assert_close(actual, voltage.detach().tanh())
+    torch.testing.assert_close(gradients[0], scale.detach() * voltage.detach().cos())
+    torch.testing.assert_close(gradients[1], torch.zeros_like(scale))
 
 
 @pytest.mark.parametrize("fail", [False, True], ids=["success", "error"])

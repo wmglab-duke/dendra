@@ -121,7 +121,9 @@ class _CompiledScanPopulationChunk:
                     prepared["integrator"]["dt"],
                 )
 
-            assembly = make_fx(assemble)(parameters, prepared, state, ve, intra)
+            assembly = make_fx(assemble, pre_dispatch=grad_enabled)(
+                parameters, prepared, state, ve, intra
+            )
             ve, intra = assembly(parameters, prepared, state, ve, intra)
 
         sample = {}
@@ -175,7 +177,11 @@ class _CompiledScanPopulationChunk:
             # scan's non-aliasing contract applies at the block boundary.
             return (next_state, carries), emitted or {}
 
-        graph = make_fx(authored)(
+        # Preserve authored autograd boundaries before the scan body is
+        # differentiated. Post-dispatch capture may represent detach as alias,
+        # which is forward-equivalent but silently erases stop-gradient/STE
+        # semantics. Inference does not differentiate this captured graph.
+        graph = make_fx(authored, pre_dispatch=grad_enabled)(
             parameters, prepared, state, carries, invariant_carries, sample
         )
 
