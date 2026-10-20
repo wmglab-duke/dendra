@@ -1,0 +1,383 @@
+"""Explicit-state projections over NetCon's shared fixed-delay transport."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping
+from typing import NamedTuple
+
+import torch
+
+from dendra.models.core import Population
+from dendra.models.mechanisms._handler import MechanismHandler
+from dendra.models.networks._event_delivery import (
+    connection_event_counts,
+    dense_due,
+    dense_fixed_delay_transition,
+    gather_source_gates,
+)
+from dendra.models.networks.netcon import NetCon
+from dendra.models.networks.netstim import NetStim
+
+from ._types import FunctionalizationError
+
+
+class NetConTensors(NamedTuple):
+    """Independent effective weights and dense checkpoint state snapshots."""
+
+    weights: torch.Tensor
+    state: dict[str, torch.Tensor]
+
+
+def _snapshot(value, *, parameter=False):
+    with torch.inference_mode(False):
+        result = value.detach().clone(memory_format=torch.preserve_format)
+        if parameter:
+            result.requires_grad_(value.requires_grad)
+        return result
+
+
+def _effective_tensor(module, label):
+    """Read the initialized internal weight wrapper without executing it."""
+    name = getattr(type(module), "_effective_value_buffer", None)
+    value = module._buffers.get(name)
+    if (
+        not torch.is_tensor(value)
+        or "forward" in module.__dict__
+        or module._forward_hooks
+        or module._forward_pre_hooks
+    ):
+        raise FunctionalizationError(
+            f"Functional NetCon requires initialized internal {label} storage "
+            "whose forward returns its registered w Tensor."
+        )
+    return value
+
+
+def _source_tensor(netcon):
+    source = netcon.pre
+    if isinstance(source, NetStim):
+        return source._buffers["spikes"]
+    if not isinstance(source, Population) or not netcon.skip_thresholding:
+        raise FunctionalizationError(
+            "Functional NetCon requires explicit source gates: use a NetStim "
+            "or a Population connection with threshold=None. Threshold-crossing "
+            "history is not represented by this projection."
+        )
+    value = source
+    for name in netcon.pre_var.split("."):
+        if isinstance(value, MechanismHandler) and name in value.mechanisms:
+            value = value.mechanisms[name]
+            continue
+        if not isinstance(value, torch.nn.Module):
+            raise FunctionalizationError("NetCon pre_var must name a stored Tensor.")
+        slots = {**value._modules, **value._parameters, **value._buffers}
+        if name not in slots:
+            raise FunctionalizationError(
+                "Functional NetCon pre_var must name a registered Tensor; "
+                "callbacks and properties are not source gates."
+            )
+        value = slots[name]
+    if not torch.is_tensor(value):
+        raise FunctionalizationError("NetCon pre_var must name a stored Tensor.")
+    return value
+
+
+def _mode(netcon):
+    return (
+        bool(netcon.training),
+        netcon.delay_backend,
+        netcon.train_delay_backend,
+        None if netcon.train_flags is None else tuple(netcon.train_flags),
+        bool(netcon.track_events),
+        bool(netcon.skip_thresholding),
+        bool(netcon.apply_masking),
+    )
+
+
+def _eligible(netcon):
+    owner_type = type(netcon)
+    canonical_proxy = (
+        owner_type.__module__ == "dendra.models.parametric"
+        and owner_type.__bases__ == (NetCon,)
+        and set(vars(owner_type)) <= {"t", "__module__", "__doc__"}
+    )
+    if owner_type is not NetCon and not canonical_proxy:
+        raise FunctionalizationError("Expected an initialized canonical NetCon.")
+    if not getattr(netcon, "_event_delivery_initialized", False):
+        raise FunctionalizationError("Initialize the NetCon before lowering it.")
+    if netcon._mode_requires_initialize:
+        raise FunctionalizationError("NetCon mode changed; initialize it again.")
+    if netcon._checkpoint_runtime_kind() != "dense":
+        raise FunctionalizationError(
+            "Functional NetCon currently requires dense queues."
+        )
+    if netcon.training:
+        if netcon.train_flags is None:
+            raise FunctionalizationError(
+                "Configure NetCon training before lowering it."
+            )
+        if netcon.train_flags[1] or netcon.train_flags[6]:
+            raise FunctionalizationError(
+                "Functional NetCon requires diff_delays=False and "
+                "diff_scheduled_times=False."
+            )
+    if (
+        netcon.sched_con_idx.numel()
+        or netcon._sched_pre
+        or netcon._sched_w_source is not None
+        or netcon._sched_t_source is not None
+    ):
+        raise FunctionalizationError(
+            "Functional NetCon does not represent schedules or bound schedule sources."
+        )
+    allowed = (
+        NetCon.advance_non_diff_dense_uniform,
+        NetCon.advance_non_diff_dense_mixed,
+        NetCon.advance_diff,
+    )
+    if (
+        getattr(netcon.advance, "__self__", None) is not netcon
+        or getattr(netcon.advance, "__func__", None) not in allowed
+    ):
+        raise FunctionalizationError(
+            "Functional NetCon requires its canonical dense adapter."
+        )
+
+
+class FunctionalNetCon:
+    """A frozen routing plan using the same pure transport core as NetCon.
+
+    Supply full source-shaped numerical gates and effective per-connection
+    weights to :meth:`step`. Values retain their signs, amplitudes, and gradients.
+    Gates use ``source_dtype``/``source_device`` (the initialized NetCon's
+    presynaptic floating dtype/device), including when a NetStim stores hard
+    spikes as booleans. Weights use the target ``dtype``/``device``.
+    This projection performs no threshold detection or source generation. It
+    returns the due payload for exactly one separate Population ``receive`` call,
+    including an all-zero payload, and does not advance any Population clock.
+
+    Routing, quantized delays, timestep, and tensor schemas are copied at
+    lowering. Reinitialization, mode changes, or adding schedules invalidates
+    source-bound calls. Direct edits to source topology do not alter this frozen
+    plan; extraction and commit reject incompatible topology. Lower again to
+    adopt changed routing or delays. Explicit Population batch axes are part of
+    the source/target shapes; additional ``vmap`` axes stay implicit.
+    """
+
+    def __init__(self, netcon):
+        _eligible(netcon)
+        source = _source_tensor(netcon)
+        self._source = netcon
+        self._source_type = type(netcon)
+        self._pre = netcon.pre
+        self._post = netcon.post
+        self._syn = netcon.syn
+        self._generation = netcon._event_delivery_generation
+        self._mode = _mode(netcon)
+        self._advance = netcon.advance.__func__
+        self._pre_var = netcon.pre_var
+        self.source_shape = tuple(source.shape)
+        self.shape = tuple(netcon.syn.shape_f)
+        self.device = torch.device(netcon.device)
+        self.dtype = netcon.dtype
+        self.source_device = torch.device(netcon.pre_device)
+        self.source_dtype = netcon.pre_dtype
+        self._depth = int(netcon.max_delay_steps)
+        self._width = math.prod(self.shape)
+        self._connections = int(netcon._n_conn)
+        self._pre_idx = _snapshot(netcon.pre_idx)
+        self._post_idx = _snapshot(netcon.post_idx)
+        self._delay_steps = _snapshot(netcon.inference_delay_steps)
+        self._dt = _snapshot(netcon.dt)
+        self._physical_delays = _snapshot(_effective_tensor(netcon.delay_ms, "delay"))
+        self._track_events = bool(netcon.track_events)
+        checkpoint = netcon.state_dict_for_checkpoint()
+        self._state_schema = {
+            name: (tuple(value.shape), value.dtype, value.device)
+            for name, value in checkpoint.items()
+        }
+        self._validate_compatible(netcon)
+
+    def _validate_source(self):
+        source = self._source
+        if (
+            type(source) is not self._source_type
+            or not source._event_delivery_initialized
+            or source._event_delivery_generation != self._generation
+            or source._mode_requires_initialize
+            or _mode(source) != self._mode
+            or source.pre is not self._pre
+            or source.post is not self._post
+            or source.syn is not self._syn
+            or source.pre_var != self._pre_var
+            or source.device != self.device
+            or source.dtype != self.dtype
+            or source.pre_device != self.source_device
+            or source.pre_dtype != self.source_dtype
+            or source.max_delay_steps != self._depth
+            or source._n_conn != self._connections
+            or source._syn_numel != self._width
+            or tuple(source.syn.shape_f) != self.shape
+            or getattr(source.advance, "__func__", None) is not self._advance
+            or source.sched_con_idx.numel() != 0
+            or source._sched_pre
+            or source._sched_w_source is not None
+            or source._sched_t_source is not None
+        ):
+            raise FunctionalizationError(
+                "The source NetCon configuration changed; initialize and lower it again."
+            )
+
+    @staticmethod
+    def _validate_tensor(value, *, shape, dtype, device, label):
+        if not torch.is_tensor(value):
+            raise TypeError(f"{label} must be a Tensor")
+        if (
+            tuple(value.shape) != shape
+            or value.dtype != dtype
+            or value.device != device
+        ):
+            raise ValueError(f"{label} must match {device}/{dtype}/{shape}")
+
+    def _validate_state(self, state):
+        if not isinstance(state, Mapping) or set(state) != set(self._state_schema):
+            raise ValueError("NetCon state must match its dense checkpoint schema")
+        for name, (shape, dtype, device) in self._state_schema.items():
+            self._validate_tensor(
+                state[name],
+                shape=shape,
+                dtype=dtype,
+                device=device,
+                label=f"state.{name}",
+            )
+
+    def _validate_compatible(self, netcon):
+        _eligible(netcon)
+        source = _source_tensor(netcon)
+        if (
+            _mode(netcon) != self._mode
+            or tuple(source.shape) != self.source_shape
+            or tuple(netcon.syn.shape_f) != self.shape
+            or netcon.pre_var != self._pre_var
+            or netcon.device != self.device
+            or netcon.dtype != self.dtype
+            or netcon.pre_device != self.source_device
+            or netcon.pre_dtype != self.source_dtype
+            or int(netcon.max_delay_steps) != self._depth
+            or int(netcon._n_conn) != self._connections
+            or int(netcon._syn_numel) != self._width
+            or not torch.equal(netcon.pre_idx, self._pre_idx)
+            or not torch.equal(netcon.post_idx, self._post_idx)
+            or not torch.equal(netcon.inference_delay_steps, self._delay_steps)
+            or not torch.equal(netcon.dt, self._dt)
+            or not torch.equal(
+                _effective_tensor(netcon.delay_ms, "delay"), self._physical_delays
+            )
+        ):
+            raise FunctionalizationError(
+                "NetCon topology does not match this frozen plan."
+            )
+        self._validate_tensor(
+            _effective_tensor(netcon.weight, "weight"),
+            shape=(self._connections,),
+            dtype=self.dtype,
+            device=self.device,
+            label="effective weights",
+        )
+        self._validate_state(netcon.state_dict_for_checkpoint())
+        if self._depth < 1 or bool(torch.any(self._delay_steps < 1)):
+            raise FunctionalizationError("NetCon needs a nonempty fixed-delay ring.")
+        if bool(torch.any((self._pre_idx < 0) | (self._pre_idx >= source.numel()))):
+            raise FunctionalizationError(
+                "NetCon source indices are outside its source."
+            )
+        if bool(torch.any((self._post_idx < 0) | (self._post_idx >= self._width))):
+            raise FunctionalizationError(
+                "NetCon target indices are outside its target."
+            )
+
+    def extract(self, netcon=None) -> NetConTensors:
+        """Snapshot effective weights and checkpoint carry from a compatible NetCon."""
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError("Extract NetCon tensors before torch.compile.")
+        netcon = self._source if netcon is None else netcon
+        self._validate_compatible(netcon)
+        return NetConTensors(
+            _snapshot(_effective_tensor(netcon.weight, "weight"), parameter=True),
+            {
+                name: _snapshot(value)
+                for name, value in netcon.state_dict_for_checkpoint().items()
+            },
+        )
+
+    def step(self, weights, state, source_gates):
+        """Return ``(next_state, due_payload)`` without mutating any inputs."""
+        self._validate_source()
+        self._validate_state(state)
+        self._validate_tensor(
+            weights,
+            shape=(self._connections,),
+            dtype=self.dtype,
+            device=self.device,
+            label="weights",
+        )
+        self._validate_tensor(
+            source_gates,
+            shape=self.source_shape,
+            dtype=self.source_dtype,
+            device=self.source_device,
+            label="source_gates",
+        )
+        event_queue = state.get("event_queue")
+        due = dense_due(
+            state["delivery_buffer"], state["current_time_step"], event_queue
+        )
+        gates = gather_source_gates(source_gates, self._pre_idx).to(
+            device=self.device, dtype=self.dtype
+        )
+        counts = connection_event_counts(gates) if self._track_events else None
+        updated = dense_fixed_delay_transition(
+            state["delivery_buffer"],
+            state["current_time_step"],
+            state["global_step"],
+            weights,
+            gates,
+            post_idx=self._post_idx,
+            delay_steps=self._delay_steps,
+            depth=self._depth,
+            width=self._width,
+            event_queue=event_queue,
+            event_counts=counts,
+        )
+        result = dict(state)
+        result.update(
+            delivery_buffer=updated.queue,
+            current_time_step=updated.slot,
+            global_step=updated.global_step,
+        )
+        if self._track_events:
+            result.update(events=due.event_counts, event_queue=updated.event_queue)
+        return result, due.payload.reshape(self.shape)
+
+    def commit_state_(self, netcon, state):
+        """Commit independent copies of validated carry into a compatible NetCon."""
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError("Commit NetCon state outside torch.compile.")
+        self._validate_compatible(netcon)
+        self._validate_state(state)
+        with torch.inference_mode(False):
+            copied = {
+                name: value.clone(memory_format=torch.contiguous_format)
+                for name, value in state.items()
+            }
+            return netcon.restore_dict_from_checkpoint(copied)
+
+
+def make_functional_netcon(netcon) -> tuple[FunctionalNetCon, NetConTensors]:
+    """Lower one initialized dense NetCon with explicit numerical source gates."""
+    projection = FunctionalNetCon(netcon)
+    return projection, projection.extract()
+
+
+__all__ = ["FunctionalNetCon", "NetConTensors", "make_functional_netcon"]

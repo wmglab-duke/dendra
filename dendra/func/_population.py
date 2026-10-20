@@ -563,6 +563,25 @@ _STANDARD_RECEIVE_ADAPTERS = {
     name: inspect.getattr_static(Synapse, name) for name in _RECEIVE_ADAPTER_NAMES
 }
 _STANDARD_RECEIVE_VALUES = inspect.getattr_static(Synapse, "net_receive_values")
+
+
+class _RawClassHookIdentity:
+    """Compare one stored class hook without resolving its descriptor.
+
+    A class mappingproxy delegates comparison to its underlying dictionary.
+    This right-hand operand therefore receives that raw dict, allowing an
+    identity check after functional_call writes without invoking user equality
+    or descriptor getters. Dynamo's ordinary raw-entry guards remain visible.
+    """
+
+    def __init__(self, name, expected):
+        self.name = name
+        self.expected = expected
+
+    def __eq__(self, namespace):
+        return namespace.get(self.name) is self.expected
+
+
 _STATE_IMPERATIVE_INITIALIZATION_HOOKS = (
     "populate_parameter_buffers",
     "init_rng",
@@ -9374,7 +9393,7 @@ class FunctionalPopulation:
                 (
                     hook,
                     tuple(
-                        (cls, vars(cls).get(hook))
+                        (cls, hook in vars(cls), vars(cls).get(hook))
                         for cls in type(population.mech.mechanisms[name]).__mro__
                     ),
                 )
@@ -13025,20 +13044,29 @@ class FunctionalPopulation:
                 f"Synapse {target!r} event receiver changed after make_functional(); "
                 "lower the Population again."
             )
+        compiling = torch.compiler.is_compiling()
         for name, class_bindings in self._source_receiver_hooks[target]:
-            if name in source.__dict__ or any(
-                cls.__dict__.get(name) is not expected
-                for cls, expected in class_bindings
-            ):
+            expected = next(value for _cls, present, value in class_bindings if present)
+            changed = (
+                any(
+                    (name in cls.__dict__) != present
+                    or not (cls.__dict__ == _RawClassHookIdentity(name, original))
+                    for cls, present, original in class_bindings
+                )
+                if compiling
+                else any(
+                    (name in cls.__dict__) != present
+                    or cls.__dict__.get(name) is not original
+                    for cls, present, original in class_bindings
+                )
+            )
+            if name in source.__dict__ or changed:
                 raise FunctionalizationError(
                     f"Synapse {target!r} event receiver changed after "
                     "make_functional(); lower the Population again."
                 )
-            expected = next(
-                value for _cls, value in class_bindings if value is not None
-            )
             method = getattr(source, name)
-            if getattr(method, "__func__", method) is not expected:
+            if method.__self__ is not source or method.__func__ is not expected:
                 raise FunctionalizationError(
                     f"Synapse {target!r} event receiver changed after "
                     "make_functional(); lower the Population again."

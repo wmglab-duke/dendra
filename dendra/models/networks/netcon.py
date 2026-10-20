@@ -8,6 +8,15 @@ import torch
 from ...helpers import current_native_extension_policy
 from ...utils.tensor_ops import _logical_tensor_bytes
 from ..parametric import Referency
+from ._event_delivery import (
+    _clear_dense_slot,
+    _enqueue_dense_values,
+    _fixed_delay_indices,
+    connection_event_counts,
+    dense_due,
+    dense_fixed_delay_transition,
+    gather_source_gates,
+)
 from .netstim import NetStim, _causal_step_index
 from .spiking import update_active, update_active_diff
 from .utils import make_getattr
@@ -1703,6 +1712,8 @@ class NetCon(Referency):
         """
         super().__init__()
 
+        self._event_delivery_initialized = False
+        self._event_delivery_generation = 0
         self.weight = weight
         self.syn = post_syn
         self.pre = pre
@@ -4749,9 +4760,14 @@ class NetCon(Referency):
         # 1) deliver today's payload and expose the matching hard-event counts.
         # Ambiguous surrogate/fractional event tracking is rejected by
         # set_diff_config(), so track_events here always has integer semantics.
-        todays = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)  # [n_syn]
+        due = dense_due(
+            self.delivery_buffer,
+            cur_idx,
+            self.event_queue if self.track_events else None,
+        )
+        todays = due.payload
         if self.track_events:
-            self.events.copy_(self.event_queue.index_select(0, cur_idx).squeeze(0))
+            self.events.copy_(due.event_counts)
         else:
             self.events.zero_()
         self.syn.net_receive(todays.view(*self.syn.shape_f), self)
@@ -4777,12 +4793,36 @@ class NetCon(Referency):
         self._record_gate_for_state_cache(gate)
         event_counts = None
         if self.track_events:
-            event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
+            event_counts = connection_event_counts(intrinsic_gate, sched_counts_conn)
 
         # weights (optionally detach)
         wvals = self.weight()
         if not diff_weights:
             wvals = wvals.detach()
+        if not diff_delays:
+            # The same pure transport transition backs functional projections.
+            # Source detection and scheduled-event aggregation stay here, after
+            # reception, so recurrent Network invocation order is unchanged.
+            transition = dense_fixed_delay_transition(
+                self.delivery_buffer,
+                cur_idx,
+                gs,
+                wvals,
+                gate,
+                post_idx=self.post_idx,
+                delay_steps=self.inference_delay_steps,
+                depth=self.max_delay_steps,
+                width=self._syn_numel,
+                event_queue=self.event_queue if self.track_events else None,
+                event_counts=event_counts,
+                _clone_once=True,
+            )
+            self.delivery_buffer = transition.queue
+            if self.track_events:
+                self.event_queue = transition.event_queue
+            self.current_time_step = transition.slot.detach()
+            self.global_step = transition.global_step.detach()
+            return
         weighted_spikes = wvals * gate  # [n_conn]
 
         # ------------------------------------------------------------------
@@ -4840,17 +4880,6 @@ class NetCon(Referency):
                 )  # [n_conn,3]
                 vals = weighted_spikes.unsqueeze(-1) * w  # [n_conn,3]
                 buf_flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
-        else:
-            future_steps = (cur_idx + self.inference_delay_steps).remainder(
-                self.max_delay_steps
-            )
-            flat = future_steps * self.syn_numel + self.post_idx
-            # Integer delay: single destination per connection
-            buf_flat.index_add_(0, flat, weighted_spikes)
-            if event_queue_next is not None:
-                flat_events = future_steps * self._n_conn + self.con_range
-                event_queue_next.view(-1).index_add_(0, flat_events, event_counts)
-
         # Commit next buffer (already cleared + updated)
         self.delivery_buffer = buf_next
         if event_queue_next is not None:
@@ -4867,21 +4896,20 @@ class NetCon(Referency):
     def _dense_current_delivery(self):
         """Return the dense delivery row due at the current slot."""
         cur_idx = self.current_time_step
-        todays_delivery = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)
-        return cur_idx, todays_delivery
+        return cur_idx, dense_due(self.delivery_buffer, cur_idx).payload
 
     def _dense_current_events(self, cur_idx):
         """Expose per-connection event counts for the current slot if enabled."""
         if self.track_events:
-            self.events.copy_(self.event_queue.index_select(0, cur_idx).squeeze(0))
+            self.events.copy_(dense_due(self.event_queue, cur_idx).payload)
         else:
             self.events.zero_()
 
     def _dense_clear_current_slot(self, cur_idx):
         """Clear the dense delivery/event row after it has been delivered."""
-        self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
+        _clear_dense_slot(self.delivery_buffer, cur_idx, inplace=True)
         if self.track_events:
-            self.event_queue.index_fill_(0, cur_idx, 0)
+            _clear_dense_slot(self.event_queue, cur_idx, inplace=True)
 
     def _dense_gate_and_event_counts(self):
         """Compute this step's connection gate and optional event counts."""
@@ -4897,13 +4925,15 @@ class NetCon(Referency):
                 self.sched_counts.copy_(sched_counts_conn)
             gate = intrinsic_gate + sched_wsum_conn
             if self.track_events:
-                event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
+                event_counts = connection_event_counts(
+                    intrinsic_gate, sched_counts_conn
+                )
             else:
                 event_counts = None
         else:
             gate = intrinsic_gate
             if self.track_events:
-                event_counts = (intrinsic_gate > 0).to(torch.int32)
+                event_counts = connection_event_counts(intrinsic_gate)
             else:
                 event_counts = None
 
@@ -4911,29 +4941,52 @@ class NetCon(Referency):
         return gate, event_counts
 
     def _dense_schedule_uniform(self, cur_idx, weighted_spikes, event_counts=None):
-        """Schedule all connections into one future dense delay row."""
-        future = (cur_idx + int(self._dense_uniform_delay_step)).remainder(
-            self.max_delay_steps
+        """Schedule into one future row without copying owned inference rings."""
+        flat = _fixed_delay_indices(
+            cur_idx,
+            self.post_idx,
+            self.inference_delay_steps,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            uniform_delay=self._dense_uniform_delay_step,
         )
-        flat = future * self._syn_numel + self.post_idx
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted_spikes)
-
+        _enqueue_dense_values(self.delivery_buffer, flat, weighted_spikes, inplace=True)
         if self.track_events and event_counts is not None:
-            flat_e = future * self._n_conn + self.con_range
-            self.event_queue.view(-1).index_add_(0, flat_e.reshape(-1), event_counts)
+            flat_events = _fixed_delay_indices(
+                cur_idx,
+                self.con_range,
+                self.inference_delay_steps,
+                depth=self.max_delay_steps,
+                width=self._n_conn,
+                uniform_delay=self._dense_uniform_delay_step,
+            )
+            _enqueue_dense_values(
+                self.event_queue, flat_events, event_counts, inplace=True
+            )
 
     def _dense_schedule_mixed(self, cur_idx, weighted_spikes, event_counts=None):
-        """Schedule all connections using precomputed per-connection offsets."""
-        base = cur_idx * self._syn_numel
-        flat = (base + self.flat_delay_offsets).remainder(self._delivery_numel)
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted_spikes)
-
+        """Schedule mixed delays using the same routing and owned-buffer writes."""
+        flat = _fixed_delay_indices(
+            cur_idx,
+            self.post_idx,
+            self.inference_delay_steps,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            flat_offsets=self.flat_delay_offsets,
+        )
+        _enqueue_dense_values(self.delivery_buffer, flat, weighted_spikes, inplace=True)
         if self.track_events and event_counts is not None:
-            base_e = cur_idx * self._n_conn
-            flat_e = (base_e + self.flat_event_offsets).remainder(
-                self._event_queue_numel
+            flat_events = _fixed_delay_indices(
+                cur_idx,
+                self.con_range,
+                self.inference_delay_steps,
+                depth=self.max_delay_steps,
+                width=self._n_conn,
+                flat_offsets=self.flat_event_offsets,
             )
-            self.event_queue.view(-1).index_add_(0, flat_e.reshape(-1), event_counts)
+            _enqueue_dense_values(
+                self.event_queue, flat_events, event_counts, inplace=True
+            )
 
     def _advance_dense_counters(self):
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)
@@ -5038,7 +5091,7 @@ class NetCon(Referency):
         # 5) Optional per-connection event introspection, without allocating the
         # dense ``[max_delay_steps, n_conn]`` debug queue.
         if self.track_events:
-            event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
+            event_counts = connection_event_counts(intrinsic_gate, sched_counts_conn)
             active_events = torch.nonzero(event_counts != 0, as_tuple=False).flatten()
             if active_events.numel() > 0:
                 delay_steps = self.inference_delay_steps.index_select(0, active_events)
@@ -5113,18 +5166,11 @@ class NetCon(Referency):
         # (or spikes_gate for differentiable spiking)
         if diff_spiking:
             # surrogate / soft gate, already float
-            gate = (
-                pre.spike_gate.to(self.pre_device)
-                .view(-1)
-                .index_select(0, self.pre_idx)
-            )
+            gate = gather_source_gates(pre.spike_gate.to(self.pre_device), self.pre_idx)
         else:
             # hard spikes; usually bool → cast to float gate {0, 1}
-            gate = (
-                pre.spikes.to(self.pre_device)
-                .view(-1)
-                .index_select(0, self.pre_idx)
-                .to(self.pre_dtype)
+            gate = gather_source_gates(pre.spikes.to(self.pre_device), self.pre_idx).to(
+                self.pre_dtype
             )
 
         # Ensure dtype is always self.dtype
@@ -5166,13 +5212,9 @@ class NetCon(Referency):
           are NaN.
         """
         # Always work in the module's float dtype
-        v_selected = (
-            self.get_pre_var(pre)
-            .to(self.pre_device)
-            .view(-1)
-            .index_select(0, self.pre_idx)
-            .to(self.pre_dtype)
-        )
+        v_selected = gather_source_gates(
+            self.get_pre_var(pre).to(self.pre_device), self.pre_idx
+        ).to(self.pre_dtype)
 
         if self.skip_thresholding:
             # Just mirror v as a continuous "gate"
@@ -5392,6 +5434,7 @@ class NetCon(Referency):
         * This method is invoked automatically by higher-level simulation
           loops in Dendra (e.g., :class:`dendra.models.networks.Network.initialize`).
         """
+        self._event_delivery_initialized = False
         if self.training:
             if self._use_source_history_training_runtime():
                 self._ensure_source_history_training_storage(clear=False)
@@ -5441,6 +5484,10 @@ class NetCon(Referency):
             self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
         self.detach()
         self._mode_requires_initialize = False
+        self._event_delivery_generation = (
+            getattr(self, "_event_delivery_generation", 0) + 1
+        )
+        self._event_delivery_initialized = True
 
     def numel(self):
         """

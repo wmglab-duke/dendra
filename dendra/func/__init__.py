@@ -18,6 +18,7 @@ from ._callbacks import (
 from ._compiled import CompiledPopulationChunk
 from ._convenience import CompiledRunner, compile
 from ._execution import ExecutionCapabilities, ExecutionReport
+from ._netcon import FunctionalNetCon, NetConTensors, make_functional_netcon
 from ._population import FunctionalPopulation, make_functional
 from ._runners import longrun, longrun_checkpointed, run
 from ._stimuli import FunctionalExtra, FunctionalIntra, StimulusTensors
@@ -47,9 +48,11 @@ __all__ = [
     "FunctionalPopulation",
     "FunctionalExtra",
     "FunctionalIntra",
+    "FunctionalNetCon",
     "FunctionalizationError",
     "InitializationInput",
     "LFP",
+    "NetConTensors",
     "PopulationTensors",
     "Raster",
     "Recorder",
@@ -60,5 +63,6 @@ __all__ = [
     "longrun",
     "longrun_checkpointed",
     "make_functional",
+    "make_functional_netcon",
     "run",
 ]

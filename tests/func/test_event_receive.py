@@ -713,3 +713,116 @@ def test_native_inductor_receive_and_step_trace_and_gradients(synapse):
             torch.testing.assert_close(value, reference, rtol=2e-8, atol=2e-10)
             assert torch.count_nonzero(value)
         _assert_module_snapshot(model, snapshot)
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    (
+        "method",
+        "staticmethod",
+        "classmethod",
+        "property",
+        "descriptor",
+        "equal_descriptor",
+    ),
+)
+def test_repeated_compiled_receive_guards_raw_hook_descriptors_before_getters(
+    replacement, monkeypatch
+):
+    model = _model(batch=None)
+    owner = type(model.mech.event)
+    original = owner.net_receive_values
+    # Exercise replacement of an existing raw class entry, including a
+    # staticmethod whose resolved function would still be the same object.
+    monkeypatch.setattr(owner, "net_receive_values", original)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+
+    def evaluate(payload):
+        state = functional.prepare_and_receive(
+            tensors.parameters,
+            tensors.constants,
+            tensors.state,
+            target="event",
+            payload=payload,
+        )
+        return functional.prepare_and_receive(
+            tensors.parameters,
+            tensors.constants,
+            state,
+            target="event",
+            payload=payload,
+        )
+
+    compiled = torch.compile(evaluate, backend="aot_eager", fullgraph=True)
+    payload = model.v.new_tensor(0.2)
+    _assert_tree_close(compiled(payload), evaluate(payload))
+    calls = []
+
+    class Descriptor:
+        def __get__(self, instance, owner):
+            calls.append("class" if instance is None else "instance")
+            return original
+
+    class EqualDescriptor(Descriptor):
+        def __eq__(self, other):
+            calls.append("equality")
+            return True
+
+    if replacement == "method":
+
+        def changed(self, weights, dt, values):
+            return {"states": {"g": values["g"] + 2 * weights}}
+
+        value = changed
+    elif replacement == "staticmethod":
+        value = staticmethod(original)
+    elif replacement == "classmethod":
+        value = classmethod(original)
+    elif replacement == "property":
+        value = property(lambda self: calls.append("property"))
+    elif replacement == "equal_descriptor":
+        value = EqualDescriptor()
+    else:
+        value = Descriptor()
+    monkeypatch.setattr(owner, "net_receive_values", value)
+    snapshot = _module_snapshot(model)
+    with pytest.raises((dn.func.FunctionalizationError, torch._dynamo.exc.Unsupported)):
+        compiled(payload)
+    assert calls == []
+    _assert_module_snapshot(model, snapshot)
+
+
+def test_repeated_compiled_receiver_accepts_overridden_none_base_hook():
+    class AbstractReceiver(Synapse):
+        net_receive_values = None
+
+    class ConcreteReceiver(AbstractReceiver):
+        Synapse.CARRY("calls")
+
+        def net_receive_values(self, weights, dt, values):
+            return {"carry": {"calls": values["calls"] + 1}}
+
+    model = _model(ConcreteReceiver, batch=None)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    snapshot = _module_snapshot(model)
+
+    def evaluate(payload):
+        state = tensors.state
+        for _ in range(2):
+            state = functional.prepare_and_receive(
+                tensors.parameters,
+                tensors.constants,
+                state,
+                target="event",
+                payload=payload,
+            )
+        return state
+
+    payload = model.v.new_zeros(())
+    actual = torch.compile(evaluate, backend="aot_eager", fullgraph=True)(payload)
+    _assert_tree_close(actual, evaluate(payload))
+    torch.testing.assert_close(
+        actual["mechanism_buffers"]["event"]["calls"],
+        torch.full_like(model.mech.event.calls, 2),
+    )
+    _assert_module_snapshot(model, snapshot)

@@ -619,9 +619,10 @@ reception requires the pure hook and canonical adapters.
 One ``receive`` call represents one existing NetCon receive invocation,
 including a zero payload. Preserve call order when several NetCons target
 the same mechanism: custom receivers may update timers, gates, or voltage on
-every call. This interface supplies reception only. Event detection, delays,
-queues, NetStim schedules, and complete connected Network lowering remain
-separate work.
+every call. This interface supplies reception only. For a shared dense
+fixed-delay NetCon transition with explicit source gates, weights, and queue
+state, see :ref:`functional-event-delivery`. Event detection, NetStim
+scheduling, and complete connected Network lowering remain separate work.
 
 .. _functional-scnv:
 

@@ -654,6 +654,11 @@ def make_weight(weights, n, *, device=None, dtype=None):
             return out
 
     class WeightExpander(torch.nn.Module):
+        # Internal value-storage contract shared by NetCon's eager adapter and
+        # functional extraction. Initialization has already materialized the
+        # effective per-connection tensor; neither path re-samples it on read.
+        _effective_value_buffer = "w"
+
         def __init__(self, weights, n):
             super(WeightExpander, self).__init__()
             self.weights = torch.nn.ModuleList(

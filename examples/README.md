@@ -20,6 +20,16 @@ the documentation build executes the same files.
 
 ## Simulate and fit models
 
+[`functional_event_delivery.py`](functional_event_delivery.py) starts from an
+ordinary Network, lowers one existing dense fixed-delay NetCon, and composes
+its shared transport core with functional synapse reception and population
+stepping. It checks native/functional queue and voltage parity and weight
+gradients. See the [delivery guide](../docs/advanced/A12_functional_event_delivery.md).
+
+```bash
+python examples/functional_event_delivery.py
+```
+
 [`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
 frequency, delay, and duration from simulated voltage recordings, optionally
 with observation noise, using ordinary `model.run()` and autograd. Try a

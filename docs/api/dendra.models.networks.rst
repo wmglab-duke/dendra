@@ -45,3 +45,20 @@ NetCon internals
 .. autoclass:: dendra.models.networks.netcon.NetCon
    :members:
    :special-members: __init__
+
+Functional projection tensors
+-----------------------------
+
+The shared fixed-delay transport core can be used with explicit source gates,
+weights, and queue state. This lowers an existing initialized NetCon; the
+standard Network remains the connectivity declaration. See
+:doc:`../advanced/A12_functional_event_delivery` for the supported configuration
+and complete runnable example.
+
+.. autofunction:: dendra.func.make_functional_netcon
+
+.. autoclass:: dendra.func.FunctionalNetCon
+   :members: step, extract, commit_state_
+
+.. autoclass:: dendra.func.NetConTensors
+   :members:

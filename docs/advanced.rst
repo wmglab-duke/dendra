@@ -19,3 +19,4 @@ Advanced
    advanced/A9_macroscopic_descriptor_training.rst
    advanced/A10_hard_transition_scans.rst
    advanced/A11_event_margin_training.rst
+   advanced/A12_functional_event_delivery.md
