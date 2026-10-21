@@ -91,7 +91,7 @@ needed, following the functional Population contracts. `inputs` maps names to
 `StepInput.intra`. Registered Population stimulation remains active.
 Imperative callbacks are not executed by this timestep.
 
-For a reusable runner with snapshot restart and recording, use `dn.compile`
+For a reusable runner with snapshot or fresh restart and recording, use `dn.compile`
 as described in {doc}`A21_functional_network_compile`. To compose timesteps
 in your own execution loop, compile the pure step directly; the example's
 `run_demo(compiled=True)` uses `backend="aot_eager", fullgraph=True`.
@@ -194,7 +194,7 @@ The complete example executes here:
 ```
 
 Multi-step execution is available through {doc}`A20_functional_network_rollout`,
-and snapshot-based `dn.compile(Network)` execution is described in
-{doc}`A21_functional_network_compile`. Fresh pure Network initialization,
-heterogeneous-device functional execution, compact functional event queues, and
+and `dn.compile(Network)` execution with snapshot or fresh initialization is
+described in {doc}`A21_functional_network_compile`.
+Heterogeneous-device functional execution, compact functional event queues, and
 continuous delay interpolation are currently unsupported.

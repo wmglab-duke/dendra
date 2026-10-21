@@ -236,7 +236,7 @@ The complete CPU example executes here:
 :tags: [remove-input]
 ```
 
-For snapshot-based `dn.compile(Network)` convenience execution, continue with
-{doc}`A21_functional_network_compile`. Fresh pure Network initialization,
-heterogeneous-device functional execution, compact functional event queues, and
+For `dn.compile(Network)` convenience execution with snapshot or fresh
+initialization, continue with {doc}`A21_functional_network_compile`.
+Heterogeneous-device functional execution, compact functional event queues, and
 continuous delay interpolation are currently unsupported.

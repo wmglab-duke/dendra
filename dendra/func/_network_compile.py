@@ -1,4 +1,4 @@
-"""Snapshot-based Network convenience execution over shared pure components."""
+"""Network convenience execution over shared pure components."""
 
 from __future__ import annotations
 
@@ -12,6 +12,7 @@ from torch.utils import _pytree as pytree
 from dendra.models.core import _validate_time_scalar
 
 from ._network import make_functional_network
+from ._network_initialization import NetworkInitializationInput
 from ._network_parameters import get_parameter, named_parameters, parameter_name
 from ._runner_policy import (
     _configured_callbacks,
@@ -35,10 +36,12 @@ def _map_containers(tree, mapping):
 
 
 class CompiledNetworkRunner:
-    """Fixed-horizon ``dn.compile(Network)`` execution from an initialized snapshot.
+    """Fixed-horizon ``dn.compile(Network)`` execution with explicit restart policy.
 
     No-state calls restart :attr:`initial_state`, including delivery queues and
-    NetStim clock/RNG carry. An explicit state continues without initialization;
+    NetStim clock/RNG carry. ``initialization='fresh'`` instead constructs state
+    from current parameters and :attr:`initialization_inputs`. An explicit
+    state continues without initialization;
     continue recordings with ``callback_state=aux['callbacks'].state``. Calls
     return ``(state, aux)`` and leave the native Network and restart snapshot
     unchanged. Use :meth:`FunctionalNetwork.commit_state_` to publish carry.
@@ -58,9 +61,13 @@ class CompiledNetworkRunner:
     Preparation and output graphs are invocation-local; only compiled kernels
     are cached. ``checkpoint_every`` preserves gradients across exact spans.
     The initialized Network's mode and timestep are frozen. Gradient execution
-    requires a Network initialized in training mode. Fresh initialization,
-    inference while loops, and constructor-bound ``extra`` are not supported
-    by this snapshot adapter; explicit ``ve`` tapes remain available.
+    requires a Network initialized in training mode. Fresh calls accept a
+    :class:`NetworkInitializationInput` override and return effective parameters
+    in ``aux['parameters']``. Continue those parameters explicitly when pure
+    initialization transforms replace them. Initialization runs once before
+    rollout/checkpoint spans; its graph is never cached. Inference while loops
+    and constructor-bound ``extra`` are currently unsupported; explicit ``ve``
+    tapes remain available.
     """
 
     def __init__(
@@ -85,14 +92,12 @@ class CompiledNetworkRunner:
             raise ValueError("steps must be a positive integer")
         if execution != "scan":
             raise ValueError(
-                "Network compiled runners require execution='scan'; while execution is not yet supported"
+                "Network compiled runners require execution='scan'; while execution is currently unsupported"
             )
         if not isinstance(inference, bool):
             raise TypeError("inference must be a bool")
-        if initialization != "snapshot":
-            raise ValueError(
-                "Network compiled runners require initialization='snapshot'; fresh initialization is not yet supported"
-            )
+        if initialization not in ("snapshot", "fresh"):
+            raise ValueError("initialization must be 'snapshot' or 'fresh'")
         if extra is not None:
             raise ValueError(
                 "Network compiled runners do not bind extra; supply per-population NetworkRolloutInput ve tapes"
@@ -125,10 +130,22 @@ class CompiledNetworkRunner:
             self._initial_state = pytree.tree_map_only(
                 torch.Tensor, lambda value: value.detach().clone(), tensors.state
             )
+            self._initialization_inputs = pytree.tree_map_only(
+                torch.Tensor,
+                lambda value: value.detach().clone(),
+                self._functional.initialization_inputs,
+            )
+            from ._convenience import _initialization_writes_parameters
+
+            self._initialization_writes_parameters = initialization == "fresh" and any(
+                _initialization_writes_parameters(plan)
+                for plan in self._functional.populations.values()
+            )
             self._callbacks = (
                 None if not configured else self._functional.make_callbacks(configured)
             )
         self._inference = inference
+        self._initialization = initialization
         self._steps = steps
         self._checkpoint_every = checkpoint_every
         keywords = _inference_compile_options(
@@ -140,8 +157,20 @@ class CompiledNetworkRunner:
 
     @property
     def initial_state(self):
-        """Complete restart snapshot; Tensor leaves are editable by the caller."""
+        """Complete restart snapshot; explicit state always bypasses initialization.
+
+        Fresh-policy no-state calls use :attr:`initialization_inputs` instead.
+        """
         return self._initial_state
+
+    @property
+    def initialization_inputs(self):
+        """Editable independent defaults for fresh Population and clock initialization.
+
+        Initialization-only leaves are separate from :attr:`parameters`; use
+        ``requires_grad_()`` or explicit overrides to differentiate them.
+        """
+        return self._initialization_inputs
 
     @property
     def parameters(self):
@@ -188,14 +217,31 @@ class CompiledNetworkRunner:
         initialization=None,
     ):
         _validate_host_call()
+        fresh_policy = self._initialization == "fresh"
         if initialization is not None:
-            raise ValueError(
-                "Network compiled runners use initialization='snapshot' and do not accept initialization overrides"
-            )
+            if not fresh_policy:
+                raise ValueError(
+                    "initialization overrides require initialization='fresh'"
+                )
+            if state is not None:
+                raise ValueError(
+                    "initialization cannot be combined with explicit state"
+                )
         if callback_state is not None and state is None:
             raise ValueError(
                 "callback_state continuation requires explicit Network state"
             )
+        if (
+            fresh_policy
+            and state is not None
+            and parameters is None
+            and self._initialization_writes_parameters
+        ):
+            raise ValueError(
+                "initialization transforms write parameters; continue with "
+                "parameters=aux['parameters'] from the preceding call"
+            )
+        fresh = fresh_policy and state is None
         selected_state = self._initial_state if state is None else state
         # Materialize external container code before the plan validates native
         # source structure. Tensor identities/history, including ties, survive.
@@ -204,14 +250,47 @@ class CompiledNetworkRunner:
             if parameters is None
             else _map_containers(parameters, dict)
         )
+        selected_inputs = _map_containers(inputs, dict)
+        selected_initialization = (
+            _map_containers(
+                self._initialization_inputs
+                if initialization is None
+                else initialization,
+                dict,
+            )
+            if fresh
+            else None
+        )
+        selected_constants = self._constants
         previous = self._kernel.execution_report()
         try:
+            if fresh:
+                if not isinstance(selected_initialization, NetworkInitializationInput):
+                    raise TypeError(
+                        "initialization must be a NetworkInitializationInput"
+                    )
+                # Fresh coefficients and effective parameters require ordinary,
+                # versioned tensors even under an outer inference context.
+                initialization_grad = torch.is_grad_enabled() and not self._inference
+                with (
+                    torch.inference_mode(False),
+                    torch.set_grad_enabled(initialization_grad),
+                ):
+                    initialized = self._functional._initialize_host(
+                        selected_parameters,
+                        selected_constants,
+                        selected_state,
+                        selected_initialization,
+                    )
+                selected_parameters = initialized.parameters
+                selected_constants = initialized.constants
+                selected_state = initialized.state
             with torch.inference_mode() if self._inference else nullcontext():
-                return self._functional.run(
+                final, auxiliary = self._functional.run(
                     selected_parameters,
-                    self._constants,
+                    selected_constants,
                     selected_state,
-                    inputs,
+                    selected_inputs,
                     steps=self._steps,
                     callbacks=self._callbacks,
                     callback_state=callback_state,
@@ -219,6 +298,10 @@ class CompiledNetworkRunner:
                     compiled_chunk=self._kernel,
                     chunklength=self._steps,
                 )
+                if fresh_policy:
+                    auxiliary = dict(auxiliary)
+                    auxiliary["parameters"] = _map_containers(selected_parameters, dict)
+                return final, auxiliary
         except Exception:
             self._kernel._report_state.report = previous
             raise

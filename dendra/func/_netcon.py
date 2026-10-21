@@ -11,6 +11,7 @@ import torch
 
 from dendra.models.core import Population
 from dendra.models.mechanisms._handler import MechanismHandler
+from dendra.models.networks._connection_initialization import event_initial_state
 from dendra.models.networks._event_delivery import (
     connection_event_counts,
     dense_due,
@@ -28,6 +29,11 @@ from dendra.models.networks.spiking import threshold_transition
 
 from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
 from ._types import FunctionalizationError
+
+_INITIALIZATION_METHODS = {
+    name: getattr(NetCon, name)
+    for name in ("initialize", "zero", "detach", "_clear_sparse_calendar")
+}
 
 
 class NetConTensors(NamedTuple):
@@ -402,6 +408,25 @@ class FunctionalNetCon:
             if self._diff_delays
             else None,
         )
+
+    def initial_state(self, state, *, t):
+        """Clear delivery/detector carry at finite scalar starting time ``t``.
+
+        Routing and scheduled events are unchanged. The absolute schedule
+        counter uses native NetCon rounding; all returned carry is detached,
+        matching native initialization without weight or delay resampling.
+        """
+        self._validate_source()
+        self._validate_state(state)
+        for name, expected in _INITIALIZATION_METHODS.items():
+            if (
+                name in self._source.__dict__
+                or getattr(type(self._source), name) is not expected
+            ):
+                raise FunctionalizationError(
+                    f"Fresh NetCon initialization requires its canonical {name} adapter."
+                )
+        return event_initial_state(state, t=t, dt=self._dt)
 
     def read_due(self, state):
         """Return ``(delivery_state, payload)`` for one separate receive call.

@@ -437,7 +437,7 @@ def test_network_compile_rechecks_source_after_warm_calls(mutation):
     ("options", "match"),
     (
         ({"dt": 2 * DT}, "dt|timestep"),
-        ({"initialization": "fresh"}, "snapshot|fresh|initialization"),
+        ({"initialization": "invalid"}, "snapshot|fresh|initialization"),
         ({"execution": "while"}, "scan|while|execution"),
         ({"extra": object()}, "extra|NetworkRolloutInput|population"),
     ),

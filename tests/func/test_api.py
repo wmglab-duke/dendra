@@ -162,6 +162,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "NetStimDraw",
         "NetStimOutputs",
         "NetStimTensors",
+        "NetworkInitializationInput",
         "NetworkRolloutInput",
         "NetworkTensors",
         "PopulationTensors",

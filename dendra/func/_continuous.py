@@ -9,6 +9,7 @@ from typing import NamedTuple
 import torch
 
 from dendra.models.core import Population
+from dendra.models.networks._connection_initialization import continuous_initial_state
 from dendra.models.networks._continuous_delivery import (
     continuous_clear,
     continuous_counters,
@@ -36,6 +37,10 @@ class ContinuousConTensors(NamedTuple):
 _SOURCE_METHODS = {
     name: getattr(ContinuousCon, name)
     for name in ("_pre_value", "_weighted_pre_value", "_deliver")
+}
+_INITIALIZATION_METHODS = {
+    name: getattr(ContinuousCon, name)
+    for name in ("initialize", "zero", "detach", "_configure_advance_impl")
 }
 
 
@@ -281,6 +286,24 @@ class FunctionalContinuousCon:
             },
             self._transform_parameters(con),
         )
+
+    def initial_state(self, state, *, t):
+        """Clear payload/presence rings at finite scalar starting time ``t``.
+
+        The absolute counter retains native target-dtype rounding. Reset carry
+        is detached; transform parameters, weights, and routing are unchanged.
+        """
+        self._validate_source()
+        self._validate_state(state)
+        for name, expected in _INITIALIZATION_METHODS.items():
+            if (
+                name in self._source.__dict__
+                or getattr(type(self._source), name) is not expected
+            ):
+                raise FunctionalizationError(
+                    f"Fresh ContinuousCon initialization requires its canonical {name} adapter."
+                )
+        return continuous_initial_state(state, t=t, dt=self._dt, dtype=self.dtype)
 
     def read_due(self, state):
         """Read queued payload/presence without mutation or counter advancement."""

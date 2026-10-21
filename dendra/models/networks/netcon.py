@@ -8,6 +8,12 @@ import torch
 from ...helpers import current_native_extension_policy
 from ...utils.tensor_ops import _logical_tensor_bytes
 from ..parametric import Referency
+from ._connection_initialization import (
+    continuous_initial_step,
+    continuous_runtime_reset,
+    event_initial_step,
+    event_runtime_reset,
+)
 from ._continuous_delivery import (
     continuous_clear,
     continuous_counters,
@@ -845,11 +851,19 @@ class ContinuousCon(Referency):
     # ------------------------------------------------------------------
 
     def zero(self, clear_deliveries=True):
-        self.current_time_step.fill_(0)
-        self.global_step.fill_(0)
-        if clear_deliveries:
-            self.delivery_buffer.zero_()
-            self.delivery_mask.zero_()
+        continuous_runtime_reset(
+            {
+                name: getattr(self, name)
+                for name in (
+                    "current_time_step",
+                    "global_step",
+                    "delivery_buffer",
+                    "delivery_mask",
+                )
+            },
+            clear_deliveries=clear_deliveries,
+            _inplace=True,
+        )
 
     def detach(self):
         for n, b in self.named_buffers():
@@ -867,10 +881,11 @@ class ContinuousCon(Referency):
         if reinit_delays:
             self._rebuild_delay_buffers()
         if hasattr(self, "t"):
-            step = torch.round(
-                self.t.to(self.device, dtype=self.dtype) / self.dt.to(self.dtype)
-            ).long()
-            self.global_step.copy_(step.reshape_as(self.global_step))
+            self.global_step.copy_(
+                continuous_initial_step(
+                    self.t, self.dt, self.global_step, dtype=self.dtype
+                )
+            )
         self.detach()
         self._configure_advance_impl()
         self._continuous_delivery_initialized = True
@@ -5296,31 +5311,33 @@ class NetCon(Referency):
         * ``initialize`` calls this internally, so explicit calls are only
           needed when manually resetting state mid-simulation.
         """
-        self.current_time_step.fill_(0)
+        reset_fields = (
+            "current_time_step",
+            "global_step",
+            "delivery_buffer",
+            "events",
+            "has_spiked",
+            "is_spiking",
+            "spike_history_packed",
+            "source_gate_history",
+            "bitpack_source_has_spiked",
+        )
+        if (
+            clear_delivery_buffers
+            and hasattr(self, "source_gate_history")
+            and self.source_gate_history.numel() > 0
+        ):
+            self.source_gate_history = self.source_gate_history.detach()
+        reset_state = {
+            name: getattr(self, name) for name in reset_fields if hasattr(self, name)
+        }
+        if self.track_events and hasattr(self, "event_queue"):
+            reset_state["event_queue"] = self.event_queue
+        event_runtime_reset(
+            reset_state, clear_deliveries=clear_delivery_buffers, _inplace=True
+        )
         if clear_delivery_buffers:
-            self.delivery_buffer.zero_()
             self._clear_sparse_calendar()
-            if (
-                hasattr(self, "spike_history_packed")
-                and self.spike_history_packed.numel() > 0
-            ):
-                self.spike_history_packed.zero_()
-            if (
-                hasattr(self, "source_gate_history")
-                and self.source_gate_history.numel() > 0
-            ):
-                self.source_gate_history = self.source_gate_history.detach()
-                self.source_gate_history.zero_()
-            if (
-                hasattr(self, "bitpack_source_has_spiked")
-                and self.bitpack_source_has_spiked.numel() > 0
-            ):
-                self.bitpack_source_has_spiked.zero_()
-            if self.track_events and hasattr(self, "event_queue"):
-                self.event_queue.zero_()
-            self.events.zero_()
-            self.has_spiked.fill_(False)
-            self.is_spiking.zero_()  # float buffer, reset to 0.0
 
     def detach(self):
         """
@@ -5445,7 +5462,9 @@ class NetCon(Referency):
                 self._ensure_connection_spike_buffers()
                 self.advance = self._dense_advance_target()
         with torch.no_grad():
-            self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
+            self.global_step.copy_(
+                event_initial_step(self.t, self.dt, self.global_step)
+            )
         self.detach()
         self._mode_requires_initialize = False
         self._schedule_config_generation = getattr(

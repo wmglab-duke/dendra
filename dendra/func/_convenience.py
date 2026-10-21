@@ -433,11 +433,11 @@ def compile(
 ):
     """Create a reusable Population or Network runner (scan by default).
 
-    Initialized canonical Networks return :class:`CompiledNetworkRunner` using
-    ``initialization='snapshot'`` and their existing timestep/mode. Their
+    Initialized canonical Networks return :class:`CompiledNetworkRunner` with
+    their existing timestep/mode. Their
     inputs use :class:`NetworkRolloutInput`, recordings use qualified names
     such as ``cell.v``, and parameters retain shared tensor identities. See
-    :class:`CompiledNetworkRunner` for its snapshot execution contract.
+    :class:`CompiledNetworkRunner` for its restart and continuation contract.
 
     Recording and reductions are configured only through named ``callbacks``.
     For example, ``callbacks={'trace': dn.func.Recorder(('v',))}`` records
@@ -451,10 +451,11 @@ def compile(
     scans for lower activation memory, without truncating gradients. This is
     valid only for training scan; requested recording storage remains.
     By default, calls without state restart the captured initialized snapshot.
-    Population runners also accept ``initialization='fresh'`` to initialize
+    Population and Network runners accept ``initialization='fresh'`` to initialize
     from current parameters on each such call; explicit state still continues
     without reinitialization. Edit
-    ``runner.initialization_inputs`` or pass an ``InitializationInput`` as the
+    ``runner.initialization_inputs`` or pass an ``InitializationInput`` (Population)
+    or ``NetworkInitializationInput`` (Network) as the
     call's ``initialization=`` override. Fresh-policy results expose effective
     parameters at ``aux['parameters']`` for explicit continuation after
     parameter-writing initialization transforms.

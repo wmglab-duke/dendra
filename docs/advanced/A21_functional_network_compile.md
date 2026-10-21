@@ -47,17 +47,17 @@ topology, component schemas, and timestep are fixed by the compiled plan.
 Changing them requires a new runner; initialize the Network again when its
 configuration requires it, including after changing the timestep.
 
-Network runners currently support `initialization="snapshot"` and
-`execution="scan"`. The snapshot includes Population carry, connection queues,
+Network runners support `initialization="snapshot"` (the default),
+`initialization="fresh"`, and `execution="scan"`. The snapshot includes Population carry, connection queues,
 NetStim clock/RNG/calendar state, and the authoritative Network clock. A call
 without explicit state restarts that complete snapshot; compilation does not
 advance or reinitialize the source Network. `runner.initial_state` exposes the
 restart packet, whose Tensor leaves can be edited deliberately.
 
-Initialization is not recomputed after a parameter update. Gradients therefore
-do not include fresh Network initialization. Fresh initialization
-(`initialization="fresh"` and runtime initialization overrides) and inference
-while loops are currently unsupported. Use a canonical single-device Network
+With snapshot initialization, initial state is not recomputed after a parameter
+update and gradients do not include initialization. Select fresh initialization
+to include that computation. Inference while loops are currently unsupported.
+Use a canonical single-device Network
 with supported dense event queues, as described in
 {doc}`A19_functional_network_lowering`.
 
@@ -66,6 +66,110 @@ is Inductor. For CPU inference with Inductor, Dendra requests a C++ wrapper
 unless explicit compiler options choose otherwise. Compilation is lazy,
 and the runner is called from Python. Use the lower-level pure API when
 composing `torch.func` or forward-AD transforms.
+
+## Initialize from current parameters
+
+Select `initialization="fresh"` to construct initial state from current
+parameters on each call without explicit state. Population initialization,
+connection resets, and NetStim initialization use the same pure components as
+their native adapters. Initialization runs once before rollout; checkpoint
+backward replays rollout spans without rerunning initialization or consuming
+another initialization draw.
+
+The complete
+{download}`functional_network_initialization.py <../../examples/functional_network_initialization.py>`
+example uses a noisy NetStim and differentiates through fresh Population
+initialization and two continued, checkpointed calls:
+
+```{literalinclude} ../../examples/functional_network_initialization.py
+:language: python
+:start-after: "# region fresh-compile"
+:end-before: "# endregion fresh-compile"
+:dedent: 4
+```
+
+`runner.initialization_inputs` is an independent `NetworkInitializationInput`.
+Its `populations` mapping contains one ordinary `InitializationInput` per
+Population, with expanded `v_init`, insertion-time `states`, and registered
+pure transform inputs. Edit their Tensor leaves or supply a complete
+`initialization=` override. These inputs are separate from runtime parameters
+and are not selected by `trainable`; set `requires_grad_()` on them to include
+them in an objective. `t` is the finite scalar CPU Float64 starting time and
+defaults to zero. It controls the Network clock and absolute schedule position;
+it is detached during initialization.
+
+```{literalinclude} ../../examples/functional_network_initialization.py
+:language: python
+:start-after: "# region initialization-inputs"
+:end-before: "# endregion initialization-inputs"
+:dedent: 4
+```
+
+`netstim_draw` optionally supplies an explicit initialization `NetStimDraw`.
+When omitted, the host runner samples once from its restart state's RNG carry.
+A fixed NetStim seed reseeds initialization; `seed=None` continues that supplied
+stream. Deterministic initialization consumes no random draw. The initial
+NetStim clock kick is detached, matching native initialization; subsequent
+renewal retains its configured gradient policy. Consumed heap cursors and
+seeder state are preserved, while delivery queues and detector carry reset.
+Neither the source Network's RNG nor its state is changed.
+
+The lower-level `FunctionalNetwork.initialize` consumes explicit parameters,
+constants, prior carry, and initialization inputs, returning `NetworkTensors`.
+Supply an initialization draw when the graph contains a NetStim. The prior
+carry supplies calendar cursors and RNG/seeder state; it does not replace
+fresh Population state. To prepare runtime draw tapes, sample from the returned
+initialized state:
+
+```{literalinclude} ../../examples/functional_network_initialization.py
+:language: python
+:start-after: "# region explicit-initialization"
+:end-before: "# endregion explicit-initialization"
+:dedent: 4
+```
+
+Initialization follows native order: Populations in declaration order, Network
+clock reset and Population clock synchronization, event connections,
+continuous connections, then NetStim. Parameter replacements from each
+Population initialization propagate across every shared parameter alias before
+the next Population initializes. Fresh-policy calls return the resulting
+effective parameter packet in `aux["parameters"]`; initialization does not
+overwrite the runner's independent optimizer leaves. If an initialization
+transform writes parameters, continue with that effective packet explicitly:
+
+```{literalinclude} ../../examples/functional_network_initialization.py
+:language: python
+:start-after: "# region fresh-continuation"
+:end-before: "# endregion fresh-continuation"
+:dedent: 4
+```
+
+Explicit state bypasses fresh initialization, and cannot be combined with an
+`initialization=` override. Gradients through the prefix remain attached to
+the initialized state and effective parameters:
+
+```{literalinclude} ../../examples/functional_network_initialization.py
+:language: python
+:start-after: "# region initialization-gradients"
+:end-before: "# endregion initialization-gradients"
+:dedent: 4
+```
+
+Fresh initialization uses the existing frozen topology and current explicit
+parameter values. Random parameter resampling, steady-state cache restoration,
+and custom native initialization/build adapters are currently unsupported.
+Initialize shared runtime parameters before the first Population that uses
+them. A transform on a later Population that writes a runtime parameter shared
+with an earlier Population is currently unsupported, because native execution
+can retain the earlier Population's already materialized numerical values.
+Shared initialization-only sources support ordered writes.
+Initialization writes to a parameter shared with explicit Network constants
+are currently unsupported. Parameter and buffer aliases within one Population
+use its canonical parameter binding when available.
+Population initialization hooks must satisfy the pure initialization contracts
+in {doc}`A8_functional_populations`; unsupported hooks raise an error without
+falling back to snapshot state. Explicit continuation and snapshot execution
+retain their existing admission rules.
 
 ## Keep shared trainable parameters shared
 
@@ -148,7 +252,8 @@ The example checks that automatic sampling matches the supplied tape:
 :dedent: 4
 ```
 
-No-state calls restart the NetStim RNG snapshot as well as its event clock.
+Snapshot calls without state restart the NetStim RNG snapshot and event clock.
+Fresh calls apply the initialization sampling policy described above.
 Explicit continuation advances from the returned RNG position. Constructor
 `extra=` binding is currently unsupported for Network runners; supply
 per-population `ve` tapes or supported registered stimulation.
@@ -207,8 +312,9 @@ transform, NetStim noise, and the Population input tape:
 :dedent: 4
 ```
 
-Keep parameters, constants, input tapes, and source configuration unchanged
-until backward finishes. Hard event values and configured surrogate gradients
+Keep parameters, constants, initialization-only inputs, draw packets, runtime
+input tapes, and source configuration unchanged until backward finishes.
+Hard event values and configured surrogate gradients
 retain their native meaning. Scan supports ordinary first-order reverse-mode
 gradients; use lower-level eager execution for higher derivatives.
 
@@ -237,5 +343,12 @@ sys.path.insert(0, str(Path("../../examples").resolve()))
 
 ```{code-cell} python
 :load: ../../examples/functional_network_compile.py
+:tags: [remove-input]
+```
+
+The fresh-initialization example executes here:
+
+```{code-cell} python
+:load: ../../examples/functional_network_initialization.py
 :tags: [remove-input]
 ```

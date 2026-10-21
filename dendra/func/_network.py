@@ -23,6 +23,7 @@ from ._continuous_transform import _named_tensors
 from ._netcon import FunctionalNetCon, _effective_tensor, _snapshot
 from ._netstim import FunctionalNetStim
 from ._network_bindings import AliasSnapshots, SourceBinding
+from ._network_initialization import NetworkInitializationInput
 from ._population import (
     _deepcopy_execution_module,
     _RawClassHookIdentity,
@@ -33,12 +34,14 @@ from ._types import FunctionalizationError, RolloutInput, StepInput
 
 
 class NetworkTensors(NamedTuple):
-    """Independent aggregate parameters, constants, and complete-boundary carry.
+    """Aggregate parameters, constants, and complete-boundary carry.
 
-    Component names match the ordinary Network's collections. Genuine shared
-    tensor identities in the native parameters remain shared explicit leaves.
-    Clock and RNG byte tensors retain their native devices, including CPU clock
-    metadata in an otherwise accelerator-resident Network.
+    Extraction produces independent snapshots retaining genuine shared
+    parameter identities. Fresh initialization returns effective parameters,
+    preserving unchanged explicit leaves and their gradient history. Component
+    names match the ordinary Network's collections. Clock and RNG byte tensors
+    retain their native devices, including CPU clock metadata in an otherwise
+    accelerator-resident Network.
     """
 
     parameters: dict
@@ -141,6 +144,17 @@ _NETWORK_METHODS = {
         "restore_dict_from_checkpoint",
     )
 }
+_NETWORK_INITIALIZATION_METHODS = {
+    name: inspect.getattr_static(Network, name)
+    for name in (
+        "initialize",
+        "build",
+        "init_synapses",
+        "_reset_runtime_clock",
+        "_clear_duration_remainder",
+        "_set_duration_remainder",
+    )
+}
 _COLLECTIONS = ("populations", "synapses", "continuous_synapses", "continuous_targets")
 _CACHES = (
     "_population_step_items",
@@ -226,8 +240,8 @@ class FunctionalNetwork:
     Topology, source bindings, mode, timestep, and native phase ordering are
     frozen. Canonical single-device Networks use the dense event queues and
     integer continuous delays supported by the component plans. ``dn.compile``
-    uses this plan for snapshot-based Network runners; the lower-level methods
-    also support explicit preparation and functional transforms.
+    uses this plan for snapshot or fresh Network initialization; the lower-level
+    methods also support explicit preparation and functional transforms.
     """
 
     def __init__(self, network):
@@ -245,10 +259,11 @@ class FunctionalNetwork:
                     "Network cached schedule is stale; initialize again."
                 )
         self._netstim_source = network.netstim
-        self.populations = {
-            name: make_functional(population, dt=self.dt)[0]
-            for name, population in self._schedule.populations
-        }
+        self.populations, initialization = {}, {}
+        for name, population in self._schedule.populations:
+            plan, packet = make_functional(population, dt=self.dt)
+            self.populations[name] = plan
+            initialization[name] = packet.initialization
         self.synapses = {
             name: FunctionalNetCon(connection)
             for name, connection in self._schedule.synapses
@@ -317,6 +332,83 @@ class FunctionalNetwork:
         self._parameter_aliases = tuple(
             tuple(paths) for paths in aliases.values() if len(paths) > 1
         )
+        constant_aliases = {}
+        for path, value in _tensor_paths(tensors.constants):
+            constant_aliases.setdefault(id(value), []).append(path)
+        self._parameter_constant_aliases = tuple(
+            (path, tuple(constant_aliases[id(value)]))
+            for path, value in _tensor_paths(tensors.parameters)
+            if id(value) in constant_aliases
+        )
+        self._initialization_inputs = NetworkInitializationInput(
+            populations=initialization,
+            t=torch.zeros_like(tensors.state["clock"]["t"]),
+        )
+        from ._network_initialization import initialization_alias_failures
+
+        self._initialization_alias_failures = initialization_alias_failures(self)
+
+    @property
+    def initialization_inputs(self):
+        """Independent initialization-only defaults with editable Tensor leaves."""
+        return self._initialization_inputs
+
+    def _validate_initialization_source(self):
+        self._validate_source()
+        network = self._source
+        if network._state_cache or network._syn_cache:
+            raise FunctionalizationError(
+                "Network state-cache restoration is currently unsupported by fresh initialization"
+            )
+        if self._initialization_alias_failures:
+            raise FunctionalizationError("\n".join(self._initialization_alias_failures))
+        for name, expected in _NETWORK_INITIALIZATION_METHODS.items():
+            namespace = type(network).__dict__
+            matches = (
+                namespace == _RawClassHookIdentity(name, expected)
+                if torch.compiler.is_compiling()
+                else namespace.get(name) is expected
+            )
+            if name in network.__dict__ or not matches:
+                raise FunctionalizationError(
+                    f"Fresh Network initialization requires its canonical {name} adapter"
+                )
+
+    def initialize(self, parameters, constants, state, inputs, *, netstim_draw=None):
+        """Initialize current explicit parameters and carry in native order.
+
+        Population inputs and the starting clock are explicit. Existing carry
+        supplies NetStim RNG/seeder/calendar positions; delivery and detector
+        carry is reset. Supply an explicit NetStim initialization draw when
+        present. Effective parameter replacements preserve Network aliases and
+        are returned with complete state in :class:`NetworkTensors`.
+        """
+        from ._network_initialization import initialize
+
+        return initialize(
+            self, parameters, constants, state, inputs, netstim_draw=netstim_draw
+        )
+
+    def sample_initialization_draw(self, parameters, state):
+        """Sample one initialization packet from independent explicit RNG carry."""
+        from ._network_bindings import _canonicalize_mapping_tree
+
+        (parameters, state), _ = _canonicalize_mapping_tree((parameters, state))
+        self._validate_initialization_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        return (
+            None
+            if self.netstim is None
+            else self.netstim.sample_initialization_draw(
+                parameters["netstim"]["parameters"], state["netstim"]
+            )
+        )
+
+    def _initialize_host(self, parameters, constants, state, inputs):
+        from ._network_initialization import initialize_host
+
+        return initialize_host(self, parameters, constants, state, inputs)
 
     def _population_name(self, population):
         for name, candidate in self._source.populations.items():

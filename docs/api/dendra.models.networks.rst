@@ -41,23 +41,26 @@ continuation.
 Rollouts, compiled chunks, per-population input tapes, qualified
 recordings, and checkpointed host execution are described in
 :doc:`../advanced/A20_functional_network_rollout`.
-Snapshot-based ``dn.compile(Network)`` dispatch, shared trainable parameter
-selection, restart, and explicit continuation are described in
+``dn.compile(Network)`` dispatch, snapshot and fresh initialization, shared
+trainable parameter selection, restart, and explicit continuation are described in
 :doc:`../advanced/A21_functional_network_compile`.
 
 .. autoclass:: dendra.func.CompiledNetworkRunner
-   :members: initial_state, parameters, named_parameters, constants, functional, kernel, parameter_name, get_parameter, execution_report
+   :members: initial_state, initialization_inputs, parameters, named_parameters, constants, functional, kernel, parameter_name, get_parameter, execution_report
    :special-members: __call__
 
 .. autofunction:: dendra.func.make_functional_network
 
 .. autoclass:: dendra.func.FunctionalNetwork
-   :members: prepare, step, prepare_and_step, make_callbacks, sample_step_draw, sample_draw_tape, rollout, prepare_and_rollout, compile_rollout_chunk, run, extract, commit_state_
+   :members: initialization_inputs, initialize, sample_initialization_draw, prepare, step, prepare_and_step, make_callbacks, sample_step_draw, sample_draw_tape, rollout, prepare_and_rollout, compile_rollout_chunk, run, extract, commit_state_
 
 .. autoclass:: dendra.func.NetworkTensors
    :members:
 
 .. autoclass:: dendra.func.NetworkRolloutInput
+   :members:
+
+.. autoclass:: dendra.func.NetworkInitializationInput
    :members:
 
 .. autoclass:: dendra.func.CompiledNetworkChunk
