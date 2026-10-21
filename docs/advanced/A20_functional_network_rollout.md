@@ -238,5 +238,7 @@ The complete CPU example executes here:
 
 For `dn.compile(Network)` convenience execution with snapshot or fresh
 initialization, continue with {doc}`A21_functional_network_compile`.
-Heterogeneous-device functional execution, compact functional event queues, and
-continuous delay interpolation are currently unsupported.
+Source-history training and its delivery-time parameter semantics are described
+in {doc}`A22_functional_source_history`. Heterogeneous-device functional execution,
+sparse-calendar and bitpacked-history inference runtimes, and continuous delay
+interpolation are currently unsupported.

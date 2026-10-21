@@ -26,8 +26,9 @@ Run it with `python examples/functional_network_lowering.py`.
 ## Declare the ordinary Network
 
 Functional lowering supports initialized canonical Networks whose simulation
-components use one device. Event connections must use the supported dense queue
-backend. Continuous connections retain native zero/integer-delay semantics.
+components use one device. Event connections support dense queues and compact
+source-history training, including compatible native `auto` selections.
+Continuous connections retain native zero/integer-delay semantics.
 Configure training and differentiability before lowering. Populations,
 mechanisms, and connections must have distinct mutable owners; registering the
 same evolving module through multiple Network paths is unsupported. Raw
@@ -65,7 +66,7 @@ They are ordinary tensor trees. Component names match those in
 | `parameters["continuous_synapses"]` | Continuous weights and explicit transform parameters/buffers. |
 | `parameters["netstim"]` | NetStim parameter mapping and schedule packet, or `None`. |
 | `constants` | Population constants and optional NetStim calendar constants. |
-| `state` | Population carry, event/continuous queue carry, optional NetStim clock/RNG carry, and the Network clock. |
+| `state` | Population carry, event queue/history and continuous queue carry, optional NetStim clock/RNG carry, and the Network clock. |
 
 Extraction creates independent tensor storage and detaches existing native
 simulation history. Parameter leaves retain their gradient flags.
@@ -159,8 +160,9 @@ CPU even when the simulation components use an accelerator.
 Clone live carry without detaching it when gradients must cross the saved
 prefix. Serialize or detach it deliberately for an independent saved run. Keep
 the matching parameters, constants, and frozen Network configuration with the
-checkpoint. Queued payloads retain enqueue-time weights and transform values;
-changing current parameters does not rescale pending deliveries.
+checkpoint. Dense queued payloads retain enqueue-time weights and transform
+values. Source-history training reconstructs deliveries from past activity
+using current weights and delays; see {doc}`A22_functional_source_history`.
 
 `plan.commit_state_(matching_network, state)` validates and commits a complete
 boundary, including the authoritative clock and optional NetStim RNG state.
@@ -196,5 +198,6 @@ The complete example executes here:
 Multi-step execution is available through {doc}`A20_functional_network_rollout`,
 and `dn.compile(Network)` execution with snapshot or fresh initialization is
 described in {doc}`A21_functional_network_compile`.
-Heterogeneous-device functional execution, compact functional event queues, and
-continuous delay interpolation are currently unsupported.
+Source-history training is described in {doc}`A22_functional_source_history`.
+Heterogeneous-device functional execution, sparse-calendar and bitpacked-history
+inference runtimes, and continuous delay interpolation are currently unsupported.

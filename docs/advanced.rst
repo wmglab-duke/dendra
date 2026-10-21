@@ -29,3 +29,4 @@ Advanced
    advanced/A19_functional_network_lowering.md
    advanced/A20_functional_network_rollout.md
    advanced/A21_functional_network_compile.md
+   advanced/A22_functional_source_history.md

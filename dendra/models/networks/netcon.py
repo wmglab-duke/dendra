@@ -32,6 +32,13 @@ from ._event_delivery import (
     dense_interpolated_delay_transition,
     gather_source_gates,
 )
+from ._source_history import (
+    read_float_history,
+    read_packed_history,
+    source_history_gates,
+    source_history_project,
+    source_history_record,
+)
 from ._tensor_schedules import causal_step_index as _causal_step_index
 from ._tensor_schedules import netcon_tensor_schedule, resolve_schedule_values
 from .netstim import NetStim
@@ -3412,69 +3419,46 @@ class NetCon(Referency):
         self, *, diff_spiking: bool, tau: float
     ) -> torch.Tensor:
         """Return one source-level gate value per unique presynaptic source."""
-        if isinstance(self.pre, NetStim):
-            attr = self.pre.spike_gate if diff_spiking else self.pre.spikes
-            gate = (
-                attr.to(self.pre_device)
-                .reshape(-1)
-                .index_select(0, self.bitpack_source_pre_idx)
-            )
-            return gate.to(device=self.device, dtype=self.dtype)
-
-        x_full = self.get_pre_var(self.pre)
+        x_full = (
+            (self.pre.spike_gate if diff_spiking else self.pre.spikes)
+            if isinstance(self.pre, NetStim)
+            else self.get_pre_var(self.pre)
+        )
         if x_full.device != self.pre_device:
             x_full = x_full.to(device=self.pre_device)
-        x = x_full.reshape(-1).index_select(0, self.bitpack_source_pre_idx)
-
-        if self._bitpack_mode == "pre_var":
-            if x.dtype == torch.bool:
-                gate = x.to(self.pre_dtype)
-            else:
-                gate = x.to(self.pre_dtype)
-                if not diff_spiking:
-                    gate = (gate > 0).to(self.pre_dtype)
-            return gate.to(device=self.device, dtype=self.dtype)
-
-        if self._bitpack_mode == "threshold":
-            x = x.to(self.pre_dtype)
-            self.bitpack_source_has_spiked, gate = threshold_transition(
-                x,
-                self.bitpack_source_has_spiked,
-                self.bitpack_source_threshold,
-                diff_spiking=diff_spiking,
-                tau=tau,
-            )
-            return gate.to(device=self.device, dtype=self.dtype)
-
-        raise RuntimeError("source-history training backend is not configured")
+        self.bitpack_source_has_spiked, gate = source_history_gates(
+            x_full,
+            self.bitpack_source_has_spiked,
+            source_idx=self.bitpack_source_pre_idx,
+            mode=self._bitpack_mode,
+            threshold=self.bitpack_source_threshold,
+            diff_spiking=diff_spiking,
+            tau=tau,
+            dtype=None if isinstance(self.pre, NetStim) else self.pre_dtype,
+        )
+        return gate.to(device=self.device, dtype=self.dtype)
 
     def _source_history_read_packed_connection_gates(
         self, rows: torch.Tensor
     ) -> torch.Tensor:
         """Read hard source-spike gates from packed history for connection rows."""
-        if rows.ndim == 1:
-            words = self.spike_history_packed[
-                rows.reshape(-1), self.bitpack_conn_word_idx
-            ]
-            gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0
-            return gate.to(device=self.device, dtype=self.dtype)
-        word_idx = self.bitpack_conn_word_idx.unsqueeze(-1).expand_as(rows)
-        mask = self.bitpack_conn_bit_mask.unsqueeze(-1).expand_as(rows)
-        words = self.spike_history_packed[
-            rows.reshape(-1), word_idx.reshape(-1)
-        ].view_as(rows)
-        gate = torch.bitwise_and(words, mask) != 0
-        return gate.to(device=self.device, dtype=self.dtype)
+        return read_packed_history(
+            self.spike_history_packed,
+            rows,
+            self.bitpack_conn_word_idx,
+            self.bitpack_conn_bit_mask,
+            dtype=self.dtype,
+        )
 
     def _source_history_read_float_connection_gates(
         self, rows: torch.Tensor
     ) -> torch.Tensor:
         """Read differentiable source gates for connection rows."""
-        source_pos = self._ensure_source_history_conn_source_pos()
-        if rows.ndim == 1:
-            return self.source_gate_history[rows.reshape(-1), source_pos]
-        src = source_pos.unsqueeze(-1).expand_as(rows)
-        return self.source_gate_history[rows.reshape(-1), src.reshape(-1)].view_as(rows)
+        return read_float_history(
+            self.source_gate_history,
+            rows,
+            self._ensure_source_history_conn_source_pos(),
+        )
 
     def _source_history_build_delivery_from_history(
         self,
@@ -3486,54 +3470,31 @@ class NetCon(Referency):
         sigma: float,
     ) -> torch.Tensor:
         """Construct the current dense payload from compact source history."""
-        out = torch.zeros(self._syn_numel, device=self.device, dtype=self.dtype)
         if self._n_conn == 0:
-            return out
-
+            return torch.zeros(self._syn_numel, device=self.device, dtype=self.dtype)
         wvals = self.weight()
         if not diff_weights:
             wvals = wvals.detach()
-
-        read_gates = (
-            self._source_history_read_float_connection_gates
-            if self._source_history_diff_spiking_enabled()
-            else self._source_history_read_packed_connection_gates
+        floating = self._source_history_diff_spiking_enabled()
+        return source_history_project(
+            self.source_gate_history if floating else self.spike_history_packed,
+            cur_idx,
+            wvals,
+            post_idx=self.post_idx,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            source_pos=self._ensure_source_history_conn_source_pos()
+            if floating
+            else None,
+            word_idx=self.bitpack_conn_word_idx,
+            bit_mask=self.bitpack_conn_bit_mask,
+            delay_steps=self.inference_delay_steps,
+            delays=self.delay_ms().to(self.dtype) if diff_delays else None,
+            dt=self.dt,
+            taps=taps,
+            sigma=sigma,
+            _owned_output=True,
         )
-
-        if diff_delays:
-            d_ms = self.delay_ms().to(self.dtype)
-            lam = (d_ms / self.dt.to(self.dtype)).clamp_min(1.0)
-            k = torch.floor(lam)
-            kL = k.to(torch.long)
-
-            if taps == 2:
-                alpha = (lam - k).to(self.dtype)
-                row0 = (cur_idx - kL).remainder(self.max_delay_steps)
-                row1 = (row0 - 1).remainder(self.max_delay_steps)
-                gate0 = read_gates(row0.reshape(-1))
-                gate1 = read_gates(row1.reshape(-1))
-                vals = wvals * (gate0 * (1.0 - alpha) + gate1 * alpha)
-                out.index_add_(0, self.post_idx, vals)
-            else:
-                offs = torch.stack([kL - 1, kL, kL + 1], dim=-1)
-                centers = offs.to(self.dtype)
-                lam_e = lam.unsqueeze(-1)
-                weights = torch.softmax(
-                    -0.5 * ((lam_e - centers) / (sigma + 1e-6)) ** 2,
-                    dim=-1,
-                )
-                # Future-write offset ``o`` corresponds at delivery time to source
-                # history row ``cur_idx - o``.
-                rows = (cur_idx - offs).remainder(self.max_delay_steps)
-                gates = read_gates(rows)
-                vals = wvals * (gates * weights).sum(dim=-1)
-                out.index_add_(0, self.post_idx, vals)
-        else:
-            delay_steps = self.inference_delay_steps
-            rows = (cur_idx - delay_steps).remainder(self.max_delay_steps)
-            vals = wvals * read_gates(rows.reshape(-1))
-            out.index_add_(0, self.post_idx, vals)
-        return out
 
     def _source_history_record_current_gate(
         self,
@@ -3544,13 +3505,12 @@ class NetCon(Referency):
     ):
         """Append the current source-level event/gate into compact history."""
         if diff_spiking:
-            hist_next = self.source_gate_history.clone()
-            hist_next.index_copy_(
-                0,
-                cur_idx.reshape(-1),
-                source_gate.to(device=self.device, dtype=self.dtype).reshape(1, -1),
+            self.source_gate_history = source_history_record(
+                self.source_gate_history,
+                cur_idx,
+                source_gate.to(device=self.device, dtype=self.dtype),
+                _clone_once=True,
             )
-            self.source_gate_history = hist_next
             return
         self._bitpack_pack_source_spikes(source_gate.to(torch.bool), cur_idx)
 
@@ -3677,19 +3637,28 @@ class NetCon(Referency):
     ):
         """Pack current source spikes into the current circular history row."""
         if source_spikes.numel() == 0:
-            slot = int(cur_idx.item())
-            self.spike_history_packed[slot].zero_()
+            source_history_record(
+                self.spike_history_packed,
+                cur_idx,
+                source_spikes,
+                source_word_idx=self.bitpack_source_word_idx,
+                source_bit_mask=self.bitpack_source_bit_mask,
+                _inplace=True,
+            )
             return
         if self._try_bitpack_pack_kernel(source_spikes, cur_idx):
             return
 
         # Pure-PyTorch fallback.  This is correct and memory-light in source
         # space; the lazy C++/CUDA extension above is the normal CUDA hot path.
-        slot = int(cur_idx.item())
-        row = self.spike_history_packed[slot]
-        row.zero_()
-        vals = self.bitpack_source_bit_mask * source_spikes.to(torch.int64)
-        row.index_add_(0, self.bitpack_source_word_idx, vals)
+        source_history_record(
+            self.spike_history_packed,
+            cur_idx,
+            source_spikes,
+            source_word_idx=self.bitpack_source_word_idx,
+            source_bit_mask=self.bitpack_source_bit_mask,
+            _inplace=True,
+        )
 
     def _bitpack_build_delivery_from_history(
         self, cur_idx: torch.Tensor, scratch: torch.Tensor

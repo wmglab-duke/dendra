@@ -58,8 +58,8 @@ With snapshot initialization, initial state is not recomputed after a parameter
 update and gradients do not include initialization. Select fresh initialization
 to include that computation. Inference while loops are currently unsupported.
 Use a canonical single-device Network
-with supported dense event queues, as described in
-{doc}`A19_functional_network_lowering`.
+with supported dense event queues or source-history training, as described in
+{doc}`A19_functional_network_lowering` and {doc}`A22_functional_source_history`.
 
 `backend="aot_eager"` makes this example portable on CPU. The compiler default
 is Inductor. For CPU inference with Inductor, Dendra requests a C++ wrapper

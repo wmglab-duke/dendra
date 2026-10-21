@@ -1,4 +1,4 @@
-"""Explicit-state projections over NetCon's shared dense transport."""
+"""Explicit-state projections over NetCon's shared transport kernels."""
 
 from __future__ import annotations
 
@@ -19,6 +19,11 @@ from dendra.models.networks._event_delivery import (
     dense_interpolated_delay_transition,
     gather_source_gates,
 )
+from dendra.models.networks._source_history import (
+    source_history_gates,
+    source_history_project,
+    source_history_record,
+)
 from dendra.models.networks._tensor_schedules import (
     netcon_tensor_schedule,
     resolve_schedule_values,
@@ -34,10 +39,29 @@ _INITIALIZATION_METHODS = {
     name: getattr(NetCon, name)
     for name in ("initialize", "zero", "detach", "_clear_sparse_calendar")
 }
+_SOURCE_HISTORY_METHODS = {
+    name: getattr(NetCon, name)
+    for name in (
+        "_source_history_source_gate_this_step",
+        "_source_history_build_delivery_from_history",
+        "_source_history_record_current_gate",
+        "_source_history_read_float_connection_gates",
+        "_source_history_read_packed_connection_gates",
+    )
+}
+_HISTORY_METADATA = (
+    "bitpack_source_pre_idx",
+    "bitpack_source_word_idx",
+    "bitpack_source_bit_mask",
+    "bitpack_conn_word_idx",
+    "bitpack_conn_bit_mask",
+    "bitpack_source_threshold",
+    "source_history_conn_source_pos",
+)
 
 
 class NetConTensors(NamedTuple):
-    """Independent effective parameters, dense carry, and schedule values.
+    """Independent effective parameters, transport carry, and schedule values.
 
     ``delays`` contains effective milliseconds for differentiable-delay plans;
     fixed-delay plans store ``None``. Weights and delays are parameters rather
@@ -132,10 +156,21 @@ def _eligible(netcon):
         raise FunctionalizationError("Initialize the NetCon before lowering it.")
     if netcon._mode_requires_initialize:
         raise FunctionalizationError("NetCon mode changed; initialize it again.")
-    if netcon._checkpoint_runtime_kind() != "dense":
+    runtime = netcon._checkpoint_runtime_kind()
+    if runtime not in {"dense", "source_history"}:
         raise FunctionalizationError(
-            "Functional NetCon currently requires dense queues."
+            "Functional NetCon currently requires dense queues or source-history training."
         )
+    if runtime == "source_history":
+        if not netcon.training or netcon._has_scheduled_events():
+            raise FunctionalizationError(
+                "Functional source history requires intrinsic training traffic."
+            )
+        for name, expected in _SOURCE_HISTORY_METHODS.items():
+            if name in netcon.__dict__ or getattr(owner_type, name) is not expected:
+                raise FunctionalizationError(
+                    f"Functional source history requires its canonical {name} adapter."
+                )
     if netcon.training:
         if netcon.train_flags is None:
             raise FunctionalizationError(
@@ -165,16 +200,20 @@ def _eligible(netcon):
             "Functional NetCon does not represent legacy presynaptic schedules."
         )
     allowed = (
-        NetCon.advance_non_diff_dense_uniform,
-        NetCon.advance_non_diff_dense_mixed,
-        NetCon.advance_diff,
+        (NetCon.advance_diff_source_history,)
+        if runtime == "source_history"
+        else (
+            NetCon.advance_non_diff_dense_uniform,
+            NetCon.advance_non_diff_dense_mixed,
+            NetCon.advance_diff,
+        )
     )
     if (
         getattr(netcon.advance, "__self__", None) is not netcon
         or getattr(netcon.advance, "__func__", None) not in allowed
     ):
         raise FunctionalizationError(
-            "Functional NetCon requires its canonical dense adapter."
+            "Functional NetCon requires its canonical transport adapter."
         )
 
 
@@ -209,6 +248,16 @@ class FunctionalNetCon:
     these phases when the supplied source values have already been chosen.
     Neither phase generates source activity or advances any Population clock.
 
+    Source-history training stores one gate per unique source in a compact
+    history ring. Surrogate gates use floating history; hard spikes use packed
+    bits. These plans require current weights/delays in :meth:`read_due`, and
+    :meth:`advance` records only source activity. Parameter edits between calls
+    therefore affect historical events at delivery, matching native source
+    history. Dense plans retain weighted payloads from enqueue time instead.
+    Functional source-history carry exposes history/latch tensors directly;
+    extraction and commit translate the native checkpoint's ``backend_state``.
+    Scheduled traffic follows native policy and uses the dense fallback.
+
     Routing, fixed quantized delays, timestep, and tensor schemas are copied at
     lowering. Reinitialization, calling ``set_diff_config``, mode changes, or
     changing schedule topology or bindings invalidates source-bound calls.
@@ -232,6 +281,7 @@ class FunctionalNetCon:
         self._schedule_generation = netcon._schedule_config_generation
         self._mode = _mode(netcon)
         self._advance = netcon.advance.__func__
+        self._runtime = netcon._checkpoint_runtime_kind()
         self._pre_var = netcon.pre_var
         self.source_shape = tuple(source.shape)
         self.shape = tuple(netcon.syn.shape_f)
@@ -266,12 +316,68 @@ class FunctionalNetCon:
         self._schedule = _TensorSchedulePlan(
             netcon, index_name="sched_con_idx", device=self.device, dtype=self.dtype
         )
-        checkpoint = netcon.state_dict_for_checkpoint()
+        self._history_mode = (
+            netcon._bitpack_mode if self._runtime == "source_history" else None
+        )
+        self._history_metadata = (
+            {name: _snapshot(getattr(netcon, name)) for name in _HISTORY_METADATA}
+            if self._runtime == "source_history"
+            else {}
+        )
+        self._history_name = (
+            "source_gate_history" if self._diff_spiking else "spike_history_packed"
+        )
+        checkpoint = self._checkpoint_values(netcon)
         self._state_schema = {
             name: (tuple(value.shape), value.dtype, value.device)
             for name, value in checkpoint.items()
         }
         self._validate_compatible(netcon)
+
+    @property
+    def runtime(self):
+        """The frozen native runtime: ``dense`` or ``source_history``."""
+        return self._runtime
+
+    def _checkpoint_values(self, netcon):
+        """Normalize native compact checkpoints to a Tensor-only carry packet."""
+        checkpoint = dict(netcon.state_dict_for_checkpoint())
+        if self._runtime == "dense":
+            return checkpoint
+        backend = checkpoint.pop("backend_state", None)
+        if not isinstance(backend, dict) or backend.get("kind") != self._runtime:
+            raise FunctionalizationError(
+                "NetCon checkpoint runtime does not match this plan"
+            )
+        if backend.get("sparse_calendar") or backend.get("sparse_event_calendar"):
+            raise FunctionalizationError(
+                "Functional source history cannot lower nonempty side calendars"
+            )
+        allowed = {
+            "kind",
+            "sparse_calendar",
+            "sparse_event_calendar",
+            "source_gate_history",
+            "spike_history_packed",
+            "bitpack_source_has_spiked",
+        }
+        if set(backend) - allowed:
+            raise FunctionalizationError("Unknown source-history checkpoint carry")
+        for name in (
+            "source_gate_history",
+            "spike_history_packed",
+            "bitpack_source_has_spiked",
+        ):
+            if name in backend:
+                checkpoint[name] = backend[name]
+        # Native checkpoints omit empty fields. Keep active zero-source history
+        # and latches explicit so transformed kernels retain a stable schema.
+        checkpoint.setdefault(self._history_name, getattr(netcon, self._history_name))
+        if self._history_mode == "threshold":
+            checkpoint.setdefault(
+                "bitpack_source_has_spiked", netcon.bitpack_source_has_spiked
+            )
+        return checkpoint
 
     def _validate_source(self):
         source = self._source
@@ -296,10 +402,26 @@ class FunctionalNetCon:
             or tuple(source.syn.shape_f) != self.shape
             or getattr(source.advance, "__func__", None) is not self._advance
             or source._sched_pre
+            or (
+                self._runtime == "source_history"
+                and (
+                    source._bitpack_mode != self._history_mode
+                    or not source._bitpack_can_use
+                )
+            )
         ):
             raise FunctionalizationError(
                 "The source NetCon configuration changed; initialize and lower it again."
             )
+        if self._runtime == "source_history":
+            for name, expected in _SOURCE_HISTORY_METHODS.items():
+                if (
+                    name in source.__dict__
+                    or getattr(type(source), name) is not expected
+                ):
+                    raise FunctionalizationError(
+                        f"Source-history {name} changed; lower again."
+                    )
 
     @staticmethod
     def _validate_tensor(value, *, shape, dtype, device, label):
@@ -314,7 +436,7 @@ class FunctionalNetCon:
 
     def _validate_state(self, state):
         if not isinstance(state, Mapping) or set(state) != set(self._state_schema):
-            raise ValueError("NetCon state must match its dense checkpoint schema")
+            raise ValueError("NetCon state must match its transport checkpoint schema")
         for name, (shape, dtype, device) in self._state_schema.items():
             self._validate_tensor(
                 state[name],
@@ -329,6 +451,7 @@ class FunctionalNetCon:
         source = _source_tensor(netcon)
         if (
             _mode(netcon) != self._mode
+            or netcon._checkpoint_runtime_kind() != self._runtime
             or (isinstance(netcon.pre, NetStim) or bool(netcon.skip_thresholding))
             != self._skip_thresholding
             or tuple(source.shape) != self.source_shape
@@ -360,6 +483,16 @@ class FunctionalNetCon:
             raise FunctionalizationError(
                 "NetCon topology or detector does not match this frozen plan."
             )
+        if self._runtime == "source_history" and (
+            netcon._bitpack_mode != self._history_mode
+            or any(
+                not torch.equal(getattr(netcon, name), value)
+                for name, value in self._history_metadata.items()
+            )
+        ):
+            raise FunctionalizationError(
+                "Source-history routing or detector does not match this plan"
+            )
         self._validate_tensor(
             _effective_tensor(netcon.weight, "weight"),
             shape=(self._connections,),
@@ -379,7 +512,7 @@ class FunctionalNetCon:
             raise FunctionalizationError(
                 "NetCon schedule connection indices are outside its topology."
             )
-        self._validate_state(netcon.state_dict_for_checkpoint())
+        self._validate_state(self._checkpoint_values(netcon))
         if self._depth < 1 or bool(torch.any(self._delay_steps < 1)):
             raise FunctionalizationError("NetCon needs a nonempty fixed-delay ring.")
         if bool(torch.any((self._pre_idx < 0) | (self._pre_idx >= source.numel()))):
@@ -401,7 +534,7 @@ class FunctionalNetCon:
             _snapshot(_effective_tensor(netcon.weight, "weight"), parameter=True),
             {
                 name: _snapshot(value)
-                for name, value in netcon.state_dict_for_checkpoint().items()
+                for name, value in self._checkpoint_values(netcon).items()
             },
             self._schedule.extract(netcon),
             _snapshot(_effective_tensor(netcon.delay_ms, "delay"), parameter=True)
@@ -428,14 +561,62 @@ class FunctionalNetCon:
                 )
         return event_initial_state(state, t=t, dt=self._dt)
 
-    def read_due(self, state):
+    def _validate_projection_parameters(self, weights, delays):
+        self._validate_tensor(
+            weights,
+            shape=(self._connections,),
+            dtype=self.dtype,
+            device=self.device,
+            label="weights",
+        )
+        if self._diff_delays:
+            self._validate_tensor(
+                delays,
+                shape=(self._connections,),
+                dtype=self.dtype,
+                device=self.device,
+                label="delays",
+            )
+        elif delays is not None:
+            raise ValueError("Fixed-delay NetCon plans do not accept explicit delays")
+
+    def read_due(self, state, *, weights=None, delays=None):
         """Return ``(delivery_state, payload)`` for one separate receive call.
 
         This publishes due tracked events in the returned state without clearing
         the queue or changing the detector latch, ring slot, or global step.
+        Source-history plans require current ``weights`` and differentiable
+        ``delays`` here because native delivery reconstructs traffic from past
+        source gates using the parameters at delivery time.
         """
         self._validate_source()
         self._validate_state(state)
+        if self._runtime == "source_history":
+            self._validate_projection_parameters(weights, delays)
+            metadata = self._history_metadata
+            payload = source_history_project(
+                state[self._history_name],
+                state["current_time_step"],
+                weights,
+                post_idx=self._post_idx,
+                depth=self._depth,
+                width=self._width,
+                source_pos=metadata["source_history_conn_source_pos"]
+                if self._diff_spiking
+                else None,
+                word_idx=None
+                if self._diff_spiking
+                else metadata["bitpack_conn_word_idx"],
+                bit_mask=None
+                if self._diff_spiking
+                else metadata["bitpack_conn_bit_mask"],
+                delay_steps=None if self._diff_delays else self._delay_steps,
+                delays=delays,
+                dt=self._dt,
+                taps=self._taps,
+                sigma=self._sigma,
+            )
+            return dict(state), payload.reshape(self.shape)
         due = dense_due(
             state["delivery_buffer"],
             state["current_time_step"],
@@ -447,7 +628,7 @@ class FunctionalNetCon:
         return result, due.payload.reshape(self.shape)
 
     def advance(self, weights, state, source_values, *, delays=None, schedule=None):
-        """Observe the current source, enqueue events, and return next carry.
+        """Observe the source, update transport history, and return next carry.
 
         Pass the state from :meth:`read_due` after delivering its payload and
         observing the source. Threshold metadata is frozen; gradients flow
@@ -460,13 +641,7 @@ class FunctionalNetCon:
         self._validate_source()
         self._validate_state(state)
         self._schedule.validate(schedule)
-        self._validate_tensor(
-            weights,
-            shape=(self._connections,),
-            dtype=self.dtype,
-            device=self.device,
-            label="weights",
-        )
+        self._validate_projection_parameters(weights, delays)
         self._validate_tensor(
             source_values,
             shape=self.source_shape,
@@ -474,16 +649,42 @@ class FunctionalNetCon:
             device=self.source_device,
             label="source_values",
         )
-        if self._diff_delays:
-            self._validate_tensor(
-                delays,
-                shape=(self._connections,),
-                dtype=self.dtype,
-                device=self.device,
-                label="delays",
+        if self._runtime == "source_history":
+            metadata = self._history_metadata
+            latch = state.get("bitpack_source_has_spiked")
+            if latch is None:
+                latch = metadata["bitpack_source_threshold"].new_empty(
+                    (0,), dtype=torch.bool
+                )
+            has_spiked, gates = source_history_gates(
+                source_values,
+                latch,
+                source_idx=metadata["bitpack_source_pre_idx"],
+                mode=self._history_mode,
+                threshold=metadata["bitpack_source_threshold"],
+                diff_spiking=self._diff_spiking,
+                tau=self._tau,
+                dtype=self.source_dtype,
             )
-        elif delays is not None:
-            raise ValueError("Fixed-delay NetCon plans do not accept explicit delays")
+            result = dict(state)
+            if "bitpack_source_has_spiked" in result:
+                result["bitpack_source_has_spiked"] = has_spiked
+            result[self._history_name] = source_history_record(
+                state[self._history_name],
+                state["current_time_step"],
+                gates.to(device=self.device, dtype=self.dtype),
+                source_word_idx=None
+                if self._diff_spiking
+                else metadata["bitpack_source_word_idx"],
+                source_bit_mask=None
+                if self._diff_spiking
+                else metadata["bitpack_source_bit_mask"],
+            )
+            result["current_time_step"] = (state["current_time_step"] + 1).remainder(
+                self._depth
+            )
+            result["global_step"] = state["global_step"] + 1
+            return result
         event_queue = state.get("event_queue")
         selected = gather_source_gates(source_values, self._pre_idx)
         result = dict(state)
@@ -573,7 +774,7 @@ class FunctionalNetCon:
         explicit raw gates; finite thresholds interpret it as source values.
         Use the separate phases when reception can change those values.
         """
-        delivery_state, payload = self.read_due(state)
+        delivery_state, payload = self.read_due(state, weights=weights, delays=delays)
         return (
             self.advance(
                 weights,
@@ -601,11 +802,27 @@ class FunctionalNetCon:
                 name: value.clone(memory_format=torch.contiguous_format)
                 for name, value in state.items()
             }
+            if self._runtime == "source_history":
+                history = {
+                    name: copied.pop(name)
+                    for name in (
+                        "source_gate_history",
+                        "spike_history_packed",
+                        "bitpack_source_has_spiked",
+                    )
+                    if name in copied
+                }
+                copied["backend_state"] = {
+                    "kind": self._runtime,
+                    "sparse_calendar": {},
+                    "sparse_event_calendar": {},
+                    **history,
+                }
             return netcon.restore_dict_from_checkpoint(copied)
 
 
 def make_functional_netcon(netcon) -> tuple[FunctionalNetCon, NetConTensors]:
-    """Lower one initialized dense NetCon with explicit numerical source values."""
+    """Lower an initialized NetCon with explicit numerical source values."""
     projection = FunctionalNetCon(netcon)
     return projection, projection.extract()
 

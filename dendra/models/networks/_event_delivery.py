@@ -199,6 +199,28 @@ def dense_fixed_delay_transition(
     )
 
 
+def delay_interpolation(delays, dt, *, dtype, taps, sigma):
+    """Return native delay offsets and linear or soft tap coefficients.
+
+    Two-tap callers receive the lower integer offset and upper-tap fraction.
+    Three-tap callers receive all three offsets and normalized coefficients.
+    Delivery-time history reads and enqueue-time dense writes share this math
+    while retaining their separate weighting and accumulation order.
+    """
+    lam = (delays.to(dtype) / dt.to(dtype).reshape(1)).clamp_min(1.0)
+    lower = torch.floor(lam)
+    lower_index = lower.to(torch.long)
+    if taps == 2:
+        return lower_index, lam - lower
+    offsets = torch.stack([lower_index - 1, lower_index, lower_index + 1], dim=-1)
+    centers = offsets.to(dtype)
+    fractions = torch.softmax(
+        -0.5 * ((lam.unsqueeze(-1) - centers) / (sigma + 1e-6)) ** 2,
+        dim=-1,
+    )
+    return offsets, fractions
+
+
 def dense_interpolated_delay_transition(
     queue,
     slot,
@@ -238,17 +260,17 @@ def dense_interpolated_delay_transition(
     mutated. Fractional delays do not define integer event counts, so the
     returned ``event_queue`` is always ``None``.
     """
-    lam = (delays.to(queue.dtype) / dt.to(queue.dtype)).clamp_min(1.0)
-    lower = torch.floor(lam)
-    lower_index = lower.to(torch.long)
+    offsets, fractions = delay_interpolation(
+        delays, dt, dtype=queue.dtype, taps=taps, sigma=sigma
+    )
     weighted_gates = weights * connection_gates
     output = (
         queue.clone(memory_format=torch.contiguous_format) if _clone_once else queue
     )
     next_queue = _clear_dense_slot(output, slot, inplace=_clone_once)
     if taps == 2:
-        fraction = lam - lower
-        row0 = (slot + lower_index).remainder(depth)
+        fraction = fractions
+        row0 = (slot + offsets).remainder(depth)
         row1 = (row0 + 1).remainder(depth)
         next_queue = _enqueue_interpolated_values(
             next_queue,
@@ -263,12 +285,6 @@ def dense_interpolated_delay_transition(
             inplace=_clone_once,
         )
     else:
-        offsets = torch.stack([lower_index - 1, lower_index, lower_index + 1], dim=-1)
-        centers = offsets.to(queue.dtype)
-        fractions = torch.softmax(
-            -0.5 * ((lam.unsqueeze(-1) - centers) / (sigma + 1e-6)) ** 2,
-            dim=-1,
-        )
         rows = (slot + offsets).remainder(depth)
         destinations = rows * width + post_idx.unsqueeze(-1)
         values = weighted_gates.unsqueeze(-1) * fractions

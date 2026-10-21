@@ -126,7 +126,9 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-This interface supports dense connections with fixed or interpolated delays.
+This example uses dense connections with fixed or interpolated delays.
+Compact source-level detection and history are described in
+{doc}`A22_functional_source_history`.
 Differentiable delay interpolation is described in
 {doc}`A17_functional_delay_interpolation`; tensor schedules are described in
 {doc}`A15_functional_tensor_schedules`.
@@ -135,5 +137,5 @@ checkpoint schema. Generation with explicit random draws and
 clock/RNG continuation is described in {doc}`A14_functional_netstim_renewal`.
 Consuming heap calendars are described in {doc}`A16_functional_heap_schedules`.
 Canonical single-device Network lowering is described in
-{doc}`A19_functional_network_lowering`, and snapshot-based `dn.compile(Network)`
+{doc}`A19_functional_network_lowering`, and snapshot or fresh `dn.compile(Network)`
 execution in {doc}`A21_functional_network_compile`.

@@ -38,8 +38,9 @@ restriction to hard delays, hard spikes, and hard scheduled times.
 
 Configure the source before lowering. The interpolation path applies to the
 active training runtime; evaluation retains integer-delay execution. Compact
-training and inference backends are currently unsupported by this functional
-interface.
+source-history training is described in {doc}`A22_functional_source_history`.
+Sparse-calendar and bitpacked-history inference are currently unsupported by
+this functional interface.
 
 ## Supply explicit effective delays
 
@@ -184,5 +185,6 @@ The complete example executes here:
 Continuous projections are described in
 {doc}`A18_functional_continuous_connectivity`. Canonical single-device Network
 composition is described in {doc}`A19_functional_network_lowering`. Compact
-queue backends are currently unsupported by the functional adapter. The native
-and functional adapters use the same dense interpolation policy.
+training history uses delivery-time interpolation, as described in
+{doc}`A22_functional_source_history`. The native and functional adapters share
+the interpolation coefficients while retaining each runtime's operation order.

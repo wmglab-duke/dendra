@@ -44,6 +44,9 @@ recordings, and checkpointed host execution are described in
 ``dn.compile(Network)`` dispatch, snapshot and fresh initialization, shared
 trainable parameter selection, restart, and explicit continuation are described in
 :doc:`../advanced/A21_functional_network_compile`.
+Compact source-history training with native ``auto`` selection, delivery-time
+parameter lookup, and checkpoint continuation is described in
+:doc:`../advanced/A22_functional_source_history`.
 
 .. autoclass:: dendra.func.CompiledNetworkRunner
    :members: initial_state, initialization_inputs, parameters, named_parameters, constants, functional, kernel, parameter_name, get_parameter, execution_report
@@ -98,11 +101,13 @@ Tensor schedule evaluation, differentiable values, and indexed source
 bindings are described in :doc:`../advanced/A15_functional_tensor_schedules`.
 Two- and three-tap differentiable delays are described in
 :doc:`../advanced/A17_functional_delay_interpolation`.
+Compact source-history training is described in
+:doc:`../advanced/A22_functional_source_history`.
 
 .. autofunction:: dendra.func.make_functional_netcon
 
 .. autoclass:: dendra.func.FunctionalNetCon
-   :members: read_due, advance, step, extract, commit_state_
+   :members: runtime, initial_state, read_due, advance, step, extract, commit_state_
 
 .. autoclass:: dendra.func.NetConTensors
    :members:
