@@ -1,4 +1,4 @@
-"""Functional transforms for explicit-state Dendra Population execution."""
+"""Functional transforms for explicit-state Dendra execution."""
 
 from ._binding import BoundPopulation
 from ._callbacks import (
@@ -32,6 +32,7 @@ from ._netstim import (
     make_functional_netstim,
 )
 from ._network import FunctionalNetwork, NetworkTensors, make_functional_network
+from ._network_rollout import CompiledNetworkChunk, NetworkRolloutInput
 from ._population import FunctionalPopulation, make_functional
 from ._runners import longrun, longrun_checkpointed, run
 from ._schedules import TensorScheduleTensors
@@ -51,6 +52,7 @@ __all__ = [
     "APCount",
     "AnomalyDetector",
     "BoundPopulation",
+    "CompiledNetworkChunk",
     "CompiledPopulationChunk",
     "CompiledRunner",
     "ContinuousConTensors",
@@ -74,6 +76,7 @@ __all__ = [
     "NetStimDraw",
     "NetStimOutputs",
     "NetStimTensors",
+    "NetworkRolloutInput",
     "NetworkTensors",
     "PopulationTensors",
     "Raster",

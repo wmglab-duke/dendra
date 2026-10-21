@@ -286,6 +286,9 @@ class FunctionalContinuousCon:
         """Read queued payload/presence without mutation or counter advancement."""
         self._validate_source()
         self._validate_state(state)
+        return self._read_due_values(state)
+
+    def _read_due_values(self, state):
         due = continuous_due(
             state["delivery_buffer"], state["delivery_mask"], state["current_time_step"]
         )
@@ -314,6 +317,14 @@ class FunctionalContinuousCon:
             label="source_values",
         )
         self._validate_transform_parameters(transform_parameters)
+        return self._advance_values(
+            weights, state, source_values, transform_parameters=transform_parameters
+        )
+
+    def _advance_values(
+        self, weights, state, source_values, *, transform_parameters=None
+    ):
+        """Execute validated projection tensors without inspecting live source modules."""
         queue, presence = state["delivery_buffer"], state["delivery_mask"]
         slot, global_step = state["current_time_step"], state["global_step"]
         if not self.has_connections:

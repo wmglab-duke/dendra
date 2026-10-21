@@ -363,7 +363,10 @@ class FunctionalNetStim:
 
     def _generator(self, state):
         generator = torch.Generator(device=self.device)
-        generator.set_state(state["rng_state"])
+        # Tensor tape rows can be contiguous views with a nonzero storage
+        # offset. Generator.set_state reads their backing storage from zero;
+        # materialize the selected RNG bytes before crossing that boundary.
+        generator.set_state(state["rng_state"].clone())
         return generator
 
     def _sample(self, state, *, initialize=False, parameters=None):

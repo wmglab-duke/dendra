@@ -27,3 +27,4 @@ Advanced
    advanced/A17_functional_delay_interpolation.md
    advanced/A18_functional_continuous_connectivity.md
    advanced/A19_functional_network_lowering.md
+   advanced/A20_functional_network_rollout.md

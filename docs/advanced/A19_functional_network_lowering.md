@@ -92,9 +92,12 @@ needed, following the functional Population contracts. `inputs` maps names to
 component's pure evaluation path. Imperative callbacks are not executed by
 this timestep.
 
-`dn.compile(network)` convenience dispatch is a later integration. In this
-increment, compile the pure step directly, as the example's
-`run_demo(compiled=True)` does with `backend="aot_eager", fullgraph=True`.
+`dn.compile(network)` convenience dispatch is a later integration. Compile the
+pure step directly, as the example's `run_demo(compiled=True)` does with
+`backend="aot_eager", fullgraph=True`, or use the shared rollout and compiled
+chunk APIs in {doc}`A20_functional_network_rollout`. That tutorial covers
+per-population tapes, NetStim draw tapes, recording, and checkpointed execution
+over a complete horizon.
 
 ## Observe the source at the correct phase
 
@@ -190,6 +193,7 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
+Multi-step execution is available through {doc}`A20_functional_network_rollout`.
 Heterogeneous-device orchestration, compact event queue backends, full
 `dn.compile(Network)` runner integration, and continuous delay interpolation
 remain separate extensions.

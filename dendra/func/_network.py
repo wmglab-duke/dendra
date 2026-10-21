@@ -1,4 +1,4 @@
-"""Pure timesteps composed from an initialized standard Network's components."""
+"""Pure execution composed from an initialized standard Network's components."""
 
 from __future__ import annotations
 
@@ -386,6 +386,10 @@ class FunctionalNetwork:
 
     def _validate_parameters(self, parameters):
         _validate_tree(parameters, self._parameter_schema, "parameters")
+        for name, plan in self.continuous_synapses.items():
+            plan._validate_transform_parameters(
+                parameters["continuous_synapses"][name]["transform_parameters"]
+            )
         for group in self._parameter_aliases:
             first = _at(parameters, group[0])
             if any(_at(parameters, path) is not first for path in group[1:]):
@@ -592,6 +596,145 @@ class FunctionalNetwork:
             else self.netstim.sample_step_draw(state["netstim"])
         )
 
+    def _prepare_values(self, parameters, constants):
+        return {
+            "populations": {
+                name: plan._prepare_values(
+                    parameters["populations"][name], constants["populations"][name]
+                )
+                for name, plan in self.populations.items()
+            },
+            "netstim": constants["netstim"],
+        }
+
+    def _validate_prepared(self, prepared, parameters):
+        if (
+            not isinstance(prepared, Mapping)
+            or set(prepared) != {"populations", "netstim"}
+            or not isinstance(prepared["populations"], Mapping)
+            or set(prepared["populations"]) != set(self.populations)
+        ):
+            raise ValueError("prepared must match this Network's component plans")
+        _validate_tree(
+            prepared["netstim"], self._constant_schema["netstim"], "prepared.netstim"
+        )
+        return {
+            "populations": {
+                name: plan._validate_prepared(
+                    prepared["populations"][name], parameters["populations"][name]
+                )
+                for name, plan in self.populations.items()
+            },
+            "netstim": prepared["netstim"],
+        }
+
+    def make_callbacks(self, callbacks):
+        """Bind qualified Network recordings or pure custom callbacks."""
+        from ._network_callbacks import make_network_callbacks
+
+        self._validate_source()
+        return make_network_callbacks(self, callbacks)
+
+    def sample_draw_tape(self, state, steps):
+        """Sample replayable NetStim draw/RNG packets outside compiled code."""
+        from ._network_rollout import sample_draw_tape
+
+        return sample_draw_tape(self, state, steps)
+
+    def rollout(
+        self,
+        parameters,
+        prepared,
+        state,
+        inputs=None,
+        *,
+        steps=None,
+        callbacks=None,
+        callback_state=None,
+    ):
+        """Execute a pure horizon with per-Population inputs and explicit draws."""
+        from ._network_rollout import rollout
+
+        return rollout(
+            self,
+            parameters,
+            prepared,
+            state,
+            inputs,
+            steps=steps,
+            callbacks=callbacks,
+            callback_state=callback_state,
+        )
+
+    def prepare_and_rollout(
+        self,
+        parameters,
+        constants,
+        state,
+        inputs=None,
+        *,
+        steps=None,
+        callbacks=None,
+        callback_state=None,
+    ):
+        """Derive coefficients and execute an explicit, differentiable horizon."""
+        from ._network_rollout import rollout
+
+        return rollout(
+            self,
+            parameters,
+            None,
+            state,
+            inputs,
+            steps=steps,
+            callbacks=callbacks,
+            callback_state=callback_state,
+            constants=constants,
+        )
+
+    def compile_rollout_chunk(self, steps, *, execution="scan", **compile_options):
+        """Build a fixed-horizon chunk using the shared scan or unrolled body."""
+        from ._network_rollout import CompiledNetworkChunk
+
+        return CompiledNetworkChunk(
+            self, steps=steps, execution=execution, **compile_options
+        )
+
+    def run(
+        self,
+        parameters,
+        constants,
+        state,
+        inputs=None,
+        *,
+        steps=None,
+        chunklength=64,
+        checkpoint_every=None,
+        callbacks=None,
+        callback_state=None,
+        compiled_chunk=None,
+    ):
+        """Schedule exact chunks, optional checkpoints and bounded RNG sampling.
+
+        Returned state and ``aux['callbacks'].state`` can be passed directly to
+        another call. Checkpoint replay retains gradients through all chunks.
+        """
+        from ._network_rollout import run
+
+        return run(
+            self,
+            parameters,
+            constants,
+            state,
+            inputs,
+            steps=steps,
+            chunklength=chunklength,
+            checkpoint_every=checkpoint_every,
+            callbacks=callbacks,
+            callback_state=callback_state,
+            compiled_chunk=compiled_chunk,
+        )
+
     def _source_value(self, collection, name, parameters, prepared, states, stimulus):
         binding = self._bindings[collection, name]
         if binding is None:
@@ -672,7 +815,7 @@ class FunctionalNetwork:
             post, target = self._targets["continuous_synapses", name]
             receiver = self.populations[post]
             if plan.has_connections and plan.receive_before_source:
-                _, payload, mask = plan.read_due(queue)
+                _, payload, mask = plan._read_due_values(queue)
                 states[post], scratch[post] = receiver._continuous_receive_values(
                     parameters["populations"][post],
                     prepared["populations"][post],
@@ -687,7 +830,7 @@ class FunctionalNetwork:
             source = self._source_value(
                 "continuous_synapses", name, parameters, prepared, states, stimulus
             )
-            queue, payload, mask = plan.advance(
+            queue, payload, mask = plan._advance_values(
                 value["weights"],
                 queue,
                 source,
@@ -801,21 +944,7 @@ class FunctionalNetwork:
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_state(state)
-        if (
-            not isinstance(prepared, Mapping)
-            or set(prepared) != {"populations", "netstim"}
-            or set(prepared["populations"]) != set(self.populations)
-        ):
-            raise ValueError("prepared must match this Network's component plans")
-        values = {
-            "populations": {
-                name: plan._validate_prepared(
-                    prepared["populations"][name], parameters["populations"][name]
-                )
-                for name, plan in self.populations.items()
-            },
-            "netstim": prepared["netstim"],
-        }
+        values = self._validate_prepared(prepared, parameters)
         with nullcontext() if self.training else torch.no_grad():
             return self._step_values(
                 parameters,
@@ -844,15 +973,7 @@ class FunctionalNetwork:
         _validate_tree(constants, self._constant_schema, "constants")
         self._validate_state(state)
         with nullcontext() if self.training else torch.no_grad():
-            values = {
-                "populations": {
-                    name: plan._prepare_values(
-                        parameters["populations"][name], constants["populations"][name]
-                    )
-                    for name, plan in self.populations.items()
-                },
-                "netstim": constants["netstim"],
-            }
+            values = self._prepare_values(parameters, constants)
             return self._step_values(
                 parameters,
                 values,

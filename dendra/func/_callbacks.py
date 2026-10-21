@@ -1255,7 +1255,8 @@ class _ImperativeCallbackBinding:
 class FunctionalCallbacks:
     """An immutable named collection of native functional callbacks.
 
-    Construct a collection with :meth:`FunctionalPopulation.make_callbacks`.
+    Construct a collection with the functional Population or Network plan's
+    ``make_callbacks`` method.
     Callback objects supply static configuration only and are never mutated.
     """
 
@@ -1365,7 +1366,7 @@ class FunctionalCallbacks:
     def _validate_owner(self, functional: FunctionalPopulation) -> None:
         if functional is not self._functional:
             raise FunctionalizationError(
-                "callbacks belong to a different FunctionalPopulation plan"
+                "callbacks belong to a different functional execution plan"
             )
 
     def _validate_runtime_dt(self, dt: float) -> None:

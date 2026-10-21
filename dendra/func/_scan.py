@@ -20,6 +20,7 @@ from ._carry_packing import _PackedCarryLayout
 from ._scan_autograd import guard_scan_outputs
 from ._scan_compat import install_scan_compatibility
 from ._scan_inductor import _compile_scan
+from ._scan_tree import _capture_tensor_step, _packed_tensor_scan
 from ._types import StepInput
 
 # Bound the inference graph independently of the horizon, while amortizing the
@@ -181,8 +182,11 @@ class _CompiledScanPopulationChunk:
         # differentiated. Post-dispatch capture may represent detach as alias,
         # which is forward-equivalent but silently erases stop-gradient/STE
         # semantics. Inference does not differentiate this captured graph.
-        graph = make_fx(authored, pre_dispatch=grad_enabled)(
-            parameters, prepared, state, carries, invariant_carries, sample
+        graph = _capture_tensor_step(
+            authored,
+            (parameters, prepared, state, carries, invariant_carries, sample),
+            grad_enabled=grad_enabled,
+            tracer=make_fx,
         )
 
         def execute(parameters, prepared, state, ve, intra, carries):
@@ -200,17 +204,13 @@ class _CompiledScanPopulationChunk:
                 )
 
             if packed_training:
-
-                def combine(packed, sample):
-                    state, carries = layout.unpack(packed)
-                    updated, emitted = graph(
-                        parameters, prepared, state, carries, invariant_carries, sample
-                    )
-                    return layout.pack(updated), emitted
-
-                packed, emitted = scan(
-                    combine,
-                    layout.pack((functional._clone_state_tree(state), carries)),
+                packed, emitted = _packed_tensor_scan(
+                    graph,
+                    layout,
+                    parameters,
+                    prepared,
+                    (functional._clone_state_tree(state), carries),
+                    invariant_carries,
                     samples,
                 )
                 if plans is None:

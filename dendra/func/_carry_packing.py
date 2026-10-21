@@ -26,7 +26,7 @@ class _PackedLeaf:
 @dataclass(frozen=True)
 class _PackedCarryLayout:
     spec: object
-    leaves: tuple[_PackedLeaf, ...]
+    leaves: tuple[_PackedLeaf | None, ...]
     groups: tuple[tuple[torch.dtype, torch.device], ...]
     indices: tuple[tuple[int, ...], ...]
 
@@ -38,8 +38,13 @@ class _PackedCarryLayout:
         sizes = []
         leaves = []
         for index, value in enumerate(values):
+            if value is None:
+                leaves.append(None)
+                continue
             if not torch.is_tensor(value) or value.layout is not torch.strided:
-                raise TypeError("packed loop carry requires strided Tensor leaves")
+                raise TypeError(
+                    "packed loop carry requires strided Tensor or None leaves"
+                )
             key = (value.dtype, value.device)
             if key not in groups:
                 groups.append(key)
@@ -61,6 +66,11 @@ class _PackedCarryLayout:
         values, spec = pytree.tree_flatten(tree)
         if spec != self.spec:
             raise ValueError("packed loop carry changed its tensor-tree structure")
+        if any(
+            (leaf is None) != (value is None)
+            for leaf, value in zip(self.leaves, values, strict=True)
+        ):
+            raise ValueError("packed loop carry changed a static None leaf")
         # cat owns storage even for a one-leaf group. Never use a no-copy
         # one-leaf shortcut: unchanged leaves must not alias incoming carry.
         return tuple(
@@ -72,7 +82,9 @@ class _PackedCarryLayout:
         if len(packs) != len(self.groups):
             raise ValueError("packed loop carry changed its dtype/device groups")
         values = [
-            packs[leaf.group].narrow(0, leaf.offset, leaf.numel).view(leaf.shape)
+            None
+            if leaf is None
+            else packs[leaf.group].narrow(0, leaf.offset, leaf.numel).view(leaf.shape)
             for leaf in self.leaves
         ]
         return pytree.tree_unflatten(values, self.spec)

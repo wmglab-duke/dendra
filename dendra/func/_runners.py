@@ -739,19 +739,57 @@ def _materialize_checkpoint_tree(value):
     plan identity and tree structure.
     """
 
+    inference_copies = {}
+
     def materialize(leaf):
         if torch.is_tensor(leaf):
             if torch.is_inference(leaf):
-                with torch.inference_mode(False):
-                    return leaf.clone()
+                if id(leaf) not in inference_copies:
+                    with torch.inference_mode(False):
+                        inference_copies[id(leaf)] = leaf.clone()
+                return inference_copies[id(leaf)]
             return leaf
         if isinstance(leaf, Mapping):
             return {
-                name: _materialize_checkpoint_tree(item) for name, item in leaf.items()
+                name: pytree.tree_map(materialize, item) for name, item in leaf.items()
             }
         return leaf
 
     return pytree.tree_map(materialize, value)
+
+
+def _execution_spans(steps, chunklength):
+    """Shared exact host spans, including a final short tail and zero work."""
+    for start in range(0, steps, chunklength):
+        yield start, min(start + chunklength, steps)
+
+
+def _checkpoint_tensor_tree(function, operands):
+    """Checkpoint explicit tensor operands, preserving genuine identity ties.
+
+    Save each distinct tensor once and reconstruct its repeated tree positions
+    from the same argument during replay. Aliased parameter leaves must not
+    become independent saved-tensor objects after checkpoint unpacking.
+    """
+    leaves, spec = pytree.tree_flatten(_materialize_checkpoint_tree(operands))
+    arguments, positions, identities = [], [], {}
+    for leaf in leaves:
+        if torch.is_tensor(leaf):
+            index = identities.get(id(leaf))
+            if index is None:
+                index = len(arguments)
+                identities[id(leaf)] = index
+                arguments.append(leaf)
+        else:
+            index = len(arguments)
+            arguments.append(leaf)
+        positions.append(index)
+
+    def execute(*values):
+        unpacked = pytree.tree_unflatten([values[index] for index in positions], spec)
+        return function(*unpacked)
+
+    return checkpoint(execute, *arguments, use_reentrant=False)
 
 
 def _execute_chunks(
@@ -767,8 +805,7 @@ def _execute_chunks(
     extra_tensors: StimulusTensors | None = None,
 ):
     auxiliary = None
-    for start in range(0, steps, chunklength):
-        stop = min(start + chunklength, steps)
+    for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
         extra_ve = _assemble_extra_chunk(
@@ -816,8 +853,7 @@ def _execute_chunks_with_callbacks(
     extra_tensors: StimulusTensors | None = None,
 ):
     auxiliary = None
-    for start in range(0, steps, chunklength):
-        stop = min(start + chunklength, steps)
+    for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
         extra_ve = _assemble_extra_chunk(
@@ -885,8 +921,7 @@ def _execute_checkpointed_chunks(
             checkpoint_parameter_binding=_tensor_binding(execution.binding.parameters),
         )
     auxiliary: Any = None
-    for start in range(0, steps, chunklength):
-        stop = min(start + chunklength, steps)
+    for start, stop in _execution_spans(steps, chunklength):
         chunk_steps = stop - start
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
@@ -900,7 +935,6 @@ def _execute_checkpointed_chunks(
                 None if extra_tensors is None else extra_tensors.constants,
             )
         )
-        flat_inputs, input_spec = pytree.tree_flatten(checkpoint_inputs)
 
         def execute_chunk(
             state_in,
@@ -955,18 +989,7 @@ def _execute_checkpointed_chunks(
                 callback_state_in,
             )
 
-        def execute_flat_chunk(
-            *leaves, input_spec=input_spec, execute_chunk=execute_chunk
-        ):
-            # Freeze both values per span: replay occurs after this host loop
-            # has advanced. Every dynamic Tensor must be a top-level checkpoint
-            # argument so autograd saves its version, not a mutable container.
-            operands = pytree.tree_unflatten(leaves, input_spec)
-            return execute_chunk(*operands)
-
-        checkpoint_result = checkpoint(
-            execute_flat_chunk, *flat_inputs, use_reentrant=False
-        )
+        checkpoint_result = _checkpoint_tensor_tree(execute_chunk, checkpoint_inputs)
         if callbacks is None:
             state, auxiliary = checkpoint_result
         else:

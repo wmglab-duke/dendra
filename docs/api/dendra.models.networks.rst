@@ -37,14 +37,24 @@ Network owns connectivity declarations; automatic source bindings and the shared
 native schedule preserve ordered recurrent delivery. See
 :doc:`../advanced/A19_functional_network_lowering` for complete runnable native
 parity, gradients, NetStim draw packets, and checkpoint continuation.
+Shared rollout, compiled chunks, per-population input tapes, qualified
+recordings, and checkpointed host execution are described in
+:doc:`../advanced/A20_functional_network_rollout`.
 
 .. autofunction:: dendra.func.make_functional_network
 
 .. autoclass:: dendra.func.FunctionalNetwork
-   :members: prepare, step, prepare_and_step, sample_step_draw, extract, commit_state_
+   :members: prepare, step, prepare_and_step, make_callbacks, sample_step_draw, sample_draw_tape, rollout, prepare_and_rollout, compile_rollout_chunk, run, extract, commit_state_
 
 .. autoclass:: dendra.func.NetworkTensors
    :members:
+
+.. autoclass:: dendra.func.NetworkRolloutInput
+   :members:
+
+.. autoclass:: dendra.func.CompiledNetworkChunk
+   :members: steps
+   :special-members: __call__
 
 NetStim
 -------
