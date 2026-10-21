@@ -8,6 +8,7 @@ from torch.utils import _pytree as pytree
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
+from dendra.func import _netcon as functional_netcon
 from dendra.models.mod import expsyn
 from dendra.models.networks.net import make_weight
 from dendra.models.networks.netcon import NetCon
@@ -82,6 +83,7 @@ def test_packed_projection_matches_native_carry_scratch_and_input_purity(
     assert plan.runtime == "bitpacked_history"
     assert tensors.delays is None
     assert tensors.state["delivery_buffer"].shape == (1, native._syn_numel)
+    assert plan.pending_capacity == 0
     assert "backend_state" not in tensors.state
     before = _clone(tensors.state)
     state = tensors.state
@@ -241,14 +243,88 @@ def test_packed_admission_and_frozen_boundary_errors_are_explicit():
         plan.extract()
     native.bitpack_source_threshold.sub_(0.5)
     native._sparse_calendar[0] = [(native.post_idx[:1], tensors.weights[:1])]
-    with pytest.raises(dn.func.FunctionalizationError, match="side calendars"):
+    with pytest.raises(ValueError, match="pending_capacity"):
         plan.extract()
+    imported, imported_tensors = dn.func.make_functional_netcon(native)
+    assert imported.pending_capacity == max(16, 2 * native._n_conn)
+    assert imported_tensors.state["pending_size"].item() == 1
     native._sparse_calendar.clear()
     native.schedule(con_indices=[0], times_ms=[0.0], weight=1.0)
-    with pytest.raises(dn.func.FunctionalizationError, match="NetCon schedules"):
-        dn.func.make_functional_netcon(native)
+    scheduled, _ = dn.func.make_functional_netcon(native)
+    assert scheduled.runtime == "bitpacked_history"
     with pytest.raises(dn.func.FunctionalizationError, match="configuration changed"):
         plan.read_due(tensors.state, weights=tensors.weights)
+
+
+def test_intrinsic_packed_fanout_keeps_pending_storage_empty_and_skips_transport(
+    monkeypatch,
+):
+    _, native = _netcon(mode="raw", fanout=True, size=65)
+    plan, tensors = dn.func.make_functional_netcon(native)
+    assert native._n_conn == 65 * 65
+    assert plan.pending_capacity == 0
+    for field in ("slots", "indices", "values"):
+        assert tensors.state[f"pending_{field}"].shape == (0,)
+    assert tensors.state["pending_size"].shape == (1,)
+    assert tensors.state["pending_overflow"].shape == (1,)
+
+    def unexpected_calendar(*args, **kwargs):
+        raise AssertionError("Intrinsic packed traffic must skip pending transport")
+
+    monkeypatch.setattr(functional_netcon, "pending_calendar_pop", unexpected_calendar)
+    state = tensors.state
+    active = tensors.weights.new_ones(plan.source_shape)
+    for _ in range(5):
+        state, payload = plan.step(tensors.weights, state, active)
+        native.pre.gate = active
+        previous = native.syn.g.clone()
+        native.advance()
+        torch.testing.assert_close(payload, native.syn.g - previous)
+        _close(state, plan.extract().state)
+    plan.commit_state_(native, state)
+    _close(state, plan.extract().state)
+
+
+def test_intrinsic_packed_explicit_capacity_overrides_empty_default():
+    _, native = _netcon(mode="raw", fanout=True)
+    plan, tensors = dn.func.make_functional_netcon(native, pending_capacity=7)
+    assert plan.pending_capacity == 7
+    for field in ("slots", "indices", "values"):
+        assert tensors.state[f"pending_{field}"].shape == (7,)
+    state, _ = plan.step(
+        tensors.weights, tensors.state, tensors.weights.new_ones(plan.source_shape)
+    )
+    assert not state["pending_size"].any()
+    plan.check_overflow(state)
+
+
+@pytest.mark.parametrize("traffic", ("schedule", "checkpoint"))
+def test_packed_scheduled_or_imported_fanout_keeps_default_pending_budget(traffic):
+    _, native = _netcon(mode="raw", fanout=True, size=17)
+    count = 2 * native._n_conn + 3
+    if traffic == "schedule":
+        native.schedule(con_indices=[0], times_ms=[0.0], weight=1.0)
+        expected = max(16, 2 * native._n_conn)
+    else:
+        native._sparse_calendar[0] = [
+            (torch.zeros(count, dtype=torch.long), torch.ones(count, dtype=DTYPE))
+        ]
+        expected = count
+    plan, tensors = dn.func.make_functional_netcon(native)
+    assert plan.pending_capacity == expected
+    assert tensors.state["pending_values"].shape == (expected,)
+    state, payload = plan.step(
+        tensors.weights,
+        tensors.state,
+        tensors.weights.new_zeros(plan.source_shape),
+        schedule=tensors.schedule,
+    )
+    if traffic == "schedule":
+        assert state["pending_size"].item() == 1
+    else:
+        assert not state["pending_size"].any()
+        assert payload.flatten()[0].item() == count
+    plan.check_overflow(state)
 
 
 def test_packed_canonical_transport_guards_reject_changed_helpers():

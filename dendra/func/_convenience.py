@@ -471,6 +471,7 @@ def compile(
     initialization="snapshot",
     checkpoint_every=None,
     trainable=(),
+    pending_capacity=None,
     backend="inductor",
     options=None,
     **compile_options,
@@ -482,6 +483,10 @@ def compile(
     inputs use :class:`NetworkRolloutInput`, recordings use qualified names
     such as ``cell.v``, and parameters retain shared tensor identities. See
     :class:`CompiledNetworkRunner` for its restart and continuation contract.
+    ``pending_capacity`` configures Network pending-event calendars with one
+    positive entry count or a mapping from connection names to counts. Overflow
+    raises before a result is returned; increase capacity and retry from a valid
+    checkpoint. Population runners do not accept this option.
 
     Recording and reductions are configured only through named ``callbacks``.
     For example, ``callbacks={'trace': dn.func.Recorder(('v',))}`` records
@@ -514,10 +519,14 @@ def compile(
     from dendra.models.networks.net import Network
 
     runner_type = CompiledRunner
+    runner_keywords = {}
     if isinstance(population, Network):
         from ._network_compile import CompiledNetworkRunner
 
         runner_type = CompiledNetworkRunner
+        runner_keywords["pending_capacity"] = pending_capacity
+    elif pending_capacity is not None:
+        raise ValueError("pending_capacity applies only to Network compilation")
     return runner_type(
         population,
         dt=dt,
@@ -531,6 +540,7 @@ def compile(
         trainable=trainable,
         backend=backend,
         options=options,
+        **runner_keywords,
         **compile_options,
     )
 

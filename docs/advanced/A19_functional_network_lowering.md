@@ -28,7 +28,9 @@ Run it with `python examples/functional_network_lowering.py`.
 Functional lowering supports initialized canonical Networks whose simulation
 components use one device. Event connections support dense queues and compact
 source-history training, including compatible native `auto` selections, and
-intrinsic packed-history inference.
+packed-history inference with connection schedules, and sparse-calendar
+inference. Pending calendar capacity and overflow handling are described in
+{doc}`A24_functional_pending_calendar`.
 Continuous connections retain native zero/integer-delay semantics.
 Configure training and differentiability before lowering. Populations,
 mechanisms, and connections must have distinct mutable owners; registering the
@@ -201,6 +203,7 @@ and `dn.compile(Network)` execution with snapshot or fresh initialization is
 described in {doc}`A21_functional_network_compile`.
 Source-history training is described in {doc}`A22_functional_source_history`.
 Packed inference is described in {doc}`A23_functional_bitpacked_inference`.
-Heterogeneous-device functional execution, sparse-calendar inference, packed
-NetCon scheduled side traffic, and continuous delay interpolation are currently
-unsupported.
+Sparse-calendar inference and packed NetCon scheduled traffic use the shared
+pending calendar described in {doc}`A24_functional_pending_calendar`.
+Heterogeneous-device functional execution and continuous delay interpolation are
+currently unsupported.

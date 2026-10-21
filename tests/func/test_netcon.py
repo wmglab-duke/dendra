@@ -346,14 +346,9 @@ def test_inference_mode_commit_publishes_ordinary_native_mutable_storage():
     native.advance()
 
 
-@pytest.mark.parametrize("unsupported", ("compact", "uninitialized"))
-def test_unsupported_projection_layouts_fail_before_effects(unsupported):
-    _, native = _netcon(
-        delay_backend="sparse_calendar" if unsupported == "compact" else "dense",
-        tracked=False,
-    )
-    if unsupported == "uninitialized":
-        native._event_delivery_initialized = False
+def test_uninitialized_projection_fails_before_effects():
+    _, native = _netcon(tracked=False)
+    native._event_delivery_initialized = False
     snapshot = _clone(native.state_dict_for_checkpoint())
     with pytest.raises(dn.func.FunctionalizationError):
         dn.func.make_functional_netcon(native)

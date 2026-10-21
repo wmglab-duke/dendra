@@ -10,9 +10,9 @@ kernelspec:
 # Packed-history inference
 
 Functional Networks support native `bitpacked_history` inference for intrinsic
-source traffic. The runtime stores one hard spike per unique presynaptic source
-in an `int64` history ring. Deliveries read that history using the current
-connection weights and the initialized integer delay offsets. Native and
+source traffic and per-NetCon schedules. The runtime stores one hard spike per
+unique presynaptic source in an `int64` history ring. Deliveries read that history
+using the current connection weights and the initialized integer delay offsets. Native and
 functional execution use shared source detection, history, and projection
 kernels.
 
@@ -131,10 +131,15 @@ independent snapshots, and native commit clones incoming carry.
 Align the receiving model's parameters before committing state. Keep matching
 topology, timestep, source configuration, and ring capacity with a checkpoint.
 
-Per-NetCon scheduled events and nonempty legacy side calendars are currently
-unsupported by functional packed inference. NetStim's own schedules are
-supported because they produce source spikes before connection delivery.
-Functional `sparse_calendar` inference is currently unsupported.
+Per-NetCon schedules and nonempty legacy pending calendars use the shared pure
+pending calendar described in {doc}`A24_functional_pending_calendar`. Scheduled
+traffic retains enqueue-time weighted values, independently of intrinsic
+history's delivery-time weight lookup. That guide also covers complete
+`sparse_calendar` inference and explicit capacity/overflow handling.
+
+Intrinsic-only packed plans with no pending scheduled traffic allocate no
+pending-entry arrays by default. Their explicit history retains the packed
+layout without an additional allocation proportional to the edge count.
 
 The complete CPU example executes both initialization policies:
 

@@ -238,6 +238,26 @@ def test_network_failed_public_validation_and_callback_finalization_preserve_rep
     assert kernel.execution_report() is original
 
 
+def test_network_run_failed_callback_finalization_preserves_prior_report():
+    functional, tensors, prepared = _case()
+    kernel = functional.compile_rollout_chunk(2, disable=True)
+    kernel(tensors.parameters, prepared, tensors.state)
+    original = kernel.execution_report()
+    assert original is not None and not original.callbacks
+    callbacks = functional.make_callbacks({"reject": _RejectFinalize()})
+    # A successful full chunk and tail both change the shared report before
+    # finalization rejects the complete host invocation.
+    with pytest.raises(ValueError, match="Reject callback finalization"):
+        functional.run(
+            *tensors,
+            steps=3,
+            chunklength=2,
+            compiled_chunk=kernel,
+            callbacks=callbacks,
+        )
+    assert kernel.execution_report() is original
+
+
 def _read_only_tree(tree):
     if isinstance(tree, dict):
         return MappingProxyType(

@@ -31,3 +31,4 @@ Advanced
    advanced/A21_functional_network_compile.md
    advanced/A22_functional_source_history.md
    advanced/A23_functional_bitpacked_inference.md
+   advanced/A24_functional_pending_calendar.md

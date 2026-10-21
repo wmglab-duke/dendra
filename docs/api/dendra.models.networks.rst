@@ -53,6 +53,9 @@ parameter lookup, and checkpoint continuation is described in
 Intrinsic packed-history inference with hard source detection, current weights,
 fixed delays, and native checkpoint continuation is described in
 :doc:`../advanced/A23_functional_bitpacked_inference`.
+Per-NetCon packed schedules and sparse-calendar inference share a pure pending
+calendar with enqueue-time payloads. Capacity, overflow handling, and legacy
+checkpoints are described in :doc:`../advanced/A24_functional_pending_calendar`.
 
 .. autoclass:: dendra.func.CompiledNetworkRunner
    :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
@@ -61,7 +64,7 @@ fixed delays, and native checkpoint continuation is described in
 .. autofunction:: dendra.func.make_functional_network
 
 .. autoclass:: dendra.func.FunctionalNetwork
-   :members: initialization_inputs, initialize, sample_initialization_draw, prepare, step, prepare_and_step, make_callbacks, sample_step_draw, sample_draw_tape, rollout, prepare_and_rollout, compile_rollout_chunk, run, extract, commit_state_
+   :members: initialization_inputs, initialize, sample_initialization_draw, prepare, step, prepare_and_step, make_callbacks, sample_step_draw, sample_draw_tape, rollout, prepare_and_rollout, compile_rollout_chunk, run, extract, check_overflow, commit_state_
 
 .. autoclass:: dendra.func.NetworkTensors
    :members:
@@ -111,11 +114,13 @@ Compact source-history training is described in
 :doc:`../advanced/A22_functional_source_history`.
 Intrinsic packed-history inference is described in
 :doc:`../advanced/A23_functional_bitpacked_inference`.
+Sparse inference and packed connection schedules are described in
+:doc:`../advanced/A24_functional_pending_calendar`.
 
 .. autofunction:: dendra.func.make_functional_netcon
 
 .. autoclass:: dendra.func.FunctionalNetCon
-   :members: runtime, initial_state, read_due, advance, step, extract, commit_state_
+   :members: runtime, pending_capacity, initial_state, read_due, advance, step, extract, check_overflow, commit_state_
 
 .. autoclass:: dendra.func.NetConTensors
    :members:

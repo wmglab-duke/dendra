@@ -32,6 +32,14 @@ from ._event_delivery import (
     dense_interpolated_delay_transition,
     gather_source_gates,
 )
+from ._pending_calendar import (
+    CalendarState,
+    PendingCalendarMapping,
+    pending_calendar_append,
+    pending_calendar_empty,
+    pending_calendar_from_legacy,
+    pending_calendar_pop,
+)
 from ._source_history import (
     read_float_history,
     read_packed_history,
@@ -1739,7 +1747,7 @@ class NetCon(Referency):
             syn_numel]`` ring buffer, but uses precomputed integer-delay routing
             metadata and specialized uniform-/mixed-delay hot paths. The
             ``"sparse_calendar"`` backend stores pending nonzero inference
-            deliveries in Python-side calendar buckets and uses only a reusable
+            deliveries in a compact tensor calendar and uses only a reusable
             one-row dense scratch buffer before calling ``syn.net_receive(...)``.
             ``"bitpacked_history"`` is an inference-only source-spike history
             backend for large SNNs: it stores only packed source spikes over the
@@ -3192,143 +3200,147 @@ class NetCon(Referency):
             )
         self.bitpack_source_has_spiked.copy_(src_state)
 
+    @property
+    def _sparse_calendar(self):
+        return PendingCalendarMapping(self, "_pending_calendar")
+
+    @_sparse_calendar.setter
+    def _sparse_calendar(self, chunks):
+        previous = getattr(self, "_pending_calendar", None)
+        count = sum(value.numel() for bucket in chunks.values() for _, value in bucket)
+        capacity = max(16, count, 0 if previous is None else previous.values.numel())
+        self._pending_calendar = pending_calendar_from_legacy(
+            chunks, capacity=capacity, device=self.device, dtype=self.dtype
+        )
+        self._pending_calendar_size = count
+
+    @property
+    def _sparse_event_calendar(self):
+        return PendingCalendarMapping(self, "_pending_event_calendar")
+
+    @_sparse_event_calendar.setter
+    def _sparse_event_calendar(self, chunks):
+        previous = getattr(self, "_pending_event_calendar", None)
+        count = sum(value.numel() for bucket in chunks.values() for _, value in bucket)
+        capacity = max(16, count, 0 if previous is None else previous.values.numel())
+        self._pending_event_calendar = pending_calendar_from_legacy(
+            chunks, capacity=capacity, device=self.device, dtype=torch.int32
+        )
+        self._pending_event_calendar_size = count
+
     def _clear_sparse_calendar(self):
-        """Drop all pending sparse-calendar deliveries and event counts."""
+        """Drop pending payloads and counts while retaining allocated capacity."""
         self._sparse_calendar.clear()
         self._sparse_event_calendar.clear()
 
     def _move_sparse_calendar_to_device(self):
-        """Move Python-side calendar chunks after ``.to(...)`` or device realignment."""
-        if not hasattr(self, "_sparse_calendar"):
-            return
-
-        def move_payload(chunks):
-            return [
-                (
-                    idx.to(device=self.device, dtype=torch.long),
-                    val.to(device=self.device, dtype=self.dtype),
+        """Move persistent calendars after ``.to(...)`` or device realignment."""
+        for name, dtype in (
+            ("_pending_calendar", self.dtype),
+            ("_pending_event_calendar", torch.int32),
+        ):
+            state = getattr(self, name, None)
+            if state is not None:
+                setattr(
+                    self,
+                    name,
+                    CalendarState(
+                        state.slots.to(device=self.device),
+                        state.indices.to(device=self.device),
+                        state.values.to(device=self.device, dtype=dtype),
+                        state.size.to(device=self.device),
+                        state.overflow.to(device=self.device),
+                    ),
                 )
-                for idx, val in chunks
-            ]
-
-        def move_events(chunks):
-            return [
-                (
-                    idx.to(device=self.device, dtype=torch.long),
-                    cnt.to(device=self.device, dtype=torch.int32),
-                )
-                for idx, cnt in chunks
-            ]
-
-        self._sparse_calendar = {
-            int(slot): move_payload(chunks)
-            for slot, chunks in self._sparse_calendar.items()
-            if len(chunks) > 0
-        }
-        self._sparse_event_calendar = {
-            int(slot): move_events(chunks)
-            for slot, chunks in self._sparse_event_calendar.items()
-            if len(chunks) > 0
-        }
 
     def _compact_sparse_payload_slot(self, slot: int):
-        chunks = self._sparse_calendar.get(slot)
-        if not chunks or len(chunks) <= 1:
-            return
-        self._sparse_calendar[slot] = [
-            (
-                torch.cat([idx for idx, _ in chunks], dim=0),
-                torch.cat([val for _, val in chunks], dim=0),
-            )
-        ]
+        """Tensor calendars already keep one stable compact prefix."""
 
     def _compact_sparse_event_slot(self, slot: int):
-        chunks = self._sparse_event_calendar.get(slot)
-        if not chunks or len(chunks) <= 1:
-            return
-        self._sparse_event_calendar[slot] = [
-            (
-                torch.cat([idx for idx, _ in chunks], dim=0),
-                torch.cat([cnt for _, cnt in chunks], dim=0),
-            )
-        ]
+        """Tensor calendars already keep one stable compact prefix."""
 
-    def _append_sparse_payloads(
-        self,
-        future_slots: torch.Tensor,
-        post_idx: torch.Tensor,
-        values: torch.Tensor,
-    ):
-        """Append nonzero dense-payload contributions to sparse calendar buckets."""
+    def _append_pending_calendar(self, attribute, future_slots, indices, values):
         if values.numel() == 0:
             return
-
-        for slot in torch.unique(future_slots.detach()).detach().cpu().tolist():
-            slot_i = int(slot)
-            mask = future_slots == slot_i
-            self._sparse_calendar.setdefault(slot_i, []).append(
-                (
-                    post_idx[mask].detach(),
-                    values[mask].detach(),
-                )
+        state = getattr(self, attribute)
+        required = getattr(self, f"{attribute}_size") + values.numel()
+        capacity = state.values.numel()
+        if required > capacity:
+            # Grow before invoking the atomic transition, retaining all existing
+            # entries and their order without converting through Python buckets.
+            expanded = pending_calendar_empty(
+                max(required, capacity * 2, 16),
+                device=state.values.device,
+                dtype=state.values.dtype,
             )
-            if len(self._sparse_calendar[slot_i]) > self._calendar_compact_threshold:
-                self._compact_sparse_payload_slot(slot_i)
-
-    def _append_sparse_events(
-        self,
-        future_slots: torch.Tensor,
-        con_idx: torch.Tensor,
-        counts: torch.Tensor,
-    ):
-        """Append per-connection event counts for optional sparse introspection."""
-        if counts.numel() == 0:
-            return
-
-        for slot in torch.unique(future_slots.detach()).detach().cpu().tolist():
-            slot_i = int(slot)
-            mask = future_slots == slot_i
-            self._sparse_event_calendar.setdefault(slot_i, []).append(
-                (
-                    con_idx[mask].detach(),
-                    counts[mask].detach(),
-                )
+            pad = expanded.values.numel() - capacity
+            state = CalendarState(
+                torch.cat((state.slots, expanded.slots[:pad])),
+                torch.cat((state.indices, expanded.indices[:pad])),
+                torch.cat((state.values, expanded.values[:pad])),
+                state.size,
+                state.overflow,
             )
-            if (
-                len(self._sparse_event_calendar[slot_i])
-                > self._calendar_compact_threshold
-            ):
-                self._compact_sparse_event_slot(slot_i)
+        # Legacy buckets were created in sorted physical-slot order on each
+        # append. Stable sorting retains connection order inside each bucket.
+        order = torch.argsort(future_slots, stable=True)
+        updated = pending_calendar_append(
+            state,
+            future_slots.index_select(0, order).detach(),
+            indices.index_select(0, order).detach(),
+            values.index_select(0, order).detach(),
+        )
+        if bool(updated.overflow.any()):
+            raise RuntimeError("Native pending calendar could not grow safely.")
+        setattr(self, attribute, updated)
+        setattr(self, f"{attribute}_size", required)
+
+    def _append_sparse_payloads(self, future_slots, post_idx, values):
+        """Append enqueue-time weighted payloads using the shared pure calendar."""
+        self._append_pending_calendar(
+            "_pending_calendar", future_slots, post_idx, values
+        )
+
+    def _append_sparse_events(self, future_slots, con_idx, counts):
+        """Append event counts independently of zero or cancelling payloads."""
+        self._append_pending_calendar(
+            "_pending_event_calendar", future_slots, con_idx, counts
+        )
 
     def _pop_sparse_calendar_to_dense(self, slot: int) -> torch.Tensor:
-        """Reduce due sparse payload chunks into the reusable dense scratch row."""
-        scratch = self.delivery_buffer.squeeze(0)
-        scratch.zero_()
-        chunks = self._sparse_calendar.pop(slot, None)
-        if chunks:
-            for post_idx, values in chunks:
-                if values.numel() > 0:
-                    scratch.index_add_(0, post_idx, values)
-        return scratch
+        """Reduce due pending contributions into the reusable dense scratch row."""
+        scratch = self.delivery_buffer.squeeze(0).zero_()
+        # Host metadata avoids a device synchronization in idle packed paths.
+        if not self._pending_calendar_size:
+            return scratch
+        self._pending_calendar, payload = pending_calendar_pop(
+            self._pending_calendar, slot, width=self._syn_numel, _scratch=scratch
+        )
+        self._pending_calendar_size = int(self._pending_calendar.size.item())
+        return payload
 
     def _pop_sparse_events(self, slot: int):
-        """Populate ``self.events`` from sparse event-count chunks due now."""
+        """Populate current per-connection counts using the shared pure calendar."""
         self.events.zero_()
-        if not self.track_events:
-            return
-        chunks = self._sparse_event_calendar.pop(slot, None)
-        if chunks:
-            for con_idx, counts in chunks:
-                if counts.numel() > 0:
-                    self.events.index_add_(0, con_idx, counts)
+        if self.track_events and self._pending_event_calendar_size:
+            self._pending_event_calendar, _ = pending_calendar_pop(
+                self._pending_event_calendar,
+                slot,
+                width=self._n_conn,
+                _scratch=self.events,
+            )
+            self._pending_event_calendar_size = int(
+                self._pending_event_calendar.size.item()
+            )
 
     def _add_sparse_calendar_to_dense(self, slot: int, scratch: torch.Tensor):
-        """Add due sparse side-calendar payloads into an existing dense scratch row."""
-        chunks = self._sparse_calendar.pop(slot, None)
-        if chunks:
-            for post_idx, values in chunks:
-                if values.numel() > 0:
-                    scratch.index_add_(0, post_idx, values)
+        """Add due scheduled payloads to the packed-history receive payload."""
+        if not self._pending_calendar_size:
+            return
+        self._pending_calendar, _ = pending_calendar_pop(
+            self._pending_calendar, slot, width=self._syn_numel, _scratch=scratch
+        )
+        self._pending_calendar_size = int(self._pending_calendar.size.item())
 
     def _ensure_source_history_conn_source_pos(self):
         """Ensure connection→unique-source positions exist for float source history."""
@@ -4987,14 +4999,14 @@ class NetCon(Referency):
     @torch.no_grad()
     def advance_non_diff_sparse_calendar(self):
         """
-        Advance one inference step using sparse calendar buckets.
+        Advance one inference step using the shared pure pending calendar.
 
         This path preserves the existing ``syn.net_receive(payload, self)``
         contract by reducing due sparse deliveries into a reusable dense scratch
         row before delivery.  Unlike :meth:`advance_non_diff`, it does not keep
         a dense ``[max_delay_steps, syn_numel]`` pending-delivery ring.  Pending
-        future deliveries are stored only as nonzero ``(post_idx, value)``
-        chunks in ``self._sparse_calendar``.
+        future deliveries use compact tensor entries containing their physical
+        ring slot, target index, and enqueue-time weighted value.
         """
         cur_idx = self.current_time_step
         cur_slot = int(cur_idx.item())
@@ -5072,8 +5084,7 @@ class NetCon(Referency):
 
         # 2) Optional explicit scheduled per-connection events are handled by a
         # sparse side calendar so they do not force a dense delay buffer.
-        if self._sparse_calendar:
-            self._add_sparse_calendar_to_dense(int(cur_idx.item()), scratch)
+        self._add_sparse_calendar_to_dense(cur_idx, scratch)
         if self.events.numel() > 0:
             self.events.zero_()
         self.syn.net_receive(scratch.view(*self.syn.shape_f), self)

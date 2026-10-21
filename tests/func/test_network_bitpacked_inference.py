@@ -346,18 +346,20 @@ def test_compiled_packed_inference_restarts_and_continues_nonempty_carry(
     assert runner.execution_report().strategy == "compiled_scan"
 
 
-def test_packed_eval_network_rejects_gradient_runner_and_netcon_side_traffic():
+def test_packed_eval_network_rejects_gradient_runner_and_accepts_netcon_side_traffic():
     network = _stimulus()
     with pytest.raises(dn.func.FunctionalizationError, match="training mode"):
         dn.compile(network, dt=DT, steps=2, inference=False, backend="eager")
     connection = next(iter(network.synapses.values()))
     connection.schedule(con_indices=[0], times_ms=[DT], weight=0.7)
-    with pytest.raises(dn.func.FunctionalizationError, match="schedule|scheduled"):
-        dn.func.make_functional_network(network)
+    functional, _ = dn.func.make_functional_network(network)
+    assert all(
+        plan.runtime == "bitpacked_history" for plan in functional.synapses.values()
+    )
     other = _stimulus()
     connection = next(iter(other.synapses.values()))
     connection._sparse_calendar[0] = [
         (connection.post_idx[:1], connection.weight.w[:1])
     ]
-    with pytest.raises(dn.func.FunctionalizationError, match="calendar"):
-        dn.func.make_functional_network(other)
+    _, tensors = dn.func.make_functional_network(other)
+    assert next(iter(tensors.state["synapses"].values()))["pending_size"].item() == 1

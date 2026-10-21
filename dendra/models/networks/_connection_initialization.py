@@ -68,6 +68,16 @@ def event_runtime_reset(state, *, clear_deliveries=True, step=None, _inplace=Fal
             "spike_history_packed",
             "source_gate_history",
             "bitpack_source_has_spiked",
+            "pending_slots",
+            "pending_indices",
+            "pending_values",
+            "pending_size",
+            "pending_overflow",
+            "event_pending_slots",
+            "event_pending_indices",
+            "event_pending_values",
+            "event_pending_size",
+            "event_pending_overflow",
         ):
             if name in state:
                 result[name] = _zero(state[name], inplace=_inplace)

@@ -180,12 +180,13 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-Functional schedules currently use fixed tensor topology and dense projections.
+Functional schedules use fixed tensor topology. Event projections support dense
+queues, packed scheduled traffic, and sparse-calendar inference; see
+{doc}`A24_functional_pending_calendar` for compact calendar capacity and overflow.
 Differentiable delays are described in
 {doc}`A17_functional_delay_interpolation`. Heap calendars are described in
 {doc}`A16_functional_heap_schedules`.
-Dynamic insertion inside transformed loops and transport backends other than
-dense functional projections are currently unsupported. Canonical single-device
+Dynamic insertion inside transformed loops is currently unsupported. Canonical single-device
 Network lowering is described in {doc}`A19_functional_network_lowering`, and
 snapshot-based `dn.compile(Network)` execution in
 {doc}`A21_functional_network_compile`.

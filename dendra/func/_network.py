@@ -251,14 +251,42 @@ class FunctionalNetwork:
     only; align native parameters/schedules separately before continuation.
     Topology, source bindings, mode, timestep, and native phase ordering are
     frozen. Canonical single-device Networks use dense, source-history training,
-    or intrinsic packed-history inference event runtimes and integer continuous
-    delays supported by the component plans. ``dn.compile`` uses this plan for
-    snapshot or fresh Network initialization; the lower-level methods support
+    packed-history, or sparse-calendar inference event runtimes and integer
+    continuous delays supported by the component plans. ``dn.compile`` uses this
+    plan for snapshot or fresh Network initialization; the lower-level methods support
     explicit preparation and functional transforms.
+
+    ``pending_capacity`` bounds each sparse pending calendar independently of
+    delay depth. Supply one positive integer or a connection-name mapping.
+    Active-calendar defaults cover at least 16 entries, twice the edge count,
+    and the imported pending count. Intrinsic-only packed plans with no pending
+    traffic omit unused calendar storage. Host execution checks overflow before
+    returning a result.
     """
 
-    def __init__(self, network):
+    def __init__(self, network, *, pending_capacity=None):
         _eligible(network)
+        if isinstance(pending_capacity, Mapping):
+            capacities = dict(pending_capacity)
+            unknown = capacities.keys() - network.synapses.keys()
+            if unknown:
+                raise ValueError(
+                    f"pending_capacity names unknown event connections: {sorted(unknown, key=str)!r}"
+                )
+        else:
+            capacities = {name: pending_capacity for name in network.synapses}
+        selected_capacities = (
+            capacities.values()
+            if isinstance(pending_capacity, Mapping)
+            else (pending_capacity,)
+        )
+        for capacity in selected_capacities:
+            if capacity is not None and (
+                isinstance(capacity, bool)
+                or not isinstance(capacity, int)
+                or capacity < 1
+            ):
+                raise ValueError("pending_capacity must contain positive integers")
         self._source = network
         self.dt, self.training = float(network.dt), bool(network.training)
         self.device = next(iter(network.populations.values())).device()
@@ -278,7 +306,7 @@ class FunctionalNetwork:
             self.populations[name] = plan
             initialization[name] = packet.initialization
         self.synapses = {
-            name: FunctionalNetCon(connection)
+            name: FunctionalNetCon(connection, pending_capacity=capacities.get(name))
             for name, connection in self._schedule.synapses
         }
         self.continuous_synapses = {
@@ -527,6 +555,7 @@ class FunctionalNetwork:
 
     def _validate_state(self, state):
         _validate_tree(state, self._state_schema, "state")
+        self.check_overflow(state)
 
     def _extract(self, network):
         snapshots = AliasSnapshots()
@@ -1078,7 +1107,7 @@ class FunctionalNetwork:
         self._validate_state(state)
         values = self._validate_prepared(prepared, parameters)
         with nullcontext() if self.training else torch.no_grad():
-            return self._step_values(
+            result = self._step_values(
                 parameters,
                 values,
                 state,
@@ -1087,6 +1116,8 @@ class FunctionalNetwork:
                 extra=extra,
                 intra=intra,
             )
+        self.check_overflow(result[0])
+        return result
 
     def prepare_and_step(
         self,
@@ -1106,7 +1137,7 @@ class FunctionalNetwork:
         self._validate_state(state)
         with nullcontext() if self.training else torch.no_grad():
             values = self._prepare_values(parameters, constants)
-            return self._step_values(
+            result = self._step_values(
                 parameters,
                 values,
                 state,
@@ -1115,6 +1146,21 @@ class FunctionalNetwork:
                 extra=extra,
                 intra=intra,
             )
+        self.check_overflow(result[0])
+        return result
+
+    def check_overflow(self, state):
+        """Reject incomplete pending calendars at an untransformed host boundary.
+
+        Compiled and transformed pure calls propagate sticky Tensor flags.
+        Validate their returned carry here before consuming or committing it.
+        Host rollout and compiled runners perform this check automatically.
+        """
+        for name, plan in self.synapses.items():
+            try:
+                plan.check_overflow(state["synapses"][name])
+            except RuntimeError as error:
+                raise RuntimeError(f"Event connection {name!r}: {error}") from error
 
     def commit_state_(self, network, state):
         """Stage and atomically publish complete runtime carry to a compatible graph."""
@@ -1123,6 +1169,7 @@ class FunctionalNetwork:
         self._validate_source()
         self._validate_compatible(network)
         self._validate_state(state)
+        self.check_overflow(state)
         clock = state["clock"]
         if (
             not bool(torch.isfinite(clock["origin"]))
@@ -1163,6 +1210,8 @@ class FunctionalNetwork:
         staged._buffers["_duration_remainder"] = clock["duration_remainder"].clone()
         checkpoint = staged.state_dict_for_checkpoint()
         network.restore_dict_from_checkpoint(checkpoint)
+        for name, plan in self.synapses.items():
+            plan._commit_pending_(network.synapses[name], state["synapses"][name])
         # SCNV's native checkpoint omits its exposed voltage. The Population
         # adapter has already staged/validated that separate functional carry.
         for name in self.populations:
@@ -1173,9 +1222,18 @@ class FunctionalNetwork:
         return network
 
 
-def make_functional_network(network):
-    """Lower an initialized standard Network and extract independent explicit tensors."""
-    plan = FunctionalNetwork(network)
+def make_functional_network(network, *, pending_capacity=None):
+    """Lower a Network with independent explicit tensors and bounded pending carry.
+
+    ``pending_capacity`` is a positive entry count per calendar, or a mapping
+    from event-connection names to counts. Omitted capacities use at least
+    twice the connection count and accommodate existing checkpoint traffic;
+    intrinsic-only packed connections with no pending traffic need no calendar
+    allocation.
+    Overflow raises at host execution boundaries; retry from the input state
+    with a larger-capacity plan.
+    """
+    plan = FunctionalNetwork(network, pending_capacity=pending_capacity)
     return plan, plan.extract()
 
 

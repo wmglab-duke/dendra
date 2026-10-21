@@ -77,6 +77,12 @@ class CompiledNetworkRunner:
     rollout/checkpoint spans; its graph is never cached. Inference while loops
     and constructor-bound ``extra`` are currently unsupported; explicit ``ve``
     tapes remain available.
+
+    ``pending_capacity`` sets the entry count for packed scheduled traffic and
+    sparse inference calendars. It accepts one positive integer or a mapping
+    keyed by event-connection name. A full calendar raises without changing
+    the input state, restart snapshot, native model, or execution report. Compile
+    with a larger capacity and retry from a valid checkpoint.
     """
 
     def __init__(
@@ -92,6 +98,7 @@ class CompiledNetworkRunner:
         initialization="snapshot",
         checkpoint_every=None,
         trainable=(),
+        pending_capacity=None,
         backend="inductor",
         options=None,
         **compile_options,
@@ -125,7 +132,9 @@ class CompiledNetworkRunner:
         configured = _configured_callbacks(callbacks)
         dt_value = _validate_time_scalar(dt, name="dt", positive=True)
         with torch.inference_mode(False), torch.no_grad():
-            self._functional, tensors = make_functional_network(network)
+            self._functional, tensors = make_functional_network(
+                network, pending_capacity=pending_capacity
+            )
             if dt_value != self._functional.dt:
                 raise ValueError(
                     "dt must match the initialized Network timestep; initialize and compile again to change it"

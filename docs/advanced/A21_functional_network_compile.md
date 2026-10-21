@@ -57,10 +57,11 @@ restart packet, whose Tensor leaves can be edited deliberately.
 With snapshot initialization, initial state is not recomputed after a parameter
 update and gradients do not include initialization. Select fresh initialization
 to include that computation. Inference while loops are currently unsupported.
-Use a canonical single-device Network
-with supported dense event queues, source-history training, or intrinsic
-packed-history inference, as described in {doc}`A19_functional_network_lowering`,
-{doc}`A22_functional_source_history`, and {doc}`A23_functional_bitpacked_inference`.
+Use a canonical single-device Network with supported dense event queues,
+source-history training, packed-history or sparse-calendar inference, as
+described in {doc}`A19_functional_network_lowering`,
+{doc}`A22_functional_source_history`, {doc}`A23_functional_bitpacked_inference`,
+and {doc}`A24_functional_pending_calendar`.
 
 `backend="aot_eager"` makes this example portable on CPU. The compiler default
 is Inductor. For CPU inference with Inductor, Dendra requests a C++ wrapper

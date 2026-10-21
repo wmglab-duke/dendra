@@ -240,6 +240,7 @@ For `dn.compile(Network)` convenience execution with snapshot or fresh
 initialization, continue with {doc}`A21_functional_network_compile`.
 Source-history training and its delivery-time parameter semantics are described
 in {doc}`A22_functional_source_history`. Intrinsic packed-history inference is
-described in {doc}`A23_functional_bitpacked_inference`. Heterogeneous-device
-functional execution, sparse-calendar inference, packed NetCon scheduled side
-traffic, and continuous delay interpolation are currently unsupported.
+described in {doc}`A23_functional_bitpacked_inference`. Sparse-calendar inference
+and packed NetCon scheduled traffic use {doc}`A24_functional_pending_calendar`.
+Heterogeneous-device functional execution and continuous delay interpolation are
+currently unsupported.

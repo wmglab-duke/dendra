@@ -103,12 +103,9 @@ def _native_source(native, values, mode, diff_spiking):
 
 
 def _flat_checkpoint(native):
-    checkpoint = native.state_dict_for_checkpoint()
-    backend = checkpoint.pop("backend_state")
-    checkpoint.update(
-        {name: value for name, value in backend.items() if torch.is_tensor(value)}
-    )
-    return checkpoint
+    # Compact functional carry includes fixed-capacity pending tables in
+    # addition to the Tensor fields in native legacy checkpoints.
+    return dn.func.make_functional_netcon(native)[1].state
 
 
 def _tape(shape, mode):

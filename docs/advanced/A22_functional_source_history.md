@@ -156,8 +156,8 @@ Source-history training with nonempty legacy side calendars is currently
 unsupported by functional lowering. Scheduled configurations use the native
 dense fallback. Intrinsic packed-history inference is described in
 {doc}`A23_functional_bitpacked_inference`; its hard source semantics differ from
-surrogate training history. Functional sparse-calendar inference is currently
-unsupported.
+surrogate training history. Functional sparse-calendar inference and packed
+per-NetCon schedules are described in {doc}`A24_functional_pending_calendar`.
 
 The complete CPU example executes both floating and packed training modes:
 

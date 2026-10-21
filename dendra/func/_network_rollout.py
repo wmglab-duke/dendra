@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import weakref
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import NamedTuple
 
 import torch
@@ -275,6 +275,7 @@ def rollout(
             callbacks,
             callback_state,
         )
+    functional.check_overflow(state)
     if callbacks is not None and callbacks._has_emissions(emitted):
         parts.append(emitted)
     return state, _attach_callback_results(auxiliary, callbacks, callback_state, parts)
@@ -435,6 +436,7 @@ class CompiledNetworkChunk:
                 callbacks,
                 callback_state,
             )
+            self._functional.check_overflow(result[0])
             strategy = (
                 "eager_transform_fallback"
                 if transform
@@ -467,6 +469,7 @@ class CompiledNetworkChunk:
         }
         carries = {} if callback_state is None else callback_state.carries
         loop, carries, emitted = kernel(parameters, prepared, loop, carries, tape)
+        self._functional.check_overflow(loop["network"])
         if callbacks is not None:
             emitted = {plan.name: emitted.get(plan.name) for plan in callbacks._plans}
             callback_state = callbacks._wrap_compiled_update(
@@ -519,6 +522,17 @@ class CompiledNetworkChunk:
         except BaseException:
             self._report_state.report = previous
             raise
+
+
+@contextmanager
+def _restore_report_on_error(chunk):
+    previous = None if chunk is None else chunk.execution_report()
+    try:
+        yield
+    except BaseException:
+        if chunk is not None:
+            chunk._report_state.report = previous
+        raise
 
 
 def run(
@@ -608,12 +622,16 @@ def run(
                 state_in, auxiliary_in, callback_in, emitted = kernel._values(
                     parameters_in, values, state_in, selected, callbacks, callback_in
                 )
+            functional.check_overflow(state_in)
             if callbacks is not None and callbacks._has_emissions(emitted):
                 emitted_parts.append(emitted)
         emitted = None if callbacks is None else callbacks._concatenate(emitted_parts)
         return state_in, auxiliary_in, callback_in, emitted
 
-    with nullcontext() if functional.training else torch.no_grad():
+    with (
+        _restore_report_on_error(compiled_chunk),
+        nullcontext() if functional.training else torch.no_grad(),
+    ):
         for start, stop in _execution_spans(steps, horizon):
             selected = _slice(tape, start, stop)
             if functional.netstim is not None and selected.get("netstim") is None:
@@ -649,7 +667,9 @@ def run(
                 )
             if callbacks is not None and callbacks._has_emissions(emitted):
                 parts.append(emitted)
-    return state, _attach_callback_results(auxiliary, callbacks, callback_state, parts)
+        return state, _attach_callback_results(
+            auxiliary, callbacks, callback_state, parts
+        )
 
 
 __all__ = ["NetworkRolloutInput", "CompiledNetworkChunk"]

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping
-from numbers import Real
+from numbers import Integral, Real
 from typing import NamedTuple
 
 import torch
@@ -18,6 +18,13 @@ from dendra.models.networks._event_delivery import (
     dense_fixed_delay_transition,
     dense_interpolated_delay_transition,
     gather_source_gates,
+)
+from dendra.models.networks._pending_calendar import (
+    CalendarState,
+    pending_calendar_append,
+    pending_calendar_from_legacy,
+    pending_calendar_pop,
+    pending_calendar_to_legacy,
 )
 from dendra.models.networks._source_history import (
     source_history_gates,
@@ -58,6 +65,17 @@ _BITPACKED_HISTORY_METHODS = {
         "_bitpack_schedule_due_scheduled_events",
     )
 }
+_PENDING_CALENDAR_METHODS = {
+    name: getattr(NetCon, name)
+    for name in (
+        "_append_pending_calendar",
+        "_append_sparse_payloads",
+        "_append_sparse_events",
+        "_pop_sparse_calendar_to_dense",
+        "_pop_sparse_events",
+        "_add_sparse_calendar_to_dense",
+    )
+}
 _HISTORY_METADATA = (
     "bitpack_source_pre_idx",
     "bitpack_source_word_idx",
@@ -67,6 +85,20 @@ _HISTORY_METADATA = (
     "bitpack_source_threshold",
     "source_history_conn_source_pos",
 )
+_HISTORY_RUNTIMES = {"source_history", "bitpacked_history"}
+_CALENDAR_RUNTIMES = {"sparse_calendar", "bitpacked_history"}
+_CALENDAR_FIELDS = CalendarState._fields
+
+
+def _calendar_state(state, prefix):
+    return CalendarState(*(state[f"{prefix}{name}"] for name in _CALENDAR_FIELDS))
+
+
+def _put_calendar(state, prefix, calendar):
+    state.update(
+        (f"{prefix}{name}", value)
+        for name, value in zip(_CALENDAR_FIELDS, calendar, strict=True)
+    )
 
 
 class NetConTensors(NamedTuple):
@@ -166,25 +198,26 @@ def _eligible(netcon):
     if netcon._mode_requires_initialize:
         raise FunctionalizationError("NetCon mode changed; initialize it again.")
     runtime = netcon._checkpoint_runtime_kind()
-    if runtime not in {"dense", "source_history", "bitpacked_history"}:
+    if runtime not in {
+        "dense",
+        "source_history",
+        "bitpacked_history",
+        "sparse_calendar",
+    }:
         raise FunctionalizationError(
             "Functional NetCon currently requires dense queues, source-history "
-            "training, or bitpacked-history inference."
+            "training, bitpacked-history inference, or sparse-calendar inference."
         )
     if runtime == "source_history":
         if not netcon.training or netcon._has_scheduled_events():
             raise FunctionalizationError(
                 "Functional source history requires intrinsic training traffic."
             )
-    if runtime == "bitpacked_history" and (
-        netcon.training or netcon._has_scheduled_events()
-    ):
+    if runtime in _CALENDAR_RUNTIMES and netcon.training:
         raise FunctionalizationError(
-            "Functional bitpacked inference requires intrinsic source traffic; "
-            "NetCon schedules are currently unsupported. NetStim source schedules "
-            "remain supported."
+            "Functional compact pending calendars require inference mode."
         )
-    if runtime != "dense":
+    if runtime in _HISTORY_RUNTIMES:
         methods = (
             _SOURCE_HISTORY_METHODS
             if runtime == "source_history"
@@ -194,6 +227,12 @@ def _eligible(netcon):
             if name in netcon.__dict__ or getattr(owner_type, name) is not expected:
                 raise FunctionalizationError(
                     f"Functional compact history requires its canonical {name} adapter."
+                )
+    if runtime in _CALENDAR_RUNTIMES:
+        for name, expected in _PENDING_CALENDAR_METHODS.items():
+            if name in netcon.__dict__ or getattr(owner_type, name) is not expected:
+                raise FunctionalizationError(
+                    f"Functional pending calendar requires its canonical {name} adapter."
                 )
     if netcon.training:
         if netcon.train_flags is None:
@@ -226,12 +265,18 @@ def _eligible(netcon):
     allowed = (
         (NetCon.advance_diff_source_history,)
         if runtime == "source_history"
-        else (NetCon.advance_non_diff_bitpacked_history,)
-        if runtime == "bitpacked_history"
         else (
-            NetCon.advance_non_diff_dense_uniform,
-            NetCon.advance_non_diff_dense_mixed,
-            NetCon.advance_diff,
+            (NetCon.advance_non_diff_bitpacked_history,)
+            if runtime == "bitpacked_history"
+            else (
+                (NetCon.advance_non_diff_sparse_calendar,)
+                if runtime == "sparse_calendar"
+                else (
+                    NetCon.advance_non_diff_dense_uniform,
+                    NetCon.advance_non_diff_dense_mixed,
+                    NetCon.advance_diff,
+                )
+            )
         )
     )
     if (
@@ -281,19 +326,24 @@ class FunctionalNetCon:
     bits. These plans require current weights/delays in :meth:`read_due`, and
     :meth:`advance` records only source activity. Parameter edits between calls
     therefore affect historical events at delivery, matching native source
-    history. Dense plans retain weighted payloads from enqueue time instead.
+    history. Dense and sparse-calendar plans retain weighted payloads from
+    enqueue time instead.
     Functional source-history carry exposes history/latch tensors directly;
     extraction and commit translate the native checkpoint's ``backend_state``.
-    Scheduled traffic follows native policy and uses the dense fallback.
+    Source-history training with scheduled traffic follows native policy and
+    uses the dense fallback.
 
     Bitpacked-history inference uses hard source events, fixed initialized delay
     offsets, and the same packed history kernels. Supply current weights to
     :meth:`read_due`; its returned carry publishes the native delivery scratch
     row. NetStim's own schedules are source activity. Per-connection NetCon
-    schedules and nonempty legacy side calendars are currently unsupported for
-    functional bitpacked inference. This runtime does not convert to dense
-    delivery queues. Lower-level explicit weights retain their gradient flags;
-    inference runner execution suppresses simulation gradients.
+    schedules use a shared pending calendar with enqueue-time weights and fixed
+    delay offsets. Sparse-calendar inference uses that calendar for intrinsic
+    and scheduled traffic, with independent tracked event counts. These
+    runtimes retain compact delivery storage. Lower-level explicit weights
+    retain their gradient flags; inference runner execution suppresses simulation
+    gradients. Pending capacity is fixed at lowering; :meth:`check_overflow`
+    validates the explicit status before using a lower-level result.
 
     Routing, fixed quantized delays, timestep, and tensor schemas are copied at
     lowering. Reinitialization, calling ``set_diff_config``, mode changes, or
@@ -306,7 +356,7 @@ class FunctionalNetCon:
     additional ``vmap`` axes stay implicit.
     """
 
-    def __init__(self, netcon):
+    def __init__(self, netcon, *, pending_capacity=None):
         _eligible(netcon)
         source = _source_tensor(netcon)
         self._source = netcon
@@ -353,10 +403,40 @@ class FunctionalNetCon:
         self._schedule = _TensorSchedulePlan(
             netcon, index_name="sched_con_idx", device=self.device, dtype=self.dtype
         )
-        self._history_mode = netcon._bitpack_mode if self._runtime != "dense" else None
+        if pending_capacity is not None and (
+            isinstance(pending_capacity, bool)
+            or not isinstance(pending_capacity, Integral)
+            or pending_capacity < 1
+        ):
+            raise ValueError("pending_capacity must be a positive integer")
+        if self._runtime in _CALENDAR_RUNTIMES:
+            backend = netcon.state_dict_for_checkpoint()["backend_state"]
+            existing = max(
+                sum(
+                    values.numel()
+                    for chunks in backend.get(name, {}).values()
+                    for _, values in chunks
+                )
+                for name in ("sparse_calendar", "sparse_event_calendar")
+            )
+            intrinsic_only = (
+                self._runtime == "bitpacked_history"
+                and not self._schedule.events
+                and existing == 0
+            )
+            self._pending_capacity = (
+                (0 if intrinsic_only else max(existing, 2 * self._connections, 16))
+                if pending_capacity is None
+                else int(pending_capacity)
+            )
+        else:
+            self._pending_capacity = None
+        self._history_mode = (
+            netcon._bitpack_mode if self._runtime in _HISTORY_RUNTIMES else None
+        )
         self._history_metadata = (
             {name: _snapshot(getattr(netcon, name)) for name in _HISTORY_METADATA}
-            if self._runtime != "dense"
+            if self._runtime in _HISTORY_RUNTIMES
             else {}
         )
         self._history_name = (
@@ -371,8 +451,61 @@ class FunctionalNetCon:
 
     @property
     def runtime(self):
-        """Frozen runtime: ``dense``, ``source_history``, or ``bitpacked_history``."""
+        """Frozen native transport runtime."""
         return self._runtime
+
+    @property
+    def pending_capacity(self):
+        """Maximum entries per pending calendar, or ``None`` for other runtimes.
+
+        Intrinsic-only packed plans with no imported pending traffic use zero
+        entries by default and skip calendar transport. Other defaults use the
+        largest of existing checkpoint traffic, twice the connection count, and
+        sixteen entries. An explicit positive ``pending_capacity`` overrides
+        either default. Increase it when lowering if traffic can accumulate.
+        """
+        return self._pending_capacity
+
+    def check_overflow(self, state):
+        """Raise on pending overflow; transformed calls retain explicit status.
+
+        Pure transitions expose sticky ``pending_overflow`` and, for tracked
+        sparse projections, ``event_pending_overflow`` tensors. An overflow
+        invalidates that invocation. Restart from an earlier checkpoint with
+        a larger ``pending_capacity`` rather than continuing its returned carry.
+        Host checks accept stacked or ``vmap`` outputs with leading batch axes
+        and reject overflow in any lane, including nested batches.
+        """
+        if (
+            torch.compiler.is_compiling()
+            or torch._C._are_functorch_transforms_active()
+            or torch.autograd.forward_ad._current_level >= 0
+        ):
+            return
+        if not isinstance(state, Mapping):
+            raise ValueError("NetCon overflow status requires a state mapping")
+        flags = []
+        for name in ("pending_overflow", "event_pending_overflow"):
+            if name not in self._state_schema:
+                continue
+            shape, dtype, device = self._state_schema[name]
+            value = state.get(name)
+            if (
+                not torch.is_tensor(value)
+                or value.ndim < len(shape)
+                or tuple(value.shape[-len(shape) :]) != shape
+                or value.dtype != dtype
+                or value.device != device
+            ):
+                raise ValueError(
+                    f"state.{name} must match {device}/{dtype} and end in {shape}"
+                )
+            flags.append(value)
+        if any(bool(value.any()) for value in flags):
+            raise RuntimeError(
+                "NetCon pending calendar overflowed; increase pending_capacity "
+                "when lowering and restart from the previous checkpoint."
+            )
 
     def _checkpoint_values(self, netcon):
         """Normalize native compact checkpoints to a Tensor-only carry packet."""
@@ -384,7 +517,9 @@ class FunctionalNetCon:
             raise FunctionalizationError(
                 "NetCon checkpoint runtime does not match this plan"
             )
-        if backend.get("sparse_calendar") or backend.get("sparse_event_calendar"):
+        if self._runtime == "source_history" and (
+            backend.get("sparse_calendar") or backend.get("sparse_event_calendar")
+        ):
             raise FunctionalizationError(
                 "Functional compact history cannot lower nonempty side calendars"
             )
@@ -407,11 +542,65 @@ class FunctionalNetCon:
                 checkpoint[name] = backend[name]
         # Native checkpoints omit empty fields. Keep active zero-source history
         # and latches explicit so transformed kernels retain a stable schema.
-        checkpoint.setdefault(self._history_name, getattr(netcon, self._history_name))
+        if self._runtime in _HISTORY_RUNTIMES:
+            checkpoint.setdefault(
+                self._history_name, getattr(netcon, self._history_name)
+            )
         if self._history_mode == "threshold":
             checkpoint.setdefault(
                 "bitpack_source_has_spiked", netcon.bitpack_source_has_spiked
             )
+        if self._runtime in _CALENDAR_RUNTIMES:
+
+            def pending_values(mapping, legacy, dtype):
+                # Legacy buckets retain within-slot order, but grouping them
+                # would change the cross-slot ordering of a live flat table.
+                if hasattr(mapping, "tensor_state"):
+                    pending = mapping.tensor_state
+                    size = int(pending.size.item())
+                    if size > self._pending_capacity:
+                        raise ValueError(
+                            "pending_capacity is too small for the existing checkpoint"
+                        )
+                    return CalendarState(
+                        *(
+                            torch.cat(
+                                (
+                                    value[:size],
+                                    value.new_zeros(self._pending_capacity - size),
+                                )
+                            )
+                            for value in pending[:3]
+                        ),
+                        pending.size,
+                        pending.overflow,
+                    )
+                return pending_calendar_from_legacy(
+                    legacy,
+                    capacity=self._pending_capacity,
+                    device=self.device,
+                    dtype=dtype,
+                )
+
+            _put_calendar(
+                checkpoint,
+                "pending_",
+                pending_values(
+                    netcon._sparse_calendar,
+                    backend.get("sparse_calendar", {}),
+                    self.dtype,
+                ),
+            )
+            if self._runtime == "sparse_calendar" and self._track_events:
+                _put_calendar(
+                    checkpoint,
+                    "event_pending_",
+                    pending_values(
+                        netcon._sparse_event_calendar,
+                        backend.get("sparse_event_calendar", {}),
+                        torch.int32,
+                    ),
+                )
         return checkpoint
 
     def _validate_source(self):
@@ -438,7 +627,7 @@ class FunctionalNetCon:
             or getattr(source.advance, "__func__", None) is not self._advance
             or source._sched_pre
             or (
-                self._runtime != "dense"
+                self._runtime in _HISTORY_RUNTIMES
                 and (
                     source._bitpack_mode != self._history_mode
                     or not source._bitpack_can_use
@@ -448,7 +637,7 @@ class FunctionalNetCon:
             raise FunctionalizationError(
                 "The source NetCon configuration changed; initialize and lower it again."
             )
-        if self._runtime != "dense":
+        if self._runtime in _HISTORY_RUNTIMES:
             methods = (
                 _SOURCE_HISTORY_METHODS
                 if self._runtime == "source_history"
@@ -461,6 +650,15 @@ class FunctionalNetCon:
                 ):
                     raise FunctionalizationError(
                         f"Compact-history {name} changed; lower again."
+                    )
+        if self._runtime in _CALENDAR_RUNTIMES:
+            for name, expected in _PENDING_CALENDAR_METHODS.items():
+                if (
+                    name in source.__dict__
+                    or getattr(type(source), name) is not expected
+                ):
+                    raise FunctionalizationError(
+                        f"Pending-calendar {name} changed; lower again."
                     )
 
     @staticmethod
@@ -485,6 +683,24 @@ class FunctionalNetCon:
                 device=device,
                 label=f"state.{name}",
             )
+
+    def _validate_pending(self, state):
+        """Validate variable live-prefix metadata before any native mutation."""
+        for prefix, width in (
+            ("pending_", self._width),
+            ("event_pending_", self._connections),
+        ):
+            if f"{prefix}size" not in state:
+                continue
+            calendar = _calendar_state(state, prefix)
+            size = int(calendar.size.item())
+            if not 0 <= size <= self._pending_capacity:
+                raise ValueError("Pending calendar size is outside its capacity")
+            slots, indices = calendar.slots[:size], calendar.indices[:size]
+            if bool(((slots < 0) | (slots >= self._depth)).any()):
+                raise ValueError("Pending calendar slot is outside its delay ring")
+            if bool(((indices < 0) | (indices >= width)).any()):
+                raise ValueError("Pending calendar index is outside its topology")
 
     def _validate_compatible(self, netcon):
         _eligible(netcon)
@@ -523,7 +739,7 @@ class FunctionalNetCon:
             raise FunctionalizationError(
                 "NetCon topology or detector does not match this frozen plan."
             )
-        if self._runtime != "dense" and (
+        if self._runtime in _HISTORY_RUNTIMES and (
             netcon._bitpack_mode != self._history_mode
             or any(
                 not torch.equal(getattr(netcon, name), value)
@@ -577,9 +793,11 @@ class FunctionalNetCon:
                 for name, value in self._checkpoint_values(netcon).items()
             },
             self._schedule.extract(netcon),
-            _snapshot(_effective_tensor(netcon.delay_ms, "delay"), parameter=True)
-            if self._diff_delays
-            else None,
+            (
+                _snapshot(_effective_tensor(netcon.delay_ms, "delay"), parameter=True)
+                if self._diff_delays
+                else None
+            ),
         )
 
     def initial_state(self, state, *, t):
@@ -633,7 +851,7 @@ class FunctionalNetCon:
         """
         self._validate_source()
         self._validate_state(state)
-        if self._runtime != "dense":
+        if self._runtime in _HISTORY_RUNTIMES:
             self._validate_projection_parameters(weights, delays)
             metadata = self._history_metadata
             payload = source_history_project(
@@ -643,15 +861,17 @@ class FunctionalNetCon:
                 post_idx=self._post_idx,
                 depth=self._depth,
                 width=self._width,
-                source_pos=metadata["source_history_conn_source_pos"]
-                if self._diff_spiking
-                else None,
-                word_idx=None
-                if self._diff_spiking
-                else metadata["bitpack_conn_word_idx"],
-                bit_mask=None
-                if self._diff_spiking
-                else metadata["bitpack_conn_bit_mask"],
+                source_pos=(
+                    metadata["source_history_conn_source_pos"]
+                    if self._diff_spiking
+                    else None
+                ),
+                word_idx=(
+                    None if self._diff_spiking else metadata["bitpack_conn_word_idx"]
+                ),
+                bit_mask=(
+                    None if self._diff_spiking else metadata["bitpack_conn_bit_mask"]
+                ),
                 delay_steps=None if self._diff_delays else self._delay_steps,
                 delays=delays,
                 dt=self._dt,
@@ -660,9 +880,35 @@ class FunctionalNetCon:
             )
             result = dict(state)
             if self._runtime == "bitpacked_history":
+                if self._pending_capacity:
+                    calendar, payload = pending_calendar_pop(
+                        _calendar_state(state, "pending_"),
+                        state["current_time_step"],
+                        width=self._width,
+                        base=payload,
+                    )
+                    _put_calendar(result, "pending_", calendar)
                 result["delivery_buffer"] = payload.reshape(1, self._width)
                 if "events" in result:
                     result["events"] = torch.zeros_like(state["events"])
+            return result, payload.reshape(self.shape)
+        if self._runtime == "sparse_calendar":
+            result = dict(state)
+            calendar, payload = pending_calendar_pop(
+                _calendar_state(state, "pending_"),
+                state["current_time_step"],
+                width=self._width,
+            )
+            _put_calendar(result, "pending_", calendar)
+            result["delivery_buffer"] = payload.reshape(1, self._width)
+            if self._track_events:
+                events, counts = pending_calendar_pop(
+                    _calendar_state(state, "event_pending_"),
+                    state["current_time_step"],
+                    width=self._connections,
+                )
+                _put_calendar(result, "event_pending_", events)
+                result["events"] = counts
             return result, payload.reshape(self.shape)
         due = dense_due(
             state["delivery_buffer"],
@@ -673,6 +919,79 @@ class FunctionalNetCon:
         if self._track_events:
             result["events"] = due.event_counts
         return result, due.payload.reshape(self.shape)
+
+    def _scheduled_gates(self, state, schedule):
+        if not self._schedule.events:
+            return None, None
+        times, amplitudes = resolve_schedule_values(
+            schedule.times,
+            schedule.amplitudes,
+            self._schedule.time_idx,
+            self._schedule.amplitude_idx,
+            time_source=schedule.time_source,
+            weight_source=schedule.amplitude_source,
+            time_dtype=self.dtype,
+        )
+        return netcon_tensor_schedule(
+            self._schedule.indices,
+            times,
+            amplitudes,
+            state["global_step"],
+            self._dt,
+            connections=self._connections,
+            differentiable_times=self._diff_scheduled_times,
+            width=self._sched_width,
+        )
+
+    def _enqueue_pending(self, state, weights, gates, *, counts=None):
+        """Freeze enqueue-time payloads and atomically append both channels."""
+        result = dict(state)
+        future_slots = (state["current_time_step"] + self._delay_steps).remainder(
+            self._depth
+        )
+        # Native append visits physical slots in sorted order and preserves
+        # connection order within each slot. Retain that checkpoint ordering.
+        order = torch.argsort(future_slots, stable=True)
+        active_gates = gates != 0
+        values = torch.where(active_gates, weights, 0) * torch.where(
+            active_gates, gates, 0
+        )
+        previous = _calendar_state(state, "pending_")
+        pending = pending_calendar_append(
+            previous,
+            future_slots[order],
+            self._post_idx[order],
+            values[order],
+            ((gates != 0) & (values != 0))[order],
+        )
+        overflow = pending.overflow
+        event_previous = event_pending = None
+        if counts is not None:
+            event_previous = _calendar_state(state, "event_pending_")
+            event_pending = pending_calendar_append(
+                event_previous,
+                future_slots[order],
+                order,
+                counts[order],
+                (counts != 0)[order],
+            )
+            overflow = overflow | event_pending.overflow
+
+        def publish(before, after):
+            return CalendarState(
+                *(
+                    torch.where(overflow, original, updated)
+                    for original, updated in zip(before[:-1], after[:-1], strict=True)
+                ),
+                overflow,
+            )
+
+        _put_calendar(result, "pending_", publish(previous, pending))
+        if event_pending is not None:
+            _put_calendar(
+                result, "event_pending_", publish(event_previous, event_pending)
+            )
+        return result
 
     def advance(self, weights, state, source_values, *, delays=None, schedule=None):
         """Observe the source, update transport history, and return next carry.
@@ -696,7 +1015,7 @@ class FunctionalNetCon:
             device=self.source_device,
             label="source_values",
         )
-        if self._runtime != "dense":
+        if self._runtime in _HISTORY_RUNTIMES:
             metadata = self._history_metadata
             latch = state.get("bitpack_source_has_spiked")
             if latch is None:
@@ -720,16 +1039,22 @@ class FunctionalNetCon:
             result[self._history_name] = source_history_record(
                 state[self._history_name],
                 state["current_time_step"],
-                gates.to(device=self.device)
-                if self._runtime == "bitpacked_history"
-                else gates.to(device=self.device, dtype=self.dtype),
-                source_word_idx=None
-                if self._diff_spiking
-                else metadata["bitpack_source_word_idx"],
-                source_bit_mask=None
-                if self._diff_spiking
-                else metadata["bitpack_source_bit_mask"],
+                (
+                    gates.to(device=self.device)
+                    if self._runtime == "bitpacked_history"
+                    else gates.to(device=self.device, dtype=self.dtype)
+                ),
+                source_word_idx=(
+                    None if self._diff_spiking else metadata["bitpack_source_word_idx"]
+                ),
+                source_bit_mask=(
+                    None if self._diff_spiking else metadata["bitpack_source_bit_mask"]
+                ),
             )
+            if self._runtime == "bitpacked_history":
+                scheduled_gates, _ = self._scheduled_gates(state, schedule)
+                if scheduled_gates is not None:
+                    result = self._enqueue_pending(result, weights, scheduled_gates)
             result["current_time_step"] = (state["current_time_step"] + 1).remainder(
                 self._depth
             )
@@ -750,27 +1075,8 @@ class FunctionalNetCon:
                 nan_mask=self._nan_mask if self._apply_masking else None,
             )
         gates = gates.to(device=self.device, dtype=self.dtype)
-        scheduled_counts = None
-        if self._schedule.events:
-            times, amplitudes = resolve_schedule_values(
-                schedule.times,
-                schedule.amplitudes,
-                self._schedule.time_idx,
-                self._schedule.amplitude_idx,
-                time_source=schedule.time_source,
-                weight_source=schedule.amplitude_source,
-                time_dtype=self.dtype,
-            )
-            scheduled_gates, scheduled_counts = netcon_tensor_schedule(
-                self._schedule.indices,
-                times,
-                amplitudes,
-                state["global_step"],
-                self._dt,
-                connections=self._connections,
-                differentiable_times=self._diff_scheduled_times,
-                width=self._sched_width,
-            )
+        scheduled_gates, scheduled_counts = self._scheduled_gates(state, schedule)
+        if scheduled_gates is not None:
             combined = gates + scheduled_gates
         else:
             combined = gates
@@ -779,6 +1085,13 @@ class FunctionalNetCon:
             if self._track_events
             else None
         )
+        if self._runtime == "sparse_calendar":
+            result = self._enqueue_pending(result, weights, combined, counts=counts)
+            result["current_time_step"] = (state["current_time_step"] + 1).remainder(
+                self._depth
+            )
+            result["global_step"] = state["global_step"] + 1
+            return result
         if self._diff_delays:
             updated = dense_interpolated_delay_transition(
                 state["delivery_buffer"],
@@ -847,6 +1160,8 @@ class FunctionalNetCon:
             raise FunctionalizationError("Commit NetCon state outside torch.compile.")
         self._validate_compatible(netcon)
         self._validate_state(state)
+        self.check_overflow(state)
+        self._validate_pending(state)
         with torch.inference_mode(False):
             copied = {
                 name: value.clone(memory_format=torch.contiguous_format)
@@ -862,18 +1177,51 @@ class FunctionalNetCon:
                     )
                     if name in copied
                 }
+                calendars = {}
+                for prefix, name in (
+                    ("pending_", "sparse_calendar"),
+                    ("event_pending_", "sparse_event_calendar"),
+                ):
+                    calendars[name] = (
+                        pending_calendar_to_legacy(_calendar_state(copied, prefix))
+                        if f"{prefix}size" in copied
+                        else {}
+                    )
+                    for field in _CALENDAR_FIELDS:
+                        copied.pop(f"{prefix}{field}", None)
                 copied["backend_state"] = {
                     "kind": self._runtime,
-                    "sparse_calendar": {},
-                    "sparse_event_calendar": {},
+                    **calendars,
                     **history,
                 }
-            return netcon.restore_dict_from_checkpoint(copied)
+            netcon.restore_dict_from_checkpoint(copied)
+            return self._commit_pending_(netcon, state)
+
+    def _commit_pending_(self, netcon, state):
+        """Retain exact flat order after a validated legacy checkpoint restore."""
+        if self._runtime in _CALENDAR_RUNTIMES:
+            with torch.inference_mode(False):
+                for prefix, mapping in (
+                    ("pending_", netcon._sparse_calendar),
+                    ("event_pending_", netcon._sparse_event_calendar),
+                ):
+                    if f"{prefix}size" in state:
+                        mapping.replace_tensor_state(
+                            CalendarState(
+                                *(
+                                    value.clone()
+                                    for value in _calendar_state(state, prefix)
+                                )
+                            )
+                        )
+        return netcon
 
 
-def make_functional_netcon(netcon) -> tuple[FunctionalNetCon, NetConTensors]:
+def make_functional_netcon(
+    netcon, *, pending_capacity=None
+) -> tuple[FunctionalNetCon, NetConTensors]:
     """Lower an initialized NetCon with explicit numerical source values."""
-    projection = FunctionalNetCon(netcon)
+    projection = FunctionalNetCon(netcon, pending_capacity=pending_capacity)
     return projection, projection.extract()
 
 

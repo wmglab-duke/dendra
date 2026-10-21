@@ -189,8 +189,10 @@ The complete example executes here:
 
 Pure calendar evaluation supports `torch.compile` and `torch.func`, including
 mapped cursor state and empty mapped lanes. Sampling and cold extraction/commit
-stay outside transformed graphs. Dynamic event insertion and transport backends
-other than dense functional projections are currently unsupported. Canonical
+stay outside transformed graphs. Dynamic event insertion is currently
+unsupported. NetStim calendar events feed dense, packed-history, or
+sparse-calendar connections; compact pending transport is described in
+{doc}`A24_functional_pending_calendar`. Canonical
 single-device Network lowering is described in
 {doc}`A19_functional_network_lowering`, and snapshot-based `dn.compile(Network)`
 execution in {doc}`A21_functional_network_compile`.
