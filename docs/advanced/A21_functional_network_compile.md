@@ -191,23 +191,73 @@ transform parameters use
 `continuous_synapses.<connection-name>.transform_parameters.<parameter-name>`.
 NetStim renewal parameters appear under `netstim.parameters`, and schedule
 values retain named fields such as `schedule.times` and
-`schedule.amplitudes`. `runner.parameter_name(query)` resolves an exact name
-or one unique partial match; `runner.get_parameter(query)` returns that leaf.
-Ambiguous queries raise with the matching names.
+`schedule.amplitudes`.
+
+`trainable` accepts exact names, unique partial names, glob patterns, and
+explicit regex selectors. For example:
+
+```python
+import re
+
+runner = dn.compile(
+    network, dt=dt, steps=100, inference=False,
+    trainable=(
+        "synapses.*.weights",
+        re.compile(r"^populations\.cell\..*\.leak\.g_param$"),
+    ),
+)
+```
+
+Globs match the complete dotted name case-sensitively; `*` spans dots.
+`glob:synapses.*.weights` is equivalent to the bare glob above. Regex selectors
+use `re:` strings or compiled string patterns, with regex `search` semantics.
+For example, `r"re:^synapses\..*\.(weights|delays)$"` selects event weights and
+explicit differentiable delays. Empty/invalid selectors and unmatched
+`trainable` selectors raise an error. A plain substring still must identify
+one name, while a pattern can select several. Selected leaves must have a
+floating-point or complex dtype; narrow broad patterns that also match
+integer or Boolean buffers. The full matching rules also apply to Population
+runners and `independent_parameters`, as described in
+{ref}`functional-parameter-selection`.
+
+Preview candidates before compiling, or search a runner's independent copies:
+
+```python
+_, tensors = dn.func.make_functional_network(network)
+print(tuple(tensors.find_parameters("synapses.*.weights")))
+print(tuple(runner.find_parameters(r"re:\.(weights|delays)$")))
+```
+
+`runner.parameter_name(query)` resolves an exact name or one unique selector
+match; `runner.get_parameter(query)` returns that leaf. Both reject ambiguous
+matches, including when several names alias the same Tensor.
 
 Selecting any alias in `trainable` turns the shared independent leaf into one
 `torch.nn.Parameter`. All aliases still refer to that same object, so their
 gradient contributions accumulate. Distinct Tensor views are independent
 leaves unless they were the same Tensor object in the original packet.
-Unselected leaves are detached ordinary tensors.
+Unselected leaves are detached ordinary tensors. Inspect the actual selected
+leaves with `runner.trainable_parameters`:
+
+```python
+print(tuple(runner.trainable_parameters))
+for name, parameter in runner.trainable_parameters.items():
+    print(name, tuple(parameter.shape), parameter.dtype, parameter.requires_grad)
+```
+
+This named mapping contains every alias whose live Tensor has
+`requires_grad=True`, including aliases outside the selector that share a
+selected object. Each access reflects explicit freezing or unfreezing. It
+describes the runner's default parameter packet, rather than an invocation-local
+packet supplied with `parameters=`. `inference=True` suppresses simulation gradients
+even when this mapping is nonempty; use `inference=False` for training.
 
 An optimizer should receive each shared object only once:
 
 ```python
 unique_trainable = {
     id(value): value
-    for value in runner.named_parameters.values()
-    if value.requires_grad
+    for value in runner.trainable_parameters.values()
 }
 optimizer = torch.optim.Adam(list(unique_trainable.values()), lr=1e-3)
 ```
@@ -217,8 +267,19 @@ Replacement tensors retain their autograd history and must preserve the
 Network's shared parameter identities and component schema. The runner does
 not retain a replacement packet or its preparation graph between calls.
 `NetworkTensors` from `make_functional_network` also supplies
-`named_parameters`, `find_parameters`, `parameter_name`, `get_parameter`, and
-`independent_parameters(trainable=...)` for lower-level use.
+`named_parameters`, `trainable_parameters`, `find_parameters`, `parameter_name`,
+`get_parameter`, and `independent_parameters(trainable=...)` for lower-level
+use.
+
+The complete CPU
+{download}`functional_parameter_selection.py <../../examples/functional_parameter_selection.py>`
+example checks wildcard and regex selection, parameter inspection, and backward
+gradients for both a Population and a Network with shared connection weights:
+
+```{code-cell} python
+:load: ../../examples/functional_parameter_selection.py
+:tags: [remove-input]
+```
 
 ## Supply Population inputs and explicit NetStim tapes
 

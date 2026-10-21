@@ -53,16 +53,28 @@ class NetworkTensors(NamedTuple):
         """Flatten explicit leaves by canonical collection/component-qualified names."""
         return _network_parameters.named_parameters(self.parameters)
 
+    @property
+    def trainable_parameters(self):
+        """Return named leaves currently requiring gradients, including shared aliases.
+
+        Deduplicate values by identity before passing them to an optimizer.
+        """
+        return {
+            name: value
+            for name, value in self.named_parameters.items()
+            if value.requires_grad
+        }
+
     def find_parameters(self, query):
-        """Return all parameter leaves whose canonical names contain ``query``."""
+        """Return parameter leaves matching a substring, glob, or regex query."""
         return _network_parameters.find_parameters(self.parameters, query)
 
     def parameter_name(self, query):
-        """Resolve an exact canonical name or unique partial-name query."""
+        """Resolve one exact, partial, glob, or regex parameter-name match."""
         return _network_parameters.parameter_name(self.parameters, query)
 
     def get_parameter(self, query):
-        """Return the leaf selected by an exact or unique partial name."""
+        """Return the leaf selected by one unambiguous parameter query."""
         return _network_parameters.get_parameter(self.parameters, query)
 
     def independent_parameters(self, trainable=()):

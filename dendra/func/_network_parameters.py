@@ -6,7 +6,9 @@ from collections.abc import Mapping
 
 import torch
 
-from ._types import _normalize_queries, _validate_query
+from ._parameter_queries import matching_names
+from ._parameter_queries import parameter_name as _parameter_name
+from ._parameter_queries import select_names
 
 
 def _parameter_paths(tree, path=()):
@@ -45,48 +47,34 @@ def named_parameters(parameters):
 
 
 def find_parameters(parameters, query):
-    """Return all canonical Network parameter names containing ``query``."""
-    query = _validate_query(query)
-    return {
-        name: value
-        for name, value in named_parameters(parameters).items()
-        if query in name
-    }
+    """Find canonical names by substring, full-name glob, or regex search."""
+    candidates = named_parameters(parameters)
+    return {name: candidates[name] for name in matching_names(candidates, query)}
 
 
 def parameter_name(parameters, query):
-    """Resolve an exact canonical name or one unique partial-name match."""
-    query = _validate_query(query)
+    """Resolve one exact, partial, glob, or regex parameter-name match."""
     candidates = named_parameters(parameters)
-    if query in candidates:
-        return query
-    matches = tuple(name for name in candidates if query in name)
-    if len(matches) == 1:
-        return matches[0]
-    if not matches:
-        raise KeyError(f"no Network parameter matching {query!r} was found")
-    raise KeyError(
-        f"Network parameter query {query!r} is ambiguous; matches={list(matches)}"
-    )
+    return _parameter_name(candidates, query, label="Network parameter")
 
 
 def get_parameter(parameters, query):
-    """Return the explicit Tensor selected by an exact or unique partial name."""
+    """Return the explicit Tensor selected by one exact, partial, glob, or regex match."""
     return named_parameters(parameters)[parameter_name(parameters, query)]
 
 
 def independent_parameters(parameters, trainable=()):
     """Clone a nested packet once per Tensor identity, retaining parameter ties.
 
+    Exact or unique partial names select one leaf; full-name globs and ``re:``
+    or compiled regex selectors can select multiple. Each selector must match.
     Selecting any alias makes the shared independent leaf a single trainable
     ``nn.Parameter``. All other leaves are detached ordinary tensors, including
     registered buffers extracted in continuous-transform parameter packets.
     Neither storage nor autograd history is shared with the input packet.
     """
     named = named_parameters(parameters)
-    selected = {
-        parameter_name(parameters, query) for query in _normalize_queries(trainable)
-    }
+    selected = select_names(named, trainable, label="Network parameter")
     non_differentiable = sorted(
         name
         for name in selected

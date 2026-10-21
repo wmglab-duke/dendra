@@ -11,6 +11,8 @@ from torch.utils import _pytree as pytree
 
 from ._binding import BoundPopulation
 from ._compiled import CompiledPopulationChunk
+from ._parameter_queries import matching_names
+from ._parameter_queries import parameter_name as _parameter_name
 from ._population import (
     FunctionalPopulation,
     _initialization_transform_hooks,
@@ -65,6 +67,11 @@ class CompiledRunner:
     without reinitializing. Parameters
     are independent copies; select differentiable leaves with ``trainable``
     and ``inference=False``, or pass an explicit parameter mapping per call.
+    Selectors accept exact or unique partial names, glob patterns, and ``re:``
+    or compiled regular expressions. :attr:`named_parameters` lists the
+    runner-owned defaults; :attr:`trainable_parameters` shows their current
+    ``requires_grad`` leaves. Per-call overrides are not retained for inspection.
+    ``inference=True`` suppresses execution gradients regardless of selection.
 
     ``callbacks`` is a named mapping of functional callback configurations.
     Recording is explicit: use ``callbacks={'trace': dn.func.Recorder(('v',))}``
@@ -211,6 +218,43 @@ class CompiledRunner:
     def parameters(self):
         """Read-only mapping of independent, live parameter tensor leaves."""
         return MappingProxyType(self._parameters)
+
+    @property
+    def named_parameters(self):
+        """Read-only canonical names for the runner-owned default parameter leaves."""
+        return MappingProxyType(self._parameters)
+
+    @property
+    def trainable_parameters(self):
+        """Read-only named defaults currently requiring gradients, including aliases.
+
+        Tensor objects remain live; freezing or unfreezing a leaf is reflected
+        on the next access. Per-call parameter overrides are not included.
+        Deduplicate values by identity before supplying them to an optimizer.
+        Inference execution suppresses gradients even for selected leaves.
+        """
+        return MappingProxyType(
+            {
+                name: value
+                for name, value in self._parameters.items()
+                if value.requires_grad
+            }
+        )
+
+    def find_parameters(self, query):
+        """Return all named defaults matching a substring, glob, or regex query."""
+        return {
+            name: self._parameters[name]
+            for name in matching_names(self._parameters, query)
+        }
+
+    def parameter_name(self, query):
+        """Resolve one exact, partial, glob, or regex match among named defaults."""
+        return _parameter_name(self._parameters, query)
+
+    def get_parameter(self, query):
+        """Return the live default Tensor selected by one unambiguous query."""
+        return self._parameters[self.parameter_name(query)]
 
     @property
     def constants(self):
@@ -446,8 +490,11 @@ def compile(
     compartments with ``dn.func.Recorder(..., node_indices=[...])``, not a
     runner argument. CPU inference with ordinary Inductor defaults to
     ``options={'cpp_wrapper': True}``; explicit compiler choices win. Use
-    ``inference=False, trainable=(...)`` for scan gradients. Add
-    ``checkpoint_every=H`` to trade backward recomputation of H-step compiled
+    ``inference=False, trainable=(...)`` for scan gradients. Supply
+    exact/unique partial names, glob patterns, or ``re:``/compiled regex selectors
+    to ``trainable``; inspect ``runner.trainable_parameters`` for the live named
+    defaults selected for gradients. Inference execution still suppresses gradients.
+    Add ``checkpoint_every=H`` to trade backward recomputation of H-step compiled
     scans for lower activation memory, without truncating gradients. This is
     valid only for training scan; requested recording storage remains.
     By default, calls without state restart the captured initialized snapshot.

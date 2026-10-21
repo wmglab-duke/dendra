@@ -7,27 +7,15 @@ from typing import Literal, NamedTuple
 
 import torch
 
+from ._parameter_queries import ParameterQuery, matching_names
+from ._parameter_queries import parameter_name as _parameter_name
+from ._parameter_queries import select_names
+
 TensorTree = dict[str, object]
 _ParameterSubset = Literal["all", "model", "intra", "extra"]
 
 _INTRA_PREFIX = "stimulation.intra."
 _EXTRA_PREFIX = "stimulation.extra."
-
-
-def _validate_query(query: str) -> str:
-    if not isinstance(query, str):
-        raise TypeError("parameter query must be a string")
-    if not query:
-        raise ValueError("parameter query must be a non-empty string")
-    return query
-
-
-def _normalize_queries(queries: str | Iterable[str]) -> tuple[str, ...]:
-    if isinstance(queries, str):
-        queries = (queries,)
-    else:
-        queries = tuple(queries)
-    return tuple(_validate_query(query) for query in queries)
 
 
 class InitializationInput(NamedTuple):
@@ -56,6 +44,19 @@ class PopulationTensors(NamedTuple):
     constants: dict[str, torch.Tensor]
     state: TensorTree
     initialization: InitializationInput
+
+    @property
+    def trainable_parameters(self) -> dict[str, torch.Tensor]:
+        """Named parameter leaves with live ``requires_grad=True`` flags.
+
+        Shared aliases remain visible. Deduplicate values by identity before
+        passing them to an optimizer.
+        """
+        return {
+            name: value
+            for name, value in self.parameters.items()
+            if value.requires_grad
+        }
 
     def _parameter_subset(
         self,
@@ -103,77 +104,60 @@ class PopulationTensors(NamedTuple):
 
     def find_parameters(
         self,
-        query: str,
+        query: ParameterQuery,
         *,
         within: _ParameterSubset = "all",
     ) -> dict[str, torch.Tensor]:
-        """Return every parameter whose canonical name contains ``query``.
+        """Find parameters by substring, full-name glob, or regular expression.
 
         Matching is case-sensitive and preserves canonical extraction order.
+        Use ``re:expression`` or a compiled string regex for regex search.
         Use :meth:`parameter_name` when exactly one match is required.
         """
 
-        query = _validate_query(query)
-        return {
-            name: value
-            for name, value in self._parameter_subset(within).items()
-            if query in name
-        }
+        candidates = self._parameter_subset(within)
+        return {name: candidates[name] for name in matching_names(candidates, query)}
 
     def parameter_name(
         self,
-        query: str,
+        query: ParameterQuery,
         *,
         within: _ParameterSubset = "all",
     ) -> str:
-        """Resolve an exact name or unique partial parameter-name match."""
+        """Resolve one exact, partial, glob, or regex parameter-name match."""
 
-        query = _validate_query(query)
         candidates = self._parameter_subset(within)
-        if query in candidates:
-            return query
-        matches = tuple(name for name in candidates if query in name)
-        if len(matches) == 1:
-            return matches[0]
-        if not matches:
-            raise KeyError(
-                f"no parameter matching {query!r} was found within {within!r}"
-            )
-        raise KeyError(
-            f"parameter query {query!r} is ambiguous within {within!r}; "
-            f"matches={list(matches)}"
-        )
+        return _parameter_name(candidates, query, within=within)
 
     def get_parameter(
         self,
-        query: str,
+        query: ParameterQuery,
         *,
         within: _ParameterSubset = "all",
     ) -> torch.Tensor:
-        """Return the Tensor selected by an exact or unique partial name."""
+        """Return the Tensor selected by one exact, partial, glob, or regex match."""
 
         return self.parameters[self.parameter_name(query, within=within)]
 
     def independent_parameters(
         self,
-        trainable: str | Iterable[str] = (),
+        trainable: ParameterQuery | Iterable[ParameterQuery] = (),
         *,
         within: _ParameterSubset = "all",
     ) -> dict[str, torch.Tensor]:
         """Clone the complete parameter tree independently of its Population.
 
-        Entries selected by exact or unique partial names in ``trainable`` are
-        returned as :class:`torch.nn.Parameter` objects. Every other leaf is a
+        Exact or unique partial names select one leaf; full-name globs and
+        ``re:`` or compiled regex selectors can select multiple leaves. Each
+        selector must match. Selected leaves are returned as
+        :class:`torch.nn.Parameter` objects. Every other leaf is a
         detached ordinary Tensor. The returned mapping retains canonical names
         and can be passed directly to functional preparation and transitions.
         """
 
         # Validate the scope even when no trainable queries were requested.
-        self._parameter_subset(within)
-        trainable_names = {
-            self.parameter_name(query, within=within)
-            for query in _normalize_queries(trainable)
-        }
+        candidates = self._parameter_subset(within)
+        trainable_names = select_names(candidates, trainable, within=within)
         non_differentiable = sorted(
             name
             for name in trainable_names

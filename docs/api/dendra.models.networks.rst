@@ -44,12 +44,15 @@ recordings, and checkpointed host execution are described in
 ``dn.compile(Network)`` dispatch, snapshot and fresh initialization, shared
 trainable parameter selection, restart, and explicit continuation are described in
 :doc:`../advanced/A21_functional_network_compile`.
+``trainable`` accepts exact/unique partial names, glob patterns, and explicit
+regex selectors. Preview matches with ``find_parameters`` and inspect the live
+selected leaves through ``trainable_parameters``; shared aliases remain visible.
 Compact source-history training with native ``auto`` selection, delivery-time
 parameter lookup, and checkpoint continuation is described in
 :doc:`../advanced/A22_functional_source_history`.
 
 .. autoclass:: dendra.func.CompiledNetworkRunner
-   :members: initial_state, initialization_inputs, parameters, named_parameters, constants, functional, kernel, parameter_name, get_parameter, execution_report
+   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
    :special-members: __call__
 
 .. autofunction:: dendra.func.make_functional_network

@@ -9,6 +9,23 @@ Core
    :member-order: groupwise
 
 
+Functional Population parameters
+--------------------------------
+
+``dn.compile(Population)`` returns independent parameter leaves selectable by
+exact/unique partial names, glob patterns, or explicit regex selectors. Use
+``find_parameters`` to preview matches and ``trainable_parameters`` to inspect
+the live ``requires_grad`` subset. See
+:ref:`functional-parameter-selection` for matching rules and runnable examples.
+
+.. autoclass:: dendra.func.CompiledRunner
+   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
+   :special-members: __call__
+
+.. autoclass:: dendra.func.PopulationTensors
+   :members: parameters, trainable_parameters, model_parameters, intra_parameters, extra_parameters, find_parameters, parameter_name, get_parameter, independent_parameters
+
+
 Intrinsic activity
 ------------------
 

@@ -13,7 +13,12 @@ from dendra.models.core import _validate_time_scalar
 
 from ._network import make_functional_network
 from ._network_initialization import NetworkInitializationInput
-from ._network_parameters import get_parameter, named_parameters, parameter_name
+from ._network_parameters import (
+    find_parameters,
+    get_parameter,
+    named_parameters,
+    parameter_name,
+)
 from ._runner_policy import (
     _configured_callbacks,
     _inference_compile_options,
@@ -48,8 +53,12 @@ class CompiledNetworkRunner:
 
     :attr:`parameters` is a nested read-only view with editable, independent
     Tensor leaves. :attr:`named_parameters` exposes dotted query names. Select
-    exact or unique partial names with ``trainable`` and ``inference=False``.
+    exact or unique partial names, glob patterns, or ``re:``/compiled regular
+    expressions with ``trainable`` and ``inference=False``.
     Every alias of a selected shared Tensor remains the same trainable leaf.
+    :attr:`trainable_parameters` reports every named default currently requiring
+    gradients, including aliases. Per-call overrides are not retained for
+    inspection. Inference execution suppresses gradients regardless of selection.
     Per-call parameter overrides preserve their Tensor objects and autograd
     history, and must retain the Network's parameter ties and component schema.
 
@@ -183,6 +192,22 @@ class CompiledNetworkRunner:
         return MappingProxyType(named_parameters(self._parameters))
 
     @property
+    def trainable_parameters(self):
+        """Read-only named defaults currently requiring gradients, including aliases.
+
+        Reflects live freezing/unfreezing on access, not per-call overrides.
+        Deduplicate values by identity before supplying them to an optimizer.
+        Inference execution suppresses gradients even for selected leaves.
+        """
+        return MappingProxyType(
+            {
+                name: value
+                for name, value in named_parameters(self._parameters).items()
+                if value.requires_grad
+            }
+        )
+
+    @property
     def constants(self):
         """Read-only nested constants; edits to Tensor values apply on the next call."""
         return _map_containers(self._constants, MappingProxyType)
@@ -196,12 +221,16 @@ class CompiledNetworkRunner:
         return self._kernel
 
     def parameter_name(self, query):
-        """Resolve an exact name or a unique partial parameter query."""
+        """Resolve one exact, partial, glob, or regex match among named defaults."""
         return parameter_name(self._parameters, query)
 
     def get_parameter(self, query):
-        """Return the live Tensor selected by an exact or unique partial query."""
+        """Return the live default Tensor selected by one unambiguous query."""
         return get_parameter(self._parameters, query)
+
+    def find_parameters(self, query):
+        """Return all named defaults matching a substring, glob, or regex query."""
+        return find_parameters(self._parameters, query)
 
     def execution_report(self):
         """Return the latest successful kernel dispatch, including tails/replay."""

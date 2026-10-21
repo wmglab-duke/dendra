@@ -103,8 +103,10 @@ Use ``runner.execution_report()`` after a call to inspect the selected strategy.
 
 For ordinary first-order backpropagation, select scan and disable inference
 explicitly. The default has no trainable parameter leaves; ``trainable`` accepts
-the same exact or unambiguous partial parameter names as
-``PopulationTensors.independent_parameters``:
+exact names, unambiguous partial names, glob patterns, and explicit regular
+expressions. It uses the same selectors as
+``PopulationTensors.independent_parameters``; see
+:ref:`functional-parameter-selection` for matching rules and previewing matches:
 
 .. code-block:: python
 
@@ -119,7 +121,7 @@ the same exact or unambiguous partial parameter names as
        trainable=("gnabar",),
        callbacks={"trace": dn.func.Recorder(("v",))},
    )
-   trainable = [p for p in train_runner.parameters.values() if p.requires_grad]
+   trainable = list(train_runner.trainable_parameters.values())
    optimizer = torch.optim.Adam(trainable, lr=1e-4)
    for _ in range(2):
        optimizer.zero_grad()
@@ -1159,8 +1161,10 @@ The extracted ``PopulationTensors`` contains:
    ``mechanisms.hh.m``. These leaves can be replaced or made trainable without
    changing transition preparation.
 
-Parameter lookup and independent copies
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+.. _functional-parameter-selection:
+
+Parameter selection, lookup, and independent copies
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Canonical parameter paths remain the keys accepted by ``prepare`` and the
 transition, but callers do not need to hard-code those paths. The extracted
@@ -1180,10 +1184,44 @@ Use ``find_parameters`` when multiple matches are useful, or
    gnabar = tensors.get_parameter("gnabar", within="model")
    intra_amp = tensors.get_parameter("amp", within="intra")
 
-Searches are case-sensitive substring matches. Exact canonical names take
-precedence during single-result resolution; missing or ambiguous partial names
-raise with the matching canonical paths. The available scopes are ``"all"``,
-``"model"``, ``"intra"``, and ``"extra"``.
+Plain strings use case-sensitive substring matching. Exact canonical names take
+precedence for ``parameter_name``, ``get_parameter``, and ``trainable``;
+otherwise those selectors must identify one name. ``find_parameters`` returns
+all substring matches, including when one is an exact name. The available
+scopes are ``"all"``, ``"model"``, ``"intra"``, and ``"extra"``.
+
+Glob and regex selectors match multiple parameters without listing each name:
+
+.. code-block:: python
+
+   import re
+
+   conductances = tensors.find_parameters("*.g*_param", within="model")
+   sodium_regions = tensors.find_parameters(re.compile(r"\.gnabar_(?:soma|axon)$"))
+   parameters = tensors.independent_parameters(
+       trainable=("*.g*_param", r"re:stimulation\.intra\..*\.amp$"),
+   )
+
+Glob patterns use ``*``, ``?``, and ``[characters]`` against the complete
+canonical name. Matching is case-sensitive, and ``*`` spans dots in a path.
+The explicit ``glob:`` prefix is also accepted. Regex selectors use a ``re:``
+prefix or a compiled string pattern from ``re.compile``. They use regex
+``search``; add ``^`` and ``$`` when the entire name must match. Compiled regex
+flags such as ``re.IGNORECASE`` are retained.
+
+``trainable`` accepts one selector or an iterable mixing these forms. Glob and
+regex selectors can match several names, overlapping selectors are combined,
+and selection preserves canonical parameter order. Each selector must match at
+least one parameter; unmatched selectors raise ``KeyError``. A plain substring
+that matches several names also raises. Invalid or empty expressions raise
+instead of selecting nothing. Exact canonical names take precedence even when
+they contain glob punctuation. ``parameter_name`` and ``get_parameter`` accept
+patterns but still require exactly one matching name. ``find_parameters``
+returns an empty mapping for a valid selector with no matches.
+
+Selected leaves must have a floating-point or complex dtype. A broad pattern
+that also matches integer or Boolean stimulation buffers raises an error.
+Preview its matches and narrow the selector to the intended numerical leaves.
 
 Regional overrides remain separate canonical leaves. For example, a mechanism
 may expose ``gnabar_param``, ``gnabar_soma``, and ``gnabar_axon``. A singular
@@ -1225,6 +1263,30 @@ wrapped as optimizer-ready ``torch.nn.Parameter`` leaves:
 The scope constrains trainable-name lookup; the returned mapping is still
 complete and can be passed directly to ``prepare``. Perform name searches and
 construct independent leaves outside compiled or transformed functions.
+
+Use ``runner.find_parameters(selector)`` to inspect matches on a compiled
+Population, and ``runner.named_parameters`` to inspect every canonical name.
+``runner.trainable_parameters`` exposes the live ``requires_grad=True`` subset:
+
+.. code-block:: python
+
+   print(tuple(train_runner.trainable_parameters))
+   for name, parameter in train_runner.trainable_parameters.items():
+       print(name, tuple(parameter.shape), parameter.dtype, parameter.requires_grad)
+
+The mapping reports the runner's own default parameter leaves. Each access
+reflects explicit freezing with ``requires_grad_(False)`` and does not describe a
+replacement packet passed to one call. ``PopulationTensors.trainable_parameters``
+provides the same view of its extracted parameter mapping. Selection alone does
+not enable simulation gradients: use ``inference=False``. Constants, initial
+state, initialization-only inputs, and runtime input tapes are outside
+``trainable``; make those explicit inputs differentiable separately when needed.
+
+The complete CPU example
+:download:`functional_parameter_selection.py <../../examples/functional_parameter_selection.py>`
+previews Population selectors, mixes wildcard and regex selection, checks
+backward gradients, and demonstrates shared Network parameters. Run it from the
+repository root with ``python examples/functional_parameter_selection.py``.
 
 ``prepare`` derives model-parameter-, geometry-, and timestep-dependent
 coefficients once for eager execution. A prepared object is bound to the exact model tensor
@@ -1374,9 +1436,11 @@ The compiled convenience entry point accepts this specification directly:
 
 This example assumes a waveform with ``amp``, ``freq``, and ``phase`` leaves,
 such as ``dn.sin``. Inspect ``runner.parameters`` for the canonical names of
-other waveforms or contacts. ``trainable`` uses exact or unambiguous partial
-names, and may also select model parameters. Even fields originally authored
-as ordinary tensors become selectable stimulation leaves.
+other waveforms or contacts. ``trainable`` accepts the selectors described in
+:ref:`functional-parameter-selection`, including glob patterns such as
+``"stimulation.extra.waveforms.*.amp"``, and may also select model parameters.
+Even fields originally authored as ordinary tensors become selectable
+stimulation leaves.
 
 Optimize the independent tensors in ``runner.parameters``, not the original
 field or Waveform object: runner construction snapshots and detaches authoring
