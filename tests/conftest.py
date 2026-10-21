@@ -95,8 +95,27 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     Tests may carry more than one backend marker (for example the CUDA NEURON
     comparison), but only tests requiring neither receive the ``cpu`` marker.
     Parameterized ``device='cuda'`` cases are classified independently from
-    their CPU siblings.
+    their CPU siblings unless an authored ``cpu`` marker declares that only
+    device metadata is inspected. Explicit CUDA markers and hardware guards
+    still identify accelerator requirements, including within CPU-marked
+    modules or classes.
     """
+
+    authored_cpu = {
+        item for item in items if item.get_closest_marker("cpu") is not None
+    }
+    # Pytest inherits module/class markers even when a case declares another
+    # backend. Restore CPU markers per case so explicit CUDA requirements do
+    # not also satisfy the required lane's ``cpu`` alternative.
+    cpu_owners = {
+        owner
+        for item in authored_cpu
+        for owner, _marker in item.iter_markers_with_node("cpu")
+    }
+    for owner in cpu_owners:
+        owner.own_markers[:] = [
+            marker for marker in owner.own_markers if marker.name != "cpu"
+        ]
 
     for item in items:
         for warning_filter in _UPSTREAM_COMPILER_WARNING_FILTERS:
@@ -110,7 +129,7 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             or item.get_closest_marker("neuron") is not None
         )
         needs_cuda = (
-            _parameter_uses_cuda(item)
+            (item not in authored_cpu and _parameter_uses_cuda(item))
             or _skipif_requires_cuda(item)
             or item.get_closest_marker("cuda") is not None
         )
@@ -124,5 +143,5 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         if any(token in nodeid_lower for token in _STOCHASTIC_TOKENS):
             item.add_marker(pytest.mark.stochastic)
 
-        if not needs_neuron and not needs_cuda:
+        if not needs_cuda and (item in authored_cpu or not needs_neuron):
             item.add_marker(pytest.mark.cpu)

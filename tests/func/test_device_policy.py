@@ -8,6 +8,8 @@ import torch
 from dendra.func._convenience import _inference_compile_options
 from dendra.func._population import _functional_device_failures
 
+pytestmark = pytest.mark.cpu
+
 
 @pytest.mark.parametrize("device", ["cpu", "cpu:0", "cuda", "cuda:1"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])

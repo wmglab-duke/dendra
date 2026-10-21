@@ -39,6 +39,12 @@ that require neither CUDA nor the NEURON simulator, while `neuron and not
 cuda` adds the required simulator-backed CPU tests without selecting GPU
 comparisons.
 
+Mark tests that inspect device metadata or mock compiler behavior with
+`@pytest.mark.cpu` when they do not allocate or execute on CUDA. This prevents a
+parameter such as `device="cuda"` from assigning them to the CUDA lane.
+Explicit `cuda` markers and CUDA/GPU hardware guards still identify tests that
+require an accelerator.
+
 CUDA- and Triton-dependent cases use the `cuda` marker.
 `neuron and cuda` narrows that lane to NEURON comparisons on CUDA. Longer
 comparisons also carry `slow`, and randomized or property-generated cases

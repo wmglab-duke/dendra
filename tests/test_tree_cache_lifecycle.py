@@ -190,18 +190,23 @@ def test_tree_reinitialization_refreshes_autograd_without_recompilation(compiler
 
 
 @pytest.mark.parametrize(
-    "integrator_type, solver",
+    "module, integrator_type, solver_name",
     [
-        (tree_module._dhs, tree_module.dhs_solve_cuda),
-        (tree_module._dhs_multi, tree_module.dhs_solve_multi_cuda),
-        (block_module._dhs_bt, block_module.dhs_bt_solve_cuda),
+        (tree_module, tree_module._dhs, "dhs_solve_cuda"),
+        (tree_module, tree_module._dhs_multi, "dhs_solve_multi_cuda"),
+        (block_module, block_module._dhs_bt, "dhs_bt_solve_cuda"),
     ],
 )
 def test_cuda_solver_binding_keeps_identical_selection_without_gpu(
-    integrator_type, solver
+    monkeypatch, module, integrator_type, solver_name
 ):
+    solver = getattr(module, solver_name)
     if not callable(solver):
-        pytest.skip("CUDA solver bindings are unavailable")
+
+        def solver(*args, **kwargs):
+            pytest.fail("Selecting a CUDA solver must not execute its kernel")
+
+        monkeypatch.setattr(module, solver_name, solver)
     integrator = integrator_type.__new__(integrator_type)
     torch.nn.Module.__init__(integrator)
     integrator.threads = 2

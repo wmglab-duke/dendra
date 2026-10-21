@@ -422,10 +422,9 @@ def test_allow_tf32_without_a_cuda_backend_is_a_noop(monkeypatch, state):
     assert probe.version_reads == 0
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("state", [True, False])
 def test_allow_tf32(state):
-    """Set and restore all three supported fine-grained CUDA precision controls."""
+    """Set and restore backend precision metadata without allocating on CUDA."""
     orig_matmul = torch.backends.cuda.matmul.fp32_precision
     orig_conv = torch.backends.cudnn.conv.fp32_precision
     orig_rnn = torch.backends.cudnn.rnn.fp32_precision

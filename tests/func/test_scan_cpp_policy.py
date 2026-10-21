@@ -9,6 +9,8 @@ import torch
 from dendra.func import _scan
 from dendra.func._scan_inductor import _compile_scan, _ScanInductorBackend
 
+pytestmark = pytest.mark.cpu
+
 
 def _capture(monkeypatch):
     captured = {}
