@@ -10,24 +10,24 @@ kernelspec:
 # Run and record a functional Network
 
 An initialized standard `Network` can execute for a complete horizon through
-`dn.func.make_functional_network`. Its rollout, compiled chunk, and host runner
-reuse the same connected timestep and the existing functional execution and
-callback machinery. Event delivery, continuous source observation, and
-Population updates retain the native ordering described in
+`dn.func.make_functional_network`. Rollouts accept per-population input tapes
+and NetStim draw packets, support recording and reducer callbacks, and return
+state for continuation. Event delivery, continuous source observation, and
+Population updates follow the native ordering described in
 {doc}`A19_functional_network_lowering`.
 
 The complete
 {download}`functional_network_rollout.py <../../examples/functional_network_rollout.py>`
-example adds a noisy NetStim and per-population current tapes to the recurrent
-Network from that tutorial. It checks checkpointed state, recordings, gradients,
+example simulates a recurrent Network with a noisy NetStim and per-population
+current tapes. It checks checkpointed state, recordings, gradients,
 segmented continuation, and native continuation from a complete boundary.
 Run it with `python examples/functional_network_rollout.py`.
 
 ## Declare and lower the Network
 
 Build the Network with ordinary Population and connection methods. The example
-uses two populations of single-compartment cells, a trainable continuous release transform, threshold
-events, and a NetStim that shares the event target:
+uses two populations of single-compartment cells, a trainable continuous release
+transform, threshold events, and a NetStim that shares the event target:
 
 ```{literalinclude} ../../examples/functional_network_rollout.py
 :language: python
@@ -104,8 +104,8 @@ samples. The results appear under `aux["callbacks"]["trace"]` and preserve
 gradients. `node_indices`, `max_only`, and `partition` follow the ordinary
 functional Recorder contract.
 
-The example also uses the same pure `FunctionalCallback` reducer interface as
-Population rollouts. A Network callback receives the full Network state:
+Use `FunctionalCallback` to define a pure reducer. A Network callback receives
+the full Network state:
 
 ```{literalinclude} ../../examples/functional_network_rollout.py
 :language: python
@@ -118,13 +118,14 @@ next carry and an optional emission, and `finalize` returns the public result.
 Keep schemas stable and implementations deterministic and side-effect-free;
 use explicit tensor carry for evolving values. The
 {doc}`A8_functional_populations` callback section explains the complete contract.
-Network-level region/LFP and threshold-analysis callback binding are not yet
-supported; use qualified recorders or pure custom reducers for this increment.
+Network-level region/LFP and threshold-analysis callback binding are currently
+unsupported; use qualified recorders or pure custom reducers.
 Mutable native callbacks are not run by the functional Network.
 
 ## Choose eager rollout or compiled chunks
 
-Use eager rollout as a direct reference, with preparation outside the loop:
+Use eager rollout to execute a horizon without compilation. Prepare the
+coefficients before running the loop:
 
 ```{literalinclude} ../../examples/functional_network_rollout.py
 :language: python
@@ -151,9 +152,8 @@ state3, aux3 = chunk(
 The complete example's `run_demo(compiled=True)` selects this mode. A scan has
 a bounded loop graph rather than one graph expanded over the entire horizon.
 `execution="unrolled"` compiles the ordinary expanded recurrence instead.
-The chunk width must be positive; each direct call supplies exactly that many
-input samples. Validation and preparation remain outside the compiled body.
-The chunk already owns its compiled boundary, so call it directly.
+The chunk width must be positive; each call supplies exactly that many input
+samples. Prepare coefficients before calling the chunk, and call it directly.
 
 For a long horizon, use the host runner with optional checkpointing:
 
@@ -168,9 +168,8 @@ Here `chunk` is `None` in the default eager example, or a compiled chunk when
 `run_demo(compiled=True)` is selected. `chunklength` bounds execution chunks.
 `checkpoint_every` independently chooses host checkpoint spans, including the
 automatic NetStim draw-tape spans; neither option truncates gradients. The runner
-executes exact shorter tails when span,
-checkpoint, and compiled widths do not divide the horizon. It reuses shared
-chunk scheduling, tensor-tree checkpointing, and callback collection logic.
+executes exact shorter tails when execution, checkpoint, and compiled widths do
+not divide the horizon.
 Checkpoint backward replays the same explicit inputs and NetStim packets.
 Keep parameter, constant, input-tape, and source configuration values unchanged
 until backward completes.
@@ -237,6 +236,7 @@ The complete CPU example executes here:
 :tags: [remove-input]
 ```
 
-`dn.compile(Network)` convenience dispatch, heterogeneous-device orchestration,
-compact event queue backends, and continuous delay interpolation remain
-separate extensions.
+For snapshot-based `dn.compile(Network)` convenience execution, continue with
+{doc}`A21_functional_network_compile`. Fresh pure Network initialization,
+heterogeneous-device functional execution, compact functional event queues, and
+continuous delay interpolation are currently unsupported.

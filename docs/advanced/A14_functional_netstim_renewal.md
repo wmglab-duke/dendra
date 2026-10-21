@@ -7,13 +7,13 @@ kernelspec:
 ---
 
 (functional-netstim-renewal)=
-# Shared NetStim renewal with explicit random draws
+# NetStim renewal with explicit random draws
 
 An initialized `dn.NetStim` can be lowered with
-`dn.func.make_functional_netstim`. Native and functional execution use the
-same pure initialization and renewal transitions in the network layer.
-Construct the source and connections through the ordinary Network API;
-functional execution supplies parameters, clocks, and random draws explicitly.
+`dn.func.make_functional_netstim`. Construct the source and connections through
+the ordinary Network API, then supply parameters, clocks, and random draws
+explicitly for functional initialization and renewal. The resulting trajectories
+and gradients follow the native NetStim policy.
 This example uses unscheduled renewal. Tensor schedules and indexed source
 bindings are supported as described in {doc}`A15_functional_tensor_schedules`.
 
@@ -67,7 +67,7 @@ their seeder streams can still differ until explicitly restored.
 
 ## Sample outside the numerical graph
 
-The cold sampling helper restores an independent `torch.Generator` from the
+The sampling helper restores an independent `torch.Generator` from the
 explicit state. It changes neither the native source nor the supplied state:
 
 ```{literalinclude} ../../examples/functional_netstim_renewal.py
@@ -181,8 +181,9 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-Tensor schedules use shared pure evaluation and explicit packets as described
-in {doc}`A15_functional_tensor_schedules`. Consuming heap calendars use shared
-pure heads and cursor transitions as described in
-{doc}`A16_functional_heap_schedules`. Complete `Network`-level lowering remains
-a future extension.
+Tensor schedules use explicit packets as described in
+{doc}`A15_functional_tensor_schedules`. Consuming heap calendars use explicit
+heads and cursor state as described in
+{doc}`A16_functional_heap_schedules`. Canonical single-device Network lowering
+is described in {doc}`A19_functional_network_lowering`, and snapshot-based
+`dn.compile(Network)` execution in {doc}`A21_functional_network_compile`.

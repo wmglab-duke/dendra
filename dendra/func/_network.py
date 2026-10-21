@@ -17,6 +17,7 @@ from dendra.models.networks.net import (
 )
 from dendra.models.networks.net import step as _native_step
 
+from . import _network_parameters
 from ._continuous import FunctionalContinuousCon
 from ._continuous_transform import _named_tensors
 from ._netcon import FunctionalNetCon, _effective_tensor, _snapshot
@@ -43,6 +44,27 @@ class NetworkTensors(NamedTuple):
     parameters: dict
     constants: dict
     state: dict
+
+    @property
+    def named_parameters(self):
+        """Flatten explicit leaves by canonical collection/component-qualified names."""
+        return _network_parameters.named_parameters(self.parameters)
+
+    def find_parameters(self, query):
+        """Return all parameter leaves whose canonical names contain ``query``."""
+        return _network_parameters.find_parameters(self.parameters, query)
+
+    def parameter_name(self, query):
+        """Resolve an exact canonical name or unique partial-name query."""
+        return _network_parameters.parameter_name(self.parameters, query)
+
+    def get_parameter(self, query):
+        """Return the leaf selected by an exact or unique partial name."""
+        return _network_parameters.get_parameter(self.parameters, query)
+
+    def independent_parameters(self, trainable=()):
+        """Clone nested parameters with shared identities and trainable selection."""
+        return _network_parameters.independent_parameters(self.parameters, trainable)
 
 
 class _TensorSchema(NamedTuple):
@@ -203,8 +225,9 @@ class FunctionalNetwork:
     only; align native parameters/schedules separately before continuation.
     Topology, source bindings, mode, timestep, and native phase ordering are
     frozen. Canonical single-device Networks use the dense event queues and
-    integer continuous delays supported by the component plans. This API does
-    not yet extend the ``dn.compile`` convenience runner to Networks.
+    integer continuous delays supported by the component plans. ``dn.compile``
+    uses this plan for snapshot-based Network runners; the lower-level methods
+    also support explicit preparation and functional transforms.
     """
 
     def __init__(self, network):

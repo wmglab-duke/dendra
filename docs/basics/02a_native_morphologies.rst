@@ -12,12 +12,12 @@ model from that snapshot. If the compiled graph is one unbranched material
 path, :meth:`dendra.Cable.from_morphology` uses the faster tridiagonal cable
 backend without approximating the canonical geometry.
 
-NEURON import remains fully supported. :meth:`dendra.Morphology.from_swc` and
-:meth:`dendra.Morphology.from_asc` now make the editable native declaration the
-canonical representation after loading. The older
+Use :meth:`dendra.Morphology.from_swc` and
+:meth:`dendra.Morphology.from_asc` to load an editable native declaration before
+compiling it or constructing a model. The
 :meth:`dendra.Tree.from_NEURON`, :meth:`dendra.Tree.from_swc`, and
-:meth:`dendra.Tree.from_asc` constructors remain available for established
-workflows that intentionally want NEURON's immediate d-lambda discretization.
+:meth:`dendra.Tree.from_asc` constructors import a model directly using
+NEURON's immediate d-lambda discretization.
 Native and imported morphologies ultimately use the same scalar
 compartment-resistor graph contract in Dendra.
 
@@ -336,8 +336,8 @@ ASC import preserves the selected NEURON-normalized cable topology,
 centerlines, diameters, logical attachments, and explicit Dendra electrical
 policy. As with native SWC loading, ``nseg`` is a uniform initial declaration;
 the later ``apply_d_lambda`` call is an explicit, independently repeatable
-authoring step. This differs from the older :meth:`dendra.Tree.from_swc` and
-:meth:`dendra.Tree.from_asc` constructors, which intentionally apply their
+authoring step. The :meth:`dendra.Tree.from_swc` and
+:meth:`dendra.Tree.from_asc` constructors apply their
 NEURON-backed d-lambda policy during immediate model import. Native ASC loading
 is not a lossless document parser: source formatting, comments,
 colors, markers, properties, spines, trace IDs, original soma contours, and
@@ -821,8 +821,8 @@ An authored zero-length diameter discontinuity appears as the corresponding
 annular shoulder rather than being smoothed or assigned artificial length.
 Likewise, connected stylized Sections retain their canonical local z-axis and
 may overlap. This is a tapered-cable envelope, not a histological reconstruction
-or a boolean surface union at branch junctions; native Morphology does not yet
-define a distinct spherical-soma primitive.
+or a boolean surface union at branch junctions. A distinct spherical-soma
+primitive is currently unsupported.
 
 For a diagnostic orthographic view, :meth:`~dendra.Morphology.plot` draws the
 exact authored centerlines and optional controls. ``view`` is the axis viewed
@@ -1299,11 +1299,10 @@ The native morphology API currently supports:
   :class:`dendra.Cable` populations for material-only unbranched paths, whose
   ``N`` members share that morphology.
 
-It does not yet define finite-extracellular/double-cable circuit layers for
+Finite-extracellular/double-cable circuit layers for
 :class:`dendra.ExtCellTree` or :class:`dendra.ExtCellAxon`, a packed block-DHS
-representation, or per-population-member graph variation. Those extensions can
-build on the canonical contract without changing the section connection rules
-described here.
+representation, and per-population-member graph variation are currently
+unsupported by the native morphology API.
 
 See also
 --------

@@ -7,14 +7,13 @@ kernelspec:
 ---
 
 (functional-heap-schedules)=
-# Shared consuming heap calendars
+# Consuming heap calendars
 
-NetStim's unit-amplitude Python schedules now use a compact tensor calendar
-shared by native and functional execution. Declare events through the ordinary
-`dn.NetStim.schedule` API, then lower the initialized source with
-`dn.func.make_functional_netstim`. The calendar is fixed configuration; the
-consumed position is explicit state. No Python heap is visited during a pure
-step, and there is no separate functional scheduling engine.
+NetStim's unit-amplitude Python schedules consume due events from a fixed
+calendar. Declare events through `dn.NetStim.schedule`, then lower the
+initialized source with `dn.func.make_functional_netstim`. Functional execution
+represents the calendar as tensor constants and the consumed position as
+explicit state, so checkpoint continuation retains which events have fired.
 
 The complete
 {download}`functional_heap_schedules.py <../../examples/functional_heap_schedules.py>`
@@ -39,7 +38,7 @@ Both storage policies can coexist on one source:
 :dedent: 8
 ```
 
-Index expansion and `allow_past` filtering still happen when scheduling events.
+Index expansion and `allow_past` filtering happen when scheduling events.
 Appending or clearing events changes calendar topology and requires lowering
 again. Insertion inside a transformed loop is not part of this interface.
 NetCon's value and indexed schedules retain tensor evaluation; the consuming
@@ -47,7 +46,7 @@ calendar belongs to NetStim sources.
 
 ## Extract constants and cursor carry
 
-The source API and its explicit draw protocol are unchanged:
+Extract the source's parameters, constants, state, and schedule packet:
 
 ```{literalinclude} ../../examples/functional_heap_schedules.py
 :language: python
@@ -96,7 +95,7 @@ the current source gates, then advance populations:
 :dedent: 4
 ```
 
-The shared calendar reads the head before calling the shared renewal transition.
+Each source step reads the calendar head before evaluating renewal.
 If a finite head is due and the source has not reached `max_spikes`, it consumes
 the complete overdue prefix. Duplicate and skipped-over heap events coalesce
 into one Boolean source event in that call. A simultaneous stochastic or tensor
@@ -141,7 +140,7 @@ while retaining autograd history within this example's fixed-parameter run:
 :dedent: 12
 ```
 
-The example actually resumes the saved state and checks every remaining step:
+The example resumes the saved state and checks every remaining step:
 
 ```{literalinclude} ../../examples/functional_heap_schedules.py
 :language: python
@@ -154,8 +153,8 @@ For durable checkpoints across optimizer updates, serialize or clone/detach
 parameters, constants, and schedule values as well as carry. Detached carry
 starts a new gradient history; live cloned carry can continue BPTT.
 
-`initial_state` resets the renewal clock, counts, and initialization RNG as
-before. It preserves consumed heap cursors and clears legacy head overrides,
+`initial_state` resets the renewal clock, counts, and initialization RNG.
+It preserves consumed heap cursors and clears legacy head overrides,
 matching native `initialize()`. Clearing consumption requires declaring a fresh
 calendar or restoring a checkpoint containing the desired earlier cursor.
 
@@ -190,5 +189,8 @@ The complete example executes here:
 
 Pure calendar evaluation supports `torch.compile` and `torch.func`, including
 mapped cursor state and empty mapped lanes. Sampling and cold extraction/commit
-stay outside transformed graphs. Dynamic event insertion, other transport
-backends, and complete standard Network lowering remain later extensions.
+stay outside transformed graphs. Dynamic event insertion and transport backends
+other than dense functional projections are currently unsupported. Canonical
+single-device Network lowering is described in
+{doc}`A19_functional_network_lowering`, and snapshot-based `dn.compile(Network)`
+execution in {doc}`A21_functional_network_compile`.

@@ -7,20 +7,17 @@ kernelspec:
 ---
 
 (functional-event-delivery)=
-# Shared NetCon event delivery
+# Functional NetCon event delivery
 
-An ordinary `Network` declares connectivity once. Its `NetCon` objects own the
-connection routing and delivery state. Dense fixed-delay delivery uses a shared
-tensor core: imperative execution commits its results to owned buffers, while
-the functional interface returns explicit queue state and a due payload.
-`dn.func` supplies the tensor interface and validation; it does not implement
-another connection simulator.
+Lower an initialized `NetCon` with `dn.func.make_functional_netcon` to advance
+event delivery using explicit weights, source observations, and queue state.
+Declare connectivity through the ordinary `Network` API. The functional
+projection returns updated queue state and the payload due for reception,
+without changing the native connection or its input tensors.
 
-This is a building block toward passing a standard `Network` to `dn.compile`.
-Complete Network lowering is still separate work. The interface below lowers
-one existing initialized projection, with explicitly supplied source gates and
-weights. It can be composed with functional populations without redefining
-their connectivity or synapse equations.
+Use this component interface to compose delivery with functional populations.
+For complete Network execution, see {doc}`A19_functional_network_lowering` and
+{doc}`A21_functional_network_compile`.
 
 ## Start with an ordinary Network
 
@@ -46,7 +43,7 @@ synaptic conductances, voltages, and weight gradients.
 The script's `GateInput` is an ordinary `Mechanism` with
 `Mechanism.CARRY("gate")`; fresh initialization sets it to zero. The source
 uses `threshold=None` and `pre_var="mech.source.gate"`, so its values are
-already event gates. `diff_delays=False` selects the existing hard-delay
+already event gates. `diff_delays=False` selects hard-delay
 semantics. Explicitly selecting the dense training backend ensures this
 projection uses a dense delivery ring in both executions.
 
@@ -55,9 +52,9 @@ schedules described in {doc}`A15_functional_tensor_schedules`. This example
 uses raw gates; finite and mixed thresholds are also
 supported, with explicit detector carry and ordered projection phases as
 described in {doc}`A13_functional_threshold_detection`.
-Shared two- and three-tap differentiable delay interpolation is described in
+Two- and three-tap differentiable delay interpolation is described in
 {doc}`A17_functional_delay_interpolation`. Compact queue backends remain native
-execution modes. Shared pure `NetStim` generation and RNG continuation are
+execution modes. `NetStim` generation and RNG continuation are
 described in {doc}`A14_functional_netstim_renewal`.
 
 ## Extract the projection and its explicit tensors
@@ -100,7 +97,7 @@ point synapse, weights and delivered payloads are numerical conductances in
 :dedent: 8
 ```
 
-One projection step returns the already queued payload due now and a new
+One projection step returns the queued payload due at this timestep and a new
 connection state. It clears that due row, multiplies the current gates by the
 current weights, scatters into future rows, and advances its ring and step
 counters. It does not advance a Population or Network clock.
@@ -137,23 +134,20 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-## One transport implementation
+## Compile and batch a composed step
 
-The shared code lives with NetCon in the network layer. Dense training and
-functional delivery use its pure queue transition. Dense inference reuses the
-same routing and write operations with exclusively owned storage, retaining
-its existing uniform/mixed-delay specializations. Reception and source
-detection stay in the existing imperative phase order.
+Functional delivery returns new queue tensors without changing the incoming
+state. Queues, weights, and source gates can therefore be mapped independently
+with `torch.func.vmap`. Use `torch.compile` to compile a step that combines
+projection delivery, reception, and Population integration, preserving the
+connection order described above.
 
-Native training clones each ring once before updating its owned output. The
-functional path uses out-of-place operations so queues, weights, or gates can
-be mapped independently with `vmap`. Its eager execution can need an extra
-temporary ring; native compilation can fuse those operations into one output.
-
-NetStim generation and RNG now use explicit transitions as described in
-{doc}`A14_functional_netstim_renewal`; tensor schedule evaluation is shared as
-described in {doc}`A15_functional_tensor_schedules`. Consuming heap calendars
-are shared as described in {doc}`A16_functional_heap_schedules`.
-Network-level lowering remains a future extension. Users continue to construct networks
-through the standard Dendra API. See {doc}`A8_functional_populations` for population
-execution and {doc}`../synapse_authoring` for authoring a pure receiver.
+NetStim generation with explicit random draws and RNG continuation is described
+in {doc}`A14_functional_netstim_renewal`; tensor schedules are described in
+{doc}`A15_functional_tensor_schedules`, and consuming heap calendars in
+{doc}`A16_functional_heap_schedules`.
+Canonical single-device Network lowering is described in
+{doc}`A19_functional_network_lowering`, and snapshot-based `dn.compile(Network)`
+execution in {doc}`A21_functional_network_compile`. Users construct networks
+through the standard Dendra API. See {doc}`A8_functional_populations` for
+population execution and {doc}`../synapse_authoring` for authoring a pure receiver.

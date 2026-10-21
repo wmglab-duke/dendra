@@ -7,13 +7,13 @@ kernelspec:
 ---
 
 (functional-threshold-detection)=
-# Shared threshold detection and ordered projection phases
+# Threshold detection and ordered projection phases
 
 An initialized dense NetCon can be lowered with finite thresholds as well as
-explicit raw gates. Native and functional execution share the detector in
-the network layer and the fixed-delay transport described in
-{doc}`A12_functional_event_delivery`. Declare connectivity once through an
-ordinary `Network`, then supply source observations and carry explicitly.
+explicit raw gates. Supply source observations and detector carry to reproduce
+the ordinary NetCon threshold policy in functional execution. Declare
+connectivity through an ordinary `Network` and use the delivery interface
+described in {doc}`A12_functional_event_delivery`.
 
 ## Receive before observing the source
 
@@ -33,7 +33,7 @@ The two phases matter when reception changes a field used by a later source
 observation. Precomputing all source values at the start of the connection
 phase changes that behavior. The combined `projection.step(...)` remains
 useful when the supplied observations are already chosen independently of
-reception; its `source_gates` argument now also accepts observations for a
+reception; its `source_gates` argument accepts observations for a
 thresholded projection.
 
 ## Complete recurrent example
@@ -127,11 +127,13 @@ The complete example executes here:
 ```
 
 This interface supports dense connections with fixed or interpolated delays.
-Shared differentiable delay interpolation is described in
+Differentiable delay interpolation is described in
 {doc}`A17_functional_delay_interpolation`; tensor schedules are described in
 {doc}`A15_functional_tensor_schedules`.
 NetStim-generated values bypass threshold detection and retain the native
-checkpoint schema. Shared pure generation with explicit random draws and
+checkpoint schema. Generation with explicit random draws and
 clock/RNG continuation is described in {doc}`A14_functional_netstim_renewal`.
 Consuming heap calendars are described in {doc}`A16_functional_heap_schedules`.
-Complete Network lowering remains a later extension.
+Canonical single-device Network lowering is described in
+{doc}`A19_functional_network_lowering`, and snapshot-based `dn.compile(Network)`
+execution in {doc}`A21_functional_network_compile`.

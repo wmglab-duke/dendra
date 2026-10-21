@@ -10,10 +10,10 @@ kernelspec:
 # Lower a standard Network
 
 Declare and initialize a `Network` using the ordinary Dendra API, then call
-`dn.func.make_functional_network(network)`. The result combines the existing
-functional Population, NetStim, NetCon, and ContinuousCon plans into one pure
-connected timestep. It reuses their numerical implementations and the native
-Network's ordered schedule.
+`dn.func.make_functional_network(network)`. The result is a plan for executing
+connected timesteps with explicit parameters, constants, and state. Functional
+execution preserves the native Network's phase order and supports gradients,
+replay, and checkpoint continuation without advancing the source Network.
 
 The complete
 {download}`functional_network_lowering.py <../../examples/functional_network_lowering.py>`
@@ -25,7 +25,7 @@ Run it with `python examples/functional_network_lowering.py`.
 
 ## Declare the ordinary Network
 
-The initial lowering supports initialized canonical Networks whose simulation
+Functional lowering supports initialized canonical Networks whose simulation
 components use one device. Event connections must use the supported dense queue
 backend. Continuous connections retain native zero/integer-delay semantics.
 Configure training and differentiability before lowering. Populations,
@@ -55,12 +55,12 @@ Network timestep are in milliseconds. See {doc}`../units` and
 ```
 
 `NetworkTensors` has three fields: `parameters`, `constants`, and `state`.
-They are ordinary tensor trees. Component names are the existing names in
+They are ordinary tensor trees. Component names match those in
 `network.populations`, `network.synapses`, and `network.continuous_synapses`.
 
 | Tree | Contents |
 | --- | --- |
-| `parameters["populations"]` | Raw Population parameter mappings from the component lowerers. |
+| `parameters["populations"]` | Raw Population parameter mappings. |
 | `parameters["synapses"]` | Event weights, optional differentiable delays, and schedule packets. |
 | `parameters["continuous_synapses"]` | Continuous weights and explicit transform parameters/buffers. |
 | `parameters["netstim"]` | NetStim parameter mapping and schedule packet, or `None`. |
@@ -88,21 +88,21 @@ changing parameters or constants. Pass per-population explicit `inputs`,
 `extra`, and `intra` values through the corresponding keyword mappings when
 needed, following the functional Population contracts. `inputs` maps names to
 `dn.func.StepInput` values; an `intra` entry overrides that Population's
-`StepInput.intra`. Registered functional stimulation keeps the Population
-component's pure evaluation path. Imperative callbacks are not executed by
-this timestep.
+`StepInput.intra`. Registered Population stimulation remains active.
+Imperative callbacks are not executed by this timestep.
 
-`dn.compile(network)` convenience dispatch is a later integration. Compile the
-pure step directly, as the example's `run_demo(compiled=True)` does with
-`backend="aot_eager", fullgraph=True`, or use the shared rollout and compiled
-chunk APIs in {doc}`A20_functional_network_rollout`. That tutorial covers
-per-population tapes, NetStim draw tapes, recording, and checkpointed execution
-over a complete horizon.
+For a reusable runner with snapshot restart and recording, use `dn.compile`
+as described in {doc}`A21_functional_network_compile`. To compose timesteps
+in your own execution loop, compile the pure step directly; the example's
+`run_demo(compiled=True)` uses `backend="aot_eager", fullgraph=True`.
+For eager rollouts and fixed-horizon compiled chunks, see
+{doc}`A20_functional_network_rollout`, including per-population input tapes,
+NetStim draw tapes, recording, and checkpointed execution.
 
 ## Observe the source at the correct phase
 
-The lowerer resolves each connection's registered `pre_var` into its current
-functional Population frame. Users do not assemble source vectors manually.
+Dendra resolves each connection's registered `pre_var` automatically during
+functional execution.
 Boolean and integer source fields use the same floating dtype conversion as
 the native connection adapters.
 It observes the state at the same phase as the native Network:
@@ -119,10 +119,10 @@ combined delivery. Every event connection delivers due values before observing
 its source. These distinctions matter in recurrent networks: an earlier
 receive can change a field used by the same or a later connection.
 
-Receiver scratch is internal to one timestep. It is reset once and threaded
-between continuous receives, so first-delivery `min`/`max` behavior and true zero
+Each continuous target resets its per-timestep inputs once, then accumulates
+receives in connection order. First-delivery `min`/`max` behavior and true zero
 deliveries retain native semantics. A returned Network state is a complete
-timestep boundary; partial delivery-phase continuation is not exposed here.
+timestep boundary; partial delivery-phase continuation is currently unsupported.
 
 ## Keep NetStim draws explicit
 
@@ -180,9 +180,9 @@ commit directly without first running the prefix:
 Changing wiring, placement, timestep, training mode, source bindings, or static
 transform configuration requires lowering again, and may require native
 initialization first. Runtime values with compatible schemas can be changed
-explicitly. The component-specific purity and eligibility checks still apply;
-their canonical dispatch, storage, and copy/serialization restrictions are
-inherited by Network lowering. See {doc}`A12_functional_event_delivery`,
+explicitly. Populations, connections, and transforms must satisfy their
+functional purity and eligibility contracts, including restrictions on custom
+dispatch, storage, and copy/serialization hooks. See {doc}`A12_functional_event_delivery`,
 {doc}`A17_functional_delay_interpolation`, and
 {doc}`A18_functional_continuous_connectivity`.
 
@@ -193,7 +193,8 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-Multi-step execution is available through {doc}`A20_functional_network_rollout`.
-Heterogeneous-device orchestration, compact event queue backends, full
-`dn.compile(Network)` runner integration, and continuous delay interpolation
-remain separate extensions.
+Multi-step execution is available through {doc}`A20_functional_network_rollout`,
+and snapshot-based `dn.compile(Network)` execution is described in
+{doc}`A21_functional_network_compile`. Fresh pure Network initialization,
+heterogeneous-device functional execution, compact functional event queues, and
+continuous delay interpolation are currently unsupported.

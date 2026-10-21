@@ -7,14 +7,13 @@ kernelspec:
 ---
 
 (functional-tensor-schedules)=
-# Shared tensor schedules and indexed sources
+# Tensor schedules and indexed sources
 
-Native NetStim and NetCon schedules now use pure evaluation in the network
-layer. Their functional adapters call the same evaluator with explicit event
-times, amplitudes, and indexed source vectors. Declare events through the
-ordinary `schedule`, `schedule_ref`, and `schedule_time_ref` APIs before
-lowering. Event routing and reference indices are fixed for a lowered plan;
-floating values remain explicit inputs.
+Functional NetStim and NetCon schedules accept explicit event times,
+amplitudes, and indexed source vectors, including differentiable values.
+Declare events through the ordinary `schedule`, `schedule_ref`, and
+`schedule_time_ref` APIs before lowering. Event routing and reference indices
+are fixed for a lowered plan; floating values remain explicit inputs.
 
 Index expansion and `allow_past` filtering happen when events are declared,
 before lowering. Editing packet values reevaluates retained events; it does
@@ -40,8 +39,8 @@ and multiple schedule owners, can use the same source entry.
 :dedent: 8
 ```
 
-NetStim's legacy unit-amplitude Python schedule uses heaps. Select tensor
-storage with `differentiable=True`, tensor-valued trainable times, or
+NetStim's unit-amplitude Python schedule uses consuming heap calendars. Select
+tensor storage with `differentiable=True`, tensor-valued trainable times, or
 non-unit/tensor amplitudes. Indexed reference methods also use tensor storage.
 Functional NetStim lowering also accepts consuming heap calendars with explicit
 cursor carry, as described in {doc}`A16_functional_heap_schedules`.
@@ -133,9 +132,9 @@ tracking rejection.
 
 Tensor schedule evaluation is stateless: repeating a time/step reevaluates the
 same event; skipping a hard event's grid step misses it. No consumed-event
-cursor is added. Heap events consume overdue entries and coalesce them under
-their existing policy. Preserve these distinctions when implementing an outer
-loop. For Network parity, generate times as
+cursor is added. Heap events consume overdue entries and coalesce them into
+one source event per call. Preserve these distinctions when implementing an
+outer loop. For Network parity, generate times as
 `origin + origin.new_tensor(integer_step) * dt`, as the example does. This
 preserves the clock dtype and multiplication order; repeated floating-point
 addition or multiplication first performed as Python floats can move an exact
@@ -182,6 +181,11 @@ The complete example executes here:
 ```
 
 Functional schedules currently use fixed tensor topology and dense projections.
-Shared differentiable delays are described in {doc}`A17_functional_delay_interpolation`. Heap calendars are described in {doc}`A16_functional_heap_schedules`.
-Dynamic insertion inside transformed loops, other
-transport backends, and complete Network lowering remain later extensions.
+Differentiable delays are described in
+{doc}`A17_functional_delay_interpolation`. Heap calendars are described in
+{doc}`A16_functional_heap_schedules`.
+Dynamic insertion inside transformed loops and transport backends other than
+dense functional projections are currently unsupported. Canonical single-device
+Network lowering is described in {doc}`A19_functional_network_lowering`, and
+snapshot-based `dn.compile(Network)` execution in
+{doc}`A21_functional_network_compile`.

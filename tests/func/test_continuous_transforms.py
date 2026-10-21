@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 import sys
-from types import ModuleType
+from types import MappingProxyType, ModuleType
 
 import numpy as np
 import pytest
@@ -217,6 +217,33 @@ def test_tied_registered_parameter_aliases_keep_the_native_gradient():
     actual = torch.autograd.grad(payload.sum(), parameters["left"])[0]
     expected = torch.autograd.grad(native.syn.g_pre.sum(), native.transform.left)[0]
     torch.testing.assert_close(actual, expected)
+
+
+def test_read_only_transform_packet_preserves_tied_native_parameter_gradients():
+    _, native = _connection((0.0,) * 4, transform=_TiedGate())
+    projection, tensors = dn.func.make_functional_continuous_con(native)
+    parameters = MappingProxyType(tensors.transform_parameters)
+    if "right" in parameters:
+        assert parameters["right"] is parameters["left"]
+    values = torch.tensor([[-0.8], [0.6]], dtype=DTYPE, requires_grad=True)
+    native_values = values.detach().clone().requires_grad_()
+    _, payload, _ = projection.advance(
+        tensors.weights, tensors.state, values, transform_parameters=parameters
+    )
+    native.pre.v = native_values
+    native.syn.reset_continuous_inputs()
+    native.advance()
+    torch.testing.assert_close(payload, native.syn.g_pre)
+    actual = torch.autograd.grad(
+        payload.square().sum(), (parameters["left"], values, tensors.weights)
+    )
+    expected = torch.autograd.grad(
+        native.syn.g_pre.square().sum(),
+        (native.transform.left, native_values, native.weight.w),
+    )
+    _close(actual, expected)
+    assert all(value.abs().sum() > 0 for value in actual)
+    assert parameters["left"] is tensors.transform_parameters["left"]
 
 
 @pytest.mark.parametrize("backend", ("aot_eager", "inductor"))

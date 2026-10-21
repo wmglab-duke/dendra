@@ -739,7 +739,7 @@ class ContinuousTransformPlan:
         if self.is_module:
             result = functional_call(
                 self._execution,
-                parameters or {},
+                {} if parameters is None else dict(parameters),
                 (values,),
                 strict=True,
                 tie_weights=True,

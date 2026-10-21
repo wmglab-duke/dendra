@@ -15,7 +15,7 @@ change.
 Population-shaped sparse storage (experimental)
 ------------------------------------------------
 
-By default, a non-contiguous sparse support keeps its historical flat local
+By default, a non-contiguous sparse support uses a flat local
 axis. For example, a mechanism installed on ``K`` identical compartment
 columns in each of ``N`` cells has local shape ``(N * K,)``. A Population can
 opt into the experimental population-shaped layout:
@@ -58,7 +58,7 @@ therefore shares one value across all cells.
 Construction policy and precedence
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The base ``Population`` default remains off for compatibility. A model family
+The base ``Population`` default is ``False``. A model family
 that has audited its mechanisms, batching semantics, and checkpoints may opt in
 by declaring a class default:
 
@@ -128,9 +128,9 @@ when all of the following are true:
 * its class-wide RANGE/BATCH defaults, constructor overrides, and initial
   conditions have unambiguous broadcast shapes.
 
-All other cases silently retain their established layout and numerical path.
+All other cases retain their default layout and numerical path.
 Dense and rectangular slice placements are not transformed by this option
-because their established layout already retains its native rectangular axes.
+because their layout retains its rectangular axes.
 Other fallbacks include partial or different per-cell supports, ragged
 supports, duplicate/copy slots, forced-flat placements, PointProcess and
 synapse types, VoltageProcess, MaterialProcess (including regional diffusion),
@@ -138,10 +138,10 @@ packed MultiPopulation models, and flat-only class-wide parameter values.
 
 The option is accepted by ``Population`` and by model families (including
 Axon and Tree subclasses) that forward Population constructor keywords.
-``MultiPopulation`` currently packs each component through its existing
-one-population representation, so it deliberately receives no benefit yet.
+``MultiPopulation`` packs each component through a one-population
+representation and does not use population-shaped sparse storage.
 
-A custom mechanism whose code assigns special meaning to the historical flat
+A custom mechanism whose code assigns special meaning to the flat local
 slot axis can explicitly opt out:
 
 .. code-block:: python
@@ -162,9 +162,8 @@ Each handler owns one runtime-only support registry. During construction, and
 again whenever runtime maps are rebuilt after loading or device conversion,
 the registry visits mechanisms in authored order and groups them only when
 their ordered physical support *and* local tensor layout are exactly equal.
-All initialization, state, field-read, assigned-value, and current plans refer
-to the same handler-wide support IDs rather than independently renumbering a
-support in each phase.
+All initialization, state, field-read, assigned-value, and current plans use
+the same handler-wide support IDs.
 
 Support IDs are the authored ordinal of the first mechanism in a group and may
 therefore be sparse. If mechanisms 0 and 1 share a support while mechanism 2
@@ -207,7 +206,7 @@ in-place mutation would therefore be visible to another reader. A Material
 READ+WRITE binding remains isolated because its local value is intentionally
 mutable before the ordered write-back phase.
 
-This is scheduling reuse, not mechanism fusion. Every mechanism keeps its own
+Every mechanism keeps its own
 parameters, state solver, assigned-value evaluation, RNG streams, and write
 semantics. Mechanism and State hooks must treat their voltage argument as
 read-only because equal-support mechanisms can receive the same gathered
@@ -225,25 +224,24 @@ Compatibility and checkpoints
 -----------------------------
 
 The option changes the mechanism storage ABI. Ordinary ``state_dict`` entries
-therefore have different shapes between legacy and population-shaped models;
+therefore have different shapes between flat and population-shaped models;
 do not reinterpret one layout as the other. Ordinary state dictionaries are
 weights for the same compiled architecture: persistent selector keys must
 match the target placement exactly, and a same-sized key for another region is
 rejected. Runtime checkpoints additionally store a versioned, named support
 identity and reject a checkpoint for different physical compartments or a
 different local layout before mutating tensors, RNG streams, or delay queues.
-Checkpoints written before support identity was introduced remain loadable
-under their historical shape-only rule.
+Checkpoints without support identity metadata use shape-only validation.
 
-For compatibility, ``mechanism.key`` currently remains the complete ordered
+``mechanism.key`` is the complete ordered
 flat physical key even when the structured mapper operates on only ``K``
 column indices. It is structural, immutable runtime data: do not modify it in
 place or load it from a differently placed model. Change placement through
-``Population.insert`` / ``delete`` and rebuild. Equal-support mechanisms now
+``Population.insert`` / ``delete`` and rebuild. Equal-support mechanisms
 share one immutable runtime mapper and support specification, but every
 mechanism retains its own registered compatibility key. The registry owns no
-selector tensors and contributes no ``state_dict`` entries, so ordinary and
-runtime checkpoint formats are unchanged.
+selector tensors and contributes no entries to ordinary state dictionaries or
+runtime checkpoints.
 
 Inspection and benchmarking
 ---------------------------
@@ -264,11 +262,11 @@ per-mechanism compatibility representation used by current checkpoints.
 
 ``scripts/benchmark_mechanism_support.py`` compares separate and grouped
 flat/axis current assembly plus separate, shared, and clone-isolated field
-reads in eager or compiled execution. It also compares the former repeated
-per-phase support partitioning with one registry rebuild followed by phase
+reads in eager or compiled execution. It also compares per-phase support
+partitioning with one registry rebuild followed by phase
 lookups. ``--distinct-supports`` distributes channels into contiguous authored
 clusters across multiple exact supports, matching the scheduler's adjacent-run
-current aggregation. The report distinguishes unchanged serialized/runtime
+current aggregation. The report distinguishes serialized/runtime
 key bytes, a unique flattened target, and the compact interned target; the
-latter two describe raw integer-selector payload for later storage migrations,
-not current ``state_dict`` size or total checkpoint size.
+latter two measure raw integer-selector payload. They are not measurements of
+``state_dict`` size or total checkpoint size.

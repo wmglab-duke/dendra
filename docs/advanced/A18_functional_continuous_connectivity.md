@@ -7,12 +7,13 @@ kernelspec:
 ---
 
 (functional-continuous-connectivity)=
-# Shared continuous connectivity
+# Continuous connectivity
 
 Continuous connections sample a source variable each timestep. Declare them
 with the standard `Network.connect_continuous` API, then lower the initialized
-`ContinuousCon` and its target Population. Native and functional execution use
-the same pure transport, receiver operations, and user-authored source transform.
+`ContinuousCon` and its target Population. Supply explicit source values,
+weights, and connection state to reproduce the native delivery and receiver
+behavior in a functional step, including custom source transforms.
 
 The complete
 {download}`functional_continuous_connectivity.py <../../examples/functional_continuous_connectivity.py>`
@@ -158,9 +159,9 @@ Unregistered tensor captures in functions, closures, or module attributes must
 be made explicit through a module. Pure functions may use immutable constants
 and helpers; their dependencies are checked as part of lowering.
 
-`sigmoid_release` follows this same generic module path, using its existing
-`forward`. Its default `theta` and `sigma` float attributes remain static
-configuration. It has no privileged lowering and needs no extra hook.
+`sigmoid_release` is a stateless module with a `forward` method. Its default
+`theta` and `sigma` float attributes are static configuration. Supply and
+parameterize it using the same module contract as custom transforms.
 
 Lowering qualifies a disposable transform copy and checks source-code
 dependencies, arguments, registered tensors, Python state, repeated outputs, and
@@ -227,7 +228,7 @@ checkpoint data. Resume at a complete timestep boundary and create fresh
 scratch at the next reset. The runtime checkpoint protocol preserves pending
 payloads and their gradient history. Native `state_cache()` is a separate,
 detached cold-start protocol that rematerializes recorded source history
-using current parameters; its existing behavior is retained.
+using current parameters.
 
 The complete example executes here:
 
@@ -238,4 +239,4 @@ The complete example executes here:
 
 Canonical single-device `Network` lowering is described in
 {doc}`A19_functional_network_lowering`. Differentiable continuous delay
-interpolation remains a separate extension.
+interpolation is currently unsupported.

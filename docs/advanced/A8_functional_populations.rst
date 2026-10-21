@@ -12,11 +12,10 @@ and ``torch.compile`` without changing the normal ``Population.step()``,
 Quick start: compiled scan or while loop
 ----------------------------------------
 
-For a reusable compiled simulation, ``dn.compile`` handles
-functionalization, independent parameter copies, preparation, compilation, and
-binding. It is an exact top-level alias of ``dn.func.compile``, which remains
-supported; both names refer to the same function. Start from an initialized,
-functionally supported Population:
+For a reusable compiled simulation, use ``dn.compile`` (also available as
+``dn.func.compile``). Its runner provides independent parameter tensors,
+configurable recording, and explicit simulation state. Start from an
+initialized, functionally supported Population:
 
 .. code-block:: python
 
@@ -72,8 +71,8 @@ path. Both modes default to ``inference=True``: the runner manages
 ``torch.inference_mode()`` and, for CPU Inductor compilation, enables the C++
 wrapper unless ``options={"cpp_wrapper": False}`` overrides it. The first call
 captures and compiles the loop; retain the runner for subsequent calls.
-Explicit compiler modes and alternate code-generation options retain their
-original compiler policy rather than receiving a new wrapper preference.
+Explicit compiler modes and alternate code-generation options take precedence
+over the default C++ wrapper choice.
 Scan and while execution use Dendra's PyTorch 2.14+ baseline; supported features
 are not selected by patch-version number. While execution requires at least four steps, a nonempty
 collection of supported built-in callbacks, and a capturable inference step.
@@ -1732,8 +1731,9 @@ packed Slice does not restore its original cell-axis layout.
 Regions select physical coordinates for ``v``, ``i_membrane``, and ``vc``;
 ``vc`` retains all three circuit-potential channels. Scalar ``t`` may be
 recorded alongside these and is left unchanged. Mechanism-local states such
-as ``hh.m`` do not yet support ``region`` because their sparse support need
-not match physical voltage coordinates. They remain recordable without it.
+as ``hh.m`` are recordable without ``region``. Region selection for these
+states is currently unsupported because their sparse support need not match
+physical voltage coordinates.
 
 ``region`` cannot be combined with ``node_indices``, ``max_only``, or
 ``partition``. Those existing arguments retain their final-axis semantics;
@@ -2642,7 +2642,7 @@ the t=0 state. Initial Ion and Material tensor parameters participate in
 autograd, higher-order transforms, ``vmap``, and transform-then-compile in the
 same way as other functional parameters. A direct tensor initial value may be
 scalar or have any visible shape that broadcasts exactly to its complete
-shared-field shape; callable-module initial sources are not yet supported.
+shared-field shape; callable-module initial sources are currently unsupported.
 
 Other functional models can still start from ``tensors.state``. Fresh
 ``initialize`` is unavailable for arbitrary Population or Integrator

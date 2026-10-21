@@ -16,6 +16,34 @@ from dendra.models.mechanisms._handler import MechanismHandler
 from ._types import FunctionalizationError
 
 
+def _canonicalize_mapping_tree(tree):
+    """Normalize public Mappings to compiler PyTrees without copying tensors.
+
+    Standard dict/tuple packets retain their containers when no child changes.
+    Mapping accessors may execute external Python; complete normalization
+    before checking source, schema, or prepared-coefficient freshness.
+    """
+    if isinstance(tree, Mapping):
+        changed = type(tree) is not dict
+        values = {}
+        for name, value in tree.items():
+            normalized, child_changed = _canonicalize_mapping_tree(value)
+            values[name] = normalized
+            changed |= child_changed
+        return (values if changed else tree), changed
+    if isinstance(tree, tuple):
+        values = []
+        changed = False
+        for value in tree:
+            normalized, child_changed = _canonicalize_mapping_tree(value)
+            values.append(normalized)
+            changed |= child_changed
+        if changed:
+            result = type(tree)(*values) if hasattr(tree, "_fields") else tuple(values)
+            return result, True
+    return tree, False
+
+
 def _registered_source(population, reference):
     if not isinstance(reference, str) or not reference:
         raise FunctionalizationError("Network pre_var must name a registered Tensor.")

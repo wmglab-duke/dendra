@@ -7,11 +7,11 @@ kernelspec:
 ---
 
 (functional-delay-interpolation)=
-# Shared differentiable connection delays
+# Differentiable connection delays
 
-Native NetCon and its functional adapter now share pure two- and three-tap
-dense delay interpolation. Declare connectivity with the ordinary Network API,
-configure interpolated training delays, then lower the existing connection.
+NetCon's functional adapter supports two- and three-tap dense delay
+interpolation. Declare connectivity with the ordinary Network API, configure
+interpolated training delays, then lower the initialized connection.
 Physical delays become explicit differentiable inputs; the routing, timestep,
 interpolation policy, and queue capacity remain fixed in the plan.
 
@@ -38,7 +38,8 @@ restriction to hard delays, hard spikes, and hard scheduled times.
 
 Configure the source before lowering. The interpolation path applies to the
 active training runtime; evaluation retains integer-delay execution. Compact
-training and inference backends remain separate work.
+training and inference backends are currently unsupported by this functional
+interface.
 
 ## Supply explicit effective delays
 
@@ -49,15 +50,15 @@ training and inference backends remain separate work.
 :dedent: 4
 ```
 
-`NetConTensors` now has fields `(weights, state, schedule=None, delays=None)`.
-Existing field access and three-argument construction remain valid. Consumers
-that unpack the complete tuple should account for its fourth field.
+`NetConTensors` has fields `(weights, state, schedule=None, delays=None)`.
+`schedule` and `delays` are optional constructor arguments. Unpacking the
+complete tuple returns all four fields.
 
 | Field | Meaning |
 | --- | --- |
 | `weights` | Effective target-unit weights, one per materialized connection. |
 | `delays` | Effective physical delay tensor in milliseconds for interpolation plans; `None` for fixed-delay plans. |
-| `state` | Existing dense queue, ring/global-step counters, and detector carry. |
+| `state` | Dense queue, ring/global-step counters, and detector carry. |
 | `schedule` | Optional tensor schedule packet, independent of delay interpolation. |
 
 Extracted parameters and schedule values are independent ordinary leaf
@@ -69,7 +70,7 @@ flow to the explicit inputs rather than the original Network.
 
 Interpolation plans require `delays=...` on every `advance` or `step` call.
 The tensor must retain the extracted shape, dtype, and device. Fixed-delay
-plans retain their existing calls without a delay argument and reject a
+plans use calls without a delay argument and reject a
 non-`None` delay input, since their integer routing is frozen.
 
 ## Preserve receive-before-observe ordering
@@ -105,16 +106,15 @@ For each physical delay `d`, native interpolation forms
 - Three taps write at offsets `k - 1`, `k`, and `k + 1`, with weights given by
   `softmax(-0.5 * ((position - offsets) / (sigma + 1e-6))**2)`.
 
-All destinations use the initialized ring's modulo addressing. The shared
-core preserves the existing clamp/floor autograd conventions and operation
-order. Delay gradients are piecewise; comparisons at delay boundaries should
+All destinations use the initialized ring's modulo addressing. Native and
+functional execution use the same clamp/floor autograd conventions and
+operation order. Delay gradients are piecewise; comparisons at delay boundaries should
 use the native analytical policy rather than assume a smooth finite difference.
 
 Three-tap offsets can include zero when `k == 1`. That tap is written after
 the current row has already been read, so it arrives when the ring visits that
-row again, after a full ring wrap. This is the existing native dense behavior;
-the shared implementation preserves it rather than moving that contribution
-to the next timestep.
+row again, after a full ring wrap. This behavior applies to native and
+functional dense execution.
 
 Queue capacity does not grow when explicit delay values change. Delays outside
 the initialized horizon wrap modulo that capacity, as they do natively. Choose
@@ -140,7 +140,7 @@ the owner clock together:
 ```
 
 The example clones carry without detaching it, preserving BPTT history through
-the saved prefix. It then actually resumes that saved state and checks each
+the saved prefix. It resumes that saved state and checks each
 remaining step and the complete gradients:
 
 ```{literalinclude} ../../examples/functional_delay_interpolation.py
@@ -170,8 +170,8 @@ The example deliberately changes the receiving connection before restoring:
 ```
 
 This continuation uses the runtime `state_dict_for_checkpoint` protocol. The
-older `state_cache()` / `initialize_from_state_cache()` gate-history API is a
-different operation: its native cold rematerialization still uses current
+`state_cache()` / `initialize_from_state_cache()` gate-history API is a
+different operation: native cold rematerialization uses current
 integer inference delays. It is not interpolation-aware runtime restoration.
 
 The complete example executes here:
@@ -181,8 +181,8 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-Shared pure continuous projections are described in
+Continuous projections are described in
 {doc}`A18_functional_continuous_connectivity`. Canonical single-device Network
 composition is described in {doc}`A19_functional_network_lowering`. Compact
-queue backends remain a later extension; the native and functional adapters
-already share the same dense interpolation engine.
+queue backends are currently unsupported by the functional adapter. The native
+and functional adapters use the same dense interpolation policy.

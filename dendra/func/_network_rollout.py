@@ -11,8 +11,16 @@ import torch
 from torch.utils import _pytree as pytree
 
 from ._callbacks import _update_callback_values
+from ._execution import (
+    ExecutionCapabilities,
+    ExecutionReport,
+    _backend_name,
+    _capabilities,
+    _ExecutionReportState,
+)
 from ._netstim import NetStimDraw, NetStimOutputs
 from ._network import _schema, _tensor_paths, _validate_tree
+from ._network_bindings import _canonicalize_mapping_tree
 from ._population import _tensor_tree_binding
 from ._runners import (
     _attach_callback_results,
@@ -244,15 +252,18 @@ def rollout(
     callback_state=None,
     constants=None,
 ):
+    (parameters, prepared, state, inputs, constants), _ = _canonicalize_mapping_tree(
+        (parameters, prepared, state, inputs, constants)
+    )
     callbacks, callback_state, parts = _validate(
         functional, parameters, state, callbacks, callback_state
     )
+    tape, steps = _resolve_inputs(functional, inputs, steps)
     if constants is None:
         values = functional._validate_prepared(prepared, parameters)
     else:
         _validate_tree(constants, functional._constant_schema, "constants")
         values = functional._prepare_values(parameters, constants)
-    tape, steps = _resolve_inputs(functional, inputs, steps)
     with nullcontext() if functional.training else torch.no_grad():
         state, auxiliary, callback_state, emitted = _eager_values(
             functional,
@@ -278,7 +289,15 @@ class CompiledNetworkChunk:
     tensor-only kernel. Kernel caches retain no live input/preparation graphs.
     """
 
-    def __init__(self, functional, *, steps, execution="scan", **compile_options):
+    def __init__(
+        self,
+        functional,
+        *,
+        steps,
+        execution="scan",
+        _report_state=None,
+        **compile_options,
+    ):
         if _steps(steps) < 1:
             raise ValueError("compiled chunks require a positive step count")
         if execution not in {"scan", "unrolled"}:
@@ -291,6 +310,10 @@ class CompiledNetworkChunk:
             # the public cold boundary, before any checkpoint forward/replay.
             install_scan_compatibility()
         self._functional, self._steps, self._execution = functional, steps, execution
+        self._capabilities = _capabilities(execution)
+        self._report_state = (
+            _ExecutionReportState() if _report_state is None else _report_state
+        )
         self._options = dict(compile_options)
         self._options.setdefault("fullgraph", True)
         self._options.setdefault("dynamic", False)
@@ -302,6 +325,30 @@ class CompiledNetworkChunk:
     def steps(self):
         return self._steps
 
+    @property
+    def capabilities(self) -> ExecutionCapabilities:
+        """The immutable execution and differentiation contract for this chunk."""
+        return self._capabilities
+
+    def execution_report(self) -> ExecutionReport | None:
+        """Describe the latest successful dispatch, including tails and replay.
+
+        Reports contain scalar metadata only. An empty host run makes no
+        dispatch, and checkpoint replay may replace the report during backward.
+        """
+        return self._report_state.report
+
+    def _record_execution(self, strategy, *, callbacks, grad_enabled, reason=None):
+        self._report_state.report = ExecutionReport(
+            requested_execution=self._execution,
+            strategy=strategy,
+            steps=self.steps,
+            callbacks=callbacks is not None,
+            grad_enabled=grad_enabled,
+            backend=_backend_name(self._options),
+            reason=reason,
+        )
+
     def _runner_chunk(self, steps):
         if steps == self.steps:
             return self
@@ -312,6 +359,7 @@ class CompiledNetworkChunk:
                 self._functional,
                 steps=steps,
                 execution=self._execution,
+                _report_state=self._report_state,
                 **self._options,
             )
         return self._tails[steps]
@@ -372,12 +420,12 @@ class CompiledNetworkChunk:
         )
 
     def _values(self, parameters, prepared, state, tape, callbacks, callback_state):
-        transform = (
-            torch._C._are_functorch_transforms_active()
-            or torch.autograd.forward_ad._current_level >= 0
-        )
-        if transform or self._options.get("disable", False):
-            return _eager_values(
+        transform = torch._C._are_functorch_transforms_active()
+        forward_ad = torch.autograd.forward_ad._current_level >= 0
+        disabled = self._options.get("disable", False)
+        grad_enabled = torch.is_grad_enabled()
+        if transform or forward_ad or disabled:
+            result = _eager_values(
                 self._functional,
                 parameters,
                 prepared,
@@ -387,6 +435,24 @@ class CompiledNetworkChunk:
                 callbacks,
                 callback_state,
             )
+            strategy = (
+                "eager_transform_fallback"
+                if transform
+                else "eager_forward_ad_fallback"
+                if forward_ad
+                else "eager_disabled"
+            )
+            self._record_execution(
+                strategy,
+                callbacks=callbacks,
+                grad_enabled=grad_enabled,
+                reason=(
+                    "Compilation was explicitly disabled."
+                    if strategy == "eager_disabled"
+                    else None
+                ),
+            )
+            return result
         if callbacks is None:
             if self._plain_kernel is None:
                 self._plain_kernel = self._make_kernel(None)
@@ -406,6 +472,16 @@ class CompiledNetworkChunk:
             callback_state = callbacks._wrap_compiled_update(
                 callback_state, carries, emitted
             )
+        self._record_execution(
+            "compiled_scan" if self._execution == "scan" else "compiled_unrolled",
+            callbacks=callbacks,
+            grad_enabled=grad_enabled,
+            reason=(
+                "Unrolled execution was explicitly selected."
+                if self._execution == "unrolled"
+                else None
+            ),
+        )
         return loop["network"], loop["auxiliary"], callback_state, emitted
 
     def __call__(
@@ -418,21 +494,31 @@ class CompiledNetworkChunk:
         callbacks=None,
         callback_state=None,
     ):
-        functional = self._functional
-        callbacks, callback_state, parts = _validate(
-            functional, parameters, state, callbacks, callback_state
-        )
-        values = functional._validate_prepared(prepared, parameters)
-        tape, _ = _resolve_inputs(functional, inputs, self.steps)
-        with nullcontext() if functional.training else torch.no_grad():
-            state, auxiliary, callback_state, emitted = self._values(
-                parameters, values, state, tape, callbacks, callback_state
+        previous = self._report_state.report
+        try:
+            # Mapping accessors may execute external Python. Finish all public
+            # packet traversal before validating source/preparation freshness.
+            (parameters, prepared, state, inputs), _ = _canonicalize_mapping_tree(
+                (parameters, prepared, state, inputs)
             )
-        if callbacks is not None and callbacks._has_emissions(emitted):
-            parts.append(emitted)
-        return state, _attach_callback_results(
-            auxiliary, callbacks, callback_state, parts
-        )
+            functional = self._functional
+            callbacks, callback_state, parts = _validate(
+                functional, parameters, state, callbacks, callback_state
+            )
+            tape, _ = _resolve_inputs(functional, inputs, self.steps)
+            values = functional._validate_prepared(prepared, parameters)
+            with nullcontext() if functional.training else torch.no_grad():
+                state, auxiliary, callback_state, emitted = self._values(
+                    parameters, values, state, tape, callbacks, callback_state
+                )
+            if callbacks is not None and callbacks._has_emissions(emitted):
+                parts.append(emitted)
+            return state, _attach_callback_results(
+                auxiliary, callbacks, callback_state, parts
+            )
+        except BaseException:
+            self._report_state.report = previous
+            raise
 
 
 def run(
@@ -455,6 +541,10 @@ def run(
     sample each bounded host span sequentially from explicit RNG carry before
     entering checkpoint/compiled execution. Backward reuses those same packets.
     """
+    public_parameters, public_constants, public_inputs = parameters, constants, inputs
+    (parameters, constants, state, inputs), _ = _canonicalize_mapping_tree(
+        (parameters, constants, state, inputs)
+    )
     callbacks, callback_state, parts = _validate(
         functional, parameters, state, callbacks, callback_state
     )
@@ -480,19 +570,21 @@ def run(
         kernel_width = chunklength
     # Capture the live public bindings as well as explicit checkpoint operands.
     # Container rebinding and tensor writes after forward invalidate replay.
-    binding = _binding((parameters, constants)) if checkpoint_active else None
-    tape_binding = _binding((inputs, tape)) if checkpoint_active else None
+    binding = (
+        _binding((public_parameters, public_constants)) if checkpoint_active else None
+    )
+    tape_binding = _binding((public_inputs, tape)) if checkpoint_active else None
     auxiliary = _auxiliary(functional, state)
 
     def span(parameters_in, constants_in, state_in, tape_in, callback_in, span_steps):
-        functional._validate_source()
         if binding is not None and (
-            _binding((parameters, constants)) != binding
-            or _binding((inputs, tape)) != tape_binding
+            _binding((public_parameters, public_constants)) != binding
+            or _binding((public_inputs, tape)) != tape_binding
         ):
             raise FunctionalizationError(
                 "Network parameters, constants, or input tapes changed after checkpoint forward"
             )
+        functional._validate_source()
         functional._validate_parameters(parameters_in)
         functional._validate_state(state_in)
         values = functional._prepare_values(parameters_in, constants_in)

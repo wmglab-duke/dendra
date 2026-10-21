@@ -1,0 +1,80 @@
+"""Shared host-runner validation and compiler policy."""
+
+from collections.abc import Mapping
+
+import torch
+
+from ._callbacks import FunctionalCallback
+from ._types import FunctionalizationError
+
+
+def _validate_host_construction(compile_options):
+    if torch.compiler.is_compiling():
+        raise FunctionalizationError("construct compiled runners outside torch.compile")
+    removed = [name for name in ("record", "node_indices") if name in compile_options]
+    if removed:
+        raise TypeError(
+            f"Removed compile argument(s): {', '.join(removed)}; configure "
+            "recording through callbacks={'trace': "
+            "dn.func.Recorder(..., node_indices=...)}"
+        )
+
+
+def _configured_callbacks(callbacks):
+    if callbacks is not None and not isinstance(callbacks, Mapping):
+        raise TypeError(
+            "callbacks must be a named mapping of FunctionalCallback configurations"
+        )
+    configured = {} if callbacks is None else dict(callbacks)
+    for name, callback in configured.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("functional callback names must be non-empty strings")
+        if not isinstance(callback, FunctionalCallback):
+            raise TypeError(
+                "callback values must be FunctionalCallback configurations, not imperative callbacks"
+            )
+    return configured
+
+
+def _validate_host_call():
+    if torch.compiler.is_compiling():
+        raise FunctionalizationError("call compiled runners outside torch.compile")
+    if (
+        torch._C._are_functorch_transforms_active()
+        or torch.autograd.forward_ad._current_level >= 0
+    ):
+        raise FunctionalizationError(
+            "compiled runners are host-side callables; use the lower-level "
+            "functional API for torch.func or forward-mode AD transforms"
+        )
+
+
+def _inference_compile_options(functional, inference, backend, options, keywords):
+    """Prefer a native CPU loop without overriding explicit compiler choices."""
+    result = dict(keywords)
+    result["backend"] = backend
+    selected = None if options is None else dict(options)
+    if (
+        inference
+        and functional.device.type == "cpu"
+        and backend == "inductor"
+        and not result.get("disable", False)
+        and result.get("mode") is None
+    ):
+        from torch._inductor import config
+
+        candidate = selected or {}
+        normalized = {
+            name.replace("-", "_"): value for name, value in candidate.items()
+        }
+        if not (
+            normalized.get("use_aoti", False)
+            or normalized.get("disable_cpp_codegen", config.disable_cpp_codegen)
+            or normalized.get("fx_wrapper", config.fx_wrapper)
+        ):
+            selected = dict(candidate)
+            if "cpp_wrapper" not in normalized:
+                selected["cpp_wrapper"] = True
+    if selected is not None:
+        result["options"] = selected
+    return result

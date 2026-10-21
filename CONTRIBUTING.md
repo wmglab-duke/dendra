@@ -96,6 +96,23 @@ docs: clarify CPU solver installation
 or changelog manually; continuous integration handles both after changes reach
 `main`.
 
+## Write user documentation
+
+Describe what Dendra supports and how users can use it. State current behavior
+directly, using phrases such as "uses" or "supports" rather than "now uses" or
+"previously used". Explain implementation details when they help users choose
+an API, understand results, or use a feature correctly.
+
+Describe feature limitations as "currently unsupported" without implying a
+roadmap. When support is implemented, replace those limitations with usage
+guidance and links to the supported APIs. Keep related tutorials and API
+references consistent.
+
+Put version comparisons and change history in release notes or the
+[upgrading guide](docs/upgrading.rst). Tutorials and API references should
+describe the current interface without requiring knowledge of its development
+history.
+
 ## Test the change
 
 Run the smallest relevant tests while developing, then run the required CPU

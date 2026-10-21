@@ -1,4 +1,4 @@
-"""Opt-in compiled runners; imperative Population scheduling is unchanged."""
+"""Opt-in compiled runners over the existing functional execution adapters."""
 
 from __future__ import annotations
 
@@ -10,12 +10,17 @@ import torch
 from torch.utils import _pytree as pytree
 
 from ._binding import BoundPopulation
-from ._callbacks import FunctionalCallback
 from ._compiled import CompiledPopulationChunk
 from ._population import (
     FunctionalPopulation,
     _initialization_transform_hooks,
     make_functional,
+)
+from ._runner_policy import (
+    _configured_callbacks,
+    _inference_compile_options,
+    _validate_host_call,
+    _validate_host_construction,
 )
 from ._runners import _run_source_validated, run
 from ._types import FunctionalizationError, InitializationInput
@@ -46,37 +51,6 @@ def _initialization_writes_parameters(functional):
         for hook in _initialization_transform_hooks(population, phase)
         for reference in population._initialization_transforms[hook.action_name].writes
     )
-
-
-def _inference_compile_options(functional, inference, backend, options, keywords):
-    """Prefer a native CPU loop without overriding explicit compiler choices."""
-    result = dict(keywords)
-    result["backend"] = backend
-    selected = None if options is None else dict(options)
-    if (
-        inference
-        and functional.device.type == "cpu"
-        and backend == "inductor"
-        and not result.get("disable", False)
-        and result.get("mode") is None
-    ):
-        from torch._inductor import config
-
-        candidate = selected or {}
-        normalized = {
-            name.replace("-", "_"): value for name, value in candidate.items()
-        }
-        if not (
-            normalized.get("use_aoti", False)
-            or normalized.get("disable_cpp_codegen", config.disable_cpp_codegen)
-            or normalized.get("fx_wrapper", config.fx_wrapper)
-        ):
-            selected = dict(candidate)
-            if "cpp_wrapper" not in normalized:
-                selected["cpp_wrapper"] = True
-    if selected is not None:
-        result["options"] = selected
-    return result
 
 
 class CompiledRunner:
@@ -142,19 +116,7 @@ class CompiledRunner:
         options=None,
         **compile_options,
     ):
-        if torch.compiler.is_compiling():
-            raise FunctionalizationError(
-                "construct compiled runners outside torch.compile"
-            )
-        removed = [
-            name for name in ("record", "node_indices") if name in compile_options
-        ]
-        if removed:
-            raise TypeError(
-                f"Removed compile argument(s): {', '.join(removed)}; configure "
-                "recording through callbacks={'trace': "
-                "dn.func.Recorder(..., node_indices=...)}"
-            )
+        _validate_host_construction(compile_options)
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError("steps must be a positive integer")
         if execution not in ("scan", "while"):
@@ -174,18 +136,7 @@ class CompiledRunner:
                 raise ValueError(
                     "checkpoint_every requires execution='scan' and inference=False"
                 )
-        if callbacks is not None and not isinstance(callbacks, Mapping):
-            raise TypeError(
-                "callbacks must be a named mapping of FunctionalCallback configurations"
-            )
-        configured_callbacks = {} if callbacks is None else dict(callbacks)
-        for name, callback in configured_callbacks.items():
-            if not isinstance(name, str) or not name:
-                raise ValueError("functional callback names must be non-empty strings")
-            if not isinstance(callback, FunctionalCallback):
-                raise TypeError(
-                    "callback values must be FunctionalCallback configurations, not imperative callbacks"
-                )
+        configured_callbacks = _configured_callbacks(callbacks)
         if execution == "while":
             if not inference:
                 raise ValueError(
@@ -350,16 +301,7 @@ class CompiledRunner:
         callback_state=None,
         initialization=None,
     ):
-        if torch.compiler.is_compiling():
-            raise FunctionalizationError("call compiled runners outside torch.compile")
-        if (
-            torch._C._are_functorch_transforms_active()
-            or torch.autograd.forward_ad._current_level >= 0
-        ):
-            raise FunctionalizationError(
-                "compiled runners are host-side callables; use the lower-level "
-                "functional API for torch.func or forward-mode AD transforms"
-            )
+        _validate_host_call()
         fresh_policy = self._initialization == "fresh"
         if initialization is not None:
             if not fresh_policy:
@@ -489,7 +431,13 @@ def compile(
     options=None,
     **compile_options,
 ):
-    """Create a reusable :class:`CompiledRunner` (scan by default).
+    """Create a reusable Population or Network runner (scan by default).
+
+    Initialized canonical Networks return :class:`CompiledNetworkRunner` using
+    ``initialization='snapshot'`` and their existing timestep/mode. Their
+    inputs use :class:`NetworkRolloutInput`, recordings use qualified names
+    such as ``cell.v``, and parameters retain shared tensor identities. See
+    :class:`CompiledNetworkRunner` for its snapshot execution contract.
 
     Recording and reductions are configured only through named ``callbacks``.
     For example, ``callbacks={'trace': dn.func.Recorder(('v',))}`` records
@@ -503,18 +451,26 @@ def compile(
     scans for lower activation memory, without truncating gradients. This is
     valid only for training scan; requested recording storage remains.
     By default, calls without state restart the captured initialized snapshot.
-    Use ``initialization='fresh'`` to initialize from current parameters on each
-    such call; explicit state still continues without reinitialization. Edit
+    Population runners also accept ``initialization='fresh'`` to initialize
+    from current parameters on each such call; explicit state still continues
+    without reinitialization. Edit
     ``runner.initialization_inputs`` or pass an ``InitializationInput`` as the
     call's ``initialization=`` override. Fresh-policy results expose effective
     parameters at ``aux['parameters']`` for explicit continuation after
     parameter-writing initialization transforms.
-    ``extra=(field, waveform)`` or a sequence of such pairs binds extracellular
-    stimulation. Select its independent fields and waveform leaves through
+    For Populations, ``extra=(field, waveform)`` or a sequence of such pairs
+    binds extracellular stimulation. Select its independent fields and waveform leaves through
     ``trainable``; inspect ``runner.parameters`` for canonical names. See
     :class:`CompiledRunner` for all constructor options.
     """
-    return CompiledRunner(
+    from dendra.models.networks.net import Network
+
+    runner_type = CompiledRunner
+    if isinstance(population, Network):
+        from ._network_compile import CompiledNetworkRunner
+
+        runner_type = CompiledNetworkRunner
+    return runner_type(
         population,
         dt=dt,
         steps=steps,

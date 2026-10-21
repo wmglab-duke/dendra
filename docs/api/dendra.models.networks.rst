@@ -31,15 +31,23 @@ Network
 Functional Network lowering
 ---------------------------
 
-An initialized canonical single-device Network can be lowered into one pure
-connected timestep using the existing functional component plans. The standard
-Network owns connectivity declarations; automatic source bindings and the shared
-native schedule preserve ordered recurrent delivery. See
-:doc:`../advanced/A19_functional_network_lowering` for complete runnable native
-parity, gradients, NetStim draw packets, and checkpoint continuation.
-Shared rollout, compiled chunks, per-population input tapes, qualified
+Declare and initialize a canonical single-device Network with the standard
+Network API, then lower it for pure execution with explicit parameters and
+state. Connections read their registered source fields automatically, and
+recurrent delivery follows native execution order. See
+:doc:`../advanced/A19_functional_network_lowering` for a runnable example of
+pure timesteps, parameter gradients, NetStim draw packets, and checkpoint
+continuation.
+Rollouts, compiled chunks, per-population input tapes, qualified
 recordings, and checkpointed host execution are described in
 :doc:`../advanced/A20_functional_network_rollout`.
+Snapshot-based ``dn.compile(Network)`` dispatch, shared trainable parameter
+selection, restart, and explicit continuation are described in
+:doc:`../advanced/A21_functional_network_compile`.
+
+.. autoclass:: dendra.func.CompiledNetworkRunner
+   :members: initial_state, parameters, named_parameters, constants, functional, kernel, parameter_name, get_parameter, execution_report
+   :special-members: __call__
 
 .. autofunction:: dendra.func.make_functional_network
 
@@ -53,7 +61,7 @@ recordings, and checkpointed host execution are described in
    :members:
 
 .. autoclass:: dendra.func.CompiledNetworkChunk
-   :members: steps
+   :members: steps, capabilities, execution_report
    :special-members: __call__
 
 NetStim
@@ -68,8 +76,8 @@ Network endpoints can use :class:`dendra.models.slice.SynapseSlots` to address
 local slots in banked point-process mechanisms. Its canonical API reference is
 :doc:`dendra.models.slice`.
 
-NetCon internals
-----------------
+NetCon
+------
 .. autoclass:: dendra.models.networks.netcon.NetCon
    :members:
    :special-members: __init__
@@ -77,15 +85,15 @@ NetCon internals
 Functional projection tensors
 -----------------------------
 
-The shared detector and dense transport core can be used with explicit
-source observations, weights, optional physical delays, and carry. This lowers an existing initialized
-NetCon; the standard Network remains the connectivity declaration. See
+Lower an initialized NetCon to evaluate event delivery from explicit source
+observations, weights, optional physical delays, and state. Declare connectivity
+through the standard Network API. See
 :doc:`../advanced/A12_functional_event_delivery` for the supported configuration
 and complete runnable example. See :doc:`../advanced/A13_functional_threshold_detection`
 for finite thresholds and ordered receive-before-observe execution.
-Shared tensor schedule evaluation, differentiable values, and indexed source
+Tensor schedule evaluation, differentiable values, and indexed source
 bindings are described in :doc:`../advanced/A15_functional_tensor_schedules`.
-Shared two- and three-tap differentiable delays are described in
+Two- and three-tap differentiable delays are described in
 :doc:`../advanced/A17_functional_delay_interpolation`.
 
 .. autofunction:: dendra.func.make_functional_netcon
@@ -99,8 +107,8 @@ Shared two- and three-tap differentiable delays are described in
 Functional continuous projections
 ---------------------------------
 
-ContinuousCon and its functional adapter share input projection and
-zero/integer-delay transport. See
+Use a functional ContinuousCon to project source values through zero- or
+integer-delay connections. See
 :doc:`../advanced/A18_functional_continuous_connectivity` for ordered source
 observation, receiver scratch, transform parameters, and runnable continuation.
 
@@ -115,8 +123,8 @@ observation, receiver scratch, transform parameters, and runnable continuation.
 Functional NetStim renewal
 --------------------------
 
-Initialized NetStims expose the shared pure initialization and
-renewal core through explicit parameters, random draws, and clock/RNG carry.
+Lower an initialized NetStim to evaluate pure initialization and renewal with
+explicit parameters, random draws, and clock/RNG state.
 See :doc:`../advanced/A14_functional_netstim_renewal` for sampling policy,
 ordered projection composition, and checkpoint continuation.
 Tensor schedules and indexed bindings are described in
