@@ -182,6 +182,7 @@ The complete example executes here:
 ```
 
 Shared pure continuous projections are described in
-{doc}`A18_functional_continuous_connectivity`. Standard Network lowering and
-compact queue backends remain later extensions; the native and functional
-adapters already share the same dense interpolation engine.
+{doc}`A18_functional_continuous_connectivity`. Canonical single-device Network
+composition is described in {doc}`A19_functional_network_lowering`. Compact
+queue backends remain a later extension; the native and functional adapters
+already share the same dense interpolation engine.

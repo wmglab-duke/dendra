@@ -13397,11 +13397,18 @@ class FunctionalPopulation:
                     f"ContinuousSynapse {target!r} cannot reset functionally: "
                     + "; ".join(failures)
                 )
+        return self._reset_continuous_inputs_values(
+            state, tuple(self._continuous_receiver_inputs)
+        )
+
+    def _reset_continuous_inputs_values(self, state, targets):
+        """Shared reset for an explicitly selected native target schedule."""
         result = {}
         for leaf in self._state_layout:
             _put_path(result, leaf.public_path, _get_path(state, leaf.public_path))
         scratch = {}
-        for target, inputs in self._continuous_receiver_inputs.items():
+        for target in targets:
+            inputs = self._continuous_receiver_inputs[target]
             self._validate_receiver_hooks(target, continuous=True)
             values = state.get("mechanism_buffers", {}).get(target, {})
             updates, scratch[target] = reset_continuous_values(

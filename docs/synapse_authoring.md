@@ -294,8 +294,9 @@ projection and receiver APIs. See
 {doc}`advanced/A18_functional_continuous_connectivity` for a complete connected
 example, differentiable weights and source values, and checkpoint continuation.
 Custom reception uses `continuous_receive_values`; leave the standard reset
-and receive adapters in place. Complete functional Network orchestration is
-a subsequent step.
+and receive adapters in place. See {doc}`advanced/A19_functional_network_lowering`
+for automatic canonical single-device Network composition with the same
+component plans and native ordering.
 
 ## What to check when adapting these examples
 

@@ -151,6 +151,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "FunctionalIntra",
         "FunctionalNetCon",
         "FunctionalNetStim",
+        "FunctionalNetwork",
         "FunctionalPopulation",
         "FunctionalizationError",
         "InitializationInput",
@@ -159,6 +160,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "NetStimDraw",
         "NetStimOutputs",
         "NetStimTensors",
+        "NetworkTensors",
         "PopulationTensors",
         "Raster",
         "Recorder",
@@ -173,6 +175,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "make_functional_continuous_con",
         "make_functional_netcon",
         "make_functional_netstim",
+        "make_functional_network",
         "run",
     }
 

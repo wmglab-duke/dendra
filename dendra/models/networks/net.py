@@ -5,7 +5,7 @@ import math
 import os
 from collections.abc import Mapping
 from contextlib import nullcontext
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal, NamedTuple, Optional
 
 import torch
 from tqdm.auto import tqdm
@@ -160,6 +160,30 @@ def _accelerator_first_step_items(collection):
         return 1 if dev.type in ("cpu", "meta") else 0
 
     return tuple(sorted(items, key=priority))
+
+
+class _NetworkStepSchedule(NamedTuple):
+    """Immutable launch order shared by native and functional Network adapters."""
+
+    populations: tuple
+    synapses: tuple
+    continuous_synapses: tuple
+    continuous_targets: tuple
+
+
+def _network_step_schedule(network):
+    """Describe the existing ordered phases without changing runtime state.
+
+    NetStim advances first, then continuous targets reset, continuous and event
+    projections advance, and populations solve. These item tuples preserve the
+    stable order within each phase, including accelerator-first placement.
+    """
+    return _NetworkStepSchedule(
+        _accelerator_first_step_items(network.populations),
+        _accelerator_first_step_items(network.synapses),
+        _accelerator_first_step_items(network.continuous_synapses),
+        _accelerator_first_step_items(network.continuous_targets),
+    )
 
 
 def advance_populations(populations, dt, extra, intra):
@@ -2936,14 +2960,11 @@ class Network(RNGMixin):
 
     def _refresh_step_schedule(self):
         """Cache accelerator-first launch order for timestep execution."""
-        self._population_step_items = _accelerator_first_step_items(self.populations)
-        self._synapse_step_items = _accelerator_first_step_items(self.synapses)
-        self._continuous_synapse_step_items = _accelerator_first_step_items(
-            self.continuous_synapses
-        )
-        self._continuous_target_step_items = _accelerator_first_step_items(
-            self.continuous_targets
-        )
+        schedule = _network_step_schedule(self)
+        self._population_step_items = schedule.populations
+        self._synapse_step_items = schedule.synapses
+        self._continuous_synapse_step_items = schedule.continuous_synapses
+        self._continuous_target_step_items = schedule.continuous_targets
 
     def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """

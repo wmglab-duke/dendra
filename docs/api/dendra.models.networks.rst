@@ -28,6 +28,24 @@ Network
 .. autoclass:: dendra.models.networks.Network
    :members:
 
+Functional Network lowering
+---------------------------
+
+An initialized canonical single-device Network can be lowered into one pure
+connected timestep using the existing functional component plans. The standard
+Network owns connectivity declarations; automatic source bindings and the shared
+native schedule preserve ordered recurrent delivery. See
+:doc:`../advanced/A19_functional_network_lowering` for complete runnable native
+parity, gradients, NetStim draw packets, and checkpoint continuation.
+
+.. autofunction:: dendra.func.make_functional_network
+
+.. autoclass:: dendra.func.FunctionalNetwork
+   :members: prepare, step, prepare_and_step, sample_step_draw, extract, commit_state_
+
+.. autoclass:: dendra.func.NetworkTensors
+   :members:
+
 NetStim
 -------
 .. autoclass:: dendra.models.networks.NetStim

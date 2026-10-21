@@ -236,5 +236,6 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-Complete `Network` lowering and differentiable continuous delay interpolation
-remain subsequent steps.
+Canonical single-device `Network` lowering is described in
+{doc}`A19_functional_network_lowering`. Differentiable continuous delay
+interpolation remains a separate extension.

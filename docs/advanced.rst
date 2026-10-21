@@ -26,3 +26,4 @@ Advanced
    advanced/A16_functional_heap_schedules.md
    advanced/A17_functional_delay_interpolation.md
    advanced/A18_functional_continuous_connectivity.md
+   advanced/A19_functional_network_lowering.md

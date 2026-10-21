@@ -31,6 +31,7 @@ from ._netstim import (
     NetStimTensors,
     make_functional_netstim,
 )
+from ._network import FunctionalNetwork, NetworkTensors, make_functional_network
 from ._population import FunctionalPopulation, make_functional
 from ._runners import longrun, longrun_checkpointed, run
 from ._schedules import TensorScheduleTensors
@@ -65,6 +66,7 @@ __all__ = [
     "FunctionalIntra",
     "FunctionalNetCon",
     "FunctionalNetStim",
+    "FunctionalNetwork",
     "FunctionalizationError",
     "InitializationInput",
     "LFP",
@@ -72,6 +74,7 @@ __all__ = [
     "NetStimDraw",
     "NetStimOutputs",
     "NetStimTensors",
+    "NetworkTensors",
     "PopulationTensors",
     "Raster",
     "Recorder",
@@ -86,5 +89,6 @@ __all__ = [
     "make_functional_continuous_con",
     "make_functional_netcon",
     "make_functional_netstim",
+    "make_functional_network",
     "run",
 ]
