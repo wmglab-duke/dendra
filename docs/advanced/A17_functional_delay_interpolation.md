@@ -181,6 +181,7 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-Standard Network lowering, continuous projections, and compact queue backends
-remain later extensions; the native and functional adapters already share
-the same dense interpolation engine.
+Shared pure continuous projections are described in
+{doc}`A18_functional_continuous_connectivity`. Standard Network lowering and
+compact queue backends remain later extensions; the native and functional
+adapters already share the same dense interpolation engine.

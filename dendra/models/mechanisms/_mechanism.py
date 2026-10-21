@@ -19,6 +19,7 @@ from dendra.models._class_declarations import (
 )
 from dendra.models.parametric import Parameterized
 
+from ._continuous_receive import reduce_continuous_values, reset_continuous_values
 from ._ions import VALENCES
 from ._materials import _canonical_material_name
 from ._state import (
@@ -4300,19 +4301,26 @@ class Synapse(Mechanism):
             )
         weights = torch.broadcast_to(weights, self._net_receive_payload_shape())
         updates = self.net_receive_values(weights, dt.reshape(1), values)
+        return self._validate_net_receive_updates(updates)
+
+    def _validate_net_receive_updates(
+        self, updates, *, allow_continuous_inputs=False, hook_name="net_receive_values"
+    ):
+        """Validate event and continuous transactions before committing any leaf."""
         if not isinstance(updates, Mapping):
-            raise TypeError("Synapse.net_receive_values() must return a mapping.")
+            raise TypeError(f"Synapse.{hook_name}() must return a mapping.")
         unknown = set(updates) - {"states", "carry", "state_carry"}
         if unknown:
             raise KeyError(
-                f"Synapse.net_receive_values() returned unknown sections {sorted(map(str, unknown))}."
+                f"Synapse.{hook_name}() returned unknown sections {sorted(map(str, unknown))}."
             )
         shared_names = set(self._runtime_shared_local_names())
-        shared_names.update(getattr(self, "_continuous_inputs", ()))
-        shared_names.update(getattr(self, "_continuous_input_old", {}).values())
+        if not allow_continuous_inputs:
+            shared_names.update(getattr(self, "_continuous_inputs", ()))
+            shared_names.update(getattr(self, "_continuous_input_old", {}).values())
         _validate_runtime_outputs(
             self,
-            "net_receive_values.states",
+            f"{hook_name}.states",
             updates.get("states", {}),
             {
                 name: self._buffers[name]
@@ -4322,7 +4330,7 @@ class Synapse(Mechanism):
         )
         _validate_runtime_outputs(
             self,
-            "net_receive_values.carry",
+            f"{hook_name}.carry",
             updates.get("carry", {}),
             {
                 name: self._buffers[name]
@@ -4342,7 +4350,7 @@ class Synapse(Mechanism):
             state = self.DE[state_name]
             _validate_runtime_outputs(
                 state,
-                "net_receive_values.state_carry",
+                f"{hook_name}.state_carry",
                 outputs,
                 {
                     name: state._buffers[name]
@@ -4428,7 +4436,9 @@ class ContinuousSynapse(Mechanism):
         old_map = {}
         for base in reversed(cls.__mro__):
             if "_continuous_inputs" in base.__dict__:
-                inputs.extend(list(base._continuous_inputs))
+                inputs.extend(
+                    name for name in base._continuous_inputs if name not in inputs
+                )
             if "_continuous_input_old" in base.__dict__:
                 old_map.update(dict(base._continuous_input_old))
 
@@ -4488,44 +4498,14 @@ class ContinuousSynapse(Mechanism):
             ContinuousSynapse._continuous_input_declarations,
         )
 
-    def reset_continuous_inputs(self):
-        """Reset continuous input buffers before new analog deliveries.
+    # Event and analog receivers share explicit frames, transaction validation,
+    # and commit rules. Only continuous receivers may update declared INPUT carry.
+    _continuous_receive_payload_shape = Synapse._net_receive_payload_shape
+    _continuous_receive_value_frame = Synapse._net_receive_value_frame
+    _validate_net_receive_updates = Synapse._validate_net_receive_updates
+    _apply_continuous_receive_updates = Synapse._apply_net_receive_updates
 
-        For each declared input ``x``, ``x_old`` is first updated to the current
-        value when available, and ``x`` is then reset to zeros.  Rebinding rather
-        than in-place mutation keeps the operation compatible with autograd.
-        """
-        self._continuous_received_masks.clear()
-        for name in self._continuous_inputs:
-            current = getattr(self, name)
-            old_name = self._continuous_input_old.get(name, None)
-            if old_name is not None and hasattr(self, old_name):
-                setattr(self, old_name, current)
-            setattr(self, name, torch.zeros_like(current))
-        self._continuous_reset_count = self._continuous_reset_count + 1
-
-    def continuous_receive(self, value, con=None, input=None, reduce=None, mask=None):
-        """Receive a continuously valued presynaptic projection.
-
-        Parameters
-        ----------
-        value : torch.Tensor
-            Delivered value in the synapse-local shape.
-        con : ContinuousCon, optional
-            Connectivity object delivering the value.
-        input : str, optional
-            Name of the input buffer to update.  If omitted, the first declared
-            input is used.
-        reduce : {"sum", "set", "max", "min"}, optional
-            Reduction used when multiple continuous projections target the same
-            input.  Defaults to the connection's ``reduce`` attribute if present,
-            otherwise ``"sum"``.
-        mask : torch.Tensor, optional
-            Boolean tensor identifying elements actually targeted by this
-            delivery. If omitted, every element is treated as delivered. This is
-            supplied by :class:`ContinuousCon` so its zero-filled scatter slots do
-            not participate in non-additive reductions.
-        """
+    def _continuous_input_name(self, input):
         if input is None:
             if len(self._continuous_inputs) != 1:
                 raise ValueError(
@@ -4533,55 +4513,137 @@ class ContinuousSynapse(Mechanism):
                     f"{len(self._continuous_inputs)} declared inputs."
                 )
             input = self._continuous_inputs[0]
-
         if input not in self._continuous_inputs:
             raise ValueError(
                 f"{self.name!r} has no continuous input {input!r}. "
                 f"Declared inputs are {self._continuous_inputs!r}."
             )
+        return input
 
-        if reduce is None:
-            reduce = getattr(con, "reduce", "sum")
+    def reset_continuous_inputs(self):
+        """Move inputs into their old-value carry and reset once before delivery.
 
-        current = getattr(self, input)
-        value = value.to(device=current.device, dtype=current.dtype)
-        if mask is None:
-            delivery_mask = torch.ones_like(current, dtype=torch.bool)
-        else:
-            delivery_mask = torch.as_tensor(
-                mask, device=current.device, dtype=torch.bool
+        Native Network owns the reset boundary. Functional callers use the same
+        pure reset with explicit per-step delivery scratch, outside checkpoint carry.
+        """
+        values = {name: self._buffers[name] for name in self._continuous_inputs}
+        updates, received = reset_continuous_values(
+            values, self._continuous_inputs, self._continuous_input_old
+        )
+        self._apply_continuous_receive_updates({"carry": updates})
+        self._continuous_received_masks = received
+        self._continuous_reset_count = self._continuous_reset_count + 1
+
+    def continuous_receive_values(
+        self, value, dt, values, *, input, reduce, mask, received
+    ):
+        """Return declared state/carry updates for one ordered analog delivery.
+
+        ``value`` and Boolean ``mask`` have the named input's local shape.
+        ``received`` marks elements delivered earlier in this timestep, including
+        actual zero deliveries. ``dt`` has shape ``(1,)``. ``values`` uses the
+        event-receive frame, including input/old-input CARRY and nested State
+        CARRY. Return event-style ``states``, ``carry`` and ``state_carry``
+        mappings without modifying any input or module state.
+
+        The default hook implements sum/add, set/replace/last, min and max.
+        Override this pure hook to add synaptic dynamics at delivery time;
+        legacy imperative ``continuous_receive`` overrides remain native-only.
+        """
+        del dt
+        return {
+            "carry": {
+                input: reduce_continuous_values(
+                    values[input], value, received, mask, reduce
+                )
+            }
+        }
+
+    def _derive_continuous_receive_values(
+        self, value, dt, values, received, *, input=None, reduce="sum", mask=None
+    ):
+        input = self._continuous_input_name(input)
+        current = values[input]
+        if not torch.is_tensor(value):
+            raise TypeError("Continuous receive payload must be a Tensor.")
+        if value.device != current.device or value.dtype != current.dtype:
+            raise ValueError(
+                "Continuous receive payload must match the input dtype and device."
             )
+        value = torch.broadcast_to(value, current.shape)
+        if not torch.is_tensor(dt) or tuple(dt.shape) != ():
+            raise TypeError("Continuous receive dt must be a scalar Tensor.")
+        if dt.device != current.device or dt.dtype != current.dtype:
+            raise ValueError(
+                "Continuous receive dt must match the input dtype and device."
+            )
+        if mask is None:
+            mask = torch.ones_like(current, dtype=torch.bool)
+        for label, operand in (("mask", mask), ("received", received)):
+            if not torch.is_tensor(operand) or operand.dtype != torch.bool:
+                raise TypeError(f"Continuous receive {label} must be a Boolean Tensor.")
+            if operand.device != current.device:
+                raise ValueError(
+                    f"Continuous receive {label} must match the input device."
+                )
             try:
-                delivery_mask = torch.broadcast_to(delivery_mask, current.shape)
+                projected = torch.broadcast_to(operand, current.shape)
             except RuntimeError as error:
                 raise ValueError(
-                    f"Continuous delivery mask with shape {tuple(delivery_mask.shape)} "
+                    f"Continuous delivery {label} with shape {tuple(operand.shape)} "
                     f"cannot be broadcast to input {input!r} with shape "
                     f"{tuple(current.shape)}."
                 ) from error
+            if label == "mask":
+                mask = projected
+            else:
+                received = projected
+        updates = self.continuous_receive_values(
+            value,
+            dt.reshape(1),
+            values,
+            input=input,
+            reduce=reduce,
+            mask=mask,
+            received=received,
+        )
+        updates = self._validate_net_receive_updates(
+            updates, allow_continuous_inputs=True, hook_name="continuous_receive_values"
+        )
+        return updates, received | mask
 
+    def continuous_receive(self, value, con=None, input=None, reduce=None, mask=None):
+        """Apply the shared pure receive hook at the native connection boundary."""
+        input = self._continuous_input_name(input)
+        current = self._buffers[input]
+        value = value.to(device=current.device, dtype=current.dtype)
+        if reduce is None:
+            reduce = getattr(con, "reduce", "sum")
+        if mask is not None:
+            mask = torch.as_tensor(mask, device=current.device, dtype=torch.bool)
         received = self._continuous_received_masks.get(input)
         if received is None or tuple(received.shape) != tuple(current.shape):
             received = torch.zeros_like(current, dtype=torch.bool)
-        elif received.device != current.device:
-            received = received.to(device=current.device)
-
-        if reduce in ("sum", "add"):
-            update = torch.where(delivery_mask, value, torch.zeros_like(value))
-            setattr(self, input, current + update)
-        elif reduce in ("set", "replace", "last"):
-            setattr(self, input, torch.where(delivery_mask, value, current))
-        elif reduce == "max":
-            reduced = torch.maximum(current, value)
-            update = torch.where(received, reduced, value)
-            setattr(self, input, torch.where(delivery_mask, update, current))
-        elif reduce == "min":
-            reduced = torch.minimum(current, value)
-            update = torch.where(received, reduced, value)
-            setattr(self, input, torch.where(delivery_mask, update, current))
         else:
-            raise ValueError(f"Unsupported continuous reduction mode: {reduce!r}.")
-        self._continuous_received_masks[input] = received | delivery_mask
+            received = received.to(device=current.device)
+        # Initialized mechanisms expose their own timestep; direct native calls
+        # need no connection object. The default reducer also works on manually
+        # supplied input buffers before a clock has been bound.
+        dt = getattr(self, "dt", None)
+        if dt is None:
+            dt = current.new_zeros(())
+        dt = torch.as_tensor(dt, device=current.device, dtype=current.dtype).reshape(())
+        updates, received = self._derive_continuous_receive_values(
+            value,
+            dt,
+            self._continuous_receive_value_frame(),
+            received,
+            input=input,
+            reduce=reduce,
+            mask=mask,
+        )
+        self._apply_continuous_receive_updates(updates)
+        self._continuous_received_masks[input] = received
 
 
 def rename(mechanism, new_name=None):

@@ -115,6 +115,11 @@ The canonical hooks are:
   event-triggered State and carry replacements. Leave the standard
   ``net_receive`` adapter in place so imperative and functional execution
   share those equations.
+* ``continuous_receive_values(value, dt, values, *, input, reduce, mask, received)``
+  on ``ContinuousSynapse`` for custom analog reception. Its default implementation
+  handles declared ``INPUT`` buffers and the standard reductions. Keep the
+  canonical reset/receive adapters for functional delivery; see
+  :doc:`advanced/A18_functional_continuous_connectivity`.
 
 Treat all arguments as read-only and return a mapping of Tensors. Dendra checks
 the declared names, shapes, dtypes, and devices on the first eager evaluation.

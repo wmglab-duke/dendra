@@ -68,6 +68,22 @@ Shared two- and three-tap differentiable delays are described in
 .. autoclass:: dendra.func.NetConTensors
    :members:
 
+Functional continuous projections
+---------------------------------
+
+ContinuousCon and its functional adapter share input projection and
+zero/integer-delay transport. See
+:doc:`../advanced/A18_functional_continuous_connectivity` for ordered source
+observation, receiver scratch, transform parameters, and runnable continuation.
+
+.. autofunction:: dendra.func.make_functional_continuous_con
+
+.. autoclass:: dendra.func.FunctionalContinuousCon
+   :members: read_due, advance, extract, commit_state_
+
+.. autoclass:: dendra.func.ContinuousConTensors
+   :members:
+
 Functional NetStim renewal
 --------------------------
 

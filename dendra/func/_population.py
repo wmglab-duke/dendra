@@ -52,6 +52,7 @@ from dendra.models.integrators.tree_bt import (
     _dhs_bt_multi,
     _tree_layered_edge_conductance,
 )
+from dendra.models.mechanisms._continuous_receive import reset_continuous_values
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion
 from dendra.models.mechanisms._material_process import (
@@ -63,6 +64,7 @@ from dendra.models.mechanisms._material_process import (
 )
 from dendra.models.mechanisms._materials import Material
 from dendra.models.mechanisms._mechanism import (
+    ContinuousSynapse,
     Mechanism,
     PointProcess,
     Synapse,
@@ -557,12 +559,27 @@ _RECEIVE_ADAPTER_NAMES = (
     "_net_receive_payload_shape",
     "_net_receive_value_frame",
     "_derive_net_receive_values",
+    "_validate_net_receive_updates",
     "_apply_net_receive_updates",
 )
 _STANDARD_RECEIVE_ADAPTERS = {
     name: inspect.getattr_static(Synapse, name) for name in _RECEIVE_ADAPTER_NAMES
 }
 _STANDARD_RECEIVE_VALUES = inspect.getattr_static(Synapse, "net_receive_values")
+_CONTINUOUS_RECEIVE_ADAPTER_NAMES = (
+    "reset_continuous_inputs",
+    "continuous_receive",
+    "_continuous_input_name",
+    "_continuous_receive_payload_shape",
+    "_continuous_receive_value_frame",
+    "_derive_continuous_receive_values",
+    "_validate_net_receive_updates",
+    "_apply_continuous_receive_updates",
+)
+_STANDARD_CONTINUOUS_RECEIVE_ADAPTERS = {
+    name: inspect.getattr_static(ContinuousSynapse, name)
+    for name in _CONTINUOUS_RECEIVE_ADAPTER_NAMES
+}
 
 
 class _RawClassHookIdentity:
@@ -1897,6 +1914,78 @@ def _event_receiver_signature(process):
     )
 
 
+def _continuous_receiver_failures(process):
+    if not isinstance(process, ContinuousSynapse):
+        return ["target is not a ContinuousSynapse"]
+    failures = []
+    changed = [
+        name
+        for name, standard in _STANDARD_CONTINUOUS_RECEIVE_ADAPTERS.items()
+        if name in process.__dict__
+        or inspect.getattr_static(type(process), name) is not standard
+    ]
+    if changed:
+        failures.append(
+            f"replaces canonical continuous adapters {changed}; implement "
+            "continuous_receive_values instead"
+        )
+    hook = inspect.getattr_static(type(process), "continuous_receive_values")
+    if "continuous_receive_values" in process.__dict__ or not inspect.isfunction(hook):
+        failures.append("continuous_receive_values must be a pure subclass method")
+    else:
+        try:
+            _initialization_callable_dependency_signature(
+                process.continuous_receive_values,
+                label=f"{process.name}.continuous_receive_values",
+                owner=process,
+                strict=True,
+                forbidden_receiver_attributes=frozenset(process._assigned)
+                | {
+                    "_buffers",
+                    "_runtime_value_frame",
+                    "_continuous_received_masks",
+                    "_continuous_reset_count",
+                },
+            )
+        except FunctionalizationError as exc:
+            failures.append(str(exc))
+    return failures
+
+
+def _continuous_receiver_signature(process):
+    if not isinstance(process, ContinuousSynapse):
+        return None
+    return (
+        _configuration_signature(process._continuous_inputs),
+        _configuration_signature(process._continuous_input_old),
+        tuple(
+            (name, _effective_hook_identity(process, name))
+            for name in (
+                *_CONTINUOUS_RECEIVE_ADAPTER_NAMES,
+                "continuous_receive_values",
+            )
+        ),
+        _initialization_callable_dependency_signature(
+            process.continuous_receive_values,
+            label=f"{process.name}.continuous_receive_values",
+            owner=process,
+            strict=False,
+            forbidden_receiver_attributes=frozenset(process._assigned)
+            | {
+                "_buffers",
+                "_runtime_value_frame",
+                "_continuous_received_masks",
+                "_continuous_reset_count",
+            },
+        )
+        if "continuous_receive_values" not in process.__dict__
+        and inspect.isfunction(
+            inspect.getattr_static(type(process), "continuous_receive_values")
+        )
+        else ("unsupported-continuous-receive-hook",),
+    )
+
+
 def _state_external_input_signature(state, mechanism):
     """Describe implicit external State inputs without evaluating getters.
 
@@ -2206,17 +2295,17 @@ def _install_state_input_audits(population):
                 )
 
 
-def _install_event_receiver_audit(process):
-    """Observe the pure event hook before its returned updates are committed."""
-    hook = process.net_receive_values
+def _install_receiver_audit(process, hook_name):
+    """Observe a pure receiver before its returned updates are committed."""
+    hook = getattr(process, hook_name)
 
-    def evaluate(weights, dt, values):
+    def evaluate(*args, **kwargs):
         registered = _registered_tensor_bindings(process)
         python_state = _transition_python_state_snapshot(process)
-        arguments = (weights, dt, values)
+        arguments = (args, kwargs)
         argument_state = _audit_python_value_signature(arguments, set())
         try:
-            return hook(weights, dt, values)
+            return hook(*args, **kwargs)
         finally:
             if (
                 _registered_tensor_bindings(process) != registered
@@ -2224,12 +2313,16 @@ def _install_event_receiver_audit(process):
                 or _audit_python_value_signature(arguments, set()) != argument_state
             ):
                 raise FunctionalizationError(
-                    f"Synapse {process.name!r}.net_receive_values() mutated its "
+                    f"Synapse {process.name!r}.{hook_name}() mutated its "
                     "module or read-only payload, timestep, or values inputs. "
                     "Return declared event updates without modifying inputs or self."
                 )
 
-    process.net_receive_values = evaluate
+    setattr(process, hook_name, evaluate)
+
+
+def _install_event_receiver_audit(process):
+    _install_receiver_audit(process, "net_receive_values")
 
 
 def _material_process_failures(process, population=None):
@@ -6223,20 +6316,32 @@ class _PopulationTransition(torch.nn.Module):
 
 
 class _PopulationReceive(torch.nn.Module):
-    """Apply exactly one event transaction to an explicitly rebound Population."""
+    """Apply one synaptic transaction to an explicitly rebound Population."""
 
-    def __init__(self, population, target, layout):
+    def __init__(self, population, target, layout, *, continuous=False):
         super().__init__()
         self.population = population
         self.target = target
         self.layout = layout
+        self.continuous = continuous
         object.__setattr__(
             self,
             "_state_owners",
             tuple(_module_at(population, entry.module_path) for entry in layout),
         )
 
-    def forward(self, v, t, duration_remainder, dt, payload):
+    def forward(
+        self,
+        v,
+        t,
+        duration_remainder,
+        dt,
+        payload,
+        input=None,
+        reduce="sum",
+        mask=None,
+        received=None,
+    ):
         incoming = []
         for entry, owner in zip(self.layout, self._state_owners, strict=True):
             if entry.public_path == ("integrator", "v"):
@@ -6254,10 +6359,22 @@ class _PopulationReceive(torch.nn.Module):
         handler.read_from_materials()
         handler._bind_ion_current_fields()
         mechanism = handler.mechanisms[self.target]
-        updates = mechanism._derive_net_receive_values(
-            payload, dt, mechanism._net_receive_value_frame()
-        )
-        mechanism._apply_net_receive_updates(updates)
+        if self.continuous:
+            updates, received = mechanism._derive_continuous_receive_values(
+                payload,
+                dt,
+                mechanism._continuous_receive_value_frame(),
+                received,
+                input=input,
+                reduce=reduce,
+                mask=mask,
+            )
+            mechanism._apply_continuous_receive_updates(updates)
+        else:
+            updates = mechanism._derive_net_receive_values(
+                payload, dt, mechanism._net_receive_value_frame()
+            )
+            mechanism._apply_net_receive_updates(updates)
         outputs = []
         for entry, previous in zip(self.layout, incoming, strict=True):
             path = entry.public_path
@@ -6274,7 +6391,7 @@ class _PopulationReceive(torch.nn.Module):
                         .get(path[3], previous)
                     )
             outputs.append(value)
-        return tuple(outputs)
+        return (*outputs, received) if self.continuous else tuple(outputs)
 
 
 def _uses_standard_unmyelinated_geometry(population) -> bool:
@@ -7839,6 +7956,16 @@ def _functionalization_failures(
                 )
     for mechanism in stateful_modules:
         mechanism_label = getattr(mechanism, "name", type(mechanism).__qualname__)
+        if isinstance(mechanism, ContinuousSynapse) and all(
+            name not in mechanism.__dict__
+            and inspect.getattr_static(type(mechanism), name)
+            is _STANDARD_CONTINUOUS_RECEIVE_ADAPTERS[name]
+            for name in ("continuous_receive", "reset_continuous_inputs")
+        ):
+            failures.extend(
+                f"ContinuousSynapse {mechanism_label!r}: {failure}"
+                for failure in _continuous_receiver_failures(mechanism)
+            )
         if (
             isinstance(mechanism, Synapse)
             and "net_receive" not in mechanism.__dict__
@@ -8978,6 +9105,7 @@ def _structure_signature(population) -> tuple:
             _material_process_signature(module, handler),
             _voltage_process_signature(module),
             _event_receiver_signature(module),
+            _continuous_receiver_signature(module),
         )
 
     return (
@@ -9403,6 +9531,63 @@ class FunctionalPopulation:
         }
         self._source_receiver_types = {
             name: type(population.mech.mechanisms[name]) for name in self._receivers
+        }
+        self._continuous_receiver_failures = {
+            name: tuple(_continuous_receiver_failures(mechanism))
+            for name, mechanism in execution_population.mech.mechanisms.items()
+            if isinstance(mechanism, ContinuousSynapse)
+        }
+        self._continuous_receivers = {
+            name: _PopulationReceive(
+                execution_population, name, self._state_layout, continuous=True
+            )
+            for name, failures in self._continuous_receiver_failures.items()
+            if not failures
+        }
+        self._continuous_receiver_inputs = {
+            name: tuple(execution_population.mech.mechanisms[name]._continuous_inputs)
+            for name in self._continuous_receivers
+        }
+        self._continuous_input_shapes = {
+            name: {
+                input: tuple(
+                    execution_population.mech.mechanisms[name]._buffers[input].shape
+                )
+                for input in inputs
+            }
+            for name, inputs in self._continuous_receiver_inputs.items()
+        }
+        self._continuous_receiver_shapes = {
+            name: tuple(
+                execution_population.mech.mechanisms[
+                    name
+                ]._continuous_receive_payload_shape()
+            )
+            for name in self._continuous_receivers
+        }
+        self._continuous_old_names = {
+            name: dict(execution_population.mech.mechanisms[name]._continuous_input_old)
+            for name in self._continuous_receivers
+        }
+        self._source_continuous_receiver_hooks = {
+            name: tuple(
+                (
+                    hook,
+                    tuple(
+                        (cls, hook in vars(cls), vars(cls).get(hook))
+                        for cls in type(population.mech.mechanisms[name]).__mro__
+                    ),
+                )
+                for hook in (
+                    *_CONTINUOUS_RECEIVE_ADAPTER_NAMES,
+                    "continuous_receive_values",
+                )
+            )
+            for name in self._continuous_receivers
+        }
+        self._source_continuous_receiver_types = {
+            name: type(population.mech.mechanisms[name])
+            for name in self._continuous_receivers
         }
         _validate_support_keys(
             population,
@@ -11892,8 +12077,13 @@ class FunctionalPopulation:
         )
 
     def _audit_event_receivers(self, tensors: PopulationTensors) -> None:
-        """Exercise each pure receiver on disposable zero/nonzero event frames."""
-        if not self._receivers:
+        self._audit_receivers(tensors, continuous=False)
+        self._audit_receivers(tensors, continuous=True)
+
+    def _audit_receivers(self, tensors: PopulationTensors, *, continuous) -> None:
+        """Exercise pure receivers on disposable, independently rebound frames."""
+        receivers = self._continuous_receivers if continuous else self._receivers
+        if not receivers:
             return
         rng_state = _global_rng_snapshot(self.device)
         class_state = _class_state_snapshot(
@@ -11913,12 +12103,31 @@ class FunctionalPopulation:
                 }
                 state = self._clone_state_tree(tensors.state)
                 prepared = self._prepare_values(parameters, constants)
-                for target in self._receivers:
+                cases = (
+                    (target, input, reduction)
+                    for target in receivers
+                    for input in (
+                        self._continuous_receiver_inputs[target]
+                        if continuous
+                        else (None,)
+                    )
+                    for reduction in (
+                        ("sum", "set", "min", "max") if continuous else ("sum",)
+                    )
+                )
+                for target, input, reduction in cases:
                     population = _deepcopy_execution_module(self._transition.population)
                     _rebind_population_time_references(population)
                     process = population.mech.mechanisms[target]
-                    _install_event_receiver_audit(process)
-                    facade = _PopulationReceive(population, target, self._state_layout)
+                    _install_receiver_audit(
+                        process,
+                        "continuous_receive_values"
+                        if continuous
+                        else "net_receive_values",
+                    )
+                    facade = _PopulationReceive(
+                        population, target, self._state_layout, continuous=continuous
+                    )
                     python_state = _transition_python_state_snapshot(facade)
                     registered = _registered_tensor_bindings(facade)
                     repeated = []
@@ -11927,10 +12136,23 @@ class FunctionalPopulation:
                             parameters, prepared, state, isolate_read_only=True
                         )
                         payload = torch.full(
-                            self._receiver_shapes[target],
+                            self._continuous_input_shapes[target][input]
+                            if continuous
+                            else self._receiver_shapes[target],
                             weight,
                             dtype=self.dtype,
                             device=self.device,
+                        )
+                        arguments = (v, t, remainder, dt, payload)
+                        if continuous:
+                            arguments += (
+                                input,
+                                reduction,
+                                torch.ones_like(payload, dtype=torch.bool),
+                                torch.zeros_like(payload, dtype=torch.bool),
+                            )
+                        argument_before = _audit_python_value_signature(
+                            arguments, set()
                         )
                         payload_before = _audit_tensor_binding(payload)
                         read_only = {
@@ -11942,15 +12164,17 @@ class FunctionalPopulation:
                             outputs = functional_call(
                                 facade,
                                 mapping,
-                                (v, t, remainder, dt, payload),
+                                arguments,
                                 tie_weights=False,
                             )
                         except Exception as exc:
                             raise FunctionalizationError(
-                                f"Synapse {target!r} pure event audit failed: {exc}"
+                                f"Synapse {target!r} pure receive audit failed: {exc}"
                             ) from exc
                         if (
                             _audit_tensor_binding(payload) != payload_before
+                            or _audit_python_value_signature(arguments, set())
+                            != argument_before
                             or any(
                                 name not in mapping
                                 or _audit_tensor_binding(mapping[name]) != binding
@@ -11960,7 +12184,7 @@ class FunctionalPopulation:
                             or _transition_python_state_snapshot(facade) != python_state
                         ):
                             raise FunctionalizationError(
-                                f"Synapse {target!r} event receiver mutated read-only "
+                                f"Synapse {target!r} receiver mutated read-only "
                                 "inputs or retained hidden module/Python state"
                             )
                         if weight:
@@ -11969,7 +12193,7 @@ class FunctionalPopulation:
                             )
                     if repeated[0] != repeated[1]:
                         raise FunctionalizationError(
-                            f"Synapse {target!r} event receiver returned "
+                            f"Synapse {target!r} receiver returned "
                             "non-deterministic results from identical explicit inputs"
                         )
         finally:
@@ -11980,7 +12204,7 @@ class FunctionalPopulation:
                 _restore_global_rng(rng_state, self.device)
         if mutated_class_state or consumed_rng:
             raise FunctionalizationError(
-                "pure event receiver audit observed class mutation or RNG "
+                "pure receiver audit observed class mutation or RNG "
                 f"consumption: classes={sorted(mutated_class_state)}, "
                 f"RNG={sorted(consumed_rng)}"
             )
@@ -13035,17 +13259,30 @@ class FunctionalPopulation:
                 f"event payload shape {_shape_tuple(payload)} cannot broadcast to "
                 f"target {target!r} shape {shape}"
             )
+        self._validate_receiver_hooks(target)
+
+    def _validate_receiver_hooks(self, target, *, continuous=False):
         # Keep source-hook bindings visible to Dynamo, including instance
         # replacement. The larger structural fingerprint is checked once per
         # compiled graph, whereas these ordinary guards invalidate warm graphs.
         source = self._population.mech.mechanisms[target]
-        if type(source) is not self._source_receiver_types[target]:
+        types = (
+            self._source_continuous_receiver_types
+            if continuous
+            else self._source_receiver_types
+        )
+        hooks = (
+            self._source_continuous_receiver_hooks
+            if continuous
+            else self._source_receiver_hooks
+        )
+        if type(source) is not types[target]:
             raise FunctionalizationError(
                 f"Synapse {target!r} event receiver changed after make_functional(); "
                 "lower the Population again."
             )
         compiling = torch.compiler.is_compiling()
-        for name, class_bindings in self._source_receiver_hooks[target]:
+        for name, class_bindings in hooks[target]:
             expected = next(value for _cls, present, value in class_bindings if present)
             changed = (
                 any(
@@ -13071,6 +13308,136 @@ class FunctionalPopulation:
                     f"Synapse {target!r} event receiver changed after "
                     "make_functional(); lower the Population again."
                 )
+
+    def _validate_continuous_scratch(self, scratch):
+        if not isinstance(scratch, Mapping) or set(scratch) != set(
+            self._continuous_receiver_inputs
+        ):
+            raise ValueError(
+                "continuous scratch must match this Population's receiver schema"
+            )
+        for target, inputs in self._continuous_receiver_inputs.items():
+            local = scratch[target]
+            if not isinstance(local, Mapping) or set(local) != set(inputs):
+                raise ValueError(
+                    f"continuous scratch for {target!r} must match its inputs"
+                )
+            for input in inputs:
+                value = local[input]
+                if (
+                    not torch.is_tensor(value)
+                    or value.dtype != torch.bool
+                    or value.device != self.device
+                    or _shape_tuple(value)
+                    != self._continuous_input_shapes[target][input]
+                ):
+                    raise ValueError(
+                        f"continuous scratch {target!r}.{input} must be a local Boolean Tensor"
+                    )
+
+    def _validate_continuous_receive(self, target, payload, input, reduce, mask):
+        if not isinstance(target, str):
+            raise TypeError("continuous target must be a mechanism name")
+        if target not in self._continuous_receiver_failures:
+            raise ValueError(f"unknown continuous target {target!r}")
+        failures = self._continuous_receiver_failures[target]
+        if failures:
+            raise FunctionalizationError(
+                f"ContinuousSynapse {target!r} cannot receive functionally: "
+                + "; ".join(failures)
+            )
+        inputs = self._continuous_receiver_inputs[target]
+        if input is None:
+            if len(inputs) != 1:
+                raise ValueError(
+                    "continuous_receive requires input= when the target has multiple inputs"
+                )
+            input = inputs[0]
+        if input not in inputs:
+            raise ValueError(f"target {target!r} has no continuous input {input!r}")
+        if reduce not in ("sum", "add", "set", "replace", "last", "min", "max"):
+            raise ValueError(f"Unsupported continuous reduction mode: {reduce!r}")
+        shape = self._continuous_input_shapes[target][input]
+        for label, value, dtype in (
+            ("payload", payload, self.dtype),
+            ("mask", mask, torch.bool),
+        ):
+            if label == "mask" and value is None:
+                continue
+            if not torch.is_tensor(value):
+                raise TypeError(f"continuous {label} must be a Tensor")
+            if value.device != self.device or value.dtype != dtype:
+                raise ValueError(f"continuous {label} must use {self.device}/{dtype}")
+            try:
+                projected = torch.broadcast_shapes(_shape_tuple(value), shape)
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"continuous {label} cannot broadcast to input {input!r} shape {shape}"
+                ) from exc
+            if projected != shape:
+                raise ValueError(
+                    f"continuous {label} cannot broadcast to input {input!r} shape {shape}"
+                )
+        self._validate_receiver_hooks(target, continuous=True)
+        return input
+
+    def reset_continuous_inputs(self, state):
+        """Reset every continuous receiver once and return fresh per-step scratch.
+
+        ``x`` and ``x_old`` remain ordinary Population CARRY. Scratch contains
+        only Boolean first-delivery masks, is reset at the network step boundary,
+        and is deliberately separate from checkpoint carry. Preserve it when
+        pausing between deliveries within the same timestep.
+        """
+        self._validate_source()
+        self._validate_state(state)
+        for target, failures in self._continuous_receiver_failures.items():
+            if failures:
+                raise FunctionalizationError(
+                    f"ContinuousSynapse {target!r} cannot reset functionally: "
+                    + "; ".join(failures)
+                )
+        result = {}
+        for leaf in self._state_layout:
+            _put_path(result, leaf.public_path, _get_path(state, leaf.public_path))
+        scratch = {}
+        for target, inputs in self._continuous_receiver_inputs.items():
+            self._validate_receiver_hooks(target, continuous=True)
+            values = state.get("mechanism_buffers", {}).get(target, {})
+            updates, scratch[target] = reset_continuous_values(
+                values, inputs, self._continuous_old_names[target]
+            )
+            for name, value in updates.items():
+                _put_path(result, ("mechanism_buffers", target, name), value)
+        return result, scratch
+
+    def _continuous_receive_values(
+        self, parameters, prepared, state, scratch, target, payload, input, reduce, mask
+    ):
+        mapping, dt, _celsius, v, t, remainder = self._mapping(
+            parameters, prepared, state
+        )
+        outputs = functional_call(
+            self._continuous_receivers[target],
+            mapping,
+            (v, t, remainder, dt, payload, input, reduce, mask, scratch[target][input]),
+            tie_weights=False,
+        )
+        result = {}
+        for leaf, value in zip(self._state_layout, outputs[:-1], strict=True):
+            if (
+                not torch.is_tensor(value)
+                or _shape_tuple(value) != leaf.shape
+                or value.dtype != leaf.dtype
+                or value.device != leaf.device
+            ):
+                raise FunctionalizationError(
+                    f"functional continuous receive changed the state schema for {'.'.join(leaf.public_path)!r}"
+                )
+            _put_path(result, leaf.public_path, value)
+        next_scratch = {name: dict(values) for name, values in scratch.items()}
+        next_scratch[target][input] = outputs[-1]
+        return result, next_scratch
 
     def _receive_values(self, parameters, prepared, state, target, payload):
         mapping, dt, _celsius, v, t, duration_remainder = self._mapping(
@@ -13575,6 +13942,69 @@ class FunctionalPopulation:
         self._validate_receive(target, payload)
         prepared = self._prepare_values(parameters, constants)
         return self._receive_values(parameters, prepared, state, target, payload)
+
+    def continuous_receive(
+        self,
+        parameters,
+        prepared,
+        state,
+        scratch,
+        *,
+        target: str,
+        payload,
+        input=None,
+        reduce="sum",
+        mask=None,
+    ):
+        """Apply one ordered analog delivery without advancing the Population.
+
+        ``mask`` distinguishes absent scatter slots from actual zero deliveries.
+        Return the new Population carry and scratch for the next delivery in
+        native connection order. Reset once before the first delivery, including
+        timesteps with no active connections.
+        """
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        self._validate_continuous_scratch(scratch)
+        input = self._validate_continuous_receive(target, payload, input, reduce, mask)
+        prepared_values = self._validate_prepared(prepared, parameters)
+        return self._continuous_receive_values(
+            parameters,
+            prepared_values,
+            state,
+            scratch,
+            target,
+            payload,
+            input,
+            reduce,
+            mask,
+        )
+
+    def prepare_and_continuous_receive(
+        self,
+        parameters,
+        constants,
+        state,
+        scratch,
+        *,
+        target: str,
+        payload,
+        input=None,
+        reduce="sum",
+        mask=None,
+    ):
+        """Prepare coefficients and apply an analog delivery under compilation."""
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_constants(constants)
+        self._validate_state(state)
+        self._validate_continuous_scratch(scratch)
+        input = self._validate_continuous_receive(target, payload, input, reduce, mask)
+        prepared = self._prepare_values(parameters, constants)
+        return self._continuous_receive_values(
+            parameters, prepared, state, scratch, target, payload, input, reduce, mask
+        )
 
     def bind(self, parameters, prepared):
         """Bind one eager step to explicit parameters and reusable preparation.

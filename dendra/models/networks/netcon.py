@@ -8,6 +8,14 @@ import torch
 from ...helpers import current_native_extension_policy
 from ...utils.tensor_ops import _logical_tensor_bytes
 from ..parametric import Referency
+from ._continuous_delivery import (
+    continuous_clear,
+    continuous_counters,
+    continuous_due,
+    continuous_enqueue,
+    continuous_project,
+    gather_continuous_source,
+)
 from ._event_delivery import (
     _clear_dense_slot,
     _enqueue_dense_values,
@@ -513,6 +521,7 @@ class ContinuousCon(Referency):
         pre_dtype=None,
     ):
         super().__init__()
+        self._continuous_delivery_initialized = False
         self.weight = weight
         self.delay_ms = delay
         self.syn = post_syn
@@ -672,6 +681,13 @@ class ContinuousCon(Referency):
         self._configure_advance_impl()
         return self
 
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._continuous_delivery_generation = (
+            getattr(self, "_continuous_delivery_generation", 0) + 1
+        )
+        return result
+
     # ------------------------------------------------------------------
     # Delay metadata / specialization
     # ------------------------------------------------------------------
@@ -685,6 +701,9 @@ class ContinuousCon(Referency):
 
     def _rebuild_delay_metadata(self):
         """Precompute masks/indices/offsets used by the continuous hot path."""
+        self._continuous_delivery_generation = (
+            getattr(self, "_continuous_delivery_generation", 0) + 1
+        )
         delay_steps = self.delay_steps.flatten().to(self.device, dtype=torch.long)
         n_conn = int(delay_steps.numel())
         self._n_conn = n_conn
@@ -839,6 +858,9 @@ class ContinuousCon(Referency):
     def initialize(
         self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
     ):
+        self._continuous_delivery_generation = (
+            getattr(self, "_continuous_delivery_generation", 0) + 1
+        )
         self.zero(clear_deliveries=clear_deliveries)
         self.weight.init(reinit=reinit_weights)
         self.delay_ms.init(reinit=reinit_delays)
@@ -851,6 +873,7 @@ class ContinuousCon(Referency):
             self.global_step.copy_(step.reshape_as(self.global_step))
         self.detach()
         self._configure_advance_impl()
+        self._continuous_delivery_initialized = True
         return self
 
     def enable_state_cache_recording(self, *, horizon_steps: int | None = None):
@@ -1182,9 +1205,14 @@ class ContinuousCon(Referency):
         # by Network before advancing continuous projections.
         return None
 
-    def _advance_counters(self):
-        self.current_time_step.add_(1).remainder_(self.max_delay_steps)
-        self.global_step.add_(1)
+    def _advance_counters(self, *, all_immediate=False):
+        self.current_time_step, self.global_step = continuous_counters(
+            self.current_time_step,
+            self.global_step,
+            depth=self.max_delay_steps,
+            all_immediate=all_immediate,
+            _inplace=not torch.is_grad_enabled(),
+        )
 
     def _pre_value(self):
         # The presynaptic variable should already live on the source device; only
@@ -1193,7 +1221,7 @@ class ContinuousCon(Referency):
         x_full = self.get_pre_var(self.pre)
         if x_full.device != self.pre_device or x_full.dtype != self.pre_dtype:
             x_full = x_full.to(device=self.pre_device, dtype=self.pre_dtype)
-        x = x_full.reshape(-1).index_select(0, self.pre_idx)
+        x = gather_continuous_source(x_full, self.pre_idx)
         if x.device != self.device or x.dtype != self.dtype:
             x = x.to(device=self.device, dtype=self.dtype)
         # Record raw selected values. Restore reapplies the current memoryless
@@ -1210,25 +1238,30 @@ class ContinuousCon(Referency):
         return torch.zeros(self._syn_numel, device=self.device, dtype=self.dtype)
 
     def _scatter_all(self, values):
-        if self._direct_all:
-            return values
-        out = self._zeros_delivery()
-        out.index_add_(0, self.post_idx, values)
-        return out
+        return continuous_project(
+            values, self.post_idx, width=self._syn_numel, direct=self._direct_all
+        )
 
     def _scatter_zero_subset(self, values):
-        out = self._zeros_delivery()
         vals = values.index_select(0, self.zero_con_idx)
-        out.index_add_(0, self.post_idx_zero, vals)
-        return out
+        return continuous_project(vals, self.post_idx_zero, width=self._syn_numel)
 
     def _read_and_clear_current_row(self):
         cur_idx = self.current_time_step
-        delayed_delivery = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)
-        delayed_mask = self.delivery_mask.index_select(0, cur_idx).squeeze(0)
-        self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
-        self.delivery_mask.index_fill_(0, cur_idx, False)
-        return cur_idx, delayed_delivery, delayed_mask
+        due = continuous_due(self.delivery_buffer, self.delivery_mask, cur_idx)
+        reuse = (
+            not torch.is_grad_enabled()
+            and self.delivery_buffer.is_contiguous()
+            and self.delivery_mask.is_contiguous()
+        )
+        self.delivery_buffer, self.delivery_mask = continuous_clear(
+            self.delivery_buffer,
+            self.delivery_mask,
+            cur_idx,
+            _inplace=reuse,
+            _clone_once=not reuse,
+        )
+        return cur_idx, due.payload, due.mask
 
     def _deliver(self, flat_delivery, flat_mask):
         self.syn.continuous_receive(
@@ -1240,34 +1273,34 @@ class ContinuousCon(Referency):
         )
 
     def _schedule_all_delayed_uniform(self, cur_idx, weighted):
-        future = (cur_idx + int(self._uniform_delay_step)).remainder(
-            self.max_delay_steps
-        )
-        flat = future * self._syn_numel + self.post_idx
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
-        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
+        self._schedule_delayed(cur_idx, weighted, all_connections=True, uniform=True)
 
     def _schedule_selected_delayed_uniform(self, cur_idx, weighted):
-        vals = weighted.index_select(0, self.nonzero_con_idx)
-        future = (cur_idx + int(self._uniform_delay_step)).remainder(
-            self.max_delay_steps
-        )
-        flat = future * self._syn_numel + self.post_idx_nz
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
-        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
+        self._schedule_delayed(cur_idx, weighted, all_connections=False, uniform=True)
 
     def _schedule_all_delayed_mixed(self, cur_idx, weighted):
-        base = cur_idx * self._syn_numel
-        flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
-        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
+        self._schedule_delayed(cur_idx, weighted, all_connections=True, uniform=False)
 
     def _schedule_selected_delayed_mixed(self, cur_idx, weighted):
-        vals = weighted.index_select(0, self.nonzero_con_idx)
-        base = cur_idx * self._syn_numel
-        flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
-        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
+        self._schedule_delayed(cur_idx, weighted, all_connections=False, uniform=False)
+
+    def _schedule_delayed(self, cur_idx, weighted, *, all_connections, uniform):
+        self.delivery_buffer, self.delivery_mask = continuous_enqueue(
+            self.delivery_buffer,
+            self.delivery_mask,
+            cur_idx,
+            weighted,
+            post_idx=self.post_idx if all_connections else self.post_idx_nz,
+            delay_steps=self.delay_steps_nz,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            connection_idx=None if all_connections else self.nonzero_con_idx,
+            uniform_delay=int(self._uniform_delay_step) if uniform else None,
+            flat_offsets=None if uniform else self.flat_delay_offsets_nz,
+            # Read/clear already allocated an owned training ring. Inference
+            # owns the persistent ring, so both paths can enqueue into it.
+            _inplace=True,
+        )
 
     # ------------------------------------------------------------------
     # Specialized advance paths
@@ -1279,8 +1312,7 @@ class ContinuousCon(Referency):
     def _advance_all_immediate(self):
         weighted = self._weighted_pre_value()
         self._deliver(self._scatter_all(weighted), self.post_delivery_mask)
-        # All delays are zero, so current_time_step remains zero modulo one.
-        self.global_step.add_(1)
+        self._advance_counters(all_immediate=True)
 
     def _advance_all_delayed_uniform(self):
         cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()

@@ -25,3 +25,4 @@ Advanced
    advanced/A15_functional_tensor_schedules.md
    advanced/A16_functional_heap_schedules.md
    advanced/A17_functional_delay_interpolation.md
+   advanced/A18_functional_continuous_connectivity.md

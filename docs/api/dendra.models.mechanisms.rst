@@ -544,7 +544,7 @@ complete implementation and :ref:`functional-event-receive` for explicit
 functional delivery.
 
 .. autoclass:: dendra.models.mechanisms.ContinuousSynapse
-   :members: INPUT, reset_continuous_inputs, continuous_receive
+   :members: INPUT, reset_continuous_inputs, continuous_receive, continuous_receive_values
    :show-inheritance:
 
 ``ContinuousSynapse.INPUT`` declares a persistent delivery buffer populated by
@@ -552,7 +552,10 @@ Network continuous connections, with optional previous-input storage. It is
 distinct from ephemeral ``State.INPUT`` values supplied by
 ``Population.bind_input(...)`` in the same Population. Qualify the declaration
 with its owning class. See :doc:`../synapse_authoring` for a continuous synapse
-example.
+example. The standard reset and receive adapters share pure tensor operations
+with functional execution. Override ``continuous_receive_values`` for a custom
+pure receive rule; see :doc:`../advanced/A18_functional_continuous_connectivity`
+for explicit per-step masks and ordered functional delivery.
 
 State SDE support
 -----------------

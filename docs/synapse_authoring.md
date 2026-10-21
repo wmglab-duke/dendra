@@ -289,9 +289,13 @@ The complete continuous example runs here:
 ```
 
 The ordinary Network owns continuous input resets, sampling, reductions, and
-delays. Connected continuous delivery is not yet lowered by `dn.func`.
-Using pure State/current hooks makes the local computations explicit; it
-does not supply a functional connected Network scheduler.
+delays. These operations share pure tensor cores with the explicit functional
+projection and receiver APIs. See
+{doc}`advanced/A18_functional_continuous_connectivity` for a complete connected
+example, differentiable weights and source values, and checkpoint continuation.
+Custom reception uses `continuous_receive_values`; leave the standard reset
+and receive adapters in place. Complete functional Network orchestration is
+a subsequent step.
 
 ## What to check when adapting these examples
 
