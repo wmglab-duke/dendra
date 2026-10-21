@@ -154,8 +154,10 @@ capacity; constrain learned delays to the intended horizon.
 
 Source-history training with nonempty legacy side calendars is currently
 unsupported by functional lowering. Scheduled configurations use the native
-dense fallback. Sparse-calendar and bitpacked-history inference runtimes are
-currently unsupported; packed hard *training* history is supported.
+dense fallback. Intrinsic packed-history inference is described in
+{doc}`A23_functional_bitpacked_inference`; its hard source semantics differ from
+surrogate training history. Functional sparse-calendar inference is currently
+unsupported.
 
 The complete CPU example executes both floating and packed training modes:
 

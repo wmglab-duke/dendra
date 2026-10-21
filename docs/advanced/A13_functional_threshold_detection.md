@@ -128,7 +128,8 @@ The complete example executes here:
 
 This example uses dense connections with fixed or interpolated delays.
 Compact source-level detection and history are described in
-{doc}`A22_functional_source_history`.
+{doc}`A22_functional_source_history`; packed hard inference is described in
+{doc}`A23_functional_bitpacked_inference`.
 Differentiable delay interpolation is described in
 {doc}`A17_functional_delay_interpolation`; tensor schedules are described in
 {doc}`A15_functional_tensor_schedules`.

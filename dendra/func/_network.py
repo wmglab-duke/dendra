@@ -250,11 +250,11 @@ class FunctionalNetwork:
     not perform fresh initialization. ``commit_state_`` publishes runtime carry
     only; align native parameters/schedules separately before continuation.
     Topology, source bindings, mode, timestep, and native phase ordering are
-    frozen. Canonical single-device Networks use the dense or source-history
-    event runtimes and integer continuous delays supported by the component
-    plans. ``dn.compile`` uses this plan for snapshot or fresh Network
-    initialization; the lower-level methods also support explicit preparation
-    and functional transforms.
+    frozen. Canonical single-device Networks use dense, source-history training,
+    or intrinsic packed-history inference event runtimes and integer continuous
+    delays supported by the component plans. ``dn.compile`` uses this plan for
+    snapshot or fresh Network initialization; the lower-level methods support
+    explicit preparation and functional transforms.
     """
 
     def __init__(self, network):

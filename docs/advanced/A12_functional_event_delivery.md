@@ -54,8 +54,9 @@ supported, with explicit detector carry and ordered projection phases as
 described in {doc}`A13_functional_threshold_detection`.
 Two- and three-tap differentiable delay interpolation is described in
 {doc}`A17_functional_delay_interpolation`. Compact source-history training is
-described in {doc}`A22_functional_source_history`. `NetStim` generation and RNG
-continuation are described in {doc}`A14_functional_netstim_renewal`.
+described in {doc}`A22_functional_source_history`; intrinsic packed-history
+inference is described in {doc}`A23_functional_bitpacked_inference`. `NetStim`
+generation and RNG continuation are described in {doc}`A14_functional_netstim_renewal`.
 
 ## Extract the projection and its explicit tensors
 

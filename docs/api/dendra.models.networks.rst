@@ -50,6 +50,9 @@ selected leaves through ``trainable_parameters``; shared aliases remain visible.
 Compact source-history training with native ``auto`` selection, delivery-time
 parameter lookup, and checkpoint continuation is described in
 :doc:`../advanced/A22_functional_source_history`.
+Intrinsic packed-history inference with hard source detection, current weights,
+fixed delays, and native checkpoint continuation is described in
+:doc:`../advanced/A23_functional_bitpacked_inference`.
 
 .. autoclass:: dendra.func.CompiledNetworkRunner
    :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
@@ -106,6 +109,8 @@ Two- and three-tap differentiable delays are described in
 :doc:`../advanced/A17_functional_delay_interpolation`.
 Compact source-history training is described in
 :doc:`../advanced/A22_functional_source_history`.
+Intrinsic packed-history inference is described in
+:doc:`../advanced/A23_functional_bitpacked_inference`.
 
 .. autofunction:: dendra.func.make_functional_netcon
 

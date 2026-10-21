@@ -39,8 +39,9 @@ restriction to hard delays, hard spikes, and hard scheduled times.
 Configure the source before lowering. The interpolation path applies to the
 active training runtime; evaluation retains integer-delay execution. Compact
 source-history training is described in {doc}`A22_functional_source_history`.
-Sparse-calendar and bitpacked-history inference are currently unsupported by
-this functional interface.
+Intrinsic packed-history inference with fixed delays is described in
+{doc}`A23_functional_bitpacked_inference`. Sparse-calendar inference is currently
+unsupported by this functional interface.
 
 ## Supply explicit effective delays
 

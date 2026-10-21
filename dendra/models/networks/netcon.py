@@ -3530,36 +3530,22 @@ class NetCon(Referency):
 
     def _bitpack_source_spikes_this_step(self) -> torch.Tensor:
         """Return one binary spike/event value per unique presynaptic source."""
-        if self._bitpack_mode == "netstim":
-            spikes = (
-                self.pre.spikes.to(self.pre_device)
-                .reshape(-1)
-                .index_select(0, self.bitpack_source_pre_idx)
-            )
-            return spikes.to(torch.bool)
-
-        x_full = self.get_pre_var(self.pre)
+        mode = self._bitpack_mode
+        if mode not in ("netstim", "pre_var", "threshold"):
+            raise RuntimeError("bitpacked_history backend is not configured")
+        x_full = self.pre.spikes if mode == "netstim" else self.get_pre_var(self.pre)
         if x_full.device != self.pre_device:
             x_full = x_full.to(device=self.pre_device)
-        x = x_full.reshape(-1).index_select(0, self.bitpack_source_pre_idx)
-
-        if self._bitpack_mode == "pre_var":
-            # Explicit pre-side event variables are interpreted as binary gates.
-            # bool tensors are used directly; numeric tensors fire when > 0.
-            if x.dtype == torch.bool:
-                return x
-            return x.to(self.pre_dtype) > 0
-
-        if self._bitpack_mode == "threshold":
-            x = x.to(self.pre_dtype)
-            self.bitpack_source_has_spiked, spikes = threshold_transition(
-                x,
-                self.bitpack_source_has_spiked,
-                self.bitpack_source_threshold,
-            )
-            return spikes.to(torch.bool)
-
-        raise RuntimeError("bitpacked_history backend is not configured")
+        self.bitpack_source_has_spiked, spikes = source_history_gates(
+            x_full,
+            self.bitpack_source_has_spiked,
+            source_idx=self.bitpack_source_pre_idx,
+            mode=mode,
+            threshold=self.bitpack_source_threshold,
+            dtype=self.pre_dtype,
+            binary=True,
+        )
+        return spikes
 
     def _try_bitpack_pack_kernel(
         self, source_spikes: torch.Tensor, cur_idx: torch.Tensor
@@ -3675,13 +3661,18 @@ class NetCon(Referency):
         # is unavailable or cannot handle the current launch. A failed native
         # launch may have written a partial result before reporting failure, so
         # reset the output again before constructing the complete fallback result.
-        scratch.zero_()
-        rows = (cur_idx - self.inference_delay_steps).remainder(self.max_delay_steps)
-        words = self.spike_history_packed[rows.reshape(-1), self.bitpack_conn_word_idx]
-        gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0
-        values = self.weight() * gate.to(dtype=self.dtype)
-        scratch.index_add_(0, self.post_idx, values)
-        return scratch
+        return source_history_project(
+            self.spike_history_packed,
+            cur_idx,
+            self.weight(),
+            post_idx=self.post_idx,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            word_idx=self.bitpack_conn_word_idx,
+            bit_mask=self.bitpack_conn_bit_mask,
+            delay_steps=self.inference_delay_steps,
+            _scratch=scratch,
+        )
 
     def _bitpack_schedule_due_scheduled_events(self, cur_idx: torch.Tensor):
         """Route explicit scheduled per-connection events through sparse side buckets."""

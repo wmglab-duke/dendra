@@ -1,4 +1,4 @@
-"""Shared pure source-history transport for NetCon training adapters.
+"""Shared pure source-history transport for NetCon adapters.
 
 Read and deliver from history before observing the source and recording its
 current gate. Weights and physical delays belong to the read phase: changing
@@ -21,15 +21,31 @@ def source_history_gates(
     diff_spiking=False,
     tau=0.1,
     dtype=None,
+    binary=False,
 ):
-    """Observe one value per unique source, preserving native gate semantics."""
+    """Observe one value per unique source, preserving native gate semantics.
+
+    ``binary=True`` returns hard booleans without floating event intermediates.
+    Already generated NetStim events and boolean raw fields bypass detector
+    dtype conversion, matching native packed inference. Surrogate gates cannot
+    use this binary path.
+    """
+    if binary and diff_spiking:
+        raise ValueError("binary source history cannot use surrogate spiking")
     selected = source_values.reshape(source_values.numel()).index_select(0, source_idx)
+    if binary and mode == "netstim":
+        return has_spiked, selected.to(torch.bool)
+    if binary and mode == "pre_var" and selected.dtype == torch.bool:
+        return has_spiked, selected
     dtype = source_values.dtype if dtype is None else dtype
     selected = selected.to(dtype=dtype)
     if mode == "netstim":
         return has_spiked, selected
     if mode == "pre_var":
-        return has_spiked, selected if diff_spiking else (selected > 0).to(dtype)
+        if diff_spiking:
+            return has_spiked, selected
+        gates = selected > 0
+        return has_spiked, gates if binary else gates.to(dtype)
     if mode == "threshold":
         return threshold_transition(
             selected,
@@ -81,16 +97,19 @@ def source_history_project(
     taps=2,
     sigma=0.35,
     _owned_output=False,
+    _scratch=None,
 ):
     """Reconstruct today's payload using current weights and delays.
 
     Supply ``source_pos`` for floating history or packed word/mask metadata.
     Fixed reads use ``delay_steps``. Differentiable physical delays use the
     native two-tap linear or three-tap soft interpolation within fixed capacity.
-    No history, parameter, or pointer is changed. The private owned-output path
-    accumulates into its freshly allocated payload.
+    No history, parameter, or pointer is changed by default. The private
+    owned-output path accumulates into its freshly allocated payload. Native
+    inference can instead donate ``_scratch`` to clear and reuse its existing
+    dense output row, including after a partially failed optimized launch.
     """
-    out = weights.new_zeros((width,))
+    out = weights.new_zeros((width,)) if _scratch is None else _scratch.zero_()
     if weights.numel() == 0:
         return out
 
@@ -125,7 +144,7 @@ def source_history_project(
     # history, slot, weights, and delays, including empty mapped lanes.
     return (
         out.index_add_(0, post_idx, values)
-        if _owned_output
+        if _owned_output or _scratch is not None
         else out.index_add(0, post_idx, values)
     )
 

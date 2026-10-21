@@ -49,6 +49,15 @@ _SOURCE_HISTORY_METHODS = {
         "_source_history_read_packed_connection_gates",
     )
 }
+_BITPACKED_HISTORY_METHODS = {
+    name: getattr(NetCon, name)
+    for name in (
+        "_bitpack_source_spikes_this_step",
+        "_bitpack_pack_source_spikes",
+        "_bitpack_build_delivery_from_history",
+        "_bitpack_schedule_due_scheduled_events",
+    )
+}
 _HISTORY_METADATA = (
     "bitpack_source_pre_idx",
     "bitpack_source_word_idx",
@@ -157,19 +166,34 @@ def _eligible(netcon):
     if netcon._mode_requires_initialize:
         raise FunctionalizationError("NetCon mode changed; initialize it again.")
     runtime = netcon._checkpoint_runtime_kind()
-    if runtime not in {"dense", "source_history"}:
+    if runtime not in {"dense", "source_history", "bitpacked_history"}:
         raise FunctionalizationError(
-            "Functional NetCon currently requires dense queues or source-history training."
+            "Functional NetCon currently requires dense queues, source-history "
+            "training, or bitpacked-history inference."
         )
     if runtime == "source_history":
         if not netcon.training or netcon._has_scheduled_events():
             raise FunctionalizationError(
                 "Functional source history requires intrinsic training traffic."
             )
-        for name, expected in _SOURCE_HISTORY_METHODS.items():
+    if runtime == "bitpacked_history" and (
+        netcon.training or netcon._has_scheduled_events()
+    ):
+        raise FunctionalizationError(
+            "Functional bitpacked inference requires intrinsic source traffic; "
+            "NetCon schedules are currently unsupported. NetStim source schedules "
+            "remain supported."
+        )
+    if runtime != "dense":
+        methods = (
+            _SOURCE_HISTORY_METHODS
+            if runtime == "source_history"
+            else _BITPACKED_HISTORY_METHODS
+        )
+        for name, expected in methods.items():
             if name in netcon.__dict__ or getattr(owner_type, name) is not expected:
                 raise FunctionalizationError(
-                    f"Functional source history requires its canonical {name} adapter."
+                    f"Functional compact history requires its canonical {name} adapter."
                 )
     if netcon.training:
         if netcon.train_flags is None:
@@ -202,6 +226,8 @@ def _eligible(netcon):
     allowed = (
         (NetCon.advance_diff_source_history,)
         if runtime == "source_history"
+        else (NetCon.advance_non_diff_bitpacked_history,)
+        if runtime == "bitpacked_history"
         else (
             NetCon.advance_non_diff_dense_uniform,
             NetCon.advance_non_diff_dense_mixed,
@@ -228,8 +254,10 @@ class FunctionalNetCon:
     ``delays=`` in milliseconds using that target dtype/device. Interpolation
     uses the initialized two- or three-tap policy and ring capacity. The native
     minimum delay and modulo behavior are preserved as delay values change.
-    Finite thresholds detect rising edges using explicit ``has_spiked`` carry;
-    NaN thresholds retain raw signed values and gradients. Training preserves
+    Finite thresholds detect rising edges using explicit detector carry.
+    Dense raw projections and differentiable source-history gates retain signed
+    values and gradients for NaN thresholds; hard compact histories use binary
+    source events. Training preserves
     the initialized hard or surrogate detector configuration. The surrogate
     temperature ``tau`` is scalar real metadata, rather than an explicit
     differentiable Tensor input.
@@ -257,6 +285,15 @@ class FunctionalNetCon:
     Functional source-history carry exposes history/latch tensors directly;
     extraction and commit translate the native checkpoint's ``backend_state``.
     Scheduled traffic follows native policy and uses the dense fallback.
+
+    Bitpacked-history inference uses hard source events, fixed initialized delay
+    offsets, and the same packed history kernels. Supply current weights to
+    :meth:`read_due`; its returned carry publishes the native delivery scratch
+    row. NetStim's own schedules are source activity. Per-connection NetCon
+    schedules and nonempty legacy side calendars are currently unsupported for
+    functional bitpacked inference. This runtime does not convert to dense
+    delivery queues. Lower-level explicit weights retain their gradient flags;
+    inference runner execution suppresses simulation gradients.
 
     Routing, fixed quantized delays, timestep, and tensor schemas are copied at
     lowering. Reinitialization, calling ``set_diff_config``, mode changes, or
@@ -316,12 +353,10 @@ class FunctionalNetCon:
         self._schedule = _TensorSchedulePlan(
             netcon, index_name="sched_con_idx", device=self.device, dtype=self.dtype
         )
-        self._history_mode = (
-            netcon._bitpack_mode if self._runtime == "source_history" else None
-        )
+        self._history_mode = netcon._bitpack_mode if self._runtime != "dense" else None
         self._history_metadata = (
             {name: _snapshot(getattr(netcon, name)) for name in _HISTORY_METADATA}
-            if self._runtime == "source_history"
+            if self._runtime != "dense"
             else {}
         )
         self._history_name = (
@@ -336,7 +371,7 @@ class FunctionalNetCon:
 
     @property
     def runtime(self):
-        """The frozen native runtime: ``dense`` or ``source_history``."""
+        """Frozen runtime: ``dense``, ``source_history``, or ``bitpacked_history``."""
         return self._runtime
 
     def _checkpoint_values(self, netcon):
@@ -351,7 +386,7 @@ class FunctionalNetCon:
             )
         if backend.get("sparse_calendar") or backend.get("sparse_event_calendar"):
             raise FunctionalizationError(
-                "Functional source history cannot lower nonempty side calendars"
+                "Functional compact history cannot lower nonempty side calendars"
             )
         allowed = {
             "kind",
@@ -362,7 +397,7 @@ class FunctionalNetCon:
             "bitpack_source_has_spiked",
         }
         if set(backend) - allowed:
-            raise FunctionalizationError("Unknown source-history checkpoint carry")
+            raise FunctionalizationError("Unknown compact-history checkpoint carry")
         for name in (
             "source_gate_history",
             "spike_history_packed",
@@ -403,7 +438,7 @@ class FunctionalNetCon:
             or getattr(source.advance, "__func__", None) is not self._advance
             or source._sched_pre
             or (
-                self._runtime == "source_history"
+                self._runtime != "dense"
                 and (
                     source._bitpack_mode != self._history_mode
                     or not source._bitpack_can_use
@@ -413,14 +448,19 @@ class FunctionalNetCon:
             raise FunctionalizationError(
                 "The source NetCon configuration changed; initialize and lower it again."
             )
-        if self._runtime == "source_history":
-            for name, expected in _SOURCE_HISTORY_METHODS.items():
+        if self._runtime != "dense":
+            methods = (
+                _SOURCE_HISTORY_METHODS
+                if self._runtime == "source_history"
+                else _BITPACKED_HISTORY_METHODS
+            )
+            for name, expected in methods.items():
                 if (
                     name in source.__dict__
                     or getattr(type(source), name) is not expected
                 ):
                     raise FunctionalizationError(
-                        f"Source-history {name} changed; lower again."
+                        f"Compact-history {name} changed; lower again."
                     )
 
     @staticmethod
@@ -483,7 +523,7 @@ class FunctionalNetCon:
             raise FunctionalizationError(
                 "NetCon topology or detector does not match this frozen plan."
             )
-        if self._runtime == "source_history" and (
+        if self._runtime != "dense" and (
             netcon._bitpack_mode != self._history_mode
             or any(
                 not torch.equal(getattr(netcon, name), value)
@@ -491,7 +531,7 @@ class FunctionalNetCon:
             )
         ):
             raise FunctionalizationError(
-                "Source-history routing or detector does not match this plan"
+                "Compact-history routing or detector does not match this plan"
             )
         self._validate_tensor(
             _effective_tensor(netcon.weight, "weight"),
@@ -585,13 +625,15 @@ class FunctionalNetCon:
 
         This publishes due tracked events in the returned state without clearing
         the queue or changing the detector latch, ring slot, or global step.
-        Source-history plans require current ``weights`` and differentiable
-        ``delays`` here because native delivery reconstructs traffic from past
-        source gates using the parameters at delivery time.
+        Compact-history plans require current ``weights`` because native delivery
+        reconstructs traffic from past source gates at delivery time. Training
+        with differentiable delays also requires current ``delays``. Bitpacked
+        inference publishes its scratch payload in the returned carry, including
+        zero deliveries, without changing the input state.
         """
         self._validate_source()
         self._validate_state(state)
-        if self._runtime == "source_history":
+        if self._runtime != "dense":
             self._validate_projection_parameters(weights, delays)
             metadata = self._history_metadata
             payload = source_history_project(
@@ -616,7 +658,12 @@ class FunctionalNetCon:
                 taps=self._taps,
                 sigma=self._sigma,
             )
-            return dict(state), payload.reshape(self.shape)
+            result = dict(state)
+            if self._runtime == "bitpacked_history":
+                result["delivery_buffer"] = payload.reshape(1, self._width)
+                if "events" in result:
+                    result["events"] = torch.zeros_like(state["events"])
+            return result, payload.reshape(self.shape)
         due = dense_due(
             state["delivery_buffer"],
             state["current_time_step"],
@@ -649,7 +696,7 @@ class FunctionalNetCon:
             device=self.source_device,
             label="source_values",
         )
-        if self._runtime == "source_history":
+        if self._runtime != "dense":
             metadata = self._history_metadata
             latch = state.get("bitpack_source_has_spiked")
             if latch is None:
@@ -665,6 +712,7 @@ class FunctionalNetCon:
                 diff_spiking=self._diff_spiking,
                 tau=self._tau,
                 dtype=self.source_dtype,
+                binary=self._runtime == "bitpacked_history",
             )
             result = dict(state)
             if "bitpack_source_has_spiked" in result:
@@ -672,7 +720,9 @@ class FunctionalNetCon:
             result[self._history_name] = source_history_record(
                 state[self._history_name],
                 state["current_time_step"],
-                gates.to(device=self.device, dtype=self.dtype),
+                gates.to(device=self.device)
+                if self._runtime == "bitpacked_history"
+                else gates.to(device=self.device, dtype=self.dtype),
                 source_word_idx=None
                 if self._diff_spiking
                 else metadata["bitpack_source_word_idx"],
@@ -802,7 +852,7 @@ class FunctionalNetCon:
                 name: value.clone(memory_format=torch.contiguous_format)
                 for name, value in state.items()
             }
-            if self._runtime == "source_history":
+            if self._runtime != "dense":
                 history = {
                     name: copied.pop(name)
                     for name in (

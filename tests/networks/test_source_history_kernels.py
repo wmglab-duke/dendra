@@ -98,6 +98,92 @@ def test_native_netstim_gates_cast_directly_to_delivery_dtype(pre_dtype):
     torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("mode", ("netstim", "pre_var", "threshold"))
+@pytest.mark.parametrize("boolean", (False, True))
+@pytest.mark.parametrize("pre_dtype", (torch.float16, torch.float32))
+def test_native_hard_observation_preserves_source_casts_and_detector_latches(
+    mode, boolean, pre_dtype
+):
+    values = torch.tensor([1e-9, -0.1, 0.3, 1.0], dtype=DTYPE)
+    if boolean:
+        values = values > 0
+    indices = torch.tensor([0, 2, 3])
+    previous = torch.tensor([False, True, False])
+    thresholds = torch.tensor([0.0, 0.5, 1.0], dtype=pre_dtype)
+    connection = SimpleNamespace(
+        pre=SimpleNamespace(spikes=values),
+        get_pre_var=lambda _: values,
+        pre_device=torch.device("cpu"),
+        pre_dtype=pre_dtype,
+        bitpack_source_pre_idx=indices,
+        bitpack_source_has_spiked=previous.clone(),
+        bitpack_source_threshold=thresholds,
+        _bitpack_mode=mode,
+    )
+    selected = values.index_select(0, indices)
+    expected_latch = previous
+    if mode == "netstim":
+        # NetStim is an already generated hard event, even if stored numerically.
+        expected = selected.to(torch.bool)
+    elif mode == "pre_var":
+        expected = selected if boolean else selected.to(pre_dtype) > 0
+    else:
+        expected_latch, expected = threshold_transition(
+            selected.to(pre_dtype), previous, thresholds
+        )
+    actual = NetCon._bitpack_source_spikes_this_step(connection)
+    assert actual.dtype == torch.bool
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(connection.bitpack_source_has_spiked, expected_latch)
+    torch.testing.assert_close(previous, torch.tensor([False, True, False]))
+
+
+@pytest.mark.parametrize("mode", ("netstim", "pre_var", "threshold"))
+@pytest.mark.parametrize("boolean", (False, True))
+def test_binary_observation_preserves_hard_semantics_without_float_event_results(
+    mode, boolean
+):
+    values = torch.tensor([1e-9, -0.25, 0.5, 1.5], dtype=DTYPE)
+    if boolean:
+        values = values > 0
+    indices = torch.tensor([0, 1, 3])
+    latch = torch.tensor([False, True, False])
+    threshold = torch.tensor([0.0, 0.0, 1.0], dtype=torch.float16)
+    updated, gates = source_history_gates(
+        values,
+        latch,
+        source_idx=indices,
+        mode=mode,
+        threshold=threshold,
+        dtype=torch.float16,
+        binary=True,
+    )
+    selected = values[indices]
+    expected_latch = latch
+    if mode == "netstim":
+        expected = selected.to(torch.bool)
+    elif mode == "pre_var":
+        expected = selected if boolean else selected.to(torch.float16) > 0
+    else:
+        expected_latch, expected = threshold_transition(
+            selected.to(torch.float16), latch, threshold
+        )
+    assert gates.dtype == torch.bool
+    torch.testing.assert_close(gates, expected)
+    torch.testing.assert_close(updated, expected_latch)
+    torch.testing.assert_close(latch, torch.tensor([False, True, False]))
+    with pytest.raises(ValueError, match="binary.*surrogate"):
+        source_history_gates(
+            values,
+            latch,
+            source_idx=indices,
+            mode=mode,
+            threshold=threshold,
+            diff_spiking=True,
+            binary=True,
+        )
+
+
 def test_packed_record_overwrites_rows_and_crosses_word_boundaries_without_mutation():
     size, depth = 130, 4
     word_idx, bit_mask = _packing(size)
@@ -183,6 +269,66 @@ def _fixture(*, packed=False, dtype=DTYPE):
             )
         kwargs = {"word_idx": word_idx[source_pos], "bit_mask": bit_mask[source_pos]}
     return history, values, source_pos, post_idx, kwargs
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float32, DTYPE))
+@pytest.mark.parametrize("empty", (False, True))
+def test_native_packed_projection_reuses_scratch_and_clears_failed_launches(
+    dtype, empty
+):
+    history, _, _, post_idx, metadata = _fixture(packed=True, dtype=dtype)
+    weights = torch.tensor([0.7, -0.2, 1.3, 0.5, 2.1], dtype=dtype)
+    fixed = torch.tensor([1, 2, 3, 4, 1])
+    if empty:
+        weights, post_idx, fixed = weights[:0], post_idx[:0], fixed[:0]
+        metadata = {name: value[:0] for name, value in metadata.items()}
+    scratch = torch.full((2,), 99.0, dtype=dtype)
+    address = scratch.data_ptr()
+    pristine = history.clone()
+    slot = torch.tensor([4])
+    rows = (slot - fixed).remainder(history.shape[0])
+    gates = (
+        torch.bitwise_and(history[rows, metadata["word_idx"]], metadata["bit_mask"])
+        != 0
+    )
+    expected = torch.zeros_like(scratch)
+    expected.index_add_(0, post_idx, weights * gates.to(dtype))
+
+    def failed_launch(_, output):
+        output.fill_(1000.0)
+        return False
+
+    connection = SimpleNamespace(
+        _n_conn=weights.numel(),
+        _syn_numel=scratch.numel(),
+        spike_history_packed=history,
+        post_idx=post_idx,
+        max_delay_steps=history.shape[0],
+        bitpack_conn_word_idx=metadata["word_idx"],
+        bitpack_conn_bit_mask=metadata["bit_mask"],
+        inference_delay_steps=fixed,
+        _try_bitpack_delivery_kernel=failed_launch,
+        weight=lambda: weights,
+    )
+    observed = NetCon._bitpack_build_delivery_from_history(connection, slot, scratch)
+    assert observed is scratch and observed.data_ptr() == address
+    torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+    torch.testing.assert_close(history, pristine)
+    # The same donated row can be overwritten on the next call without stale data.
+    result = source_history_project(
+        history,
+        slot,
+        weights * 2,
+        post_idx=post_idx,
+        depth=history.shape[0],
+        width=scratch.numel(),
+        delay_steps=fixed,
+        _scratch=scratch,
+        **metadata,
+    )
+    assert result is scratch and result.data_ptr() == address
+    expected.zero_().index_add_(0, post_idx, weights * 2 * gates.to(dtype))
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("packed", (False, True))

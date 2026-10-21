@@ -30,3 +30,4 @@ Advanced
    advanced/A20_functional_network_rollout.md
    advanced/A21_functional_network_compile.md
    advanced/A22_functional_source_history.md
+   advanced/A23_functional_bitpacked_inference.md
