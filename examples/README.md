@@ -69,6 +69,15 @@ See the [heap calendar guide](../docs/advanced/A16_functional_heap_schedules.md)
 python examples/functional_heap_schedules.py
 ```
 
+[`functional_delay_interpolation.py`](functional_delay_interpolation.py) compares
+shared two-/three-tap NetCon interpolation with native connected execution,
+including delay/weight/source gradients and saved-state replay. See the
+[delay interpolation guide](../docs/advanced/A17_functional_delay_interpolation.md).
+
+```bash
+python examples/functional_delay_interpolation.py
+```
+
 [`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
 frequency, delay, and duration from simulated voltage recordings, optionally
 with observation noise, using ordinary `model.run()` and autograd. Try a

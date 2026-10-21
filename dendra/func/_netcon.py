@@ -1,4 +1,4 @@
-"""Explicit-state projections over NetCon's shared fixed-delay transport."""
+"""Explicit-state projections over NetCon's shared dense transport."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from dendra.models.networks._event_delivery import (
     connection_event_counts,
     dense_due,
     dense_fixed_delay_transition,
+    dense_interpolated_delay_transition,
     gather_source_gates,
 )
 from dendra.models.networks._tensor_schedules import (
@@ -30,11 +31,17 @@ from ._types import FunctionalizationError
 
 
 class NetConTensors(NamedTuple):
-    """Independent effective weights, dense carry, and optional schedule values."""
+    """Independent effective parameters, dense carry, and schedule values.
+
+    ``delays`` contains effective milliseconds for differentiable-delay plans;
+    fixed-delay plans store ``None``. Weights and delays are parameters rather
+    than checkpoint carry.
+    """
 
     weights: torch.Tensor
     state: dict[str, torch.Tensor]
     schedule: TensorScheduleTensors | None = None
+    delays: torch.Tensor | None = None
 
 
 def _snapshot(value, *, parameter=False):
@@ -128,13 +135,24 @@ def _eligible(netcon):
             raise FunctionalizationError(
                 "Configure NetCon training before lowering it."
             )
-        if netcon.train_flags[1]:
-            raise FunctionalizationError(
-                "Functional NetCon requires diff_delays=False."
+        if netcon.train_flags[1] and (
+            not isinstance(netcon.train_flags[3], Real)
+            or netcon.train_flags[3] not in (2, 3)
+            or (
+                netcon.train_flags[3] == 3
+                and not isinstance(netcon.train_flags[4], Real)
             )
-        if netcon.track_events and (netcon.train_flags[2] or netcon.train_flags[6]):
+        ):
             raise FunctionalizationError(
-                "Tracked NetCon events require hard spiking and scheduled-time semantics."
+                "Functional NetCon requires two or three interpolation taps "
+                "and scalar real sigma metadata."
+            )
+        if netcon.track_events and (
+            netcon.train_flags[1] or netcon.train_flags[2] or netcon.train_flags[6]
+        ):
+            raise FunctionalizationError(
+                "Tracked NetCon events require hard delay, spiking, and "
+                "scheduled-time semantics."
             )
     if netcon._sched_pre:
         raise FunctionalizationError(
@@ -161,6 +179,10 @@ class FunctionalNetCon:
     weights. Values use ``source_dtype``/``source_device`` (the initialized NetCon's
     presynaptic floating dtype/device), including when a NetStim stores hard
     spikes as booleans. Weights use the target ``dtype``/``device``.
+    Training with ``diff_delays=True`` also requires explicit per-connection
+    ``delays=`` in milliseconds using that target dtype/device. Interpolation
+    uses the initialized two- or three-tap policy and ring capacity. The native
+    minimum delay and modulo behavior are preserved as delay values change.
     Finite thresholds detect rising edges using explicit ``has_spiked`` carry;
     NaN thresholds retain raw signed values and gradients. Training preserves
     the initialized hard or surrogate detector configuration. The surrogate
@@ -181,13 +203,15 @@ class FunctionalNetCon:
     these phases when the supplied source values have already been chosen.
     Neither phase generates source activity or advances any Population clock.
 
-    Routing, quantized delays, timestep, and tensor schemas are copied at
+    Routing, fixed quantized delays, timestep, and tensor schemas are copied at
     lowering. Reinitialization, calling ``set_diff_config``, mode changes, or
     changing schedule topology or bindings invalidates source-bound calls.
     Direct edits to source topology or detector buffers do not alter this frozen
     plan; extraction and commit reject incompatible metadata. Lower again to adopt changed routing,
-    delays, or thresholds. Explicit Population batch axes are part of the
-    source/target shapes; additional ``vmap`` axes stay implicit.
+    fixed delays, or thresholds. Differentiable delay values may change without
+    lowering again; changing capacity requires initialization and lowering.
+    Explicit Population batch axes are part of the source/target shapes;
+    additional ``vmap`` axes stay implicit.
     """
 
     def __init__(self, netcon):
@@ -227,6 +251,9 @@ class FunctionalNetCon:
         self._nan_mask = _snapshot(netcon.thresh_is_nan)
         self._apply_masking = bool(netcon.apply_masking)
         self._diff_spiking = bool(netcon.training and netcon.train_flags[2])
+        self._diff_delays = bool(netcon.training and netcon.train_flags[1])
+        self._taps = int(netcon.train_flags[3]) if self._diff_delays else 2
+        self._sigma = float(netcon.train_flags[4]) if self._taps == 3 else 0.35
         self._tau = float(netcon.train_flags[5]) if netcon.training else 0.1
         self._diff_scheduled_times = bool(netcon.training and netcon.train_flags[6])
         self._sched_width = float(netcon.train_flags[7]) if netcon.training else 1.0
@@ -310,12 +337,18 @@ class FunctionalNetCon:
             or int(netcon._syn_numel) != self._width
             or not torch.equal(netcon.pre_idx, self._pre_idx)
             or not torch.equal(netcon.post_idx, self._post_idx)
-            or not torch.equal(netcon.inference_delay_steps, self._delay_steps)
+            or (
+                not self._diff_delays
+                and not torch.equal(netcon.inference_delay_steps, self._delay_steps)
+            )
             or not torch.equal(netcon.dt, self._dt)
             or not torch.equal(netcon.threshold, self._threshold)
             or not torch.equal(netcon.thresh_is_nan, self._nan_mask)
-            or not torch.equal(
-                _effective_tensor(netcon.delay_ms, "delay"), self._physical_delays
+            or (
+                not self._diff_delays
+                and not torch.equal(
+                    _effective_tensor(netcon.delay_ms, "delay"), self._physical_delays
+                )
             )
         ):
             raise FunctionalizationError(
@@ -327,6 +360,13 @@ class FunctionalNetCon:
             dtype=self.dtype,
             device=self.device,
             label="effective weights",
+        )
+        self._validate_tensor(
+            _effective_tensor(netcon.delay_ms, "delay"),
+            shape=(self._connections,),
+            dtype=self.dtype,
+            device=self.device,
+            label="effective delays",
         )
         self._schedule.validate_compatible(netcon)
         if bool(torch.any(self._schedule.indices >= self._connections)):
@@ -346,7 +386,7 @@ class FunctionalNetCon:
             )
 
     def extract(self, netcon=None) -> NetConTensors:
-        """Snapshot effective weights, checkpoint carry, and schedule values."""
+        """Snapshot effective parameters, checkpoint carry, and schedule values."""
         if torch.compiler.is_compiling():
             raise FunctionalizationError("Extract NetCon tensors before torch.compile.")
         netcon = self._source if netcon is None else netcon
@@ -358,6 +398,9 @@ class FunctionalNetCon:
                 for name, value in netcon.state_dict_for_checkpoint().items()
             },
             self._schedule.extract(netcon),
+            _snapshot(_effective_tensor(netcon.delay_ms, "delay"), parameter=True)
+            if self._diff_delays
+            else None,
         )
 
     def read_due(self, state):
@@ -378,13 +421,16 @@ class FunctionalNetCon:
             result["events"] = due.event_counts
         return result, due.payload.reshape(self.shape)
 
-    def advance(self, weights, state, source_values, *, schedule=None):
+    def advance(self, weights, state, source_values, *, delays=None, schedule=None):
         """Observe the current source, enqueue events, and return next carry.
 
         Pass the state from :meth:`read_due` after delivering its payload and
         observing the source. Threshold metadata is frozen; gradients flow
         through explicit weights, source values, pending payloads, and schedule
         amplitudes. Triangular scheduling also differentiates explicit times.
+        Interpolated-delay plans require explicit ``delays``; fixed-delay plans
+        reject it. Delay values use the native fixed ring and are not scanned
+        for a range on each step.
         """
         self._validate_source()
         self._validate_state(state)
@@ -403,6 +449,16 @@ class FunctionalNetCon:
             device=self.source_device,
             label="source_values",
         )
+        if self._diff_delays:
+            self._validate_tensor(
+                delays,
+                shape=(self._connections,),
+                dtype=self.dtype,
+                device=self.device,
+                label="delays",
+            )
+        elif delays is not None:
+            raise ValueError("Fixed-delay NetCon plans do not accept explicit delays")
         event_queue = state.get("event_queue")
         selected = gather_source_gates(source_values, self._pre_idx)
         result = dict(state)
@@ -447,19 +503,35 @@ class FunctionalNetCon:
             if self._track_events
             else None
         )
-        updated = dense_fixed_delay_transition(
-            state["delivery_buffer"],
-            state["current_time_step"],
-            state["global_step"],
-            weights,
-            combined,
-            post_idx=self._post_idx,
-            delay_steps=self._delay_steps,
-            depth=self._depth,
-            width=self._width,
-            event_queue=event_queue,
-            event_counts=counts,
-        )
+        if self._diff_delays:
+            updated = dense_interpolated_delay_transition(
+                state["delivery_buffer"],
+                state["current_time_step"],
+                state["global_step"],
+                weights,
+                combined,
+                delays,
+                self._dt,
+                post_idx=self._post_idx,
+                depth=self._depth,
+                width=self._width,
+                taps=self._taps,
+                sigma=self._sigma,
+            )
+        else:
+            updated = dense_fixed_delay_transition(
+                state["delivery_buffer"],
+                state["current_time_step"],
+                state["global_step"],
+                weights,
+                combined,
+                post_idx=self._post_idx,
+                delay_steps=self._delay_steps,
+                depth=self._depth,
+                width=self._width,
+                event_queue=event_queue,
+                event_counts=counts,
+            )
         result.update(
             delivery_buffer=updated.queue,
             current_time_step=updated.slot,
@@ -469,7 +541,7 @@ class FunctionalNetCon:
             result["event_queue"] = updated.event_queue
         return result
 
-    def step(self, weights, state, source_gates, *, schedule=None):
+    def step(self, weights, state, source_gates, *, delays=None, schedule=None):
         """Return ``(next_state, due_payload)`` using prechosen source values.
 
         ``source_gates`` retains its original argument name for callers using
@@ -478,7 +550,13 @@ class FunctionalNetCon:
         """
         delivery_state, payload = self.read_due(state)
         return (
-            self.advance(weights, delivery_state, source_gates, schedule=schedule),
+            self.advance(
+                weights,
+                delivery_state,
+                source_gates,
+                delays=delays,
+                schedule=schedule,
+            ),
             payload,
         )
 
@@ -486,7 +564,7 @@ class FunctionalNetCon:
         """Commit independent copies of validated carry into a compatible NetCon.
 
         This restores queues, counters, detector history, and tracked events.
-        Align effective weights and floating schedule values separately when
+        Align effective weights, delays, and floating schedule values separately when
         resuming native execution; they are parameters rather than carry.
         """
         if torch.compiler.is_compiling():

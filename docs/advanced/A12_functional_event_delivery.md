@@ -50,12 +50,13 @@ already event gates. `diff_delays=False` selects the existing hard-delay
 semantics. Explicitly selecting the dense training backend ensures this
 projection uses a dense delivery ring in both executions.
 
-The interface accepts the active dense fixed-delay runtime, including tensor
+The fixed-delay example uses the active dense runtime, including tensor
 schedules described in {doc}`A15_functional_tensor_schedules`. This example
 uses raw gates; finite and mixed thresholds are also
 supported, with explicit detector carry and ordered projection phases as
 described in {doc}`A13_functional_threshold_detection`.
-Differentiable-delay interpolation and compact queue backends remain native
+Shared two- and three-tap differentiable delay interpolation is described in
+{doc}`A17_functional_delay_interpolation`. Compact queue backends remain native
 execution modes. Shared pure `NetStim` generation and RNG continuation are
 described in {doc}`A14_functional_netstim_renewal`.
 

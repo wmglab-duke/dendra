@@ -126,8 +126,10 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-This interface supports dense fixed-delay connections, including tensor
-schedules described in {doc}`A15_functional_tensor_schedules`.
+This interface supports dense connections with fixed or interpolated delays.
+Shared differentiable delay interpolation is described in
+{doc}`A17_functional_delay_interpolation`; tensor schedules are described in
+{doc}`A15_functional_tensor_schedules`.
 NetStim-generated values bypass threshold detection and retain the native
 checkpoint schema. Shared pure generation with explicit random draws and
 clock/RNG continuation is described in {doc}`A14_functional_netstim_renewal`.

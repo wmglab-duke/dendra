@@ -181,7 +181,7 @@ The complete example executes here:
 :tags: [remove-input]
 ```
 
-Functional schedules currently use fixed tensor topology and dense fixed-delay
-projections. Heap calendars are described in {doc}`A16_functional_heap_schedules`.
+Functional schedules currently use fixed tensor topology and dense projections.
+Shared differentiable delays are described in {doc}`A17_functional_delay_interpolation`. Heap calendars are described in {doc}`A16_functional_heap_schedules`.
 Dynamic insertion inside transformed loops, other
 transport backends, and complete Network lowering remain later extensions.

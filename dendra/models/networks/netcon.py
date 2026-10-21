@@ -15,6 +15,7 @@ from ._event_delivery import (
     connection_event_counts,
     dense_due,
     dense_fixed_delay_transition,
+    dense_interpolated_delay_transition,
     gather_source_gates,
 )
 from ._tensor_schedules import causal_step_index as _causal_step_index
@@ -4819,75 +4820,24 @@ class NetCon(Referency):
             self.current_time_step = transition.slot.detach()
             self.global_step = transition.global_step.detach()
             return
-        weighted_spikes = wvals * gate  # [n_conn]
-
-        # ------------------------------------------------------------------
-        # Build next delivery buffer WITHOUT allocating a full-size "contrib"
-        # buffer and WITHOUT constructing a full-size dense mask.
-        #
-        # We clone once (this is the output buffer), clear the delivered row,
-        # then scatter-add into it.
-        #
-        # This reduces per-step peak memory substantially compared to:
-        #   contrib=zeros_like(buf_flat) + mask2d + (buf_flat*mask2d + contrib)
-        # ------------------------------------------------------------------
-        buf_next = self.delivery_buffer.clone()
-        buf_next.index_fill_(0, cur_idx, 0.0)  # clear the row we just delivered
-        buf_flat = buf_next.view(-1)
-        event_queue_next = None
-        if self.track_events:
-            event_queue_next = self.event_queue.clone()
-            event_queue_next.index_fill_(0, cur_idx, 0)
-
-        if diff_delays:
-            d_ms = self.delay_ms().to(dtype)  # [n_conn]
-            # Detection happens after the current receive slot has already been
-            # delivered.  Consequently, even a sub-timestep physical delay can
-            # arrive no earlier than the next simulation step.  Keep the
-            # differentiable dense path aligned with inference and the compact
-            # source-history training backend; otherwise a rounded-zero delay
-            # is written into the cleared current slot and is not seen again
-            # until the circular buffer wraps.
-            lam = (d_ms / self.dt.to(dtype)).clamp_min(1.0)
-            k = torch.floor(lam)
-            kL = k.to(torch.long)
-
-            if taps == 2:
-                alpha = (lam - k).to(dtype)
-                idx0 = (cur_idx + kL).remainder(self.max_delay_steps)
-                idx1 = (idx0 + 1).remainder(self.max_delay_steps)
-                flat0 = idx0 * self.syn_numel + self.post_idx
-                flat1 = idx1 * self.syn_numel + self.post_idx
-                # Vectorized 2-tap write
-                buf_flat.index_add_(0, flat0, weighted_spikes * (1.0 - alpha))
-                buf_flat.index_add_(0, flat1, weighted_spikes * alpha)
-            else:
-                offs = torch.stack([kL - 1, kL, kL + 1], dim=-1)
-                centers = offs.to(dtype)
-                lam_e = lam.unsqueeze(-1)
-                w = torch.softmax(
-                    -0.5 * ((lam_e - centers) / (sigma + 1e-6)) ** 2, dim=-1
-                )
-
-                idxs = (cur_idx + offs).remainder(self.max_delay_steps)
-                # Vectorized 3-tap write
-                flat_idx = idxs * self.syn_numel + self.post_idx.unsqueeze(
-                    -1
-                )  # [n_conn,3]
-                vals = weighted_spikes.unsqueeze(-1) * w  # [n_conn,3]
-                buf_flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
-        # Commit next buffer (already cleared + updated)
-        self.delivery_buffer = buf_next
-        if event_queue_next is not None:
-            self.event_queue = event_queue_next
-
-        # advance counters (no grad)
-        with torch.no_grad():
-            # Rebind buffers (out-of-place) to avoid version bumps on saved tensors
-            self.current_time_step = (
-                (self.current_time_step + 1).remainder(self.max_delay_steps).detach()
-            )
-            self.global_step = (self.global_step + 1).detach()
+        transition = dense_interpolated_delay_transition(
+            self.delivery_buffer,
+            cur_idx,
+            gs,
+            wvals,
+            gate,
+            self.delay_ms(),
+            self.dt,
+            post_idx=self.post_idx,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            taps=taps,
+            sigma=sigma,
+            _clone_once=True,
+        )
+        self.delivery_buffer = transition.queue
+        self.current_time_step = transition.slot.detach()
+        self.global_step = transition.global_step.detach()
 
     def _dense_current_delivery(self):
         """Return the dense delivery row due at the current slot."""

@@ -1,4 +1,4 @@
-"""Canonical dense fixed-delay event transport for NetCon adapters.
+"""Canonical dense event transport for NetCon adapters.
 
 The public tensor functions are pure and retain gradients through gates,
 weights, and already queued values. Detection, scheduling, receiver invocation,
@@ -105,6 +105,23 @@ def _enqueue_dense_values(queue, destination, values, *, inplace=False):
     ).reshape(queue.shape)
 
 
+def _enqueue_interpolated_values(queue, destination, values, *, inplace=False):
+    """Retain native interpolation's indexed accumulation precision.
+
+    On CPU, scatter_add promotes float16/bfloat16 collision sums whereas the
+    previous index_add rounded each addition to the queue dtype. index_put
+    preserves that policy and handles empty mapped-index lanes under vmap.
+    """
+    if queue.device.type != "cpu" or queue.dtype not in (torch.float16, torch.bfloat16):
+        return _enqueue_dense_values(queue, destination, values, inplace=inplace)
+    flat = queue.view(queue.numel()) if inplace else queue.reshape(queue.numel())
+    indices = (destination.reshape(destination.numel()),)
+    if inplace:
+        flat.index_put_(indices, values, accumulate=True)
+        return queue
+    return flat.index_put(indices, values, accumulate=True).reshape(queue.shape)
+
+
 def dense_fixed_delay_transition(
     queue,
     slot,
@@ -179,4 +196,88 @@ def dense_fixed_delay_transition(
         (slot + 1).remainder(depth),
         global_step + 1,
         next_events,
+    )
+
+
+def dense_interpolated_delay_transition(
+    queue,
+    slot,
+    global_step,
+    weights,
+    connection_gates,
+    delays,
+    dt,
+    *,
+    post_idx,
+    depth,
+    width,
+    taps,
+    sigma,
+    _clone_once=False,
+):
+    """Enqueue physical delays with native two- or three-tap interpolation.
+
+    ``delays`` contains one physical delay per connection, in the same units
+    as scalar ``dt``. Delay positions are clamped to at least one timestep,
+    then split between adjacent steps (two taps) or normalized Gaussian
+    weights centered on ``floor(position) + [-1, 0, 1]`` (three taps).
+    ``sigma`` is measured in timesteps and retains the native ``1e-6``
+    denominator offset.
+
+    Today's row must be delivered before this transition clears it. Tap
+    destinations wrap modulo ``depth``, including the native three-tap
+    current-row contribution when ``floor(position) == 1``. Such a value is
+    delivered when the ring next visits that row. Weights, gates, delays, and
+    timestep are evaluated at enqueue time; subsequent changes never move or
+    rescale pending values.
+
+    The default path is pure and supports independently mapped inputs under
+    vmap, including empty lanes. ``_clone_once`` shares the fixed-delay
+    transition's private native storage policy: clone one contiguous output
+    ring, then clear and scatter only into the owned clone. No input is
+    mutated. Fractional delays do not define integer event counts, so the
+    returned ``event_queue`` is always ``None``.
+    """
+    lam = (delays.to(queue.dtype) / dt.to(queue.dtype)).clamp_min(1.0)
+    lower = torch.floor(lam)
+    lower_index = lower.to(torch.long)
+    weighted_gates = weights * connection_gates
+    output = (
+        queue.clone(memory_format=torch.contiguous_format) if _clone_once else queue
+    )
+    next_queue = _clear_dense_slot(output, slot, inplace=_clone_once)
+    if taps == 2:
+        fraction = lam - lower
+        row0 = (slot + lower_index).remainder(depth)
+        row1 = (row0 + 1).remainder(depth)
+        next_queue = _enqueue_interpolated_values(
+            next_queue,
+            row0 * width + post_idx,
+            weighted_gates * (1.0 - fraction),
+            inplace=_clone_once,
+        )
+        next_queue = _enqueue_interpolated_values(
+            next_queue,
+            row1 * width + post_idx,
+            weighted_gates * fraction,
+            inplace=_clone_once,
+        )
+    else:
+        offsets = torch.stack([lower_index - 1, lower_index, lower_index + 1], dim=-1)
+        centers = offsets.to(queue.dtype)
+        fractions = torch.softmax(
+            -0.5 * ((lam.unsqueeze(-1) - centers) / (sigma + 1e-6)) ** 2,
+            dim=-1,
+        )
+        rows = (slot + offsets).remainder(depth)
+        destinations = rows * width + post_idx.unsqueeze(-1)
+        values = weighted_gates.unsqueeze(-1) * fractions
+        next_queue = _enqueue_interpolated_values(
+            next_queue,
+            destinations,
+            values.reshape(values.numel()),
+            inplace=_clone_once,
+        )
+    return DenseTransition(
+        next_queue, (slot + 1).remainder(depth), global_step + 1, None
     )

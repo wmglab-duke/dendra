@@ -628,6 +628,7 @@ draws and clock/RNG carry is described in :ref:`functional-netstim-renewal`.
 Shared tensor schedules and indexed bindings are described in
 :ref:`functional-tensor-schedules`. Consuming heap calendars and explicit
 cursor state are described in :ref:`functional-heap-schedules`.
+Shared differentiable delays are described in :ref:`functional-delay-interpolation`.
 Complete connected Network lowering remains separate work.
 
 .. _functional-scnv:
