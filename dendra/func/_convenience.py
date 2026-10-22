@@ -515,9 +515,11 @@ def compile(
     parameters at ``aux['parameters']`` for explicit continuation after
     parameter-writing initialization transforms.
     For Populations, ``extra=(field, waveform)`` or a sequence of such pairs
-    binds extracellular stimulation. Select its independent fields and waveform leaves through
-    ``trainable``; inspect ``runner.parameters`` for canonical names. See
-    :class:`CompiledRunner` for all constructor options.
+    binds extracellular stimulation. For Networks, ``extra`` maps Population
+    names to those same bindings. Select independent fields and waveform leaves
+    through ``trainable``; inspect ``runner.parameters`` for canonical names.
+    See :class:`CompiledRunner` and :class:`CompiledNetworkRunner` for all
+    constructor options.
     """
     from dendra.models.networks.net import Network
 

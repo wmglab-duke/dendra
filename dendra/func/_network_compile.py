@@ -79,8 +79,12 @@ class CompiledNetworkRunner:
     Network timestep and the Population packed loop engine. Qualified Recorders,
     built-ins wrapped in ``PopulationCallback``, and execution without callbacks
     are supported; use scan for custom callbacks and gradients. Short chunks
-    contain only the bounded unrolled tail. Binding ``extra`` at construction is
-    currently unsupported; explicit ``ve`` tapes remain available.
+    contain only the bounded unrolled tail. ``extra`` maps Population names to
+    ``(field, Waveform)`` pairs or contact sequences, using the Population
+    stimulation machinery. Its fields and waveform leaves are independent
+    parameters selected through ``trainable``, with shared aliases preserved.
+    Binding stimulation and supplying explicit ``ve`` inputs to the same
+    Population cannot be combined.
 
     ``pending_capacity`` sets the entry count for packed scheduled traffic and
     sparse inference calendars. It accepts one positive integer or a mapping
@@ -123,10 +127,6 @@ class CompiledNetworkRunner:
                 raise ValueError("execution='while' requires compilation to be enabled")
         if initialization not in ("snapshot", "fresh"):
             raise ValueError("initialization must be 'snapshot' or 'fresh'")
-        if extra is not None:
-            raise ValueError(
-                "Network compiled runners do not bind extra; supply per-population NetworkRolloutInput ve tapes"
-            )
         if checkpoint_every is not None:
             if (
                 isinstance(checkpoint_every, bool)
@@ -142,7 +142,7 @@ class CompiledNetworkRunner:
         dt_value = _validate_time_scalar(dt, name="dt", positive=True)
         with torch.inference_mode(False), torch.no_grad():
             self._functional, tensors = make_functional_network(
-                network, pending_capacity=pending_capacity
+                network, extra=extra, pending_capacity=pending_capacity
             )
             if dt_value != self._functional.dt:
                 raise ValueError(

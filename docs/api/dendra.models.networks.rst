@@ -68,6 +68,14 @@ Per-NetCon packed schedules and sparse-calendar inference share a pure pending
 calendar with enqueue-time payloads. Capacity, overflow handling, and legacy
 checkpoints are described in :doc:`../advanced/A24_functional_pending_calendar`.
 
+Bind extracellular stimulation with
+``extra={population_name: (field, waveform)}`` in ``dn.compile`` or
+``make_functional_network``. Each selected Population also accepts a sequence
+of contacts. Bound stimulation exposes trainable field and waveform leaves,
+preserves shared aliases, and follows the accepted simulation clock. An
+explicit ``ve`` input can supply another Population without bound stimulation.
+See :doc:`../advanced/A28_functional_network_extra` for the complete workflow.
+
 .. autoclass:: dendra.func.CompiledNetworkRunner
    :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
    :special-members: __call__

@@ -73,6 +73,11 @@ before entering a compiled span. Source renewal, schedules, threshold detection,
 continuous resets, projections, event reception, and Population solves retain
 native phase order. Capture does not sample extra random draws.
 
+Constructor `extra={population_name: specification}` binds extracellular
+contacts and Waveforms for while execution as well as scan. Their samples
+follow the accepted simulation clock. An explicit `ve` tape can drive another
+Population without bound `extra`; see {doc}`A28_functional_network_extra`.
+
 The example supplies explicit draws for snapshot restarts and uses automatic
 draws for fresh initialization. Fresh initialization runs once before each call
 without state, using current parameters and retained RNG/seeder carry. It is

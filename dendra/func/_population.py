@@ -10708,6 +10708,28 @@ class FunctionalPopulation:
             raise TypeError("state must be a mapping")
         self._validate_state_node(state, self._state_schema)
 
+    def _parameter_sources(
+        self, population: Population | None = None
+    ) -> dict[str, torch.Tensor]:
+        """Map execution parameter names to their original authored Tensors.
+
+        Stimulation constants are promoted into the parameter packet alongside
+        raw Population parameters. Their original source identity is retained
+        here even when extraction casts or clones a field or Waveform buffer.
+        Compatible alternate Populations supply their own registered parameters
+        and injections; bound extra remains attached to this plan's raw spec.
+        """
+        population = self._population if population is None else population
+        self._validate_compatible_population(population)
+        sources = dict(population.named_parameters())
+        if self._multi_canonical_parameter_names is not None:
+            sources = {
+                name: sources[name] for name in self._multi_canonical_parameter_names
+            }
+        sources.update(self._intra._tensor_sources(population))
+        sources.update(self._extra._tensor_sources())
+        return sources
+
     def extract(self, population: Population | None = None) -> PopulationTensors:
         """Extract explicit initialization, constants/state, and raw parameters."""
         population = self._population if population is None else population

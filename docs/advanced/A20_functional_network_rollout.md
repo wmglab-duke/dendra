@@ -247,6 +247,9 @@ The complete CPU example executes here:
 
 For `dn.compile(Network)` convenience execution with snapshot or fresh
 initialization, continue with {doc}`A21_functional_network_compile`.
+Bind per-population extracellular contacts and Waveforms with
+`make_functional_network(network, extra={name: specification})`; see
+{doc}`A28_functional_network_extra` for trainable leaves and mixed explicit inputs.
 Inference-only captured while loops, recording, and bounded tails use the same
 pure Network timestep; see {doc}`A25_functional_network_while`.
 Source-history training and its delivery-time parameter semantics are described

@@ -650,6 +650,31 @@ class _FunctionalWaveformBank:
     def constant_schema(self) -> dict[str, TensorSchema]:
         return {leaf.public_name: leaf.schema for leaf in self._constant_leaves}
 
+    def _tensor_sources(self) -> dict[str, torch.Tensor]:
+        """Map explicit names to authored Tensors before placement or cloning.
+
+        This cold correspondence records identity, rather than shared storage.
+        Aggregate snapshots use it to preserve aliases across stimulus plans.
+        """
+        sources = {}
+        for leaves, accessor in (
+            (self._parameter_leaves, "named_parameters"),
+            (self._constant_leaves, "named_buffers"),
+        ):
+            for leaf in leaves:
+                waveform = self._sources[leaf.waveform_index]
+                source = dict(getattr(waveform, accessor)())[leaf.source_name]
+                if (
+                    leaf.public_name in sources
+                    and sources[leaf.public_name] is not source
+                ):
+                    raise FunctionalizationError(
+                        "Waveform source aliases changed after lowering; "
+                        "lower the Population or Network again."
+                    )
+                sources[leaf.public_name] = source
+        return sources
+
     def extract(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         parameters: dict[str, torch.Tensor] = {}
         constants: dict[str, torch.Tensor] = {}
@@ -744,6 +769,10 @@ class _FunctionalStimulus:
         """Authored Waveform identities used to detect cross-plan aliases."""
 
         return self._waveforms.source_identities
+
+    def _tensor_sources(self) -> dict[str, torch.Tensor]:
+        """Return original Tensor correspondence for cold aggregate extraction."""
+        return self._waveforms._tensor_sources()
 
     def _validate_mapping(
         self,
@@ -1109,6 +1138,20 @@ class FunctionalIntra(_FunctionalStimulus):
                 "was created; lower the Population again."
             )
 
+    def _tensor_sources(
+        self, population: Population | None = None
+    ) -> dict[str, torch.Tensor]:
+        if population is not None and population is not self._population:
+            candidate = FunctionalIntra(population)
+            if not self.is_compatible(candidate):
+                raise FunctionalizationError(
+                    "Population injection topology or Waveform structure does "
+                    "not match this FunctionalIntra plan."
+                )
+            return candidate._tensor_sources()
+        self._validate_source()
+        return super()._tensor_sources()
+
     def extract(self, population: Population | None = None) -> StimulusTensors:
         if population is not None and population is not self._population:
             candidate = FunctionalIntra(population)
@@ -1392,6 +1435,17 @@ class FunctionalExtra(_FunctionalStimulus):
     @property
     def uses_waveforms(self) -> bool:
         return self._uses_waveforms
+
+    def _tensor_sources(self) -> dict[str, torch.Tensor]:
+        sources = super()._tensor_sources()
+        # Python-valued fields have no authored Tensor identity. Omitting them
+        # leaves each materialized contact independent in aggregate snapshots.
+        sources.update(
+            (name, source)
+            for name, source in self._contact_sources.items()
+            if torch.is_tensor(source)
+        )
+        return sources
 
     def extract(self) -> StimulusTensors:
         parameters, constants = self._waveforms.extract()

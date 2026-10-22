@@ -1466,6 +1466,12 @@ time-first mV tensor and pass ``runner(inputs=dn.func.RolloutInput(ve=ve))``
 instead. Both routes preserve the model's ordinary scalar-cable or
 finite-extracellular interpretation of the supplied potential.
 
+For Networks, bind the same specifications by top-level Population name with
+``extra={population_name: specification}`` in ``dn.compile`` or
+``make_functional_network``. Stimulation leaves are nested under their
+Population's parameter namespace. See :doc:`A28_functional_network_extra`
+for trainable sharing, continuation, and per-population explicit-input rules.
+
 The same ``extra=extra`` keyword is accepted by ``fmodel.step`` and by
 ``dn.func.run``, ``longrun``, and ``longrun_checkpointed``. Dendra evaluates
 and transfers the authored fields and waveforms as needed; callers do not need
@@ -2504,9 +2510,11 @@ audit; CUDA support does not disable or weaken that audit. This remains a
 hardware-validation risk for branched models, not a verified deterministic GPU
 execution guarantee.
 
-CUDA does not remove the other admission restrictions above: no
-stochastic/delayed state, Network event scheduling, SPD block solver, or arbitrary
-custom geometry/integrators. MPS, float16 and bfloat16 remain unsupported.
+CUDA retains the Population admission restrictions above: stochastic/delayed
+state, the SPD block solver, and arbitrary custom geometry/integrators are
+currently unsupported. Network event delivery uses the composed Network plan
+described in :doc:`A19_functional_network_lowering`.
+MPS, float16 and bfloat16 are currently unsupported.
 
 The CUDA acceptance tests compare full trajectories and gradients against
 imperative execution and CPU references, and separately exercise transforms and

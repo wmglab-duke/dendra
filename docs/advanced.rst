@@ -35,3 +35,4 @@ Advanced
    advanced/A25_functional_network_while.md
    advanced/A26_functional_network_regions.md
    advanced/A27_functional_network_callbacks.md
+   advanced/A28_functional_network_extra.md

@@ -326,8 +326,11 @@ The example checks that automatic sampling matches the supplied tape:
 Snapshot calls without state restart the NetStim RNG snapshot and event clock.
 Fresh calls apply the initialization sampling policy described above.
 Explicit continuation advances from the returned RNG position. Constructor
-`extra=` binding is currently unsupported for Network runners; supply
-per-population `ve` tapes or supported registered stimulation.
+`extra={population_name: specification}` binds each selected Population's
+extracellular contacts and Waveforms. Their field and waveform leaves support
+trainable selection, shared aliases, and the same continuation clock; see
+{doc}`A28_functional_network_extra`. An explicit `ve` tape remains available for
+any Population without bound `extra`.
 
 ## Restart or continue explicitly
 

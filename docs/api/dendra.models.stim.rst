@@ -132,6 +132,13 @@ Waveform objects.  In a multi-contact Population call, all contacts must use
 the same temporal type: either Waveforms or time-last tensors.  In every case,
 ``ve_s * time`` must be an extracellular potential in mV.
 
+Functional Network construction accepts the same per-population mapping in
+``dn.compile(network, extra=...)`` or ``make_functional_network``. A value may
+also be a sequence of Waveform contacts for that Population. Bound fields and
+waveform leaves become explicit selectable parameters; see
+:doc:`../advanced/A28_functional_network_extra` for sharing, continuation,
+training, and the per-population rules for explicit ``ve`` tapes.
+
 The spatial field ``ve_s`` broadcasts to ``[*B, N, C]``:
 
 * for a regular Population, use ``[C]``, ``[1, C]``, or ``[N, C]``;

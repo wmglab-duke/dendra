@@ -61,6 +61,9 @@ Network timestep are in milliseconds. See {doc}`../units` and
 `NetworkTensors` has three fields: `parameters`, `constants`, and `state`.
 They are ordinary tensor trees. Component names match those in
 `network.populations`, `network.synapses`, and `network.continuous_synapses`.
+Lower with `extra={population_name: specification}` to bind extracellular
+contacts and Waveforms. Their explicit leaves live under the selected
+Population's parameter namespace; see {doc}`A28_functional_network_extra`.
 
 | Tree | Contents |
 | --- | --- |

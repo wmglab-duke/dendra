@@ -256,6 +256,14 @@ class FunctionalNetwork:
     plan for snapshot or fresh Network initialization; the lower-level methods support
     explicit preparation and functional transforms.
 
+    ``extra`` maps Population names to extracellular stimulation bindings,
+    each using one ``(field, Waveform)`` pair or a sequence of contacts. Fields
+    and waveform leaves appear in the selected Population's explicit
+    ``stimulation.extra.*`` parameters. Shared authored Tensor objects retain
+    their aliases across the Network. Bound stimulation uses the Network clock
+    before each timestep; explicit ``ve`` inputs for the same Population cannot
+    be combined with it.
+
     ``pending_capacity`` bounds each sparse pending calendar independently of
     delay depth. Supply one positive integer or a connection-name mapping.
     Active-calendar defaults cover at least 16 entries, twice the edge count,
@@ -264,8 +272,16 @@ class FunctionalNetwork:
     returning a result.
     """
 
-    def __init__(self, network, *, pending_capacity=None):
+    def __init__(self, network, *, extra=None, pending_capacity=None):
         _eligible(network)
+        if extra is not None and not isinstance(extra, Mapping):
+            raise TypeError("extra must map Population names to stimulation bindings")
+        extra = {} if extra is None else dict(extra)
+        unknown = extra.keys() - network.populations.keys()
+        if unknown:
+            raise ValueError(
+                f"extra names unknown Populations: {sorted(unknown, key=str)!r}"
+            )
         if isinstance(pending_capacity, Mapping):
             capacities = dict(pending_capacity)
             unknown = capacities.keys() - network.synapses.keys()
@@ -302,7 +318,9 @@ class FunctionalNetwork:
         self._netstim_source = network.netstim
         self.populations, initialization = {}, {}
         for name, population in self._schedule.populations:
-            plan, packet = make_functional(population, dt=self.dt)
+            plan, packet = make_functional(
+                population, dt=self.dt, extra=extra.get(name)
+            )
             self.populations[name] = plan
             initialization[name] = packet.initialization
         self.synapses = {
@@ -593,7 +611,7 @@ class FunctionalNetwork:
             population = network.populations[name]
             packet = plan.extract(population)
             parameters["populations"][name] = snapshots.tree(
-                dict(population.named_parameters()), packet.parameters
+                plan._parameter_sources(population), packet.parameters
             )
             native_constants = {
                 entry.key: population.get_submodule(entry.module_path)._buffers[
@@ -1239,8 +1257,14 @@ class FunctionalNetwork:
         return network
 
 
-def make_functional_network(network, *, pending_capacity=None):
+def make_functional_network(network, *, extra=None, pending_capacity=None):
     """Lower a Network with independent explicit tensors and bounded pending carry.
+
+    ``extra`` maps Population names to one ``(field, Waveform)`` pair or a
+    sequence of contacts, using the same stimulation bindings as
+    :func:`make_functional`. Omitted Populations have no bound extracellular
+    stimulation. Fields and waveform leaves are explicit parameters, with
+    shared Tensor aliases preserved across components.
 
     ``pending_capacity`` is a positive entry count per calendar, or a mapping
     from event-connection names to counts. Omitted capacities use at least
@@ -1250,7 +1274,7 @@ def make_functional_network(network, *, pending_capacity=None):
     Overflow raises at host execution boundaries; retry from the input state
     with a larger-capacity plan.
     """
-    plan = FunctionalNetwork(network, pending_capacity=pending_capacity)
+    plan = FunctionalNetwork(network, extra=extra, pending_capacity=pending_capacity)
     return plan, plan.extract()
 
 
