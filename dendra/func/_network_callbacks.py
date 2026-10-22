@@ -1,8 +1,8 @@
 """Bind Network observations into the existing functional callback machinery.
 
-Only selection names differ from Population callbacks. Recorder updates,
-emissions, explicit carry, continuation tokens, and finalization are the same
-operations used by Population execution.
+Qualified paths and Population scopes are cold binding adapters. Callback
+updates, emissions, explicit carry, continuation tokens, and finalization use
+the same operations as Population execution.
 """
 
 from __future__ import annotations
@@ -119,9 +119,10 @@ def make_network_callbacks(functional, callbacks):
     ``region`` selects a physical Slice of one exact source Population,
     including named components of a concatenated MultiPopulation. The qualified
     physical selections must belong to that Population; the Network or selected
-    Population clock remains scalar. LFP, threshold, and anomaly callbacks are
-    currently unsupported at Network level. Custom callbacks receive the
-    complete Network state and auxiliary mapping.
+    Population clock remains scalar. Bind Population-specific callbacks such
+    as LFP, spike analysis, and anomaly detection with ``PopulationCallback``.
+    Unscoped custom callbacks receive the complete Network state and auxiliary
+    mapping; scoped ones receive the selected Population's values.
     """
     if not isinstance(callbacks, Mapping):
         raise TypeError(
@@ -148,7 +149,7 @@ def make_network_callbacks(functional, callbacks):
         elif isinstance(callback, (LFP, _ThresholdCallback, AnomalyDetector)):
             raise FunctionalizationError(
                 f"{type(callback).__name__} requires a Population-specific "
-                "binding; use a pure Network FunctionalCallback instead."
+                "binding; wrap it in PopulationCallback(name, callback)."
             )
         else:
             adapted[name] = callback

@@ -49,6 +49,12 @@ recording engine; see :doc:`../advanced/A25_functional_network_while`.
 Qualified physical Recorders accept Population Slice regions, including named
 components after ``Network.concat()``; see
 :doc:`../advanced/A26_functional_network_regions`.
+``PopulationCallback("left", callback)`` applies an existing functional
+Population callback to one named Population. LFP, threshold-analysis, anomaly,
+and scoped Recorder callbacks support scan and while execution; scoped custom
+callbacks support scan. See
+:doc:`../advanced/A27_functional_network_callbacks` for shapes, callback windows,
+lead-field gradients, packed components, and continuation.
 ``trainable`` accepts exact/unique partial names, glob patterns, and explicit
 regex selectors. Preview matches with ``find_parameters`` and inspect the live
 selected leaves through ``trainable_parameters``; shared aliases remain visible.
@@ -65,6 +71,8 @@ checkpoints are described in :doc:`../advanced/A24_functional_pending_calendar`.
 .. autoclass:: dendra.func.CompiledNetworkRunner
    :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
    :special-members: __call__
+
+.. autoclass:: dendra.func.PopulationCallback
 
 .. autofunction:: dendra.func.make_functional_network
 

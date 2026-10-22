@@ -38,11 +38,13 @@ suppresses gradients, including when the native Network was initialized in
 training mode. Use `execution="scan", inference=False` for gradients and
 `checkpoint_every` for training recomputation.
 
-While execution supports qualified `dn.func.Recorder` selections. Omit
-`callbacks` when only the final state is needed. Custom callbacks and reducers
-are currently unsupported by Network while execution; use scan for those
-configurations. Explicit while requests raise on unsupported capture or
-compiler configurations rather than select a different long-horizon executor.
+While execution supports qualified `dn.func.Recorder` selections and built-ins
+wrapped in `dn.func.PopulationCallback`, including LFP, threshold analysis,
+and anomaly detection. See {doc}`A27_functional_network_callbacks` for scoping,
+reducer results, and callback-relative windows. Omit `callbacks` when only the
+final state is needed. Custom callbacks are currently unsupported by Network
+while execution; use scan for those configurations. Explicit while requests
+raise when capture or compilation is unsupported for the configuration.
 Compilation must be enabled for the convenience runner.
 
 Physical recordings can use a Population Slice, for example

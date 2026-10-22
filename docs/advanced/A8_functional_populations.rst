@@ -1812,6 +1812,13 @@ For an ordinary Network, retain the Population-qualified field name, such as
 scan/while example are described in
 :doc:`A26_functional_network_regions`.
 
+To use a Population callback inside a functional Network, wrap it in
+``dn.func.PopulationCallback("left", callback)``. This selects the top-level
+Population named ``left`` while retaining the callback's local state names,
+physical shape, and continuation rules. LFP, threshold-analysis, anomaly, and
+scoped Recorder examples for scan and while execution are described in
+:doc:`A27_functional_network_callbacks`.
+
 Threshold detection
 ^^^^^^^^^^^^^^^^^^^
 

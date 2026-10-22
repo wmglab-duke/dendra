@@ -153,6 +153,12 @@ compartments. Use separate Recorder streams when different selections are
 needed. Other Network callback contracts are described in
 {doc}`A20_functional_network_rollout` and {doc}`A25_functional_network_while`.
 
+For a local Recorder wrapped in `PopulationCallback`, use local state names:
+`PopulationCallback("left", Recorder(("v", "t"), region=network.left.soma))`.
+Its result fields remain `"v"` and `"t"`. LFP, threshold analysis, anomaly
+detection, and packed component scoping are described in
+{doc}`A27_functional_network_callbacks`.
+
 The complete CPU example executes here:
 
 ```{code-cell} python

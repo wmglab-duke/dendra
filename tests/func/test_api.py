@@ -166,6 +166,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "NetworkRolloutInput",
         "NetworkTensors",
         "PopulationTensors",
+        "PopulationCallback",
         "Raster",
         "Recorder",
         "RolloutInput",

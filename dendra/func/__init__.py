@@ -12,6 +12,7 @@ from ._callbacks import (
     FunctionalCallbackResults,
     FunctionalCallbacks,
     FunctionalCallbackState,
+    PopulationCallback,
     Raster,
     Recorder,
 )
@@ -83,6 +84,7 @@ __all__ = [
     "NetworkRolloutInput",
     "NetworkTensors",
     "PopulationTensors",
+    "PopulationCallback",
     "Raster",
     "Recorder",
     "RolloutInput",

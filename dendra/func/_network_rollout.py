@@ -372,11 +372,12 @@ class CompiledNetworkChunk:
     def _validate_while_callbacks(self, callbacks):
         if self._execution != "while" or callbacks is None:
             return
-        from ._callbacks import _BoundRecorder
+        from ._callbacks import _is_builtin_callback
 
-        if any(type(plan.callback) is not _BoundRecorder for plan in callbacks._plans):
+        if any(not _is_builtin_callback(plan.callback) for plan in callbacks._plans):
             raise FunctionalizationError(
-                "Network execution='while' supports qualified Recorders; "
+                "Network execution='while' supports qualified Recorders and "
+                "PopulationCallback scopes around supported built-ins; "
                 "use scan for custom callbacks or reducers."
             )
 

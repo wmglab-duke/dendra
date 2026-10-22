@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ._callbacks import _BoundLFP
+from ._callbacks import _BoundLFP, _callback_implementation
 
 
 @dataclass(frozen=True)
@@ -23,7 +23,11 @@ class _CallbackCarryPartition:
         plans = () if plans is None else plans
         return cls(
             tuple(plan.name for plan in plans),
-            tuple(plan.name for plan in plans if type(plan.callback) is _BoundLFP),
+            tuple(
+                plan.name
+                for plan in plans
+                if type(_callback_implementation(plan.callback)) is _BoundLFP
+            ),
         )
 
     def split(self, carries):

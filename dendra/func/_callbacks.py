@@ -1,4 +1,4 @@
-"""Pure callback reducers for functional Population execution.
+"""Pure callback reducers for functional Population and Network execution.
 
 Functional callbacks are a parallel API to Dendra's mutable callback classes.
 They own explicit tensor carry, return optional tensor emissions, and finalize a
@@ -78,6 +78,101 @@ class FunctionalCallback(ABC):
 
         del functional
         return self
+
+
+@dataclass(frozen=True)
+class PopulationCallback(FunctionalCallback):
+    """Apply an existing pure callback to one Population in a Network.
+
+    ``PopulationCallback("left", LFP(lead_fields))`` binds the inner callback
+    against the Network's ``left`` Population. Its state, auxiliary values,
+    result names, shapes, sampling phase, and continuation carry follow the
+    ordinary Population callback contract. The callback mapping's key names
+    the result stream. Use relative state names inside a scoped Recorder.
+
+    ``population`` is an exact top-level Network Population name. A concatenated
+    MultiPopulation is one such owner: use its packed coordinates for threshold
+    selections and lead fields, or named Slice regions in a scoped Recorder.
+    Pure custom callbacks support scan; inference while execution supports the
+    same built-ins as Population execution.
+    """
+
+    population: str
+    callback: FunctionalCallback
+
+    def __post_init__(self):
+        if not isinstance(self.population, str):
+            raise TypeError("PopulationCallback population must be a string")
+        if not self.population:
+            raise ValueError("PopulationCallback population must not be empty")
+        if not isinstance(self.callback, FunctionalCallback):
+            raise TypeError("PopulationCallback requires a pure FunctionalCallback")
+        if isinstance(self.callback, PopulationCallback):
+            raise ValueError("PopulationCallback scopes cannot be nested")
+
+    def _bind(self, functional):
+        from ._network import FunctionalNetwork
+
+        if not isinstance(functional, FunctionalNetwork):
+            raise FunctionalizationError(
+                "PopulationCallback must be bound to a functional Network; "
+                "use the inner callback directly for a Population"
+            )
+        if self.population not in functional.populations:
+            raise FunctionalizationError(
+                f"Unknown Network Population {self.population!r}; "
+                f"available names are {tuple(functional.populations)}"
+            )
+        bound = self.callback._bind(functional.populations[self.population])
+        if not isinstance(bound, FunctionalCallback):
+            raise FunctionalizationError(
+                "PopulationCallback inner callback returned an invalid bound object"
+            )
+        if isinstance(bound, _BoundPopulationCallback):
+            raise FunctionalizationError("PopulationCallback scopes cannot be nested")
+        return _BoundPopulationCallback(self.population, bound)
+
+    def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
+        del state, auxiliary
+        raise FunctionalizationError(
+            "PopulationCallback must be bound with functional.make_callbacks(...)"
+        )
+
+    def update(self, carry, state, auxiliary):  # pragma: no cover - guarded by bind
+        del carry, state, auxiliary
+        raise FunctionalizationError(
+            "PopulationCallback must be bound with functional.make_callbacks(...)"
+        )
+
+    def finalize(self, carry, emissions):  # pragma: no cover - guarded by bind
+        del carry, emissions
+        raise FunctionalizationError(
+            "PopulationCallback must be bound with functional.make_callbacks(...)"
+        )
+
+
+@dataclass(frozen=True)
+class _BoundPopulationCallback(FunctionalCallback):
+    """Project a Network frame without changing the inner callback contract."""
+
+    population: str
+    callback: FunctionalCallback
+
+    def _auxiliary(self, auxiliary):
+        return None if auxiliary is None else auxiliary["populations"][self.population]
+
+    def initialize(self, state, auxiliary):
+        return self.callback.initialize(
+            state["populations"][self.population], self._auxiliary(auxiliary)
+        )
+
+    def update(self, carry, state, auxiliary):
+        return self.callback.update(
+            carry, state["populations"][self.population], self._auxiliary(auxiliary)
+        )
+
+    def finalize(self, carry, emissions):
+        return self.callback.finalize(carry, emissions)
 
 
 class Recorder(FunctionalCallback):
@@ -899,6 +994,23 @@ class Active(ActiveAL):
         )
 
 
+def _callback_implementation(callback):
+    """Expose built-in policy through an exact, trusted Population adapter."""
+    return callback.callback if type(callback) is _BoundPopulationCallback else callback
+
+
+def _is_builtin_callback(callback):
+    return type(_callback_implementation(callback)) in {
+        _BoundRecorder,
+        _BoundLFP,
+        AnomalyDetector,
+        _BoundRaster,
+        _BoundAPCount,
+        _BoundActiveAL,
+        _BoundActiveALCount,
+    }
+
+
 @dataclass(frozen=True)
 class FunctionalCallbackResults(Mapping[str, object]):
     """Immutable finalized result envelope for one callback execution segment.
@@ -1365,16 +1477,7 @@ class FunctionalCallbacks:
             emission_schema=emission_schema,
             result_schema=result_schema,
             initial_emits=initial_emits,
-            validate_updates=type(callback)
-            not in {
-                _BoundRecorder,
-                _BoundLFP,
-                AnomalyDetector,
-                _BoundRaster,
-                _BoundAPCount,
-                _BoundActiveAL,
-                _BoundActiveALCount,
-            },
+            validate_updates=not _is_builtin_callback(callback),
         )
 
     def _validate_owner(self, functional: FunctionalPopulation) -> None:
@@ -1385,7 +1488,7 @@ class FunctionalCallbacks:
 
     def _validate_runtime_dt(self, dt: float) -> None:
         for plan in self._plans:
-            callback = plan.callback
+            callback = _callback_implementation(plan.callback)
             if isinstance(callback, (_BoundRaster, _BoundAPCount)) and (
                 dt != callback.callback_dt
             ):
@@ -1396,7 +1499,7 @@ class FunctionalCallbacks:
 
     def _validate_runtime_dt_tensor(self, dt: torch.Tensor) -> None:
         for plan in self._plans:
-            callback = plan.callback
+            callback = _callback_implementation(plan.callback)
             if not isinstance(callback, (_BoundRaster, _BoundAPCount)):
                 continue
             expected = dt.new_tensor(callback.callback_dt)
@@ -1689,6 +1792,7 @@ __all__ = [
     "FunctionalCallbackState",
     "FunctionalCallbacks",
     "LFP",
+    "PopulationCallback",
     "Raster",
     "Recorder",
 ]

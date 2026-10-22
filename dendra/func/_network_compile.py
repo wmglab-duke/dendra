@@ -76,10 +76,11 @@ class CompiledNetworkRunner:
     initialization transforms replace them. Initialization runs once before
     rollout/checkpoint spans; its graph is never cached. Inference while-loop
     execution uses ``execution='while', inference=True`` with the same pure
-    Network timestep and the Population packed loop engine. Qualified Recorders
-    and no-callback execution are supported; use scan for custom callbacks and
-    gradients. Short chunks contain only the bounded unrolled tail. Constructor-
-    bound ``extra`` is currently unsupported; explicit ``ve`` tapes remain available.
+    Network timestep and the Population packed loop engine. Qualified Recorders,
+    built-ins wrapped in ``PopulationCallback``, and execution without callbacks
+    are supported; use scan for custom callbacks and gradients. Short chunks
+    contain only the bounded unrolled tail. Binding ``extra`` at construction is
+    currently unsupported; explicit ``ve`` tapes remain available.
 
     ``pending_capacity`` sets the entry count for packed scheduled traffic and
     sparse inference calendars. It accepts one positive integer or a mapping

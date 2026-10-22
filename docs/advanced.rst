@@ -34,3 +34,4 @@ Advanced
    advanced/A24_functional_pending_calendar.md
    advanced/A25_functional_network_while.md
    advanced/A26_functional_network_regions.md
+   advanced/A27_functional_network_callbacks.md

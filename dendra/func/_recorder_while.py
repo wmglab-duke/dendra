@@ -17,16 +17,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
-from ._callbacks import (
-    AnomalyDetector,
-    _BoundActiveAL,
-    _BoundActiveALCount,
-    _BoundAPCount,
-    _BoundLFP,
-    _BoundRaster,
-    _BoundRecorder,
-    _update_callback_values,
-)
+from ._callbacks import _is_builtin_callback, _update_callback_values
 from ._tensor_tree_while import _CompiledTensorTreeWhile, _schema
 from ._types import StepInput
 from ._while_inductor import _compile_while
@@ -48,17 +39,8 @@ class _RecorderWhileExecutor:
 
         if self._steps < _STRUCTURED_ROLLOUT_CHUNK:
             return None, "The chunk is shorter than one inference loop block."
-        supported = {
-            _BoundRecorder,
-            AnomalyDetector,
-            _BoundRaster,
-            _BoundAPCount,
-            _BoundLFP,
-            _BoundActiveAL,
-            _BoundActiveALCount,
-        }
         if not self._plans or not all(
-            type(plan.callback) in supported for plan in self._plans
+            _is_builtin_callback(plan.callback) for plan in self._plans
         ):
             return None, (
                 "Inference callback loops require supported built-in functional "
