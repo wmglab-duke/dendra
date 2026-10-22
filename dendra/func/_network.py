@@ -557,6 +557,23 @@ class FunctionalNetwork:
         _validate_tree(state, self._state_schema, "state")
         self.check_overflow(state)
 
+    def _clone_state_tree(self, state):
+        """Own state leaves in the frozen schema's mapping and tuple order."""
+
+        def clone(value, schema):
+            if isinstance(schema, _TensorSchema):
+                return value.clone(memory_format=torch.contiguous_format)
+            if isinstance(schema, Mapping):
+                return {
+                    name: clone(value[name], child) for name, child in schema.items()
+                }
+            if isinstance(schema, tuple):
+                values = tuple(clone(item, child) for item, child in zip(value, schema))
+                return type(schema)(*values) if hasattr(schema, "_fields") else values
+            return None
+
+        return clone(state, self._state_schema)
+
     def _extract(self, network):
         snapshots = AliasSnapshots()
         parameters = {
@@ -850,7 +867,7 @@ class FunctionalNetwork:
         )
 
     def compile_rollout_chunk(self, steps, *, execution="scan", **compile_options):
-        """Build a fixed-horizon chunk using the shared scan or unrolled body."""
+        """Build a scan, unrolled, or inference-only shared while-loop chunk."""
         from ._network_rollout import CompiledNetworkChunk
 
         return CompiledNetworkChunk(

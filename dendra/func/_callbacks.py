@@ -96,7 +96,11 @@ class Recorder(FunctionalCallback):
     Mechanism-local state has separate support maps and cannot yet be selected
     with ``region``. Region selection is mutually exclusive with ``node_indices``,
     ``max_only``, and ``partition``; without a region those retain their
-    existing final-axis semantics.
+    existing final-axis semantics. Network selections use qualified names such
+    as ``cells.v`` and a region rooted at that Network's source Population,
+    including ``network.packed.cell_a.soma`` after concatenation. Each regional
+    recorder selects one Population; the Network or selected Population clock
+    may be recorded alongside physical fields.
     """
 
     def __init__(
@@ -129,17 +133,12 @@ class Recorder(FunctionalCallback):
         self.region = region
 
     def _bind(self, functional: FunctionalPopulation):
-        if self.dt is not None:
-            raise FunctionalizationError(
-                "dn.func.Recorder does not yet support dt; it records the "
-                "initial boundary and every post-step value"
-            )
-        if self.sliding_window is not None:
-            raise FunctionalizationError(
-                "dn.func.Recorder does not yet support sliding_window; apply a "
-                "pure tensor reduction to the finalized recording"
-            )
+        paths = self._resolve_paths(functional)
+        region = self._bind_region(functional, paths)
+        return self._bind_paths(functional, paths, region)
 
+    def _resolve_paths(self, functional):
+        """Resolve public selections through a Population or Network layout."""
         available = {}
         for leaf in functional._state_layout:
             if leaf.public_path[0] == "integrator":
@@ -154,33 +153,46 @@ class Recorder(FunctionalCallback):
                 "dn.func.Recorder can only observe explicit transition state; "
                 f"unsupported selection(s): {missing}"
             )
-        paths = tuple(available[state] for state in self.states)
-        region = None
-        if self.region is not None:
-            from ._regions import _RecorderRegion
+        return tuple(available[state] for state in self.states)
 
-            if (
-                self.max_only
-                or self.node_indices is not None
-                or self.partition is not None
-            ):
+    def _bind_region(self, functional, paths):
+        """Bind physical paths relative to the region's owning Population."""
+        if self.region is None:
+            return None
+        from ._regions import _RecorderRegion
+
+        if self.max_only or self.node_indices is not None or self.partition is not None:
+            raise FunctionalizationError(
+                "dn.func.Recorder region cannot be combined with "
+                "node_indices, max_only, or partition"
+            )
+        for state_name, path in zip(self.states, paths, strict=True):
+            if path not in {
+                ("integrator", "v"),
+                ("integrator", "vc"),
+                ("integrator", "i_membrane"),
+                ("clock", "t"),
+            }:
                 raise FunctionalizationError(
-                    "dn.func.Recorder region cannot be combined with "
-                    "node_indices, max_only, or partition"
+                    "dn.func.Recorder region only selects physical v, vc, "
+                    "or i_membrane state (and leaves clock t unchanged); "
+                    f"{state_name!r} is mechanism-local state"
                 )
-            for state_name, path in zip(self.states, paths, strict=True):
-                if path not in {
-                    ("integrator", "v"),
-                    ("integrator", "vc"),
-                    ("integrator", "i_membrane"),
-                    ("clock", "t"),
-                }:
-                    raise FunctionalizationError(
-                        "dn.func.Recorder region only selects physical v, vc, "
-                        "or i_membrane state (and leaves clock t unchanged); "
-                        f"{state_name!r} is mechanism-local state"
-                    )
-            region = _RecorderRegion.bind(functional, self.region)
+        return _RecorderRegion.bind(functional, self.region)
+
+    def _bind_paths(self, functional, paths, region):
+        """Bind shared recording options after path and region resolution."""
+        if self.dt is not None:
+            raise FunctionalizationError(
+                "dn.func.Recorder does not yet support dt; it records the "
+                "initial boundary and every post-step value"
+            )
+        if self.sliding_window is not None:
+            raise FunctionalizationError(
+                "dn.func.Recorder does not yet support sliding_window; apply a "
+                "pure tensor reduction to the finalized recording"
+            )
+
         selected_schemas = []
         for state_name, path in zip(self.states, paths, strict=True):
             schema = functional._state_schema
@@ -276,8 +288,10 @@ class _BoundRecorder(FunctionalCallback):
                 raise FunctionalizationError(
                     f"functional Recorder state {name!r} is no longer a Tensor"
                 )
-            if self.region is not None and path != ("clock", "t"):
-                value = self.region.select(value, payload_ndim=int(name == "vc"))
+            if self.region is not None and path[-2:] != ("clock", "t"):
+                value = self.region.select(
+                    value, payload_ndim=int(path[-2:] == ("integrator", "vc"))
+                )
             if self.max_only:
                 if self.partition is None:
                     value = torch.amax(value, dim=-1, keepdim=True)

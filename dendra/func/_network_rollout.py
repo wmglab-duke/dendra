@@ -195,8 +195,8 @@ def _auxiliary(functional, state, *, scan=False):
         )
     return {
         "populations": {
-            name: {"v": value["integrator"]["v"]}
-            for name, value in state["populations"].items()
+            name: {"v": state["populations"][name]["integrator"]["v"]}
+            for name in functional.populations
         },
         "netstim": stimulus,
     }
@@ -282,11 +282,13 @@ def rollout(
 
 
 class CompiledNetworkChunk:
-    """A fixed-horizon Network adapter over the shared packed scan engine.
+    """A fixed-horizon Network adapter over shared tensor-tree loop engines.
 
     ``execution='scan'`` preserves the existing first-order reverse-mode scan
     contract. ``execution='unrolled'`` uses the same authored body without a
-    HOP. Public calls validate source/schema/preparation before entering the
+    HOP. ``execution='while'`` captures an inference-only bounded loop using
+    Population's packed carry and invocation-local recording machinery.
+    Public calls validate source/schema/preparation before entering the
     tensor-only kernel. Kernel caches retain no live input/preparation graphs.
     """
 
@@ -301,8 +303,10 @@ class CompiledNetworkChunk:
     ):
         if _steps(steps) < 1:
             raise ValueError("compiled chunks require a positive step count")
-        if execution not in {"scan", "unrolled"}:
-            raise ValueError("Network chunk execution must be 'scan' or 'unrolled'")
+        if execution not in {"scan", "unrolled", "while"}:
+            raise ValueError(
+                "Network chunk execution must be 'scan', 'unrolled', or 'while'"
+            )
         functional._validate_source()
         if execution == "scan":
             from ._scan_compat import install_scan_compatibility
@@ -365,6 +369,17 @@ class CompiledNetworkChunk:
             )
         return self._tails[steps]
 
+    def _validate_while_callbacks(self, callbacks):
+        if self._execution != "while" or callbacks is None:
+            return
+        from ._callbacks import _BoundRecorder
+
+        if any(type(plan.callback) is not _BoundRecorder for plan in callbacks._plans):
+            raise FunctionalizationError(
+                "Network execution='while' supports qualified Recorders; "
+                "use scan for custom callbacks or reducers."
+            )
+
     def _make_kernel(self, callbacks):
         functional = self._functional
         plans = None if callbacks is None else callbacks._plans
@@ -379,6 +394,30 @@ class CompiledNetworkChunk:
                     plans, carries, state, auxiliary
                 )
             return ({"network": state, "auxiliary": auxiliary}, carries), emitted or {}
+
+        if self._execution == "while":
+            from ._tensor_tree_while import _CompiledTensorTreeWhile
+
+            def clone_loop(loop):
+                return {
+                    "network": functional._clone_state_tree(loop["network"]),
+                    "auxiliary": pytree.tree_map_only(
+                        torch.Tensor,
+                        lambda value: value.clone(
+                            memory_format=torch.contiguous_format
+                        ),
+                        loop["auxiliary"],
+                    ),
+                }
+
+            return _CompiledTensorTreeWhile(
+                body,
+                steps=self.steps,
+                compile_options=self._options,
+                device=functional.device,
+                plans=plans,
+                clone_state=clone_loop,
+            )
 
         if self._execution == "unrolled":
             from dendra._bootstrap import isolate_compilation_callable
@@ -421,6 +460,7 @@ class CompiledNetworkChunk:
         )
 
     def _values(self, parameters, prepared, state, tape, callbacks, callback_state):
+        self._validate_while_callbacks(callbacks)
         transform = torch._C._are_functorch_transforms_active()
         forward_ad = torch.autograd.forward_ad._current_level >= 0
         disabled = self._options.get("disable", False)
@@ -455,6 +495,11 @@ class CompiledNetworkChunk:
                 ),
             )
             return result
+        if self._execution == "while" and grad_enabled:
+            raise FunctionalizationError(
+                "Network execution='while' is inference-only; use torch.no_grad() "
+                "or scan for gradients."
+            )
         if callbacks is None:
             if self._plain_kernel is None:
                 self._plain_kernel = self._make_kernel(None)
@@ -468,20 +513,39 @@ class CompiledNetworkChunk:
             "auxiliary": _auxiliary(self._functional, state, scan=True),
         }
         carries = {} if callback_state is None else callback_state.carries
-        loop, carries, emitted = kernel(parameters, prepared, loop, carries, tape)
+        try:
+            loop, carries, emitted = kernel(parameters, prepared, loop, carries, tape)
+        except Exception as error:
+            if self._execution == "while":
+                raise FunctionalizationError(
+                    f"Network execution='while' is unavailable: {error}. "
+                    "Use scan for this configuration."
+                ) from error
+            raise
         self._functional.check_overflow(loop["network"])
         if callbacks is not None:
             emitted = {plan.name: emitted.get(plan.name) for plan in callbacks._plans}
             callback_state = callbacks._wrap_compiled_update(
                 callback_state, carries, emitted
             )
+        from ._population import _STRUCTURED_ROLLOUT_CHUNK
+
+        while_loop = (
+            self._execution == "while" and self.steps >= _STRUCTURED_ROLLOUT_CHUNK
+        )
         self._record_execution(
-            "compiled_scan" if self._execution == "scan" else "compiled_unrolled",
+            "compiled_while_loop"
+            if while_loop
+            else "compiled_scan"
+            if self._execution == "scan"
+            else "compiled_unrolled",
             callbacks=callbacks,
             grad_enabled=grad_enabled,
             reason=(
                 "Unrolled execution was explicitly selected."
                 if self._execution == "unrolled"
+                else "The chunk is shorter than one inference loop block."
+                if self._execution == "while" and not while_loop
                 else None
             ),
         )

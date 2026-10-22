@@ -44,6 +44,11 @@ recordings, and checkpointed host execution are described in
 ``dn.compile(Network)`` dispatch, snapshot and fresh initialization, shared
 trainable parameter selection, restart, and explicit continuation are described in
 :doc:`../advanced/A21_functional_network_compile`.
+Inference-only ``execution="while"`` reuses Population's packed loop and
+recording engine; see :doc:`../advanced/A25_functional_network_while`.
+Qualified physical Recorders accept Population Slice regions, including named
+components after ``Network.concat()``; see
+:doc:`../advanced/A26_functional_network_regions`.
 ``trainable`` accepts exact/unique partial names, glob patterns, and explicit
 regex selectors. Preview matches with ``find_parameters`` and inspect the live
 selected leaves through ``trainable_parameters``; shared aliases remain visible.

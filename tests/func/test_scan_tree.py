@@ -118,3 +118,46 @@ def test_shared_scan_preserves_optional_leaves_and_gradients(inputs):
         )
         for actual, wanted in zip(gradients, oracle, strict=True):
             torch.testing.assert_close(actual, wanted)
+
+
+def test_shared_scan_preserves_trainable_leaf_and_nonleaf_parameter_metadata():
+    def body(parameters, prepared, state, carries, sample):
+        scale = parameters["scale"]
+        gain = 2.0 if scale.requires_grad else 11.0
+        gain += 3.0 if scale.is_leaf else 7.0
+        value = state["v"] + scale * gain + prepared["bias"]
+        return ({"v": value}, carries), {"v": value}
+
+    engine = _CompiledTensorTreeScan(
+        body,
+        steps=3,
+        compile_options={"backend": "aot_eager", "fullgraph": True},
+        device="cpu",
+    )
+    for leaf in (True, False):
+        upstream = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
+        scale = upstream if leaf else upstream * 1.25
+        initial = torch.tensor([-0.3, 0.2], dtype=torch.float64, requires_grad=True)
+        prepared = {"bias": torch.tensor(0.125, dtype=torch.float64)}
+        with torch_compiler_warning_context():
+            final, _, emitted = engine(
+                {"scale": scale}, prepared, {"v": initial}, {}, None
+            )
+            gain = 5.0 if leaf else 9.0
+            frames = initial + torch.arange(1, 4, dtype=torch.float64)[:, None] * (
+                scale * gain + prepared["bias"]
+            )
+            torch.testing.assert_close(final["v"], frames[-1])
+            torch.testing.assert_close(emitted["v"], frames)
+            actual = torch.autograd.grad(
+                final["v"].square().sum() + emitted["v"].square().sum(),
+                (upstream, initial),
+                retain_graph=True,
+            )
+            expected = torch.autograd.grad(
+                frames[-1].square().sum() + frames.square().sum(),
+                (upstream, initial),
+            )
+        for gradient, reference in zip(actual, expected, strict=True):
+            torch.testing.assert_close(gradient, reference)
+        assert scale.requires_grad and scale.is_leaf is leaf

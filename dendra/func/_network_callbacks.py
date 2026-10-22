@@ -71,6 +71,43 @@ class _NetworkRecorderLayout:
         self.ambiguous = frozenset(ambiguous)
 
 
+def _bind_network_region(functional, callback, paths):
+    """Resolve one source Population, then reuse its physical Slice selector."""
+    from dendra.models.slice import Slice
+
+    if not isinstance(callback.region, Slice):
+        raise FunctionalizationError(
+            "Network Recorder region must be a physical Population Slice"
+        )
+    source = object.__getattribute__(callback.region, "root_model")
+    owners = [
+        (name, population)
+        for name, population in functional.populations.items()
+        if population._population is source
+    ]
+    if len(owners) != 1:
+        raise FunctionalizationError(
+            "Network Recorder region must belong to an exact source Population "
+            "in this Network; select packed components through the packed "
+            "Population's named Slices."
+        )
+    name, population = owners[0]
+    prefix = ("populations", name)
+    relative = []
+    for state_name, path in zip(callback.states, paths, strict=True):
+        if path == ("clock", "t"):
+            relative.append(path)
+        elif path[:2] == prefix:
+            relative.append(path[2:])
+        else:
+            raise FunctionalizationError(
+                f"Network Recorder region belongs to Population {name!r}; "
+                f"{state_name!r} must select that same Population or the "
+                "Network clock. Use separate Recorders for different Populations."
+            )
+    return callback._bind_region(population, tuple(relative))
+
+
 def make_network_callbacks(functional, callbacks):
     """Bind qualified Recorders and pure custom callbacks to a Network plan.
 
@@ -79,9 +116,12 @@ def make_network_callbacks(functional, callbacks):
     ``populations.cell.integrator.v`` are also accepted. The finalized result
     retains the selection strings supplied by the user.
 
-    Population-specific region, LFP, threshold, and anomaly callbacks require
-    a population selection contract and are not yet bound at Network level.
-    Custom callbacks receive the complete Network state and auxiliary mapping.
+    ``region`` selects a physical Slice of one exact source Population,
+    including named components of a concatenated MultiPopulation. The qualified
+    physical selections must belong to that Population; the Network or selected
+    Population clock remains scalar. LFP, threshold, and anomaly callbacks are
+    currently unsupported at Network level. Custom callbacks receive the
+    complete Network state and auxiliary mapping.
     """
     if not isinstance(callbacks, Mapping):
         raise TypeError(
@@ -91,11 +131,6 @@ def make_network_callbacks(functional, callbacks):
     layout = None
     for name, callback in callbacks.items():
         if isinstance(callback, Recorder):
-            if callback.region is not None:
-                raise FunctionalizationError(
-                    "Network Recorder region selections are not yet supported; "
-                    "select qualified state names or node_indices instead."
-                )
             if layout is None:
                 layout = _NetworkRecorderLayout(functional)
             ambiguous = layout.ambiguous.intersection(callback.states)
@@ -104,7 +139,12 @@ def make_network_callbacks(functional, callbacks):
                     f"Network Recorder selections {sorted(ambiguous)!r} are ambiguous; "
                     "use fully qualified explicit state paths."
                 )
-            adapted[name] = callback._bind(layout)
+            if callback.region is None:
+                adapted[name] = callback._bind(layout)
+            else:
+                paths = callback._resolve_paths(layout)
+                region = _bind_network_region(functional, callback, paths)
+                adapted[name] = callback._bind_paths(layout, paths, region)
         elif isinstance(callback, (LFP, _ThresholdCallback, AnomalyDetector)):
             raise FunctionalizationError(
                 f"{type(callback).__name__} requires a Population-specific "

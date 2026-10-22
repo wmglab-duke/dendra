@@ -48,7 +48,8 @@ Changing them requires a new runner; initialize the Network again when its
 configuration requires it, including after changing the timestep.
 
 Network runners support `initialization="snapshot"` (the default),
-`initialization="fresh"`, and `execution="scan"`. The snapshot includes Population carry, connection queues,
+`initialization="fresh"`, and `execution="scan"` or inference-only
+`execution="while"`. The snapshot includes Population carry, connection queues,
 NetStim clock/RNG/calendar state, and the authoritative Network clock. A call
 without explicit state restarts that complete snapshot; compilation does not
 advance or reinitialize the source Network. `runner.initial_state` exposes the
@@ -56,7 +57,10 @@ restart packet, whose Tensor leaves can be edited deliberately.
 
 With snapshot initialization, initial state is not recomputed after a parameter
 update and gradients do not include initialization. Select fresh initialization
-to include that computation. Inference while loops are currently unsupported.
+to include that computation. Inference while loops share Population's packed
+carry and recording engine; see {doc}`A25_functional_network_while` for execution,
+recording, and continuation examples. Scan remains the default and supports
+training gradients and custom callbacks.
 Use a canonical single-device Network with supported dense event queues,
 source-history training, packed-history or sparse-calendar inference, as
 described in {doc}`A19_functional_network_lowering`,

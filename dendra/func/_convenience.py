@@ -483,6 +483,8 @@ def compile(
     inputs use :class:`NetworkRolloutInput`, recordings use qualified names
     such as ``cell.v``, and parameters retain shared tensor identities. See
     :class:`CompiledNetworkRunner` for its restart and continuation contract.
+    Network inference supports ``execution='while'`` with qualified Recorders
+    or without callbacks; use scan for gradients and custom callbacks.
     ``pending_capacity`` configures Network pending-event calendars with one
     positive entry count or a mapping from connection names to counts. Overflow
     raises before a result is returned; increase capacity and retry from a valid

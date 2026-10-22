@@ -1805,6 +1805,13 @@ in particular, ``node_indices`` applied to ``vc`` selects circuit channels,
 not physical compartments. Use ``region`` when selecting compartments or
 named cells, especially with explicit batches.
 
+For an ordinary Network, retain the Population-qualified field name, such as
+``Recorder(("left.v", "t"), region=network.left.soma)``. After
+``network.concat()``, use ``"all_populations.v"`` with a region such as
+``network.all_populations.exc.soma``. The Network workflow and runnable
+scan/while example are described in
+:doc:`A26_functional_network_regions`.
+
 Threshold detection
 ^^^^^^^^^^^^^^^^^^^
 

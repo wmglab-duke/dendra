@@ -104,6 +104,12 @@ samples. The results appear under `aux["callbacks"]["trace"]` and preserve
 gradients. `node_indices`, `max_only`, and `partition` follow the ordinary
 functional Recorder contract.
 
+Use `region=network.left.soma` with qualified physical fields such as `left.v`
+to record a labeled Population Slice. For a concatenated Network, select
+`all_populations.v` with `region=network.all_populations.exc.soma`. Labels,
+batch selection, supported fields, and a runnable scan/while example are
+described in {doc}`A26_functional_network_regions`.
+
 Use `FunctionalCallback` to define a pure reducer. A Network callback receives
 the full Network state:
 
@@ -118,7 +124,7 @@ next carry and an optional emission, and `finalize` returns the public result.
 Keep schemas stable and implementations deterministic and side-effect-free;
 use explicit tensor carry for evolving values. The
 {doc}`A8_functional_populations` callback section explains the complete contract.
-Network-level region/LFP and threshold-analysis callback binding are currently
+Network-level LFP and threshold-analysis callback binding are currently
 unsupported; use qualified recorders or pure custom reducers.
 Mutable native callbacks are not run by the functional Network.
 
@@ -238,6 +244,8 @@ The complete CPU example executes here:
 
 For `dn.compile(Network)` convenience execution with snapshot or fresh
 initialization, continue with {doc}`A21_functional_network_compile`.
+Inference-only captured while loops, recording, and bounded tails use the same
+pure Network timestep; see {doc}`A25_functional_network_while`.
 Source-history training and its delivery-time parameter semantics are described
 in {doc}`A22_functional_source_history`. Intrinsic packed-history inference is
 described in {doc}`A23_functional_bitpacked_inference`. Sparse-calendar inference

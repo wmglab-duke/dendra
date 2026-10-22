@@ -74,9 +74,12 @@ class CompiledNetworkRunner:
     :class:`NetworkInitializationInput` override and return effective parameters
     in ``aux['parameters']``. Continue those parameters explicitly when pure
     initialization transforms replace them. Initialization runs once before
-    rollout/checkpoint spans; its graph is never cached. Inference while loops
-    and constructor-bound ``extra`` are currently unsupported; explicit ``ve``
-    tapes remain available.
+    rollout/checkpoint spans; its graph is never cached. Inference while-loop
+    execution uses ``execution='while', inference=True`` with the same pure
+    Network timestep and the Population packed loop engine. Qualified Recorders
+    and no-callback execution are supported; use scan for custom callbacks and
+    gradients. Short chunks contain only the bounded unrolled tail. Constructor-
+    bound ``extra`` is currently unsupported; explicit ``ve`` tapes remain available.
 
     ``pending_capacity`` sets the entry count for packed scheduled traffic and
     sparse inference calendars. It accepts one positive integer or a mapping
@@ -106,12 +109,17 @@ class CompiledNetworkRunner:
         _validate_host_construction(compile_options)
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError("steps must be a positive integer")
-        if execution != "scan":
-            raise ValueError(
-                "Network compiled runners require execution='scan'; while execution is currently unsupported"
-            )
+        if execution not in {"scan", "while"}:
+            raise ValueError("execution must be 'scan' or 'while'")
         if not isinstance(inference, bool):
             raise TypeError("inference must be a bool")
+        if execution == "while":
+            if not inference:
+                raise ValueError(
+                    "execution='while' is inference-only; use scan for gradients"
+                )
+            if compile_options.get("disable", False):
+                raise ValueError("execution='while' requires compilation to be enabled")
         if initialization not in ("snapshot", "fresh"):
             raise ValueError("initialization must be 'snapshot' or 'fresh'")
         if extra is not None:
@@ -125,7 +133,7 @@ class CompiledNetworkRunner:
                 or checkpoint_every < 1
             ):
                 raise ValueError("checkpoint_every must be a positive integer")
-            if inference:
+            if inference or execution != "scan":
                 raise ValueError(
                     "checkpoint_every requires execution='scan' and inference=False"
                 )
@@ -163,6 +171,7 @@ class CompiledNetworkRunner:
                 None if not configured else self._functional.make_callbacks(configured)
             )
         self._inference = inference
+        self._execution = execution
         self._initialization = initialization
         self._steps = steps
         self._checkpoint_every = checkpoint_every
@@ -170,8 +179,9 @@ class CompiledNetworkRunner:
             self._functional, inference, backend, options, compile_options
         )
         self._kernel = self._functional.compile_rollout_chunk(
-            steps, execution="scan", **keywords
+            steps, execution=execution, **keywords
         )
+        self._kernel._validate_while_callbacks(self._callbacks)
 
     @property
     def initial_state(self):

@@ -32,3 +32,5 @@ Advanced
    advanced/A22_functional_source_history.md
    advanced/A23_functional_bitpacked_inference.md
    advanced/A24_functional_pending_calendar.md
+   advanced/A25_functional_network_while.md
+   advanced/A26_functional_network_regions.md

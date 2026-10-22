@@ -27,10 +27,6 @@ def _clone_tree(tree):
     )
 
 
-def _detach_tree(tree):
-    return pytree.tree_map_only(torch.Tensor, lambda value: value.detach(), tree)
-
-
 def _capture_tensor_step(body, arguments, *, grad_enabled, tracer=None):
     """Capture authored detach/STE boundaries before scan differentiates them."""
     tracer = make_fx if tracer is None else tracer
@@ -58,9 +54,22 @@ def _packed_tensor_scan(
 def _schema(tree):
     values, spec = pytree.tree_flatten(tree)
     return spec, tuple(
-        (tuple(value.shape), value.dtype, value.device, value.requires_grad)
-        if torch.is_tensor(value)
-        else (type(value), value)
+        (
+            (
+                tuple(value.shape),
+                value.dtype,
+                value.device,
+                tuple(value.stride()),
+                value.storage_offset(),
+                value.requires_grad,
+                value.is_leaf,
+                value.is_conj(),
+                value.is_neg(),
+                torch.is_inference(value),
+            )
+            if torch.is_tensor(value)
+            else (type(value), value)
+        )
         for value in values
     )
 
@@ -156,9 +165,10 @@ class _CompiledTensorTreeScan:
     ):
         body = self._body
         partition = self._callback_carry
-        parameters, prepared, state, carries, samples = _detach_tree(
-            (parameters, prepared, _clone_tree(state), carries, samples)
-        )
+        # Explicit invariant operands are read-only. Retain their visible
+        # metadata during capture, including requires_grad and leaf status.
+        # The no-grad capture boundary owns recurrent storage separately.
+        state = _clone_tree(state)
         mutable, invariant = partition.split(carries)
         layout = _PackedCarryLayout.from_tree((state, mutable))
         # Use the exact logical views that the scan body receives. Authored
