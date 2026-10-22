@@ -34,6 +34,7 @@ from ._kinetic import kinetic_to_derivatives
 from ._linearimplicit import build_linearimplicit
 from ._mechanism import classproperty
 from ._rosenbrock import build_rosenbrock1
+from ._sde import sample_state_sde_draw, validate_state_sde_draws
 
 
 def _extend_unique(target, values):
@@ -1726,6 +1727,7 @@ class State(Parameterized):
         execution_slots = _parameterized_workspace_slots(cls) | {
             "_name",
             "_sde_rng_names",
+            "_sde_draw_state_names",
             "celsius",
             "diam",
             "dt",
@@ -1945,7 +1947,12 @@ class State(Parameterized):
         self._solve = MethodType(ifunc, self)
 
         self._sde_rng_names = ()
+        self._sde_draw_state_names = ()
         if self.method in {"euler_maruyama", "euler_heun"}:
+            eliminated_sde_states = dict(cinfo or ())
+            self._sde_draw_state_names = tuple(
+                name for name in self._state if name not in eliminated_sde_states
+            )
             self._sde_rng_names = tuple(f"{state}_dW_rng" for state in self._state)
             for rng_name in self._sde_rng_names:
                 if not hasattr(self, rng_name):
@@ -2314,13 +2321,13 @@ class State(Parameterized):
 
     @staticmethod
     def DIFFUSION(*args):
-        """Declare diffusion coefficients for Euler-Maruyama state SDEs.
+        """Declare diffusion coefficients for State SDEs.
 
         Each declaration has the form ``"x = sigma"`` and represents the
         multiplicative noise coefficient. ``State.METHOD("euler_maruyama")``
         interprets this as an Itô SDE. ``State.METHOD("euler_heun")`` interprets
-        it as a Stratonovich SDE. Voltage-equation noise is intentionally handled
-        by future stochastic voltage/cable integrators.
+        it as a Stratonovich SDE. Stochastic voltage/cable equations are
+        currently unsupported.
         """
         declare_class_value("state.diffusion", args, State._diffusion_declarations)
 
@@ -2398,7 +2405,7 @@ class State(Parameterized):
             self._assigned_schema_validated = True
         return outputs
 
-    def advance(self, v, dt, values):
+    def advance(self, v, dt, values, *, draws=None):
         """Return the next declared state from a read-only current-value frame.
 
         The default implementation runs the generated solver for this State's
@@ -2407,18 +2414,39 @@ class State(Parameterized):
         CARRY. Runtime outputs preserve their exact shape, dtype, and device.
         Other bundles and the owning Mechanism advance from the same incoming
         snapshot; their new values are not visible during this calculation.
+
+        For Euler-Maruyama and Euler-Heun, ``draws`` supplies a mapping from
+        non-eliminated state names to standard-normal tensors with the exact
+        shape, dtype, and device of the corresponding current state. Base draws
+        are detached; drift, diffusion coefficients, and timestep retain their
+        gradients. Omitting ``draws`` samples the State's Native RNG streams.
         """
-        if self.method == "euler_heun":
-            return self._solve(v, dt, values)
         assigned = self._derive_assigned_values(v, values)
+        if self.method in {"euler_maruyama", "euler_heun"}:
+            if draws is None:
+                draws = {
+                    name: self._sde_randn_like(name, values[name])
+                    for name in self._sde_draw_state_names
+                }
+            else:
+                validate_state_sde_draws(draws, self._sde_draw_state_names, values)
+            if self.method == "euler_heun":
+                return self._solve(v, dt, values, draws, assigned)
+            return self._solve(dt, **{**values, **assigned}, __draws=draws)
+        if draws is not None:
+            raise ValueError("Explicit State draws require an SDE integration method")
         # A State ASSIGNED name may intentionally shadow a parent Mechanism
         # input with the same spelling. The freshly evaluated State value owns
         # the solver slot; merging first also avoids duplicate-keyword errors.
         return self._solve(dt, **{**values, **assigned})
 
-    def _derive_advance_values(self, v, dt, values):
+    def _derive_advance_values(self, v, dt, values, *, draws=None):
         """Evaluate State advance and validate custom output structure once."""
-        outputs = self.advance(v, dt, values)
+        outputs = (
+            self.advance(v, dt, values)
+            if draws is None
+            else self.advance(v, dt, values, draws=draws)
+        )
         if (
             not torch.compiler.is_compiling()
             and self._has_authored_advance
@@ -2441,10 +2469,9 @@ class State(Parameterized):
         """Detached standard-normal increment for State SDE solvers."""
         rng_name = f"{state_name}_dW_rng"
         rng = getattr(self, rng_name)
-        if isinstance(rng, RNGModule):
-            rng.init(like.device)
-        with torch.no_grad():
-            return rng.randn(tuple(like.shape), device=like.device, dtype=like.dtype)
+        return sample_state_sde_draw(
+            rng, tuple(like.shape), device=like.device, dtype=like.dtype
+        )
 
     def init_rng(self):
         super().init_rng()

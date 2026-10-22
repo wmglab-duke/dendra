@@ -196,7 +196,9 @@ automatically, or ``initial.random_draw`` supplies an explicit packet. See
 shared streams, and custom pure distributions. Inserted Mechanisms and nested
 States can use ``GLOBALNOISE``, ``BATCHNOISE``, and ``RANGENOISE`` with detached
 per-step draws and explicit RNG tapes; see :doc:`A31_functional_runtime_noise`.
-State ``DIFFUSION`` is currently unsupported.
+State ``DIFFUSION`` uses the shared Euler–Maruyama and Euler–Heun solvers
+with explicit standard-normal draws and RNG carry; see
+:doc:`A32_functional_state_sde`.
 
 Explicit state always means continuation and bypasses initialization, even on
 a fresh-policy runner. Every fresh-policy call returns its effective runtime
@@ -379,7 +381,7 @@ lowering. Current limitations include non-injective regional concentration or
 Material replacement writes and non-injective voltage replacement support,
 the reserved compact rowwise support encoding,
 TABLE lookups, MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
-families, mechanism-owned waveform injections, delayed state or State DIFFUSION SDEs,
+families, mechanism-owned waveform injections, delayed state,
 legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
@@ -2543,8 +2545,8 @@ audit; CUDA support does not disable or weaken that audit. This remains a
 hardware-validation risk for branched models, not a verified deterministic GPU
 execution guarantee.
 
-CUDA retains the Population admission restrictions above: State DIFFUSION SDEs,
-delayed state, the SPD block solver, and arbitrary custom geometry/integrators are
+CUDA retains the Population admission restrictions above: delayed state,
+the SPD block solver, and arbitrary custom geometry/integrators are
 currently unsupported. Network event delivery uses the composed Network plan
 described in :doc:`A19_functional_network_lowering`.
 MPS, float16 and bfloat16 are currently unsupported.

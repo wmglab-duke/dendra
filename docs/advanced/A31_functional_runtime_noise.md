@@ -65,15 +65,16 @@ differentiable through their use of the sampled drive:
 
 Use RAND declarations for sampled parameter heterogeneity with optional
 reparameterized distribution gradients; see
-{doc}`A30_functional_random_parameters`. State `DIFFUSION` SDE execution is
-currently unsupported by functional lowering. Runtime NOISE declarations
-on MaterialProcess objects are also currently unsupported.
+{doc}`A30_functional_random_parameters`. Use State `DIFFUSION` for Itô or
+Stratonovich dynamics with differentiable drift, diffusion, and timestep;
+see {doc}`A32_functional_state_sde`. Runtime NOISE declarations on
+MaterialProcess objects are currently unsupported.
 
 ## Supply draw and RNG tapes
 
 A `RuntimeNoiseDraw` contains two mappings: `draws` holds explicit base draws
-under canonical declaration names, and `rng` holds the resulting state of
-each independent stream. A recurrent tape adds a leading time axis to every
+for runtime NOISE and State SDEs under canonical names, and `rng` holds the
+resulting state of each independent stream. A recurrent tape adds a leading time axis to every
 Tensor in both mappings. Keep the base draws and matching post-draw RNG
 state together so a selected prefix can continue the same stream.
 

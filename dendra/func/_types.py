@@ -26,7 +26,7 @@ class RandomParameterDraw(NamedTuple):
 
 
 class RuntimeNoiseDraw(NamedTuple):
-    """Detached NOISE base draws and the resulting shared stream states."""
+    """Detached NOISE/State SDE draws and resulting shared stream states."""
 
     draws: dict[str, torch.Tensor]
     rng: dict[str, dict[str, torch.Tensor]]

@@ -2286,11 +2286,11 @@ def _install_state_input_audits(population):
     """
 
     def checked_hook(label, names, hook):
-        def evaluate(*arguments):
+        def evaluate(*arguments, **keywords):
             values = arguments[-1]
             before = {name: _audit_tensor_binding(values[name]) for name in names}
             try:
-                return hook(*arguments)
+                return hook(*arguments, **keywords)
             finally:
                 changed = [
                     name
@@ -6406,7 +6406,7 @@ class _PopulationInitialization(torch.nn.Module):
 
 
 class _PopulationTransition(torch.nn.Module):
-    """Functional facade over a supported deterministic step implementation."""
+    """Functional facade over a supported step implementation."""
 
     def __init__(self, population: Population, solver, layout):
         super().__init__()
@@ -8321,7 +8321,17 @@ def _functionalization_failures(
                     f"{mechanism.name} uses TABLE lookup workspaces, which are "
                     "not lowered yet"
                 )
-            if getattr(module, "_diffusion", None):
+            if isinstance(module, State) and (
+                module.method in {"euler_maruyama", "euler_heun"}
+                or getattr(module, "_diffusion", None)
+            ):
+                from ._state_sde import state_sde_failures
+
+                failures.extend(
+                    f"{mechanism.name}: {failure}"
+                    for failure in state_sde_failures(module)
+                )
+            elif getattr(module, "_diffusion", None):
                 failures.append(
                     f"{mechanism.name} uses stochastic state, which is not supported yet"
                 )
@@ -10081,7 +10091,13 @@ class FunctionalPopulation:
         from ._runtime_noise import RuntimeNoisePlan, noise_declarations
 
         self._noise_plan = (
-            RuntimeNoisePlan(population) if noise_declarations(population) else None
+            RuntimeNoisePlan(population)
+            if noise_declarations(population)
+            or any(
+                getattr(owner, "_sde_rng_names", ())
+                for owner in _parameterized_owners(population)
+            )
+            else None
         )
         if self._noise_plan is not None:
             self._initialization_failures = (
@@ -10184,6 +10200,11 @@ class FunctionalPopulation:
                     )
             except (KeyError, TypeError, ValueError, RuntimeError) as error:
                 self._owned_cache_error = str(error)
+        if self._noise_plan is not None:
+            # SDE draws are call-local inputs on the owned transition. Install
+            # their temporary bindings after capturing the persistent tensor
+            # contract and creating the separate initialization program.
+            self._noise_plan.install(self._transition.population)
 
     def _build_multi_component_plans(
         self,
@@ -10585,7 +10606,9 @@ class FunctionalPopulation:
 
     def _validate_source(self) -> None:
         if self._random_plan is None and any(
-            owner.random_parameters or owner.runtime_noises
+            owner.random_parameters
+            or owner.runtime_noises
+            or getattr(owner, "_sde_rng_names", ())
             for owner in _parameterized_owners(self._population)
         ):
             raise FunctionalizationError(
@@ -11725,7 +11748,7 @@ class FunctionalPopulation:
         )
 
     def sample_noise_draw(self, state):
-        """Sample one explicit runtime draw without changing source or carry."""
+        """Sample NOISE/SDE draws without changing the source or carry."""
         self._validate_source()
         self._validate_state(state)
         return (
@@ -11749,7 +11772,9 @@ class FunctionalPopulation:
     def _validate_noise_draw(self, draw, *, steps=None):
         if self._noise_plan is None or not self._noise_plan.runtime:
             if draw is not None:
-                raise ValueError("This Population has no recurrent NOISE declarations")
+                raise ValueError(
+                    "This Population has no recurrent NOISE or State SDE draws"
+                )
             return
         if steps == 0 and draw is None:
             return
@@ -13903,6 +13928,15 @@ class FunctionalPopulation:
             for index in range(steps):
                 packet = torch.utils._pytree.tree_map(lambda value: value[index], noise)
                 values = self._noise_plan.values(mapping, packet, dt)
+                sde_values = self._noise_plan.sde_values(packet)
+                if index == 0:
+                    # Binding these registered temporary slots makes
+                    # functional_call restore them when the recurrence exits.
+                    mapping.update(sde_values)
+                values.update(
+                    (slot.removeprefix("population."), value)
+                    for slot, value in sde_values.items()
+                )
                 for name, value in values.items():
                     noise_values.setdefault(name, []).append(value)
             noise_values = {

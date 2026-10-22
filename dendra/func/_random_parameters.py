@@ -348,7 +348,7 @@ class RandomParameterPlan:
                 )
             ):
                 raise FunctionalizationError(
-                    "RAND RNG stream adapters changed; lower again"
+                    "Population RNG stream adapters changed; lower again"
                 )
         for index, (path, name, spec, sampler, transform) in enumerate(self._bindings):
             owner = owners[path]
@@ -398,7 +398,7 @@ class RandomParameterPlan:
 
         if _stream_topology(population) != self._stream_topology:
             raise FunctionalizationError(
-                "Population RAND/NOISE RNG stream sharing does not match this functional plan; lower again"
+                "Population RNG stream sharing does not match this functional plan; lower again"
             )
 
     def validate_compatible_population(self, population):

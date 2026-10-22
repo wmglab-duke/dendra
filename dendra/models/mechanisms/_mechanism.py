@@ -205,10 +205,12 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
     for idx, (state_key, state_module) in enumerate(mech.DE.items()):
         state_var_names = tuple(state_module._state)
         state_carry_names = tuple(state_module._carry)
-        uses_default_advance = (
-            getattr(type(state_module), "advance", None) is State.advance
-            and getattr(state_module, "method", None) != "euler_heun"
-        )
+        uses_default_advance = getattr(
+            type(state_module), "advance", None
+        ) is State.advance and getattr(state_module, "method", None) not in {
+            "euler_maruyama",
+            "euler_heun",
+        }
         uses_default_assigned = (
             getattr(type(state_module), "assigned_values", None)
             is State.assigned_values

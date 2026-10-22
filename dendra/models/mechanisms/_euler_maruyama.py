@@ -7,6 +7,7 @@ import torch
 from dendra.helpers import DEBUG, logger
 from dendra.utils.dynamic_compilation import compile_generated_function
 
+from ._sde import state_sde_draw, state_sde_dt
 from ._solve_utils import (
     TORCH_OPS,
     extract_vars,
@@ -80,7 +81,8 @@ def build_euler_maruyama(
 
     ``DERIVATIVE`` declarations provide the drift term and optional ``DIFFUSION``
     declarations provide the multiplicative noise coefficient per state.  Noise is
-    generated as a detached standard normal increment by ``State._sde_randn_like``.
+    supplied explicitly as detached standard-normal draws. The Native State
+    adapter owns sampling; generated evaluation does not consume RNG.
     """
 
     # State.__init__ injects the legacy ``pade`` option for historical CNEXP
@@ -105,16 +107,14 @@ def build_euler_maruyama(
         _unique_preserve_order(states + assigned_list_sorted)
     )
 
-    lines = [f"def solve(self, dt, {states_and_assigned}, **kwargs):"]
+    lines = [f"def solve(self, dt, {states_and_assigned}, *, __draws, **kwargs):"]
     if not states_and_assigned:
-        lines = ["def solve(self, dt, **kwargs):"]
+        lines = ["def solve(self, dt, *, __draws, **kwargs):"]
     lines.append("    __dt_ref = None")
     for state in states:
         lines.append(f"    __old_{state} = {state}")
         lines.append(f"    if __dt_ref is None: __dt_ref = __old_{state}")
-    lines.append(
-        "    __dt = torch.as_tensor(dt, dtype=__dt_ref.dtype, device=__dt_ref.device)"
-    )
+    lines.append("    __dt = state_sde_dt(dt, __dt_ref)")
     lines.append("    __sqrt_dt = torch.sqrt(__dt)")
 
     returns = []
@@ -136,7 +136,7 @@ def build_euler_maruyama(
             lines.append(f"    __diff_{state} = {diffusion_expr}")
             lines.append(
                 f"    _{state} = __old_{state} + __drift_{state} * __dt + "
-                f"__diff_{state} * __sqrt_dt * self._sde_randn_like({state!r}, __old_{state})"
+                f"__diff_{state} * __sqrt_dt * state_sde_draw(__draws, {state!r}, __old_{state})"
             )
         returns.append(f"'{state}': _{state}")
 

@@ -177,7 +177,9 @@ described above. Initialization-time RAND declarations use explicit draw and
 RNG packets, including their resampling and ``reseed_on_initialize`` policies;
 see {doc}`A30_functional_random_parameters`. Runtime NOISE declarations use
 per-Population draw/RNG tapes, with automatic host sampling and explicit
-continuation; see {doc}`A31_functional_runtime_noise`. Custom native
+continuation; see {doc}`A31_functional_runtime_noise`. State `DIFFUSION` uses
+the same packet for explicit Wiener draws and RNG carry, with pathwise
+drift/diffusion gradients; see {doc}`A32_functional_state_sde`. Custom native
 initialization/build adapters are currently unsupported.
 Initialize shared runtime parameters before the first Population that uses
 them. A transform on a later Population that writes a runtime parameter shared

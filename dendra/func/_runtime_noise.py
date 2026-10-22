@@ -1,4 +1,4 @@
-"""Explicit runtime NOISE draws with canonical shared RNG ownership."""
+"""Explicit runtime NOISE/SDE draws with canonical shared RNG ownership."""
 
 from __future__ import annotations
 
@@ -33,6 +33,10 @@ def stream_inventory(population):
             rng = getattr(owner, spec.effective_rng_name)
             key = identities.setdefault(id(rng), f"stream_{len(identities)}")
             streams.setdefault(key, (path, spec.effective_rng_name))
+        for name in getattr(owner, "_sde_rng_names", ()):
+            rng = getattr(owner, name)
+            key = identities.setdefault(id(rng), f"stream_{len(identities)}")
+            streams.setdefault(key, (path, name))
     return streams, identities
 
 
@@ -41,7 +45,7 @@ def _stream_topology(population):
     from ._population import _parameterized_owner_paths
 
     _streams, identities = stream_inventory(population)
-    return tuple(
+    declared = tuple(
         (path, kind, name, identities[id(getattr(owner, spec.effective_rng_name))])
         for path, owner in _parameterized_owner_paths(population)
         for kind, declarations in (
@@ -49,6 +53,11 @@ def _stream_topology(population):
             ("noise", owner.runtime_noises),
         )
         for name, spec in declarations.items()
+    )
+    return declared + tuple(
+        (path, "sde", name, identities[id(getattr(owner, name))])
+        for path, owner in _parameterized_owner_paths(population)
+        for name in getattr(owner, "_sde_rng_names", ())
     )
 
 
@@ -113,7 +122,9 @@ def _validate_rng_adapter(rng):
             "reseed_for_generation",
         )
     ):
-        raise FunctionalizationError("NOISE requires canonical RNGModule streams")
+        raise FunctionalizationError(
+            "Runtime NOISE/SDE requires canonical RNGModule streams"
+        )
 
 
 class RuntimeNoisePlan:
@@ -247,7 +258,17 @@ class RuntimeNoisePlan:
             )
         self.entries, self.contracts = tuple(entries), tuple(contracts)
         self._rng_bindings = tuple(self._rng_bindings)
-        self.runtime = tuple(entry for entry in self.entries if entry.path)
+        from ._state_sde import StateSDEPlan
+
+        self.noise_runtime = tuple(entry for entry in self.entries if entry.path)
+        self.sde = StateSDEPlan(population, identities)
+        self.runtime = (*self.noise_runtime, *self.sde.entries)
+
+    def install(self, population):
+        self.sde.install(population)
+
+    def sde_values(self, packet):
+        return self.sde.values(packet)
 
     def initialization_failures(self):
         """Audit preparation hooks against initialization-only NOISE phases."""
@@ -296,13 +317,14 @@ class RuntimeNoisePlan:
             _module_at,
         )
 
+        self.sde.validate_population(self.population, source=True)
         if noise_declarations(self.population) != self.declarations:
             raise FunctionalizationError(
                 "NOISE declarations changed; lower the Population again"
             )
         if _stream_topology(self.population) != self._stream_topology:
             raise FunctionalizationError(
-                "RAND/NOISE RNG stream sharing changed; lower the Population again"
+                "Population RNG stream sharing changed; lower the Population again"
             )
         for entry, (sampler, transform, signatures), captured_rng in zip(
             self.entries, self.contracts, self._rng_bindings, strict=True
@@ -343,13 +365,14 @@ class RuntimeNoisePlan:
 
     def validate_compatible_population(self, population):
         """Require target checkpoints to preserve declaration stream aliases."""
+        self.sde.validate_population(population)
         if noise_declarations(population) != self.declarations:
             raise FunctionalizationError(
                 "Population NOISE declarations do not match this functional plan"
             )
         if _stream_topology(population) != self._stream_topology:
             raise FunctionalizationError(
-                "Population RAND/NOISE RNG stream sharing does not match this functional plan"
+                "Population RNG stream sharing does not match this functional plan"
             )
         from ._population import _module_at
 
@@ -360,18 +383,24 @@ class RuntimeNoisePlan:
 
     def validate(self, packet, *, steps=None, initialization=False):
         if not isinstance(packet, RuntimeNoiseDraw) and not initialization:
-            raise ValueError("NOISE requires an explicit RuntimeNoiseDraw packet")
+            raise ValueError(
+                "Runtime NOISE/SDE requires an explicit RuntimeNoiseDraw packet"
+            )
         entries = self.entries if initialization else self.runtime
         expected = {name for entry in entries for name in entry.draw_names}
         selected = {
             name: value
             for name, value in packet.draws.items()
             if name.startswith("noise.draws.")
+            or not initialization
+            and name.startswith("sde.draws.")
         }
         if set(selected) != expected or (
             not initialization and set(packet.draws) != expected
         ):
-            raise ValueError("NOISE draw names do not match the lowered plan")
+            raise ValueError(
+                "Runtime NOISE/SDE draw names do not match the lowered plan"
+            )
         for entry in entries:
             for name, reference in zip(entry.draw_names, entry.leaves, strict=True):
                 value = selected[name]
@@ -387,14 +416,14 @@ class RuntimeNoisePlan:
                     or value.device != reference.device
                 ):
                     raise ValueError(
-                        f"NOISE draw {name!r} has incompatible Tensor schema"
+                        f"Runtime NOISE/SDE draw {name!r} has incompatible Tensor schema"
                     )
 
     def values(self, mapping, packet, dt, *, initialization=False):
         from dendra.models.random_parameters import evaluate_runtime_noise
 
         values = {}
-        for entry in self.entries if initialization else self.runtime:
+        for entry in self.entries if initialization else self.noise_runtime:
             prefix = f"population.{entry.path + '.' if entry.path else ''}"
             parameters = {
                 name: mapping[f"{prefix}{entry.spec.full_parameter_name(name)}"]
@@ -476,7 +505,7 @@ class RuntimeNoisePlan:
             sampled, checkpoints = sample_runtime_noise_draws(requests, checkpoints)
             for entry, draw in zip(self.runtime, sampled, strict=True):
                 leaves, spec = _pytree.tree_flatten(draw)
-                if spec != entry.draw_spec:
+                if hasattr(entry, "draw_spec") and spec != entry.draw_spec:
                     raise FunctionalizationError("NOISE draw tree changed; lower again")
                 for name, leaf in zip(entry.draw_names, leaves, strict=True):
                     draws[name].append(leaf.detach().clone())

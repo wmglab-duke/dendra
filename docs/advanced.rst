@@ -39,3 +39,4 @@ Advanced
    advanced/A29_functional_network_cache_initialization.md
    advanced/A30_functional_random_parameters.md
    advanced/A31_functional_runtime_noise.md
+   advanced/A32_functional_state_sde.md
