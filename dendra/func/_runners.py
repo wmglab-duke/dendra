@@ -486,13 +486,18 @@ def _validate_rollout_input_container(inputs: RolloutInput | None):
 
 def _resolve_inputs(functional, inputs: RolloutInput, steps: int | None):
     ve, intra, resolved_steps = functional._resolve_rollout_inputs(inputs, steps)
-    return RolloutInput(ve=ve, intra=intra), resolved_steps
+    return RolloutInput(ve=ve, intra=intra, noise=inputs.noise), resolved_steps
 
 
 def _slice_inputs(inputs: RolloutInput, start: int, stop: int) -> RolloutInput:
     return RolloutInput(
         ve=None if inputs.ve is None else inputs.ve[start:stop],
         intra=None if inputs.intra is None else inputs.intra[start:stop],
+        noise=None
+        if inputs.noise is None
+        else torch.utils._pytree.tree_map(
+            lambda value: value[start:stop], inputs.noise
+        ),
     )
 
 
@@ -578,6 +583,11 @@ def _execute_steps(step, state, inputs: RolloutInput, steps: int):
             StepInput(
                 ve=None if inputs.ve is None else inputs.ve[index],
                 intra=None if inputs.intra is None else inputs.intra[index],
+                noise=None
+                if inputs.noise is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value[index], inputs.noise
+                ),
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -633,6 +643,11 @@ def _execute_steps_with_callbacks(
             StepInput(
                 ve=None if inputs.ve is None else inputs.ve[index],
                 intra=None if inputs.intra is None else inputs.intra[index],
+                noise=None
+                if inputs.noise is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value[index], inputs.noise
+                ),
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -808,6 +823,10 @@ def _execute_chunks(
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
+        if chunk_inputs.noise is None:
+            chunk_inputs = chunk_inputs._replace(
+                noise=functional.sample_noise_draw_tape(state, stop - start)
+            )
         extra_ve = _assemble_extra_chunk(
             functional,
             extra_plan,
@@ -819,7 +838,9 @@ def _execute_chunks(
             dt,
         )
         if extra_ve is not None:
-            chunk_inputs = RolloutInput(ve=extra_ve, intra=chunk_inputs.intra)
+            chunk_inputs = RolloutInput(
+                ve=extra_ve, intra=chunk_inputs.intra, noise=chunk_inputs.noise
+            )
         state, auxiliary = _execute_steps(
             step,
             state,
@@ -856,6 +877,10 @@ def _execute_chunks_with_callbacks(
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
+        if chunk_inputs.noise is None:
+            chunk_inputs = chunk_inputs._replace(
+                noise=functional.sample_noise_draw_tape(state, stop - start)
+            )
         extra_ve = _assemble_extra_chunk(
             functional,
             extra_plan,
@@ -867,7 +892,9 @@ def _execute_chunks_with_callbacks(
             dt,
         )
         if extra_ve is not None:
-            chunk_inputs = RolloutInput(ve=extra_ve, intra=chunk_inputs.intra)
+            chunk_inputs = RolloutInput(
+                ve=extra_ve, intra=chunk_inputs.intra, noise=chunk_inputs.noise
+            )
         state, auxiliary, callback_state, emitted = _execute_steps_with_callbacks(
             step,
             state,
@@ -925,12 +952,17 @@ def _execute_checkpointed_chunks(
         chunk_steps = stop - start
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
+        if chunk_inputs.noise is None:
+            chunk_inputs = chunk_inputs._replace(
+                noise=functional.sample_noise_draw_tape(state, stop - start)
+            )
         checkpoint_inputs = _materialize_checkpoint_tree(
             (
                 state,
                 callback_state,
                 chunk_inputs.ve,
                 chunk_inputs.intra,
+                chunk_inputs.noise,
                 None if extra_tensors is None else extra_tensors.parameters,
                 None if extra_tensors is None else extra_tensors.constants,
             )
@@ -941,6 +973,7 @@ def _execute_checkpointed_chunks(
             callback_state_in,
             ve,
             intra,
+            noise,
             extra_parameters,
             extra_constants,
             chunk_steps=chunk_steps,
@@ -977,13 +1010,13 @@ def _execute_checkpointed_chunks(
                 return _execute_steps(
                     chunk_execution,
                     state_in,
-                    RolloutInput(ve=ve, intra=intra),
+                    RolloutInput(ve=ve, intra=intra, noise=noise),
                     chunk_steps,
                 )
             return _execute_steps_with_callbacks(
                 chunk_execution,
                 state_in,
-                RolloutInput(ve=ve, intra=intra),
+                RolloutInput(ve=ve, intra=intra, noise=noise),
                 chunk_steps,
                 callbacks,
                 callback_state_in,
@@ -1133,7 +1166,9 @@ def _run_validated_schedule(
         span = _validate_chunklength(span)
     inputs = _validate_rollout_input_container(inputs)
     extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
-    has_drives = inputs.ve is not None or inputs.intra is not None
+    has_drives = (
+        inputs.ve is not None or inputs.intra is not None or inputs.noise is not None
+    )
     if legacy_input_horizon:
         if has_drives:
             duration = _MISSING
@@ -1143,6 +1178,8 @@ def _run_validated_schedule(
         state, steps = _stage_duration(state, duration, dt, name=duration_name)
         expected_remainder = _validate_duration_remainder(state)
     inputs, steps = _resolve_inputs(functional, inputs, steps)
+    if inputs.noise is not None or steps == 0:
+        functional._validate_noise_draw(inputs.noise, steps=steps)
     chunklength = max(steps, 1) if span is None else span
     use_checkpoint = checkpointed and torch.is_grad_enabled() and steps > 0
     if use_checkpoint:

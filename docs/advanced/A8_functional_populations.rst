@@ -193,8 +193,10 @@ their resampling and ``reseed_on_initialize`` policies; snapshot restart and
 explicit continuation retain the selected realization. The host runner samples
 automatically, or ``initial.random_draw`` supplies an explicit packet. See
 :doc:`A30_functional_random_parameters` for distribution-parameter gradients,
-shared streams, and custom pure distributions. Per-step ``NOISE`` and State
-``DIFFUSION`` are currently unsupported.
+shared streams, and custom pure distributions. Inserted Mechanisms and nested
+States can use ``GLOBALNOISE``, ``BATCHNOISE``, and ``RANGENOISE`` with detached
+per-step draws and explicit RNG tapes; see :doc:`A31_functional_runtime_noise`.
+State ``DIFFUSION`` is currently unsupported.
 
 Explicit state always means continuation and bypasses initialization, even on
 a fresh-policy runner. Every fresh-policy call returns its effective runtime
@@ -294,7 +296,7 @@ The current transition API supports initialized models with all of the
 following properties:
 
 * either a point model using standard Population area geometry (an exact
-  ``Population`` or ``SingleCompartment`` container, or a RAND declaration-only
+  ``Population`` or ``SingleCompartment`` container, or a RAND/NOISE declaration-only
   subclass inheriting every numerical and lifecycle method), an
   ``Unmyelinated`` topology with standard
   cylindrical cable geometry, a ``Myelinated`` model with Dendra's standard
@@ -377,13 +379,13 @@ lowering. Current limitations include non-injective regional concentration or
 Material replacement writes and non-injective voltage replacement support,
 the reserved compact rowwise support encoding,
 TABLE lookups, MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
-families, mechanism-owned waveform injections, delayed or stochastic state,
+families, mechanism-owned waveform injections, delayed state or State DIFFUSION SDEs,
 legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
 Population topologies
 (including generic ``Axon``, ``Population``/``SingleCompartment`` subclasses
-outside the RAND declaration-only contract above, nested ``MultiPopulation``,
+outside the RAND/NOISE declaration-only contract above, nested ``MultiPopulation``,
 and mixtures of scalar and
 finite-extracellular components), Cable/Axon/Tree subclasses with unrecognized
 custom geometry, stateful
@@ -2541,8 +2543,8 @@ audit; CUDA support does not disable or weaken that audit. This remains a
 hardware-validation risk for branched models, not a verified deterministic GPU
 execution guarantee.
 
-CUDA retains the Population admission restrictions above: stochastic/delayed
-state, the SPD block solver, and arbitrary custom geometry/integrators are
+CUDA retains the Population admission restrictions above: State DIFFUSION SDEs,
+delayed state, the SPD block solver, and arbitrary custom geometry/integrators are
 currently unsupported. Network event delivery uses the composed Network plan
 described in :doc:`A19_functional_network_lowering`.
 MPS, float16 and bfloat16 are currently unsupported.

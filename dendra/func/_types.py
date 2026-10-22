@@ -19,7 +19,14 @@ _EXTRA_PREFIX = "stimulation.extra."
 
 
 class RandomParameterDraw(NamedTuple):
-    """Explicit RAND base draws and the resulting independent stream states."""
+    """RAND/NOISE initialization draws and resulting shared stream states."""
+
+    draws: dict[str, torch.Tensor]
+    rng: dict[str, dict[str, torch.Tensor]]
+
+
+class RuntimeNoiseDraw(NamedTuple):
+    """Detached NOISE base draws and the resulting shared stream states."""
 
     draws: dict[str, torch.Tensor]
     rng: dict[str, dict[str, torch.Tensor]]
@@ -42,7 +49,8 @@ class InitializationInput(NamedTuple):
     bound during lowering. Cached initialization restores this mapping,
     skips fresh initialization hooks, and returns effective constants with
     the initialized parameter and state packet. ``random_draw`` supplies RAND
-    base draws and resulting stream state from ``sample_initialization_draw``.
+    and NOISE base draws and resulting stream state from
+    ``sample_initialization_draw``.
     Host runners sample an independent packet when this field is omitted.
     """
 
@@ -201,17 +209,19 @@ class PopulationTensors(NamedTuple):
 
 
 class StepInput(NamedTuple):
-    """Already assembled inputs for one functional Population step."""
+    """Assembled voltage/current inputs and an explicit single-step NOISE packet."""
 
     ve: torch.Tensor | None = None
     intra: torch.Tensor | None = None
+    noise: RuntimeNoiseDraw | None = None
 
 
 class RolloutInput(NamedTuple):
-    """Time-first, already assembled inputs for a functional rollout."""
+    """Time-first voltage/current inputs and an explicit NOISE draw/RNG tape."""
 
     ve: torch.Tensor | None = None
     intra: torch.Tensor | None = None
+    noise: RuntimeNoiseDraw | None = None
 
 
 class FunctionalizationError(RuntimeError):
@@ -222,6 +232,7 @@ __all__ = [
     "FunctionalizationError",
     "InitializationInput",
     "RandomParameterDraw",
+    "RuntimeNoiseDraw",
     "PopulationTensors",
     "RolloutInput",
     "StepInput",

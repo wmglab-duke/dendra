@@ -3704,8 +3704,8 @@ class Parameterized(SimpleParameterized):
         This is the shared raw-to-effective boundary for ordinary population
         and functional preparation. It preserves the established deterministic
         order: declared defaults, regional overrides, then authored in-graph
-        transforms. Stochastic parameter and noise sampling remain later
-        imperative-only phases.
+        transforms. Stochastic parameter and noise sampling remain separate
+        phases after this deterministic materialization.
         """
         categories = (
             self.__class__._global,

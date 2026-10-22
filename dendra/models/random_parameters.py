@@ -27,7 +27,13 @@ __all__ = [
     "RandomParameterDrawRequest",
     "sample_random_parameter_draws",
     "prepare_rng_for_random_parameter",
+    "RuntimeNoiseDrawRequest",
+    "sample_runtime_noise_draws",
+    "sample_runtime_noise_draw",
+    "evaluate_runtime_noise",
+    "sample_runtime_noise_with_draw",
     "sample_runtime_noise",
+    "iter_initialization_random_declarations",
 ]
 
 _ALLOWED_CONSTRAINTS = {"real", "positive", "negative"}
@@ -452,6 +458,8 @@ def make_runtime_noise_spec(
         raise ValueError("Runtime noise v1 supports phase='pre_state' only.")
 
     scale_norm = str(scale).strip().lower()
+    if scale_norm == "dw":
+        scale_norm = "dW"
     if scale_norm not in _ALLOWED_NOISE_SCALES:
         raise ValueError(
             f"Runtime noise scale must be one of {sorted(_ALLOWED_NOISE_SCALES)}."
@@ -473,6 +481,25 @@ def make_runtime_noise_spec(
 
 # ---------------------------------------------------------------------------
 # Sampling
+
+
+def iter_initialization_random_declarations(owner):
+    """Yield canonical owner initialization draws in their native order.
+
+    Each item is ``(owner, kind, name, spec)``, where ``kind`` is ``"random"``
+    or ``"noise"``. Mechanism initialization samples its nested State noise
+    through the mechanism's runtime sampler before separately populating each
+    State's parameters. That early noise draw consumes the shared stream even
+    though the State's later initialization noise replaces its value.
+    """
+    states = tuple(getattr(owner, "DE", {}).values())
+    for name, spec in owner.random_parameters.items():
+        yield owner, "random", name, spec
+    for source in (owner, *states):
+        for name, spec in source.runtime_noises.items():
+            yield source, "noise", name, spec
+    for state in states:
+        yield from iter_initialization_random_declarations(state)
 
 
 def _distribution(spec):
@@ -520,11 +547,21 @@ class RandomParameterDrawRequest(NamedTuple):
     """One host draw in Native order, keyed by its explicit shared RNG stream."""
 
     rng_key: str
-    spec: RandomParameterSpec | DistributionSpec
+    spec: RandomParameterSpec | RuntimeNoiseSpec | DistributionSpec
     shape: tuple[int, ...]
     device: torch.device | str
     dtype: torch.dtype
     reseed_on_initialize: bool = False
+
+
+class RuntimeNoiseDrawRequest(NamedTuple):
+    """One detached runtime base draw from an explicit shared RNG stream."""
+
+    rng_key: str
+    spec: RuntimeNoiseSpec | DistributionSpec
+    shape: tuple[int, ...]
+    device: torch.device | str
+    dtype: torch.dtype
 
 
 def prepare_rng_for_random_parameter(
@@ -560,9 +597,12 @@ def sample_random_parameter_draws(requests, rng_states, *, initialization=True):
     generation = object() if initialization else None
     draws = []
     for request in requests:
-        if not isinstance(request, RandomParameterDrawRequest):
+        if not isinstance(
+            request, (RandomParameterDrawRequest, RuntimeNoiseDrawRequest)
+        ):
             raise TypeError(
-                "random draw requests must be RandomParameterDrawRequest instances"
+                "random draw requests must be RandomParameterDrawRequest or "
+                "RuntimeNoiseDrawRequest instances"
             )
         if request.rng_key not in modules:
             raise KeyError(
@@ -572,7 +612,9 @@ def sample_random_parameter_draws(requests, rng_states, *, initialization=True):
             request.spec,
             modules[request.rng_key],
             generation,
-            reseed_on_initialize=True if request.reseed_on_initialize else None,
+            reseed_on_initialize=(
+                True if getattr(request, "reseed_on_initialize", False) else None
+            ),
         )
         draw = sample_random_parameter_draw(
             request.spec,
@@ -585,6 +627,15 @@ def sample_random_parameter_draws(requests, rng_states, *, initialization=True):
     return tuple(draws), {
         key: module.get_extra_state() for key, module in modules.items()
     }
+
+
+def sample_runtime_noise_draws(requests, rng_states):
+    """Return detached base draws and advanced checkpoints without mutation.
+
+    This host adapter shares the ordered stream machinery used by RAND
+    initialization. Runtime draws never apply initialization reseeding.
+    """
+    return sample_random_parameter_draws(requests, rng_states, initialization=False)
 
 
 def sample_random_parameter(
@@ -617,6 +668,38 @@ def _scale_runtime_noise(sample: torch.Tensor, dt, scale: str) -> torch.Tensor:
     raise ValueError(f"Unknown runtime noise scale: {scale!r}")
 
 
+def sample_runtime_noise_draw(spec, rng, shape, *, device, dtype):
+    """Sample a parameter-independent runtime base draw through explicit RNG."""
+    return sample_random_parameter_draw(spec, rng, shape, device=device, dtype=dtype)
+
+
+def evaluate_runtime_noise(spec, parameters, draw, *, dt=None):
+    """Evaluate detached runtime noise from explicit parameters and a base draw.
+
+    Distribution evaluation and timestep scaling use the same algebra as native
+    sampling. The result is detached from parameters, base draws, and ``dt``.
+    """
+    dist = _distribution(spec)
+    if dist.draw_sampler is None or dist.transform is None:
+        raise ValueError(
+            f"Random distribution {dist.name!r} has no pure draw_sampler/transform contract"
+        )
+    sample = dist.transform(parameters, draw)
+    return _scale_runtime_noise(sample, dt, spec.scale).detach()
+
+
+def sample_runtime_noise_with_draw(
+    spec, parameters, rng, shape, *, device, dtype, dt=None
+):
+    """Sample detached noise through the pure core or a legacy native sampler."""
+    dist = _distribution(spec)
+    if dist.draw_sampler is not None and dist.transform is not None:
+        draw = sample_runtime_noise_draw(dist, rng, shape, device=device, dtype=dtype)
+        return evaluate_runtime_noise(spec, parameters, draw, dt=dt), draw
+    sample = dist.sampler(parameters, rng, shape, device=device, dtype=dtype)
+    return _scale_runtime_noise(sample, dt, spec.scale).detach(), None
+
+
 def sample_runtime_noise(
     spec: RuntimeNoiseSpec,
     parameters: Mapping[str, torch.Tensor],
@@ -629,7 +712,6 @@ def sample_runtime_noise(
 ) -> torch.Tensor:
     """Sample a detached runtime-noise buffer."""
 
-    dist = get_random_distribution(spec.distribution)
-    sample = dist.sampler(parameters, rng, shape, device=device, dtype=dtype)
-    sample = _scale_runtime_noise(sample, dt, spec.scale)
-    return sample.detach()
+    return sample_runtime_noise_with_draw(
+        spec, parameters, rng, shape, device=device, dtype=dtype, dt=dt
+    )[0]

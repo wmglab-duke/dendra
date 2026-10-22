@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from typing import NamedTuple
 
 import torch
+from torch.utils import _pytree as pytree
 
 from dendra.models.integrators import _bwd_euler_sc_skip
 from dendra.models.networks.net import (
@@ -538,7 +539,7 @@ class FunctionalNetwork:
         )
 
     def sample_population_initialization_draws(self, parameters, state):
-        """Draw Population RAND packets without changing the supplied carry.
+        """Draw Population initialization packets without changing the carry.
 
         Assign each returned packet to its Population's
         ``InitializationInput.random_draw`` before calling :meth:`initialize`.
@@ -929,6 +930,24 @@ class FunctionalNetwork:
 
         return sample_draw_tape(self, state, steps)
 
+    def sample_population_noise_tapes(self, state, steps):
+        """Sample per-Population NOISE draw/RNG tapes from independent carry.
+
+        Assign each returned packet to its Population's ``RolloutInput.noise``.
+        NetStim has its separate :meth:`sample_draw_tape` packet. Sampling
+        follows the authored Population order and never changes the source
+        Network or supplied state.
+        """
+        from ._network_bindings import _canonicalize_mapping_tree
+
+        (state,), _ = _canonicalize_mapping_tree((state,))
+        self._validate_source()
+        self._validate_state(state)
+        return {
+            name: plan.sample_noise_draw_tape(state["populations"][name], steps)
+            for name, plan in self.populations.items()
+        }
+
     def rollout(
         self,
         parameters,
@@ -1181,6 +1200,9 @@ class FunctionalNetwork:
             rollout = RolloutInput(
                 ve=None if ve is None else ve.unsqueeze(0),
                 intra=None if injection is None else injection.unsqueeze(0),
+                noise=pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), selected.noise
+                ),
             )
             states[name], aux[name] = plan._rollout_values(
                 parameters["populations"][name],

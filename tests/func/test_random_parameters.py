@@ -688,7 +688,7 @@ def test_rand_declaration_does_not_admit_private_population_execution_overrides(
         dn.func.make_functional(source, dt=DT)
 
 
-def test_population_rand_does_not_admit_unsupported_runtime_noise():
+def test_population_rand_and_noise_share_native_initialization_stream():
     class _RandomNoisyPopulation(dn.SingleCompartment):
         dn.SingleCompartment.GLOBALRAND("trial_value", seed=17, rng_name="shared_rng")
         dn.SingleCompartment.GLOBALNOISE(
@@ -699,6 +699,14 @@ def test_population_rand_does_not_admit_unsupported_runtime_noise():
     source.insert(_CustomLeak)
     source.initialize()
     rng = source.shared_rng.get_extra_state()
-    with pytest.raises(dn.func.FunctionalizationError, match="runtime NOISE"):
-        dn.func.make_functional(source, dt=DT)
+    functional, tensors = dn.func.make_functional(source, dt=DT)
     _close(source.shared_rng.get_extra_state(), rng)
+    initialized = functional.initialize_host(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization,
+        state=tensors.state,
+    )
+    source.initialize()
+    _close(initialized.state, functional.extract().state)
+    assert functional.sample_noise_draw(tensors.state) is None

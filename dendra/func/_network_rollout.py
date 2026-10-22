@@ -33,12 +33,13 @@ from ._types import FunctionalizationError, RolloutInput, StepInput
 
 
 class NetworkRolloutInput(NamedTuple):
-    """Time-leading per-Population inputs and optional explicit NetStim draws.
+    """Time-leading per-Population inputs and explicit stochastic draw tapes.
 
-    ``populations`` maps names to :class:`RolloutInput`. ``netstim`` is a
+    ``populations`` maps names to :class:`RolloutInput`, including each
+    Population's ``noise`` draw/RNG tape. ``netstim`` is a
     :class:`NetStimDraw` whose two Tensor fields have one leading time axis.
     Keep draw values and their matching post-draw RNG bytes together. Pure
-    rollout/chunk calls require a supplied tape when NetStim is present;
+    rollout/chunk calls require tapes for recurrent NOISE and NetStim;
     the host ``run`` scheduler can sample bounded tapes from explicit carry.
     """
 
@@ -94,11 +95,10 @@ def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
     for name, selected in populations.items():
         if not isinstance(selected, RolloutInput):
             raise TypeError(f"Population {name!r} inputs must be a RolloutInput")
-        for value in selected:
-            if value is not None:
-                if not torch.is_tensor(value) or value.ndim < 1:
-                    raise ValueError("Population input tapes need a leading time axis")
-                lengths.append(value.shape[0])
+        for _path, value in _tensor_paths(selected):
+            if value.ndim < 1:
+                raise ValueError("Population input tapes need a leading time axis")
+            lengths.append(value.shape[0])
     if inputs.netstim is not None:
         if functional.netstim is None:
             raise ValueError("A Network without NetStim requires netstim=None")
@@ -116,17 +116,22 @@ def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
     if any(length != steps for length in lengths):
         raise ValueError("All Network input tapes must have exactly steps samples")
     normalized = {}
-    for name, selected in populations.items():
-        ve, intra, _ = functional.populations[name]._resolve_rollout_inputs(
-            selected, steps
-        )
-        selected = {
+    for name, plan in functional.populations.items():
+        selected = populations.get(name, RolloutInput())
+        ve, intra, _ = plan._resolve_rollout_inputs(selected, steps)
+        if selected.noise is not None or not allow_missing_draws:
+            plan._validate_noise_draw(selected.noise, steps=steps)
+        normalized_values = {
             key: value
-            for key, value in (("ve", ve), ("intra", intra))
+            for key, value in (
+                ("ve", ve),
+                ("intra", intra),
+                ("noise", selected.noise),
+            )
             if value is not None
         }
-        if selected:
-            normalized[name] = selected
+        if normalized_values:
+            normalized[name] = normalized_values
     draws = inputs.netstim
     if functional.netstim is not None:
         if draws is None:
@@ -204,7 +209,9 @@ def _auxiliary(functional, state, *, scan=False):
 
 def _step(functional, parameters, prepared, state, sample):
     inputs = {
-        name: StepInput(selected.get("ve"), selected.get("intra"))
+        name: StepInput(
+            selected.get("ve"), selected.get("intra"), selected.get("noise")
+        )
         for name, selected in sample.get("populations", {}).items()
     }
     return functional._step_values(
@@ -445,11 +452,16 @@ class CompiledNetworkChunk:
             ("network", "clock", "duration_remainder"),
         ]
         detached = [("network", "clock", "t")]
-        for name in functional.populations:
+        for name, population in functional.populations.items():
             static.append(
                 ("network", "populations", name, "control", "duration_remainder")
             )
             detached.append(("network", "populations", name, "clock", "t"))
+            detached.extend(
+                ("network", "populations", name, *leaf.public_path)
+                for leaf in population._state_layout
+                if leaf.public_path[0] == "runtime_noise"
+            )
         return _CompiledTensorTreeScan(
             body,
             steps=self.steps,
@@ -616,9 +628,10 @@ def run(
 ):
     """Host scheduling with shared exact spans and non-reentrant checkpoints.
 
-    Explicit tapes are sliced without detaching. If NetStim draws are omitted,
-    sample each bounded host span sequentially from explicit RNG carry before
-    entering checkpoint/compiled execution. Backward reuses those same packets.
+    Explicit tapes are sliced without detaching. Missing NOISE or NetStim
+    tapes are sampled for each bounded host span sequentially from explicit
+    RNG carry before entering checkpoint/compiled execution. Backward reuses
+    those same packets.
     """
     public_parameters, public_constants, public_inputs = parameters, constants, inputs
     (parameters, constants, state, inputs), _ = _canonicalize_mapping_tree(
@@ -699,6 +712,16 @@ def run(
     ):
         for start, stop in _execution_spans(steps, horizon):
             selected = _slice(tape, start, stop)
+            populations = dict(selected["populations"])
+            for name, plan in functional.populations.items():
+                values = populations.get(name, {})
+                if values.get("noise") is None:
+                    noise = plan.sample_noise_draw_tape(
+                        state["populations"][name], stop - start
+                    )
+                    if noise is not None:
+                        populations[name] = {**values, "noise": noise}
+            selected = {**selected, "populations": populations}
             if functional.netstim is not None and selected.get("netstim") is None:
                 selected = {
                     **selected,

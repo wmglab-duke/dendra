@@ -278,8 +278,12 @@ def test_per_population_input_tapes_match_native_values_and_input_gradients(exec
         for value in final["populations"].values()
     )
     expected_loss = sum(cell.v.square().sum() for cell in native.populations.values())
-    targets = tuple(leaf for pair in populations.values() for leaf in pair)
-    native_targets = tuple(leaf for pair in native_inputs.values() for leaf in pair)
+    targets = tuple(
+        leaf for pair in populations.values() for leaf in (pair.ve, pair.intra)
+    )
+    native_targets = tuple(
+        leaf for pair in native_inputs.values() for leaf in (pair.ve, pair.intra)
+    )
     actual = torch.autograd.grad(
         actual_loss, targets, allow_unused=True, materialize_grads=True
     )

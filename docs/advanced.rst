@@ -38,3 +38,4 @@ Advanced
    advanced/A28_functional_network_extra.md
    advanced/A29_functional_network_cache_initialization.md
    advanced/A30_functional_random_parameters.md
+   advanced/A31_functional_runtime_noise.md

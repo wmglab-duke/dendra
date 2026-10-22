@@ -186,7 +186,10 @@ class RandomParameterPlan:
         self.population = population
         self._declarations = _declaration_signature(population)
         self.entries = []
-        self.streams = {}
+        from ._runtime_noise import _stream_topology, stream_inventory
+
+        self.streams, stream_ids = stream_inventory(population)
+        self._stream_topology = _stream_topology(population)
         self.defaults = {}
         self._bindings = []
         self._rng_bindings = {}
@@ -194,7 +197,11 @@ class RandomParameterPlan:
         from ._population import _initialization_callable_dependency_signature
 
         owners = dict(_owners(population))
-        stream_ids = {}
+        self._rng_bindings = {
+            stream: getattr(owners[path], name)
+            for stream, (path, name) in self.streams.items()
+        }
+        self.noise = None
         for path, name, spec in random_declarations(population):
             owner = owners[path]
             for adapter in (
@@ -311,11 +318,14 @@ class RandomParameterPlan:
         return value.detach().to(device=device, dtype=dtype).clone()
 
     def validate_source(self):
+        if self.noise is not None:
+            self.noise.validate_source()
         owners = dict(_owners(self.population))
         if _declaration_signature(self.population) != self._declarations:
             raise FunctionalizationError(
                 "RAND declarations changed; lower the Population again"
             )
+        self.validate_stream_topology(self.population)
         from ._population import _initialization_callable_dependency_signature
 
         for stream, (path, name) in self.streams.items():
@@ -383,6 +393,19 @@ class RandomParameterPlan:
                     "RAND buffer is not initialized; initialize and lower again"
                 )
 
+    def validate_stream_topology(self, population):
+        from ._runtime_noise import _stream_topology
+
+        if _stream_topology(population) != self._stream_topology:
+            raise FunctionalizationError(
+                "Population RAND/NOISE RNG stream sharing does not match this functional plan; lower again"
+            )
+
+    def validate_compatible_population(self, population):
+        self.validate_stream_topology(population)
+        if self.noise is not None:
+            self.noise.validate_compatible_population(population)
+
     def extract(self, population=None):
         population = self.population if population is None else population
         owners = dict(_owners(population))
@@ -447,16 +470,45 @@ class RandomParameterPlan:
         selected = tuple(
             entry for entry in self.entries if entry.spec.resample_on_initialize
         )
+        if self.noise is None:
+            scheduled = selected
+        else:
+            from dendra.models.random_parameters import (
+                iter_initialization_random_declarations,
+            )
+
+            owners = dict(_owners(self.population))
+            by_identity = {id(owner): path for path, owner in owners.items()}
+            random_entries = {(entry.path, entry.name): entry for entry in selected}
+            noise_entries = {
+                (entry.path, entry.name): entry for entry in self.noise.entries
+            }
+            scheduled = []
+            visited = set()
+            for path, owner in owners.items():
+                if id(owner) in visited:
+                    continue
+                for child, kind, name, _spec in iter_initialization_random_declarations(
+                    owner
+                ):
+                    child_path = by_identity[id(child)]
+                    visited.add(id(child))
+                    entry = (random_entries if kind == "random" else noise_entries).get(
+                        (child_path, name)
+                    )
+                    if entry is not None:
+                        scheduled.append(entry)
+            scheduled = tuple(scheduled)
         requests = tuple(
             RandomParameterDrawRequest(
                 entry.stream,
-                entry.distribution,
+                entry.spec,
                 entry.shape,
                 entry.device,
                 entry.dtype,
-                entry.spec.reseed_on_initialize,
+                getattr(entry.spec, "reseed_on_initialize", False),
             )
-            for entry in selected
+            for entry in scheduled
         )
         from ._population import (
             _global_rng_changes,
@@ -482,7 +534,7 @@ class RandomParameterPlan:
                 f"RAND draw sampler consumed global RNG state {sorted(changes)}; use its explicit RNGModule"
             )
         draws = {}
-        for entry, draw in zip(selected, sampled, strict=True):
+        for entry, draw in zip(scheduled, sampled, strict=True):
             leaves, spec = _pytree.tree_flatten(draw)
             if spec != entry.draw_spec:
                 raise FunctionalizationError(
@@ -509,12 +561,19 @@ class RandomParameterPlan:
                 "RAND initialization requires a draw packet from sample_initialization_draw"
             )
         expected = {name for entry in self.entries for name in entry.draw_names}
-        if set(draw.draws) != expected:
+        full_expected = expected | (
+            {name for entry in self.noise.entries for name in entry.draw_names}
+            if self.noise is not None
+            else set()
+        )
+        if set(draw.draws) != full_expected:
             raise ValueError(
                 "RAND initialization draw names do not match the lowered plan"
             )
         result = dict(constants)
         for name, value in draw.draws.items():
+            if name not in expected:
+                continue
             shape, dtype, device = self.schema[name]
             if (
                 not torch.is_tensor(value)

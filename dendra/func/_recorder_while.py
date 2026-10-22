@@ -26,20 +26,23 @@ from ._while_inductor import _compile_while
 class _RecorderWhileExecutor:
     """Capture one accepted-clock transition, then reuse a bounded loop body."""
 
-    def __init__(self, functional, *, steps, plans, compile_options):
+    def __init__(
+        self, functional, *, steps, plans, compile_options, allow_empty_plans=False
+    ):
         self._functional = functional
         self._steps = steps
         self._plans = plans
         self._options = compile_options
+        self._allow_empty_plans = allow_empty_plans
         self._kernels = {}
         self._capture_errors = {}
 
-    def kernel_for(self, parameters, prepared, state, ve, intra, carries):
+    def kernel_for(self, parameters, prepared, state, ve, intra, carries, noise=None):
         from ._population import _STRUCTURED_ROLLOUT_CHUNK
 
         if self._steps < _STRUCTURED_ROLLOUT_CHUNK:
             return None, "The chunk is shorter than one inference loop block."
-        if not self._plans or not all(
+        if (not self._plans and not self._allow_empty_plans) or not all(
             _is_builtin_callback(plan.callback) for plan in self._plans
         ):
             return None, (
@@ -50,7 +53,7 @@ class _RecorderWhileExecutor:
         # baseline. Compile the selected route rather than choosing behavior
         # from a patch-version label.
         signature = (
-            _schema((parameters, prepared, state, ve, intra, carries)),
+            _schema((parameters, prepared, state, ve, intra, carries, noise)),
             MEMBRANE_ASSEMBLY.value,
         )
         if signature in self._capture_errors:
@@ -61,7 +64,7 @@ class _RecorderWhileExecutor:
                 # invocation itself uses inference_mode. They are never kept.
                 with torch.inference_mode(False), torch.no_grad():
                     self._kernels[signature] = self._capture(
-                        parameters, prepared, state, ve, intra, carries
+                        parameters, prepared, state, ve, intra, carries, noise
                     )
             except Exception as error:
                 reason = (
@@ -72,7 +75,7 @@ class _RecorderWhileExecutor:
                 return None, reason
         return self._kernels[signature], None
 
-    def _capture(self, parameters, prepared, state, ve, intra, carries):
+    def _capture(self, parameters, prepared, state, ve, intra, carries, noise):
         functional, plans = self._functional, self._plans
 
         def body(parameters, prepared, current, current_carries, sample):
@@ -80,9 +83,12 @@ class _RecorderWhileExecutor:
             next_state, auxiliary = functional._step_values(
                 parameters, prepared, current, StepInput(*sample)
             )
-            updated, emitted = _update_callback_values(
-                plans, current_carries, next_state, auxiliary
-            )
+            if plans:
+                updated, emitted = _update_callback_values(
+                    plans, current_carries, next_state, auxiliary
+                )
+            else:
+                updated, emitted = current_carries, {}
             return (next_state, updated), emitted or {}
 
         engine = _CompiledTensorTreeWhile(
@@ -95,12 +101,14 @@ class _RecorderWhileExecutor:
             tracer=make_fx,
             compiler=_compile_while,
         )
-        kernel = engine.kernel_for(parameters, prepared, state, carries, (ve, intra))
+        kernel = engine.kernel_for(
+            parameters, prepared, state, carries, (ve, intra, noise)
+        )
 
         @wraps(kernel)
-        def materialize(parameters, prepared, state, ve, intra, carries):
+        def materialize(parameters, prepared, state, ve, intra, carries, noise=None):
             final, final_carries, observed = kernel(
-                parameters, prepared, state, carries, (ve, intra)
+                parameters, prepared, state, carries, (ve, intra, noise)
             )
             emitted = {plan.name: observed.get(plan.name) for plan in plans}
             return final, {"v": final["integrator"]["v"]}, final_carries, emitted

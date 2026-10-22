@@ -650,7 +650,10 @@ def test_clamp_checkpointed_continuation_full_traces_and_all_gradients(
         reference_targets,
     ) = _arguments(runner, model)
     doubled = dn.func.RolloutInput(
-        *(torch.cat((value, value)) for value in reference_inputs)
+        *(
+            torch.cat((value, value))
+            for value in (reference_inputs.ve, reference_inputs.intra)
+        )
     )
     expected = _explicit_reference(
         runner, reference_parameters, reference_initialization, doubled, steps=2 * STEPS
@@ -666,7 +669,9 @@ def test_clamp_checkpointed_continuation_full_traces_and_all_gradients(
             runner,
             parameters,
             initialization,
-            dn.func.RolloutInput(*(torch.cat((value, value)) for value in inputs)),
+            dn.func.RolloutInput(
+                *(torch.cat((value, value)) for value in (inputs.ve, inputs.intra))
+            ),
             steps=2 * STEPS,
         ),
     )
@@ -1036,7 +1041,10 @@ def _exchange_continuation(
         reference_targets,
     ) = _arguments(runner, model)
     doubled = dn.func.RolloutInput(
-        *(torch.cat((value, value)) for value in reference_inputs)
+        *(
+            torch.cat((value, value))
+            for value in (reference_inputs.ve, reference_inputs.intra)
+        )
     )
     expected = _explicit_reference(
         runner, reference_parameters, reference_initialization, doubled, steps=2 * STEPS
@@ -1047,7 +1055,7 @@ def _exchange_continuation(
     _close(gradients, _gradients(reference_recorded, reference_targets), dtype=dtype)
     _material_oracle(recorded, parameters, runner.constants["dt"], family="exchange")
     doubled_inputs = dn.func.RolloutInput(
-        *(torch.cat((value, value)) for value in inputs)
+        *(torch.cat((value, value)) for value in (inputs.ve, inputs.intra))
     )
     _close(
         recorded,

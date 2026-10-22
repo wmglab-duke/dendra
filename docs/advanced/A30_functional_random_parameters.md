@@ -126,6 +126,10 @@ each top-level Population. Assign it to that Population's initialization input:
 :dedent: 4
 ```
 
+For models with NOISE declarations, this initialization packet also carries
+their ordered initialization draws and shared RNG suffix. Recurrent NOISE
+tapes are separate; see {doc}`A31_functional_runtime_noise`.
+
 NetStim initialization and per-step draw tapes remain separate inputs; see
 {doc}`A14_functional_netstim_renewal` and
 {doc}`A21_functional_network_compile`. A shared `rng_name` within an owner
@@ -180,12 +184,13 @@ RNG state are restored without running Population resampling. Cached
 materializations remain detached; see
 {doc}`A29_functional_network_cache_initialization` for gradient boundaries.
 
-Per-step `GLOBALNOISE`, `BATCHNOISE`, and `RANGENOISE` buffers, plus State
-`DIFFUSION` SDEs, are currently unsupported by functional execution. RAND
-heterogeneity does not add random draws to the recurrent timestep.
+Per-step `GLOBALNOISE`, `BATCHNOISE`, and `RANGENOISE` buffers use detached
+explicit draw/RNG tapes; see {doc}`A31_functional_runtime_noise`. RAND
+heterogeneity does not add random draws to the recurrent timestep. State
+`DIFFUSION` SDEs are currently unsupported by functional execution.
 
-Fresh initialization of a Population that declares its own RAND parameters
-and has a parameter-writing pre-initialization transform is currently
+Fresh initialization of a Population that declares its own RAND or NOISE
+buffers and has a parameter-writing pre-initialization transform is currently
 unsupported. Native Population sampling precedes those writes, while
 Mechanism and nested State sampling follows them. Mechanism and State RAND
 declarations support parameter-writing pre transforms; snapshot execution

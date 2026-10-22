@@ -2924,6 +2924,7 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
             key
             for key in bindings
             if ".__dendra_stochastic_state__.random_parameter." in key
+            or ".__dendra_stochastic_state__.runtime_noise." in key
         }
     )
     if unclassified:
@@ -3005,6 +3006,24 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
             )
         )
 
+    for owner_path, owner in _parameterized_owner_paths(population):
+        for noise_name in owner.runtime_noises:
+            value = owner._buffers[noise_name]
+            leaves.append(
+                _StateLeaf(
+                    public_path=(
+                        "runtime_noise",
+                        f"{owner_path + '.' if owner_path else ''}{noise_name}",
+                    ),
+                    module_path=owner_path,
+                    buffer_name=noise_name,
+                    mapping_slots=((owner_path, noise_name),),
+                    checkpoint_key=None,
+                    shape=_shape_tuple(value),
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+            )
     leaves.extend(
         (
             _StateLeaf(
@@ -5679,13 +5698,13 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             )
 
     failures.extend(_functional_initialization_transform_failures(population))
-    if population.random_parameters and any(
+    if (population.random_parameters or population.runtime_noises) and any(
         reference.startswith("parameters.")
         for hook in _initialization_transform_hooks(population, "pre")
         for reference in population._initialization_transforms[hook.action_name].writes
     ):
         failures.append(
-            "Population RAND sampling with parameter-writing pre-initialize transforms is currently unsupported; sample the Population before applying those writes"
+            "Population RAND/NOISE sampling with parameter-writing pre-initialize transforms is currently unsupported; sample the Population before applying those writes"
         )
     if (
         "_steady_state" in population._caches
@@ -6007,6 +6026,8 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         unsupported = []
         for leaf in layout:
             path = leaf.public_path
+            if path[0] == "runtime_noise":
+                continue
             if path in {
                 ("integrator", "v"),
                 ("integrator", "vc"),
@@ -6362,6 +6383,8 @@ class _PopulationInitialization(torch.nn.Module):
                     leaf.module_path,
                     leaf.buffer_name,
                 )
+            if leaf.public_path[0] == "runtime_noise":
+                value = value.reshape(leaf.shape)
             if not torch.is_tensor(value):
                 raise FunctionalizationError(
                     "fresh functional initialization returned non-Tensor state "
@@ -6399,7 +6422,18 @@ class _PopulationTransition(torch.nn.Module):
             tuple(_module_at(population, entry.module_path) for entry in layout),
         )
 
-    def forward(self, v, t, duration_remainder, dt, celsius, ve, intra, steps: int):
+    def forward(
+        self,
+        v,
+        t,
+        duration_remainder,
+        dt,
+        celsius,
+        ve,
+        intra,
+        steps: int,
+        noise_values=None,
+    ):
         handler = self.population.mech
         shared_celsius = _pad_to_visible_rank(celsius, v)
         handler._sync_celsius(celsius)
@@ -6410,6 +6444,15 @@ class _PopulationTransition(torch.nn.Module):
         vc = self.population._buffers.get("vc") if self.block_voltage_state else None
         i_membrane = self.population._buffers["i_membrane"] if integrator.imem else None
         for index in range(steps):
+            if noise_values is not None:
+                for path, values in noise_values.items():
+                    module_path, _separator, buffer_name = path.rpartition(".")
+                    owner = _module_at(self.population, module_path)
+                    value = values[index]
+                    owner._buffers[buffer_name] = value.reshape(
+                        (1,) * max(0, len(owner.shape_f) - value.ndim)
+                        + tuple(value.shape)
+                    )
             ve_step = None if ve is None else ve[index]
             intra_step = None if intra is None else intra[index]
             # Mechanism ``t`` references resolve through the Population buffer.
@@ -6456,6 +6499,8 @@ class _PopulationTransition(torch.nn.Module):
                 value = duration_remainder
             else:
                 value = owner._buffers[entry.buffer_name]
+            if entry.public_path[0] == "runtime_noise":
+                value = value.reshape(entry.shape)
             outputs.append(value)
         return tuple(outputs)
 
@@ -6680,17 +6725,16 @@ def _uses_standard_single_compartment_geometry(population) -> bool:
 
 
 def _is_scalar_point(population) -> bool:
-    """Admit canonical point containers and RAND declaration-only subclasses.
+    """Admit canonical point containers and RAND/NOISE declaration-only subclasses.
 
     A declaration-only subclass inherits every numerical/lifecycle method.
     Private methods and descriptors also change execution, so they do not gain
-    admission merely by declaring a random parameter.
+    admission merely by declaring a RAND or NOISE buffer.
     """
     if type(population) in (Population, SingleCompartment):
         return True
-    if (
-        not isinstance(population, (Population, SingleCompartment))
-        or not population.random_parameters
+    if not isinstance(population, (Population, SingleCompartment)) or not (
+        population.random_parameters or population.runtime_noises
     ):
         return False
     for cls in type(population).__mro__:
@@ -7750,10 +7794,6 @@ def _functionalization_failures(
         return ["expected an initialized dendra Population"]
     if not population.initialized:
         failures.append("Population must be initialized before functionalization")
-    if population.runtime_noises:
-        failures.append(
-            "Population runtime NOISE declarations are currently unsupported"
-        )
     is_multi = _is_multi(population)
     is_single_compartment = _is_scalar_point(population)
     is_extcell_axon = isinstance(population, ExtCellAxon)
@@ -8281,7 +8321,7 @@ def _functionalization_failures(
                     f"{mechanism.name} uses TABLE lookup workspaces, which are "
                     "not lowered yet"
                 )
-            if module.runtime_noises or getattr(module, "_diffusion", None):
+            if getattr(module, "_diffusion", None):
                 failures.append(
                     f"{mechanism.name} uses stochastic state, which is not supported yet"
                 )
@@ -10038,12 +10078,24 @@ class FunctionalPopulation:
         )
         self._random_plan = None
         from ._random_parameters import RandomParameterPlan, random_declarations
+        from ._runtime_noise import RuntimeNoisePlan, noise_declarations
 
-        if random_declarations(population):
+        self._noise_plan = (
+            RuntimeNoisePlan(population) if noise_declarations(population) else None
+        )
+        if self._noise_plan is not None:
+            self._initialization_failures = (
+                *self._initialization_failures,
+                *self._noise_plan.initialization_failures(),
+            )
+        if random_declarations(population) or self._noise_plan is not None:
             self._random_plan = RandomParameterPlan(population)
+            self._random_plan.noise = self._noise_plan
         self._state_schema = self._make_state_schema(self._state_layout)
         if self._random_plan is not None:
             _constants, random_state = self._random_plan.extract()
+            self._random_plan.rng_reference = random_state["rng"]
+            self._state_schema["random"] = {"rng": {}, "values": {}}
             for path, value in _tensor_tree_paths(random_state):
                 _put_path(
                     self._state_schema,
@@ -10533,7 +10585,8 @@ class FunctionalPopulation:
 
     def _validate_source(self) -> None:
         if self._random_plan is None and any(
-            owner.random_parameters for owner in _parameterized_owners(self._population)
+            owner.random_parameters or owner.runtime_noises
+            for owner in _parameterized_owners(self._population)
         ):
             raise FunctionalizationError(
                 "The source random parameter resampling declarations changed; initialize and lower the Population again"
@@ -10775,6 +10828,8 @@ class FunctionalPopulation:
                 "execution plan. Rebuild and lower the model again after changing "
                 "integrator state buffers or their shape, dtype, or device."
             )
+        if self._random_plan is not None:
+            self._random_plan.validate_compatible_population(population)
 
     def _validate_parameters(self, parameters) -> None:
         if not isinstance(parameters, Mapping):
@@ -11593,6 +11648,19 @@ class FunctionalPopulation:
             isolate_read_only=True,
             mechanism_dt=initialization_dt,
         )
+        if self._noise_plan is not None:
+            self._noise_plan.validate(selected_random_draw, initialization=True)
+            for path, value in self._noise_plan.values(
+                mapping,
+                selected_random_draw,
+                torch.ones_like(initialization_dt),
+                initialization=True,
+            ).items():
+                module_path, _separator, _name = path.rpartition(".")
+                owner = _module_at(self._initialization.population, module_path)
+                mapping[f"population.{path}"] = value.reshape(
+                    (1,) * max(0, len(owner.shape_f) - value.ndim) + tuple(value.shape)
+                )
         outputs = functional_call(
             self._initialization,
             mapping,
@@ -11655,6 +11723,53 @@ class FunctionalPopulation:
             if self._random_plan is None or self._owned_cache_bound
             else self._random_plan.sample(state)
         )
+
+    def sample_noise_draw(self, state):
+        """Sample one explicit runtime draw without changing source or carry."""
+        self._validate_source()
+        self._validate_state(state)
+        return (
+            None
+            if self._noise_plan is None or not self._noise_plan.runtime
+            else self._noise_plan.sample(state)
+        )
+
+    def sample_noise_draw_tape(self, state, steps):
+        """Sample a bounded time-first draw and RNG tape from an explicit carry."""
+        self._validate_source()
+        self._validate_state(state)
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("steps must be a non-negative integer")
+        return (
+            None
+            if self._noise_plan is None or not self._noise_plan.runtime
+            else self._noise_plan.sample(state, steps=steps)
+        )
+
+    def _validate_noise_draw(self, draw, *, steps=None):
+        if self._noise_plan is None or not self._noise_plan.runtime:
+            if draw is not None:
+                raise ValueError("This Population has no recurrent NOISE declarations")
+            return
+        if steps == 0 and draw is None:
+            return
+        self._noise_plan.validate(draw, steps=steps)
+        reference = self._random_plan.rng_reference
+        if set(draw.rng) != set(reference):
+            raise ValueError("NOISE RNG stream names do not match the lowered plan")
+        for stream, leaves in reference.items():
+            if set(draw.rng[stream]) != set(leaves):
+                raise ValueError("NOISE RNG state schema is incompatible")
+            for name, target in leaves.items():
+                value = draw.rng[stream][name]
+                shape = tuple(target.shape) if steps is None else (steps, *target.shape)
+                if (
+                    not torch.is_tensor(value)
+                    or tuple(value.shape) != shape
+                    or value.dtype != target.dtype
+                    or value.device != target.device
+                ):
+                    raise ValueError("NOISE RNG state has incompatible Tensor schema")
 
     def initialize_host(self, parameters, constants, inputs, *, state=None):
         """Sample missing RAND draws at a cold boundary, then initialize purely."""
@@ -13774,6 +13889,7 @@ class FunctionalPopulation:
         ve,
         intra,
         steps,
+        noise=None,
     ):
         """Execute the established authored transition with a Python loop."""
         mapping, dt, celsius, v, t, duration_remainder = self._mapping(
@@ -13781,6 +13897,17 @@ class FunctionalPopulation:
             prepared,
             state,
         )
+        noise_values = None
+        if noise is not None:
+            noise_values = {}
+            for index in range(steps):
+                packet = torch.utils._pytree.tree_map(lambda value: value[index], noise)
+                values = self._noise_plan.values(mapping, packet, dt)
+                for name, value in values.items():
+                    noise_values.setdefault(name, []).append(value)
+            noise_values = {
+                name: torch.stack(values) for name, values in noise_values.items()
+            }
         outputs = functional_call(
             self._transition,
             mapping,
@@ -13793,6 +13920,7 @@ class FunctionalPopulation:
                 ve,
                 intra,
                 steps,
+                noise_values,
             ),
             tie_weights=False,
         )
@@ -13818,7 +13946,16 @@ class FunctionalPopulation:
                 )
             _put_path(next_state, leaf.public_path, value)
         if self._random_plan is not None:
-            next_state["random"] = state["random"]
+            next_state["random"] = (
+                state["random"]
+                if noise is None or not steps
+                else {
+                    **state["random"],
+                    "rng": torch.utils._pytree.tree_map(
+                        lambda value: value[-1].clone(), noise.rng
+                    ),
+                }
+            )
         return next_state, {"v": next_state["integrator"]["v"]}
 
     def _clone_state_tree(self, state):
@@ -14192,6 +14329,19 @@ class FunctionalPopulation:
             name="intra",
             steps=resolved_steps,
         )
+        if inputs.noise is not None:
+            lengths = [
+                int(value.shape[0])
+                for value in torch.utils._pytree.tree_leaves(inputs.noise)
+            ]
+            if lengths and (
+                len(set(lengths)) != 1
+                or resolved_steps is not None
+                and resolved_steps != lengths[0]
+            ):
+                raise ValueError("NOISE tape length does not match rollout steps")
+            if lengths:
+                resolved_steps = lengths[0]
         if resolved_steps is None:
             raise ValueError("steps is required when both rollout inputs are None")
         return ve, intra, resolved_steps
@@ -14204,6 +14354,7 @@ class FunctionalPopulation:
         ve,
         intra,
         steps,
+        noise=None,
     ):
         """Execute already validated tensor inputs through the selected path."""
         ve, intra = self._assemble_bound_inputs(
@@ -14220,7 +14371,8 @@ class FunctionalPopulation:
             MEMBRANE_ASSEMBLY.value,
         )
         if (
-            torch.compiler.is_compiling()
+            noise is None
+            and torch.compiler.is_compiling()
             and not torch.is_grad_enabled()
             and torch.autograd.forward_ad._current_level < 0
             and not torch._C._are_functorch_transforms_active()
@@ -14241,6 +14393,7 @@ class FunctionalPopulation:
             ve,
             intra,
             steps,
+            noise,
         )
 
     def _execute_rollout_values_with_callbacks(
@@ -14253,6 +14406,7 @@ class FunctionalPopulation:
         steps,
         callbacks,
         callback_state,
+        noise=None,
     ):
         """Execute a fixed-step rollout while threading pure callback carry."""
 
@@ -14300,6 +14454,11 @@ class FunctionalPopulation:
                     None if ve is None else ve[index : index + 1],
                     None if intra is None else intra[index : index + 1],
                     1,
+                    None
+                    if noise is None
+                    else torch.utils._pytree.tree_map(
+                        lambda value: value[index : index + 1], noise
+                    ),
                 )
                 callback_state, emitted = callbacks._update(
                     callback_state,
@@ -14355,6 +14514,11 @@ class FunctionalPopulation:
             ve,
             intra,
             1,
+            None
+            if inputs.noise is None
+            else torch.utils._pytree.tree_map(
+                lambda value: value.unsqueeze(0), inputs.noise
+            ),
         )
 
     def _rollout_values(
@@ -14370,6 +14534,8 @@ class FunctionalPopulation:
         callback_state=None,
     ):
         ve, intra, resolved_steps = self._resolve_rollout_inputs(inputs, steps)
+        noise = None if inputs is None else inputs.noise
+        self._validate_noise_draw(noise, steps=resolved_steps)
         if extra is not None:
             if self._extra.enabled:
                 raise ValueError(
@@ -14402,6 +14568,7 @@ class FunctionalPopulation:
                 ve,
                 intra,
                 resolved_steps,
+                noise,
             )
         from ._callbacks import FunctionalCallbacks
 
@@ -14419,6 +14586,7 @@ class FunctionalPopulation:
             resolved_steps,
             callbacks,
             callback_state,
+            noise,
         )
 
     def rollout(
@@ -14506,7 +14674,15 @@ class FunctionalPopulation:
             parameters,
             prepared,
             state,
-            RolloutInput(ve=ve, intra=intra),
+            RolloutInput(
+                ve=ve,
+                intra=intra,
+                noise=None
+                if inputs.noise is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value.unsqueeze(0), inputs.noise
+                ),
+            ),
             steps=1,
             extra=extra,
         )
@@ -14534,7 +14710,15 @@ class FunctionalPopulation:
             parameters,
             constants,
             state,
-            RolloutInput(ve=ve, intra=intra),
+            RolloutInput(
+                ve=ve,
+                intra=intra,
+                noise=None
+                if inputs.noise is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value.unsqueeze(0), inputs.noise
+                ),
+            ),
             steps=1,
             extra=extra,
         )
@@ -14819,7 +15003,7 @@ def make_functional(
     extra=None,
     _bind_owned_cache=True,
 ) -> tuple[FunctionalPopulation, PopulationTensors]:
-    """Lower an initialized deterministic Population into a pure transition."""
+    """Lower an initialized Population into a pure transition."""
     if isinstance(dt, bool):
         raise TypeError("dt must be a finite positive scalar")
     try:

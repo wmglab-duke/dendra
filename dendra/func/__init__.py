@@ -49,6 +49,7 @@ from ._types import (
     PopulationTensors,
     RandomParameterDraw,
     RolloutInput,
+    RuntimeNoiseDraw,
     StepInput,
 )
 
@@ -94,6 +95,7 @@ __all__ = [
     "Raster",
     "Recorder",
     "RolloutInput",
+    "RuntimeNoiseDraw",
     "StepInput",
     "StimulusTensors",
     "TensorScheduleTensors",

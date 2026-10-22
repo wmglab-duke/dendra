@@ -588,7 +588,9 @@ def test_diffusion_checkpointed_continuation_full_traces_and_gradients(
         runner,
         rp,
         ri,
-        dn.func.RolloutInput(*(torch.cat((value, value)) for value in rx)),
+        dn.func.RolloutInput(
+            *(torch.cat((value, value)) for value in (rx.ve, rx.intra))
+        ),
         steps=2 * STEPS,
     )
     _assert_tree_close(final, expected[0], rtol=3e-9, atol=3e-10)
@@ -602,7 +604,9 @@ def test_diffusion_checkpointed_continuation_full_traces_and_gradients(
             runner,
             parameters,
             initialization,
-            dn.func.RolloutInput(*(torch.cat((value, value)) for value in inputs)),
+            dn.func.RolloutInput(
+                *(torch.cat((value, value)) for value in (inputs.ve, inputs.intra))
+            ),
             steps=2 * STEPS,
         ),
     )

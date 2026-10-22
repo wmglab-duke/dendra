@@ -175,8 +175,10 @@ connection parameters, gradient boundaries, and required continuation packets.
 Without a cache, fresh initialization uses current explicit parameters as
 described above. Initialization-time RAND declarations use explicit draw and
 RNG packets, including their resampling and ``reseed_on_initialize`` policies;
-see {doc}`A30_functional_random_parameters`. Custom native initialization/build
-adapters are currently unsupported.
+see {doc}`A30_functional_random_parameters`. Runtime NOISE declarations use
+per-Population draw/RNG tapes, with automatic host sampling and explicit
+continuation; see {doc}`A31_functional_runtime_noise`. Custom native
+initialization/build adapters are currently unsupported.
 Initialize shared runtime parameters before the first Population that uses
 them. A transform on a later Population that writes a runtime parameter shared
 with an earlier Population is currently unsupported, because native execution

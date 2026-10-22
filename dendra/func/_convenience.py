@@ -25,7 +25,7 @@ from ._runner_policy import (
     _validate_host_construction,
 )
 from ._runners import _run_source_validated, run
-from ._types import FunctionalizationError, InitializationInput
+from ._types import FunctionalizationError, InitializationInput, RolloutInput
 
 _OWNED_PREPARE = FunctionalPopulation.prepare
 _OWNED_BIND = CompiledPopulationChunk.bind
@@ -189,7 +189,10 @@ class CompiledRunner:
             )
             self._initialization_writes_constants = initialization == "fresh" and (
                 self._functional._owned_cache_bound
-                or self._functional._random_plan is not None
+                or (
+                    self._functional._random_plan is not None
+                    and bool(self._functional._random_plan.entries)
+                )
             )
             self._callbacks = (
                 None
@@ -342,7 +345,13 @@ class CompiledRunner:
                 "execution='while' has no functional callback loop executor"
             )
         kernel, reason = executor.kernel_for(
-            parameters, values, state, ve, intra, carry.carries
+            parameters,
+            values,
+            state,
+            ve,
+            intra,
+            carry.carries,
+            None if inputs is None else inputs.noise,
         )
         if kernel is None:
             raise FunctionalizationError(f"execution='while' is unavailable: {reason}")
@@ -461,6 +470,16 @@ class CompiledRunner:
                 if owned_boundaries
                 else self._kernel.bind(selected_parameters, prepared)
             )
+            if inputs is None:
+                inputs = RolloutInput()
+            if not isinstance(inputs, RolloutInput):
+                raise TypeError("inputs must be a RolloutInput or None")
+            if self._execution == "while" and inputs.noise is None:
+                inputs = inputs._replace(
+                    noise=self._functional.sample_noise_draw_tape(
+                        selected_state, self._steps
+                    )
+                )
             if self._execution == "while":
                 self._require_while(
                     bound._parameters, prepared, selected_state, inputs, callback_state
