@@ -47,6 +47,7 @@ from ._types import (
     FunctionalizationError,
     InitializationInput,
     PopulationTensors,
+    RandomParameterDraw,
     RolloutInput,
     StepInput,
 )
@@ -88,6 +89,7 @@ __all__ = [
     "NetworkRolloutInput",
     "NetworkTensors",
     "PopulationTensors",
+    "RandomParameterDraw",
     "PopulationCallback",
     "Raster",
     "Recorder",

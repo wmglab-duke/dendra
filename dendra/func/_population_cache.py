@@ -197,8 +197,10 @@ class PopulationCachePlan:
             raise FunctionalizationError(
                 "Population state cache must match the initialized state-dict schema"
             )
+        from ._random_parameters import cache_metadata_tensors
+
         self._reference = {
-            name: value if bindings_only else value.detach().clone()
+            name: value if bindings_only else cache_metadata_tensors(value, plan.device)
             for name, value in reference.items()
         }
         parameter_slots = dict(population.named_parameters(remove_duplicate=False))
@@ -422,16 +424,30 @@ class PopulationCachePlan:
             raise FunctionalizationError(
                 "Population state cache schema changed; lower again"
             )
+        from ._random_parameters import cache_metadata_tensors
+
+        if self.plan._random_plan is not None:
+            self.plan._random_plan.validate_native_cache(cache)
+        converted = {
+            name: cache_metadata_tensors(value, self.plan.device)
+            for name, value in cache.items()
+        }
+        if self.plan._random_plan is not None:
+            self.plan._random_plan.validate_cache(converted)
         for name, reference in self._reference.items():
-            value = cache[name]
-            if not torch.is_tensor(value) or tuple(value.shape) != tuple(
-                reference.shape
+            expected, spec = torch.utils._pytree.tree_flatten(reference)
+            actual, other = torch.utils._pytree.tree_flatten(converted[name])
+            if spec != other or any(
+                not torch.is_tensor(value) or tuple(value.shape) != tuple(target.shape)
+                for value, target in zip(actual, expected, strict=True)
             ):
                 raise FunctionalizationError(
                     f"Population cache {name!r} has incompatible shape"
                 )
-        normalized = dict(restore_population_cache_values(self._reference, cache))
+        normalized = dict(restore_population_cache_values(self._reference, converted))
         self.validate_values(normalized)
+        if self.plan._random_plan is not None:
+            self.plan._random_plan.validate_cache(normalized)
         return normalized
 
     def restore(self, parameters, constants, state, cache):
@@ -460,6 +476,10 @@ class PopulationCachePlan:
             reference = _get_path(state, path)
             value = cache[source].detach().to(reference).clone()
             _put_path(restored_state, path, value)
+        if plan._random_plan is not None:
+            effective_constants, restored_state["random"] = (
+                plan._random_plan.restore_cache(cache, effective_constants)
+            )
         plan._validate_parameters(effective)
         plan._validate_constants(effective_constants)
         plan._validate_state(restored_state)

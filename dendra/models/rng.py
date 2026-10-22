@@ -358,6 +358,34 @@ class RNGModule(RNGMixin):
         self.shape_f = shape_f
         self.rng = None
 
+    @classmethod
+    def from_checkpoint(cls, payload, *, shape_p=(), shape_f=()):
+        """Construct an isolated host sampler from explicit generator metadata.
+
+        Sampling the returned module changes neither the source checkpoint nor
+        any live model RNG. Device generators retain their saved byte states;
+        missing devices derive their stream from the saved base seed.
+        """
+        base_seed, state = _validate_rng_checkpoint_payload(payload, allow_legacy=False)
+        module = cls(base_seed, shape_p=shape_p, shape_f=shape_f)
+        module._apply_validated_rng_state(state)
+        return module
+
+    def reseed_for_generation(self, generation):
+        """Reset once at the first initialization request sharing this RNG.
+
+        A missing generation denotes manual sampling and does not reset the
+        stream. Other declarations sharing this RNG continue in Native order.
+        """
+        if generation is None:
+            return False
+        previous = getattr(self, "_random_parameter_reseed_generation", None)
+        if previous is generation or previous == generation:
+            return False
+        self.reset()
+        self._random_parameter_reseed_generation = generation
+        return True
+
     def init(self, device: torch.device | str | None = None):
         """Initialize the RNG for a specific device."""
         self.rng = self._rng(device)

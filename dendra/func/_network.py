@@ -537,6 +537,29 @@ class FunctionalNetwork:
             )
         )
 
+    def sample_population_initialization_draws(self, parameters, state):
+        """Draw Population RAND packets without changing the supplied carry.
+
+        Assign each returned packet to its Population's
+        ``InitializationInput.random_draw`` before calling :meth:`initialize`.
+        Network-wide cache restoration consumes no Population draws. NetStim
+        has its separate :meth:`sample_initialization_draw` packet.
+        """
+        from ._network_bindings import _canonicalize_mapping_tree
+
+        (parameters, state), _ = _canonicalize_mapping_tree((parameters, state))
+        self._validate_initialization_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        return {
+            name: None
+            if self._cache_enabled
+            else plan.sample_initialization_draw(
+                parameters["populations"][name], state["populations"][name]
+            )
+            for name, plan in self.populations.items()
+        }
+
     def _initialize_host(self, parameters, constants, state, inputs):
         from ._network_initialization import initialize_host
 
@@ -1301,6 +1324,16 @@ class FunctionalNetwork:
                 raise ValueError(
                     f"Population {name!r} clock does not match the Network step boundary"
                 )
+        # Build graph-carrying RAND materializations against the destination's
+        # raw Parameters before publishing any state. A staged checkpoint's
+        # sample graphs instead belong to its private parameter copies.
+        random_commits = {
+            name: plan._random_plan.prepare_commit(
+                network.populations[name], state["populations"][name]["random"]
+            )
+            for name, plan in self.populations.items()
+            if plan._random_plan is not None
+        }
         staged = _deepcopy_execution_module(network)
         for name, plan in self.populations.items():
             plan.commit_state_(staged.populations[name], state["populations"][name])
@@ -1320,6 +1353,10 @@ class FunctionalNetwork:
         network.restore_dict_from_checkpoint(checkpoint)
         for name, plan in self.synapses.items():
             plan._commit_pending_(network.synapses[name], state["synapses"][name])
+        for name, prepared in random_commits.items():
+            self.populations[name]._random_plan.publish_commit(
+                network.populations[name], prepared
+            )
         # SCNV's native checkpoint omits its exposed voltage. The Population
         # adapter has already staged/validated that separate functional carry.
         for name in self.populations:

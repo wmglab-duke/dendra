@@ -184,7 +184,7 @@ class CompiledNetworkRunner:
                     for plan in self._functional._population_cache_plans.values()
                 )
                 or any(
-                    plan._owned_cache_bound
+                    plan._owned_cache_bound or plan._random_plan is not None
                     for plan in self._functional.populations.values()
                 )
             )
@@ -319,7 +319,7 @@ class CompiledNetworkRunner:
             and self._initialization_writes_constants
         ):
             raise ValueError(
-                "cache initialization writes constants; continue with "
+                "initialization writes constants; continue with "
                 "constants=aux['constants'] from the preceding call"
             )
         fresh = fresh_policy and state is None

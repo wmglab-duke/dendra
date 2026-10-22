@@ -26,9 +26,12 @@ from .modular import DNModule, matches_any_pattern
 from .random_parameters import (
     RandomParameterSpec,
     RuntimeNoiseSpec,
+    clone_random_parameter_tree,
+    get_random_distribution,
     make_random_parameter_spec,
     make_runtime_noise_spec,
-    sample_random_parameter,
+    prepare_rng_for_random_parameter,
+    sample_random_parameter_with_draw,
     sample_runtime_noise,
 )
 from .rng import RNGModule
@@ -2547,6 +2550,7 @@ class Parameterized(SimpleParameterized):
         seed: int | None = None,
         reparameterized: bool = True,
         rng_name: str | None = None,
+        reseed_on_initialize: bool = False,
         **distribution_parameters,
     ):
         """Declare a sampled scalar buffer with parametric distribution parameters."""
@@ -2560,6 +2564,7 @@ class Parameterized(SimpleParameterized):
                 seed=seed,
                 reparameterized=reparameterized,
                 rng_name=rng_name,
+                reseed_on_initialize=reseed_on_initialize,
                 **distribution_parameters,
             ),
             Parameterized._global_rand_declarations,
@@ -2574,6 +2579,7 @@ class Parameterized(SimpleParameterized):
         seed: int | None = None,
         reparameterized: bool = True,
         rng_name: str | None = None,
+        reseed_on_initialize: bool = False,
         **distribution_parameters,
     ):
         """Declare a sampled per-compartment buffer.
@@ -2594,6 +2600,7 @@ class Parameterized(SimpleParameterized):
                 seed=seed,
                 reparameterized=reparameterized,
                 rng_name=rng_name,
+                reseed_on_initialize=reseed_on_initialize,
                 **distribution_parameters,
             ),
             Parameterized._range_rand_declarations,
@@ -2608,6 +2615,7 @@ class Parameterized(SimpleParameterized):
         seed: int | None = None,
         reparameterized: bool = True,
         rng_name: str | None = None,
+        reseed_on_initialize: bool = False,
         **distribution_parameters,
     ):
         """Declare a sampled buffer with BATCH-shaped distribution parameters."""
@@ -2621,6 +2629,7 @@ class Parameterized(SimpleParameterized):
                 seed=seed,
                 reparameterized=reparameterized,
                 rng_name=rng_name,
+                reseed_on_initialize=reseed_on_initialize,
                 **distribution_parameters,
             ),
             Parameterized._batch_rand_declarations,
@@ -2828,6 +2837,8 @@ class Parameterized(SimpleParameterized):
         self.runtime_noises = self.__class__._runtime_noises.copy()
         self._random_parameter_generation = {}
         self._random_parameter_initialized = {}
+        self._random_parameter_draws = {}
+        self._random_parameter_parameters = {}
 
         self.in_graph_parametrizations = {}
 
@@ -3082,6 +3093,8 @@ class Parameterized(SimpleParameterized):
             )
             self._random_parameter_generation.pop(name, None)
             self._random_parameter_initialized[name] = False
+            self._random_parameter_draws.pop(name, None)
+            self._random_parameter_parameters.pop(name, None)
             if not hasattr(self, spec.effective_rng_name):
                 setattr(
                     self,
@@ -3160,6 +3173,99 @@ class Parameterized(SimpleParameterized):
             if isinstance(rng_module, RNGModule):
                 rng_module.reset()
 
+    def _random_parameter_state_for_checkpoint(self):
+        """Snapshot detached sample provenance and retained-sample policy."""
+        return {
+            "version": 1,
+            "initialized": dict(self._random_parameter_initialized),
+            "draws": clone_random_parameter_tree(
+                self._random_parameter_draws, detach=True
+            ),
+            "parameters": clone_random_parameter_tree(
+                self._random_parameter_parameters, detach=True
+            ),
+        }
+
+    def _prepare_random_parameter_state(self, provenance):
+        """Validate provenance without mutating sampled buffers or RNG streams."""
+        if provenance is None:
+            return {
+                "version": 1,
+                "initialized": dict(self._random_parameter_initialized),
+                "draws": {},
+                "parameters": {},
+            }
+        expected = set(self.random_parameters)
+        if not isinstance(provenance, dict) or provenance.get("version") != 1:
+            raise ValueError("unsupported random-parameter provenance version")
+        initialized = provenance["initialized"]
+        draws, parameters = provenance["draws"], provenance["parameters"]
+        if (
+            not isinstance(initialized, dict)
+            or set(initialized) != expected
+            or any(type(value) is not bool for value in initialized.values())
+        ):
+            raise ValueError(
+                "random-parameter initialized flags must match the declarations"
+            )
+        if (
+            not isinstance(draws, dict)
+            or not isinstance(parameters, dict)
+            or not set(draws) <= expected
+            or not set(parameters) <= expected
+        ):
+            raise ValueError(
+                "random-parameter provenance names must match the declarations"
+            )
+        for name, values in parameters.items():
+            if not isinstance(values, dict) or set(values) != set(
+                self.random_parameters[name].params
+            ):
+                raise ValueError(
+                    f"random-parameter provenance parameters for {name!r} do not match its distribution"
+                )
+            if any(not torch.is_tensor(value) for value in values.values()):
+                raise TypeError(
+                    "random-parameter provenance parameters must be tensors"
+                )
+        return clone_random_parameter_tree(provenance, detach=True)
+
+    def _apply_random_parameter_state(self, provenance):
+        self._random_parameter_initialized = provenance["initialized"]
+        self._random_parameter_draws = provenance["draws"]
+        self._random_parameter_parameters = provenance["parameters"]
+        self._random_parameter_generation = {}
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if self.random_parameters:
+            destination[f"{prefix}_random_parameter_state"] = (
+                self._random_parameter_state_for_checkpoint()
+            )
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+
+        def apply(value):
+            if torch.is_tensor(value):
+                return fn(value)
+            if isinstance(value, dict):
+                return {name: apply(child) for name, child in value.items()}
+            if isinstance(value, tuple):
+                children = tuple(apply(child) for child in value)
+                return type(value)(*children) if hasattr(value, "_fields") else children
+            if isinstance(value, list):
+                return [apply(child) for child in value]
+            return value
+
+        self._random_parameter_draws = apply(
+            getattr(self, "_random_parameter_draws", {})
+        )
+        self._random_parameter_parameters = apply(
+            getattr(self, "_random_parameter_parameters", {})
+        )
+        return result
+
     def _load_from_state_dict(
         self,
         state_dict,
@@ -3171,6 +3277,17 @@ class Parameterized(SimpleParameterized):
         error_msgs,
     ):
         """Load checkpoints across registrations of shared tensor aliases."""
+        provenance_key = f"{prefix}_random_parameter_state"
+        has_provenance = provenance_key in state_dict
+        provenance = state_dict.pop(provenance_key, None)
+        prepared_provenance = None
+        if has_provenance:
+            try:
+                prepared_provenance = self._prepare_random_parameter_state(provenance)
+            except (KeyError, TypeError, ValueError) as error:
+                error_msgs.append(
+                    f"Invalid random-parameter provenance {provenance_key!r}: {error}"
+                )
         # Registering an authored transform can expose a second state-dict path
         # to a parameter or persistent buffer that already has a stable public
         # path. Older checkpoints store that tensor only once. Materialize
@@ -3196,15 +3313,45 @@ class Parameterized(SimpleParameterized):
                 if alias_key not in state_dict and canonical_key in state_dict:
                     state_dict[alias_key] = state_dict[canonical_key]
 
-        return super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
+        try:
+            result = super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+        finally:
+            if has_provenance:
+                state_dict[provenance_key] = provenance
+        if not has_provenance:
+            # Older checkpoints retain their sampled values and initialized
+            # policy, but cannot attest to the constructor's unrelated draws.
+            prepared_provenance = self._prepare_random_parameter_state(None)
+        if prepared_provenance is not None:
+            for name in self.random_parameters:
+                if f"{prefix}{name}" in state_dict:
+                    continue
+                # Partial loads, including Population.load's shape filtering,
+                # retain this sample. Keep its own provenance paired with it
+                # even when other compatible distribution parameters load.
+                prepared_provenance["initialized"][name] = (
+                    self._random_parameter_initialized.get(name, False)
+                )
+                for label, retained in (
+                    ("draws", self._random_parameter_draws),
+                    ("parameters", self._random_parameter_parameters),
+                ):
+                    if name in retained:
+                        prepared_provenance[label][name] = clone_random_parameter_tree(
+                            retained[name], detach=True
+                        )
+                    else:
+                        prepared_provenance[label].pop(name, None)
+            self._apply_random_parameter_state(prepared_provenance)
+        return result
 
     def register_parametrization_in_graph(self, name: str, param: Callable, args=None):
         """
@@ -3763,10 +3910,11 @@ class Parameterized(SimpleParameterized):
             rng = getattr(self, spec.effective_rng_name)
             if isinstance(rng, RNGModule):
                 rng.init(buffer.device)
+            prepare_rng_for_random_parameter(spec, rng, random_generation)
             distribution_params = {
                 p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
             }
-            sample = sample_random_parameter(
+            sample, draw = sample_random_parameter_with_draw(
                 spec,
                 distribution_params,
                 rng,
@@ -3775,6 +3923,16 @@ class Parameterized(SimpleParameterized):
                 dtype=buffer.dtype,
             )
             setattr(self, name, sample.to(device=buffer.device, dtype=buffer.dtype))
+            if get_random_distribution(spec.distribution).draw_sampler is not None:
+                self._random_parameter_draws[name] = clone_random_parameter_tree(
+                    draw, detach=True
+                )
+                self._random_parameter_parameters[name] = clone_random_parameter_tree(
+                    distribution_params, detach=True
+                )
+            else:
+                self._random_parameter_draws.pop(name, None)
+                self._random_parameter_parameters.pop(name, None)
             self._random_parameter_initialized[name] = True
             if random_generation is not None:
                 self._random_parameter_generation[name] = random_generation

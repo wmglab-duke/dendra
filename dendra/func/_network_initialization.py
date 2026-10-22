@@ -560,7 +560,9 @@ def _validate(functional, parameters, constants, state, inputs, draw, *, require
         functional.netstim._validate_draw(draw)
 
 
-def _initialize_components(functional, parameters, constants, state, inputs):
+def _initialize_components(
+    functional, parameters, constants, state, inputs, *, sample_random=False
+):
     """Complete the native phases preceding NetStim initialization."""
     from ._network import NetworkTensors
 
@@ -574,10 +576,14 @@ def _initialize_components(functional, parameters, constants, state, inputs):
         for name, plan in functional.populations.items():
             incoming_parameters = effective
             if inputs.cache is None:
-                initialized = plan.initialize(
+                initialize_population = (
+                    plan.initialize_host if sample_random else plan.initialize
+                )
+                initialized = initialize_population(
                     effective["populations"][name],
                     effective_constants["populations"][name],
                     inputs.populations[name],
+                    state=populations[name],
                 )
             else:
                 initialized = functional._population_cache_plans[name].restore(
@@ -708,7 +714,9 @@ def initialize_host(functional, parameters, constants, state, inputs):
         inputs.netstim_draw,
         require_draw=False,
     )
-    packet = _initialize_components(functional, parameters, constants, state, inputs)
+    packet = _initialize_components(
+        functional, parameters, constants, state, inputs, sample_random=True
+    )
     draw = inputs.netstim_draw
     if functional.netstim is not None and draw is None:
         # Native initialization samples last. Population transforms may have

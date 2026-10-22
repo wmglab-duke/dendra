@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, NamedTuple
 
 import torch
 
@@ -20,6 +21,12 @@ __all__ = [
     "make_random_parameter_spec",
     "make_runtime_noise_spec",
     "sample_random_parameter",
+    "sample_random_parameter_draw",
+    "evaluate_random_parameter",
+    "sample_random_parameter_with_draw",
+    "RandomParameterDrawRequest",
+    "sample_random_parameter_draws",
+    "prepare_rng_for_random_parameter",
     "sample_runtime_noise",
 ]
 
@@ -27,14 +34,63 @@ _ALLOWED_CONSTRAINTS = {"real", "positive", "negative"}
 _ALLOWED_SCOPES = {"global", "range", "batch"}
 _ALLOWED_NOISE_PHASES = {"pre_state"}
 _ALLOWED_NOISE_SCALES = {"standard", "dW", "white"}
+_SQRT_TWO = math.sqrt(2.0)
 
 
 def _readonly(mapping):
     return MappingProxyType(dict(mapping))
 
 
+def clone_random_parameter_tree(value, *, memo=None, detach=False):
+    """Own declaration/provenance tensors without copying an autograd graph."""
+    memo = {} if memo is None else memo
+    identity = id(value)
+    if identity in memo:
+        return memo[identity]
+    if torch.is_tensor(value):
+        cloned = value.detach().clone()
+        if isinstance(value, torch.nn.Parameter) and not detach:
+            cloned = torch.nn.Parameter(cloned, requires_grad=value.requires_grad)
+        elif not detach:
+            cloned.requires_grad_(value.requires_grad)
+    elif isinstance(value, Mapping):
+        copied = {
+            name: clone_random_parameter_tree(child, memo=memo, detach=detach)
+            for name, child in value.items()
+        }
+        cloned = _readonly(copied) if isinstance(value, MappingProxyType) else copied
+    elif isinstance(value, tuple):
+        children = tuple(
+            clone_random_parameter_tree(child, memo=memo, detach=detach)
+            for child in value
+        )
+        cloned = type(value)(*children) if hasattr(value, "_fields") else children
+    elif isinstance(value, list):
+        cloned = [
+            clone_random_parameter_tree(child, memo=memo, detach=detach)
+            for child in value
+        ]
+    else:
+        cloned = copy.deepcopy(value, memo)
+    memo[identity] = cloned
+    return cloned
+
+
+class _ImmutableSpec:
+    def __deepcopy__(self, memo):
+        cloned = object.__new__(type(self))
+        memo[id(self)] = cloned
+        for name in self.__dataclass_fields__:
+            object.__setattr__(
+                cloned,
+                name,
+                clone_random_parameter_tree(getattr(self, name), memo=memo),
+            )
+        return cloned
+
+
 @dataclass(frozen=True)
-class RandomParameterSpec:
+class RandomParameterSpec(_ImmutableSpec):
     """Specification for a sampled, usually initialization-time, parameter buffer."""
 
     name: str
@@ -46,6 +102,7 @@ class RandomParameterSpec:
     seed: int | None = None
     reparameterized: bool = True
     rng_name: str | None = None
+    reseed_on_initialize: bool = False
 
     @property
     def parameter_names(self) -> tuple[str, ...]:
@@ -60,7 +117,7 @@ class RandomParameterSpec:
 
 
 @dataclass(frozen=True)
-class RuntimeNoiseSpec:
+class RuntimeNoiseSpec(_ImmutableSpec):
     """Specification for a detached runtime-noise buffer.
 
     Runtime noise is intended for stochastic drives in mechanisms/states during
@@ -95,7 +152,7 @@ class RuntimeNoiseSpec:
 
 
 @dataclass(frozen=True)
-class DistributionSpec:
+class DistributionSpec(_ImmutableSpec):
     """Registered random distribution.
 
     Parameters
@@ -110,12 +167,22 @@ class DistributionSpec:
     sampler:
         Callable with signature ``sampler(parameters, rng, shape, *, device,
         dtype)``.  The sampler must return a tensor broadcastable to ``shape``.
+    draw_sampler:
+        Optional ``draw_sampler(rng, shape, *, device, dtype)`` producing a
+        Tensor tree of parameter-independent base draws.
+    transform:
+        Optional pure ``transform(parameters, draw)`` converting those base
+        draws to samples. Both split hooks are required together. Native
+        sampling uses the split hooks when provided; legacy-only samplers
+        remain available for imperative execution.
     """
 
     name: str
     parameter_defaults: Mapping[str, object]
     parameter_constraints: Mapping[str, str]
     sampler: Callable[..., torch.Tensor]
+    draw_sampler: Callable | None = None
+    transform: Callable | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -129,26 +196,31 @@ def _canonical_name(name: str) -> str:
     return key
 
 
-def _normal_sampler(parameters, rng, shape, *, device, dtype):
-    eps = rng.randn(shape, device=device, dtype=dtype)
-    return parameters["mu"] + parameters["sigma"] * eps
+def _normal_draw(rng, shape, *, device, dtype):
+    return rng.randn(shape, device=device, dtype=dtype)
 
 
-def _lognormal_sampler(parameters, rng, shape, *, device, dtype):
-    eps = rng.randn(shape, device=device, dtype=dtype)
-    return torch.exp(parameters["mu"] + parameters["sigma"] * eps)
+def _uniform_draw(rng, shape, *, device, dtype):
+    return rng.rand(shape, device=device, dtype=dtype)
 
 
-def _uniform_sampler(parameters, rng, shape, *, device, dtype):
-    u = rng.rand(shape, device=device, dtype=dtype)
-    return parameters["low"] + (parameters["high"] - parameters["low"]) * u
+def _normal_transform(parameters, draw):
+    return parameters["mu"] + parameters["sigma"] * draw
+
+
+def _lognormal_transform(parameters, draw):
+    return torch.exp(_normal_transform(parameters, draw))
+
+
+def _uniform_transform(parameters, draw):
+    return parameters["low"] + (parameters["high"] - parameters["low"]) * draw
 
 
 def _standard_normal_cdf(x):
-    return 0.5 * (1.0 + torch.erf(x / math.sqrt(2.0)))
+    return 0.5 * (1.0 + torch.erf(x / _SQRT_TWO))
 
 
-def _truncated_normal_sampler(parameters, rng, shape, *, device, dtype):
+def _truncated_normal_transform(parameters, draw):
     """Sample a true inverse-CDF truncated normal distribution."""
 
     mu = parameters["mu"]
@@ -161,15 +233,22 @@ def _truncated_normal_sampler(parameters, rng, shape, *, device, dtype):
     cdf_low = _standard_normal_cdf(alpha)
     cdf_high = _standard_normal_cdf(beta)
 
-    finfo = torch.finfo(dtype if dtype is not None else mu.dtype)
+    finfo = torch.finfo(draw.dtype)
     eps = finfo.eps
     cdf_high = torch.maximum(cdf_high, cdf_low + eps)
 
-    u = rng.rand(shape, device=device, dtype=dtype)
-    p = cdf_low + (cdf_high - cdf_low) * u
+    p = cdf_low + (cdf_high - cdf_low) * draw
     p = torch.clamp(p, eps, 1.0 - eps)
-    sample = mu + sigma * math.sqrt(2.0) * torch.erfinv(2.0 * p - 1.0)
+    sample = mu + sigma * _SQRT_TWO * torch.erfinv(2.0 * p - 1.0)
     return torch.minimum(torch.maximum(sample, low), high)
+
+
+def _split_sampler(draw_sampler, transform):
+    def sampler(parameters, rng, shape, *, device, dtype):
+        draw = draw_sampler(rng, shape, device=device, dtype=dtype)
+        return transform(parameters, draw)
+
+    return sampler
 
 
 _DISTRIBUTIONS: dict[str, DistributionSpec] = {}
@@ -182,6 +261,8 @@ def register_random_distribution(
     sampler: Callable[..., torch.Tensor] | None = None,
     *,
     overwrite: bool = False,
+    draw_sampler: Callable | None = None,
+    transform: Callable | None = None,
 ) -> DistributionSpec:
     """Register a distribution for RAND/NOISE declarations.
 
@@ -195,6 +276,12 @@ def register_random_distribution(
             f"Random distribution {name!r} is already registered. Pass "
             "overwrite=True to replace it."
         )
+    if (draw_sampler is None) != (transform is None):
+        raise ValueError("draw_sampler and transform must be supplied together.")
+    if draw_sampler is not None:
+        if not callable(draw_sampler) or not callable(transform):
+            raise TypeError("draw_sampler and transform must be callable.")
+        sampler = _split_sampler(draw_sampler, transform)
     if sampler is None or not callable(sampler):
         raise TypeError("register_random_distribution requires a callable sampler.")
 
@@ -217,7 +304,14 @@ def register_random_distribution(
             )
         constraints[param_name] = constraint
 
-    spec = DistributionSpec(key, _readonly(defaults), _readonly(constraints), sampler)
+    spec = DistributionSpec(
+        key,
+        _readonly(defaults),
+        _readonly(constraints),
+        sampler,
+        draw_sampler,
+        transform,
+    )
     _DISTRIBUTIONS[key] = spec
     return spec
 
@@ -226,25 +320,29 @@ register_random_distribution(
     "normal",
     {"mu": 0.0, "sigma": 1.0},
     {"mu": "real", "sigma": "positive"},
-    _normal_sampler,
+    draw_sampler=_normal_draw,
+    transform=_normal_transform,
 )
 register_random_distribution(
     "lognormal",
     {"mu": 0.0, "sigma": 1.0},
     {"mu": "real", "sigma": "positive"},
-    _lognormal_sampler,
+    draw_sampler=_normal_draw,
+    transform=_lognormal_transform,
 )
 register_random_distribution(
     "uniform",
     {"low": 0.0, "high": 1.0},
     {"low": "real", "high": "real"},
-    _uniform_sampler,
+    draw_sampler=_uniform_draw,
+    transform=_uniform_transform,
 )
 register_random_distribution(
     "truncated_normal",
     {"mu": 0.0, "sigma": 1.0, "low": -2.0, "high": 2.0},
     {"mu": "real", "sigma": "positive", "low": "real", "high": "real"},
-    _truncated_normal_sampler,
+    draw_sampler=_uniform_draw,
+    transform=_truncated_normal_transform,
 )
 
 
@@ -301,6 +399,7 @@ def make_random_parameter_spec(
     seed: int | None = None,
     reparameterized: bool = True,
     rng_name: str | None = None,
+    reseed_on_initialize: bool = False,
     **distribution_parameters,
 ) -> RandomParameterSpec:
     """Construct and validate a quenched random-parameter declaration."""
@@ -320,6 +419,7 @@ def make_random_parameter_spec(
         seed=None if seed is None else int(seed),
         reparameterized=bool(reparameterized),
         rng_name=rng_name,
+        reseed_on_initialize=bool(reseed_on_initialize),
     )
 
 
@@ -375,6 +475,118 @@ def make_runtime_noise_spec(
 # Sampling
 
 
+def _distribution(spec):
+    return (
+        spec
+        if isinstance(spec, DistributionSpec)
+        else get_random_distribution(spec.distribution)
+    )
+
+
+def sample_random_parameter_draw(spec, rng, shape, *, device, dtype):
+    """Draw explicit parameter-independent noise using the Native RNG calls."""
+    dist = _distribution(spec)
+    if dist.draw_sampler is None or dist.transform is None:
+        raise ValueError(
+            f"Random distribution {dist.name!r} has no pure draw_sampler/transform contract"
+        )
+    return dist.draw_sampler(rng, shape, device=device, dtype=dtype)
+
+
+def evaluate_random_parameter(spec, parameters, draw):
+    """Purely evaluate one distribution from its parameters and explicit draw."""
+    dist = _distribution(spec)
+    if dist.draw_sampler is None or dist.transform is None:
+        raise ValueError(
+            f"Random distribution {dist.name!r} has no pure draw_sampler/transform contract"
+        )
+    sample = dist.transform(parameters, draw)
+    return sample if getattr(spec, "reparameterized", True) else sample.detach()
+
+
+def sample_random_parameter_with_draw(spec, parameters, rng, shape, *, device, dtype):
+    """Sample through the shared pure core, retaining optional base provenance."""
+    dist = _distribution(spec)
+    if dist.draw_sampler is not None and dist.transform is not None:
+        draw = sample_random_parameter_draw(
+            dist, rng, shape, device=device, dtype=dtype
+        )
+        return evaluate_random_parameter(spec, parameters, draw), draw
+    sample = dist.sampler(parameters, rng, shape, device=device, dtype=dtype)
+    return (sample if spec.reparameterized else sample.detach()), None
+
+
+class RandomParameterDrawRequest(NamedTuple):
+    """One host draw in Native order, keyed by its explicit shared RNG stream."""
+
+    rng_key: str
+    spec: RandomParameterSpec | DistributionSpec
+    shape: tuple[int, ...]
+    device: torch.device | str
+    dtype: torch.dtype
+    reseed_on_initialize: bool = False
+
+
+def prepare_rng_for_random_parameter(
+    spec, rng, generation, *, reseed_on_initialize=None
+):
+    """Apply one declaration's ordered initialization reseed request."""
+    requested = (
+        getattr(spec, "reseed_on_initialize", False)
+        if reseed_on_initialize is None
+        else reseed_on_initialize
+    )
+    if not requested or generation is None:
+        return False
+    reset = getattr(rng, "reseed_for_generation", None)
+    if reset is None:
+        raise TypeError("reseed_on_initialize requires an RNGModule stream")
+    return reset(generation)
+
+
+def sample_random_parameter_draws(requests, rng_states, *, initialization=True):
+    """Sample an ordered draw packet from independent explicit RNG checkpoints.
+
+    Requests with the same key consume one shared stream in sequence. The
+    returned checkpoints include every supplied stream and retain base seeds
+    and deferred per-device state, without mutating a source model or packet.
+    This host adapter is separate from pure distribution evaluation.
+    """
+    from .rng import RNGModule
+
+    modules = {
+        key: RNGModule.from_checkpoint(state) for key, state in rng_states.items()
+    }
+    generation = object() if initialization else None
+    draws = []
+    for request in requests:
+        if not isinstance(request, RandomParameterDrawRequest):
+            raise TypeError(
+                "random draw requests must be RandomParameterDrawRequest instances"
+            )
+        if request.rng_key not in modules:
+            raise KeyError(
+                f"Missing random-parameter RNG checkpoint {request.rng_key!r}"
+            )
+        prepare_rng_for_random_parameter(
+            request.spec,
+            modules[request.rng_key],
+            generation,
+            reseed_on_initialize=True if request.reseed_on_initialize else None,
+        )
+        draw = sample_random_parameter_draw(
+            request.spec,
+            modules[request.rng_key],
+            request.shape,
+            device=request.device,
+            dtype=request.dtype,
+        )
+        draws.append(clone_random_parameter_tree(draw, detach=True))
+    return tuple(draws), {
+        key: module.get_extra_state() for key, module in modules.items()
+    }
+
+
 def sample_random_parameter(
     spec: RandomParameterSpec,
     parameters: Mapping[str, torch.Tensor],
@@ -386,9 +598,9 @@ def sample_random_parameter(
 ) -> torch.Tensor:
     """Sample a random parameter buffer from resolved distribution parameters."""
 
-    dist = get_random_distribution(spec.distribution)
-    sample = dist.sampler(parameters, rng, shape, device=device, dtype=dtype)
-    return sample if spec.reparameterized else sample.detach()
+    return sample_random_parameter_with_draw(
+        spec, parameters, rng, shape, device=device, dtype=dtype
+    )[0]
 
 
 def _scale_runtime_noise(sample: torch.Tensor, dt, scale: str) -> torch.Tensor:

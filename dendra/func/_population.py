@@ -509,8 +509,24 @@ def _functional_initialization_profile(population):
         return ExtCellTree, "block_tree", _dhs_bt
     if _is_scalar_point(population):
         if isinstance(population.integrator, _bwd_euler_sc_skip):
-            return type(population), "scalar_point_skip", _bwd_euler_sc_skip
-        return type(population), "scalar_point", _bwd_euler_sc
+            return (
+                (
+                    SingleCompartment
+                    if isinstance(population, SingleCompartment)
+                    else Population
+                ),
+                "scalar_point_skip",
+                _bwd_euler_sc_skip,
+            )
+        return (
+            (
+                SingleCompartment
+                if isinstance(population, SingleCompartment)
+                else Population
+            ),
+            "scalar_point",
+            _bwd_euler_sc,
+        )
     if isinstance(population, Myelinated):
         return Myelinated, "scalar_path", _bwd_euler_ub
     if isinstance(population, Unmyelinated):
@@ -1132,8 +1148,8 @@ def _safe_class_restore_copy(
                 )
                 for item in value
             }
-        if type(value) is dict:
-            return {
+        if type(value) in (dict, types.MappingProxyType):
+            restored = {
                 _safe_class_restore_copy(
                     key,
                     label=f"{label}.key",
@@ -1149,6 +1165,11 @@ def _safe_class_restore_copy(
                 )
                 for key, item in value.items()
             }
+            return (
+                types.MappingProxyType(restored)
+                if type(value) is types.MappingProxyType
+                else restored
+            )
     finally:
         seen.remove(identity)
     raise FunctionalizationError(
@@ -2899,6 +2920,11 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
         - set(expected)
         - _local_synchronization_keys(handler)
         - _derived_handler_keys(handler)
+        - {
+            key
+            for key in bindings
+            if ".__dendra_stochastic_state__.random_parameter." in key
+        }
     )
     if unclassified:
         raise FunctionalizationError(
@@ -3004,6 +3030,14 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
         )
     )
     return tuple(leaves)
+
+
+def _tensor_tree_paths(tree, prefix=()):
+    for name, value in tree.items():
+        if torch.is_tensor(value):
+            yield (*prefix, name), value
+        else:
+            yield from _tensor_tree_paths(value, (*prefix, name))
 
 
 def _state_layout_signature(layout: tuple[_StateLeaf, ...]) -> tuple:
@@ -3191,6 +3225,19 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     dtype=buffer.dtype,
                     device=buffer.device,
                     kind="effective_parameter",
+                )
+            )
+        for name in module.random_parameters:
+            buffer = module._buffers[name]
+            effective.append(
+                _PreparedBuffer(
+                    f"{module_path}.{name}",
+                    module_path,
+                    name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "random_parameter",
                 )
             )
         for name in _derived_buffer_names(module):
@@ -3555,9 +3602,19 @@ class _PopulationPreparation(torch.nn.Module):
             bindings,
             f"{type(population).__qualname__}._derive_parameter_buffers()",
         )
-        self.population_parameter_names = tuple(population_values)
+        self.population_parameter_names = (
+            *tuple(population_values),
+            *tuple(population.random_parameters),
+        )
         self.population_parameter_shapes = {
-            name: _shape_tuple(value) for name, value in population_values.items()
+            name: _shape_tuple(value)
+            for name, value in {
+                **population_values,
+                **{
+                    name: population._buffers[name]
+                    for name in population.random_parameters
+                },
+            }.items()
         }
         self.uses_diameter_parametrization = (
             hasattr(population, "parametrizations")
@@ -3602,7 +3659,12 @@ class _PopulationPreparation(torch.nn.Module):
             validation_population = _clone_execution_population(population)
             owner_parameter_values = {}
             for index, entry in enumerate(self.layout):
-                if entry.kind in {"derived", "timestep", "material_process"}:
+                if entry.kind in {
+                    "derived",
+                    "timestep",
+                    "material_process",
+                    "random_parameter",
+                }:
                     offset_names.append(None)
                     continue
                 owner = _module_at(population, entry.module_path)
@@ -3778,7 +3840,9 @@ class _PopulationPreparation(torch.nn.Module):
         material_area=None,
         cache_values=None,
         cache_active=None,
+        random_inputs=None,
     ):
+        random_outputs = {}
         if for_initialization:
             # INITIAL/defaults and ordinary parameter/derived builders see the
             # construction-fresh timestep view, even after a previous run.
@@ -3803,6 +3867,20 @@ class _PopulationPreparation(torch.nn.Module):
             bindings,
             f"{type(self.population).__qualname__}._derive_parameter_buffers()",
         )
+        if random_inputs is not None:
+            from ._random_parameters import materialize_random_parameters
+
+            random_outputs.update(
+                materialize_random_parameters(
+                    self.population, "", population_values, random_inputs
+                )
+            )
+            population_values.update(
+                {
+                    name: self.population._buffers[name]
+                    for name in self.population.random_parameters
+                }
+            )
         for name in self.population_parameter_names:
             population_values[name] = _cache_materialization(
                 population_values[name], name, cache_values, cache_active
@@ -3867,6 +3945,20 @@ class _PopulationPreparation(torch.nn.Module):
                     bindings,
                     f"{type(owner).__qualname__}._derive_parameter_buffers()",
                 )
+                if random_inputs is not None:
+                    from ._random_parameters import materialize_random_parameters
+
+                    random_outputs.update(
+                        materialize_random_parameters(
+                            owner,
+                            entry.module_path,
+                            owner_parameter_values[entry.module_path],
+                            random_inputs,
+                        )
+                    )
+                    owner_parameter_values[entry.module_path].update(
+                        {name: owner._buffers[name] for name in owner.random_parameters}
+                    )
             value = owner_parameter_values[entry.module_path][entry.buffer_name]
             value = torch.broadcast_to(value, entry.shape)
             offset_name = self.offset_names[index]
@@ -3996,8 +4088,8 @@ class _PopulationPreparation(torch.nn.Module):
             tuple(by_key[entry.key] for entry in self.layout),
         )
         if self.local_geometry_bindings:
-            return (*result, tuple(local_geometry))
-        return result
+            result = (*result, tuple(local_geometry))
+        return (*result, random_outputs) if random_inputs is not None else result
 
 
 class _ComponentPhysicalPreparation(_PopulationPreparation):
@@ -5587,9 +5679,18 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             )
 
     failures.extend(_functional_initialization_transform_failures(population))
-    if "_steady_state" in population._caches or bool(
-        population.initializing_from_state_cache
+    if population.random_parameters and any(
+        reference.startswith("parameters.")
+        for hook in _initialization_transform_hooks(population, "pre")
+        for reference in population._initialization_transforms[hook.action_name].writes
     ):
+        failures.append(
+            "Population RAND sampling with parameter-writing pre-initialize transforms is currently unsupported; sample the Population before applying those writes"
+        )
+    if (
+        "_steady_state" in population._caches
+        or bool(population.initializing_from_state_cache)
+    ) and not population._has_random_parameters_resampled_on_initialize():
         failures.append(
             "steady-state cache restoration is not a fresh deterministic "
             "functional initialization"
@@ -6579,13 +6680,34 @@ def _uses_standard_single_compartment_geometry(population) -> bool:
 
 
 def _is_scalar_point(population) -> bool:
-    """Admit the two exact containers for independent scalar compartments.
+    """Admit canonical point containers and RAND declaration-only subclasses.
 
-    ``SingleCompartment`` is a convenience subclass of ``Population``; their
-    geometry and electrical equations are identical. Do not use ``isinstance``
-    here: it would also admit Cable, Axon, Tree, and arbitrary custom models.
+    A declaration-only subclass inherits every numerical/lifecycle method.
+    Private methods and descriptors also change execution, so they do not gain
+    admission merely by declaring a random parameter.
     """
-    return type(population) in (Population, SingleCompartment)
+    if type(population) in (Population, SingleCompartment):
+        return True
+    if (
+        not isinstance(population, (Population, SingleCompartment))
+        or not population.random_parameters
+    ):
+        return False
+    for cls in type(population).__mro__:
+        if cls in (Population, SingleCompartment):
+            return True
+        if any(
+            not name.startswith("_")
+            or callable(value)
+            or isinstance(value, (property, classmethod, staticmethod))
+            or (
+                inspect.isdatadescriptor(value)
+                and name not in {"__dict__", "__weakref__"}
+            )
+            for name, value in vars(cls).items()
+        ):
+            return False
+    return False
 
 
 def _is_native_cable(population) -> bool:
@@ -7628,6 +7750,10 @@ def _functionalization_failures(
         return ["expected an initialized dendra Population"]
     if not population.initialized:
         failures.append("Population must be initialized before functionalization")
+    if population.runtime_noises:
+        failures.append(
+            "Population runtime NOISE declarations are currently unsupported"
+        )
     is_multi = _is_multi(population)
     is_single_compartment = _is_scalar_point(population)
     is_extcell_axon = isinstance(population, ExtCellAxon)
@@ -8154,10 +8280,6 @@ def _functionalization_failures(
                 failures.append(
                     f"{mechanism.name} uses TABLE lookup workspaces, which are "
                     "not lowered yet"
-                )
-            if module.random_parameters:
-                failures.append(
-                    f"{mechanism.name} uses random parameters, which are not supported yet"
                 )
             if module.runtime_noises or getattr(module, "_diffusion", None):
                 failures.append(
@@ -9294,10 +9416,6 @@ def _owned_cache_initialization_failures(population):
         failures.append(
             "Population steady-state cache restoration with legacy post-initialize hooks is currently unsupported"
         )
-    if population._has_random_parameters_resampled_on_initialize():
-        failures.append(
-            "Population steady-state cache invalidation by initialization-time random parameter resampling is currently unsupported"
-        )
     return tuple(failures)
 
 
@@ -9470,8 +9588,11 @@ class FunctionalPopulation:
         self._multi_component_plans = ()
         self._cache_value_specs = ()
         self._bind_owned_cache = _bind_owned_cache
+        self._owned_cache_source_present = "_steady_state" in population._caches
         self._owned_cache_bound = (
-            _bind_owned_cache and "_steady_state" in population._caches
+            _bind_owned_cache
+            and self._owned_cache_source_present
+            and not population._has_random_parameters_resampled_on_initialize()
         )
         self._owned_cache_plan = None
         self._owned_cache_error = None
@@ -9759,7 +9880,7 @@ class FunctionalPopulation:
         self._prepared_buffer_visible_ranks = {
             entry.key: (
                 len(_module_at(execution_population, entry.module_path).shape_f)
-                if entry.kind == "effective_parameter"
+                if entry.kind in {"effective_parameter", "random_parameter"}
                 else (
                     _module_at(
                         execution_population, entry.module_path
@@ -9915,7 +10036,29 @@ class FunctionalPopulation:
         self._parameter_devices.update(
             {name: contract.device for name, contract in stimulation_schema.items()}
         )
+        self._random_plan = None
+        from ._random_parameters import RandomParameterPlan, random_declarations
+
+        if random_declarations(population):
+            self._random_plan = RandomParameterPlan(population)
         self._state_schema = self._make_state_schema(self._state_layout)
+        if self._random_plan is not None:
+            _constants, random_state = self._random_plan.extract()
+            for path, value in _tensor_tree_paths(random_state):
+                _put_path(
+                    self._state_schema,
+                    ("random", *path),
+                    _StateLeaf(
+                        ("random", *path),
+                        "",
+                        "",
+                        (),
+                        None,
+                        _shape_tuple(value),
+                        value.dtype,
+                        value.device,
+                    ),
+                )
         self._initialization = None
         self._initialization_state_template = None
         if not self._initialization_failures:
@@ -10389,6 +10532,18 @@ class FunctionalPopulation:
             )
 
     def _validate_source(self) -> None:
+        if self._random_plan is None and any(
+            owner.random_parameters for owner in _parameterized_owners(self._population)
+        ):
+            raise FunctionalizationError(
+                "The source random parameter resampling declarations changed; initialize and lower the Population again"
+            )
+        if self._random_plan is not None:
+            from ._random_parameters import validate_random_source
+
+            validate_random_source(
+                self._random_plan
+            ) if torch.compiler.is_compiling() else self._random_plan.validate_source()
         if torch.compiler.is_compiling():
             # The general source fingerprint is evaluated once per graph. Keep
             # public binding paths and their literal plan visible to Dynamo so
@@ -10661,7 +10816,7 @@ class FunctionalPopulation:
         paths.extend(
             f"{entry.module_path}.{entry.buffer_name}"
             for entry in self._prepared_buffers
-            if entry.kind in {"effective_parameter", "derived"}
+            if entry.kind in {"effective_parameter", "derived", "random_parameter"}
         )
         for record, preparation in zip(
             self._multi_component_plans,
@@ -10716,6 +10871,8 @@ class FunctionalPopulation:
                 "dt",
             }
         )
+        if self._random_plan is not None:
+            expected_names.update(self._random_plan.schema)
         if self._cache_value_specs:
             expected_names.update(name for name, *_ in self._cache_value_specs)
             expected_names.add("cache.active")
@@ -10785,6 +10942,18 @@ class FunctionalPopulation:
                 raise ValueError(
                     f"constant 'cache.active' must be a scalar bool on {self.device}"
                 )
+        if self._random_plan is not None:
+            for name, (shape, dtype, device) in self._random_plan.schema.items():
+                value = constants[name]
+                if (
+                    not torch.is_tensor(value)
+                    or _shape_tuple(value) != shape
+                    or value.dtype != dtype
+                    or value.device != device
+                ):
+                    raise ValueError(
+                        f"RAND constant {name!r} has incompatible Tensor schema"
+                    )
         dt = constants["dt"]
         if not torch.is_tensor(dt) or _shape_tuple(dt) != ():
             raise ValueError("constant 'dt' must be a scalar Tensor")
@@ -10804,7 +10973,8 @@ class FunctionalPopulation:
             raise TypeError("inputs must be an InitializationInput")
         if (
             self._bind_owned_cache
-            and ("_steady_state" in self._population._caches) != self._owned_cache_bound
+            and ("_steady_state" in self._population._caches)
+            != self._owned_cache_source_present
         ):
             raise FunctionalizationError(
                 "Population steady-state cache presence changed; lower again"
@@ -10830,11 +11000,16 @@ class FunctionalPopulation:
                 )
             for name, expected in reference.items():
                 value = inputs.cache[name]
-                if (
-                    not torch.is_tensor(value)
-                    or _shape_tuple(value) != _shape_tuple(expected)
-                    or value.dtype != expected.dtype
-                    or value.device != expected.device
+                actual, tree_spec = torch.utils._pytree.tree_flatten(value)
+                reference_leaves, reference_spec = torch.utils._pytree.tree_flatten(
+                    expected
+                )
+                if tree_spec != reference_spec or any(
+                    not torch.is_tensor(leaf)
+                    or _shape_tuple(leaf) != _shape_tuple(target)
+                    or leaf.dtype != target.dtype
+                    or leaf.device != target.device
+                    for leaf, target in zip(actual, reference_leaves, strict=True)
                 ):
                     raise FunctionalizationError(
                         f"Population steady-state cache {name!r} has incompatible tensor schema"
@@ -10983,6 +11158,8 @@ class FunctionalPopulation:
         for leaf in _state_layout(population):
             value = _buffer_at(population, leaf.module_path, leaf.buffer_name)
             _put_path(state, leaf.public_path, _clone_tensor(value))
+        if self._random_plan is not None:
+            _random_constants, state["random"] = self._random_plan.extract(population)
         self._validate_state(state)
         all_parameters = dict(population.named_parameters())
         parameters = (
@@ -11104,6 +11281,8 @@ class FunctionalPopulation:
             constants["cache.active"] = torch.zeros(
                 (), device=self.device, dtype=torch.bool
             )
+        if self._random_plan is not None:
+            constants.update(_random_constants)
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         initialization_states = {}
@@ -11141,7 +11320,9 @@ class FunctionalPopulation:
                 None
                 if self._owned_cache_plan is None
                 else {
-                    name: value.detach().clone()
+                    name: torch.utils._pytree.tree_map(
+                        lambda leaf: leaf.detach().clone(), value
+                    )
                     for name, value in self._owned_cache_plan.default.items()
                 }
             ),
@@ -11172,6 +11353,7 @@ class FunctionalPopulation:
         material_area=None,
         cache_values=None,
         cache_active=None,
+        random_inputs=None,
     ):
         preparation = self._preparation if preparation is None else preparation
         base_mapping = (
@@ -11206,9 +11388,13 @@ class FunctionalPopulation:
                 ),
                 "cache_values": cache_values,
                 "cache_active": cache_active,
+                "random_inputs": random_inputs,
             },
             tie_weights=False,
         )
+        random_outputs = None
+        if random_inputs is not None:
+            *outputs, random_outputs = outputs
         if preparation.local_geometry_bindings:
             population_outputs, mechanism_outputs, local_geometry_outputs = outputs
         else:
@@ -11229,7 +11415,12 @@ class FunctionalPopulation:
                 strict=True,
             )
         }
-        return population_values, mechanism_values, tuple(local_geometry_outputs)
+        return (
+            population_values,
+            mechanism_values,
+            tuple(local_geometry_outputs),
+            random_outputs,
+        )
 
     def prepare(self, parameters, constants):
         """Materialize an eagerly reusable, freshness-checked tensor plan."""
@@ -11280,7 +11471,15 @@ class FunctionalPopulation:
             values,
         )
 
-    def initialize(self, parameters, constants, inputs: InitializationInput):
+    def initialize(
+        self,
+        parameters,
+        constants,
+        inputs: InitializationInput,
+        *,
+        state=None,
+        random_draw=None,
+    ):
         """Purely initialize from declared defaults or a bound steady-state cache.
 
         Without an owned cache, registered pure pre/post transforms consume
@@ -11288,15 +11487,36 @@ class FunctionalPopulation:
         through unchanged. A bound ``inputs.cache`` restores detached saved
         state and materializations, skips fresh initialization hooks, and
         returns effective parameters and constants. Both paths reset the
-        Population clock and duration remainder.
+        Population clock and duration remainder. RAND declarations consume an
+        explicit ``random_draw`` or ``inputs.random_draw`` packet. Their retained
+        samples and provenance accompany the returned constants; ``state``
+        supplies previous samples for declarations which do not resample.
         """
 
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         self._validate_initialization(inputs)
-        if self._owned_cache_bound:
+        if self._owned_cache_bound and not (
+            self._random_plan is not None
+            and any(
+                entry.spec.resample_on_initialize for entry in self._random_plan.entries
+            )
+        ):
             return self._initialize_owned_cache(parameters, constants, inputs)
+        selected_random_draw = None
+        if self._random_plan is not None:
+            if random_draw is not None and inputs.random_draw is not None:
+                raise ValueError("Supply the RAND initialization draw only once")
+            selected_random_draw = (
+                inputs.random_draw if random_draw is None else random_draw
+            )
+            if state is not None:
+                self._validate_state(state)
+            constants = self._random_plan.retain_constants(constants, state)
+            constants = self._random_plan.initialize_constants(
+                constants, selected_random_draw
+            )
         current_failures = (
             _compiled_initialization_failures(self._population)
             if torch.compiler.is_compiling()
@@ -11402,6 +11622,13 @@ class FunctionalPopulation:
             initialization_transform_values,
         )
         state = _reset_functional_initialization_clock(state)
+        if self._random_plan is not None:
+            constants = self._random_plan.finish_constants(
+                constants, prepared["random"]
+            )
+            state["random"] = self._random_plan.state(
+                constants, selected_random_draw.rng
+            )
         self._validate_parameters(initialized_parameters)
         self._validate_state(state)
         return PopulationTensors(
@@ -11414,8 +11641,34 @@ class FunctionalPopulation:
                 v_init=inputs.v_init,
                 states=initialization_states,
                 transforms=initialization_transform_values,
+                random_draw=selected_random_draw,
             ),
         )
+
+    def sample_initialization_draw(self, parameters, state):
+        """Sample owned initialization draws without changing the source or carry."""
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        return (
+            None
+            if self._random_plan is None or self._owned_cache_bound
+            else self._random_plan.sample(state)
+        )
+
+    def initialize_host(self, parameters, constants, inputs, *, state=None):
+        """Sample missing RAND draws at a cold boundary, then initialize purely."""
+        if (
+            self._random_plan is not None
+            and not self._owned_cache_bound
+            and inputs.random_draw is None
+        ):
+            if state is None:
+                state = self.extract().state
+            inputs = inputs._replace(
+                random_draw=self.sample_initialization_draw(parameters, state)
+            )
+        return self.initialize(parameters, constants, inputs, state=state)
 
     def _initialize_owned_cache(self, parameters, constants, inputs):
         if self._owned_cache_error is not None:
@@ -11492,7 +11745,7 @@ class FunctionalPopulation:
         dt = constants["dt"]
         cache_values, cache_active = self._cache_preparation_inputs(constants)
 
-        population_values, mechanism_values, local_geometry_values = (
+        population_values, mechanism_values, local_geometry_values, random_outputs = (
             self._prepare_parameter_buffers(
                 parameters,
                 diam,
@@ -11510,6 +11763,9 @@ class FunctionalPopulation:
                 material_area=constants.get("canonical_area_cm2"),
                 cache_values=cache_values,
                 cache_active=cache_active,
+                random_inputs=None
+                if self._random_plan is None
+                else self._random_plan.inputs(constants),
             )
         )
         diam = population_values.get("diam", diam)
@@ -11779,6 +12035,8 @@ class FunctionalPopulation:
         }
         if self._local_geometry_bindings:
             values["local_geometry"] = local_geometry_values
+        if random_outputs is not None:
+            values["random"] = random_outputs
         return values
 
     def _prepare_multi_values(
@@ -12057,7 +12315,7 @@ class FunctionalPopulation:
         packed_dx = full_fields["dx"]
         cache_values, cache_active = self._cache_preparation_inputs(constants)
 
-        population_values, mechanism_values, local_geometry_values = (
+        population_values, mechanism_values, local_geometry_values, random_outputs = (
             self._prepare_parameter_buffers(
                 parameters,
                 packed_diam,
@@ -12075,6 +12333,9 @@ class FunctionalPopulation:
                 material_area=full_fields["point_area"],
                 cache_values=cache_values,
                 cache_active=cache_active,
+                random_inputs=None
+                if self._random_plan is None
+                else self._random_plan.inputs(constants),
             )
         )
         for name in (
@@ -12130,6 +12391,8 @@ class FunctionalPopulation:
         }
         if self._local_geometry_bindings:
             values["local_geometry"] = local_geometry_values
+        if random_outputs is not None:
+            values["random"] = random_outputs
         return values
 
     def _validate_prepared_freshness(self, prepared, parameters) -> Mapping:
@@ -12200,6 +12463,8 @@ class FunctionalPopulation:
         }
         if self._local_geometry_bindings:
             expected_sections.add("local_geometry")
+        if self._random_plan is not None:
+            expected_sections.add("random")
         if not isinstance(values, Mapping) or set(values) != expected_sections:
             raise FunctionalizationError("prepared tensor schema is invalid")
         if not isinstance(values["geometry"], Mapping) or set(
@@ -13552,6 +13817,8 @@ class FunctionalPopulation:
                     "initialized tensor schema across every timestep."
                 )
             _put_path(next_state, leaf.public_path, value)
+        if self._random_plan is not None:
+            next_state["random"] = state["random"]
         return next_state, {"v": next_state["integrator"]["v"]}
 
     def _clone_state_tree(self, state):
@@ -13567,6 +13834,11 @@ class FunctionalPopulation:
                 memory_format=torch.contiguous_format
             )
             _put_path(cloned, leaf.public_path, value)
+        if self._random_plan is not None:
+            cloned["random"] = torch.utils._pytree.tree_map(
+                lambda value: value.clone(memory_format=torch.contiguous_format),
+                state["random"],
+            )
         return cloned
 
     def _validate_receive(self, target, payload):
@@ -13741,7 +14013,7 @@ class FunctionalPopulation:
 
     def _reset_continuous_inputs_values(self, state, targets):
         """Shared reset for an explicitly selected native target schedule."""
-        result = {}
+        result = {"random": state["random"]} if self._random_plan is not None else {}
         for leaf in self._state_layout:
             _put_path(result, leaf.public_path, _get_path(state, leaf.public_path))
         scratch = {}
@@ -13768,7 +14040,7 @@ class FunctionalPopulation:
             (v, t, remainder, dt, payload, input, reduce, mask, scratch[target][input]),
             tie_weights=False,
         )
-        result = {}
+        result = {"random": state["random"]} if self._random_plan is not None else {}
         for leaf, value in zip(self._state_layout, outputs[:-1], strict=True):
             if (
                 not torch.is_tensor(value)
@@ -13794,7 +14066,7 @@ class FunctionalPopulation:
             (v, t, duration_remainder, dt, payload),
             tie_weights=False,
         )
-        result = {}
+        result = {"random": state["random"]} if self._random_plan is not None else {}
         for leaf, value in zip(self._state_layout, outputs, strict=True):
             if (
                 not torch.is_tensor(value)
@@ -14411,6 +14683,11 @@ class FunctionalPopulation:
         if not math.isfinite(remainder_value) or remainder_value < 0.0:
             raise ValueError("duration_remainder must be finite and non-negative")
 
+        random_commit = (
+            None
+            if self._random_plan is None
+            else self._random_plan.prepare_commit(population, state["random"])
+        )
         staged_population = _clone_execution_population(population)
         staged_layout = _state_layout(staged_population)
         for leaf in staged_layout:
@@ -14420,11 +14697,15 @@ class FunctionalPopulation:
                 leaf.buffer_name,
                 _get_path(state, leaf.public_path).clone(),
             )
+        if self._random_plan is not None:
+            self._random_plan.commit(staged_population, state["random"])
         staged_population.mech.read_from_ions()
         staged_population.mech.read_from_materials()
         checkpoint = staged_population.state_dict_for_checkpoint()
         if self._topology_kind not in {"multi_point", "multi_scalar", "multi_block"}:
             population.restore_dict_from_checkpoint(checkpoint)
+            if self._random_plan is not None:
+                self._random_plan.publish_commit(population, random_commit)
             if isinstance(population.integrator, _bwd_euler_sc_skip):
                 # scnv's imperative checkpoint deliberately has no solved
                 # voltage unknowns. Functional continuation nevertheless owns
@@ -14505,6 +14786,8 @@ class FunctionalPopulation:
 
         try:
             population.restore_dict_from_checkpoint(checkpoint)
+            if self._random_plan is not None:
+                self._random_plan.publish_commit(population, random_commit)
             if write_back:
                 offset = 0
                 for component in component_voltages:

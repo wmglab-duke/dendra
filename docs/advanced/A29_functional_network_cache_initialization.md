@@ -147,10 +147,13 @@ Ordinary `torch.compile` capture retains graph assertions; combining a
 transform with compilation still requires this concrete prevalidation.
 
 Population-owned cached initialization currently requires canonical cache
-restoration without arbitrary legacy post-initialization hooks. Parameter
-resampling that invalidates the owned cache is also currently unsupported by
-the pure cached initializer. Structured pure initialization transforms are
-skipped when their owner restores a cache, matching native initialization.
+restoration without arbitrary legacy post-initialization hooks. RAND
+declarations that resample on initialization invalidate an owned cache and use
+fresh initialization, matching native behavior. A Network-global cache takes
+precedence and restores its saved samples and RNG state. See
+{doc}`A30_functional_random_parameters` for explicit draws and resampling
+policies. Structured pure initialization transforms are skipped when their
+owner restores a cache, matching native initialization.
 
 ## Distinguish cached Population values from current connection values
 

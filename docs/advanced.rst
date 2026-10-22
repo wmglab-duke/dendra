@@ -37,3 +37,4 @@ Advanced
    advanced/A27_functional_network_callbacks.md
    advanced/A28_functional_network_extra.md
    advanced/A29_functional_network_cache_initialization.md
+   advanced/A30_functional_random_parameters.md

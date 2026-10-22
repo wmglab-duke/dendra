@@ -6704,7 +6704,12 @@ class Population(P, Sliceable):
                 "rng_state": _clone_nested_state(rng.rng_state(), detach_tensors=True),
             }
 
-        return {"buffers": buffers, "rng_states": rng_states}
+        result = {"buffers": buffers, "rng_states": rng_states}
+        if self.random_parameters:
+            result["random_parameter_state"] = (
+                self._random_parameter_state_for_checkpoint()
+            )
+        return result
 
     def _prepare_stochastic_state_from_checkpoint(self, state_dict):
         """Validate and normalize Population stochastic checkpoint state."""
@@ -6763,14 +6768,17 @@ class Population(P, Sliceable):
                     f"Invalid Population stochastic RNG payload {name!r}: {error}"
                 ) from error
 
-        return prepared_buffers, prepared_rng_states
+        provenance = self._prepare_random_parameter_state(
+            state_dict.get("random_parameter_state")
+        )
+        return prepared_buffers, prepared_rng_states, provenance
 
     def _apply_prepared_stochastic_state(self, prepared_state):
         """Apply state returned by
         :meth:`_prepare_stochastic_state_from_checkpoint`.
         """
 
-        buffers, rng_states = prepared_state
+        buffers, rng_states, provenance = prepared_state
         for name, restored in buffers.items():
             setattr(self, name, restored)
         for name, (base_seed, rng_state) in rng_states.items():
@@ -6781,6 +6789,7 @@ class Population(P, Sliceable):
                 rng.set_rng_state(rng_state)
             else:
                 rng.set_extra_state({"base_seed": base_seed, "rng_state": rng_state})
+        self._apply_random_parameter_state(provenance)
 
     def _restore_stochastic_state_from_checkpoint(self, state_dict):
         """Restore a Population stochastic checkpoint payload."""
@@ -9858,6 +9867,51 @@ def _load_compatible_state_dict_transactionally(module, state_dict):
         )
     live_state = module.state_dict()
     matched, _ = _match_state_dict(live_state, state_dict)
+    for path, owner in module.named_modules(remove_duplicate=False):
+        if not isinstance(owner, P) or not owner.random_parameters:
+            continue
+        prefix = f"{path}." if path else ""
+        key = f"{prefix}_random_parameter_state"
+        if key not in matched:
+            continue
+        selected = {
+            name for name in owner.random_parameters if f"{prefix}{name}" in matched
+        }
+        if not selected:
+            # This metadata describes samples excluded by compatible loading.
+            # The owner's load hook retains provenance for its live samples.
+            matched.pop(key)
+            continue
+        incoming = matched[key]
+        labels = ("initialized", "draws", "parameters")
+        if not isinstance(incoming, dict) or not all(
+            isinstance(incoming.get(label), dict) for label in labels
+        ):
+            # Let the regular load hook report malformed matching metadata.
+            continue
+        # Ignore metadata belonging to actual source declarations omitted by
+        # compatibility filtering; unexplained metadata names remain invalid.
+        unknown = set().union(*(incoming[label] for label in labels)) - set(
+            owner.random_parameters
+        )
+        if any(f"{prefix}{name}" not in state_dict for name in unknown):
+            continue
+        retained = live_state[key]
+        compatible = dict(incoming)
+        for label in labels:
+            compatible[label] = {
+                **{
+                    name: value
+                    for name, value in retained[label].items()
+                    if name not in selected
+                },
+                **{
+                    name: incoming[label][name]
+                    for name in selected
+                    if name in incoming[label]
+                },
+            }
+        matched[key] = compatible
     _load_state_dict_transactionally(module, matched, strict=False)
 
 

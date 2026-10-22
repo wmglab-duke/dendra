@@ -18,6 +18,13 @@ _INTRA_PREFIX = "stimulation.intra."
 _EXTRA_PREFIX = "stimulation.extra."
 
 
+class RandomParameterDraw(NamedTuple):
+    """Explicit RAND base draws and the resulting independent stream states."""
+
+    draws: dict[str, torch.Tensor]
+    rng: dict[str, dict[str, torch.Tensor]]
+
+
 class InitializationInput(NamedTuple):
     """Explicit tensor inputs consumed only while constructing initial state.
 
@@ -34,13 +41,16 @@ class InitializationInput(NamedTuple):
     ``cache`` contains a Population-owned steady-state snapshot when one was
     bound during lowering. Cached initialization restores this mapping,
     skips fresh initialization hooks, and returns effective constants with
-    the initialized parameter and state packet.
+    the initialized parameter and state packet. ``random_draw`` supplies RAND
+    base draws and resulting stream state from ``sample_initialization_draw``.
+    Host runners sample an independent packet when this field is omitted.
     """
 
     v_init: torch.Tensor
     states: dict[str, torch.Tensor] | None = None
     transforms: dict[str, torch.Tensor] | None = None
-    cache: Mapping[str, torch.Tensor] | None = None
+    cache: Mapping[str, object] | None = None
+    random_draw: RandomParameterDraw | None = None
 
 
 class PopulationTensors(NamedTuple):
@@ -211,6 +221,7 @@ class FunctionalizationError(RuntimeError):
 __all__ = [
     "FunctionalizationError",
     "InitializationInput",
+    "RandomParameterDraw",
     "PopulationTensors",
     "RolloutInput",
     "StepInput",

@@ -182,6 +182,9 @@ def _capture_stochastic_state(states, prefix, module):
     for parameter_name in sorted(getattr(module, "random_parameters", {})):
         key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter.{parameter_name}"
         states[key] = getattr(module, parameter_name)
+    if getattr(module, "random_parameters", {}):
+        key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter_state"
+        states[key] = module._random_parameter_state_for_checkpoint()
 
 
 def _integer_metadata(value, *, label, minimum=0):
@@ -2940,6 +2943,7 @@ class MechanismHandler(torch.nn.Module):
         assignments = plan["assignments"]
         rng_assignments = plan["rng_assignments"]
         delay_assignments = plan["delay_assignments"]
+        random_parameter_assignments = plan["random_parameter_assignments"]
 
         missing = object()
         original_tensors = [
@@ -2948,6 +2952,21 @@ class MechanismHandler(torch.nn.Module):
         ]
         original_delays = [
             (module, module._delayed_state_specs) for module, _ in delay_assignments
+        ]
+        original_random_parameters = [
+            (
+                module,
+                {
+                    name: getattr(module, name)
+                    for name in (
+                        "_random_parameter_initialized",
+                        "_random_parameter_draws",
+                        "_random_parameter_parameters",
+                        "_random_parameter_generation",
+                    )
+                },
+            )
+            for module, _ in random_parameter_assignments
         ]
         original_rngs = {}
         for rng, _, _ in rng_assignments:
@@ -2970,6 +2989,8 @@ class MechanismHandler(torch.nn.Module):
                 setattr(owner, name, value)
             for module, specs in delay_assignments:
                 module._delayed_state_specs = specs
+            for module, provenance in random_parameter_assignments:
+                module._apply_random_parameter_state(provenance)
         except Exception:
             for owner, name, original in reversed(original_tensors):
                 if original is missing:
@@ -2979,6 +3000,9 @@ class MechanismHandler(torch.nn.Module):
                     setattr(owner, name, original)
             for module, specs in original_delays:
                 module._delayed_state_specs = specs
+            for module, attributes in original_random_parameters:
+                for name, value in attributes.items():
+                    setattr(module, name, value)
             for (
                 rng,
                 base_seed,
@@ -3006,6 +3030,7 @@ class MechanismHandler(torch.nn.Module):
         tensor_memo = {}
         rng_assignments = []
         delay_assignments = []
+        random_parameter_assignments = []
         missing = object()
 
         def add_tensor(
@@ -3062,6 +3087,10 @@ class MechanismHandler(torch.nn.Module):
             assignment_keys.setdefault(target, key)
 
         def add_stochastic(module, prefix, legacy_prefixes):
+            if getattr(module, "random_parameters", {}):
+                key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter_state"
+                provenance = module._prepare_random_parameter_state(state_dict.get(key))
+                random_parameter_assignments.append((module, provenance))
             for rng_name in _stochastic_rng_names(module):
                 canonical_key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}rng.{rng_name}"
                 payload_key = canonical_key if canonical_key in state_dict else None
@@ -3274,6 +3303,7 @@ class MechanismHandler(torch.nn.Module):
             "assignment_keys": assignment_keys,
             "rng_assignments": rng_assignments,
             "delay_assignments": delay_assignments,
+            "random_parameter_assignments": random_parameter_assignments,
         }
 
     def _mutable_state_bindings(self):

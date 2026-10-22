@@ -27,7 +27,7 @@ pytestmark = [
 
 
 class _RandomCurrent(Mechanism):
-    """Unsupported random initializer used to exercise the admission boundary."""
+    """Declared random initializer with explicit functional base draws."""
 
     Mechanism.GLOBALRAND(
         "sample",
@@ -563,19 +563,25 @@ def test_initialize_rechecks_a_derived_buffer_builder_after_lowering():
         )
 
 
-def test_initialize_fails_closed_for_random_parameters():
+def test_initialize_consumes_explicit_random_draws_without_changing_the_source():
     model = _model("sc", mechanism=_RandomCurrent)
-
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match=r"random parameters|_random_parameters",
-    ):
-        functional, tensors = dn.func.make_functional(model, dt=DT)
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
+    native = _model("sc", mechanism=_RandomCurrent)
+    source_snapshot = _module_snapshot(model)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    draw = functional.sample_initialization_draw(tensors.parameters, tensors.state)
+    initialized = functional.initialize(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization._replace(random_draw=draw),
+        state=tensors.state,
+    )
+    native.initialize()
+    _assert_tree_close(initialized.state, functional.extract(native).state)
+    key = "random.values.integrator.mech.mechanisms._RandomCurrent.sample"
+    torch.testing.assert_close(
+        initialized.constants[key], native.mech._RandomCurrent.sample
+    )
+    _assert_module_snapshot(model, source_snapshot)
 
 
 def test_initializer_supports_stateless_mechanisms_without_special_cases():

@@ -173,8 +173,10 @@ cache semantics. Fresh results return both effective `aux["parameters"]` and
 {doc}`A29_functional_network_cache_initialization` for cache capture, current
 connection parameters, gradient boundaries, and required continuation packets.
 Without a cache, fresh initialization uses current explicit parameters as
-described above. Random parameter resampling and custom native
-initialization/build adapters are currently unsupported.
+described above. Initialization-time RAND declarations use explicit draw and
+RNG packets, including their resampling and ``reseed_on_initialize`` policies;
+see {doc}`A30_functional_random_parameters`. Custom native initialization/build
+adapters are currently unsupported.
 Initialize shared runtime parameters before the first Population that uses
 them. A transform on a later Population that writes a runtime parameter shared
 with an earlier Population is currently unsupported, because native execution

@@ -167,7 +167,7 @@ invocation-local, and no training graph is retained between calls.
    auxiliary["callbacks"]["trace"]["v"].square().mean().backward()
 
 ``runner.initialization_inputs`` contains independent tensor defaults in an
-``InitializationInput(v_init, states, transforms, cache)``. Cache leaves are
+``InitializationInput(v_init, states, transforms, cache, random_draw)``. Cache leaves are
 detached saved inputs and are not optimizer targets. For uncached initialization,
 the ``v_init``, ``states``, and ``transforms`` leaves are separate from
 ``runner.parameters`` and ``trainable``. To optimize them, enable their gradients
@@ -186,6 +186,15 @@ warmup graph. To select uncached fresh initialization, call
 ``model.clear_steady_state()`` before compiling; cache presence and structure
 are fixed when lowering. Compatible cache values can be supplied through
 ``runner(initialization=initial._replace(cache=...))``.
+
+``GLOBALRAND``, ``BATCHRAND``, and ``RANGERAND`` declarations retain sampled
+heterogeneity with explicit draw and RNG packets. Fresh initialization applies
+their resampling and ``reseed_on_initialize`` policies; snapshot restart and
+explicit continuation retain the selected realization. The host runner samples
+automatically, or ``initial.random_draw`` supplies an explicit packet. See
+:doc:`A30_functional_random_parameters` for distribution-parameter gradients,
+shared streams, and custom pure distributions. Per-step ``NOISE`` and State
+``DIFFUSION`` are currently unsupported.
 
 Explicit state always means continuation and bypasses initialization, even on
 a fresh-policy runner. Every fresh-policy call returns its effective runtime
@@ -284,8 +293,10 @@ models outside that initializer contract can still start from the extracted
 The current transition API supports initialized models with all of the
 following properties:
 
-* either an exact ``Population`` or ``SingleCompartment`` topology with standard
-  Population area geometry, an ``Unmyelinated`` topology with standard
+* either a point model using standard Population area geometry (an exact
+  ``Population`` or ``SingleCompartment`` container, or a RAND declaration-only
+  subclass inheriting every numerical and lifecycle method), an
+  ``Unmyelinated`` topology with standard
   cylindrical cable geometry, a ``Myelinated`` model with Dendra's standard
   geometry and parameter transforms, an ``ExtCellAxon`` model with standard
   cylindrical membrane and extracellular-layer geometry, an exact ``Cable`` built from a
@@ -371,8 +382,9 @@ legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, func
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
 Population topologies
-(including generic ``Axon``, custom ``Population``/``SingleCompartment``
-subclasses, nested ``MultiPopulation``, and mixtures of scalar and
+(including generic ``Axon``, ``Population``/``SingleCompartment`` subclasses
+outside the RAND declaration-only contract above, nested ``MultiPopulation``,
+and mixtures of scalar and
 finite-extracellular components), Cable/Axon/Tree subclasses with unrecognized
 custom geometry, stateful
 or unregistered parameter transforms, custom integrator subclasses, the SPD
@@ -2761,9 +2773,10 @@ functional admission succeeds.
 Population-owned ``steady_state`` caches are supported by
 ``FunctionalPopulation.initialize`` and
 ``dn.compile(population, initialization="fresh")``. The ``cache`` field of
-``InitializationInput`` contains the detached saved state. Arbitrary legacy
-post-initialization hooks and parameter resampling that invalidates the cache
-are currently unsupported for pure cached initialization. Snapshot and
+``InitializationInput`` contains the detached saved state. RAND declarations
+that resample on initialization invalidate an owned cache, matching native
+initialization; a Network-global cache takes precedence. Arbitrary legacy
+post-initialization hooks are currently unsupported for pure cached initialization. Snapshot and
 explicit-state execution remain available wherever transition admission
 succeeds.
 

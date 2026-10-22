@@ -45,7 +45,7 @@ def _initialization_input_mapping(inputs):
         if values is not None and not isinstance(values, Mapping):
             raise TypeError(f"initialization {name} must be a mapping")
         mappings.append(None if values is None else dict(values))
-    return InitializationInput(inputs.v_init, *mappings)
+    return InitializationInput(inputs.v_init, *mappings, inputs.random_draw)
 
 
 def _initialization_writes_parameters(functional):
@@ -187,8 +187,9 @@ class CompiledRunner:
                 _initialization_writes_parameters(self._functional)
                 or self._functional._owned_cache_bound
             )
-            self._initialization_writes_constants = (
-                initialization == "fresh" and self._functional._owned_cache_bound
+            self._initialization_writes_constants = initialization == "fresh" and (
+                self._functional._owned_cache_bound
+                or self._functional._random_plan is not None
             )
             self._callbacks = (
                 None
@@ -417,8 +418,11 @@ class CompiledRunner:
                 torch.inference_mode(False),
                 torch.set_grad_enabled(initialization_grad),
             ):
-                initialized = self._functional.initialize(
-                    selected_parameters, selected_constants, selected_initialization
+                initialized = self._functional.initialize_host(
+                    selected_parameters,
+                    selected_constants,
+                    selected_initialization,
+                    state=selected_state,
                 )
             selected_state = initialized.state
             selected_parameters = initialized.parameters
