@@ -11,6 +11,14 @@ import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.mod import hh
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.01
 Celsius = "celsius_param"
 

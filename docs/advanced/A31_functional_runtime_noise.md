@@ -175,7 +175,11 @@ Sharing mutable RNGModule owners between different Network Populations is
 currently unsupported. Custom distributions require the split
 `draw_sampler=` and pure `transform=` registration contract described in
 {doc}`A30_functional_random_parameters`; legacy sampler-only registrations
-remain available in native execution. Direct NOISE-buffer recording with the
+remain available in native execution. The authored transform must remain pure
+and deterministic. Functional lowering trusts this contract by default;
+`dn.ctx(CHECK_PURITY=True)` enables diagnostic checks for newly created plans.
+The explicit draw/RNG and tensor-schema requirements apply in either mode.
+Direct NOISE-buffer recording with the
 built-in `Recorder` is currently unsupported; voltage and declared State/carry
 recording retain their existing APIs.
 

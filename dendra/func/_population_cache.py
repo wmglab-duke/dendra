@@ -261,6 +261,48 @@ class PopulationCachePlan:
             for leaf in plan._state_layout
         )
         self.constants = {}
+
+        def constant_source(value, fallback, owner, buffer_name):
+            # Native state-dict restoration leaves nonpersistent configuration
+            # alone unless a persistent alias writes the same storage frame.
+            if (
+                fallback not in reference
+                and not aliases.get(self.storage_frames.get(fallback), ())
+                and buffer_name in owner._non_persistent_buffers_set
+            ):
+                # This reader is absent from the native load, so expanded
+                # views retain their original storage rather than being owned.
+                frame = _cache_storage_frame(value)
+                if frame is not None and frame[0] == "storage":
+
+                    def byte_bounds(tensor, layout):
+                        offset, shape, strides = layout[4:]
+                        last = offset + sum(
+                            (size - 1) * stride
+                            for size, stride in zip(shape, strides, strict=True)
+                        )
+                        return offset * tensor.element_size(), (
+                            last + 1
+                        ) * tensor.element_size()
+
+                    start, end = byte_bounds(value, frame)
+                    for written in self.write_keys:
+                        target = self.storage_frames[written]
+                        if target[0] != "storage" or (target[1], target[3]) != (
+                            frame[1],
+                            frame[3],
+                        ):
+                            continue
+                        first, last = byte_bounds(slots[written], target)
+                        if start < last and first < end:
+                            raise FunctionalizationError(
+                                "Nonpersistent config views partially overlapping "
+                                "cached tensor storage are currently unsupported; "
+                                "use independent config buffers or an exact shared binding"
+                            )
+                return None
+            return key(value, fallback)
+
         special = {
             "diam_original": "parametrizations.diam.original",
             "canonical_area_cm2": "_canonical_area_cm2",
@@ -280,10 +322,14 @@ class PopulationCachePlan:
                 continue
             self.constants[name] = key(value, special.get(name, name))
         for entry in plan._parametrization_constants:
-            self.constants[entry.key] = key(
+            source = constant_source(
                 _buffer_at(population, entry.module_path, entry.buffer_name),
                 f"{entry.module_path + '.' if entry.module_path else ''}{entry.buffer_name}",
+                population.get_submodule(entry.module_path),
+                entry.buffer_name,
             )
+            if source is not None:
+                self.constants[entry.key] = source
         for record in plan._multi_component_plans:
             component = population.populations[record.name]
             entries = {entry.key: entry for entry in record.parametrization_constants}
@@ -301,9 +347,19 @@ class PopulationCachePlan:
                     entry = entries[relative]
                     value = _buffer_at(component, entry.module_path, entry.buffer_name)
                     fallback = f"{entry.module_path + '.' if entry.module_path else ''}{entry.buffer_name}"
-                self.constants[public] = key(
-                    value, f"populations.{record.name}.{fallback}"
+                path = f"populations.{record.name}.{fallback}"
+                source = (
+                    key(value, path)
+                    if relative in record.geometry_constant_names
+                    else constant_source(
+                        value,
+                        path,
+                        component.get_submodule(entry.module_path),
+                        entry.buffer_name,
+                    )
                 )
+                if source is not None:
+                    self.constants[public] = source
         for public, source, _shape, _dtype, _device in plan._cache_value_specs:
             value = slots[source]
             self.constants[public] = key(value, source)

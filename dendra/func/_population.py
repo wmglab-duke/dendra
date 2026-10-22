@@ -21,7 +21,7 @@ import torch
 from torch.func import functional_call
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from dendra.helpers import MEMBRANE_ASSEMBLY
+from dendra.helpers import MEMBRANE_ASSEMBLY, ctx, current_check_purity
 from dendra.models.core import (
     Cable,
     Myelinated,
@@ -351,6 +351,9 @@ _MATERIAL_PROCESS_CONTRACTS = (
         ),
         spatial=True,
     ),
+)
+_CUSTOM_MATERIAL_PROCESS_CONTRACT = _MaterialProcessContract(
+    MaterialProcess, "custom", (), (), ()
 )
 _STANDARD_MATERIAL_FUNCTIONAL_HOOKS = {
     contract.family: {
@@ -943,6 +946,11 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
             else (physical_population,)
         )
         for owner in owners:
+            if (
+                isinstance(owner, MaterialProcess)
+                and _material_process_contract(owner).family is MaterialProcess
+            ):
+                transform_module_ids.update(id(child) for child in owner.modules())
             for transforms in owner.in_graph_parametrizations.values():
                 for transform, _args in transforms:
                     transform_module_ids.update(
@@ -1874,7 +1882,9 @@ def _material_process_contract(process):
             for contract in _MATERIAL_PROCESS_CONTRACTS
             if isinstance(process, contract.family)
         ),
-        None,
+        _CUSTOM_MATERIAL_PROCESS_CONTRACT
+        if isinstance(process, MaterialProcess)
+        else None,
     )
 
 
@@ -1905,12 +1915,13 @@ def _voltage_process_failures(process):
         failures.append("does not implement the pure voltage_values hook")
     else:
         try:
-            _initialization_callable_dependency_signature(
-                process.voltage_values,
-                label=f"{process.name}.voltage_values",
-                owner=process,
-                strict=True,
-            )
+            if current_check_purity():
+                _initialization_callable_dependency_signature(
+                    process.voltage_values,
+                    label=f"{process.name}.voltage_values",
+                    owner=process,
+                    strict=True,
+                )
         except FunctionalizationError as exc:
             failures.append(str(exc))
     support_map = getattr(process, "support_map", None)
@@ -1953,14 +1964,15 @@ def _event_receiver_failures(process):
         )
     else:
         try:
-            _initialization_callable_dependency_signature(
-                process.net_receive_values,
-                label=f"{process.name}.net_receive_values",
-                owner=process,
-                strict=True,
-                forbidden_receiver_attributes=frozenset(process._assigned)
-                | {"_buffers", "_runtime_value_frame"},
-            )
+            if current_check_purity():
+                _initialization_callable_dependency_signature(
+                    process.net_receive_values,
+                    label=f"{process.name}.net_receive_values",
+                    owner=process,
+                    strict=True,
+                    forbidden_receiver_attributes=frozenset(process._assigned)
+                    | {"_buffers", "_runtime_value_frame"},
+                )
         except FunctionalizationError as exc:
             failures.append(str(exc))
     return failures
@@ -1977,7 +1989,7 @@ def _event_receiver_signature(process):
             for name in (*_RECEIVE_ADAPTER_NAMES, "net_receive_values")
         ),
         (
-            _initialization_callable_dependency_signature(
+            _initialization_callable_contract_signature(
                 process.net_receive_values,
                 label=f"{process.name}.net_receive_values",
                 owner=process,
@@ -2014,19 +2026,20 @@ def _continuous_receiver_failures(process):
         failures.append("continuous_receive_values must be a pure subclass method")
     else:
         try:
-            _initialization_callable_dependency_signature(
-                process.continuous_receive_values,
-                label=f"{process.name}.continuous_receive_values",
-                owner=process,
-                strict=True,
-                forbidden_receiver_attributes=frozenset(process._assigned)
-                | {
-                    "_buffers",
-                    "_runtime_value_frame",
-                    "_continuous_received_masks",
-                    "_continuous_reset_count",
-                },
-            )
+            if current_check_purity():
+                _initialization_callable_dependency_signature(
+                    process.continuous_receive_values,
+                    label=f"{process.name}.continuous_receive_values",
+                    owner=process,
+                    strict=True,
+                    forbidden_receiver_attributes=frozenset(process._assigned)
+                    | {
+                        "_buffers",
+                        "_runtime_value_frame",
+                        "_continuous_received_masks",
+                        "_continuous_reset_count",
+                    },
+                )
         except FunctionalizationError as exc:
             failures.append(str(exc))
     return failures
@@ -2045,7 +2058,7 @@ def _continuous_receiver_signature(process):
                 "continuous_receive_values",
             )
         ),
-        _initialization_callable_dependency_signature(
+        _initialization_callable_contract_signature(
             process.continuous_receive_values,
             label=f"{process.name}.continuous_receive_values",
             owner=process,
@@ -2270,7 +2283,7 @@ def _voltage_process_signature(process):
             (name, _effective_hook_identity(process, name))
             for name in (*_STANDARD_VOLTAGE_FUNCTIONAL_ADAPTERS, "voltage_values")
         ),
-        _initialization_callable_dependency_signature(
+        _initialization_callable_contract_signature(
             process.voltage_values,
             label=f"{process.name}.voltage_values",
             owner=process,
@@ -2406,7 +2419,7 @@ def _install_event_receiver_audit(process):
 
 
 def _material_process_failures(process, population=None):
-    """Admit canonical declaration-driven families, not effectful custom hooks."""
+    """Admit shared pure protocols while retaining canonical scheduler adapters."""
     contract = _material_process_contract(process)
     if contract is None:
         return [
@@ -2414,14 +2427,44 @@ def _material_process_failures(process, population=None):
             "workspaces or update contracts that are not lowered yet"
         ]
     family = contract.family.__name__
-    changed = [
-        name
-        for name, standard in _STANDARD_MATERIAL_FUNCTIONAL_HOOKS[
-            contract.family
-        ].items()
-        if name in process.__dict__
-        or inspect.getattr_static(type(process), name) is not standard
-    ]
+    if contract.family is MaterialProcess:
+        from ._custom_material_processes import (
+            custom_material_constant_slots,
+            custom_material_process_failures,
+        )
+
+        failures = custom_material_process_failures(process, population)
+        if failures:
+            return list(failures)
+        if population is not None:
+            from ._initialization_sources import (
+                initialization_source_runtime_buffer_ids,
+            )
+
+            runtime_buffers = initialization_source_runtime_buffer_ids(population)
+            aliases = tuple(
+                name
+                for name, value in custom_material_constant_slots(process)
+                if id(value) in runtime_buffers
+            )
+            if aliases:
+                return [
+                    f"Custom MaterialProcess config buffers {aliases} alias "
+                    "runtime state, geometry, or reconstructed parameters; "
+                    "use registered raw Parameters or independent config buffers"
+                ]
+    changed = (
+        []
+        if contract.family is MaterialProcess
+        else [
+            name
+            for name, standard in _STANDARD_MATERIAL_FUNCTIONAL_HOOKS[
+                contract.family
+            ].items()
+            if name in process.__dict__
+            or inspect.getattr_static(type(process), name) is not standard
+        ]
+    )
     if changed:
         return [f"{family} replaces canonical pure process hooks {changed}"]
     resolver = getattr(process, "_material_resolver", None)
@@ -2483,7 +2526,9 @@ def _material_process_failures(process, population=None):
                     f"{family} geometry {source_name!r} must be a directly "
                     "registered population buffer or Parameter"
                 ]
-    if not getattr(process, f"_{contract.prefix}_material_plan", ()):
+    if contract.family is not MaterialProcess and not getattr(
+        process, f"_{contract.prefix}_material_plan", ()
+    ):
         return [f"{family} is missing its configured material field plan"]
     return []
 
@@ -2492,6 +2537,39 @@ def _material_process_signature(process, handler):
     contract = _material_process_contract(process)
     if contract is None:
         return None
+    if contract.family is MaterialProcess:
+        from ._custom_material_processes import custom_material_process_signature
+
+        return (
+            custom_material_process_signature(process),
+            tuple(
+                (
+                    name,
+                    _material_configuration_signature(
+                        getattr(type(process), name, None)
+                    ),
+                )
+                for name in (
+                    "_material_process_phase",
+                    "_material_process_method",
+                    "_material_process_method_kwargs",
+                    "_material_process_component",
+                )
+            ),
+            getattr(process, "_mp_component_shape", None),
+            tuple(sorted(getattr(process, "_mp_material_support_names", {}).items())),
+            (
+                getattr(process._material_resolver, "__self__", None) is handler,
+                id(
+                    getattr(
+                        process._material_resolver,
+                        "__func__",
+                        process._material_resolver,
+                    )
+                ),
+                _effective_hook_identity(handler, "_get_material"),
+            ),
+        )
     return (
         contract.family,
         tuple(
@@ -2715,10 +2793,12 @@ def _retain_material_spatial_plan_at_initialization(self):
     return None
 
 
-def _install_material_preparation(population, dt):
+def _install_material_preparation(population, dt, *, custom_plans=None):
     """Give the private transition fixed tensor slots for pure process outputs."""
-    for process in population.mech.material_processes.values():
+    for process_name, process in population.mech.material_processes.items():
         contract = _material_process_contract(process)
+        if contract.family is MaterialProcess:
+            custom_plans[process_name].configure_execution(process)
         if contract.spatial:
             for operator in process._spatial_operators.values():
                 if process._diffusion_method == "explicit":
@@ -2747,7 +2827,11 @@ def _install_material_preparation(population, dt):
         fields = _material_fields(population, process)
         values = process.prepare_materials(fields, dt)
         leaves, tree_spec = torch.utils._pytree.tree_flatten(values)
-        if not leaves or not all(torch.is_tensor(value) for value in leaves):
+        if (
+            (not leaves and contract.family is not MaterialProcess)
+            or values is None
+            or not all(torch.is_tensor(value) for value in leaves)
+        ):
             raise FunctionalizationError(
                 "Material preparation must be a tensor-only PyTree"
             )
@@ -2758,11 +2842,16 @@ def _install_material_preparation(population, dt):
             process.register_buffer(name, _clone_tensor(value), persistent=False)
         process._functional_material_slots = slots
         process._functional_material_tree_spec = tree_spec
-        # Pointwise families use full-field arithmetic. Keep scalar operands
-        # scalar publicly and pad only their private execution binding, avoiding
-        # the empty-vmap scalar/spatial broadcast limitation outside model math.
+        # Canonical pointwise families use full-field arithmetic, so singleton
+        # axes avoid the empty-vmap scalar/spatial broadcast limitation. Custom
+        # workspace leaves retain their authored ranks: reducing one dimension
+        # of a vector must not become a reduction of a padded matrix instead.
         visible_rank = (
-            2 if contract.spatial else max(value.ndim for value in fields.values())
+            0
+            if contract.family is MaterialProcess
+            else 2
+            if contract.spatial
+            else max(value.ndim for value in fields.values())
         )
         process._functional_material_visible_ranks = {
             name: visible_rank for name in slots
@@ -3259,7 +3348,7 @@ def _initialization_transform_signature(population: Population) -> tuple:
                     ),
                     type(action.transform).__module__,
                     type(action.transform).__qualname__,
-                    _initialization_callable_dependency_signature(
+                    _initialization_callable_contract_signature(
                         action.transform.forward,
                         label=f"{phase} initialization transform {action.name}",
                         owner=action.transform,
@@ -3395,6 +3484,7 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     kind="constant",
                 )
             )
+    from ._custom_material_processes import custom_material_constant_slots
     from ._mechanism_delays import mechanism_delay_constant_slots
     from ._mechanism_injections import mechanism_injection_constant_slots
 
@@ -3415,6 +3505,23 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                 )
             )
         for relative_path, buffer in mechanism_injection_constant_slots(owner):
+            if id(buffer) in seen or id(buffer) in parameter_ids:
+                continue
+            seen.add(id(buffer))
+            prefix, _separator, buffer_name = relative_path.rpartition(".")
+            path = f"{module_path}.{prefix}" if prefix else module_path
+            tables.append(
+                _PreparedBuffer(
+                    f"{module_path}.{relative_path}",
+                    path,
+                    buffer_name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "constant",
+                )
+            )
+        for relative_path, buffer in custom_material_constant_slots(owner):
             if id(buffer) in seen or id(buffer) in parameter_ids:
                 continue
             seen.add(id(buffer))
@@ -3788,7 +3895,7 @@ class _PopulationPreparation(torch.nn.Module):
         # Constructor-time materialization is part of the purity boundary too.
         # Audit it immediately so a transform that mutates only on its first
         # call cannot normalize that write into the retained execution clone.
-        self.audit_builder_inputs = True
+        self.audit_builder_inputs = current_check_purity()
         self.dt_value = float(dt)
         bindings = self._registered_input_bindings()
         with torch.no_grad():
@@ -3851,7 +3958,11 @@ class _PopulationPreparation(torch.nn.Module):
         with torch.no_grad():
             # Evaluate authored/raw preparation against a disposable clone so
             # an invalid one-shot source cannot taint the retained skeleton.
-            validation_population = _clone_execution_population(population)
+            validation_population = (
+                _clone_execution_population(population)
+                if self.audit_builder_inputs
+                else population
+            )
             owner_parameter_values = {}
             for index, entry in enumerate(self.layout):
                 if entry.kind in {
@@ -4068,7 +4179,11 @@ class _PopulationPreparation(torch.nn.Module):
 
             random_outputs.update(
                 materialize_random_parameters(
-                    self.population, "", population_values, random_inputs
+                    self.population,
+                    "",
+                    population_values,
+                    random_inputs,
+                    check_purity=self.audit_builder_inputs,
                 )
             )
             population_values.update(
@@ -4150,6 +4265,7 @@ class _PopulationPreparation(torch.nn.Module):
                             entry.module_path,
                             owner_parameter_values[entry.module_path],
                             random_inputs,
+                            check_purity=self.audit_builder_inputs,
                         )
                     )
                     owner_parameter_values[entry.module_path].update(
@@ -4328,9 +4444,11 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             )
 
         self.topology_kind = topology_kind
-        self.audit_builder_inputs = True
+        self.audit_builder_inputs = current_check_purity()
         device = population.device()
-        authored_classes = _authored_workspace_classes(population)
+        authored_classes = (
+            _authored_workspace_classes(population) if self.audit_builder_inputs else ()
+        )
 
         if topology_kind == "scalar_tree":
             if edge_child_orig is None or solver_order is None:
@@ -4426,51 +4544,55 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             population, (population,)
         )
 
-        # Constructor-time authored evaluation is audited on the disposable
-        # component clone.  If it is impure, failure cannot contaminate the
-        # user's source or the packed execution skeleton.
-        registered = self._registered_input_bindings()
-        python_state = _transition_python_state_snapshot(self)
-        rng_state = _global_rng_snapshot(device)
-        class_state = _class_state_snapshot(authored_classes)
-        mutated_class_state = set()
-        mutated_python_state = set()
-        try:
+        if self.audit_builder_inputs:
+            # Constructor-time authored evaluation is audited on the disposable
+            # component clone.  If it is impure, failure cannot contaminate the
+            # user's source or the packed execution skeleton.
+            registered = self._registered_input_bindings()
+            python_state = _transition_python_state_snapshot(self)
+            rng_state = _global_rng_snapshot(device)
+            class_state = _class_state_snapshot(authored_classes)
+            mutated_class_state = set()
+            mutated_python_state = set()
+            try:
+                with torch.no_grad():
+                    population_values = population._derive_parameter_buffers()
+                self._assert_registered_inputs_unchanged(
+                    registered,
+                    f"{type(population).__qualname__}._derive_parameter_buffers()",
+                )
+                current_python_state = _transition_python_state_snapshot(self)
+                mutated_python_state = {
+                    name
+                    for name in set(python_state) | set(current_python_state)
+                    if python_state.get(name) != current_python_state.get(name)
+                }
+            finally:
+                try:
+                    mutated_class_state.update(_restore_class_state(class_state))
+                finally:
+                    consumed_rng = _global_rng_changes(rng_state, device)
+                    _restore_global_rng(rng_state, device)
+            if mutated_python_state:
+                raise FunctionalizationError(
+                    "Packed component physical preparation observed authored "
+                    "mutation of unregistered Python instance state "
+                    f"{sorted(mutated_python_state)}."
+                )
+            if mutated_class_state:
+                raise FunctionalizationError(
+                    "Packed component physical preparation observed authored "
+                    "mutation of shared Python class state "
+                    f"{sorted(mutated_class_state)}."
+                )
+            if consumed_rng:
+                raise FunctionalizationError(
+                    "Packed component physical preparation observed authored "
+                    f"consumption of {sorted(consumed_rng)} RNG state."
+                )
+        else:
             with torch.no_grad():
                 population_values = population._derive_parameter_buffers()
-            self._assert_registered_inputs_unchanged(
-                registered,
-                f"{type(population).__qualname__}._derive_parameter_buffers()",
-            )
-            current_python_state = _transition_python_state_snapshot(self)
-            mutated_python_state = {
-                name
-                for name in set(python_state) | set(current_python_state)
-                if python_state.get(name) != current_python_state.get(name)
-            }
-        finally:
-            try:
-                mutated_class_state.update(_restore_class_state(class_state))
-            finally:
-                consumed_rng = _global_rng_changes(rng_state, device)
-                _restore_global_rng(rng_state, device)
-        if mutated_python_state:
-            raise FunctionalizationError(
-                "Packed component physical preparation observed authored "
-                "mutation of unregistered Python instance state "
-                f"{sorted(mutated_python_state)}."
-            )
-        if mutated_class_state:
-            raise FunctionalizationError(
-                "Packed component physical preparation observed authored "
-                "mutation of shared Python class state "
-                f"{sorted(mutated_class_state)}."
-            )
-        if consumed_rng:
-            raise FunctionalizationError(
-                "Packed component physical preparation observed authored "
-                f"consumption of {sorted(consumed_rng)} RNG state."
-            )
         if not isinstance(population_values, Mapping) or any(
             not torch.is_tensor(value) for value in population_values.values()
         ):
@@ -5069,6 +5191,56 @@ def _canonical_numerical_current_adapter(
     )
 
 
+def _callable_binding_signature(value, *, include_identity=True):
+    """Freeze call/code bindings without inspecting authored dependencies."""
+    if isinstance(value, property):
+        return (
+            "property",
+            *(
+                None
+                if accessor is None
+                else _callable_binding_signature(
+                    accessor, include_identity=include_identity
+                )
+                for accessor in (value.fget, value.fset, value.fdel)
+            ),
+        )
+    if isinstance(value, (staticmethod, classmethod)):
+        value = value.__func__
+    target = getattr(value, "__func__", value)
+
+    def literal(item):
+        if item is None or isinstance(item, (bool, int, float, complex, str, bytes)):
+            return (type(item), item)
+        if isinstance(item, tuple):
+            return (tuple, tuple(literal(part) for part in item))
+        return (type(item), id(item))
+
+    defaults = getattr(target, "__defaults__", None)
+    kwdefaults = getattr(target, "__kwdefaults__", None)
+    return (
+        "callable-binding",
+        getattr(target, "__module__", None),
+        getattr(target, "__qualname__", None),
+        id(target) if include_identity else None,
+        getattr(target, "__code__", None),
+        literal(defaults),
+        None
+        if kwdefaults is None
+        else tuple((name, literal(item)) for name, item in kwdefaults.items()),
+    )
+
+
+def _initialization_callable_contract_signature(value, *, diagnostic=None, **kwargs):
+    """Retain callable bindings; inspect dependencies only in diagnostic mode."""
+    diagnostic = current_check_purity() if diagnostic is None else diagnostic
+    if diagnostic:
+        return _initialization_callable_dependency_signature(value, **kwargs)
+    return _callable_binding_signature(
+        value, include_identity=kwargs.get("include_identity", True)
+    )
+
+
 def _initialization_callable_dependency_signature(
     value,
     *,
@@ -5097,6 +5269,12 @@ def _initialization_callable_dependency_signature(
         injection_helper = mechanism_injection_helper(owner, value)
         if injection_helper is not None:
             return ("dendra-pure-mechanism-injection", injection_helper)
+        if isinstance(owner, MaterialProcess):
+            from ._custom_material_processes import custom_material_process_helper
+
+            material_helper = custom_material_process_helper(owner, value)
+            if material_helper is not None:
+                return ("dendra-pure-material-helper", material_helper)
 
     if bound_receiver is owner and getattr(type(owner), "_table", None):
         from ._tables import table_wrapper_original
@@ -5433,7 +5611,7 @@ def _initialization_final_frame_dependency_signature(
     return tuple(
         (
             label,
-            _initialization_callable_dependency_signature(
+            _initialization_callable_contract_signature(
                 callable_value,
                 label=label,
                 owner=owner,
@@ -5547,13 +5725,14 @@ def _functional_initialization_transform_failures(
                     "inputs and compose helper operations in forward()"
                 )
             try:
-                _initialization_callable_dependency_signature(
-                    transform.forward,
-                    label=f"{phase} initialization transform {action_name}",
-                    owner=transform,
-                    strict=True,
-                    include_identity=False,
-                )
+                if current_check_purity():
+                    _initialization_callable_dependency_signature(
+                        transform.forward,
+                        label=f"{phase} initialization transform {action_name}",
+                        owner=transform,
+                        strict=True,
+                        include_identity=False,
+                    )
             except FunctionalizationError as exc:
                 failures.append(str(exc))
 
@@ -5685,7 +5864,7 @@ def _initialization_structure_signature(population: Population) -> tuple:
                         and "state_defaults" not in state.__dict__
                     )
                 )
-                else _initialization_callable_dependency_signature(
+                else _initialization_callable_contract_signature(
                     getattr(state, "state_defaults"),
                     label=f"{mechanism_name}.{state_name}.state_defaults",
                     owner=state,
@@ -5698,7 +5877,7 @@ def _initialization_structure_signature(population: Population) -> tuple:
                 if inspect.getattr_static(type(state), "initial_values")
                 is _STANDARD_STATE_INITIAL_VALUES
                 and "initial_values" not in state.__dict__
-                else _initialization_callable_dependency_signature(
+                else _initialization_callable_contract_signature(
                     state_initial_values,
                     label=f"{mechanism_name}.{state_name}.initial_values",
                     owner=state,
@@ -5746,7 +5925,7 @@ def _initialization_structure_signature(population: Population) -> tuple:
                     if inspect.getattr_static(type(mechanism), "initial_values")
                     is _STANDARD_MECHANISM_INITIAL_VALUES
                     and "initial_values" not in mechanism.__dict__
-                    else _initialization_callable_dependency_signature(
+                    else _initialization_callable_contract_signature(
                         getattr(mechanism, "initial_values"),
                         label=f"{mechanism_name}.initial_values",
                         owner=mechanism,
@@ -6044,10 +6223,11 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         )
     ):
         try:
-            _initialization_final_frame_dependency_signature(
-                population,
-                strict=True,
-            )
+            if current_check_purity():
+                _initialization_final_frame_dependency_signature(
+                    population,
+                    strict=True,
+                )
         except FunctionalizationError as exc:
             failures.append(str(exc))
 
@@ -6091,15 +6271,16 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             )
         elif class_has_initial_values:
             try:
-                _initialization_callable_dependency_signature(
-                    getattr(mechanism, "initial_values"),
-                    label=f"{mechanism_name}.initial_values",
-                    owner=mechanism,
-                    strict=True,
-                    forbidden_receiver_attributes=frozenset(
-                        {"celsius"} | shared_local_names.get(id(mechanism), set())
-                    ),
-                )
+                if current_check_purity():
+                    _initialization_callable_dependency_signature(
+                        getattr(mechanism, "initial_values"),
+                        label=f"{mechanism_name}.initial_values",
+                        owner=mechanism,
+                        strict=True,
+                        forbidden_receiver_attributes=frozenset(
+                            {"celsius"} | shared_local_names.get(id(mechanism), set())
+                        ),
+                    )
             except FunctionalizationError as exc:
                 failures.append(str(exc))
 
@@ -6141,15 +6322,17 @@ def _functional_initialization_failures(population: Population) -> list[str]:
                 )
             elif class_has_state_initial_values:
                 try:
-                    _initialization_callable_dependency_signature(
-                        getattr(state, "initial_values"),
-                        label=f"{mechanism_name}.{state_name}.initial_values",
-                        owner=state,
-                        strict=True,
-                        forbidden_receiver_attributes=frozenset(
-                            {"celsius"} | shared_local_names.get(id(mechanism), set())
-                        ),
-                    )
+                    if current_check_purity():
+                        _initialization_callable_dependency_signature(
+                            getattr(state, "initial_values"),
+                            label=f"{mechanism_name}.{state_name}.initial_values",
+                            owner=state,
+                            strict=True,
+                            forbidden_receiver_attributes=frozenset(
+                                {"celsius"}
+                                | shared_local_names.get(id(mechanism), set())
+                            ),
+                        )
                 except FunctionalizationError as exc:
                     failures.append(str(exc))
 
@@ -6180,12 +6363,13 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             ):
                 defaults_callable = getattr(state, "state_defaults")
                 try:
-                    _initialization_callable_dependency_signature(
-                        defaults_callable,
-                        label=f"{mechanism_name}.{state_name}.state_defaults",
-                        owner=state,
-                        strict=True,
-                    )
+                    if current_check_purity():
+                        _initialization_callable_dependency_signature(
+                            defaults_callable,
+                            label=f"{mechanism_name}.{state_name}.state_defaults",
+                            owner=state,
+                            strict=True,
+                        )
                 except FunctionalizationError as exc:
                     failures.append(str(exc))
                 defaults_target = getattr(
@@ -6208,7 +6392,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
                 hidden_shared_aliases = sorted(
                     receiver_attributes & shared_local_names.get(id(mechanism), set())
                 )
-                if hidden_shared_aliases:
+                if hidden_shared_aliases and current_check_purity():
                     failures.append(
                         f"State {mechanism_name}.{state_name}.state_defaults reads "
                         "support-local shared fields through hidden receiver "
@@ -6395,7 +6579,11 @@ def _apply_initialization_transforms(
         )
         versions = (
             None
-            if torch.compiler.is_compiling() or torch.is_inference_mode_enabled()
+            if (
+                not initialization.check_purity
+                or torch.compiler.is_compiling()
+                or torch.is_inference_mode_enabled()
+            )
             else tuple(value._version for value in arguments)
         )
         outputs = action(*arguments)
@@ -6523,6 +6711,7 @@ class _PopulationInitialization(torch.nn.Module):
     ):
         super().__init__()
         self.population = population
+        self.check_purity = current_check_purity()
         self.layout = layout
         self.explicit_layout = explicit_layout
         self.mechanism_plan = tuple(
@@ -7525,11 +7714,19 @@ def _parametrization_constant_layout_for_owners(
                 id(value), f"_material_geometry.{name}"
             )
 
+    from ._custom_material_processes import custom_material_constant_slots
     from ._mechanism_delays import mechanism_delay_constant_slots
     from ._mechanism_injections import mechanism_injection_constant_slots
     from ._tables import table_buffer_slots
 
     for owner in owners:
+        for relative_path, value in custom_material_constant_slots(owner):
+            if is_registered_parameter(value):
+                continue
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value), f"material_processes.{owner.name}.{relative_path}"
+            )
         for relative_path, value in mechanism_injection_constant_slots(owner):
             if is_registered_parameter(value):
                 continue
@@ -7909,6 +8106,14 @@ def _parameter_buffer_alias_conflicts(population) -> tuple[tuple, ...]:
         for _path, source in initialization_source_roots(population)
         for _name, value in _registered_tensor_slots(source)
         if value is not None and id(value) in parameter_name_by_identity
+    )
+    from ._custom_material_processes import custom_material_constant_slots
+
+    consumed_parameter_ids.update(
+        id(value)
+        for _owner_path, owner in _parameterized_owner_paths(population)
+        for _name, value in custom_material_constant_slots(owner)
+        if id(value) in parameter_name_by_identity
     )
     for _owner_path, owner in _parameterized_owner_paths(population):
         for transforms in owner.in_graph_parametrizations.values():
@@ -8683,7 +8888,8 @@ def _functionalization_failures(
                     parameter_contract_supported = False
                     break
                 try:
-                    _transform_structure_signature(transform, strict=True)
+                    if current_check_purity():
+                        _transform_structure_signature(transform, strict=True)
                 except FunctionalizationError as exc:
                     failures.append(str(exc))
                     parameter_contract_supported = False
@@ -9265,6 +9471,7 @@ def _transform_class_structure_signature(
     module: torch.nn.Module,
     *,
     strict: bool,
+    inspect_dependencies: bool = True,
 ) -> tuple:
     """Fingerprint authored transform class behavior and static configuration."""
     signatures = []
@@ -9295,10 +9502,14 @@ def _transform_class_structure_signature(
                 or isinstance(value, (staticmethod, classmethod, property))
                 or inspect.ismethoddescriptor(value)
             ):
-                signature = _transform_callable_structure_signature(
-                    value,
-                    label=label,
-                    strict=strict,
+                signature = (
+                    _transform_callable_structure_signature(
+                        value,
+                        label=label,
+                        strict=strict,
+                    )
+                    if inspect_dependencies
+                    else _callable_binding_signature(value, include_identity=False)
                 )
             elif inspect.isdatadescriptor(value):
                 signature = (
@@ -9324,6 +9535,15 @@ def _transform_structure_signature(
     strict: bool = False,
 ) -> tuple:
     """Fingerprint one transform tree, including immutable Python config."""
+    return _transform_module_structure_signature(
+        transform, strict=strict, inspect_dependencies=True
+    )
+
+
+def _transform_module_structure_signature(
+    transform: torch.nn.Module, *, strict: bool, inspect_dependencies: bool
+) -> tuple:
+    """Share registered/static structure between trusted and checked recipes."""
     modules = []
     for module_path, module in transform.named_modules(remove_duplicate=False):
         hooks = _module_autograd_hook_signature(module)
@@ -9361,11 +9581,27 @@ def _transform_structure_signature(
                 type(module).__qualname__,
                 _effective_hook_identity(module, "forward"),
                 hooks,
-                _transform_class_structure_signature(module, strict=strict),
+                _transform_class_structure_signature(
+                    module, strict=strict, inspect_dependencies=inspect_dependencies
+                ),
                 tuple(configuration),
             )
         )
     return tuple(modules)
+
+
+def _transform_contract_signature(transform):
+    if current_check_purity():
+        return _transform_structure_signature(transform)
+    return _transform_module_structure_signature(
+        transform, strict=False, inspect_dependencies=False
+    )
+
+
+def _callable_structure_contract_signature(value, *, label):
+    if current_check_purity():
+        return _transform_callable_structure_signature(value, label=label, strict=False)
+    return _callable_binding_signature(value, include_identity=False)
 
 
 def _parametrization_signatures(population) -> tuple:
@@ -9379,7 +9615,7 @@ def _parametrization_signatures(population) -> tuple:
                     tuple(
                         (
                             tuple(args),
-                            _transform_structure_signature(transform),
+                            _transform_contract_signature(transform),
                         )
                         for transform, args in transforms
                     ),
@@ -9400,8 +9636,7 @@ def _parametrization_signatures(population) -> tuple:
                 _shape_tuple(transforms.original),
                 _module_autograd_hook_signature(transforms),
                 tuple(
-                    _transform_structure_signature(transform)
-                    for transform in transforms
+                    _transform_contract_signature(transform) for transform in transforms
                 ),
             )
             for name, transforms in parametrizations.items()
@@ -9523,8 +9758,8 @@ def _membrane_coefficient_signature(module) -> tuple:
                 name,
                 "instance" if name in module.__dict__ else "class",
                 getattr(method, "__self__", None) is module,
-                _transform_callable_structure_signature(
-                    method, label=f"membrane.{name}", strict=False
+                _callable_structure_contract_signature(
+                    method, label=f"membrane.{name}"
                 ),
             )
         )
@@ -9597,13 +9832,12 @@ def _structure_signature(population) -> tuple:
                             "advance",
                         )
                     ),
-                    _transform_callable_structure_signature(
+                    _callable_structure_contract_signature(
                         state._solve,
                         label=(
                             f"{type(state).__module__}."
                             f"{type(state).__qualname__}._solve"
                         ),
-                        strict=False,
                     ),
                     _effective_hook_identity(state, "derive_buffers"),
                     _effective_hook_identity(state, "derive_timestep_buffers"),
@@ -9737,6 +9971,13 @@ def _structure_ids(population) -> tuple[int, ...]:
     return tuple(id(module) for _name, module in population.named_modules())
 
 
+def _structure_for_plan(functional, population=None) -> tuple:
+    """Revalidate bindings with the diagnostic policy retained by the plan."""
+    population = functional._population if population is None else population
+    with ctx(CHECK_PURITY=functional._check_purity):
+        return _structure_signature(population)
+
+
 @torch.compiler.assume_constant_result
 def _compiled_structure_signature_matches(functional) -> bool:
     """Evaluate the Python-only source fingerprint once per compiled graph.
@@ -9744,7 +9985,7 @@ def _compiled_structure_signature_matches(functional) -> bool:
     Keep the retained fingerprint inside its owner: authored material metadata
     can contain Python values Dynamo cannot convert into constant arguments.
     """
-    return _structure_signature(functional._population) == functional._fingerprint
+    return _structure_for_plan(functional) == functional._fingerprint
 
 
 @torch.compiler.assume_constant_result
@@ -9772,9 +10013,28 @@ def _compiled_validate_initialization_sources(functional) -> None:
 
 
 @torch.compiler.assume_constant_result
-def _compiled_initialization_failures(population) -> tuple[str, ...]:
+def _compiled_validate_custom_material_sources(functional) -> None:
+    """Qualify custom pure process recipes before capturing tensor evaluation."""
+    for plan in functional._custom_material_plans.values():
+        plan.validate_source()
+
+
+def _initialization_failures_for_plan(functional) -> tuple[str, ...]:
+    """Revalidate with the diagnostic policy retained by the lowered plan."""
+    with ctx(CHECK_PURITY=functional._check_purity):
+        return tuple(_functional_initialization_failures(functional._population))
+
+
+def _initialization_structure_for_plan(functional, population=None) -> tuple:
+    population = functional._population if population is None else population
+    with ctx(CHECK_PURITY=functional._check_purity):
+        return _initialization_structure_signature(population)
+
+
+@torch.compiler.assume_constant_result
+def _compiled_initialization_failures(functional) -> tuple[str, ...]:
     """Evaluate Python-only initializer admission once per compiled graph."""
-    return tuple(_functional_initialization_failures(population))
+    return _initialization_failures_for_plan(functional)
 
 
 def _owned_cache_initialization_failures(population):
@@ -9823,9 +10083,12 @@ def _compiled_owned_cache_initialization_failures(population):
 
 
 @torch.compiler.assume_constant_result
-def _compiled_initialization_structure_matches(population, fingerprint) -> bool:
+def _compiled_initialization_structure_matches(functional) -> bool:
     """Evaluate initializer-only source freshness once per compiled graph."""
-    return _initialization_structure_signature(population) == fingerprint
+    return (
+        _initialization_structure_for_plan(functional)
+        == functional._initialization_fingerprint
+    )
 
 
 class FunctionalPopulation:
@@ -9938,6 +10201,22 @@ class FunctionalPopulation:
         self._dtype = population.dtype()
         self._device = population.device()
         self._population = population
+        self._check_purity = current_check_purity()
+        from ._custom_material_processes import CustomMaterialProcessPlan
+
+        self._custom_material_plans = {
+            name: CustomMaterialProcessPlan(
+                process,
+                _material_fields(population, process),
+                dt,
+            )
+            for name, process in population.mech.material_processes.items()
+            if _material_process_contract(process).family is MaterialProcess
+        }
+        self._source_custom_material_bindings = tuple(
+            (name, plan.source_binding_signature())
+            for name, plan in self._custom_material_plans.items()
+        )
         from ._tables import TablePlan
 
         self._table_plan = TablePlan(population)
@@ -10130,7 +10409,9 @@ class FunctionalPopulation:
             name: workspace_shapes[shape_role]
             for name, shape_role in self._integrator_workspace_schema
         }
-        _install_material_preparation(execution_population, dt_tensor)
+        _install_material_preparation(
+            execution_population, dt_tensor, custom_plans=self._custom_material_plans
+        )
         self._state_layout = _state_layout(execution_population)
         self._state_layout_signature = _state_layout_signature(self._state_layout)
         self._initialization_state_layout = _initialization_state_layout(
@@ -10281,8 +10562,8 @@ class FunctionalPopulation:
             )
         )
         # Direct construction remains supported for internal tests and
-        # extensions. Until the one-time purity audit succeeds, transition
-        # mappings defensively isolate every read-only input from the caller.
+        # extensions. Until lowering accepts the purity contract (by trust or
+        # diagnostic audit), isolate read-only transition inputs from callers.
         self._lowering_audit_complete = False
 
         # Multi component runtime trees have already been removed above, so
@@ -10874,9 +11155,9 @@ class FunctionalPopulation:
                 )
             )
 
-        # Register adapters below the already-audited parent preparation. The
-        # parent purity probe then deep-copies and fingerprints their complete
-        # physical module trees alongside its own workspace builder.
+        # Register adapters below the parent preparation. Optional purity
+        # diagnostics inspect their complete physical module trees alongside
+        # the parent's workspace builder.
         self._preparation.component_physical_preparations = torch.nn.ModuleList(
             physical_preparations
         )
@@ -11023,6 +11304,22 @@ class FunctionalPopulation:
             )
 
     def _validate_source(self) -> None:
+        if self._custom_material_plans:
+            if torch.compiler.is_compiling():
+                if (
+                    tuple(
+                        (name, plan.source_binding_signature())
+                        for name, plan in self._custom_material_plans.items()
+                    )
+                    != self._source_custom_material_bindings
+                ):
+                    raise FunctionalizationError(
+                        "The source custom MaterialProcess recipe changed; lower again"
+                    )
+                _compiled_validate_custom_material_sources(self)
+            else:
+                for plan in self._custom_material_plans.values():
+                    plan.validate_source()
         if torch.compiler.is_compiling():
             if (
                 self._initialization_source_plan.source_binding_signature()
@@ -11202,7 +11499,7 @@ class FunctionalPopulation:
         structure_matches = (
             _compiled_structure_signature_matches(self)
             if torch.compiler.is_compiling()
-            else _structure_signature(self._population) == self._fingerprint
+            else _structure_for_plan(self) == self._fingerprint
         )
         if (
             _structure_ids(self._population) != self._source_ids
@@ -11223,6 +11520,12 @@ class FunctionalPopulation:
     def _validate_compatible_population(self, population) -> None:
         if not isinstance(population, Population):
             raise TypeError("population must be a dendra Population")
+        for name, plan in self._custom_material_plans.items():
+            if name not in population.mech.material_processes:
+                raise FunctionalizationError(
+                    "Population custom MaterialProcess layout does not match this plan"
+                )
+            plan.validate_compatible(population.mech.material_processes[name])
         self._table_plan.validate_population(population)
         self._mechanism_delay_plan.validate_population(population)
         self._mechanism_injection_plan.validate_population(population)
@@ -11309,7 +11612,7 @@ class FunctionalPopulation:
             failure = _effective_population_parameter_failure(population)
             if failure is not None:
                 raise FunctionalizationError(failure)
-        if _structure_signature(population) != self._fingerprint:
+        if _structure_for_plan(self, population) != self._fingerprint:
             raise FunctionalizationError(
                 "Population structure does not match this functional execution plan."
             )
@@ -11708,7 +12011,7 @@ class FunctionalPopulation:
         population = self._population if population is None else population
         self._validate_compatible_population(population)
         if (
-            _initialization_structure_signature(population)
+            _initialization_structure_for_plan(self, population)
             != self._initialization_fingerprint
         ):
             raise FunctionalizationError(
@@ -12079,17 +12382,14 @@ class FunctionalPopulation:
                 constants, selected_random_draw
             )
         current_failures = (
-            _compiled_initialization_failures(self._population)
+            _compiled_initialization_failures(self)
             if torch.compiler.is_compiling()
-            else tuple(_functional_initialization_failures(self._population))
+            else _initialization_failures_for_plan(self)
         )
         initialization_structure_matches = (
-            _compiled_initialization_structure_matches(
-                self._population,
-                self._initialization_fingerprint,
-            )
+            _compiled_initialization_structure_matches(self)
             if torch.compiler.is_compiling()
-            else _initialization_structure_signature(self._population)
+            else _initialization_structure_for_plan(self)
             == self._initialization_fingerprint
         )
         initialization_failures = (
@@ -13307,6 +13607,8 @@ class FunctionalPopulation:
         )
 
     def _audit_event_receivers(self, tensors: PopulationTensors) -> None:
+        if not self._check_purity:
+            return
         self._audit_receivers(tensors, continuous=False)
         self._audit_receivers(tensors, continuous=True)
 
@@ -13441,6 +13743,9 @@ class FunctionalPopulation:
 
     def _audit_read_only_workspaces(self, tensors: PopulationTensors) -> None:
         """Prove preparation/transition purity before exposing a hot-path plan."""
+        if not self._check_purity:
+            self._lowering_audit_complete = True
+            return
         # A failed re-audit leaves even directly constructed/internal plans on
         # the defensive mapping path rather than trusting an earlier result.
         self._lowering_audit_complete = False
@@ -13467,6 +13772,9 @@ class FunctionalPopulation:
                 audit_preparation = _deepcopy_execution_module(self._preparation)
                 _rebind_population_time_references(audit_preparation.population)
                 audit_preparation.audit_builder_inputs = True
+                from ._custom_material_processes import install_custom_material_audits
+
+                install_custom_material_audits(audit_preparation.population)
                 for component_preparation in getattr(
                     audit_preparation,
                     "component_physical_preparations",
@@ -13477,6 +13785,7 @@ class FunctionalPopulation:
                 _rebind_population_time_references(audit_transition.population)
                 _install_voltage_process_audits(audit_transition.population)
                 _install_state_input_audits(audit_transition.population)
+                install_custom_material_audits(audit_transition.population)
                 preparation_python_state = _transition_python_state_snapshot(
                     audit_preparation
                 )
@@ -13698,6 +14007,8 @@ class FunctionalPopulation:
 
     def _audit_initialization(self, tensors: PopulationTensors) -> None:
         """Prove admitted initialization and final-current-frame purity."""
+        if not self._check_purity:
+            return
 
         if self._initialization is None:
             return
@@ -15537,10 +15848,12 @@ def make_functional(
             "- expected an initialized dendra Population"
         )
     device = population.device()
-    rng_state = _global_rng_snapshot(device)
+    check_purity = current_check_purity()
+    rng_state = _global_rng_snapshot(device) if check_purity else None
     class_state = {}
     try:
-        class_state = _class_state_snapshot(_authored_workspace_classes(population))
+        if check_purity:
+            class_state = _class_state_snapshot(_authored_workspace_classes(population))
         multi_component_candidates = {} if _is_multi(population) else None
         failures = _functionalization_failures(
             population,
@@ -15565,8 +15878,12 @@ def make_functional(
                 _multi_component_candidates=multi_component_candidates,
                 _bind_owned_cache=_bind_owned_cache,
             )
-            construction_rng = _global_rng_changes(rng_state, device)
-            construction_class_state = _restore_class_state(class_state)
+            construction_rng = (
+                _global_rng_changes(rng_state, device) if check_purity else ()
+            )
+            construction_class_state = (
+                _restore_class_state(class_state) if check_purity else ()
+            )
             if construction_class_state or construction_rng:
                 details = []
                 if construction_class_state:
@@ -15581,10 +15898,14 @@ def make_functional(
                     + "."
                 )
             tensors = functional.extract(population)
-        functional._audit_read_only_workspaces(tensors)
-        functional._audit_event_receivers(tensors)
+        if check_purity:
+            functional._audit_read_only_workspaces(tensors)
+            functional._audit_event_receivers(tensors)
+        else:
+            functional._lowering_audit_complete = True
         try:
-            functional._audit_initialization(tensors)
+            if check_purity:
+                functional._audit_initialization(tensors)
         except FunctionalizationError as exc:
             # Initialization is an optional capability layered over the broader
             # pure transition. Preserve that separation while retaining the
@@ -15596,12 +15917,15 @@ def make_functional(
             functional._initialization = None
             functional._initialization_state_template = None
     except Exception:
-        try:
-            _restore_class_state(class_state)
-        finally:
-            _restore_global_rng(rng_state, device)
+        if check_purity:
+            try:
+                _restore_class_state(class_state)
+            finally:
+                _restore_global_rng(rng_state, device)
         raise
 
+    if not check_purity:
+        return functional, tensors
     consumed_rng = _global_rng_changes(rng_state, device)
     try:
         mutated_class_state = _restore_class_state(class_state)

@@ -504,7 +504,9 @@ def test_clearance_checkpointed_continuation_preserves_full_traces_and_gradients
         reference_inputs,
         reference_targets,
     ) = _arguments(runner, model)
-    doubled = dn.func.RolloutInput(*(torch.cat((x, x)) for x in reference_inputs))
+    doubled = pytree.tree_map_only(
+        torch.Tensor, lambda value: torch.cat((value, value)), reference_inputs
+    )
     expected = _explicit_reference(
         runner, reference_parameters, reference_initialization, doubled, steps=2 * STEPS
     )

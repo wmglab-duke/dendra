@@ -13,6 +13,7 @@ import types
 import torch
 from torch.func import functional_call
 
+from dendra.helpers import current_check_purity
 from dendra.models import parametric
 from dendra.models.mechanisms import _materials
 from dendra.models.multi import _PackedMaterialInitial
@@ -474,6 +475,79 @@ def _qualify(source, *, strict):
     )
 
 
+def _source_layout_contract(source):
+    """Qualify binding and cache dispatch without auditing authored arithmetic."""
+    source = _structural_source_view(source)
+    records = []
+    aliases = {}
+    for path, child in _registered_modules(source):
+        for name in ("__setattr__", "__delattr__"):
+            if inspect.getattr_static(type(child), name) is not inspect.getattr_static(
+                torch.nn.Module, name
+            ):
+                raise FunctionalizationError(
+                    "Initial-value sources require canonical registration attribute dispatch."
+                )
+        for name, canonical in _CALL_METHODS.items():
+            if (
+                name in vars(child)
+                or inspect.getattr_static(type(child), name) is not canonical
+            ):
+                raise FunctionalizationError(
+                    "Initial-value sources require canonical module call/attribute dispatch."
+                )
+        for name in _COPY_METHODS:
+            canonical = (
+                _CANONICAL_CACHE_STATE
+                if name == "__getstate__" and isinstance(child, cacheable)
+                else inspect.getattr_static(torch.nn.Module, name, None)
+            )
+            if inspect.getattr_static(type(child), name, None) is not canonical:
+                raise FunctionalizationError(
+                    "Initial-value sources require canonical deepcopy/serialization dispatch."
+                )
+        _require_static_method(child, "forward")
+        method = child.forward
+        if isinstance(child, cacheable):
+            _require_static_method(child, "_compute")
+            if getattr(method, "__func__", None) is not _CANONICAL_CACHE_FORWARD:
+                raise FunctionalizationError(
+                    "Cached initial-value sources require canonical cache dispatch."
+                )
+            method = child._compute
+        for name in (*child._parameters, *child._buffers, *child._modules):
+            if inspect.getattr_static(type(child), name, None) is not None:
+                raise FunctionalizationError(
+                    f"Initial-value source registered field {name!r} is shadowed by a descriptor."
+                )
+        records.append(
+            (
+                path,
+                type(child),
+                child.training,
+                _binding(method),
+                tuple(
+                    (
+                        collection,
+                        name,
+                        None
+                        if value is None
+                        else (
+                            tuple(value.shape),
+                            value.dtype,
+                            value.device,
+                            aliases.setdefault(id(value), (path, collection, name)),
+                        ),
+                    )
+                    for collection in ("_parameters", "_buffers")
+                    for name, value in vars(child)[collection].items()
+                ),
+                tuple((name, type(nested)) for name, nested in child._modules.items()),
+            )
+        )
+    return tuple(records)
+
+
 class _SourceCall(torch.nn.Module):
     """Call the shared native resolver with an explicit registered recipe."""
 
@@ -858,6 +932,7 @@ class InitializationSourcePlan:
 
     def __init__(self, population):
         self.population = population
+        self.diagnostic = current_check_purity()
         self.failures = ()
         self._contracts = []
         roots = initialization_source_roots(population)
@@ -872,8 +947,12 @@ class InitializationSourcePlan:
         failures = list(initialization_source_ownership_failures(population))
         for path, source in initialization_source_roots(population):
             try:
-                contract = _qualify(source, strict=True)
-                if id(source) not in audited:
+                contract = (
+                    _qualify(source, strict=True)
+                    if self.diagnostic
+                    else _source_layout_contract(source)
+                )
+                if self.diagnostic and id(source) not in audited:
                     _audit_source(source)
                     audited.add(id(source))
                 self._contracts.append((path, contract))
@@ -889,6 +968,12 @@ class InitializationSourcePlan:
         self._aliases = _alias_signature(
             population, initialization_source_roots(population)
         )
+        if not self.diagnostic:
+            self._class_binding_names = {}
+            self._class_members = {}
+            self._functions = self._dependencies = self._raw_class_guards = ()
+            self._bindings = self.source_binding_signature()
+            return
         self._class_binding_names = {
             cls: tuple(
                 dict.fromkeys(
@@ -934,6 +1019,11 @@ class InitializationSourcePlan:
         roots = initialization_source_roots(population)
         if not roots:
             return ()
+        if not self.diagnostic:
+            return (
+                tuple((path, _module_bindings(source, {})) for path, source in roots),
+                _alias_signature(population, roots),
+            )
         try:
             return (
                 tuple(
@@ -969,7 +1059,13 @@ class InitializationSourcePlan:
             )
         if not self.failures:
             contracts = tuple(
-                (path, _qualify(recipe, strict=True)) for path, recipe in roots
+                (
+                    path,
+                    _qualify(recipe, strict=True)
+                    if self.diagnostic
+                    else _source_layout_contract(recipe),
+                )
+                for path, recipe in roots
             )
             if (
                 contracts != tuple(self._contracts)

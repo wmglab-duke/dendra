@@ -34,6 +34,7 @@ from .const import FARADAY, PI, TAU, E, R
 from .diagnostics import doctor
 from .func import compile
 from .helpers import (
+    CHECK_PURITY,
     COMPILE_OPTIONS,
     DEVICE,
     DTYPE,
@@ -44,6 +45,7 @@ from .helpers import (
     TF32,
     allow_tf32,
     ctx,
+    current_check_purity,
     current_compile_options,
     current_device,
     current_dtype,
@@ -51,6 +53,7 @@ from .helpers import (
     current_native_extension_policy,
     current_preserve_mechanism_population_axis,
     current_runtime_contract_validation,
+    normalize_check_purity,
     normalize_membrane_assembly,
     normalize_native_extension_policy,
     normalize_preserve_mechanism_population_axis,
@@ -127,6 +130,9 @@ __all__ = [
     "R",
     "FARADAY",
     "ctx",
+    "CHECK_PURITY",
+    "current_check_purity",
+    "normalize_check_purity",
     "doctor",
     "step",
     "step_population",

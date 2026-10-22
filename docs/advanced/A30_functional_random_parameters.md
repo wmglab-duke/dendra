@@ -173,6 +173,13 @@ retains native execution; functional lowering requires the split
 `draw_sampler=` and `transform=` contract. Both split functions must be
 supplied together.
 
+Functional lowering trusts the transform's purity contract by default.
+Create a plan or runner inside `with dn.ctx(CHECK_PURITY=True):` to enable
+diagnostic dependency, mutation, and repeated-evaluation checks. Each plan
+retains its selected mode after the context exits. Explicit draw bindings and
+the returned tensor's required schema are checked in either mode; diagnostics
+do not prove purity for every possible draw.
+
 ## Steady-state caches and unsupported stochastic features
 
 A Population-owned `steady_state` cache is invalidated when initialization
@@ -187,7 +194,8 @@ materializations remain detached; see
 Per-step `GLOBALNOISE`, `BATCHNOISE`, and `RANGENOISE` buffers use detached
 explicit draw/RNG tapes; see {doc}`A31_functional_runtime_noise`. RAND
 heterogeneity does not add random draws to the recurrent timestep. State
-`DIFFUSION` SDEs are currently unsupported by functional execution.
+`DIFFUSION` supports explicit Wiener draws and pathwise gradients; see
+{doc}`A32_functional_state_sde`.
 
 Fresh initialization of a Population that declares its own RAND or NOISE
 buffers and has a parameter-writing pre-initialization transform is currently

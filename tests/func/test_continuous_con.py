@@ -406,7 +406,10 @@ def test_source_configuration_changes_reject_calls_without_mutating_carry(mutati
 def test_impure_transforms_reject_without_source_mutation(transform):
     _, native = _connection(transform=transform)
     before = _clone(native.state_dict_for_checkpoint())
-    with pytest.raises(dn.func.FunctionalizationError, match="transform"):
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(dn.func.FunctionalizationError, match="transform"),
+    ):
         dn.func.make_functional_continuous_con(native)
     _close(native.state_dict_for_checkpoint(), before)
 

@@ -39,13 +39,21 @@ initial values. The initializer supplies a fresh field value; it does not own th
 field's runtime history. Mechanisms and Material processes own subsequent
 changes to that field.
 
-Functional fresh initialization audits custom sources for deterministic,
-read-only evaluation. A source may use its registered parameters, buffers, and
+Functional fresh initialization requires deterministic, read-only sources.
+A source may use its registered parameters, buffers, and
 registered child modules. Hidden tensor dependencies, persistent mutation,
 random draws, custom module call dispatch, and execution hooks are currently
 unsupported. Parameters and buffers remain explicit inputs to functional
 execution; changing a source's structure or computation requires lowering the
 Population or Network again.
+
+Functional lowering trusts the authored purity contract by default. To run
+diagnostic mutation, dependency, and repeated-evaluation checks while creating
+the runner, use `with dn.ctx(CHECK_PURITY=True):` around `dn.compile(...)`.
+The mode is captured by the new plan; changing the context afterward does not
+change an existing plan. Required field, tensor-schema, alias, and lifecycle
+checks apply in either mode. Diagnostics can identify violations but do not
+prove purity for every possible input.
 
 Source configuration buffers must be independent of runtime state, geometry,
 and reconstructed parameter buffers. Share registered raw parameters when a

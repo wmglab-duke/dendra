@@ -157,26 +157,31 @@ Register a `torch.nn.Parameter` when a value should be trainable, and use
 `register_buffer` for a tensor coefficient that stays read-only during a call.
 Unregistered tensor captures in functions, closures, or module attributes must
 be made explicit through a module. Pure functions may use immutable constants
-and helpers; their dependencies are checked as part of lowering.
+and helpers. Keep these dependencies unchanged for the lifetime of the plan.
 
 `sigmoid_release` is a stateless module with a `forward` method. Its default
 `theta` and `sigma` float attributes are static configuration. Supply and
 parameterize it using the same module contract as custom transforms.
 
-Lowering qualifies a disposable transform copy and checks source-code
-dependencies, arguments, registered tensors, Python state, repeated outputs, and
-global random-generator state. In-place input changes, parameter/buffer writes,
-hidden counters, mutable closure/global dependencies, implicit randomness, and
-global RNG seed/state reads are rejected. Replaced call dispatch and hooks are
-also unsupported. Modules, including nested children, must retain canonical
-metadata traversal and copying/serialization behavior. Qualification can therefore
-reject an otherwise memoryless module; express that operation in a pure function
-or a module with canonical hooks instead. For example, a pure function calling
-`torch.softmax(values, dim=-1)` avoids `nn.Softmax`'s custom serialization hook.
-Qualification does not advance or mutate the source Network; RNG state is restored after
-probes. Changing static configuration or callable bindings invalidates the plan;
-lower again to adopt those changes. Explicit parameter and buffer values can
-change without rebuilding the plan when their schemas stay the same.
+Transforms must avoid in-place input changes, parameter/buffer writes, hidden
+counters, mutable closure/global dependencies, implicit randomness, and global
+RNG seed/state reads. Functional lowering trusts this contract by default. To
+enable diagnostic source-dependency, mutation, repeated-output, and RNG checks,
+create the projection or compiled Network inside
+`with dn.ctx(CHECK_PURITY=True):`. The plan captures the mode at creation;
+changing the context later does not enable or disable its diagnostics. Probes
+use disposable state and restore RNG state. They can identify violations but
+do not prove purity for every input.
+
+Required registered-tensor schemas and canonical execution bindings are checked
+in either mode. Replaced call dispatch and hooks are currently unsupported.
+Modules, including nested children, must retain canonical metadata traversal
+and copying/serialization behavior. A pure function calling
+`torch.softmax(values, dim=-1)` satisfies this contract without
+`nn.Softmax`'s custom serialization hook. Changing static module configuration
+or callable bindings invalidates the plan; lower again to adopt those changes.
+Explicit parameter and buffer values can change without rebuilding the plan
+when their schemas stay the same.
 
 Gradients flow through explicit source values, weights, transform parameters,
 receiver updates, and already queued values. Integer delays are static in

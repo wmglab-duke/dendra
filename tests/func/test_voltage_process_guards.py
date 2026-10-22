@@ -20,6 +20,14 @@ from tests.func.test_functional_initialization import (
     _module_snapshot,
 )
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 pytestmark = pytest.mark.cpu
 DT = 0.05
 _HIDDEN_TENSOR = torch.tensor(1.0)

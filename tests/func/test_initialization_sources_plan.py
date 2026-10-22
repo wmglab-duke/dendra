@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import dendra as dn
 from dendra.func._initialization_sources import (
     InitializationSourcePlan,
     configure_initialization_source_execution,
@@ -22,6 +23,12 @@ from dendra.models.multi import _PackedMaterialInitial
 from dendra.models.parametric import Bounded, NegativeParam, PositiveParam
 
 pytestmark = pytest.mark.cpu
+
+
+@pytest.fixture(autouse=True)
+def _diagnostic_purity():
+    with dn.ctx(CHECK_PURITY=True):
+        yield
 
 
 class _AffineSource(torch.nn.Module):

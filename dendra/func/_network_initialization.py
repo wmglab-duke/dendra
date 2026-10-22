@@ -46,6 +46,90 @@ class NetworkInitializationInput(NamedTuple):
     cache: NetworkInitializationCache | None = None
 
 
+def nonpersistent_material_cache_failures(functional):
+    """Reject cache writes omitted from another Population's config reader."""
+    from ._custom_material_processes import custom_material_constant_slots
+    from ._population_cache import _cache_storage_frame
+
+    plans = (
+        functional._population_cache_plans
+        if functional._cache_enabled
+        else {
+            name: plan._owned_cache_plan
+            for name, plan in functional.populations.items()
+            if plan._owned_cache_plan is not None
+        }
+    )
+    if not plans:
+        return ()
+    bindings = (
+        functional._cache_alias_bindings
+        if functional._cache_enabled
+        else tuple(
+            binding
+            for entries, _replays in functional._owned_cache_alias_plans.values()
+            for binding in entries
+        )
+    )
+    represented = {
+        path
+        for _winner, _parameters, constants, _states in bindings
+        for path in constants
+    }
+
+    def overlaps(left, right):
+        if left[0] != "storage" or right[0] != "storage":
+            return False
+        if (left[1], left[3]) != (right[1], right[3]):
+            return False
+
+        def bounds(frame):
+            offset, shape, strides = frame[4:]
+            last = offset + sum(
+                (size - 1) * stride for size, stride in zip(shape, strides, strict=True)
+            )
+            return offset * frame[2].itemsize, (last + 1) * frame[2].itemsize
+
+        start, end = bounds(left)
+        first, last = bounds(right)
+        return start < last and first < end
+
+    failures = []
+    for name, population_plan in functional.populations.items():
+        population = population_plan._population
+        config_ids = {
+            id(value)
+            for process in population.mech.material_processes.values()
+            for _slot, value in custom_material_constant_slots(process)
+        }
+        for entry in population_plan._parametrization_constants:
+            if ("populations", name, entry.key) in represented:
+                continue
+            owner = population.get_submodule(entry.module_path)
+            if entry.buffer_name not in owner._non_persistent_buffers_set:
+                continue
+            value = owner._buffers[entry.buffer_name]
+            if id(value) not in config_ids:
+                continue
+            reader = _cache_storage_frame(value)
+            if any(
+                writer_name != name
+                and any(
+                    overlaps(reader, plan.storage_frames[key])
+                    for key in plan.write_keys
+                )
+                for writer_name, plan in plans.items()
+            ):
+                failures.append(
+                    f"Population {name!r} nonpersistent custom MaterialProcess "
+                    f"config {entry.key!r} shares storage with another "
+                    "Population's cached tensor. This cache restoration is "
+                    "currently unsupported; use independent config buffers "
+                    "or register the shared config as persistent on every reader."
+                )
+    return tuple(failures)
+
+
 def initialization_alias_failures(functional):
     """Reject native retained materializations absent from the explicit packet."""
     from ._initialization_sources import (

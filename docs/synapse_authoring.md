@@ -307,6 +307,14 @@ For differentiable models, also check a gradient against a known expression
 or a finite difference. Reuse the exact declared shapes, devices, and dtypes
 in returned-value hooks.
 
+Functional lowering trusts authored hooks to keep the pure, deterministic
+contract by default. While developing a synapse, create its functional plan or
+compiled Network inside `with dn.ctx(CHECK_PURITY=True):` to enable diagnostic
+dependency and evaluation checks. Each plan captures the mode when it is
+created; required state schemas, tensor layouts, and canonical receive adapters
+remain checked in either mode. Diagnostics help find violations but do not
+prove purity for every payload or state.
+
 For migration from the earlier mutation-based hook API, see
 {doc}`upgrading`. Initialization precedence and workspace timing are detailed
 in {doc}`advanced/A7_model_initialization` and the

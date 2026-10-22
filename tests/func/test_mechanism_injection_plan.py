@@ -176,7 +176,10 @@ def _environment():
     previous = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        with torch_compiler_warning_context(), dn.ctx(JIT=0, REQUIRE_GRAD=1):
+        with (
+            torch_compiler_warning_context(),
+            dn.ctx(JIT=0, REQUIRE_GRAD=1, CHECK_PURITY=True),
+        ):
             yield
     finally:
         torch.set_num_threads(previous)
@@ -978,3 +981,19 @@ def test_plan_rejects_opaque_child_module_helper_dispatch(kind):
         waveform.layers = torch.nn.ModuleList([Child()])
     with pytest.raises(dn.func.FunctionalizationError, match="purity cannot be proven"):
         MechanismInjectionPlan(_population(waveform))
+
+
+def test_plan_can_skip_optional_purity_diagnostics_and_freezes_the_policy():
+    population = _population(_MutableWaveform())
+    waveform = population.mech.mechanisms["injected"].injected_waveforms[0]
+    counter = waveform.counter
+    with dn.ctx(CHECK_PURITY=False):
+        plan = MechanismInjectionPlan(population)
+    assert not plan.check_purity
+    assert waveform.counter == counter
+    # The outer fixture enables diagnostics; validating a trusted plan must
+    # retain its original policy and must not execute a numerical probe.
+    plan.validate_source()
+    assert waveform.counter == counter
+    with pytest.raises(dn.func.FunctionalizationError, match="purity|mutat|state"):
+        MechanismInjectionPlan(population)

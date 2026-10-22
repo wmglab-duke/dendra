@@ -215,6 +215,42 @@ def _eligible(network):
         raise FunctionalizationError(
             "A functional Network needs at least one Population."
         )
+    from ._custom_material_processes import custom_material_constant_slots
+
+    custom_config = [
+        (name, slot, value)
+        for name, population in network.populations.items()
+        for process in population.mech.material_processes.values()
+        for slot, value in custom_material_constant_slots(process)
+    ]
+    network_parameters = (
+        {id(value) for value in network.parameters()} if custom_config else set()
+    )
+    runtime_buffers = (
+        initialization_source_runtime_buffer_ids(network) if custom_config else set()
+    )
+    for name, population in network.populations.items():
+        slots = [(slot, value) for owner, slot, value in custom_config if owner == name]
+        if not slots:
+            continue
+        local_parameters = {id(value) for value in population.parameters()}
+        for slot, value in slots:
+            if id(value) in runtime_buffers:
+                raise FunctionalizationError(
+                    f"Population {name!r} custom MaterialProcess config "
+                    f"buffer {slot!r} aliases runtime state, geometry, or a "
+                    "reconstructed parameter; use an independent config "
+                    "buffer or a shared registered raw Parameter."
+                )
+            if id(value) in network_parameters - local_parameters:
+                raise FunctionalizationError(
+                    f"Population {name!r} custom MaterialProcess config "
+                    f"buffer {slot!r} aliases a raw parameter registered "
+                    "only outside that Population. Cross-Population "
+                    "buffer/parameter aliases are currently unsupported; "
+                    "register the same Parameter on the process as a "
+                    "Parameter attribute to preserve its shared binding."
+                )
     for name in ("populations", "synapses", "continuous_synapses"):
         owners = tuple(getattr(network, name).values())
         if len({id(owner) for owner in owners}) != len(owners):
@@ -508,7 +544,14 @@ class FunctionalNetwork:
             t=torch.zeros_like(tensors.state["clock"]["t"]),
             cache=initialization_cache,
         )
-        from ._network_initialization import initialization_alias_failures
+        from ._network_initialization import (
+            initialization_alias_failures,
+            nonpersistent_material_cache_failures,
+        )
+
+        self._nonpersistent_material_cache_failures = (
+            nonpersistent_material_cache_failures(self)
+        )
 
         runtime_buffer_ids = initialization_source_runtime_buffer_ids(network)
         self._initialization_alias_failures = (
@@ -537,6 +580,10 @@ class FunctionalNetwork:
             )
         if self._owned_cache_alias_error is not None:
             raise FunctionalizationError(self._owned_cache_alias_error)
+        if self._nonpersistent_material_cache_failures:
+            raise FunctionalizationError(
+                "\n".join(self._nonpersistent_material_cache_failures)
+            )
         if not self._cache_enabled and self._initialization_alias_failures:
             raise FunctionalizationError("\n".join(self._initialization_alias_failures))
         for name, expected in _NETWORK_INITIALIZATION_METHODS.items():

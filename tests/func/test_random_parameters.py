@@ -48,6 +48,18 @@ def _step(population):
     population.t = population.t + DT
 
 
+@pytest.mark.parametrize("enabled", (False, True))
+def test_random_distribution_diagnostics_retain_the_lowering_policy(enabled):
+    from dendra.func._random_parameters import RandomParameterPlan
+
+    source = _population()
+    with dn.ctx(CHECK_PURITY=enabled):
+        plan = RandomParameterPlan(source)
+    with dn.ctx(CHECK_PURITY=not enabled):
+        plan.validate_source()
+    assert plan.check_purity is enabled
+
+
 def test_random_snapshot_step_uses_retained_samples_and_has_native_gradients():
     source, native = _population(), _population()
     functional, tensors = dn.func.make_functional(source, dt=DT)
@@ -503,7 +515,10 @@ class _MutatingLeak(Mechanism):
 def test_custom_distribution_cannot_mutate_its_explicit_draw_inputs():
     source = _population(_MutatingLeak)
     saved = source.mech._MutatingLeak.g.clone()
-    with pytest.raises(dn.func.FunctionalizationError, match="in-place|mutated"):
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(dn.func.FunctionalizationError, match="in-place|mutated"),
+    ):
         dn.func.make_functional(source, dt=DT)
     torch.testing.assert_close(source.mech._MutatingLeak.g, saved)
 

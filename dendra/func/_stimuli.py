@@ -20,7 +20,7 @@ import numpy as np
 import torch
 from torch.func import functional_call
 
-from dendra.helpers import op_mc, op_sc
+from dendra.helpers import current_check_purity, op_mc, op_sc
 from dendra.models.core import Population
 from dendra.models.parametric import SimpleParameterized, cacheable
 from dendra.models.stim.intra import (
@@ -295,14 +295,48 @@ def _strict_state_signature(value: Any, *, label: str) -> Any:
     )
 
 
+def _trusted_state_signature(value: Any) -> Any:
+    """Retain recipe structure without inspecting hidden numerical state."""
+    if value is None or isinstance(value, (bool, int, float, complex, str)):
+        return value
+    if isinstance(value, (torch.dtype, torch.device)):
+        return (type(value).__name__, str(value))
+    if isinstance(value, slice):
+        return ("slice", value.start, value.stop, value.step)
+    if isinstance(value, torch.Generator):
+        return ("torch.Generator", str(value.device))
+    if isinstance(value, np.generic):
+        return (type(value).__name__, str(value.dtype), value.item())
+    if isinstance(value, np.ndarray):
+        return ("ndarray", tuple(value.shape), str(value.dtype))
+    if isinstance(value, (tuple, list)):
+        return (
+            type(value).__name__,
+            tuple(_trusted_state_signature(item) for item in value),
+        )
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                (_trusted_state_signature(key), _trusted_state_signature(item))
+                for key, item in value.items()
+            ),
+        )
+    return ("opaque", type(value), id(value))
+
+
 def _module_python_state_signature(
-    module: torch.nn.Module, label: str
+    module: torch.nn.Module, label: str, *, check_purity: bool = True
 ) -> tuple[Any, ...]:
     state = []
     for name, value in sorted(vars(module).items()):
         if _is_internal_module_state(module, name):
             continue
         if name == "_cache" and isinstance(module, cacheable):
+            continue
+        if not check_purity:
+            if not isinstance(value, torch.nn.Module):
+                state.append((name, _trusted_state_signature(value)))
             continue
         if name == "_cache":
             raise FunctionalizationError(
@@ -319,14 +353,18 @@ def _module_python_state_signature(
     return tuple(state)
 
 
-def _validate_waveform_contract(waveform: Waveform, label: str) -> None:
+def _validate_waveform_contract(
+    waveform: Waveform, label: str, *, check_purity: bool | None = None
+) -> None:
     """Validate hooks, determinism capability, and callable instance state.
 
-    Every behavior-defining Waveform class, including Dendra's built-ins, must
-    opt in explicitly with ``FUNCTIONAL_PURE = True`` on that exact concrete
-    class.
+    Optional diagnostics require ``FUNCTIONAL_PURE = True`` on each concrete
+    Waveform class. Canonical dispatch and registered hooks remain structural
+    execution contracts in either mode.
     """
 
+    if check_purity is None:
+        check_purity = current_check_purity()
     hook_attributes = (
         "_forward_pre_hooks",
         "_forward_hooks",
@@ -349,6 +387,8 @@ def _validate_waveform_contract(waveform: Waveform, label: str) -> None:
                     "gradient hooks; functional stimulation currently fails "
                     "closed on hooks."
                 )
+        if not check_purity:
+            continue
         if bool(getattr(module, "randomize_every_call", False)):
             raise FunctionalizationError(
                 f"Waveform {module_label!r} randomizes its Poisson schedule on "
@@ -584,11 +624,15 @@ class _FunctionalWaveformBank:
         namespace: str,
         device: torch.device,
         dtype: torch.dtype,
+        check_purity: bool | None = None,
     ):
         self._namespace = namespace.rstrip(".")
         self._device = device
         self._dtype = dtype
         self._sources = tuple(waveforms)
+        self._check_purity = (
+            current_check_purity() if check_purity is None else check_purity
+        )
 
         clones = []
         for index, waveform in enumerate(self._sources):
@@ -597,7 +641,9 @@ class _FunctionalWaveformBank:
                     f"waveform {index} has type {type(waveform).__name__}; "
                     "expected Waveform"
                 )
-            _validate_waveform_contract(waveform, f"waveforms.{index}")
+            _validate_waveform_contract(
+                waveform, f"waveforms.{index}", check_purity=self._check_purity
+            )
             try:
                 clone = copy.deepcopy(waveform)
             except Exception as exc:  # pragma: no cover - custom Waveform detail
@@ -615,12 +661,13 @@ class _FunctionalWaveformBank:
                 if isinstance(module, cacheable) and not isinstance(module, Waveform):
                     module.clear_cache()
                     module.training = True
-            _audit_waveform_purity(
-                clone,
-                label=f"waveforms.{index}",
-                device=device,
-                dtype=dtype,
-            )
+            if self._check_purity:
+                _audit_waveform_purity(
+                    clone,
+                    label=f"waveforms.{index}",
+                    device=device,
+                    dtype=dtype,
+                )
             clones.append(clone)
 
         self._bank = _WaveformBank(clones)
@@ -1031,13 +1078,18 @@ def _tensor_content_signature(value: torch.Tensor) -> tuple[Any, ...]:
     return (_shape(value), value.dtype, hashlib.sha256(payload).hexdigest())
 
 
-def _waveform_layout_signature(waveform: Waveform) -> tuple[Any, ...]:
+def _waveform_layout_signature(
+    waveform: Waveform, *, check_purity: bool | None = None
+) -> tuple[Any, ...]:
+    if check_purity is None:
+        check_purity = current_check_purity()
     modules = []
     for path, module in waveform.named_modules():
         module_label = "waveform" if not path else f"waveform.{path}"
         static = _module_python_state_signature(
             module,
             module_label,
+            check_purity=check_purity,
         )
         modules.append(
             (
@@ -1066,7 +1118,9 @@ def _solver_injection_specs(population: Population):
     return [spec for spec, claimed in zip(injections, accepted) if not claimed]
 
 
-def _injection_signature(population: Population) -> tuple[Any, ...]:
+def _injection_signature(
+    population: Population, *, check_purity: bool = True
+) -> tuple[Any, ...]:
     accepted = list(getattr(population, "mechanism_injection_accepted", ()))
     injections = list(getattr(population, "injections", ()))
     if len(accepted) < len(injections):
@@ -1074,7 +1128,7 @@ def _injection_signature(population: Population) -> tuple[Any, ...]:
     return tuple(
         (
             id(waveform),
-            _waveform_layout_signature(waveform),
+            _waveform_layout_signature(waveform, check_purity=check_purity),
             tuple(int(size) for size in registered_shape),
             _index_signature(index),
             bool(claimed),
@@ -1092,14 +1146,19 @@ class FunctionalIntra(_FunctionalStimulus):
     solver-owned injection is registered.
     """
 
-    def __init__(self, population: Population):
+    def __init__(self, population: Population, *, _check_purity: bool | None = None):
         shape, batch_shape, device, dtype = _population_contract(population)
         self._shape = shape
         self._batch_shape = batch_shape
         self._device = device
         self._dtype = dtype
         self._population = population
-        self._source_signature = _injection_signature(population)
+        self._check_purity = (
+            current_check_purity() if _check_purity is None else _check_purity
+        )
+        self._source_signature = _injection_signature(
+            population, check_purity=self._check_purity
+        )
         self._token = object()
 
         specs = _solver_injection_specs(population)
@@ -1137,6 +1196,7 @@ class FunctionalIntra(_FunctionalStimulus):
             namespace="stimulation.intra",
             device=device,
             dtype=dtype,
+            check_purity=self._check_purity,
         )
         self._parameter_schema = self._waveforms.parameter_schema
         self._constant_schema = self._waveforms.constant_schema
@@ -1151,7 +1211,10 @@ class FunctionalIntra(_FunctionalStimulus):
                 for canonical in self._indices
             ),
             self._selected_batch_shapes,
-            tuple(_waveform_layout_signature(waveform) for waveform in waveforms),
+            tuple(
+                _waveform_layout_signature(waveform, check_purity=self._check_purity)
+                for waveform in waveforms
+            ),
             tuple(self._parameter_schema.items()),
             tuple(self._constant_schema.items()),
         )
@@ -1174,7 +1237,10 @@ class FunctionalIntra(_FunctionalStimulus):
         )
 
     def _validate_source(self) -> None:
-        if _injection_signature(self._population) != self._source_signature:
+        if (
+            _injection_signature(self._population, check_purity=self._check_purity)
+            != self._source_signature
+        ):
             raise FunctionalizationError(
                 "Population injection structure changed after FunctionalIntra "
                 "was created; lower the Population again."
@@ -1184,7 +1250,7 @@ class FunctionalIntra(_FunctionalStimulus):
         self, population: Population | None = None
     ) -> dict[str, torch.Tensor]:
         if population is not None and population is not self._population:
-            candidate = FunctionalIntra(population)
+            candidate = FunctionalIntra(population, _check_purity=self._check_purity)
             if not self.is_compatible(candidate):
                 raise FunctionalizationError(
                     "Population injection topology or Waveform structure does "
@@ -1196,7 +1262,7 @@ class FunctionalIntra(_FunctionalStimulus):
 
     def extract(self, population: Population | None = None) -> StimulusTensors:
         if population is not None and population is not self._population:
-            candidate = FunctionalIntra(population)
+            candidate = FunctionalIntra(population, _check_purity=self._check_purity)
             if not self.is_compatible(candidate):
                 raise FunctionalizationError(
                     "Population injection topology or Waveform structure does "
@@ -1409,6 +1475,7 @@ class FunctionalExtra(_FunctionalStimulus):
         self._dtype = dtype
         self._token = object()
         self._namespace = namespace.rstrip(".")
+        self._check_purity = current_check_purity()
         pairs = _parse_extra(extra)
         self._pairs = tuple(pairs)
         self._enabled = extra is not None
@@ -1430,6 +1497,7 @@ class FunctionalExtra(_FunctionalStimulus):
             namespace=self._namespace,
             device=device,
             dtype=dtype,
+            check_purity=self._check_purity,
         )
 
         parameter_schema = self._waveforms.parameter_schema

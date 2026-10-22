@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 from torch.utils import _pytree
 
+from dendra.helpers import current_check_purity
 from dendra.models.random_parameters import get_random_distribution
 from dendra.models.rng import RNGModule
 
@@ -142,6 +143,7 @@ class RuntimeNoisePlan:
         )
 
         self.population = population
+        self.check_purity = current_check_purity()
         self.declarations = noise_declarations(population)
         self.streams, identities = stream_inventory(population)
         self._stream_topology = _stream_topology(population)
@@ -158,20 +160,26 @@ class RuntimeNoisePlan:
                 raise FunctionalizationError(
                     f"NOISE distribution {spec.distribution!r} requires a pure draw_sampler and transform contract"
                 )
-            signatures = tuple(
-                _initialization_callable_dependency_signature(
-                    fn,
-                    label=f"NOISE {spec.distribution}.{label}",
-                    owner=owner,
-                    strict=True,
+            signatures = (
+                tuple(
+                    _initialization_callable_dependency_signature(
+                        fn,
+                        label=f"NOISE {spec.distribution}.{label}",
+                        owner=owner,
+                        strict=True,
+                    )
+                    for label, fn in (
+                        ("draw_sampler", distribution.draw_sampler),
+                        ("transform", distribution.transform),
+                    )
                 )
-                for label, fn in (
-                    ("draw_sampler", distribution.draw_sampler),
-                    ("transform", distribution.transform),
-                )
+                if self.check_purity
+                else ()
             )
             value = owner._buffers[name]
-            snapshot = _global_rng_snapshot(population.device())
+            snapshot = (
+                _global_rng_snapshot(population.device()) if self.check_purity else None
+            )
             try:
                 draw = sample_runtime_noise_draw(
                     spec,
@@ -181,8 +189,13 @@ class RuntimeNoisePlan:
                     dtype=value.dtype,
                 )
             finally:
-                changes = _global_rng_changes(snapshot, population.device())
-                _restore_global_rng(snapshot, population.device())
+                changes = (
+                    _global_rng_changes(snapshot, population.device())
+                    if self.check_purity
+                    else ()
+                )
+                if self.check_purity:
+                    _restore_global_rng(snapshot, population.device())
             if changes:
                 raise FunctionalizationError(
                     "NOISE draw sampler consumed global RNG; use its explicit RNGModule"
@@ -209,17 +222,29 @@ class RuntimeNoisePlan:
                 *_pytree.tree_leaves(audit_draw),
                 audit_dt,
             )
-            versions = tuple(_audit_tensor_binding(leaf) for leaf in audited)
-            snapshot = _global_rng_snapshot(population.device())
+            versions = (
+                tuple(_audit_tensor_binding(leaf) for leaf in audited)
+                if self.check_purity
+                else None
+            )
+            snapshot = (
+                _global_rng_snapshot(population.device()) if self.check_purity else None
+            )
             try:
                 probe = evaluate_runtime_noise(
                     spec, audit_parameters, audit_draw, dt=audit_dt
                 )
             finally:
-                changes = _global_rng_changes(snapshot, population.device())
-                _restore_global_rng(snapshot, population.device())
-            if changes or versions != tuple(
-                _audit_tensor_binding(leaf) for leaf in audited
+                changes = (
+                    _global_rng_changes(snapshot, population.device())
+                    if self.check_purity
+                    else ()
+                )
+                if self.check_purity:
+                    _restore_global_rng(snapshot, population.device())
+            if changes or (
+                versions is not None
+                and versions != tuple(_audit_tensor_binding(leaf) for leaf in audited)
             ):
                 raise FunctionalizationError(
                     "NOISE transform must preserve its explicit parameters, draws, dt, and global RNG state"
@@ -272,6 +297,8 @@ class RuntimeNoisePlan:
 
     def initialization_failures(self):
         """Audit preparation hooks against initialization-only NOISE phases."""
+        if not self.check_purity:
+            return ()
         from ._population import (
             _derived_buffer_names,
             _initialization_callable_dependency_signature,
@@ -342,17 +369,21 @@ class RuntimeNoisePlan:
                 raise FunctionalizationError(
                     "NOISE RNG stream binding changed; lower the Population again"
                 )
-            current = tuple(
-                _initialization_callable_dependency_signature(
-                    fn,
-                    label=f"NOISE {entry.spec.distribution}.{label}",
-                    owner=owner,
-                    strict=True,
+            current = (
+                tuple(
+                    _initialization_callable_dependency_signature(
+                        fn,
+                        label=f"NOISE {entry.spec.distribution}.{label}",
+                        owner=owner,
+                        strict=True,
+                    )
+                    for label, fn in (
+                        ("draw_sampler", distribution.draw_sampler),
+                        ("transform", distribution.transform),
+                    )
                 )
-                for label, fn in (
-                    ("draw_sampler", distribution.draw_sampler),
-                    ("transform", distribution.transform),
-                )
+                if self.check_purity
+                else ()
             )
             if (
                 distribution.draw_sampler is not sampler
@@ -452,7 +483,8 @@ class RuntimeNoisePlan:
                     value._version
                     for value in (*parameters.values(), *_pytree.tree_leaves(draw))
                 )
-                if not torch.compiler.is_compiling()
+                if self.check_purity
+                and not torch.compiler.is_compiling()
                 and not torch._C._are_functorch_transforms_active()
                 and not any(
                     torch.is_inference(value)

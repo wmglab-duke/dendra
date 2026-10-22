@@ -190,8 +190,23 @@ def test_noise_transform_cannot_mutate_draws():
         )
 
     population = _population(MutatingNoise)
-    with pytest.raises(dn.func.FunctionalizationError, match="NOISE.*transform"):
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(dn.func.FunctionalizationError, match="NOISE.*transform"),
+    ):
         dn.func.make_functional(population, dt=DT)
+
+
+@pytest.mark.parametrize("enabled", (False, True))
+def test_noise_distribution_diagnostics_retain_the_lowering_policy(enabled):
+    from dendra.func._runtime_noise import RuntimeNoisePlan
+
+    source = _population()
+    with dn.ctx(CHECK_PURITY=enabled):
+        plan = RuntimeNoisePlan(source)
+    with dn.ctx(CHECK_PURITY=not enabled):
+        plan.validate_source()
+    assert plan.check_purity is enabled
 
 
 @pytest.mark.parametrize("builder", ("derived", "timestep"))
@@ -210,9 +225,10 @@ def test_noise_dependent_builders_fail_closed_for_fresh_initialization(builder):
         def derive_timestep_buffers(self, dt):
             return {"coefficient": self.eta * dt}
 
-    functional, tensors = dn.func.make_functional(
-        _population(DerivedNoise if builder == "derived" else TimestepNoise), dt=DT
-    )
+    with dn.ctx(CHECK_PURITY=True):
+        functional, tensors = dn.func.make_functional(
+            _population(DerivedNoise if builder == "derived" else TimestepNoise), dt=DT
+        )
     functional.prepare_and_step(
         tensors.parameters,
         tensors.constants,

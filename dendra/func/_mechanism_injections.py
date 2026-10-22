@@ -11,6 +11,7 @@ from types import MethodType
 import numpy as np
 import torch
 
+from dendra.helpers import current_check_purity
 from dendra.models.mechanisms import Mechanism, _injections
 from dendra.models.parametric import cacheable
 from dendra.models.stim.waveform import Waveform
@@ -280,24 +281,25 @@ def mechanism_injection_failures(owner):
     return tuple(failures)
 
 
-def _waveform_behavior(waveform):
+def _waveform_behavior(waveform, *, check_purity=False):
     from ._population import (
-        _initialization_callable_dependency_signature,
+        _initialization_callable_contract_signature,
         _transform_structure_signature,
     )
 
     return (
-        _waveform_layout_signature(waveform),
-        _transform_structure_signature(waveform, strict=False),
+        _waveform_layout_signature(waveform, check_purity=check_purity),
+        _transform_structure_signature(waveform, strict=False) if check_purity else (),
         tuple(
             (
                 path,
                 name,
-                _initialization_callable_dependency_signature(
+                _initialization_callable_contract_signature(
                     getattr(module, name),
                     label=f"injected_waveform.{path}.{name}",
                     owner=module,
                     strict=False,
+                    diagnostic=check_purity,
                 ),
             )
             for path, module in waveform.named_modules()
@@ -307,9 +309,36 @@ def _waveform_behavior(waveform):
     )
 
 
-def _waveform_bindings(waveform):
+def _waveform_bindings(waveform, *, check_purity=False):
     """Expose code/global identities without inspection or tensor extraction."""
     from ._population import _module_autograd_hook_signature
+
+    if not check_purity:
+        return (
+            id(waveform),
+            _waveform_layout_signature(waveform, check_purity=False),
+            tuple(
+                (
+                    path,
+                    id(module),
+                    tuple(
+                        (
+                            name,
+                            _binding(getattr(type(module), name, None)),
+                            _binding(vars(module).get(name)),
+                        )
+                        for name in (
+                            *_WAVEFORM_MODULE_DISPATCH,
+                            "forward",
+                            "fn",
+                            "_compute",
+                        )
+                    ),
+                    _module_autograd_hook_signature(module),
+                )
+                for path, module in waveform.named_modules()
+            ),
+        )
 
     def routine(value, seen):
         target = getattr(value, "__func__", value)
@@ -351,7 +380,7 @@ def _waveform_bindings(waveform):
 
     return (
         id(waveform),
-        _waveform_layout_signature(waveform),
+        _waveform_layout_signature(waveform, check_purity=check_purity),
         tuple(
             (
                 path,
@@ -707,7 +736,7 @@ def _population_ownership(population, *, validate):
     return tuple(records)
 
 
-def _contract(population):
+def _contract(population, *, check_purity=False):
     records = []
     owners = mechanism_injection_owners(population)
     for path, owner in owners:
@@ -715,8 +744,11 @@ def _contract(population):
         if failures:
             raise FunctionalizationError("; ".join(failures))
         for waveform in owner.injected_waveforms:
-            _validate_waveform_contract(waveform, "mechanism injection")
-            _validate_waveform_class_configuration(waveform)
+            _validate_waveform_contract(
+                waveform, "mechanism injection", check_purity=check_purity
+            )
+            if check_purity:
+                _validate_waveform_class_configuration(waveform)
         records.append(
             (
                 path,
@@ -729,7 +761,7 @@ def _contract(population):
                     for name, value in mechanism_injection_constant_slots(owner)
                 ),
                 tuple(
-                    _waveform_behavior(waveform)
+                    _waveform_behavior(waveform, check_purity=check_purity)
                     for waveform in owner.injected_waveforms
                 ),
             )
@@ -742,11 +774,12 @@ def _contract(population):
 
 
 class MechanismInjectionPlan:
-    """Audit authored waveforms and freeze injection ownership and routing."""
+    """Freeze ownership and routing, with optional authored purity diagnostics."""
 
     def __init__(self, population):
         self.population = population
-        self.contract = _contract(population)
+        self.check_purity = current_check_purity()
+        self.contract = _contract(population, check_purity=self.check_purity)
         self.constant_entries = tuple(
             (path, name, value.detach().clone())
             for path, owner in mechanism_injection_owners(population)
@@ -777,12 +810,16 @@ class MechanismInjectionPlan:
             _restore_class_state,
         )
 
-        for _path, owner in mechanism_injection_owners(population):
+        for _path, owner in (
+            mechanism_injection_owners(population) if self.check_purity else ()
+        ):
             for waveform in owner.injected_waveforms:
                 if id(waveform) in audited:
                     continue
                 audited.add(id(waveform))
-                _validate_waveform_contract(waveform, "mechanism injection")
+                _validate_waveform_contract(
+                    waveform, "mechanism injection", check_purity=self.check_purity
+                )
                 _validate_waveform_dependencies(waveform)
                 class_state = _class_state_snapshot(
                     _authored_workspace_classes(waveform)
@@ -822,7 +859,7 @@ class MechanismInjectionPlan:
         configure_mechanism_injection_execution(population)
 
     def validate_population(self, population, *, source=False):
-        if _contract(population) != self.contract:
+        if _contract(population, check_purity=self.check_purity) != self.contract:
             raise FunctionalizationError(
                 "Mechanism injection ownership, layout, waveform behavior, or aliases changed; lower again"
             )
@@ -876,7 +913,7 @@ class MechanismInjectionPlan:
                     if not _metadata_failures(owner)
                     else (),
                     tuple(
-                        _waveform_bindings(waveform)
+                        _waveform_bindings(waveform, check_purity=self.check_purity)
                         for waveform in owner.injected_waveforms
                     ),
                 )

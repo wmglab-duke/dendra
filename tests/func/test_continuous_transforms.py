@@ -19,6 +19,12 @@ from tests.func.test_continuous_con import DTYPE, _clone, _close, _connection
 pytestmark = pytest.mark.cpu
 
 
+@pytest.fixture(autouse=True)
+def _diagnostic_purity_checks():
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 def _signed_square(value):
     return value * value.abs()
 
@@ -37,6 +43,29 @@ def _immutable_closure():
         return torch.sin(value * scale) + offsets[0] + offsets[1]
 
     return transform
+
+
+def test_default_transform_plan_skips_probes_and_keeps_its_policy(monkeypatch):
+    def unexpected_inventory(*args, **kwargs):
+        pytest.fail("default transform plan collected diagnostic dependency guards")
+
+    monkeypatch.setattr(
+        ContinuousTransformPlan, "_collect_guards", unexpected_inventory
+    )
+    calls = []
+
+    def transform(value):
+        calls.append("forward")
+        return value.square()
+
+    with dn.ctx(CHECK_PURITY=False):
+        plan = ContinuousTransformPlan(transform, size=3, device="cpu", dtype=DTYPE)
+    assert calls == []
+    values = torch.linspace(-0.5, 0.5, 3, dtype=DTYPE)
+    with dn.ctx(CHECK_PURITY=True):
+        plan.validate_source(transform)
+        torch.testing.assert_close(plan.apply(values, None), values.square())
+    assert calls == ["forward"]
 
 
 class _AffineGate(torch.nn.Module):
@@ -247,9 +276,13 @@ def test_read_only_transform_packet_preserves_tied_native_parameter_gradients():
 
 
 @pytest.mark.parametrize("backend", ("aot_eager", "inductor"))
-def test_compiled_generic_module_parameters_buffers_and_pending_gradients(backend):
-    _, native = _connection(transform=_AffineGate())
-    projection, tensors = dn.func.make_functional_continuous_con(native)
+@pytest.mark.parametrize("check_purity", (False, True))
+def test_compiled_generic_module_parameters_buffers_and_pending_gradients(
+    backend, check_purity
+):
+    with dn.ctx(CHECK_PURITY=check_purity):
+        _, native = _connection(transform=_AffineGate())
+        projection, tensors = dn.func.make_functional_continuous_con(native)
     weights = tensors.weights.detach().requires_grad_()
     values = torch.tensor([[-0.8], [0.6]], dtype=DTYPE, requires_grad=True)
     parameters = {

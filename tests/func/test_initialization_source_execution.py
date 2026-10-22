@@ -440,6 +440,7 @@ class _MutatingInitializer(_AffineInitializer):
 
 
 @pytest.mark.cpu
+@dn.ctx(CHECK_PURITY=True)
 def test_unsupported_init_only_source_preserves_snapshot_transition_admission():
     source = _population(source=_MutatingInitializer())
     native = copy.deepcopy(source)

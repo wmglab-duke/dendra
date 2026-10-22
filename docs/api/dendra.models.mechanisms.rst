@@ -599,8 +599,9 @@ Material/Ion guards and derived-field updates run afterward.
 
 Material processes have a deliberately separate authoring contract from local
 Mechanisms. Declare process parameters with ``GLOBAL``, ``RANGE``, or ``BATCH``
-and material dependencies with the concrete family declaration (for example,
-``DIFFUSE``, ``CLEAR``, ``CLAMP``, or ``EXCHANGE``). Ordinary Mechanism state,
+and material dependencies with ``material_fields`` or a concrete family
+declaration (for example, ``DIFFUSE``, ``CLEAR``, ``CLAMP``, or ``EXCHANGE``).
+Ordinary Mechanism state,
 current, ion/material-use, and workspace declarations are rejected with an
 error because the material scheduler does not run those phases.
 
@@ -628,22 +629,37 @@ schemas, not evolving field values. State-dependent reactions belong in
 local synchronization belong to the surrounding framework transaction. This
 protocol does not introduce ordinary Mechanism ``STATE``, ``CARRY``,
 ``DERIVED_BUFFER``, or ``TIMESTEP_BUFFER`` phases for MaterialProcesses.
+Functional lowering trusts the authored purity contract by default.
+``dn.ctx(CHECK_PURITY=True)`` enables diagnostic dependency and evaluation
+checks for plans created in the context. Existing plans retain their captured
+mode; required tensor schemas, field layouts, and lifecycle checks remain
+active in either mode.
 
-``ClearanceProcess``, ``ClampProcess``, ``ExchangeProcess``, and ``DiffusionProcess`` use this shared
-numerical path in both imperative and functional execution. The imperative
-``advance_materials`` adapter still commits bound Material state;
-out-of-place arithmetic alone is not an admission contract for
-custom functional processes. ``dn.func`` admits declaration-driven
-Clearance/Clamp/Exchange/Diffusion subclasses with global or regional support
-and their canonical lifecycle, including concatenated ``MultiPopulation``
-components. Packed materials preserve independent chemical topology and
-component-local process parameters. Custom process runtime overrides remain
-unsupported by functional lowering.
+``ClearanceProcess``, ``ClampProcess``, ``ExchangeProcess``, ``DiffusionProcess``,
+and custom deterministic ``MaterialProcess`` subclasses use this shared
+numerical path in imperative and functional execution. A custom process
+implements the three pure hooks and inherits the canonical
+``configure_process``, ``set_dt``, and ``advance_materials`` lifecycle.
+Registered parameters and tensor buffers are explicit inputs. Prepared data
+must be a tensor-only PyTree with a fixed schema; an empty tuple represents
+no workspace. ``None`` is reserved by the native adapter. Returned replacements
+use a fixed subset of the declared field keys and match the complete input
+field's shape, dtype, and device. Custom imperative lifecycle overrides,
+process-level RAND/NOISE, implicit random draws, hidden tensor dependencies,
+and persistent mutation are currently unsupported by functional lowering.
+
+Global and regional insertion, including concatenated ``MultiPopulation``
+components, retain their native field layouts. Use
+``_resolve_quantity(name, like)`` for process-local parameter expansion and
+``_mask_material_updates(fields, updates)`` to preserve fields outside process
+and material support. Packed materials preserve independent chemical topology
+and component-local process parameters.
 No process is advanced during fresh initialization. Diffusion's imperative
 adapter retains cached numerical operators; functional execution retains only
 static topology and consumes explicit prepared numerical workspace.
-See :ref:`functional-material-processes` for recording, gradient, and
-continuation examples.
+See :ref:`functional-material-processes` for the built-in families and
+:ref:`functional-custom-material-processes` for a complete custom process,
+recording, gradients, and Network continuation.
 
 .. autoclass:: dendra.models.mechanisms.MaterialProcess
    :members: METHOD, PHASE, configure_process, set_dt, advance_materials, material_fields, prepare_materials, material_updates

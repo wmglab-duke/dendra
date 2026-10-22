@@ -21,6 +21,12 @@ INTRA_PREFIX = "stimulation.intra."
 EXTRA_PREFIX = "stimulation.extra."
 
 
+@pytest.fixture(autouse=True)
+def _diagnostic_purity_checks():
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 class _ModeAwarePureWaveform(Waveform):
     FUNCTIONAL_PURE = True
     Waveform.PARAMETERP(value=0.2)
@@ -927,6 +933,66 @@ def test_custom_waveforms_fail_closed_without_an_auditable_pure_contract(
 
     with pytest.raises(dn.func.FunctionalizationError, match=message):
         dn.func.make_functional(model, dt=DT)
+
+
+@pytest.mark.parametrize("callable_state", (False, True))
+def test_default_waveform_plan_trusts_contract_and_freezes_policy(
+    monkeypatch, callable_state
+):
+    from dendra.func import _stimuli
+
+    def unexpected_audit(*args, **kwargs):
+        pytest.fail("default stimulation lowering executed a purity probe")
+
+    monkeypatch.setattr(_stimuli, "_audit_waveform_purity", unexpected_audit)
+    model = _model()
+    waveform = (
+        _CallableStatePureWaveform(torch.sin)
+        if callable_state
+        else _UnmarkedCustomWaveform()
+    )
+    model[:, 1].inject(waveform)
+    with dn.ctx(CHECK_PURITY=False):
+        functional, _ = dn.func.make_functional(model, dt=DT)
+    other = _model()
+    other[:, 1].inject(
+        _CallableStatePureWaveform(torch.sin)
+        if callable_state
+        else _UnmarkedCustomWaveform()
+    )
+    with dn.ctx(CHECK_PURITY=True):
+        tensors = functional.intra.extract()
+        functional.intra.extract(other)
+        times = torch.tensor([START, START + DT], dtype=DTYPE)
+        drive = functional.intra.assemble(tensors.parameters, tensors.constants, times)
+    expected = torch.sin(times) if callable_state else torch.ones_like(times)
+    torch.testing.assert_close(
+        drive[..., 1], expected[:, None].expand(-1, model.v.shape[0])
+    )
+    torch.testing.assert_close(drive[..., 0], torch.zeros_like(drive[..., 0]))
+
+
+def test_default_fixed_poisson_layout_can_extract_an_equivalent_source():
+    models = []
+    for _ in range(2):
+        model = _model()
+        model[:, 1].inject(
+            dn.mono_rect(amp=0.2 * nA, pw=0.05).poisson(
+                interval=0.1,
+                n=3,
+                randomize_every_call=False,
+                generator=torch.Generator().manual_seed(12),
+            )
+        )
+        models.append(model)
+    with dn.ctx(CHECK_PURITY=False):
+        functional, _ = dn.func.make_functional(models[0], dt=DT)
+    with dn.ctx(CHECK_PURITY=True):
+        actual = functional.intra.extract(models[1])
+        expected = functional.intra.extract()
+    assert actual.parameters.keys() == expected.parameters.keys()
+    for name, value in actual.parameters.items():
+        torch.testing.assert_close(value, expected.parameters[name])
 
 
 def test_lowering_late_off_dtype_injection_does_not_move_the_source_waveform():

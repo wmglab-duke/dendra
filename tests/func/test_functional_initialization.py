@@ -12,6 +12,14 @@ from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.mechanisms import Mechanism
 from dendra.models.mod import hh, pas
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.01
 AM1 = "integrator.mech.mechanisms.hh.DE.mhn.am1_param"
 GNABAR = "integrator.mech.mechanisms.hh.gnabar_param"

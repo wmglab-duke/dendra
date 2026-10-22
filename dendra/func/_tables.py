@@ -8,6 +8,7 @@ from types import CodeType, MethodType
 
 import torch
 
+from dendra.helpers import current_check_purity
 from dendra.models import parametric
 from dendra.models.parametric import Parameterized
 from dendra.utils import PreparedInterp1d
@@ -325,8 +326,8 @@ def table_failures(owner):
     return tuple(failures)
 
 
-def _contract(population):
-    from ._population import _initialization_callable_dependency_signature
+def _contract(population, *, check_purity=False):
+    from ._population import _initialization_callable_contract_signature
 
     aliases = {}
     records = []
@@ -349,11 +350,12 @@ def _contract(population):
                 (
                     None
                     if getattr(owner, f"usetable_{name}")
-                    else _initialization_callable_dependency_signature(
+                    else _initialization_callable_contract_signature(
                         getattr(owner, f"{name}_original"),
                         label=f"TABLE {path}.{name}_original",
                         owner=owner,
-                        strict=True,
+                        strict=check_purity,
+                        diagnostic=check_purity,
                         include_identity=False,
                     )
                 ),
@@ -367,7 +369,8 @@ class TablePlan:
 
     def __init__(self, population):
         self.population = population
-        self.contract = _contract(population)
+        self.check_purity = current_check_purity()
+        self.contract = _contract(population, check_purity=self.check_purity)
         self._source_bindings = self._bindings(population)
 
     @staticmethod
@@ -387,7 +390,7 @@ class TablePlan:
         )
 
     def validate_population(self, population, *, source=False):
-        if _contract(population) != self.contract:
+        if _contract(population, check_purity=self.check_purity) != self.contract:
             raise FunctionalizationError(
                 "TABLE declarations, flags, interpolation layout, or authored helpers "
                 "changed; lower the Population again"

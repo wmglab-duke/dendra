@@ -44,3 +44,4 @@ Advanced
    advanced/A34_functional_mechanism_delays.md
    advanced/A35_functional_mechanism_injections.md
    advanced/A36_functional_initialization_sources.md
+   advanced/A37_functional_material_processes.md

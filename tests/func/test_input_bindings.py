@@ -16,6 +16,14 @@ from tests.func.test_functional_initialization import (
 )
 from tests.func.test_initialization_parity import _live_state
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.05
 STEPS = 4
 pytestmark = pytest.mark.cpu

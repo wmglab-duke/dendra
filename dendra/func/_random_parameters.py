@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import torch
 from torch.utils import _pytree
 
+from dendra.helpers import current_check_purity
 from dendra.models.networks._population_cache import restore_population_cache_values
 from dendra.models.parametric import Parameterized
 from dendra.models.random_parameters import (
@@ -73,7 +74,9 @@ def _rng_extra(values):
     }
 
 
-def _current_draw_leaves(distribution, rng, sample, captured_spec, captured_leaves):
+def _current_draw_leaves(
+    distribution, rng, sample, captured_spec, captured_leaves, *, check_purity=False
+):
     """Probe a target's draw schema without consuming its retained stream."""
     from ._population import (
         _global_rng_changes,
@@ -81,7 +84,7 @@ def _current_draw_leaves(distribution, rng, sample, captured_spec, captured_leav
         _restore_global_rng,
     )
 
-    snapshot = _global_rng_snapshot(sample.device)
+    snapshot = _global_rng_snapshot(sample.device) if check_purity else None
     try:
         draw = sample_random_parameter_draw(
             distribution,
@@ -91,8 +94,9 @@ def _current_draw_leaves(distribution, rng, sample, captured_spec, captured_leav
             dtype=sample.dtype,
         )
     finally:
-        changes = _global_rng_changes(snapshot, sample.device)
-        _restore_global_rng(snapshot, sample.device)
+        changes = _global_rng_changes(snapshot, sample.device) if check_purity else ()
+        if check_purity:
+            _restore_global_rng(snapshot, sample.device)
     if changes:
         raise FunctionalizationError(
             f"RAND draw sampler consumed global RNG state {sorted(changes)}; use its explicit RNGModule"
@@ -184,6 +188,7 @@ class RandomParameterPlan:
 
     def __init__(self, population):
         self.population = population
+        self.check_purity = current_check_purity()
         self._declarations = _declaration_signature(population)
         self.entries = []
         from ._runtime_noise import _stream_topology, stream_inventory
@@ -221,17 +226,21 @@ class RandomParameterPlan:
                 raise FunctionalizationError(
                     f"RAND distribution {spec.distribution!r} requires a pure draw_sampler and transform contract"
                 )
-            signatures = tuple(
-                _initialization_callable_dependency_signature(
-                    function,
-                    label=f"RAND {spec.distribution}.{label}",
-                    owner=owner,
-                    strict=True,
+            signatures = (
+                tuple(
+                    _initialization_callable_dependency_signature(
+                        function,
+                        label=f"RAND {spec.distribution}.{label}",
+                        owner=owner,
+                        strict=True,
+                    )
+                    for label, function in (
+                        ("draw_sampler", distribution.draw_sampler),
+                        ("transform", distribution.transform),
+                    )
                 )
-                for label, function in (
-                    ("draw_sampler", distribution.draw_sampler),
-                    ("transform", distribution.transform),
-                )
+                if self.check_purity
+                else ()
             )
             self._signatures.append(signatures)
             draw = getattr(owner, "_random_parameter_draws", {}).get(name)
@@ -267,7 +276,14 @@ class RandomParameterPlan:
             self.streams.setdefault(stream, (path, spec.effective_rng_name))
             self._rng_bindings.setdefault(stream, rng)
             sample = owner._buffers[name]
-            leaves = _current_draw_leaves(distribution, rng, sample, draw_spec, leaves)
+            leaves = _current_draw_leaves(
+                distribution,
+                rng,
+                sample,
+                draw_spec,
+                leaves,
+                check_purity=self.check_purity,
+            )
             draw_names = tuple(f"random.draws.{key}.{i}" for i in range(len(leaves)))
             parameter_names = tuple(f"random.parameters.{key}.{p}" for p in spec.params)
             entry = _RandomEntry(
@@ -372,17 +388,21 @@ class RandomParameterPlan:
                 raise FunctionalizationError(
                     "RAND distribution contract changed; lower the Population again"
                 )
-            signatures = tuple(
-                _initialization_callable_dependency_signature(
-                    function,
-                    label=f"RAND {spec.distribution}.{label}",
-                    owner=owners[path],
-                    strict=True,
+            signatures = (
+                tuple(
+                    _initialization_callable_dependency_signature(
+                        function,
+                        label=f"RAND {spec.distribution}.{label}",
+                        owner=owners[path],
+                        strict=True,
+                    )
+                    for label, function in (
+                        ("draw_sampler", current.draw_sampler),
+                        ("transform", current.transform),
+                    )
                 )
-                for label, function in (
-                    ("draw_sampler", current.draw_sampler),
-                    ("transform", current.transform),
-                )
+                if self.check_purity
+                else ()
             )
             if signatures != self._signatures[index]:
                 raise FunctionalizationError(
@@ -791,7 +811,7 @@ class RandomParameterPlan:
         self.publish_commit(population, self.prepare_commit(population, state))
 
 
-def materialize_random_parameters(owner, path, values, inputs):
+def materialize_random_parameters(owner, path, values, inputs, *, check_purity=False):
     """Pure distribution evaluation; owner writes remain inside functional_call."""
     from dendra.models.random_parameters import evaluate_random_parameter
 
@@ -807,7 +827,8 @@ def materialize_random_parameters(owner, path, values, inputs):
         arguments = (*selected.values(), *_pytree.tree_leaves(draw))
         versions = (
             tuple(value._version for value in arguments)
-            if not torch.compiler.is_compiling()
+            if check_purity
+            and not torch.compiler.is_compiling()
             and not torch._C._are_functorch_transforms_active()
             and not any(torch.is_inference(value) for value in arguments)
             else None

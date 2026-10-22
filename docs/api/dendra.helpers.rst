@@ -3,6 +3,22 @@ dendra.helpers
 
 Context
 -------
+
+Functional execution trusts user-authored pure hooks by default. Enable
+optional diagnostics while creating a plan or compiled runner:
+
+.. code-block:: python
+
+   with dn.ctx(CHECK_PURITY=True):
+       runner = dn.compile(network, dt=0.025, steps=100)
+
+``CHECK_PURITY`` defaults to ``False``. The plan captures this setting when it
+is created; changing the context does not change an existing plan. Diagnostic
+checks can identify mutation, implicit randomness, and hidden dependencies in
+supported hooks, but do not prove purity for every input. Tensor schemas,
+layouts, explicit bindings, and lifecycle requirements remain checked in both
+modes. Recreate a plan inside the context to diagnose an existing model.
+
 .. autoclass:: dendra.helpers.ctx
    :members:
 

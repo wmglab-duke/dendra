@@ -91,6 +91,12 @@ update a lookup workspace or mutate the source table during evaluation.
 Ordinary Native and functional checkpoint/continuation rules still apply;
 no additional table input packet is required.
 
+Keep authored table methods deterministic and read-only. Functional lowering
+trusts this contract by default; creating a plan inside
+`with dn.ctx(CHECK_PURITY=True):` enables diagnostic purity checks. Registered
+table bindings, grid layout, and returned tensor schemas retain their required
+validation in either mode.
+
 ## Initialize and continue a Network
 
 Snapshot initialization starts from the captured Population states. Fresh

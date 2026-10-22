@@ -342,7 +342,7 @@ def test_make_functional_rejects_unlowered_material_process_workspaces():
         MaterialProcess.GLOBAL(D=0.125)
 
         def advance_materials(self, dt):
-            # Arbitrary lifecycle hooks are not declaration-driven admission.
+            # Custom processes use pure field hooks and the shared lifecycle.
             return None
 
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
@@ -366,7 +366,7 @@ def test_make_functional_rejects_unlowered_material_process_workspaces():
 
     with pytest.raises(
         dn.func.FunctionalizationError,
-        match="MaterialProcesses.*workspaces",
+        match="Custom MaterialProcess replaces canonical lifecycle adapter 'advance_materials'",
     ):
         dn.func.make_functional(model, dt=DT)
 

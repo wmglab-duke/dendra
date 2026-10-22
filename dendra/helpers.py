@@ -49,6 +49,13 @@ class ctx(contextlib.ContextDecorator):
       dictionary forwarded to supported compiled kernels.
     - ``DEBUG`` (int/bool): increase logging verbosity for mechanism/state
       compilation (symbolic transforms, conductance differentiation).
+    - ``CHECK_PURITY`` (bool/int): opt into diagnostic purity checking when
+      lowering or compiling functional models. The default is ``False``:
+      Dendra trusts authored hooks to obey their pure API contracts. ``True``
+      inspects dependencies and probes disposable execution copies for hidden
+      mutation and implicit randomness. Tensor schemas and binding contracts
+      required for execution remain checked in both modes. Plans retain the
+      policy selected when they are lowered.
     - ``DEVICE`` (str/torch.device/None): default device for newly constructed
       Dendra modules and eligible PyTorch factory calls without an explicit
       ``device``.
@@ -146,6 +153,8 @@ class ctx(contextlib.ContextDecorator):
                 v = normalize_membrane_assembly(v)
             elif key == "PRESERVE_MECHANISM_POPULATION_AXIS":
                 v = normalize_preserve_mechanism_population_axis(v)
+            elif key == "CHECK_PURITY":
+                v = normalize_check_purity(v)
             elif key == "DEVICE":
                 torch_defaults[key] = _normalize_device_value(
                     v, default=torch.device("cpu")
@@ -529,6 +538,26 @@ def current_preserve_mechanism_population_axis() -> bool | None:
     )
 
 
+def normalize_check_purity(value) -> bool:
+    """Normalize the opt-in functional purity diagnostic policy."""
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "default", "false", "0"}:
+            return False
+        if normalized in {"true", "1"}:
+            return True
+    raise ValueError(f"CHECK_PURITY must be True, False, 1, or 0; got {value!r}.")
+
+
+def current_check_purity() -> bool:
+    """Return whether new functional plans enable optional purity diagnostics."""
+    return normalize_check_purity(CHECK_PURITY.value)
+
+
 # Backward-compatible context-key aliases. The exported variable
 # ``JIT_IN_NETWORK`` below points at ``JIT_NETWORK_SOLVES`` as well, but ctx()
 # needs a key-level alias so ``with dendra.ctx(JIT_IN_NETWORK=0): ...`` keeps
@@ -539,6 +568,8 @@ CONTEXT_ALIASES = {
 
 
 DEBUG = ContextVar("DEBUG", 0)
+CHECK_PURITY = ContextVar("CHECK_PURITY", "0")
+CHECK_PURITY.value = normalize_check_purity(CHECK_PURITY.value)
 DEVICE = ContextVar("DEVICE", "")
 DTYPE = ContextVar("DTYPE", "")
 TF32 = ContextVar("TF32", 0)

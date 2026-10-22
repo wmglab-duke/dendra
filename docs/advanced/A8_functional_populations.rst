@@ -390,8 +390,8 @@ Unsupported features raise ``dendra.func.FunctionalizationError`` during
 lowering. Current limitations include non-injective regional concentration or
 Material replacement writes and non-injective voltage replacement support,
 the reserved compact rowwise support encoding,
-MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
-families, delay-history resizing within
+MaterialProcesses with impure numerical hooks or custom imperative lifecycle
+overrides, delay-history resizing within
 captured execution,
 legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
@@ -488,8 +488,9 @@ schema. Read trainable parameters from ``self`` and evolving state from
 do not mutate ``self``, ``v``, or tensors in ``values``. The shared base
 ``update_v`` adapter commits these returned replacements during imperative
 execution; functional execution keeps them explicit. Ordinary Mechanism
-declarations and functional eligibility checks still apply, and the pure
-hooks undergo the same mutation/dependency audits as other functional hooks.
+declarations and functional eligibility checks still apply. Optional
+``CHECK_PURITY`` diagnostics apply the same mutation/dependency checks as for
+other functional hooks.
 An authored legacy ``update_v`` override remains usable imperatively but is
 rejected during functional lowering; it is not silently interpreted as pure.
 Nested State ``setreference`` properties and Tensor attributes outside the
@@ -656,8 +657,9 @@ frame contains explicit runtime state, prepared workspaces, geometry, shared
 fields, and nested ``values["state_carry"][state_name]`` carry frames.
 Ephemeral ``ASSIGNED`` scratch is excluded: derive event algebra in the pure
 hook from its explicit inputs, or declare ``CARRY`` when a value must persist
-between phases. Functional receivers also reject implicit reads of
-``ASSIGNED`` scratch through ``self``. Read parameters through ``self`` and
+between phases. Functional receivers must not read
+``ASSIGNED`` scratch implicitly through ``self``. Optional ``CHECK_PURITY``
+diagnostics check authored dependencies against this contract. Read parameters through ``self`` and
 return out-of-place updates. The standard ``net_receive`` adapter applies
 these same replacements during imperative execution. Legacy authored
 ``net_receive`` overrides retain their imperative behavior; explicit functional
@@ -749,10 +751,14 @@ Functional processes over Material fields
 -----------------------------------------
 
 Declaration-only ``ClearanceProcess``, ``ClampProcess``, ``ExchangeProcess``,
-and ``DiffusionProcess`` subclasses support functional transitions, fresh
+and ``DiffusionProcess`` subclasses, and deterministic custom
+``MaterialProcess`` implementations using the pure field hooks, support
+functional transitions, fresh
 initialization, and explicit-state continuation with global or regional
 insertion. This includes admitted individual and packed ``MultiPopulation``
 models, including finite-extracellular models.
+For a complete custom process, see
+:doc:`A37_functional_material_processes`.
 The existing ``CLEAR``/``DECAY``/``RELAX``, ``METHOD``, and ``PHASE`` declarations
 are unchanged; no extra functional annotations or voltage-local State are
 required. ``METHOD("exact")`` uses exponential relaxation,
@@ -810,17 +816,22 @@ updates, including Nernst reversals, run afterward, followed by local-field
 refresh. Fresh initialization applies its normal shared-field transaction but
 does not advance Material sources or processes at t=0.
 
-The tensor-only process preparation/update protocol is separate from ordinary
-Mechanism ``DERIVED_BUFFER``/``TIMESTEP_BUFFER`` declarations. Out-of-place
-arithmetic alone does not make an arbitrary ``advance_materials`` hook pure:
-the imperative adapter still commits bound Material state. Functional execution
-uses explicit field inputs and returned replacements instead. Functional
+Custom deterministic processes implement ``material_fields``,
+``prepare_materials(fields, dt)``, and ``material_updates(fields, prepared)``
+and inherit the canonical MaterialProcess lifecycle. This tensor-only protocol
+is separate from ordinary Mechanism
+``DERIVED_BUFFER``/``TIMESTEP_BUFFER`` declarations. The shared imperative
+``advance_materials`` adapter commits the returned full-field replacements;
+functional execution consumes those replacements as explicit state. Functional
 preparation runs outside the accepted-step loop and may depend on parameters,
 geometry, timestep, and field schemas, not evolving concentrations.
 State-dependent algebra belongs in the field-update computation.
 Regional insertion of the Clearance/Clamp/Exchange families uses the declared
-process support, intersected with material-field availability. Custom process
-lifecycle/update overrides remain unsupported by functional lowering.
+process support, intersected with material-field availability. Custom processes
+use the shared ``_resolve_quantity`` and ``_mask_material_updates`` helpers for
+the same full-field parameter and support semantics. Custom imperative lifecycle
+overrides, process-level RAND/NOISE, hidden tensor dependencies, mutation, and
+implicit random draws are currently unsupported by functional lowering.
 
 ``ClampProcess`` uses the same pipeline for hard assignments, lower/upper
 bounds, and bounded ranges. Its existing ``where=`` masks/selectors are
@@ -1340,13 +1351,23 @@ versions that created it. Call ``prepare`` again after replacing or modifying
 a model parameter, geometry constant, or ``dt``. Stimulation leaves may change
 without preparing the model again. Declared derived and timestep workspaces are
 read-only during a functional transition; values that evolve belong in
-``STATE``, ``CARRY``, or a declared shared field. Lowering probes both one- and
-two-step transitions on private tensors and rejects authored workspace
-mutation or rebinding before a
-plan can be used eagerly, under ``torch.func``, or under compilation. The same
-purity probe rejects unregistered Python-state mutation and implicit global RNG
-consumption; evolving or random values must be explicit tensor state or
-``CARRY``.
+``STATE``, ``CARRY``, or a declared shared field. Functional lowering trusts
+authored hooks to satisfy this purity contract by default. To enable diagnostic
+dependency, mutation, RNG, and repeated-evaluation checks, create the plan in
+``dn.ctx(CHECK_PURITY=True)``:
+
+.. code-block:: python
+
+   with dn.ctx(CHECK_PURITY=True):
+       fmodel, tensors = dn.func.make_functional(model, dt=0.025)
+
+The same context applies to ``dn.compile``. Each plan captures the mode at
+creation, so changing the context afterward does not alter it. Diagnostics
+include private one- and two-step probes for authored workspace mutation or
+rebinding; they can identify violations but do not prove purity for every
+input. Tensor schemas, layouts, explicit bindings, and canonical lifecycle
+requirements remain checked in both modes. Evolving or random values must
+remain explicit tensor state or ``CARRY``.
 
 ``prepare`` may be called inside ``torch.inference_mode()``; Dendra
 materializes ordinary versioned workspace tensors so freshness checks remain
@@ -1563,19 +1584,23 @@ compositions, fixed-schedule Poisson waveforms, and ``arbitrary`` sampled
 waveforms. The latter remains compatible with ``jacrev``, ``jacfwd``, ``vmap``,
 and compiled functional calls.
 
-Dendra fails closed on mechanism-owned injections, waveform hooks, and Poisson
-waveforms with ``randomize_every_call=True``. A fixed Poisson schedule is
+Mechanism-owned injections follow their declared ownership and timing; see
+:doc:`A35_functional_mechanism_injections`. Waveform hooks are currently
+unsupported. Poisson waveforms must use ``randomize_every_call=False`` to
+satisfy the deterministic evaluation contract. A fixed Poisson schedule is
 supported as an explicit tensor leaf. To choose another random schedule, call
 ``regenerate_schedule_()`` before lowering and keep
 ``randomize_every_call=False``. Other explicit setup operations, such as
 ``expand()`` and ``reshape_for_intra()``, are likewise outside the evaluation
 purity contract and should be completed before ``make_functional``.
 
-A custom Waveform must opt into the audited contract by declaring
-``FUNCTIONAL_PURE = True`` directly on its concrete class. An inherited marker
-is not sufficient, because a subclass may change evaluation semantics.
-Lowering recursively checks the complete waveform module tree for registered
-tensor or Python-state mutation and RNG use. When the same authored Waveform is
+A custom Waveform must keep evaluation deterministic and read-only.
+With ``CHECK_PURITY=True``, declare ``FUNCTIONAL_PURE = True`` directly on its
+concrete class to opt into diagnostic evaluation; an inherited marker is not
+sufficient because a subclass may change evaluation semantics. Diagnostic
+lowering recursively checks the waveform module tree for registered tensor or
+Python-state mutation and RNG use. The marker and numerical probes are not
+required in the default trust mode. When the same authored Waveform is
 needed for both registered intra and bound extra, use distinct instances so
 their explicit parameter namespaces cannot silently diverge.
 
@@ -2524,8 +2549,9 @@ ordinary first-order backward; while execution remains inference-only. CUDA
 does not inherit the automatic CPU C++-wrapper preference. GPU loop execution
 is not a promise of one device-resident kernel: host orchestration and
 per-block synchronization may remain, particularly for ``torch.while_loop``.
-Cold lowering, purity validation and host runners may synchronize to inspect
-tensor values; these audits are not part of a fully device-resident optimizer.
+Cold lowering, optional purity diagnostics and host runners may synchronize to
+inspect tensor values; these operations are outside a fully device-resident
+optimizer.
 
 Numerical coefficients, block workspaces and linear solves retain the model's
 floating-point dtype: float32 models are not automatically promoted to float64.
@@ -2551,8 +2577,8 @@ against a model explicitly constructed or converted to float64 before calling
 ``dn.func.make_functional`` or ``dn.func.compile``.
 
 Branched Triton DHS kernels use atomic reductions. Last-bit scheduling
-differences can therefore trigger the existing strict repeated-output purity
-audit; CUDA support does not disable or weaken that audit. This remains a
+differences can therefore trigger strict repeated-output checks when
+``CHECK_PURITY=True``. This remains a
 hardware-validation risk for branched models, not a verified deterministic GPU
 execution guarantee.
 
@@ -2785,7 +2811,7 @@ Other functional models can still start from ``tensors.state``. Fresh
 ``initialize`` is unavailable for arbitrary Population or Integrator
 initialization hooks, custom
 Ion/Material initialization behavior, impure initial-value sources,
-unsupported MaterialProcess families or custom process lifecycle
+impure MaterialProcess numerical hooks or custom imperative process lifecycle
 hooks, legacy or otherwise impure VoltageProcess hooks, and other topologies. Transition
 execution from an initialized model remains available wherever normal
 functional admission succeeds.

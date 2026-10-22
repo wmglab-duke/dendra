@@ -1,8 +1,8 @@
-"""Audited memoryless callables for the ordinary continuous transform API.
+"""Memoryless callables for the ordinary continuous transform API.
 
 The native callable remains the numerical implementation. Modules execute on
 an isolated copy with registered tensors rebound from an explicit packet;
-functions retain only audited immutable dependencies. There is no model-type
+optional diagnostics inspect authored dependencies. There is no model-type
 dispatch or alternate implementation of their arithmetic.
 """
 
@@ -15,6 +15,8 @@ from collections.abc import Mapping
 
 import torch
 from torch.func import functional_call
+
+from dendra.helpers import current_check_purity
 
 from ._netcon import _snapshot
 from ._types import FunctionalizationError
@@ -139,6 +141,42 @@ def _tensor_layout(module):
 
 def _routine(value):
     return getattr(value, "__func__", value)
+
+
+def _callable_binding(function):
+    target = _routine(function)
+    return (target, getattr(target, "__code__", None))
+
+
+def _static_configuration(module):
+    p = _helpers()
+    return tuple(
+        (
+            name,
+            value
+            if isinstance(
+                value,
+                (
+                    type(None),
+                    bool,
+                    int,
+                    float,
+                    complex,
+                    str,
+                    bytes,
+                    tuple,
+                    frozenset,
+                    torch.dtype,
+                    torch.device,
+                ),
+            )
+            else (type(value), id(value)),
+        )
+        for name, value in vars(module).items()
+        if not p._is_internal_module_state(module, name)
+        and name != "training"
+        and not isinstance(value, torch.nn.Module)
+    )
 
 
 def _codes(code):
@@ -359,7 +397,7 @@ def _function_signature(function, owner, *, strict, seen=None):
         seen.remove(id(target))
 
 
-def _qualify_module(module, *, strict):
+def _qualify_module(module, *, strict, check_purity=True):
     p = _helpers()
     signatures = []
     for path, child in _safe_modules(module):
@@ -409,11 +447,22 @@ def _qualify_module(module, *, strict):
             (
                 path,
                 bool(child.training),
-                _function_signature(child.forward, child, strict=strict),
+                (
+                    _function_signature(child.forward, child, strict=strict)
+                    if check_purity
+                    else (
+                        _callable_binding(child.forward),
+                        _static_configuration(child),
+                    )
+                ),
             )
         )
+    if not check_purity:
+        return (tuple(signatures), _tensor_layout(module))
     return (
-        p._transform_structure_signature(module, strict=strict),
+        p._transform_structure_signature(
+            module, strict=strict if check_purity else False
+        ),
         tuple(signatures),
         _tensor_layout(module),
     )
@@ -425,10 +474,11 @@ def _compiled_signature_matches(plan):
 
 
 class ContinuousTransformPlan:
-    """A frozen, audited callable plus an explicit registered-tensor schema."""
+    """A frozen callable plus an explicit registered-tensor schema."""
 
     def __init__(self, transform, *, size, device, dtype):
         self._source = transform
+        self._check_purity = current_check_purity()
         self.size = size
         # Resolve aliases such as cpu:0 and unindexed mps to the actual tensor
         # device. Native connection metadata remains separately frozen.
@@ -466,16 +516,95 @@ class ContinuousTransformPlan:
         self._guard_tensor_slots = []
         self._guard_aliases = {}
         self._guard_instances = []
-        self._collect_guards(transform)
-        self._probe()
+        if self._check_purity:
+            self._collect_guards(transform)
+            self._probe()
+        else:
+            self._collect_binding_guards(transform)
 
-    @staticmethod
-    def _signature(transform, *, strict):
+    def _signature(self, transform, *, strict):
         if transform is None:
             return ("identity",)
         if isinstance(transform, torch.nn.Module):
-            return _qualify_module(transform, strict=strict)
-        return _function_signature(transform, None, strict=strict)
+            return _qualify_module(
+                transform, strict=strict, check_purity=self._check_purity
+            )
+        if self._check_purity:
+            return _function_signature(transform, None, strict=strict)
+        return _callable_binding(transform)
+
+    def _collect_binding_guards(self, transform):
+        """Freeze explicit registrations and dispatch without dependency audits."""
+        p = _helpers()
+        if not self.is_module:
+            target = _routine(transform)
+            if inspect.isfunction(target):
+                self._guard_functions.append(
+                    (
+                        target,
+                        target.__code__,
+                        target.__defaults__,
+                        target.__kwdefaults__,
+                    )
+                )
+            return
+        for _path, child in _safe_modules(transform):
+            self._guard_instances.append((vars(child), tuple(vars(child))))
+            self._guard_modules.append(
+                (
+                    child,
+                    tuple(child._parameters),
+                    tuple(child._buffers),
+                    tuple(child._modules.items()),
+                )
+            )
+            for collection in ("_parameters", "_buffers"):
+                for name, value in vars(child)[collection].items():
+                    schema = (
+                        None
+                        if value is None
+                        else (tuple(value.shape), value.dtype, value.device)
+                    )
+                    alias = (
+                        None
+                        if value is None
+                        else self._guard_aliases.setdefault(
+                            id(value), len(self._guard_aliases)
+                        )
+                    )
+                    self._guard_tensor_slots.append(
+                        (child, collection, name, schema, alias)
+                    )
+            self._guard_attributes.append((child, "training", child.training, "config"))
+            for name, value in vars(child).items():
+                if not p._is_internal_module_state(child, name) and name != "training":
+                    self._guard_attributes.append((child, name, value, "config"))
+            for cls in type(child).__mro__:
+                if cls in (torch.nn.Module, object):
+                    continue
+                for name in (
+                    *_CALL_METHODS,
+                    *_METADATA_METHODS,
+                    *_COPY_METHODS,
+                    "forward",
+                    *child._parameters,
+                    *child._buffers,
+                    *child._modules,
+                    *_INTERNAL_FIELDS,
+                ):
+                    self._guard_classes.append(
+                        (cls, name, name in vars(cls), vars(cls).get(name))
+                    )
+            target = _routine(child.forward)
+            if inspect.isfunction(target):
+                self._guard_functions.append(
+                    (
+                        target,
+                        target.__code__,
+                        target.__defaults__,
+                        target.__kwdefaults__,
+                    )
+                )
 
     def _collect_function_guards(self, function, owner):
         target = _routine(function)
@@ -487,6 +616,8 @@ class ContinuousTransformPlan:
         self._guard_functions.append(
             (target, target.__code__, target.__defaults__, target.__kwdefaults__)
         )
+        if not self._check_purity:
+            return
         globals_used = _global_values(target)
         for name, value in globals_used.items():
             self._guard_attributes.append((target.__globals__, name, value, "global"))

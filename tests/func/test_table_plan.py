@@ -192,8 +192,9 @@ def test_table_plan_checks_authored_helper_purity():
 
     owner.curve_original = MethodType(mutating, owner)
     owner.usetables(False)
-    with pytest.raises(dn.func.FunctionalizationError, match="in-place"):
-        TablePlan(population)
+    with dn.ctx(CHECK_PURITY=True):
+        with pytest.raises(dn.func.FunctionalizationError, match="in-place"):
+            TablePlan(population)
 
 
 def test_enabled_table_does_not_audit_construction_only_generator_side_effects():
@@ -241,8 +242,9 @@ def test_enabled_table_does_not_audit_construction_only_generator_side_effects()
     assert generator.calls == before
     owner = population.mech.mechanisms["table"]
     owner.usetables(False)
-    with pytest.raises(dn.func.FunctionalizationError, match="dependency|callable"):
-        TablePlan(population)
+    with dn.ctx(CHECK_PURITY=True):
+        with pytest.raises(dn.func.FunctionalizationError, match="dependency|callable"):
+            TablePlan(population)
 
 
 @pytest.mark.parametrize("owner_kind", ("mechanism", "state"))
@@ -338,3 +340,21 @@ def test_table_construction_samples_beside_registered_cuda_parameters(learnable)
     if learnable:
         derivative = torch.autograd.grad(owner.curve(query).sum(), table.y)[0]
         assert derivative.count_nonzero() == 4
+
+
+def test_table_diagnostics_are_opt_in_and_frozen_for_the_plan():
+    population = _population()
+    _path, owner, _name, _table = table_owners(population)[0]
+
+    def mutating(self, x):
+        return x.add_(self.gain)
+
+    owner.curve_original = MethodType(mutating, owner)
+    owner.usetables(False)
+    with dn.ctx(CHECK_PURITY=False):
+        plan = TablePlan(population)
+    assert not plan.check_purity
+    with dn.ctx(CHECK_PURITY=True):
+        plan.validate_source()
+        with pytest.raises(dn.func.FunctionalizationError, match="in-place"):
+            TablePlan(population)
