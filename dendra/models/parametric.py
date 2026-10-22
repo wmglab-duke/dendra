@@ -4077,7 +4077,21 @@ class Parameterized(SimpleParameterized):
                     f"Function '{func_name}' not found in class '{self.__class__.__name__}' for table instantiation."
                 )
             func = getattr(self, func_name)
-            x = torch.linspace(low, high, n, dtype=torch.float64)
+            reference = next(self.parameters(), None)
+            if reference is None:
+                reference = next(
+                    (value for value in self.buffers() if value.is_floating_point()),
+                    None,
+                )
+            table_dtype = self._init_dtype if reference is None else reference.dtype
+            table_device = self._init_device if reference is None else reference.device
+            # Keep the established float64 construction samples. CUDA-owned
+            # generators must evaluate beside their registered parameters;
+            # MPS retains CPU sampling because it has no float64 support.
+            sample_device = (
+                "cpu" if torch.device(table_device).type == "mps" else table_device
+            )
+            x = torch.linspace(low, high, n, dtype=torch.float64, device=sample_device)
             y = func(x).flatten()
             setattr(
                 self,
@@ -4089,7 +4103,7 @@ class Parameterized(SimpleParameterized):
                     exact_clamp=False,
                     learnable_y=learnable,
                     uniform="always",
-                ).to(dtype=self.dtype(), device=self.device()),
+                ).to(dtype=table_dtype, device=table_device),
             )
             setattr(self, f"usetable_{func_name}", True)
 
@@ -4311,7 +4325,7 @@ class Parameterized(SimpleParameterized):
 table_function_template = """
 def {func_name}_with_table(self, x):
     if self.usetable_{func_name}:
-        return self.{func_name}_table(x)
+        return self.{func_name}_table(x.reshape(x.numel())).reshape(x.shape)
     return self.{func_name}_original(x)
 """
 

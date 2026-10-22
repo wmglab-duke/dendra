@@ -199,6 +199,9 @@ per-step draws and explicit RNG tapes; see :doc:`A31_functional_runtime_noise`.
 State ``DIFFUSION`` uses the shared Euler–Maruyama and Euler–Heun solvers
 with explicit standard-normal draws and RNG carry; see
 :doc:`A32_functional_state_sde`.
+Mechanism and State ``TABLE`` lookups use shared pure interpolation. Fixed
+table data are explicit constants, and ``learnable=True`` table values are
+selectable trainable parameters; see :doc:`A33_functional_tables`.
 
 Explicit state always means continuation and bypasses initialization, even on
 a fresh-policy runner. Every fresh-policy call returns its effective runtime
@@ -380,7 +383,7 @@ Unsupported features raise ``dendra.func.FunctionalizationError`` during
 lowering. Current limitations include non-injective regional concentration or
 Material replacement writes and non-injective voltage replacement support,
 the reserved compact rowwise support encoding,
-TABLE lookups, MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
+MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
 families, mechanism-owned waveform injections, delayed state,
 legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,

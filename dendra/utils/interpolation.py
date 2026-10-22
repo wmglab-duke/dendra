@@ -391,12 +391,18 @@ class PreparedInterp1d(nn.Module):
                 f"indices must have length {expected_len}, got {idx.numel()}."
             )
 
-        if self.batched:
-            if torch.any((idx < 0) | (idx >= self.D)):
-                raise ValueError(f"indices values must be in [0, {self.D - 1}].")
-        else:
-            if torch.any(idx != 0):
-                raise ValueError("In 1D mode (x,y 1D), indices can only contain 0.")
+        message = (
+            f"indices values must be in [0, {self.D - 1}]."
+            if self.batched
+            else "In 1D mode (x,y 1D), indices can only contain 0."
+        )
+        # Tensor checks remain in the graph under compilation and support mapped
+        # indices without a tensor-valued Python branch.
+        valid = (idx >= 0) & (idx < self.D) if self.batched else idx == 0
+        try:
+            torch._check_tensor_all(valid, message)
+        except RuntimeError as error:
+            raise ValueError(message) from error
 
         return idx
 
@@ -559,21 +565,10 @@ class PreparedInterp1d(nn.Module):
                 else xq
             )
 
-            if (
-                self._ind_cache is None
-                or self._ind_cache.shape != xq_used.shape
-                or self._ind_cache.device != xq_used.device
-            ):
-                self._ind_cache = torch.empty(
-                    xq_used.shape, device=xq_used.device, dtype=torch.long
-                )
-            ind = self._ind_cache
-
             if self._use_uniform:
                 # ---- uniform fast-path: no searchsorted ----
                 u = (xq_used - x_min) * self._inv_dx_uniform
-                ind.copy_(u.to(torch.long))
-                ind.clamp_(0, self._ind_hi)
+                ind = u.to(torch.long).clamp(0, self._ind_hi)
 
                 if self.learnable_y:
                     y = self.y  # (N,)
@@ -588,9 +583,12 @@ class PreparedInterp1d(nn.Module):
                     ynew = y0 + m * (xq_used - x0i)
             else:
                 # ---- original path ----
-                torch.searchsorted(self._x_search, xq_used.contiguous(), out=ind)
-                ind -= 1
-                ind.clamp_(0, self._ind_hi)
+                ind = (
+                    torch.searchsorted(self._x_search, xq_used.contiguous()).reshape(
+                        xq_used.shape
+                    )
+                    - 1
+                ).clamp(0, self._ind_hi)
 
                 x0i = self._x0[ind]
                 inv_dxi = self._inv_dx[ind]
@@ -691,20 +689,9 @@ class PreparedInterp1d(nn.Module):
                 else xq
             )
 
-            if (
-                self._ind_cache is None
-                or self._ind_cache.shape != xq_used.shape
-                or self._ind_cache.device != xq_used.device
-            ):
-                self._ind_cache = torch.empty(
-                    xq_used.shape, device=xq_used.device, dtype=torch.long
-                )
-            ind = self._ind_cache
-
             if self._use_uniform:
                 u = (xq_used - x_min) * inv_dx_u
-                ind.copy_(u.to(torch.long))
-                ind.clamp_(0, self._ind_hi)
+                ind = u.to(torch.long).clamp(0, self._ind_hi)
 
                 if self.learnable_y:
                     y0 = torch.gather(y_sel, 1, ind)
@@ -727,9 +714,14 @@ class PreparedInterp1d(nn.Module):
                         ynew = torch.where(xq <= x_min, y_first.expand_as(ynew), ynew)
                         ynew = torch.where(xq >= x_max, y_last.expand_as(ynew), ynew)
             else:
-                torch.searchsorted(x_search, xq_used.contiguous(), out=ind)
-                ind -= 1
-                ind.clamp_(0, self._ind_hi)
+                # Preserve logical query axes when searchsorted batches an empty
+                # mapped dimension (its batching rule can otherwise drop P).
+                ind = (
+                    torch.searchsorted(x_search, xq_used.contiguous()).reshape(
+                        xq_used.shape
+                    )
+                    - 1
+                ).clamp(0, self._ind_hi)
 
                 x0i = torch.gather(x0, 1, ind)
                 inv_dxi = torch.gather(inv_dx, 1, ind)

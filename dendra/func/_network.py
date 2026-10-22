@@ -34,6 +34,7 @@ from ._population import (
     make_functional,
 )
 from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
+from ._tables import network_table_alias_signature
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
 
@@ -334,6 +335,7 @@ class FunctionalNetwork:
                 plan._enable_cache_materializations()
             self.populations[name] = plan
             initialization[name] = packet.initialization
+        self._source_table_aliases = network_table_alias_signature(network)
         self.synapses = {
             name: FunctionalNetCon(connection, pending_capacity=capacities.get(name))
             for name, connection in self._schedule.synapses
@@ -652,6 +654,10 @@ class FunctionalNetwork:
             *self.continuous_synapses.values(),
         ):
             plan._validate_source()
+        if network_table_alias_signature(network) != self._source_table_aliases:
+            raise FunctionalizationError(
+                "The Network TABLE tensor aliases changed; lower again."
+            )
         if self.netstim is not None:
             self.netstim._validate_source()
 

@@ -371,7 +371,7 @@ def test_make_functional_rejects_unlowered_material_process_workspaces():
         dn.func.make_functional(model, dt=DT)
 
 
-def test_make_functional_rejects_unlowered_table_workspaces():
+def test_make_functional_table_workspaces_match_native_execution():
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
         model = dn.Unmyelinated(
             [1.0],
@@ -384,11 +384,14 @@ def test_make_functional_rejects_unlowered_table_workspaces():
         model.initialize()
         model.train()
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="TABLE lookup workspaces",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    assert any(name.startswith("tables.") for name in tensors.constants)
+    actual, _ = functional.prepare_and_step(
+        tensors.parameters, tensors.constants, tensors.state
+    )
+    with torch.no_grad():
+        model.step(DT)
+    torch.testing.assert_close(actual, functional.extract(model).state)
 
 
 def test_mechanism_timestep_configuration_is_not_a_public_author_hook():

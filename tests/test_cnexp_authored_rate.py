@@ -5,7 +5,12 @@ import torch
 
 import dendra as dn
 from dendra.models.mechanisms import Mechanism, State
-from dendra.models.mechanisms._cnexp import build_cnexp
+from dendra.models.mechanisms._cnexp import (
+    _bounded_phi1,
+    _linear_exact_step,
+    build_cnexp,
+)
+from dendra.models.mechanisms.ops import expinv
 
 
 @pytest.fixture(scope="module")
@@ -71,6 +76,19 @@ def test_cnexp_numeric_coefficients_broadcast_over_state(dt):
     torch.testing.assert_close(actual.double(), expected, rtol=2e-6, atol=1e-8)
 
 
+@pytest.mark.parametrize("dt", (0.025, 5.0), ids=("small", "stiff"))
+def test_cnexp_numeric_coefficients_accept_python_scalar_state(dt):
+    solve = build_cnexp(["x"], set(), ["x' = 1-2*x"])
+    duration = torch.tensor(dt, dtype=torch.float32, requires_grad=True)
+    actual = solve(None, duration, x=0.1)["x"]
+    expected = 0.5 - 0.4 * torch.exp(-2 * duration.double())
+    torch.testing.assert_close(actual.double(), expected, rtol=2e-6, atol=1e-8)
+    (gradient,) = torch.autograd.grad(actual, duration)
+    torch.testing.assert_close(
+        gradient.double(), 0.8 * torch.exp(-2 * duration.double()), rtol=2e-6, atol=1e-8
+    )
+
+
 def test_cnexp_numeric_coefficients_compose_with_mixed_and_empty_vmap():
     solve = build_cnexp(["x"], set(), ["x' = 1-2*x"])
 
@@ -84,6 +102,124 @@ def test_cnexp_numeric_coefficients_compose_with_mixed_and_empty_vmap():
     torch.testing.assert_close(actual.double(), expected, rtol=2e-6, atol=1e-8)
     empty = torch.vmap(lambda value: step(value, dt[0]))(state[:0])
     assert empty.dtype == torch.float32 and empty.shape == (0, 3)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize("field_coefficient", (False, True))
+def test_cnexp_mapped_scalar_timesteps_preserve_unmapped_state_fields(
+    dtype, field_coefficient
+):
+    state = torch.tensor([[0.1, 0.2, 0.7], [0.4, 0.8, 0.3]], dtype=dtype)
+    if field_coefficient:
+        solve = build_cnexp(["x"], {"target", "tau"}, ["x' = (target-x)/tau"])
+        assigned = {
+            "target": torch.full_like(state, 0.5),
+            "tau": torch.full_like(state, 0.5),
+        }
+    else:
+        solve = build_cnexp(["x"], set(), ["x' = 1-2*x"])
+        assigned = {}
+
+    def step(dt):
+        return solve(None, dt, x=state, **assigned)["x"]
+
+    durations = state.new_tensor([0.025, 5.0])
+    actual = torch.vmap(step)(durations)
+    expected = 0.5 + (state.double() - 0.5) * torch.exp(
+        -2 * durations.double()[:, None, None]
+    )
+    torch.testing.assert_close(actual.double(), expected, rtol=2e-6, atol=1e-8)
+    assert actual.shape == (2, *state.shape) and actual.dtype == dtype
+    empty = torch.vmap(step)(durations[:0])
+    assert empty.shape == (0, *state.shape) and empty.dtype == dtype
+    observed = torch.func.jacfwd(step)(durations[0])
+    wanted = -2 * (state.double() - 0.5) * torch.exp(-2 * durations[0].double())
+    torch.testing.assert_close(observed.double(), wanted, rtol=2e-6, atol=1e-8)
+
+
+def _original_scalar_arithmetic(state, rate, source, coefficient, dt):
+    """Compatibility oracle retaining native PyTorch scalar arithmetic."""
+    z = coefficient * dt
+    small = z.abs() <= 0.5
+    small_z = torch.where(small, z, torch.zeros_like(z))
+    increment = (
+        state + dt * rate * _bounded_phi1(small_z)
+        if z.dtype in (torch.float32, torch.float64)
+        else state + dt * rate / expinv(small_z)
+    )
+    denominator = torch.where(small, torch.ones_like(z), coefficient)
+    equilibrium = -source / denominator
+    relaxed = equilibrium + (state - equilibrium) * torch.exp(
+        torch.where(small, torch.zeros_like(z), z)
+    )
+    return torch.where(small, increment, relaxed)
+
+
+@pytest.mark.parametrize(
+    "field_dtype,dt_dtype",
+    (
+        (torch.float16, torch.float16),
+        (torch.float16, torch.float64),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.float64),
+        (torch.float32, torch.float16),
+        (torch.float32, torch.float32),
+        (torch.float32, torch.float64),
+        (torch.float64, torch.float32),
+        (torch.float64, torch.float64),
+    ),
+)
+@pytest.mark.parametrize("widen", (None, "state", "rate", "source", "coefficient"))
+@pytest.mark.parametrize("scalar_coefficient", (False, True))
+def test_cnexp_preserves_native_scalar_promotion_values_and_gradients(
+    field_dtype, dt_dtype, widen, scalar_coefficient
+):
+    values = {
+        "state": [0.12, 0.27],
+        "rate": [0.31, -0.23],
+        "source": [0.41, 0.73],
+        "coefficient": [-0.5, -40.0],
+    }
+    for duration in (0.025, 5.0):
+        fields = []
+        for name, value in values.items():
+            dtype = torch.float64 if name == widen else field_dtype
+            if scalar_coefficient and name in ("source", "coefficient"):
+                value = value[0]
+            fields.append(torch.tensor(value, dtype=dtype, requires_grad=True))
+        fields.append(torch.tensor(duration, dtype=dt_dtype, requires_grad=True))
+        actual = _linear_exact_step(*fields)
+        expected = _original_scalar_arithmetic(*fields)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        actual_gradients = torch.autograd.grad(actual.sum(), fields)
+        expected_gradients = torch.autograd.grad(expected.sum(), fields)
+        for observed, wanted in zip(actual_gradients, expected_gradients, strict=True):
+            torch.testing.assert_close(observed, wanted, rtol=0, atol=0)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+@pytest.mark.parametrize("scalar_coefficient", (False, True))
+def test_cnexp_native_cuda_fields_accept_cpu_scalar_timestep(dtype, scalar_coefficient):
+    values = (
+        torch.tensor([0.12, 0.27], dtype=dtype),
+        torch.tensor([0.31, -0.23], dtype=dtype),
+        torch.tensor(0.41 if scalar_coefficient else [0.41, 0.73], dtype=dtype),
+        torch.tensor(-0.5 if scalar_coefficient else [-0.5, -40.0], dtype=dtype),
+    )
+    dt = torch.tensor(0.025, dtype=torch.float64, requires_grad=True)
+    fields = tuple(value.cuda().requires_grad_() for value in values)
+    expected_fields = tuple(value.requires_grad_() for value in values)
+    expected_dt = dt.detach().clone().requires_grad_()
+    actual = _linear_exact_step(*fields, dt)
+    expected = _original_scalar_arithmetic(*expected_fields, expected_dt)
+    assert actual.device.type == "cuda"
+    torch.testing.assert_close(actual.cpu(), expected, rtol=2e-6, atol=1e-8)
+    gradients = torch.autograd.grad(actual.sum(), (*fields, dt))
+    references = torch.autograd.grad(expected.sum(), (*expected_fields, expected_dt))
+    for observed, wanted in zip(gradients, references, strict=True):
+        torch.testing.assert_close(observed.cpu(), wanted, rtol=2e-6, atol=1e-8)
 
 
 class _AuthoredRelaxationState(State):

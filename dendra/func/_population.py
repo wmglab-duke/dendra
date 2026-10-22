@@ -3229,6 +3229,7 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
     derived = []
     timestep = []
     material = []
+    tables = []
     for module_path in _parameterized_module_paths(population):
         module = _module_at(population, module_path)
         for name in _declared_parameter_names(module):
@@ -3298,7 +3299,30 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     kind="material_process",
                 )
             )
-    return tuple((*effective, *derived, *timestep, *material))
+    from ._tables import table_owners
+
+    table_ids = {id(table) for _path, _owner, _name, table in table_owners(population)}
+    parameter_ids = {id(value) for value in population.parameters()}
+    seen = set()
+    for module_path, module in population.named_modules():
+        if id(module) not in table_ids:
+            continue
+        for name, buffer in module._buffers.items():
+            if buffer is None or id(buffer) in seen or id(buffer) in parameter_ids:
+                continue
+            seen.add(id(buffer))
+            tables.append(
+                _PreparedBuffer(
+                    key=f"{module_path}.{name}",
+                    module_path=module_path,
+                    buffer_name=name,
+                    shape=_shape_tuple(buffer),
+                    dtype=buffer.dtype,
+                    device=buffer.device,
+                    kind="table",
+                )
+            )
+    return tuple((*effective, *derived, *timestep, *material, *tables))
 
 
 def _geometry_binding_layout(population: Population) -> tuple[_GeometryBinding, ...]:
@@ -3683,6 +3707,7 @@ class _PopulationPreparation(torch.nn.Module):
                     "timestep",
                     "material_process",
                     "random_parameter",
+                    "table",
                 }:
                     offset_names.append(None)
                     continue
@@ -3952,7 +3977,7 @@ class _PopulationPreparation(torch.nn.Module):
         outputs = []
         owner_parameter_values = {}
         for index, entry in enumerate(self.layout):
-            if entry.kind in {"derived", "timestep", "material_process"}:
+            if entry.kind in {"derived", "timestep", "material_process", "table"}:
                 continue
             owner = _module_at(self.population, entry.module_path)
             if entry.module_path not in owner_parameter_values:
@@ -4101,6 +4126,10 @@ class _PopulationPreparation(torch.nn.Module):
                 owner._buffers[entry.buffer_name] = value
                 outputs.append((entry.key, value))
 
+        for entry in self.layout:
+            if entry.kind == "table":
+                owner = _module_at(self.population, entry.module_path)
+                outputs.append((entry.key, owner._buffers[entry.buffer_name]))
         by_key = dict(outputs)
         result = (
             tuple(population_values[name] for name in self.population_parameter_names),
@@ -4899,6 +4928,30 @@ def _initialization_callable_dependency_signature(
         value = value.__func__
     bound_receiver = value.__self__ if inspect.ismethod(value) else None
     target = getattr(value, "__func__", value)
+
+    if bound_receiver is owner and getattr(type(owner), "_table", None):
+        from ._tables import table_wrapper_original
+
+        table_original = table_wrapper_original(owner, value)
+        if table_original is not None:
+            table_name, original = table_original
+            enabled = bool(getattr(owner, f"usetable_{table_name}"))
+            return (
+                "dendra-table-dispatch",
+                table_name,
+                enabled,
+                _initialization_callable_dependency_signature(
+                    original,
+                    label=f"{label}.{table_name}_original",
+                    owner=owner,
+                    strict=strict,
+                    seen=seen,
+                    include_identity=include_identity,
+                    forbidden_receiver_attributes=forbidden_receiver_attributes,
+                )
+                if not enabled
+                else None,
+            )
 
     generated_filename = getattr(target, "__generated_filename__", None)
     conductance_mode = getattr(target, "_dendra_conductance_mode", None)
@@ -7263,7 +7316,16 @@ def _parametrization_constant_layout_for_owners(
                 id(value), f"_material_geometry.{name}"
             )
 
+    from ._tables import table_buffer_slots
+
     for owner in owners:
+        for relative_path, value in table_buffer_slots(owner):
+            if is_registered_parameter(value):
+                continue
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value), f"tables.{module_paths[id(owner)]}.{relative_path}"
+            )
         # Myelinated geometry may append framework-owned passive-end overrides
         # to its standard torch parametrization. Their mask/value buffers must
         # remain explicit inputs, just like authored in-graph dependencies.
@@ -8152,10 +8214,12 @@ def _functionalization_failures(
                 f"MaterialProcess {name!r}: {failure}"
                 for failure in _material_process_failures(process, population)
             )
-            if getattr(type(process), "_table", None):
-                failures.append(
-                    f"MaterialProcess {name!r} uses TABLE lookup workspaces"
-                )
+            from ._tables import table_failures
+
+            failures.extend(
+                f"MaterialProcess {name!r}: {failure}"
+                for failure in table_failures(process)
+            )
             if (
                 process.random_parameters
                 or process.runtime_noises
@@ -8316,11 +8380,11 @@ def _functionalization_failures(
                     f"{list(unresolved_layouts)}; initialize the Population before "
                     "functionalization"
                 )
-            if getattr(module.__class__, "_table", None):
-                failures.append(
-                    f"{mechanism.name} uses TABLE lookup workspaces, which are "
-                    "not lowered yet"
-                )
+            from ._tables import table_failures
+
+            failures.extend(
+                f"{mechanism.name}: {failure}" for failure in table_failures(module)
+            )
             if isinstance(module, State) and (
                 module.method in {"euler_maruyama", "euler_heun"}
                 or getattr(module, "_diffusion", None)
@@ -8496,6 +8560,9 @@ def _functionalization_failures(
     regional_parameter_names = _additional_parameter_raw_names(population)
     transform_parameter_names = _in_graph_transform_parameter_names(population)
     transform_parameter_names.update(_material_preparation_parameter_names(population))
+    from ._tables import table_parameter_names
+
+    transform_parameter_names.update(table_parameter_names(population))
     shared_initial_targets = _shared_initial_parameter_target_shapes(
         population,
         parameter_name_by_identity,
@@ -9424,6 +9491,12 @@ def _compiled_structure_signature_matches(functional) -> bool:
 
 
 @torch.compiler.assume_constant_result
+def _compiled_validate_table_source(functional) -> None:
+    """Validate Python TABLE topology before capturing tensor evaluation."""
+    functional._table_plan.validate_source()
+
+
+@torch.compiler.assume_constant_result
 def _compiled_initialization_failures(population) -> tuple[str, ...]:
     """Evaluate Python-only initializer admission once per compiled graph."""
     return tuple(_functional_initialization_failures(population))
@@ -9590,6 +9663,10 @@ class FunctionalPopulation:
         self._dtype = population.dtype()
         self._device = population.device()
         self._population = population
+        from ._tables import TablePlan
+
+        self._table_plan = TablePlan(population)
+        self._source_table_bindings = self._table_plan.source_binding_signature()
         self._source_ids = _structure_ids(population)
         self._fingerprint = _structure_signature(population)
         self._initialization_fingerprint = _initialization_structure_signature(
@@ -9927,6 +10004,20 @@ class FunctionalPopulation:
                 "Preparation and transition geometry plans do not match."
             )
         self._prepared_buffers = self._preparation.layout
+        self._table_buffer_aliases = {}
+        for entry in self._prepared_buffers:
+            if entry.kind != "table":
+                continue
+            constant = next(
+                item
+                for item in self._parametrization_constants
+                if entry.key in item.aliases
+            )
+            self._table_buffer_aliases[entry.key] = tuple(
+                f"population.{alias}"
+                for alias in constant.aliases
+                if f"population.{alias}" in self._base_mapping
+            )
         self._prepared_buffer_visible_ranks = {
             entry.key: (
                 len(_module_at(execution_population, entry.module_path).shape_f)
@@ -10605,6 +10696,18 @@ class FunctionalPopulation:
             )
 
     def _validate_source(self) -> None:
+        if torch.compiler.is_compiling():
+            if (
+                self._table_plan.source_binding_signature()
+                != self._source_table_bindings
+            ):
+                raise FunctionalizationError(
+                    "The source TABLE dispatch, layout, or callable bindings changed; "
+                    "lower the Population again"
+                )
+            _compiled_validate_table_source(self)
+        else:
+            self._table_plan.validate_source()
         if self._random_plan is None and any(
             owner.random_parameters
             or owner.runtime_noises
@@ -10756,6 +10859,7 @@ class FunctionalPopulation:
     def _validate_compatible_population(self, population) -> None:
         if not isinstance(population, Population):
             raise TypeError("population must be a dendra Population")
+        self._table_plan.validate_population(population)
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
         ):
@@ -12768,6 +12872,10 @@ class FunctionalPopulation:
             mapping[slot] = mechanism_dt
         for entry in self._prepared_buffers:
             value = read_only(prepared["mechanisms"][entry.key])
+            if entry.kind == "table":
+                for slot in self._table_buffer_aliases[entry.key]:
+                    mapping[slot] = value
+                continue
             visible_rank = self._prepared_buffer_visible_ranks[entry.key]
             if value.ndim < visible_rank:
                 # A hidden zero-sized vmap lane on a logical scalar effective

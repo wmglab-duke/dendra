@@ -40,3 +40,4 @@ Advanced
    advanced/A30_functional_random_parameters.md
    advanced/A31_functional_runtime_noise.md
    advanced/A32_functional_state_sde.md
+   advanced/A33_functional_tables.md

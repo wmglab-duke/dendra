@@ -102,6 +102,21 @@ def _linear_exact_step(state, rate, source, coefficient, dt):
     For stiff decay, retain the equilibrium and the surviving transient
     directly, rather than cancelling nearly the entire old state.
     """
+    # Functional fields share a dtype and device. Expose a singleton timestep
+    # axis so PyTorch can broadcast empty mapped lanes without selecting lane 0.
+    # Other native inputs retain scalar promotion and CPU-scalar device rules.
+    if (
+        isinstance(state, torch.Tensor)
+        and isinstance(dt, torch.Tensor)
+        and dt.ndim == 0
+        and dt.dtype in (torch.float32, torch.float64)
+        and all(
+            not isinstance(value, torch.Tensor)
+            or (value.dtype == dt.dtype and value.device == dt.device)
+            for value in (state, rate, source, coefficient)
+        )
+    ):
+        dt = dt.reshape([1] * state.ndim)
     z = coefficient * dt
     small = z.abs() <= 0.5
     small_z = torch.where(small, z, torch.zeros_like(z))
