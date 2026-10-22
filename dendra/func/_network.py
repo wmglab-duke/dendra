@@ -21,6 +21,7 @@ from dendra.models.networks.net import step as _native_step
 from . import _network_parameters
 from ._continuous import FunctionalContinuousCon
 from ._continuous_transform import _named_tensors
+from ._mechanism_delays import network_mechanism_delay_alias_signature
 from ._netcon import FunctionalNetCon, _effective_tensor, _snapshot
 from ._netstim import FunctionalNetStim
 from ._network_bindings import AliasSnapshots, SourceBinding
@@ -336,6 +337,9 @@ class FunctionalNetwork:
             self.populations[name] = plan
             initialization[name] = packet.initialization
         self._source_table_aliases = network_table_alias_signature(network)
+        self._source_mechanism_delay_aliases = network_mechanism_delay_alias_signature(
+            network
+        )
         self.synapses = {
             name: FunctionalNetCon(connection, pending_capacity=capacities.get(name))
             for name, connection in self._schedule.synapses
@@ -657,6 +661,13 @@ class FunctionalNetwork:
         if network_table_alias_signature(network) != self._source_table_aliases:
             raise FunctionalizationError(
                 "The Network TABLE tensor aliases changed; lower again."
+            )
+        if (
+            network_mechanism_delay_alias_signature(network)
+            != self._source_mechanism_delay_aliases
+        ):
+            raise FunctionalizationError(
+                "The Network mechanism delay tensor aliases changed; lower again."
             )
         if self.netstim is not None:
             self.netstim._validate_source()

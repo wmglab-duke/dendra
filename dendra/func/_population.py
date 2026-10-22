@@ -2764,6 +2764,8 @@ def _derived_handler_keys(handler) -> set[str]:
 def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
     """Map checkpoint inventory keys to the public functional state tree."""
     keys = {}
+    from ._mechanism_delays import mechanism_delay_state_slots
+
     for mechanism_name, mechanism in handler.mechanisms.items():
         for state in mechanism.DE.values():
             for state_name in sorted(state._state):
@@ -2777,6 +2779,11 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
                 "mechanism_buffers",
                 mechanism_name,
                 buffer_name,
+            )
+        for buffer_name, _value in mechanism_delay_state_slots(mechanism):
+            keys.setdefault(
+                f"{mechanism_name}.{buffer_name}",
+                ("mechanism_buffers", mechanism_name, buffer_name),
             )
         for saved_name in sorted(mechanism._save):
             buffer_name = f"{saved_name}_"
@@ -2807,6 +2814,11 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
                 "material_process_buffers",
                 process_name,
                 buffer_name,
+            )
+        for buffer_name, _value in mechanism_delay_state_slots(process):
+            keys.setdefault(
+                f"{process_name}.{buffer_name}",
+                ("material_process_buffers", process_name, buffer_name),
             )
         for saved_name in sorted(process._save):
             buffer_name = f"{saved_name}_"
@@ -2915,11 +2927,21 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
     for checkpoint_key, owner, buffer_name in handler._mutable_state_bindings():
         bindings.setdefault(checkpoint_key, []).append((owner, buffer_name))
 
+    from ._mechanism_delays import mechanism_delay_constant_slots
+
+    delay_constant_keys = {
+        f"{name}.{buffer_name}"
+        for collection in (handler.mechanisms, handler.material_processes)
+        for name, owner in collection.items()
+        for buffer_name, _value in mechanism_delay_constant_slots(owner)
+    }
+
     unclassified = (
         set(bindings)
         - set(expected)
         - _local_synchronization_keys(handler)
         - _derived_handler_keys(handler)
+        - delay_constant_keys
         - {
             key
             for key in bindings
@@ -3319,7 +3341,25 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     shape=_shape_tuple(buffer),
                     dtype=buffer.dtype,
                     device=buffer.device,
-                    kind="table",
+                    kind="constant",
+                )
+            )
+    from ._mechanism_delays import mechanism_delay_constant_slots
+
+    for module_path, owner in _parameterized_owner_paths(population):
+        for name, buffer in mechanism_delay_constant_slots(owner):
+            if id(buffer) in seen:
+                continue
+            seen.add(id(buffer))
+            tables.append(
+                _PreparedBuffer(
+                    f"{module_path}.{name}",
+                    module_path,
+                    name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "constant",
                 )
             )
     return tuple((*effective, *derived, *timestep, *material, *tables))
@@ -3707,7 +3747,7 @@ class _PopulationPreparation(torch.nn.Module):
                     "timestep",
                     "material_process",
                     "random_parameter",
-                    "table",
+                    "constant",
                 }:
                     offset_names.append(None)
                     continue
@@ -3977,7 +4017,7 @@ class _PopulationPreparation(torch.nn.Module):
         outputs = []
         owner_parameter_values = {}
         for index, entry in enumerate(self.layout):
-            if entry.kind in {"derived", "timestep", "material_process", "table"}:
+            if entry.kind in {"derived", "timestep", "material_process", "constant"}:
                 continue
             owner = _module_at(self.population, entry.module_path)
             if entry.module_path not in owner_parameter_values:
@@ -4127,7 +4167,7 @@ class _PopulationPreparation(torch.nn.Module):
                 outputs.append((entry.key, value))
 
         for entry in self.layout:
-            if entry.kind == "table":
+            if entry.kind == "constant":
                 owner = _module_at(self.population, entry.module_path)
                 outputs.append((entry.key, owner._buffers[entry.buffer_name]))
         by_key = dict(outputs)
@@ -4928,6 +4968,13 @@ def _initialization_callable_dependency_signature(
         value = value.__func__
     bound_receiver = value.__self__ if inspect.ismethod(value) else None
     target = getattr(value, "__func__", value)
+
+    if bound_receiver is owner and isinstance(owner, Mechanism):
+        from ._mechanism_delays import mechanism_delay_helper
+
+        delay_helper = mechanism_delay_helper(owner, value)
+        if delay_helper is not None:
+            return ("dendra-pure-mechanism-delay", delay_helper)
 
     if bound_receiver is owner and getattr(type(owner), "_table", None):
         from ._tables import table_wrapper_original
@@ -7316,9 +7363,15 @@ def _parametrization_constant_layout_for_owners(
                 id(value), f"_material_geometry.{name}"
             )
 
+    from ._mechanism_delays import mechanism_delay_constant_slots
     from ._tables import table_buffer_slots
 
     for owner in owners:
+        for buffer_name, value in mechanism_delay_constant_slots(owner):
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value), f"mechanism_delays.{module_paths[id(owner)]}.{buffer_name}"
+            )
         for relative_path, value in table_buffer_slots(owner):
             if is_registered_parameter(value):
                 continue
@@ -8318,10 +8371,12 @@ def _functionalization_failures(
             failures.append(
                 f"{mechanism.name} support-key values are unavailable or invalid"
             )
-        if mechanism._delayed_state_specs:
-            failures.append(
-                f"{mechanism.name} uses delayed state, which is not supported yet"
-            )
+        from ._mechanism_delays import mechanism_delay_failures
+
+        failures.extend(
+            f"{mechanism.name}: {failure}"
+            for failure in mechanism_delay_failures(mechanism)
+        )
         if mechanism._injection_specs:
             failures.append(f"{mechanism.name} uses a registered waveform injection")
         for state_name, state in mechanism.DE.items():
@@ -9497,6 +9552,12 @@ def _compiled_validate_table_source(functional) -> None:
 
 
 @torch.compiler.assume_constant_result
+def _compiled_validate_mechanism_delay_source(functional) -> None:
+    """Validate cold delay registration before capturing tensor evaluation."""
+    functional._mechanism_delay_plan.validate_source()
+
+
+@torch.compiler.assume_constant_result
 def _compiled_initialization_failures(population) -> tuple[str, ...]:
     """Evaluate Python-only initializer admission once per compiled graph."""
     return tuple(_functional_initialization_failures(population))
@@ -9667,6 +9728,12 @@ class FunctionalPopulation:
 
         self._table_plan = TablePlan(population)
         self._source_table_bindings = self._table_plan.source_binding_signature()
+        from ._mechanism_delays import MechanismDelayPlan
+
+        self._mechanism_delay_plan = MechanismDelayPlan(population)
+        self._source_mechanism_delay_bindings = (
+            self._mechanism_delay_plan.source_binding_signature()
+        )
         self._source_ids = _structure_ids(population)
         self._fingerprint = _structure_signature(population)
         self._initialization_fingerprint = _initialization_structure_signature(
@@ -10004,20 +10071,31 @@ class FunctionalPopulation:
                 "Preparation and transition geometry plans do not match."
             )
         self._prepared_buffers = self._preparation.layout
-        self._table_buffer_aliases = {}
+        self._prepared_constant_aliases = {}
         for entry in self._prepared_buffers:
-            if entry.kind != "table":
+            if entry.kind != "constant":
                 continue
             constant = next(
                 item
                 for item in self._parametrization_constants
                 if entry.key in item.aliases
             )
-            self._table_buffer_aliases[entry.key] = tuple(
+            self._prepared_constant_aliases[entry.key] = tuple(
                 f"population.{alias}"
                 for alias in constant.aliases
                 if f"population.{alias}" in self._base_mapping
             )
+        self._mechanism_delay_constant_names = tuple(
+            (
+                f"{path}.{name}",
+                next(
+                    item.key
+                    for item in self._parametrization_constants
+                    if f"{path}.{name}" in item.aliases
+                ),
+            )
+            for path, name, _expected in self._mechanism_delay_plan.constant_entries
+        )
         self._prepared_buffer_visible_ranks = {
             entry.key: (
                 len(_module_at(execution_population, entry.module_path).shape_f)
@@ -10698,6 +10776,19 @@ class FunctionalPopulation:
     def _validate_source(self) -> None:
         if torch.compiler.is_compiling():
             if (
+                self._mechanism_delay_plan.source_binding_signature()
+                != self._source_mechanism_delay_bindings
+            ):
+                raise FunctionalizationError(
+                    "The source mechanism delay registration, layout, or helper "
+                    "bindings changed; lower the Population again"
+                )
+            _compiled_validate_mechanism_delay_source(self)
+            self._mechanism_delay_plan.validate_source_tensor_values()
+        else:
+            self._mechanism_delay_plan.validate_source()
+        if torch.compiler.is_compiling():
+            if (
                 self._table_plan.source_binding_signature()
                 != self._source_table_bindings
             ):
@@ -10860,6 +10951,7 @@ class FunctionalPopulation:
         if not isinstance(population, Population):
             raise TypeError("population must be a dendra Population")
         self._table_plan.validate_population(population)
+        self._mechanism_delay_plan.validate_population(population)
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
         ):
@@ -11107,6 +11199,12 @@ class FunctionalPopulation:
                 raise ValueError(
                     f"constant {entry.key!r} must use {entry.device}/{entry.dtype}"
                 )
+        self._mechanism_delay_plan.validate_constant_values(
+            {
+                slot: constants[name]
+                for slot, name in self._mechanism_delay_constant_names
+            }
+        )
         for name, _path, shape, dtype, device in self._cache_value_specs:
             value = constants[name]
             if not torch.is_tensor(value) or _shape_tuple(value) != shape:
@@ -12872,8 +12970,8 @@ class FunctionalPopulation:
             mapping[slot] = mechanism_dt
         for entry in self._prepared_buffers:
             value = read_only(prepared["mechanisms"][entry.key])
-            if entry.kind == "table":
-                for slot in self._table_buffer_aliases[entry.key]:
+            if entry.kind == "constant":
+                for slot in self._prepared_constant_aliases[entry.key]:
                     mapping[slot] = value
                 continue
             visible_rank = self._prepared_buffer_visible_ranks[entry.key]

@@ -41,3 +41,4 @@ Advanced
    advanced/A31_functional_runtime_noise.md
    advanced/A32_functional_state_sde.md
    advanced/A33_functional_tables.md
+   advanced/A34_functional_mechanism_delays.md

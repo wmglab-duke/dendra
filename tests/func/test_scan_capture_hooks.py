@@ -67,6 +67,7 @@ def test_training_body_capture_preserves_authored_stop_gradients(monkeypatch):
         None,
         None,
         {},
+        None,
         grad_enabled=True,
     )
     ((graph, examples, options),) = captured

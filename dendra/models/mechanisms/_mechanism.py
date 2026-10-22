@@ -20,6 +20,14 @@ from dendra.models._class_declarations import (
 from dendra.models.parametric import Parameterized
 
 from ._continuous_receive import reduce_continuous_values, reset_continuous_values
+from ._delays import (
+    circular_history_plan,
+    delay_history_values,
+    gather_history_values,
+    initial_delay_history_values,
+    resolve_delay_mode,
+    shifted_history_values,
+)
 from ._ions import VALENCES
 from ._materials import _canonical_material_name
 from ._state import (
@@ -136,6 +144,7 @@ def _nonnegative_integer_steps(value, *, device=None, label="delay_steps"):
 
 def _mechanism_advance_signature(mech) -> tuple:
     """Static layout signature for a generated mechanism advance fast path."""
+    history_only = set(mech._delay_history_buffer_names) - set(mech._carry)
     state_layout = []
     for state_name, state_module in mech.DE.items():
         state_carry = tuple(state_module._carry)
@@ -153,9 +162,13 @@ def _mechanism_advance_signature(mech) -> tuple:
         )
     return (
         tuple(state_layout),
-        tuple(mech._transition_input_names),
+        tuple(
+            name for name in mech._transition_input_names if name not in history_only
+        ),
         tuple(mech._carry),
-        tuple(mech._advance_output_names()),
+        tuple(
+            name for name in mech._advance_output_names() if name not in history_only
+        ),
         bool(mech._has_authored_assigned_values),
         bool(mech._has_authored_advance),
     )
@@ -189,7 +202,10 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
 
     if mech.DE or mech._has_authored_advance:
         lines.append("    self._evaluate_assigned(v)")
-    transition_names = tuple(mech._transition_input_names)
+    history_only = set(mech._delay_history_buffer_names) - set(mech._carry)
+    transition_names = tuple(
+        name for name in mech._transition_input_names if name not in history_only
+    )
     if transition_names:
         lines.append("    __values = {")
         for name in transition_names:
@@ -197,6 +213,15 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
         lines.append("    }")
     else:
         lines.append("    __values = {}")
+    # A generated class may have several live instances with different cold
+    # registrations. Read each instance's fixed history inventory rather than
+    # baking the most recently constructed instance's names into the class.
+    lines.extend(
+        [
+            "    for __history_name in self._delay_history_buffer_names:",
+            "        __values[__history_name] = __buffers[__history_name]",
+        ]
+    )
     lines.append("    __values['celsius'] = self.celsius")
     lines.append("    __values['diam'] = self.diam")
     lines.append("    __DE = self.DE")
@@ -279,8 +304,17 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
         )
         lines.extend(commit_lines)
     for name in mech._advance_output_names():
+        if name in history_only:
+            continue
         lines.append(f"    if {name!r} in __mechanism_updates:")
         lines.append(f"        setattr(self, {name!r}, __mechanism_updates[{name!r}])")
+    lines.extend(
+        [
+            "    for __history_name in self._delay_history_buffer_names:",
+            "        if __history_name not in self._carry and __history_name in __mechanism_updates:",
+            "            setattr(self, __history_name, __mechanism_updates[__history_name])",
+        ]
+    )
     lines.append("    return None")
 
     source = "\n".join(lines) + "\n"
@@ -1064,6 +1098,7 @@ class Mechanism(Parameterized):
         # state delays.  Each entry in _delayed_state_specs maps a user-facing
         # delay name to registered buffer/pointer names and update policy.
         self._delayed_state_specs = {}
+        self._delay_history_buffer_names = ()
 
         if key is not None:
             if is_composable:
@@ -1978,6 +2013,7 @@ class Mechanism(Parameterized):
         }
         carry_names = (
             *self._initial_carry_names,
+            *self._delay_history_buffer_names,
             *tuple(shared_value_names),
         )
         frame.update(
@@ -2016,6 +2052,7 @@ class Mechanism(Parameterized):
         valid_names = (
             *self._initial_state_names,
             *self._initial_carry_names,
+            *self._delay_history_buffer_names,
             *tuple(shared_value_names),
         )
         references = {
@@ -2056,7 +2093,7 @@ class Mechanism(Parameterized):
 
     def _advance_output_names(self):
         """Return ordered persistent/shared names authored advance may update."""
-        names = list(self._carry)
+        names = list(dict.fromkeys((*self._carry, *self._delay_history_buffer_names)))
         for fields in self._write_ion_c.values():
             _extend_unique(names, fields)
         for fields in self._write_material.values():
@@ -3266,6 +3303,7 @@ class Mechanism(Parameterized):
             "value_shape": tuple(like.shape),
             "mode": mode,
         }
+        self._refresh_delay_history_layout()
         return getattr(self, buffer_name)
 
     def register_delayed_states(
@@ -3475,7 +3513,133 @@ class Mechanism(Parameterized):
             "has_zero_delay": has_zero_delay,
             "all_zero_delay": all_zero_delay,
         }
+        self._refresh_delay_history_layout()
         return getattr(self, buffer_name)
+
+    def _refresh_delay_history_layout(self):
+        """Expose registered histories to returned-value hooks after registration."""
+        previous = set(self._delay_history_buffer_names) - set(self._carry)
+        names = tuple(
+            dict.fromkeys(
+                name
+                for spec in self._delayed_state_specs.values()
+                for name in (spec["buffer"], spec["pointer"])
+            )
+        )
+        self._delay_history_buffer_names = names
+        self._transition_input_names = tuple(
+            dict.fromkeys(
+                (
+                    *(n for n in self._transition_input_names if n not in previous),
+                    *names,
+                )
+            )
+        )
+        self._sync_delay_history_shapes()
+        _reset_runtime_output_validation(self)
+        # Generated transitions already read the instance's history inventory.
+        # Reinstalling here would create distinct functions on each handler's
+        # reference proxy despite identical authored transitions and layouts.
+
+    def _sync_delay_history_shapes(self):
+        """Track capacities installed by registration or checkpoint restoration."""
+        for name in self._delay_history_buffer_names:
+            if name in self._carry_specs and self._carry_specs[name][1] == "deferred":
+                self._carry_resolved_shapes[name] = tuple(self._buffers[name].shape)
+
+    def initial_delay_values(self, values, *names):
+        """Return a pure zero-history overlay for registered delay lines.
+
+        Use this from :meth:`initial_values` to clear registered histories on
+        initialization. Histories declared as CARRY already receive ordinary
+        zero defaults. Undeclared registered histories retain their values
+        unless an initialization hook returns an explicit replacement.
+        """
+        if not names:
+            names = tuple(self._delayed_state_specs)
+        updates = {}
+        for name in names:
+            spec = self._delayed_state_specs[name]
+            buffer_name, pointer_name = spec["buffer"], spec["pointer"]
+            buffer, pointer = initial_delay_history_values(
+                values[buffer_name], values[pointer_name]
+            )
+            updates[buffer_name] = buffer
+            updates[pointer_name] = pointer
+        return updates
+
+    def delayed_state_values(self, name, value, values, *, mode=None):
+        """Return ``(delayed, updates)`` for one registered fixed-step history.
+
+        Read the queue and pointer from the explicit ``values`` frame and
+        return their replacements for :meth:`advance`, :meth:`initial_values`
+        or :meth:`~VoltageProcess.voltage_values`. Neither inputs nor module
+        state are mutated. Registration and capacity are fixed; use the native
+        :meth:`delayed_state` adapter for runtime capacity changes.
+        """
+        spec = self._delay_values_spec(name, value, batched=False)
+        selected = resolve_delay_mode(
+            spec["mode"] if mode is None else mode, training=self.training
+        )
+        buffer_name, pointer_name = spec["buffer"], spec["pointer"]
+        delayed, buffer, pointer = delay_history_values(
+            values[buffer_name],
+            values[pointer_name],
+            value,
+            int(spec["steps"]),
+            axis=int(spec["axis"]),
+            mode=selected,
+            all_zero=int(spec["steps"]) == 0,
+        )
+        return delayed, {buffer_name: buffer, pointer_name: pointer}
+
+    def delayed_states_values(self, name, payload, values, *, mode=None):
+        """Return ``(delayed, updates)`` for a registered multi-stream history.
+
+        Each stream uses its registered integer delay. Shift mode preserves
+        gradients through history; circular mode detaches queued writes while
+        zero-delay streams retain the current payload's gradient.
+        """
+        spec = self._delay_values_spec(name, payload, batched=True)
+        selected = resolve_delay_mode(
+            spec["mode"] if mode is None else mode,
+            training=self.training,
+            batched=True,
+        )
+        buffer_name, pointer_name = spec["buffer"], spec["pointer"]
+        delayed, buffer, pointer = delay_history_values(
+            values[buffer_name],
+            values[pointer_name],
+            payload,
+            getattr(self, spec["steps_buffer"]),
+            axis=int(spec["axis"]),
+            mode=selected,
+            stream_axis=int(spec["stream_axis"]),
+            value_stream_axis=int(spec["value_stream_axis"]),
+            all_zero=bool(spec["all_zero_delay"]),
+        )
+        return delayed, {buffer_name: buffer, pointer_name: pointer}
+
+    def _delay_values_spec(self, name, value, *, batched):
+        if name not in self._delayed_state_specs:
+            raise KeyError(f"No delayed state named {name!r} has been registered.")
+        spec = self._delayed_state_specs[name]
+        if bool(spec.get("batched", False)) != batched:
+            method = (
+                "delayed_states_values"
+                if spec.get("batched", False)
+                else "delayed_state_values"
+            )
+            raise ValueError(f"Delayed state {name!r} requires {method}(...).")
+        if not torch.is_tensor(value):
+            raise TypeError("Delayed-state values must be a torch.Tensor.")
+        expected_shape = tuple(spec["value_shape"])
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"Delayed state {name!r} expected value shape {expected_shape}, "
+                f"but received {tuple(value.shape)}."
+            )
+        return spec
 
     def reset_delayed_states(self, *names):
         """Zero registered delayed-state buffers and reset circular pointers."""
@@ -3489,8 +3653,9 @@ class Mechanism(Parameterized):
             # and avoids invalidating an outstanding backward pass in place.
             buffer = getattr(self, spec["buffer"])
             pointer = getattr(self, spec["pointer"])
-            setattr(self, spec["buffer"], torch.zeros_like(buffer).detach())
-            setattr(self, spec["pointer"], torch.zeros_like(pointer).detach())
+            buffer, pointer = initial_delay_history_values(buffer, pointer)
+            setattr(self, spec["buffer"], buffer)
+            setattr(self, spec["pointer"], pointer)
         return self
 
     def delayed_state(self, name, value, *, delay_steps=None, mode=None):
@@ -3520,18 +3685,9 @@ class Mechanism(Parameterized):
                 raise ValueError("delay_steps must be one non-negative integer.")
             steps = int(steps_t.reshape(()).item())
 
-        selected_mode = str(spec["mode"] if mode is None else mode).lower()
-        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
-        selected_mode = aliases.get(selected_mode, selected_mode)
-        if selected_mode == "auto":
-            selected_mode = (
-                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
-            )
-        if selected_mode not in {"shift", "circular"}:
-            raise ValueError(
-                "delayed-state mode must be 'auto', 'shift', or 'circular'; "
-                f"got {selected_mode!r}."
-            )
+        selected_mode = resolve_delay_mode(
+            spec["mode"] if mode is None else mode, training=self.training
+        )
 
         if not torch.is_tensor(value):
             raise TypeError("delayed_state value must be a torch.Tensor.")
@@ -3578,11 +3734,9 @@ class Mechanism(Parameterized):
             buf = getattr(self, buf_name)
             depth = int(buf.shape[axis])
 
-        sl = [slice(None)] * buf.ndim
-        sl[axis] = slice(0, depth - 1)
-        buf_new = torch.cat((value.unsqueeze(axis), buf[tuple(sl)]), dim=axis)
+        buf_new = shifted_history_values(buf, value, axis=axis)
         setattr(self, buf_name, buf_new)
-        return buf_new.select(axis, depth - 1)
+        return gather_history_values(buf_new, steps, axis=axis)
 
     def _delayed_state_circular(self, spec, value, steps: int):
         """Fast eval delayed-state update using an in-place circular buffer."""
@@ -3596,16 +3750,16 @@ class Mechanism(Parameterized):
                 "re-registering the delayed state."
             )
 
-        read_idx = torch.remainder(ptr - int(steps), depth).reshape(1)
-        delayed = buf.index_select(axis, read_idx).squeeze(axis)
+        delayed, write_idx, payload, next_pointer = circular_history_plan(
+            buf, ptr, value, int(steps), axis=axis
+        )
 
         # Evaluation-only fast path: mutate the circular buffer without building
         # autograd history. In training/grad mode, delayed_state(..., mode='auto')
         # selects the graph-safe shift backend instead.
         with torch.no_grad():
-            write_idx = ptr.reshape(1)
-            buf.index_copy_(axis, write_idx, value.detach().unsqueeze(axis))
-            ptr.add_(1).remainder_(depth)
+            buf.index_copy_(axis, write_idx, payload)
+            ptr.copy_(next_pointer)
         return delayed
 
     def delayed_states(self, name, values, *, delay_steps=None, mode=None):
@@ -3628,18 +3782,11 @@ class Mechanism(Parameterized):
                 "use delayed_state(...) instead."
             )
 
-        selected_mode = str(spec["mode"] if mode is None else mode).lower()
-        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
-        selected_mode = aliases.get(selected_mode, selected_mode)
-        if selected_mode == "auto":
-            selected_mode = (
-                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
-            )
-        if selected_mode not in {"shift", "circular"}:
-            raise ValueError(
-                "batched delayed-state mode must be 'auto', 'shift', or 'circular'; "
-                f"got {selected_mode!r}."
-            )
+        selected_mode = resolve_delay_mode(
+            spec["mode"] if mode is None else mode,
+            training=self.training,
+            batched=True,
+        )
 
         if not torch.is_tensor(values):
             raise TypeError("delayed_states values must be a torch.Tensor.")
@@ -3692,19 +3839,12 @@ class Mechanism(Parameterized):
         return steps
 
     def _delayed_states_gather(self, buf, spec, read_idx):
-        axis = int(spec["axis"])
-        stream_axis = int(spec["stream_axis"])
-        n_streams = int(spec["n_streams"])
-
-        index_shape = [1] * buf.ndim
-        index_shape[axis] = 1
-        index_shape[stream_axis] = n_streams
-
-        expand_shape = list(buf.shape)
-        expand_shape[axis] = 1
-
-        idx = read_idx.reshape(index_shape).expand(expand_shape)
-        return torch.gather(buf, dim=axis, index=idx).squeeze(axis)
+        return gather_history_values(
+            buf,
+            read_idx,
+            axis=int(spec["axis"]),
+            stream_axis=int(spec["stream_axis"]),
+        )
 
     def _delayed_states_zero_mask(self, spec, values, steps):
         value_stream_axis = int(spec["value_stream_axis"])
@@ -3741,9 +3881,7 @@ class Mechanism(Parameterized):
             buf = getattr(self, buf_name)
             depth = int(buf.shape[axis])
 
-        sl = [slice(None)] * buf.ndim
-        sl[axis] = slice(0, depth - 1)
-        buf_new = torch.cat((values.unsqueeze(axis), buf[tuple(sl)]), dim=axis)
+        buf_new = shifted_history_values(buf, values, axis=axis)
         setattr(self, buf_name, buf_new)
         return self._delayed_states_gather(buf_new, spec, steps)
 
@@ -3760,19 +3898,19 @@ class Mechanism(Parameterized):
                 f"capacity of {depth - 1} steps. Re-register the delayed state."
             )
 
-        read_idx = torch.remainder(ptr - steps, depth)
-        delayed = self._delayed_states_gather(buf, spec, read_idx)
-
-        # A stream with zero delay should deliver the current value, not the
-        # previous content of the circular slot that will be overwritten below.
-        delayed = torch.where(
-            self._delayed_states_zero_mask(spec, values, steps), values, delayed
+        delayed, write_idx, payload, next_pointer = circular_history_plan(
+            buf,
+            ptr,
+            values,
+            steps,
+            axis=axis,
+            stream_axis=int(spec["stream_axis"]),
+            value_stream_axis=int(spec["value_stream_axis"]),
         )
 
         with torch.no_grad():
-            write_idx = ptr.reshape(1)
-            buf.index_copy_(axis, write_idx, values.detach().unsqueeze(axis))
-            ptr.add_(1).remainder_(depth)
+            buf.index_copy_(axis, write_idx, payload)
+            ptr.copy_(next_pointer)
         return delayed
 
     # -- mechanism-level waveform injections ---------------------------------
@@ -4138,7 +4276,11 @@ class VoltageProcess(Mechanism):
                 updates,
                 {
                     name: self._buffers[name]
-                    for name in (*self._initial_state_names, *self._initial_carry_names)
+                    for name in (
+                        *self._initial_state_names,
+                        *self._initial_carry_names,
+                        *self._delay_history_buffer_names,
+                    )
                 },
             )
             self._voltage_schema_validated = True
@@ -4154,7 +4296,11 @@ class VoltageProcess(Mechanism):
         voltage, updates = self._derive_voltage_values(
             v, self.dt, self._runtime_value_frame()
         )
-        for name in (*self._initial_state_names, *self._initial_carry_names):
+        for name in (
+            *self._initial_state_names,
+            *self._initial_carry_names,
+            *self._delay_history_buffer_names,
+        ):
             if name in updates:
                 self._buffers[name] = updates[name]
         return voltage

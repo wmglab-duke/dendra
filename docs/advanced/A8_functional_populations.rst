@@ -202,6 +202,9 @@ with explicit standard-normal draws and RNG carry; see
 Mechanism and State ``TABLE`` lookups use shared pure interpolation. Fixed
 table data are explicit constants, and ``learnable=True`` table values are
 selectable trainable parameters; see :doc:`A33_functional_tables`.
+Mechanism-owned single-stream and multistream delay histories use explicit
+queue/pointer carry through the pure ``delayed_state_values`` and
+``delayed_states_values`` helpers; see :doc:`A34_functional_mechanism_delays`.
 
 Explicit state always means continuation and bypasses initialization, even on
 a fresh-policy runner. Every fresh-policy call returns its effective runtime
@@ -384,7 +387,8 @@ lowering. Current limitations include non-injective regional concentration or
 Material replacement writes and non-injective voltage replacement support,
 the reserved compact rowwise support encoding,
 MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
-families, mechanism-owned waveform injections, delayed state,
+families, mechanism-owned waveform injections, delay-history resizing within
+captured execution,
 legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
@@ -2548,8 +2552,8 @@ audit; CUDA support does not disable or weaken that audit. This remains a
 hardware-validation risk for branched models, not a verified deterministic GPU
 execution guarantee.
 
-CUDA retains the Population admission restrictions above: delayed state,
-the SPD block solver, and arbitrary custom geometry/integrators are
+CUDA retains the Population admission restrictions above: the SPD block solver
+and arbitrary custom geometry/integrators are
 currently unsupported. Network event delivery uses the composed Network plan
 described in :doc:`A19_functional_network_lowering`.
 MPS, float16 and bfloat16 are currently unsupported.

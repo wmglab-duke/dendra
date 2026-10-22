@@ -15,7 +15,10 @@ from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._carry_packing import _PackedCarryLayout
 from ._scan_autograd import guard_scan_outputs
-from ._scan_compat import install_scan_compatibility
+from ._scan_compat import (
+    _capture_saved_tensor_identity,
+    install_scan_compatibility,
+)
 from ._scan_inductor import _compile_scan
 
 
@@ -30,7 +33,19 @@ def _clone_tree(tree):
 def _capture_tensor_step(body, arguments, *, grad_enabled, tracer=None):
     """Capture authored detach/STE boundaries before scan differentiates them."""
     tracer = make_fx if tracer is None else tracer
-    return tracer(body, pre_dispatch=grad_enabled)(*arguments)
+    # Capture storage is created under no-grad, but authored policy such as
+    # Mechanism's auto delay mode depends on the execution caller's grad mode.
+    # Trace that policy in its actual context, restoring the capture boundary
+    # before returning the graph.
+    # Disposable tracing saves must not enter an enclosing checkpoint's tensor
+    # inventory: recomputation reuses this graph instead of tracing it again.
+    with (
+        torch.set_grad_enabled(grad_enabled),
+        torch.autograd.graph.saved_tensors_hooks(
+            _capture_saved_tensor_identity, _capture_saved_tensor_identity
+        ),
+    ):
+        return tracer(body, pre_dispatch=grad_enabled)(*arguments)
 
 
 def _packed_tensor_scan(

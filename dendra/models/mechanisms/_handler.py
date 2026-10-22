@@ -2951,7 +2951,12 @@ class MechanismHandler(torch.nn.Module):
             for owner, name, _ in assignments
         ]
         original_delays = [
-            (module, module._delayed_state_specs) for module, _ in delay_assignments
+            (
+                module,
+                module._delayed_state_specs,
+                dict(module._carry_resolved_shapes),
+            )
+            for module, _ in delay_assignments
         ]
         original_random_parameters = [
             (
@@ -2989,6 +2994,7 @@ class MechanismHandler(torch.nn.Module):
                 setattr(owner, name, value)
             for module, specs in delay_assignments:
                 module._delayed_state_specs = specs
+                module._sync_delay_history_shapes()
             for module, provenance in random_parameter_assignments:
                 module._apply_random_parameter_state(provenance)
         except Exception:
@@ -2998,8 +3004,10 @@ class MechanismHandler(torch.nn.Module):
                         delattr(owner, name)
                 else:
                     setattr(owner, name, original)
-            for module, specs in original_delays:
+            for module, specs, resolved_shapes in original_delays:
                 module._delayed_state_specs = specs
+                module._carry_resolved_shapes.clear()
+                module._carry_resolved_shapes.update(resolved_shapes)
             for module, attributes in original_random_parameters:
                 for name, value in attributes.items():
                     setattr(module, name, value)
@@ -3239,6 +3247,11 @@ class MechanismHandler(torch.nn.Module):
                     tuple(f"{prefix}.{name}" for name in state_names),
                 )
             for buffer_name in _runtime_mechanism_carry_names(module):
+                # Registered histories can have a different saved capacity.
+                # Their metadata below supplies the exact queue shape and
+                # pointer constraints, including when storage is also CARRY.
+                if buffer_name in module._delay_history_buffer_names:
+                    continue
                 add_tensor(module, buffer_name, f"{prefix}.{buffer_name}")
             for saved_name in sorted(module._save):
                 buffer_name = f"{saved_name}_"

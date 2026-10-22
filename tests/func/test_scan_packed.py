@@ -157,6 +157,7 @@ def _capture(case, options):
             case.ve,
             case.intra,
             case.carries,
+            None,
             block=1,
             grad_enabled=True,
         )
@@ -223,7 +224,13 @@ def test_training_pack_hop_uses_dtype_groups_and_preserves_gradients(callbacks):
 
     kernel = _capture(case, {"backend": backend, "fullgraph": True})
     actual = kernel(
-        case.parameters, case.prepared, case.state, case.ve, case.intra, case.carries
+        case.parameters,
+        case.prepared,
+        case.state,
+        case.ve,
+        case.intra,
+        case.carries,
+        None,
     )
     expected = _eager(case)
     _close(actual, expected)
@@ -285,6 +292,7 @@ def _check_cpp_pack(callbacks):
             case.ve,
             case.intra,
             case.carries,
+            None,
         )
         expected = _eager(case)
         _close(actual, expected)
@@ -298,6 +306,7 @@ def _check_cpp_pack(callbacks):
             -case.ve,
             case.intra,
             case.carries,
+            None,
         )
         _assert_owned(repeated, (inputs, actual))
         _close(actual, saved, exact=True)
@@ -342,6 +351,7 @@ def test_cuda_training_pack_preserves_mixed_host_scheduling_and_gradients():
             case.ve,
             case.intra,
             case.carries,
+            None,
         )
         expected = _eager(case)
         _close(actual, expected)
