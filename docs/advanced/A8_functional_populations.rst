@@ -205,6 +205,10 @@ selectable trainable parameters; see :doc:`A33_functional_tables`.
 Mechanism-owned single-stream and multistream delay histories use explicit
 queue/pointer carry through the pure ``delayed_state_values`` and
 ``delayed_states_values`` helpers; see :doc:`A34_functional_mechanism_delays`.
+Mechanism-owned waveform currents use ``injection_values(v, t=...)`` in pure
+hooks. Native ownership excludes accepted injections from solver delivery,
+and waveform parameters retain their shared aliases; see
+:doc:`A35_functional_mechanism_injections`.
 
 Explicit state always means continuation and bypasses initialization, even on
 a fresh-policy runner. Every fresh-policy call returns its effective runtime
@@ -387,7 +391,7 @@ lowering. Current limitations include non-injective regional concentration or
 Material replacement writes and non-injective voltage replacement support,
 the reserved compact rowwise support encoding,
 MaterialProcesses outside the admitted Clearance/Clamp/Exchange/Diffusion
-families, mechanism-owned waveform injections, delay-history resizing within
+families, delay-history resizing within
 captured execution,
 legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, functional
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,

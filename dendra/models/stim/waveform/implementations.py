@@ -813,6 +813,11 @@ class arbitrary(Waveform):
         transformed = (
             torch.compiler.is_compiling() or torch._C._are_functorch_transforms_active()
         )
+        if not transformed:
+            # Direct make_fx scan capture sets neither flag above.
+            from torch.fx.experimental.proxy_tensor import get_proxy_mode
+
+            transformed = get_proxy_mode() is not None
         if transformed:
             differentiate_tpoints = True
         else:

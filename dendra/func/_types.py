@@ -176,7 +176,9 @@ class PopulationTensors(NamedTuple):
         selector must match. Selected leaves are returned as
         :class:`torch.nn.Parameter` objects. Every other leaf is a
         detached ordinary Tensor. The returned mapping retains canonical names
-        and can be passed directly to functional preparation and transitions.
+        and parameter aliases, and can be passed directly to functional
+        preparation and transitions. Selecting any alias makes its shared leaf
+        trainable.
         """
 
         # Validate the scope even when no trainable queries were requested.
@@ -195,17 +197,9 @@ class PopulationTensors(NamedTuple):
                 "trainable parameter leaves must use a floating-point or complex "
                 f"dtype; invalid={non_differentiable}"
             )
-        # Functional optimizers should never share storage or autograd history
-        # with the source Population. Also materialize ordinary versioned
-        # tensors when this helper is called from inference mode.
-        with torch.inference_mode(False):
-            independent = {
-                name: value.detach().clone(memory_format=torch.preserve_format)
-                for name, value in self.parameters.items()
-            }
-            for name in trainable_names:
-                independent[name] = torch.nn.Parameter(independent[name])
-        return independent
+        from ._network_parameters import independent_parameters
+
+        return independent_parameters(self.parameters, trainable_names)
 
 
 class StepInput(NamedTuple):

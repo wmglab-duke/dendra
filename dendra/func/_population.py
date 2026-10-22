@@ -90,6 +90,7 @@ from dendra.models.parametric import (
     cacheable,
     staticproperty,
 )
+from dendra.models.stim.waveform.core import Waveform
 from dendra.models.tree import Tree
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
@@ -909,6 +910,13 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
     """Return authored classes whose mutable class state deepcopy shares."""
     population = getattr(module, "population", module)
     transform_module_ids = set()
+    waveform_child_ids = {
+        id(child)
+        for waveform in module.modules()
+        if isinstance(waveform, Waveform)
+        for child in waveform.modules()
+        if not isinstance(child, (Mechanism, State, cacheable, Waveform))
+    }
     physical_populations = [population] if isinstance(population, Population) else []
     if type(population) is MultiPopulation:
         physical_populations.extend(population.populations.values())
@@ -952,9 +960,12 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
 
     classes = set()
     for owner in module.modules():
-        is_transform_module = id(owner) in transform_module_ids
+        is_transform_module = (
+            id(owner) in transform_module_ids or id(owner) in waveform_child_ids
+        )
         if not (
-            isinstance(owner, (Mechanism, State, cacheable)) or is_transform_module
+            isinstance(owner, (Mechanism, State, cacheable, Waveform))
+            or is_transform_module
         ):
             continue
         if is_transform_module:
@@ -969,7 +980,7 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
                 classes.add(cls)
         else:
             for cls in type(owner).__mro__:
-                if cls in {Mechanism, State, cacheable, torch.nn.Module}:
+                if cls in {Mechanism, State, cacheable, Waveform, torch.nn.Module}:
                     break
                 classes.add(cls)
     return tuple(sorted(classes, key=lambda cls: (cls.__module__, cls.__qualname__)))
@@ -1465,6 +1476,9 @@ def _rebind_population_time_references(population: Population) -> None:
 def _clone_execution_population(population: Population) -> Population:
     """Copy a model without retaining live autograd scratch or buffer aliases."""
     cloned = _deepcopy_execution_module(population)
+    from ._mechanism_injections import configure_mechanism_injection_execution
+
+    configure_mechanism_injection_execution(cloned)
     if cloned.integrator is not None:
         cloned.integrator.clear_jit_cache()
     # Imperative execution installs conditional Dynamo barriers around shared
@@ -3345,6 +3359,7 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                 )
             )
     from ._mechanism_delays import mechanism_delay_constant_slots
+    from ._mechanism_injections import mechanism_injection_constant_slots
 
     for module_path, owner in _parameterized_owner_paths(population):
         for name, buffer in mechanism_delay_constant_slots(owner):
@@ -3356,6 +3371,23 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     f"{module_path}.{name}",
                     module_path,
                     name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "constant",
+                )
+            )
+        for relative_path, buffer in mechanism_injection_constant_slots(owner):
+            if id(buffer) in seen or id(buffer) in parameter_ids:
+                continue
+            seen.add(id(buffer))
+            prefix, _separator, buffer_name = relative_path.rpartition(".")
+            path = f"{module_path}.{prefix}" if prefix else module_path
+            tables.append(
+                _PreparedBuffer(
+                    f"{module_path}.{relative_path}",
+                    path,
+                    buffer_name,
                     _shape_tuple(buffer),
                     buffer.dtype,
                     buffer.device,
@@ -3565,6 +3597,8 @@ def _ephemeral_assigned_slots(population: Population) -> tuple[str, ...]:
         id(owner): module_path for module_path, owner in population.named_modules()
     }
     slots = []
+    from ._mechanism_injections import mechanism_injection_ephemeral_slots
+
     handler = population.mech
     for collection_name in ("mechanisms", "material_processes"):
         for owner in getattr(handler, collection_name).values():
@@ -3575,6 +3609,10 @@ def _ephemeral_assigned_slots(population: Population) -> tuple[str, ...]:
                 f"population.{module_path}.{name}"
                 for name in owner._assigned
                 if name in owner._buffers
+            )
+            slots.extend(
+                f"population.{module_path}.{name}"
+                for name, _value in mechanism_injection_ephemeral_slots(owner)
             )
     return tuple(sorted(slots))
 
@@ -4975,6 +5013,11 @@ def _initialization_callable_dependency_signature(
         delay_helper = mechanism_delay_helper(owner, value)
         if delay_helper is not None:
             return ("dendra-pure-mechanism-delay", delay_helper)
+        from ._mechanism_injections import mechanism_injection_helper
+
+        injection_helper = mechanism_injection_helper(owner, value)
+        if injection_helper is not None:
+            return ("dendra-pure-mechanism-injection", injection_helper)
 
     if bound_receiver is owner and getattr(type(owner), "_table", None):
         from ._tables import table_wrapper_original
@@ -7364,9 +7407,18 @@ def _parametrization_constant_layout_for_owners(
             )
 
     from ._mechanism_delays import mechanism_delay_constant_slots
+    from ._mechanism_injections import mechanism_injection_constant_slots
     from ._tables import table_buffer_slots
 
     for owner in owners:
+        for relative_path, value in mechanism_injection_constant_slots(owner):
+            if is_registered_parameter(value):
+                continue
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value),
+                f"mechanism_injections.{module_paths[id(owner)]}.{relative_path}",
+            )
         for buffer_name, value in mechanism_delay_constant_slots(owner):
             record(value, registered_buffer_aliases(value))
             public_constant_by_identity.setdefault(
@@ -8377,8 +8429,12 @@ def _functionalization_failures(
             f"{mechanism.name}: {failure}"
             for failure in mechanism_delay_failures(mechanism)
         )
-        if mechanism._injection_specs:
-            failures.append(f"{mechanism.name} uses a registered waveform injection")
+        from ._mechanism_injections import mechanism_injection_failures
+
+        failures.extend(
+            f"{mechanism.name}: {failure}"
+            for failure in mechanism_injection_failures(mechanism)
+        )
         for state_name, state in mechanism.DE.items():
             state_label = f"{mechanism_label}.{state_name}"
             if (
@@ -8461,12 +8517,6 @@ def _functionalization_failures(
                 f"VoltageProcess {name!r}: {failure}"
                 for failure in _voltage_process_failures(process)
             )
-    if any(getattr(population, "mechanism_injection_accepted", ())):
-        failures.append(
-            "mechanism-owned waveform injections are not supported yet; only "
-            "solver-owned model[slice].inject(waveform) registrations can be lowered"
-        )
-
     parameter_contract_supported = True
     for owner in _parameterized_owners(population):
         if "_derive_parameter_buffers" in owner.__dict__ or inspect.getattr_static(
@@ -8618,6 +8668,17 @@ def _functionalization_failures(
     from ._tables import table_parameter_names
 
     transform_parameter_names.update(table_parameter_names(population))
+    from ._mechanism_injections import mechanism_injection_owners
+
+    # Waveform axes describe their own recipes (for example interpolation
+    # knots or selected compartments), rather than the mechanism's geometry.
+    # The injection plan audits the recipe and freezes each raw tensor schema.
+    transform_parameter_names.update(
+        parameter_name_by_identity[id(parameter)]
+        for _path, owner in mechanism_injection_owners(population)
+        for parameter in owner.injected_waveforms.parameters()
+        if id(parameter) in parameter_name_by_identity
+    )
     shared_initial_targets = _shared_initial_parameter_target_shapes(
         population,
         parameter_name_by_identity,
@@ -9558,6 +9619,12 @@ def _compiled_validate_mechanism_delay_source(functional) -> None:
 
 
 @torch.compiler.assume_constant_result
+def _compiled_validate_mechanism_injection_source(functional) -> None:
+    """Validate cold waveform ownership before capturing current evaluation."""
+    functional._mechanism_injection_plan.validate_source()
+
+
+@torch.compiler.assume_constant_result
 def _compiled_initialization_failures(population) -> tuple[str, ...]:
     """Evaluate Python-only initializer admission once per compiled graph."""
     return tuple(_functional_initialization_failures(population))
@@ -9733,6 +9800,12 @@ class FunctionalPopulation:
         self._mechanism_delay_plan = MechanismDelayPlan(population)
         self._source_mechanism_delay_bindings = (
             self._mechanism_delay_plan.source_binding_signature()
+        )
+        from ._mechanism_injections import MechanismInjectionPlan
+
+        self._mechanism_injection_plan = MechanismInjectionPlan(population)
+        self._source_mechanism_injection_bindings = (
+            self._mechanism_injection_plan.source_binding_signature()
         )
         self._source_ids = _structure_ids(population)
         self._fingerprint = _structure_signature(population)
@@ -10095,6 +10168,17 @@ class FunctionalPopulation:
                 ),
             )
             for path, name, _expected in self._mechanism_delay_plan.constant_entries
+        )
+        self._mechanism_injection_constant_names = tuple(
+            (
+                f"{path}.{name}",
+                next(
+                    item.key
+                    for item in self._parametrization_constants
+                    if f"{path}.{name}" in item.aliases
+                ),
+            )
+            for path, name, _expected in self._mechanism_injection_plan.constant_entries
         )
         self._prepared_buffer_visible_ranks = {
             entry.key: (
@@ -10776,6 +10860,19 @@ class FunctionalPopulation:
     def _validate_source(self) -> None:
         if torch.compiler.is_compiling():
             if (
+                self._mechanism_injection_plan.source_binding_signature()
+                != self._source_mechanism_injection_bindings
+            ):
+                raise FunctionalizationError(
+                    "The source mechanism injection registration, ownership, or "
+                    "waveform bindings changed; lower the Population again"
+                )
+            _compiled_validate_mechanism_injection_source(self)
+            self._mechanism_injection_plan.validate_source_tensor_values()
+        else:
+            self._mechanism_injection_plan.validate_source()
+        if torch.compiler.is_compiling():
+            if (
                 self._mechanism_delay_plan.source_binding_signature()
                 != self._source_mechanism_delay_bindings
             ):
@@ -10952,6 +11049,7 @@ class FunctionalPopulation:
             raise TypeError("population must be a dendra Population")
         self._table_plan.validate_population(population)
         self._mechanism_delay_plan.validate_population(population)
+        self._mechanism_injection_plan.validate_population(population)
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
         ):
@@ -11203,6 +11301,12 @@ class FunctionalPopulation:
             {
                 slot: constants[name]
                 for slot, name in self._mechanism_delay_constant_names
+            }
+        )
+        self._mechanism_injection_plan.validate_constant_values(
+            {
+                slot: constants[name]
+                for slot, name in self._mechanism_injection_constant_names
             }
         )
         for name, _path, shape, dtype, device in self._cache_value_specs:

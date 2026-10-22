@@ -22,6 +22,36 @@ def _population(parameters):
     )
 
 
+@pytest.mark.parametrize("scope", ("all", "model", "intra", "extra"))
+@pytest.mark.parametrize("inference", (False, True))
+def test_population_independent_parameters_preserve_cross_namespace_aliases(
+    scope, inference
+):
+    source = torch.nn.Parameter(torch.tensor(0.7, dtype=DTYPE))
+    names = (
+        "integrator.mech.mechanisms.owner.injected_waveforms.0.amp",
+        "stimulation.intra.waveforms.0.amp",
+        "stimulation.extra.waveforms.0.amp",
+    )
+    tensors = _population({**dict.fromkeys(names, source), "separate": source.detach()})
+    with torch.inference_mode(inference):
+        parameters = tensors.independent_parameters("*amp", within=scope)
+    shared = parameters[names[0]]
+    assert isinstance(shared, torch.nn.Parameter)
+    assert all(parameters[name] is shared for name in names)
+    assert (
+        parameters["separate"] is not shared
+        and not parameters["separate"].requires_grad
+    )
+    assert shared.data_ptr() != source.data_ptr()
+    assert shared._version == 0
+    gradient = torch.autograd.grad(
+        sum(parameters[name].square() for name in names), shared
+    )[0]
+    torch.testing.assert_close(gradient, 6 * source.detach())
+    assert source.grad is None
+
+
 def _flatten_network(parameters, prefix=()):
     result = {}
     for name, value in parameters.items():

@@ -22,6 +22,7 @@ from . import _network_parameters
 from ._continuous import FunctionalContinuousCon
 from ._continuous_transform import _named_tensors
 from ._mechanism_delays import network_mechanism_delay_alias_signature
+from ._mechanism_injections import network_mechanism_injection_alias_signature
 from ._netcon import FunctionalNetCon, _effective_tensor, _snapshot
 from ._netstim import FunctionalNetStim
 from ._network_bindings import AliasSnapshots, SourceBinding
@@ -215,14 +216,37 @@ def _eligible(network):
                 "Functional Network requires distinct mutable component owners."
             )
     population_modules = set()
+    mutable_population_modules = set()
     for population in network.populations.values():
         owned = {id(module) for module in population.modules()}
-        if population_modules & owned:
+        # A registered injection Waveform is audited as a pure recipe by each
+        # Population plan. Its parameters may be shared while its execution
+        # copy is isolated per Population. Runtime owners remain disjoint.
+        from ._mechanism_injections import mechanism_injection_owners
+
+        waveform_roots = {
+            id(waveform)
+            for _path, owner in mechanism_injection_owners(population)
+            for waveform in owner.injected_waveforms
+        }
+        mutable_owned = set()
+
+        def visit(module):
+            if id(module) in waveform_roots or id(module) in mutable_owned:
+                return
+            mutable_owned.add(id(module))
+            for child in module.children():
+                visit(child)
+
+        visit(population)
+        shared = population_modules & owned
+        if shared & (mutable_population_modules | mutable_owned):
             raise FunctionalizationError(
                 "Functional Network Populations must own distinct modules; "
                 "share raw parameter Tensors instead."
             )
         population_modules.update(owned)
+        mutable_population_modules.update(mutable_owned)
     devices = {population.device() for population in network.populations.values()}
     if len(devices) != 1 or (
         network.netstim is not None and network.netstim.device() not in devices
@@ -339,6 +363,9 @@ class FunctionalNetwork:
         self._source_table_aliases = network_table_alias_signature(network)
         self._source_mechanism_delay_aliases = network_mechanism_delay_alias_signature(
             network
+        )
+        self._source_mechanism_injection_aliases = (
+            network_mechanism_injection_alias_signature(network)
         )
         self.synapses = {
             name: FunctionalNetCon(connection, pending_capacity=capacities.get(name))
@@ -668,6 +695,13 @@ class FunctionalNetwork:
         ):
             raise FunctionalizationError(
                 "The Network mechanism delay tensor aliases changed; lower again."
+            )
+        if (
+            network_mechanism_injection_alias_signature(network)
+            != self._source_mechanism_injection_aliases
+        ):
+            raise FunctionalizationError(
+                "The Network mechanism injection tensor aliases changed; lower again."
             )
         if self.netstim is not None:
             self.netstim._validate_source()

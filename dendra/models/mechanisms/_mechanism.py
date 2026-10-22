@@ -28,6 +28,7 @@ from ._delays import (
     resolve_delay_mode,
     shifted_history_values,
 )
+from ._injections import expand_injection_value
 from ._ions import VALENCES
 from ._materials import _canonical_material_name
 from ._state import (
@@ -3983,9 +3984,10 @@ class Mechanism(Parameterized):
         :meth:`inject`.  It computes the overlap between a population-level
         injection index and the compartments occupied by this mechanism, stores
         the waveform as a submodule, and records a boolean local mask.  Later,
-        :meth:`evaluate_injections` evaluates all registered waveforms at the
-        current mechanism time and returns a tensor shaped like the local voltage
-        argument, with zeros outside the targeted compartments.
+        :meth:`injection_values` evaluates registered waveforms at an explicit
+        time and returns a tensor shaped like the local voltage argument, with
+        zeros outside the targeted compartments. :meth:`evaluate_injections`
+        additionally assigns the named current for native compatibility.
 
         Registration succeeds only when this mechanism covers every targeted
         population location.  Partial overlap returns ``False`` without storing
@@ -4019,14 +4021,15 @@ class Mechanism(Parameterized):
         # complete population-level injection.  Reject partial overlap before
         # registering anything so the solver fallback can safely deliver the
         # whole stimulus without duplicating covered locations.
-        local_coverage = local_mask.to(dtype=torch.bool)
-        full_coverage = self.put(
-            local_coverage,
-            torch.zeros_like(full_mask),
-            full_mask,
-        ).to(dtype=torch.bool)
-        if not bool(torch.all(full_coverage[full_mask]).item()):
-            return False
+        if model_shape is not None:
+            local_coverage = local_mask.to(dtype=torch.bool)
+            full_coverage = self.put(
+                local_coverage,
+                torch.zeros_like(full_mask),
+                full_mask,
+            ).to(dtype=torch.bool)
+            if not bool(torch.all(full_coverage[full_mask]).item()):
+                return False
 
         k = len(self.injected_waveforms)
         mask_name = f"_injection_mask_{k}"
@@ -4072,121 +4075,35 @@ class Mechanism(Parameterized):
         n_local_selected=None,
     ):
         """Return ``value`` padded/broadcast into ``out`` at ``mask`` locations."""
-        value = torch.as_tensor(value, device=out.device, dtype=out.dtype)
+        return expand_injection_value(
+            value,
+            mask,
+            out,
+            selected_index=selected_index,
+            n_local_selected=n_local_selected,
+        )
 
-        # Bring an unbatched mask up to the current local state shape.
-        local_mask = mask.to(device=out.device, dtype=torch.bool)
-        mask = local_mask
-        while mask.ndim < out.ndim:
-            mask = mask.unsqueeze(0)
-        mask = mask.expand_as(out)
+    def injection_values(self, v, *, t, current_name="i_inj"):
+        """Return registered waveform currents without changing mechanism state.
 
-        if value.ndim == 0 or value.numel() == 1:
-            return value.reshape(()) * mask.to(out.dtype)
+        ``v`` supplies the local output shape, device and dtype. ``t`` is an
+        explicit scalar evaluation time in ms. The returned tensor sums matching
+        registrations, with zeros outside their masks. Waveform outputs may
+        be scalar, broadcast over the local shape, or contain one value per
+        selected compartment, optionally preceded by batch axes. Scales multiply
+        waveform outputs before the singleton time axis is removed, so tensor
+        scales must broadcast with that time-last output.
 
-        if tuple(value.shape) == tuple(out.shape):
-            return value * mask.to(out.dtype)
-
-        # Common case: waveform returns the unbatched local mechanism shape.
-        if value.ndim <= out.ndim:
-            v = value
-            while v.ndim < out.ndim:
-                v = v.unsqueeze(0)
-            if tuple(v.shape) == tuple(out.shape) or all(
-                a == b or a == 1 for a, b in zip(v.shape, out.shape)
-            ):
-                return v.expand_as(out) * mask.to(out.dtype)
-
-        # Vector over selected compartments.  This supports either a single
-        # unbatched vector of length n_selected or a batched tensor whose last
-        # dimension is n_selected.
-        # If the mask describes the local (unbatched) suffix, accept either one
-        # selected vector shared across batches or one vector per batch.
-        if local_mask.ndim <= out.ndim and tuple(
-            out.shape[out.ndim - local_mask.ndim :]
-        ) == tuple(local_mask.shape):
-            batch_shape = tuple(out.shape[: out.ndim - local_mask.ndim])
-            if n_local_selected is None:
-                n_local_selected = int(local_mask.reshape(-1).sum().item())
-            selected_shape = batch_shape + (n_local_selected,)
-            selected = None
-            if value.numel() == n_local_selected:
-                selected = value.reshape(
-                    (1,) * len(batch_shape) + (n_local_selected,)
-                ).expand(selected_shape)
-            else:
-                try:
-                    selected = value.expand(selected_shape)
-                except RuntimeError:
-                    pass
-            if selected is not None:
-                if selected_index is None:
-                    selected_index = torch.nonzero(
-                        local_mask.reshape(-1), as_tuple=False
-                    ).reshape(-1)
-                padded = torch.zeros_like(out).reshape(-1, local_mask.numel())
-                padded = padded.index_copy(
-                    1,
-                    selected_index.to(device=out.device),
-                    selected.reshape(-1, n_local_selected),
-                )
-                return padded.reshape_as(out)
-
-        n_selected = int(mask.reshape(-1).sum().item())
-        if value.numel() == n_selected:
-            padded = torch.zeros_like(out)
-            padded.reshape(-1)[mask.reshape(-1)] = value.reshape(-1)
-            return padded
-
-        # Last-resort attempt: rely on PyTorch broadcasting, then mask.
-        try:
-            return value.expand_as(out) * mask.to(out.dtype)
-        except RuntimeError as exc:
-            raise ValueError(
-                f"Waveform output shape {tuple(value.shape)} cannot be broadcast "
-                f"or padded into mechanism-local shape {tuple(out.shape)}."
-            ) from exc
-
-    def evaluate_injections(self, v=None, *, t=None, current_name="i_inj"):
-        """Evaluate registered waveform injections and expose the result.
-
-        Parameters
-        ----------
-        v : torch.Tensor, optional
-            Local voltage/state tensor that defines the desired output shape.  If
-            omitted, the first injection mask shape is used.
-        t : torch.Tensor or float, optional
-            Evaluation time in ms.  Defaults to the mechanism's ``t`` reference,
-            which :class:`Population` sets during build.
-        current_name : str, optional
-            Name of the exposed current variable.  Defaults to ``i_inj``.
-
-        Returns
-        -------
-        torch.Tensor
-            Sum of all registered waveform currents, padded to ``v``'s shape.
+        Waveforms must evaluate without mutating their module or inputs when
+        this helper is used from a pure hook. Parameters and tensor-valued times
+        remain differentiable. This helper does not assign ``current_name``;
+        return the result from ``assigned_values`` or use it in current algebra.
         """
-        if v is None:
-            if self._injection_specs:
-                v = getattr(self, self._injection_specs[0]["mask"]).to(self.diam.dtype)
-            elif hasattr(self, current_name):
-                v = getattr(self, current_name)
-            else:
-                v = self.diam
-
-        out = torch.zeros_like(v, dtype=v.dtype, device=v.device)
+        out = torch.zeros_like(v)
         if not self._injection_specs:
-            setattr(self, current_name, out)
             return out
 
-        if t is None:
-            t = (
-                self.t
-                if hasattr(self, "t")
-                else torch.zeros((), device=v.device, dtype=v.dtype)
-            )
-        t = torch.as_tensor(t, device=v.device, dtype=v.dtype)
-        t = torch.atleast_1d(t)
+        t = torch.atleast_1d(torch.as_tensor(t, device=v.device, dtype=v.dtype))
         if t.numel() != 1:
             raise ValueError(
                 "Mechanism waveform injections are evaluated one timestep at a "
@@ -4199,21 +4116,48 @@ class Mechanism(Parameterized):
             mask = getattr(self, spec["mask"])
             scale = getattr(self, spec["scale"])
             selected_index = getattr(self, spec["index"])
-            value = self.injected_waveforms[k](t) * scale
-            # Dendra Waveforms always return time on the last axis.  This
-            # method evaluates one timestep, so remove that singleton before
-            # applying spatial/batch broadcasting.  Custom modules that return
-            # a spatial value directly remain supported.
+            value = torch.as_tensor(
+                self.injected_waveforms[k](t) * scale,
+                device=v.device,
+                dtype=v.dtype,
+            )
+            # Waveforms put time last; this call evaluates one timestep. Custom
+            # modules may also return a spatial value directly.
             if value.ndim > 0 and value.shape[-1] == 1:
                 value = value.squeeze(-1)
-            out = out + self._expand_injection_value(
+            current = self._expand_injection_value(
                 value,
                 mask,
                 out,
                 selected_index=selected_index,
                 n_local_selected=int(spec["n_selected"]),
             )
+            out = out + current
+        return out
 
+    def evaluate_injections(self, v=None, *, t=None, current_name="i_inj"):
+        """Evaluate registered waveform currents and assign ``current_name``.
+
+        This native compatibility adapter uses :meth:`injection_values` for
+        numerical evaluation. ``v`` defaults to the first injection mask, an
+        existing named current, or ``diam``. ``t`` defaults to the mechanism's
+        clock, or zero when it has no clock. Pure hooks use
+        :meth:`injection_values` with explicit ``v`` and ``t`` instead.
+        """
+        if v is None:
+            if self._injection_specs:
+                v = getattr(self, self._injection_specs[0]["mask"]).to(self.diam.dtype)
+            elif hasattr(self, current_name):
+                v = getattr(self, current_name)
+            else:
+                v = self.diam
+        if t is None and self._injection_specs:
+            t = (
+                self.t
+                if hasattr(self, "t")
+                else torch.zeros((), device=v.device, dtype=v.dtype)
+            )
+        out = self.injection_values(v, t=t, current_name=current_name)
         setattr(self, current_name, out)
         return out
 

@@ -1210,14 +1210,12 @@ def interp1d(
 
     # --- make inputs at least 2D ---
     is_flat = {}
-    require_grad = {}
     v = {}
 
     for name, vec in {"x": x, "y": y, "xnew": xnew}.items():
         assert vec.ndim <= 2, "interp1d: all inputs must be at most 2-D."
         v[name] = vec[None, :] if vec.ndim == 1 else vec
         is_flat[name] = v[name].shape[0] == 1
-        require_grad[name] = vec.requires_grad
 
     device = x.device
     assert y.device == device and xnew.device == device, (
@@ -1263,101 +1261,94 @@ def interp1d(
             return t.contiguous().view(-1)[ind]
         return torch.gather(t, 1, ind)
 
-    # Never re-enable reverse-mode recording inside an ambient no-grad context.
-    enable_grad = torch.is_grad_enabled() and (
-        require_grad["x"] or require_grad["y"] or require_grad["xnew"]
-    )
-    grad_ctx = torch.enable_grad() if enable_grad else torch.no_grad()
-
-    with grad_ctx:
-        # Decide whether to use uniform fast-path
-        use_uniform = False
-        if uniform != "never":
-            dx = v["x"][:, 1:] - v["x"][:, :-1]  # (Rx,N-1)
-            dx0 = dx[:, :1]
-            uniform_ok = bool(torch.all(dx0 > 0).item()) and torch.allclose(
-                dx, dx0.expand_as(dx), rtol=uniform_rtol, atol=uniform_atol
+    # Respect the caller's grad mode. Captured scan inputs can report
+    # requires_grad=False while still representing differentiable leaves.
+    # Decide whether to use uniform fast-path
+    use_uniform = False
+    if uniform != "never":
+        dx = v["x"][:, 1:] - v["x"][:, :-1]  # (Rx,N-1)
+        dx0 = dx[:, :1]
+        uniform_ok = bool(torch.all(dx0 > 0).item()) and torch.allclose(
+            dx, dx0.expand_as(dx), rtol=uniform_rtol, atol=uniform_atol
+        )
+        if uniform == "always" and not uniform_ok:
+            raise ValueError(
+                "uniform='always' but x is not uniformly spaced (per row)."
             )
-            if uniform == "always" and not uniform_ok:
-                raise ValueError(
-                    "uniform='always' but x is not uniformly spaced (per row)."
-                )
-            use_uniform = uniform_ok
+        use_uniform = uniform_ok
 
-        if use_uniform:
-            x_min = v["x"][:, :1]
-            x_max = v["x"][:, -1:]
-            dx0 = v["x"][:, 1:2] - v["x"][:, 0:1]
+    if use_uniform:
+        x_min = v["x"][:, :1]
+        x_max = v["x"][:, -1:]
+        dx0 = v["x"][:, 1:2] - v["x"][:, 0:1]
 
-            if x_min.shape[0] == 1 and D_eff > 1:
-                x_min = x_min.expand(D_eff, 1)
-                x_max = x_max.expand(D_eff, 1)
-                dx0 = dx0.expand(D_eff, 1)
+        if x_min.shape[0] == 1 and D_eff > 1:
+            x_min = x_min.expand(D_eff, 1)
+            x_max = x_max.expand(D_eff, 1)
+            dx0 = dx0.expand(D_eff, 1)
 
-            eps = torch.finfo(v["x"].dtype).eps
-            safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
-            inv_dx0 = 1.0 / safe_dx0
+        eps = torch.finfo(v["x"].dtype).eps
+        safe_dx0 = torch.where(dx0 == 0, torch.full_like(dx0, eps), dx0)
+        inv_dx0 = 1.0 / safe_dx0
 
-            x_used = (
-                torch.clamp(v["xnew"], x_min, x_max)
-                if outside == "clamp"
-                else v["xnew"]
-            )
-            u = (x_used - x_min) * inv_dx0
-            ind = u.to(torch.long).clamp(0, v["x"].shape[1] - 2)
-            t = u - ind.to(u.dtype)
-            if outside == "clamp":
-                t = torch.clamp(t, 0.0, 1.0)
+        x_used = (
+            torch.clamp(v["xnew"], x_min, x_max) if outside == "clamp" else v["xnew"]
+        )
+        u = (x_used - x_min) * inv_dx0
+        ind = u.to(torch.long).clamp(0, v["x"].shape[1] - 2)
+        t = u - ind.to(u.dtype)
+        if outside == "clamp":
+            t = torch.clamp(t, 0.0, 1.0)
 
-            dy = v["y"][:, 1:] - v["y"][:, :-1]
-            dy_is_flat = dy.shape[0] == 1
+        dy = v["y"][:, 1:] - v["y"][:, :-1]
+        dy_is_flat = dy.shape[0] == 1
 
-            ynew = sel(v["y"], is_flat["y"], ind) + sel(dy, dy_is_flat, ind) * t
+        ynew = sel(v["y"], is_flat["y"], ind) + sel(dy, dy_is_flat, ind) * t
 
-            if outside == "clamp":
-                y_min = v["y"][:, :1]
-                y_max = v["y"][:, -1:]
-                if y_min.shape[0] == 1 and D_eff > 1:
-                    y_min = y_min.expand(D_eff, 1)
-                    y_max = y_max.expand(D_eff, 1)
-                ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
-                ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
-            else:
-                outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
-                ynew = ynew.masked_fill(outside_mask, 0.0)
-
+        if outside == "clamp":
+            y_min = v["y"][:, :1]
+            y_max = v["y"][:, -1:]
+            if y_min.shape[0] == 1 and D_eff > 1:
+                y_min = y_min.expand(D_eff, 1)
+                y_max = y_max.expand(D_eff, 1)
+            ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
+            ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
         else:
-            # Original searchsorted path
-            # Materialize query values at any hidden vmap levels carried by
-            # ``x``. Merely calling contiguous() on an unbatched query leaves
-            # the batching rule with a stride-zero broadcast and emits a
-            # performance warning.
-            search_values = (v["xnew"] + torch.zeros_like(v["x"][:, :1])).contiguous()
-            ind = torch.searchsorted(v["x"].contiguous().squeeze(), search_values)
-            ind = (ind - 1).clamp(0, v["x"].shape[1] - 2)
+            outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
+            ynew = ynew.masked_fill(outside_mask, 0.0)
 
-            dx = v["x"][:, 1:] - v["x"][:, :-1]
-            safe_dx = torch.where(
-                dx == 0, torch.full_like(dx, torch.finfo(dx.dtype).eps), dx
-            )
-            slopes = (v["y"][:, 1:] - v["y"][:, :-1]) / safe_dx
-            slopes_is_flat = slopes.shape[0] == 1
+    else:
+        # Original searchsorted path
+        # Materialize query values at any hidden vmap levels carried by
+        # ``x``. Merely calling contiguous() on an unbatched query leaves
+        # the batching rule with a stride-zero broadcast and emits a
+        # performance warning.
+        search_values = (v["xnew"] + torch.zeros_like(v["x"][:, :1])).contiguous()
+        ind = torch.searchsorted(v["x"].contiguous().squeeze(), search_values)
+        ind = (ind - 1).clamp(0, v["x"].shape[1] - 2)
 
-            ynew = sel(v["y"], is_flat["y"], ind) + sel(slopes, slopes_is_flat, ind) * (
-                v["xnew"] - sel(v["x"], is_flat["x"], ind)
-            )
+        dx = v["x"][:, 1:] - v["x"][:, :-1]
+        safe_dx = torch.where(
+            dx == 0, torch.full_like(dx, torch.finfo(dx.dtype).eps), dx
+        )
+        slopes = (v["y"][:, 1:] - v["y"][:, :-1]) / safe_dx
+        slopes_is_flat = slopes.shape[0] == 1
 
-            x_min = v["x"][:, :1]
-            x_max = v["x"][:, -1:]
+        ynew = sel(v["y"], is_flat["y"], ind) + sel(slopes, slopes_is_flat, ind) * (
+            v["xnew"] - sel(v["x"], is_flat["x"], ind)
+        )
 
-            if outside == "clamp":
-                y_min = v["y"][:, :1]
-                y_max = v["y"][:, -1:]
-                ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
-                ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
-            else:
-                outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
-                ynew = ynew.masked_fill(outside_mask, 0.0)
+        x_min = v["x"][:, :1]
+        x_max = v["x"][:, -1:]
+
+        if outside == "clamp":
+            y_min = v["y"][:, :1]
+            y_max = v["y"][:, -1:]
+            ynew = torch.where(v["xnew"] <= x_min, y_min.expand_as(ynew), ynew)
+            ynew = torch.where(v["xnew"] >= x_max, y_max.expand_as(ynew), ynew)
+        else:
+            outside_mask = (v["xnew"] < x_min) | (v["xnew"] > x_max)
+            ynew = ynew.masked_fill(outside_mask, 0.0)
 
     if ybuf is not None:
         ybuf.copy_(ynew)

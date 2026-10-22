@@ -331,6 +331,77 @@ def test_purity_audit_includes_non_waveform_module_children():
     assert waveform.child.params["calls"] == 0
 
 
+@pytest.mark.parametrize(
+    "name",
+    ("__call__", "_call_impl", "_wrapped_call_impl", "__getattribute__", "__getattr__"),
+)
+def test_purity_validation_rejects_custom_module_dispatch(name):
+    def fn(self, t):
+        return torch.ones_like(t)
+
+    def call(self, t):
+        return torch.ones_like(t)
+
+    def getattribute(self, name):
+        return object.__getattribute__(self, name)
+
+    def getattr_(self, name):
+        return torch.nn.Module.__getattr__(self, name)
+
+    override = {
+        "__call__": call,
+        "_call_impl": call,
+        "_wrapped_call_impl": call,
+        "__getattribute__": getattribute,
+        "__getattr__": getattr_,
+    }[name]
+    waveform_type = type(
+        "CustomDispatchWaveform",
+        (Waveform,),
+        {"FUNCTIONAL_PURE": True, "fn": fn, name: override},
+    )
+    model = _model()
+    model[:, 1].inject(waveform_type())
+    with pytest.raises(dn.func.FunctionalizationError, match="canonical.*dispatch"):
+        dn.func.make_functional(model, dt=DT)
+
+
+def test_purity_validation_qualifies_nested_module_dispatch():
+    class Child(torch.nn.Module):
+        def __call__(self, t):
+            return torch.ones_like(t)
+
+    class Recipe(Waveform):
+        FUNCTIONAL_PURE = True
+
+        def __init__(self):
+            super().__init__()
+            self.child = Child()
+
+        def fn(self, t):
+            return self.child(t)
+
+    model = _model()
+    model[:, 1].inject(Recipe())
+    with pytest.raises(dn.func.FunctionalizationError, match="canonical.*dispatch"):
+        dn.func.make_functional(model, dt=DT)
+
+
+def test_purity_validation_preserves_custom_forward():
+    class Recipe(Waveform):
+        FUNCTIONAL_PURE = True
+
+        def forward(self, t):
+            return torch.ones_like(t) * 0.2
+
+    model = _model()
+    model[:, 1].inject(Recipe())
+    functional, _tensors = dn.func.make_functional(model, dt=DT)
+    times = torch.tensor([0.0, 0.05, 0.125], dtype=DTYPE)
+    assembled = functional.intra.assemble_tensors(functional.intra.extract(), times)
+    assert torch.isfinite(assembled).all()
+
+
 def test_interp1d_mixed_dtype_preserves_allocation_and_out_contracts():
     x = torch.tensor([0.0, 0.25, 1.0], dtype=torch.float32)
     y = torch.tensor([1.0, 3.0, 9.0], dtype=torch.float64)

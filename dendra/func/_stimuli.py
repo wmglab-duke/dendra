@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -153,6 +154,47 @@ _MODULE_INTERNAL_STATE = {
     "_modules",
 }
 _SIMPLE_PARAMETERIZED_CONSTRUCTOR_MIRRORS = {"params", "params_p", "params_n"}
+_WAVEFORM_MODULE_DISPATCH = {
+    name: inspect.getattr_static(torch.nn.Module, name)
+    for name in ("__call__", "_call_impl", "_wrapped_call_impl", "__getattr__")
+}
+_WAVEFORM_MODULE_DISPATCH["__getattribute__"] = object.__getattribute__
+
+
+def _validate_waveform_dispatch(module: torch.nn.Module, label: str) -> None:
+    """Keep evaluated recipes on the forward/registered-attribute contract."""
+    for name, standard in _WAVEFORM_MODULE_DISPATCH.items():
+        if inspect.getattr_static(
+            type(module), name
+        ) is not standard or name in object.__getattribute__(module, "__dict__"):
+            raise FunctionalizationError(
+                f"Waveform {label!r} requires canonical module call/attribute "
+                "dispatch; express custom behavior in forward or fn and use "
+                "registered parameters, buffers, and child modules."
+            )
+    if getattr(module, "_compiled_call_impl", None) is not None:
+        raise FunctionalizationError(
+            f"Waveform {label!r} cannot retain compiled custom call dispatch."
+        )
+
+
+def _waveform_registered_modules(waveform: Waveform):
+    """Visit raw registered children, qualifying dispatch before reading state."""
+    seen = set()
+
+    def visit(path, module):
+        if id(module) in seen:
+            return
+        seen.add(id(module))
+        _validate_waveform_dispatch(module, path or "waveform")
+        yield path, module
+        for name, child in object.__getattribute__(module, "__dict__")[
+            "_modules"
+        ].items():
+            if child is not None:
+                yield from visit(f"{path}.{name}" if path else name, child)
+
+    return visit("", waveform)
 
 
 def _is_internal_module_state(module: torch.nn.Module, name: str) -> bool:
@@ -291,7 +333,7 @@ def _validate_waveform_contract(waveform: Waveform, label: str) -> None:
         "_backward_pre_hooks",
         "_backward_hooks",
     )
-    for module_name, module in waveform.named_modules():
+    for module_name, module in _waveform_registered_modules(waveform):
         module_label = label if not module_name else f"{label}.{module_name}"
         for attribute in hook_attributes:
             if getattr(module, attribute, None):
