@@ -5,7 +5,7 @@ import torch
 from dendra.helpers import DEBUG
 
 from ..parametric import resolve, to_param
-from ._materials import Material, MaterialFieldSpec
+from ._materials import Material, MaterialFieldSpec, _resolve_initial_source
 
 # default reversal potentials from NEURON
 REVERSAL = {"ena": 50.0, "ek": -77.0, "eca": 132.0}
@@ -254,7 +254,7 @@ class Ion(Material):
 
     @staticmethod
     def _expand_init_like(value, like):
-        value = resolve(value)
+        value = _resolve_initial_source(value)
         if torch.is_tensor(value):
             value_t = value.to(device=like.device, dtype=like.dtype)
         else:
@@ -264,6 +264,12 @@ class Ion(Material):
         return value_t.expand_as(like).clone()
 
     def initialize(self, celsius) -> None:
+        """Reset ionic fields from current source leaves and derive reversals.
+
+        Canonical bounded sources bypass their derived inference caches while
+        retaining their authored training modes. Evaluation detaches the
+        installed runtime fields.
+        """
         # Ion initialization should use e_init/i_init/o_init so that explicit
         # equilibria()/concentrations() values, including trainable parameter
         # declarations handled by to_param, remain the source of truth.

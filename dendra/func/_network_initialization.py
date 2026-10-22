@@ -48,10 +48,51 @@ class NetworkInitializationInput(NamedTuple):
 
 def initialization_alias_failures(functional):
     """Reject native retained materializations absent from the explicit packet."""
-    from ._population import _initialization_transform_hooks
+    from ._initialization_sources import (
+        initialization_source_constant_slots,
+        initialization_source_roots,
+    )
+    from ._population import (
+        _initialization_only_parameter_names,
+        _initialization_transform_hooks,
+    )
 
     order = {name: index for index, name in enumerate(functional.populations)}
+    initial_only = {
+        name: _initialization_only_parameter_names(plan._population)
+        for name, plan in functional.populations.items()
+    }
     failures = []
+    initial_constants = {}
+    for name, plan in functional.populations.items():
+        if plan._owned_cache_bound:
+            continue
+        population = plan._population
+        source_buffer_ids = {
+            id(value)
+            for _path, source in initialization_source_roots(population)
+            for _slot, value in initialization_source_constant_slots(source)
+        }
+        for entry in plan._parametrization_constants:
+            value = population.get_submodule(entry.module_path)._buffers[
+                entry.buffer_name
+            ]
+            if id(value) in source_buffer_ids:
+                initial_constants[("populations", name, entry.key)] = name
+    for parameter_path, constant_paths in functional._parameter_constant_aliases:
+        for constant_path in constant_paths:
+            name = initial_constants.get(constant_path)
+            if name is None or parameter_path[:2] == ("populations", name):
+                continue
+            failures.append(
+                f"Population {name!r} initialization source buffer "
+                f"{constant_path[2]!r} aliases parameter "
+                f"{'.'.join(parameter_path)!r} registered only outside that "
+                "Population. Cross-Population initializer buffer/parameter "
+                "aliases are currently unsupported; register the same Parameter "
+                "on the initializer module as a Parameter attribute to preserve "
+                "its canonical shared binding"
+            )
     for name, plan in functional.populations.items():
         if plan._owned_cache_bound:
             # Owned-cache initialization skips both pre transforms and
@@ -88,7 +129,7 @@ def initialization_alias_failures(functional):
                 if (
                     path[0] == "populations"
                     and order[path[1]] < order[name]
-                    and "._initial_sources." not in path[2]
+                    and path[2] not in initial_only[path[1]]
                 ):
                     failures.append(
                         f"Population {name!r} writes a shared runtime parameter of "
@@ -105,7 +146,7 @@ def initialization_alias_failures(functional):
                         path[0] == "populations"
                         and order[path[1]] < order[owner]
                         and not functional.populations[path[1]]._owned_cache_bound
-                        and "._initial_sources." not in path[2]
+                        and path[2] not in initial_only[path[1]]
                     ):
                         failures.append(
                             f"Population {owner!r} cache writes a shared runtime "

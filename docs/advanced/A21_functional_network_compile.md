@@ -173,7 +173,11 @@ cache semantics. Fresh results return both effective `aux["parameters"]` and
 {doc}`A29_functional_network_cache_initialization` for cache capture, current
 connection parameters, gradient boundaries, and required continuation packets.
 Without a cache, fresh initialization uses current explicit parameters as
-described above. Initialization-time RAND declarations use explicit draw and
+described above. Ion and Material initial values can use `PositiveParam` or
+deterministic zero-argument modules with registered parameters and buffers;
+shared sources retain one raw parameter binding across populations. See
+{doc}`A36_functional_initialization_sources` for source purity, gradients, and
+cache behavior. Initialization-time RAND declarations use explicit draw and
 RNG packets, including their resampling and ``reseed_on_initialize`` policies;
 see {doc}`A30_functional_random_parameters`. Runtime NOISE declarations use
 per-Population draw/RNG tapes, with automatic host sampling and explicit

@@ -1637,10 +1637,14 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             values = ion._derive_initial_field_values(celsius)
             ion._install_field_values(values)
+            if not ion.training:
+                ion.detach()
         for material in self.materials.values():
             values = material._derive_initial_field_values()
             values.update(material._derive_advanced_field_updates(values, celsius))
             material._install_field_values(values)
+            if not material.training:
+                material.detach()
 
     def _advance_shared_fields(self, celsius, *, dispatch_hooks):
         """Apply guards and derived-field updates to the committed frame."""

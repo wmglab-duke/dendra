@@ -201,24 +201,13 @@ _MATERIAL_FUNCTIONAL_COMMON_HOOKS = (
     "set_dt",
     "_reset_initialization_timestep",
 )
-_STANDARD_PACKED_MATERIAL_INITIAL_FORWARD = _PackedMaterialInitial.forward
 _STANDARD_PACKED_MATERIAL_GEOMETRY_FORWARD = _PackedMaterialGeometry.forward
 
 
 def _is_pure_shared_initial_source(source):
-    if isinstance(source, torch.nn.Parameter):
-        return True
-    if (
-        type(source) is not _PackedMaterialInitial
-        or "forward" in source.__dict__
-        or type(source).forward is not _STANDARD_PACKED_MATERIAL_INITIAL_FORWARD
-        or _module_autograd_hook_signature(source)
-    ):
-        return False
-    return all(
-        _is_pure_shared_initial_source(getattr(source, f"source_{index}"))
-        for index in range(len(source.shapes))
-    )
+    # Module recipes receive a separate cold purity audit. Its failures disable
+    # fresh initialization while retaining an otherwise valid snapshot plan.
+    return isinstance(source, (torch.nn.Parameter, torch.nn.Module))
 
 
 @dataclass(frozen=True)
@@ -928,6 +917,16 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
             if isinstance(child, component_adapter_type)
         )
     for physical_population in physical_populations:
+        from ._initialization_sources import (
+            _registered_modules,
+            initialization_source_roots,
+        )
+
+        transform_module_ids.update(
+            id(child)
+            for _path, source in initialization_source_roots(physical_population)
+            for _child_path, child in _registered_modules(source)
+        )
         initialization_transforms = getattr(
             physical_population,
             "_initialization_transforms",
@@ -1479,6 +1478,9 @@ def _clone_execution_population(population: Population) -> Population:
     from ._mechanism_injections import configure_mechanism_injection_execution
 
     configure_mechanism_injection_execution(cloned)
+    from ._initialization_sources import configure_initialization_source_execution
+
+    configure_initialization_source_execution(cloned)
     if cloned.integrator is not None:
         cloned.integrator.clear_jit_cache()
     # Imperative execution installs conditional Dynamo barriers around shared
@@ -1559,6 +1561,41 @@ def _parameter_alias_paths(module: torch.nn.Module) -> dict[str, tuple[str, ...]
                     f"{prefix}{buffer_name}"
                 )
     return {name: tuple(paths) for name, paths in aliases.items()}
+
+
+def _initialization_only_parameter_names(population) -> frozenset[str]:
+    """Identify raw leaves used exclusively by declared shared-field sources."""
+    from ._initialization_sources import _initial_source_entries
+
+    source_parameters = set()
+    source_prefixes = []
+
+    def collect(owner, prefix=""):
+        aliases = {}
+        for path, module in owner.named_modules(remove_duplicate=False):
+            aliases.setdefault(id(module), []).append(path)
+        for path, source in _initial_source_entries(owner, include_tensors=True):
+            parent_path, _separator, slot = path.rpartition(".")
+            parent = _module_at(owner, parent_path)
+            for alias in aliases[id(parent)]:
+                allowed = prefix + f"{alias + '.' if alias else ''}{slot}"
+                if isinstance(source, torch.nn.Module):
+                    source_prefixes.append(allowed + ".")
+                else:
+                    source_parameters.add(allowed)
+        if type(owner) is MultiPopulation:
+            for name, component in owner.populations.items():
+                collect(component, f"{prefix}populations.{name}.")
+
+    collect(population)
+    return frozenset(
+        name
+        for name, paths in _parameter_alias_paths(population).items()
+        if all(
+            path in source_parameters or path.startswith(tuple(source_prefixes))
+            for path in paths
+        )
+    )
 
 
 def _unpack_forward_ad(value: torch.Tensor):
@@ -3394,6 +3431,43 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     "constant",
                 )
             )
+    from ._initialization_sources import (
+        initialization_source_constant_slots,
+        initialization_source_roots,
+        initialization_source_runtime_buffer_ids,
+    )
+
+    initial_roots = initialization_source_roots(population)
+    runtime_buffer_ids = (
+        initialization_source_runtime_buffer_ids(population) if initial_roots else set()
+    )
+    initial_buffer_ids = {
+        id(value)
+        for _path, source in initial_roots
+        for _name, value in initialization_source_constant_slots(source)
+        if id(value) not in runtime_buffer_ids
+    }
+    for module_path, module in population.named_modules():
+        for name, buffer in module._buffers.items():
+            if (
+                buffer is None
+                or id(buffer) not in initial_buffer_ids
+                or id(buffer) in seen
+                or id(buffer) in parameter_ids
+            ):
+                continue
+            seen.add(id(buffer))
+            tables.append(
+                _PreparedBuffer(
+                    f"{module_path}.{name}",
+                    module_path,
+                    name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "constant",
+                )
+            )
     return tuple((*effective, *derived, *timestep, *material, *tables))
 
 
@@ -4316,6 +4390,11 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
         population._m_list = []
         population.injections = []
         population.mechanism_injections = []
+        # These authoring maps refer to initializer recipes on the removed
+        # handler. They do not participate in component geometry preparation.
+        population._concentrations = {}
+        population._equilibria = {}
+        population._material_configs = {}
         population.mechanism_injection_accepted = []
         population.intra = None
         population.__dict__.pop("_duration_remainder", None)
@@ -5918,8 +5997,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         if unsupported_sources:
             failures.append(
                 f"Ion {ion_name!r} initial sources {unsupported_sources} are "
-                "callable Modules; this initializer slice requires direct "
-                "registered Tensor parameters"
+                "not registered Tensor parameters or zero-argument Modules"
             )
 
     for material_name, material in handler.materials.items():
@@ -5950,8 +6028,8 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         if unsupported_sources:
             failures.append(
                 f"Material {material_name!r} initial sources "
-                f"{unsupported_sources} are callable Modules; this initializer "
-                "slice requires direct registered Tensor parameters"
+                f"{unsupported_sources} are not registered Tensor parameters "
+                "or zero-argument Modules"
             )
 
     if (
@@ -7389,6 +7467,47 @@ def _parametrization_constant_layout_for_owners(
             )
         record(value, aliases)
 
+    from ._initialization_sources import (
+        initialization_source_constant_slots,
+        initialization_source_roots,
+        initialization_source_runtime_buffer_ids,
+    )
+
+    initial_roots = initialization_source_roots(population)
+    runtime_buffer_ids = (
+        initialization_source_runtime_buffer_ids(population) if initial_roots else set()
+    )
+    initial_buffers = {
+        id(value): value
+        for _path, source in initial_roots
+        for _name, value in initialization_source_constant_slots(source)
+        if id(value) not in runtime_buffer_ids
+    }
+    # Packed sources can retain the same Module under a component and the
+    # packed owner. Only the latter remains in execution after child stripping.
+    initial_aliases = {}
+    seen_initial_modules = set()
+    for path, module in modules:
+        if type(population) is MultiPopulation and path.startswith("populations."):
+            continue
+        if id(module) in seen_initial_modules:
+            continue
+        seen_initial_modules.add(id(module))
+        for name, value in module._buffers.items():
+            if id(value) in initial_buffers:
+                initial_aliases.setdefault(id(value), []).append(
+                    f"{path + '.' if path else ''}{name}"
+                )
+    for identity, value in initial_buffers.items():
+        if is_registered_parameter(value):
+            continue
+        aliases = initial_aliases.get(identity, ())
+        if aliases:
+            record(value, aliases)
+            public_constant_by_identity.setdefault(
+                identity, f"initialization_sources.{aliases[0]}"
+            )
+
     material_geometry = population._modules.get("_material_geometry")
     if material_geometry is not None and population.mech.material_processes:
         for name, value in material_geometry.named_buffers():
@@ -7779,6 +7898,17 @@ def _parameter_buffer_alias_conflicts(population) -> tuple[tuple, ...]:
         identity
         for identity, name in parameter_name_by_identity.items()
         if name in material_parameter_names
+    )
+    from ._initialization_sources import (
+        _registered_tensor_slots,
+        initialization_source_roots,
+    )
+
+    consumed_parameter_ids.update(
+        id(value)
+        for _path, source in initialization_source_roots(population)
+        for _name, value in _registered_tensor_slots(source)
+        if value is not None and id(value) in parameter_name_by_identity
     )
     for _owner_path, owner in _parameterized_owner_paths(population):
         for transforms in owner.in_graph_parametrizations.values():
@@ -8668,6 +8798,17 @@ def _functionalization_failures(
     from ._tables import table_parameter_names
 
     transform_parameter_names.update(table_parameter_names(population))
+    from ._initialization_sources import (
+        _registered_tensor_slots,
+        initialization_source_roots,
+    )
+
+    transform_parameter_names.update(
+        parameter_name_by_identity[id(parameter)]
+        for _path, source in initialization_source_roots(population)
+        for _name, parameter in _registered_tensor_slots(source)
+        if id(parameter) in parameter_name_by_identity
+    )
     from ._mechanism_injections import mechanism_injection_owners
 
     # Waveform axes describe their own recipes (for example interpolation
@@ -9625,6 +9766,12 @@ def _compiled_validate_mechanism_injection_source(functional) -> None:
 
 
 @torch.compiler.assume_constant_result
+def _compiled_validate_initialization_sources(functional) -> None:
+    """Audit cold source recipes before capturing explicit initialization."""
+    functional._initialization_source_plan.validate_source()
+
+
+@torch.compiler.assume_constant_result
 def _compiled_initialization_failures(population) -> tuple[str, ...]:
     """Evaluate Python-only initializer admission once per compiled graph."""
     return tuple(_functional_initialization_failures(population))
@@ -9807,6 +9954,12 @@ class FunctionalPopulation:
         self._source_mechanism_injection_bindings = (
             self._mechanism_injection_plan.source_binding_signature()
         )
+        from ._initialization_sources import InitializationSourcePlan
+
+        self._initialization_source_plan = InitializationSourcePlan(population)
+        self._source_initialization_bindings = (
+            self._initialization_source_plan.source_binding_signature()
+        )
         self._source_ids = _structure_ids(population)
         self._fingerprint = _structure_signature(population)
         self._initialization_fingerprint = _initialization_structure_signature(
@@ -9869,8 +10022,9 @@ class FunctionalPopulation:
         self._multi_public_constant_devices = {}
         self._multi_canonical_parameter_names = None
         self._multi_component_physical_parameter_names = frozenset()
-        self._initialization_failures = tuple(
-            _functional_initialization_failures(population)
+        self._initialization_failures = (
+            tuple(_functional_initialization_failures(population))
+            + self._initialization_source_plan.failures
         )
 
         execution_population = _clone_execution_population(population)
@@ -10481,6 +10635,17 @@ class FunctionalPopulation:
         canonical_parameter_names.update(
             _shared_initial_parameter_target_shapes(population, canonical_by_identity)
         )
+        from ._initialization_sources import (
+            _registered_tensor_slots,
+            initialization_source_roots,
+        )
+
+        canonical_parameter_names.update(
+            canonical_by_identity[id(parameter)]
+            for _path, source in initialization_source_roots(population)
+            for _name, parameter in _registered_tensor_slots(source)
+            if id(parameter) in canonical_by_identity
+        )
         material_geometry = population._modules.get("_material_geometry")
         if material_geometry is not None and population.mech.material_processes:
             canonical_parameter_names.update(
@@ -10860,6 +11025,17 @@ class FunctionalPopulation:
     def _validate_source(self) -> None:
         if torch.compiler.is_compiling():
             if (
+                self._initialization_source_plan.source_binding_signature()
+                != self._source_initialization_bindings
+            ):
+                raise FunctionalizationError(
+                    "The source initialization recipes, dependencies, or aliases changed; lower again"
+                )
+            _compiled_validate_initialization_sources(self)
+        else:
+            self._initialization_source_plan.validate_source()
+        if torch.compiler.is_compiling():
+            if (
                 self._mechanism_injection_plan.source_binding_signature()
                 != self._source_mechanism_injection_bindings
             ):
@@ -11050,6 +11226,7 @@ class FunctionalPopulation:
         self._table_plan.validate_population(population)
         self._mechanism_delay_plan.validate_population(population)
         self._mechanism_injection_plan.validate_population(population)
+        self._initialization_source_plan.validate_population(population)
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
         ):

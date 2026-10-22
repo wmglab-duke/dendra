@@ -21,6 +21,12 @@ from dendra.models.networks.net import step as _native_step
 from . import _network_parameters
 from ._continuous import FunctionalContinuousCon
 from ._continuous_transform import _named_tensors
+from ._initialization_sources import (
+    initialization_source_ownership_failures,
+    initialization_source_roots,
+    initialization_source_runtime_buffer_ids,
+    network_initialization_source_alias_signature,
+)
 from ._mechanism_delays import network_mechanism_delay_alias_signature
 from ._mechanism_injections import network_mechanism_injection_alias_signature
 from ._netcon import FunctionalNetCon, _effective_tensor, _snapshot
@@ -219,9 +225,9 @@ def _eligible(network):
     mutable_population_modules = set()
     for population in network.populations.values():
         owned = {id(module) for module in population.modules()}
-        # A registered injection Waveform is audited as a pure recipe by each
-        # Population plan. Its parameters may be shared while its execution
-        # copy is isolated per Population. Runtime owners remain disjoint.
+        # Authored initialization sources and injection Waveforms are audited
+        # by each Population plan and get isolated execution copies. Their
+        # parameters may be shared while runtime owners remain disjoint.
         from ._mechanism_injections import mechanism_injection_owners
 
         waveform_roots = {
@@ -229,10 +235,13 @@ def _eligible(network):
             for _path, owner in mechanism_injection_owners(population)
             for waveform in owner.injected_waveforms
         }
+        recipe_roots = waveform_roots | {
+            id(source) for _path, source in initialization_source_roots(population)
+        }
         mutable_owned = set()
 
         def visit(module):
-            if id(module) in waveform_roots or id(module) in mutable_owned:
+            if id(module) in recipe_roots or id(module) in mutable_owned:
                 return
             mutable_owned.add(id(module))
             for child in module.children():
@@ -367,6 +376,9 @@ class FunctionalNetwork:
         self._source_mechanism_injection_aliases = (
             network_mechanism_injection_alias_signature(network)
         )
+        self._source_initialization_source_aliases = (
+            network_initialization_source_alias_signature(network)
+        )
         self.synapses = {
             name: FunctionalNetCon(connection, pending_capacity=capacities.get(name))
             for name, connection in self._schedule.synapses
@@ -498,7 +510,18 @@ class FunctionalNetwork:
         )
         from ._network_initialization import initialization_alias_failures
 
-        self._initialization_alias_failures = initialization_alias_failures(self)
+        runtime_buffer_ids = initialization_source_runtime_buffer_ids(network)
+        self._initialization_alias_failures = (
+            *initialization_alias_failures(self),
+            *(
+                f"Population {name!r}: {failure}"
+                for name, plan in self.populations.items()
+                if not plan._owned_cache_bound
+                for failure in initialization_source_ownership_failures(
+                    plan._population, runtime_buffer_ids=runtime_buffer_ids
+                )
+            ),
+        )
 
     @property
     def initialization_inputs(self):
@@ -703,6 +726,13 @@ class FunctionalNetwork:
             raise FunctionalizationError(
                 "The Network mechanism injection tensor aliases changed; lower again."
             )
+        if (
+            network_initialization_source_alias_signature(network)
+            != self._source_initialization_source_aliases
+        ):
+            raise FunctionalizationError(
+                "The Network initialization source aliases changed; lower again."
+            )
         if self.netstim is not None:
             self.netstim._validate_source()
 
@@ -858,6 +888,13 @@ class FunctionalNetwork:
 
     def _validate_compatible(self, network):
         _eligible(network)
+        if (
+            network_initialization_source_alias_signature(network)
+            != self._source_initialization_source_aliases
+        ):
+            raise FunctionalizationError(
+                "Network initialization source sharing does not match this plan."
+            )
         if float(network.dt) != self.dt or bool(network.training) != self.training:
             raise FunctionalizationError(
                 "Network timestep or mode does not match this plan."

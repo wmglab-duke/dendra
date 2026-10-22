@@ -2764,7 +2764,7 @@ state. In particular, ``values["celsius"]`` is already padded to the local
 voltage rank and remains safe for empty and nonempty ``vmap`` lanes.
 
 Canonical ``Ion`` and generic ``Material`` fields are also reconstructed from
-their registered tensor initial values. Initialization preserves Dendra's
+their registered initial values. Initialization preserves Dendra's
 ordinary shared-field semantics: current-reading states see the provisional
 pre-replacement current, concentration and Material replacements are committed
 once, guards and enabled reversal-potential updates are applied, and the
@@ -2774,13 +2774,18 @@ the t=0 state. Initial Ion and Material tensor parameters participate in
 autograd, higher-order transforms, ``vmap``, and transform-then-compile in the
 same way as other functional parameters. A direct tensor initial value may be
 scalar or have any visible shape that broadcasts exactly to its complete
-shared-field shape; callable-module initial sources are currently unsupported.
+shared-field shape. A zero-argument ``torch.nn.Module`` can compute an initial
+value from registered parameters and buffers, including ``PositiveParam``.
+Fresh initialization reads its current raw parameters and preserves shared
+parameter aliases; its forward must be deterministic and free of mutation and
+implicit RNG. See :doc:`A36_functional_initialization_sources` for examples,
+purity checks, source constants, and steady-state cache behavior.
 
 Other functional models can still start from ``tensors.state``. Fresh
 ``initialize`` is unavailable for arbitrary Population or Integrator
 initialization hooks, custom
-Ion/Material initialization behavior, callable-module Material initial
-sources, unsupported MaterialProcess families or custom process lifecycle
+Ion/Material initialization behavior, impure initial-value sources,
+unsupported MaterialProcess families or custom process lifecycle
 hooks, legacy or otherwise impure VoltageProcess hooks, and other topologies. Transition
 execution from an initialized model remains available wherever normal
 functional admission succeeds.

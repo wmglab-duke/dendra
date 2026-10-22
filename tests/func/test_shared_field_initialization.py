@@ -846,17 +846,22 @@ def test_replaced_handler_initialization_hooks_fail_closed(hook_name):
         )
 
 
-def test_callable_material_initial_source_remains_fail_closed():
+def test_positive_material_initial_source_preserves_raw_parameter_gradient():
     source = PositiveParam(torch.tensor(1.25, dtype=DTYPE), requires_grad=True)
     model = _model(material_source=source)
     functional, tensors = dn.func.make_functional(model, dt=DT)
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="initial sources.*callable Modules",
-    ):
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
+    initialized = functional.initialize(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization,
+    )
+    parameter_name = _parameter_name(
+        tensors.parameters, "pool._initial_sources.amount.rho"
+    )
+    expected = source._compute()
+    amount = initialized.state["materials"]["pool"]["amount"]
+    torch.testing.assert_close(amount, expected.expand_as(amount))
+    gradient = torch.autograd.grad(amount.sum(), tensors.parameters[parameter_name])[0]
+    expected_gradient = torch.autograd.grad(expected, source.rho)[0]
+    torch.testing.assert_close(gradient, expected_gradient * amount.numel())

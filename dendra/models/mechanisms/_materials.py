@@ -9,15 +9,17 @@ such as diffusion operate on the full fields directly.
 
 from __future__ import annotations
 
+import inspect
 from contextlib import ContextDecorator
 from dataclasses import dataclass
+from types import MethodType
 from typing import Mapping, Sequence
 
 import torch
 
 from dendra.helpers import DEBUG
 
-from ..parametric import resolve, to_param
+from ..parametric import cacheable, resolve, to_param
 
 
 @dataclass(frozen=True)
@@ -41,9 +43,83 @@ def _canonical_material_name(name: str) -> str:
     return MATERIAL_ALIASES.get(name, name)
 
 
+def _initial_source_cache_free_forward(self, *args, **kwargs):
+    """Evaluate the existing parameter transform without its derived cache."""
+    return self._compute(*args, **kwargs)
+
+
+def _configure_initial_source_execution(source: torch.nn.Module) -> None:
+    """Normalize only a private source recipe for mutation-free execution."""
+    pending = [source]
+    seen = set()
+    while pending:
+        module = pending.pop()
+        if id(module) in seen:
+            continue
+        seen.add(id(module))
+        pending.extend(
+            child for child in vars(module)["_modules"].values() if child is not None
+        )
+        forward = inspect.getattr_static(module, "forward", None)
+        if isinstance(module, cacheable) and (
+            forward is cacheable.forward
+            or (
+                isinstance(forward, MethodType)
+                and forward.__func__ is cacheable.forward
+                and forward.__self__ is module
+            )
+        ):
+            object.__setattr__(
+                module,
+                "forward",
+                MethodType(_initial_source_cache_free_forward, module),
+            )
+        # Packed recipes resolve their child sources through the same helper.
+        # Mark every private child so those nested calls take its pure fast path.
+        # Authored recipes are validated before normalization.
+        vars(module)["_initialization_source_cache_free"] = True
+
+
+def _resolve_initial_source(source):
+    """Resolve current initial-value leaves without reading or filling caches.
+
+    Canonical ``cacheable`` transforms share their existing ``_compute``
+    implementation. The imperative adapter temporarily bypasses their derived
+    caches, including nested sources, while retaining module calls, hooks, custom
+    forwards, and authored training modes. Private functional recipes are
+    normalized once and take the direct, mutation-free call path.
+    """
+    if not isinstance(source, torch.nn.Module):
+        return resolve(source)
+    if getattr(source, "_initialization_source_cache_free", False) is True:
+        return source()
+
+    missing = object()
+    restored = []
+    try:
+        for module in source.modules():
+            if (
+                isinstance(module, cacheable)
+                and getattr(module.forward, "__func__", None) is cacheable.forward
+            ):
+                restored.append((module, vars(module).get("forward", missing)))
+                object.__setattr__(
+                    module,
+                    "forward",
+                    MethodType(_initial_source_cache_free_forward, module),
+                )
+        return source()
+    finally:
+        for module, forward in reversed(restored):
+            if forward is missing:
+                object.__delattr__(module, "forward")
+            else:
+                object.__setattr__(module, "forward", forward)
+
+
 def _make_into_shape(shape, value, *, like: torch.Tensor | None = None):
     """Resolve and broadcast one material initial-value source."""
-    value = resolve(value)
+    value = _resolve_initial_source(value)
     if not torch.is_tensor(value):
         if like is None:
             value = torch.as_tensor(value)
@@ -219,7 +295,9 @@ class Material(torch.nn.Module):
     while :meth:`initial_source` returns its registered initial-value parameter
     or parametric module. :meth:`initialize` resolves that source afresh. This
     preserves gradients to trainable initial values in training mode; evaluation
-    initialization keeps the historical detached-runtime-state behavior.
+    initialization produces detached runtime fields. Canonical bounded sources
+    are evaluated from their current raw parameters without reusing or changing
+    their inference caches.
     """
 
     __constants__ = ("name",)
@@ -321,7 +399,7 @@ class Material(torch.nn.Module):
         return getattr(self._initial_sources, field)
 
     def initialize(self, *args, **kwargs) -> None:
-        """Reset material fields from their registered initial-value sources."""
+        """Reset material fields from current registered initial-value sources."""
         values = self._derive_initial_field_values()
         self._install_field_values(values)
         # Preserve Material's imperative extension point. Canonical Material
