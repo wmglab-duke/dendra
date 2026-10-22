@@ -23,7 +23,10 @@ from ._continuous_transform import _named_tensors
 from ._netcon import FunctionalNetCon, _effective_tensor, _snapshot
 from ._netstim import FunctionalNetStim
 from ._network_bindings import AliasSnapshots, SourceBinding
-from ._network_initialization import NetworkInitializationInput
+from ._network_initialization import (
+    NetworkInitializationCache,
+    NetworkInitializationInput,
+)
 from ._population import (
     _deepcopy_execution_module,
     _RawClassHookIdentity,
@@ -162,6 +165,8 @@ _NETWORK_INITIALIZATION_METHODS = {
         "initialize",
         "build",
         "init_synapses",
+        "initialize_pops_from_state_cache",
+        "initialize_synapses_from_state_cache",
         "_reset_runtime_clock",
         "_clear_duration_remainder",
         "_set_duration_remainder",
@@ -319,8 +324,13 @@ class FunctionalNetwork:
         self.populations, initialization = {}, {}
         for name, population in self._schedule.populations:
             plan, packet = make_functional(
-                population, dt=self.dt, extra=extra.get(name)
+                population,
+                dt=self.dt,
+                extra=extra.get(name),
+                _bind_owned_cache=not bool(network._state_cache),
             )
+            if network._state_cache:
+                plan._enable_cache_materializations()
             self.populations[name] = plan
             initialization[name] = packet.initialization
         self.synapses = {
@@ -399,9 +409,58 @@ class FunctionalNetwork:
             for path, value in _tensor_paths(tensors.parameters)
             if id(value) in constant_aliases
         )
+        self._population_cache_plans = {}
+        self._cache_enabled = bool(network._state_cache)
+        self._cache_error = None
+        initialization_cache = None
+        if self._cache_enabled:
+            try:
+                from ._population_cache import PopulationCachePlan
+
+                for name, plan in self.populations.items():
+                    self._population_cache_plans[name] = PopulationCachePlan(
+                        plan, network._state_cache[name]
+                    )
+                saved = network._syn_cache or {}
+                if not isinstance(saved, Mapping):
+                    raise TypeError("Network connection state cache must be a mapping")
+                events = (
+                    saved.get("event", {})
+                    if "event" in saved or "continuous" in saved
+                    else saved
+                )
+                analog = saved.get("continuous", {})
+                initialization_cache = NetworkInitializationCache(
+                    populations={
+                        name: plan.default
+                        for name, plan in self._population_cache_plans.items()
+                    },
+                    synapses={
+                        name: plan.normalize_cache(events[name])
+                        for name, plan in self.synapses.items()
+                        if name in events
+                    },
+                    continuous_synapses={
+                        name: plan.normalize_cache(analog[name])
+                        for name, plan in self.continuous_synapses.items()
+                        if name in analog
+                    },
+                )
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                self._cache_error = str(error)
+        self._cache_schema = _schema(initialization_cache)
+        from ._network_initialization import cache_alias_bindings
+
+        self._cache_alias_bindings = cache_alias_bindings(self)
+        from ._network_initialization import population_cache_alias_bindings
+
+        self._owned_cache_alias_plans, self._owned_cache_alias_error = (
+            population_cache_alias_bindings(self)
+        )
         self._initialization_inputs = NetworkInitializationInput(
             populations=initialization,
             t=torch.zeros_like(tensors.state["clock"]["t"]),
+            cache=initialization_cache,
         )
         from ._network_initialization import initialization_alias_failures
 
@@ -415,11 +474,13 @@ class FunctionalNetwork:
     def _validate_initialization_source(self):
         self._validate_source()
         network = self._source
-        if network._state_cache or network._syn_cache:
+        if self._cache_error is not None:
             raise FunctionalizationError(
-                "Network state-cache restoration is currently unsupported by fresh initialization"
+                f"Network state cache cannot be restored: {self._cache_error}"
             )
-        if self._initialization_alias_failures:
+        if self._owned_cache_alias_error is not None:
+            raise FunctionalizationError(self._owned_cache_alias_error)
+        if not self._cache_enabled and self._initialization_alias_failures:
             raise FunctionalizationError("\n".join(self._initialization_alias_failures))
         for name, expected in _NETWORK_INITIALIZATION_METHODS.items():
             namespace = type(network).__dict__
@@ -433,14 +494,26 @@ class FunctionalNetwork:
                     f"Fresh Network initialization requires its canonical {name} adapter"
                 )
 
+    def _validate_initialization_cache(self, cache):
+        if self._cache_enabled and cache is None:
+            raise ValueError(
+                "This Network initialization requires its captured cache packet"
+            )
+        if not self._cache_enabled and cache is not None:
+            raise ValueError("This Network plan has no bound initialization cache")
+        _validate_tree(cache, self._cache_schema, "initialization.cache")
+
     def initialize(self, parameters, constants, state, inputs, *, netstim_draw=None):
         """Initialize current explicit parameters and carry in native order.
 
         Population inputs and the starting clock are explicit. Existing carry
         supplies NetStim RNG/seeder/calendar positions; delivery and detector
         carry is reset. Supply an explicit NetStim initialization draw when
-        present. Effective parameter replacements preserve Network aliases and
-        are returned with complete state in :class:`NetworkTensors`.
+        present. A bound Network-wide cache restores detached Population
+        materializations and connection history. Without that cache, each
+        Population restores its own bound cache or runs fresh initialization
+        in authored order. Effective parameters and constants accompany state in
+        :class:`NetworkTensors`.
         """
         from ._network_initialization import initialize
 

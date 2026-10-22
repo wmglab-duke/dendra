@@ -72,8 +72,13 @@ class CompiledNetworkRunner:
     The initialized Network's mode and timestep are frozen. Gradient execution
     requires a Network initialized in training mode. Fresh calls accept a
     :class:`NetworkInitializationInput` override and return effective parameters
-    in ``aux['parameters']``. Continue those parameters explicitly when pure
-    initialization transforms replace them. Initialization runs once before
+    and constants in ``aux['parameters']`` and ``aux['constants']``. Continue
+    those packets explicitly when initialization replaces them. A captured
+    Network-wide steady-state cache supplies detached Population
+    materializations and rebuilds connection carry using the shared cache
+    restoration helpers. Without that global cache, each Population restores
+    its own bound cache or runs its fresh initializer in authored order.
+    Initialization runs once before
     rollout/checkpoint spans; its graph is never cached. Inference while-loop
     execution uses ``execution='while', inference=True`` with the same pure
     Network timestep and the Population packed loop engine. Qualified Recorders,
@@ -165,8 +170,23 @@ class CompiledNetworkRunner:
             from ._convenience import _initialization_writes_parameters
 
             self._initialization_writes_parameters = initialization == "fresh" and any(
-                _initialization_writes_parameters(plan)
+                plan._owned_cache_bound or _initialization_writes_parameters(plan)
                 for plan in self._functional.populations.values()
+            )
+            if initialization == "fresh" and self._functional._cache_enabled:
+                self._initialization_writes_parameters = any(
+                    plan.parameters
+                    for plan in self._functional._population_cache_plans.values()
+                )
+            self._initialization_writes_constants = initialization == "fresh" and (
+                any(
+                    plan.constants
+                    for plan in self._functional._population_cache_plans.values()
+                )
+                or any(
+                    plan._owned_cache_bound
+                    for plan in self._functional.populations.values()
+                )
             )
             self._callbacks = (
                 None if not configured else self._functional.make_callbacks(configured)
@@ -194,10 +214,11 @@ class CompiledNetworkRunner:
 
     @property
     def initialization_inputs(self):
-        """Editable independent defaults for fresh Population and clock initialization.
+        """Editable independent defaults for Population, clock and cache initialization.
 
         Initialization-only leaves are separate from :attr:`parameters`; use
-        ``requires_grad_()`` or explicit overrides to differentiate them.
+        ``requires_grad_()`` or explicit overrides to differentiate fresh
+        initial values. Captured steady-state cache values are detached.
         """
         return self._initialization_inputs
 
@@ -261,6 +282,7 @@ class CompiledNetworkRunner:
         state=None,
         *,
         parameters=None,
+        constants=None,
         inputs=None,
         callback_state=None,
         initialization=None,
@@ -287,8 +309,18 @@ class CompiledNetworkRunner:
             and self._initialization_writes_parameters
         ):
             raise ValueError(
-                "initialization transforms write parameters; continue with "
+                "initialization writes parameters; continue with "
                 "parameters=aux['parameters'] from the preceding call"
+            )
+        if (
+            fresh_policy
+            and state is not None
+            and constants is None
+            and self._initialization_writes_constants
+        ):
+            raise ValueError(
+                "cache initialization writes constants; continue with "
+                "constants=aux['constants'] from the preceding call"
             )
         fresh = fresh_policy and state is None
         selected_state = self._initial_state if state is None else state
@@ -310,7 +342,9 @@ class CompiledNetworkRunner:
             if fresh
             else None
         )
-        selected_constants = self._constants
+        selected_constants = (
+            self._constants if constants is None else _map_containers(constants, dict)
+        )
         previous = self._kernel.execution_report()
         try:
             if fresh:
@@ -350,6 +384,7 @@ class CompiledNetworkRunner:
                 if fresh_policy:
                     auxiliary = dict(auxiliary)
                     auxiliary["parameters"] = _map_containers(selected_parameters, dict)
+                    auxiliary["constants"] = _map_containers(selected_constants, dict)
                 return final, auxiliary
         except Exception:
             self._kernel._report_state.report = previous

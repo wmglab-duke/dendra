@@ -141,9 +141,10 @@ not reset the captured initial state or perform differentiable initialization.
 Opt-in fresh initialization
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Use ``initialization="fresh"`` to recompute initial state from current model
-parameters every time the runner is called **without** explicit state. This
-uses the pure differentiable initializer described in
+Use ``initialization="fresh"`` to initialize every call **without** explicit
+state. A Population with an owned ``steady_state`` cache restores that saved
+state; an uncached Population constructs its initial state from current model
+parameters. Uncached starts use the pure differentiable initializer described in
 :ref:`functional-fresh-initialization`, including Myelinated geometry,
 finite-extracellular circuit state, packed populations, insertion-time initial
 conditions, and registered pre/post initialization transforms. Unsupported
@@ -166,13 +167,25 @@ invocation-local, and no training graph is retained between calls.
    auxiliary["callbacks"]["trace"]["v"].square().mean().backward()
 
 ``runner.initialization_inputs`` contains independent tensor defaults in an
-``InitializationInput(v_init, states, transforms)``. These initialization-only
-leaves are separate from ``runner.parameters`` and ``trainable``. To optimize
-them, enable their gradients and include the desired leaves in your optimizer.
+``InitializationInput(v_init, states, transforms, cache)``. Cache leaves are
+detached saved inputs and are not optimizer targets. For uncached initialization,
+the ``v_init``, ``states``, and ``transforms`` leaves are separate from
+``runner.parameters`` and ``trainable``. To optimize them, enable their gradients
+and include the desired leaves in your optimizer.
 An individual fresh call can instead receive
 ``runner(initialization=dn.func.InitializationInput(...))``; explicit nonleaf
 tensors retain their autograd connection. State and transform mappings must
 use the complete canonical names and shapes exposed by the defaults.
+
+For a Population with a saved resting state, ``initial.cache`` contains an
+independent detached copy of its native state dictionary. Cached starts
+restore saved voltage, mechanism state, parameters, and buffers instead of
+evaluating ``v_init``, insertion-time initial values, or pure initialization
+transforms. Cache inputs and restored materializations are detached from the
+warmup graph. To select uncached fresh initialization, call
+``model.clear_steady_state()`` before compiling; cache presence and structure
+are fixed when lowering. Compatible cache values can be supplied through
+``runner(initialization=initial._replace(cache=...))``.
 
 Explicit state always means continuation and bypasses initialization, even on
 a fresh-policy runner. Every fresh-policy call returns its effective runtime
@@ -185,12 +198,17 @@ must carry that mapping explicitly:
    continued_state, continued_auxiliary = fresh_runner(
        final_state,
        parameters=auxiliary["parameters"],
+       constants=auxiliary["constants"],
        callback_state=auxiliary["callbacks"].state,
    )
 
-Without parameter-writing transforms, state-only continuation remains valid.
+Cached starts also return effective constants at ``auxiliary["constants"]``;
+pass both effective parameter and constant mappings when continuing their
+returned state. Without a cache or parameter-writing transforms, state-only
+continuation remains valid.
 To replay the originally captured snapshot on a fresh-policy runner, use
-``fresh_runner(fresh_runner.initial_state, parameters=fresh_runner.parameters)``.
+``fresh_runner(fresh_runner.initial_state, parameters=fresh_runner.parameters,
+constants=fresh_runner.constants)``.
 An initialization override cannot be combined with explicit state or used on a
 snapshot-policy runner. A fresh restart cannot accept callback carry without
 state: restart both together, or continue both together. Fresh initialization
@@ -256,7 +274,8 @@ canonical point, cable, myelinated, Tree, finite-extracellular, and packed
 families with their admitted integrators, including ``scnv`` for standalone
 point models. It has additional lifecycle requirements: initialization must be
 declaration-driven or use registered pure
-transforms, not arbitrary imperative hooks or cached steady states. This
+transforms rather than arbitrary imperative hooks. Population-owned
+steady-state caches use the separate cache-restoration path described below. This
 includes the Tigerholm/Thio models with registered pure resting-balance
 transforms. See :ref:`functional-fresh-initialization` for the exact contract;
 models outside that initializer contract can still start from the extracted
@@ -2732,9 +2751,25 @@ shared-field shape; callable-module initial sources are currently unsupported.
 
 Other functional models can still start from ``tensors.state``. Fresh
 ``initialize`` is unavailable for arbitrary Population or Integrator
-initialization hooks, steady-state caches, custom
+initialization hooks, custom
 Ion/Material initialization behavior, callable-module Material initial
 sources, unsupported MaterialProcess families or custom process lifecycle
 hooks, legacy or otherwise impure VoltageProcess hooks, and other topologies. Transition
 execution from an initialized model remains available wherever normal
 functional admission succeeds.
+
+Population-owned ``steady_state`` caches are supported by
+``FunctionalPopulation.initialize`` and
+``dn.compile(population, initialization="fresh")``. The ``cache`` field of
+``InitializationInput`` contains the detached saved state. Arbitrary legacy
+post-initialization hooks and parameter resampling that invalidates the cache
+are currently unsupported for pure cached initialization. Snapshot and
+explicit-state execution remain available wherever transition admission
+succeeds.
+
+``dn.compile(network, initialization="fresh")`` supports Network-global caches
+and individual Population-owned caches, including Networks that combine
+cached and uncached Populations. A global cache takes precedence over
+individual caches. See :doc:`A29_functional_network_cache_initialization` for
+cache inputs, connection histories, gradient boundaries, and continuation with
+the returned effective parameter and constant packets.

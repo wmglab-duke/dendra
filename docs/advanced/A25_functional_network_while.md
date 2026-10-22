@@ -80,9 +80,12 @@ Population without bound `extra`; see {doc}`A28_functional_network_extra`.
 
 The example supplies explicit draws for snapshot restarts and uses automatic
 draws for fresh initialization. Fresh initialization runs once before each call
-without state, using current parameters and retained RNG/seeder carry. It is
+without state, using the source Network's cache-aware initialization policy
+and retained RNG/seeder carry. It is
 outside the while body. The initialization policy follows
-{doc}`A21_functional_network_compile`.
+{doc}`A21_functional_network_compile`; cache restoration and its effective
+parameter/constant packets are described in
+{doc}`A29_functional_network_cache_initialization`.
 
 ## Continue state and recordings
 

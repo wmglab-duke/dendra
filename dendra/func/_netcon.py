@@ -12,6 +12,14 @@ import torch
 from dendra.models.core import Population
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.networks._connection_initialization import event_initial_state
+from dendra.models.networks._event_cache import (
+    EventCache,
+    clone_event_cache,
+    event_cache_metadata,
+    normalize_event_cache,
+    restore_event_cache,
+    validate_event_cache,
+)
 from dendra.models.networks._event_delivery import (
     connection_event_counts,
     dense_due,
@@ -45,6 +53,9 @@ from ._types import FunctionalizationError
 _INITIALIZATION_METHODS = {
     name: getattr(NetCon, name)
     for name in ("initialize", "zero", "detach", "_clear_sparse_calendar")
+}
+_CACHE_INITIALIZATION_METHODS = {
+    "initialize_from_state_cache": NetCon.initialize_from_state_cache,
 }
 _SOURCE_HISTORY_METHODS = {
     name: getattr(NetCon, name)
@@ -442,6 +453,9 @@ class FunctionalNetCon:
         self._history_name = (
             "source_gate_history" if self._diff_spiking else "spike_history_packed"
         )
+        self._cache_metadata = event_cache_metadata(
+            netcon, frozen=self._history_metadata
+        )
         checkpoint = self._checkpoint_values(netcon)
         self._state_schema = {
             name: (tuple(value.shape), value.dtype, value.device)
@@ -818,6 +832,88 @@ class FunctionalNetCon:
                     f"Fresh NetCon initialization requires its canonical {name} adapter."
                 )
         return event_initial_state(state, t=t, dt=self._dt)
+
+    def normalize_cache(self, cache):
+        """Own a detached steady-state cache at the lowered dt and topology."""
+        return self._normalize_cache(cache, copy_normalized=True)
+
+    def _normalize_cache(self, cache, *, copy_normalized):
+        self._validate_source()
+        for name, expected in _CACHE_INITIALIZATION_METHODS.items():
+            if (
+                name in self._source.__dict__
+                or getattr(type(self._source), name) is not expected
+            ):
+                raise FunctionalizationError(
+                    f"NetCon cache initialization requires its canonical {name} adapter."
+                )
+        if isinstance(cache, EventCache):
+            validate_event_cache(
+                cache,
+                runtime=self._runtime,
+                depth=self._depth,
+                delivery_depth=self._state_schema["delivery_buffer"][0][0],
+                width=self._width,
+                connections=self._connections,
+                device=self.device,
+                dtype=self.dtype,
+                source_device=self.source_device,
+                source_dtype=self.source_dtype,
+                metadata=self._cache_metadata,
+                binary_history=not self._diff_spiking,
+            )
+            return clone_event_cache(cache) if copy_normalized else cache
+        if torch.compiler.is_compiling() or torch._C._are_functorch_transforms_active():
+            raise FunctionalizationError(
+                "Normalize event state caches outside compiled or transformed execution"
+            )
+        return normalize_event_cache(
+            cache,
+            backend=self._source.delay_backend,
+            runtime=self._runtime,
+            depth=self._depth,
+            delivery_depth=self._state_schema["delivery_buffer"][0][0],
+            width=self._width,
+            dt=float(self._dt.detach().cpu().item()),
+            device=self.device,
+            dtype=self.dtype,
+            source_device=self.source_device,
+            source_dtype=self.source_dtype,
+            track_events=self._track_events,
+            metadata=self._cache_metadata,
+            binary_history=not self._diff_spiking,
+        )
+
+    def restore_cache(self, parameters, state, cache, *, t):
+        """Restore detached steady-state history using explicit current parameters."""
+        self._validate_source()
+        self._validate_state(state)
+        weights = parameters["weights"]
+        delays = parameters.get("delays")
+        self._validate_projection_parameters(weights, delays)
+        cache = self._normalize_cache(cache, copy_normalized=False)
+        delay_steps = (
+            self._delay_steps
+            if delays is None
+            else torch.round(delays.detach() / self._dt).to(torch.long).clamp_min(1)
+        )
+        result = restore_event_cache(
+            state,
+            cache,
+            weights,
+            delay_steps=delay_steps,
+            post_idx=self._post_idx,
+            metadata=self._cache_metadata,
+            runtime=self._runtime,
+            depth=self._depth,
+            width=self._width,
+            t=t,
+            dt=self._dt,
+            binary_history=not self._diff_spiking,
+        )
+        self._validate_state(result)
+        self.check_overflow(result)
+        return result
 
     def _validate_projection_parameters(self, weights, delays):
         self._validate_tensor(

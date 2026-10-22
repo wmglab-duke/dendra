@@ -29,6 +29,7 @@ from ..core import (
     Population,
     _duration_step_budget,
     _load_compatible_state_dict_transactionally,
+    _load_population_cache_transactionally,
     _time_grid_from_step_count,
     _validate_time_scalar,
     make_intra,
@@ -37,6 +38,7 @@ from ..multi import concat_models, offsets
 from ..parametric import is_parametric, to_param
 from ..rng import RNGMixin
 from ..slice import SynapseSlots
+from ._population_cache import restore_population_cache_values
 from .netcon import ContinuousCon, NetCon
 from .netstim import NetStim
 
@@ -3109,7 +3111,12 @@ class Network(RNGMixin):
                     force=pop.force_integrator_reinit(),
                     compile_scope="network_population",
                 )
-            pop.load_state_dict(self._state_cache[name])
+            cached = restore_population_cache_values(
+                pop.state_dict(keep_vars=True),
+                self._state_cache[name],
+                parameter_names=dict(pop.named_parameters(remove_duplicate=False)),
+            )
+            _load_population_cache_transactionally(pop, cached)
             pop.detach()
             pop.initialized = True
             pop.initializing_from_state_cache = True

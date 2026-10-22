@@ -10,6 +10,14 @@ import torch
 
 from dendra.models.core import Population
 from dendra.models.networks._connection_initialization import continuous_initial_state
+from dendra.models.networks._continuous_cache import (
+    ContinuousCache,
+    _has_empty_cache_vmap_axis,
+    continuous_cache_routes,
+    normalize_continuous_cache,
+    restore_continuous_cache,
+    validate_continuous_cache,
+)
 from dendra.models.networks._continuous_delivery import (
     continuous_clear,
     continuous_counters,
@@ -41,6 +49,13 @@ _SOURCE_METHODS = {
 _INITIALIZATION_METHODS = {
     name: getattr(ContinuousCon, name)
     for name in ("initialize", "zero", "detach", "_configure_advance_impl")
+}
+_CACHE_METHODS = {
+    name: getattr(ContinuousCon, name)
+    for name in (
+        "initialize_from_state_cache",
+        "_materialize_delivery_from_pre_value_history",
+    )
 }
 
 
@@ -143,6 +158,10 @@ class FunctionalContinuousCon:
         self._connections = int(con._n_conn)
         self._pre_idx, self._post_idx = _snapshot(con.pre_idx), _snapshot(con.post_idx)
         self._delay_steps, self._dt = _snapshot(con.delay_steps), _snapshot(con.dt)
+        self._cache_dt = float(con.dt.detach().cpu())
+        self._cache_routes = continuous_cache_routes(
+            self._delay_steps, self._post_idx, depth=self._depth, width=self._width
+        )
         self._physical_delays = _snapshot(_effective_tensor(con.delay_ms, "delay"))
         self._zero_idx = _snapshot(con.zero_con_idx)
         self._nonzero_idx = _snapshot(con.nonzero_con_idx)
@@ -304,6 +323,93 @@ class FunctionalContinuousCon:
                     f"Fresh ContinuousCon initialization requires its canonical {name} adapter."
                 )
         return continuous_initial_state(state, t=t, dt=self._dt, dtype=self.dtype)
+
+    def normalize_cache(self, cache):
+        """Own and resample native cache rows to this frozen routing/timestep.
+
+        The returned Tensor/None packet keeps raw and legacy transformed
+        histories distinct. Cache construction is a cold operation; pass the
+        normalized packet into transformed or compiled initialization.
+        """
+        self._validate_source()
+        return normalize_continuous_cache(
+            cache,
+            dt=self._cache_dt,
+            device=self.device,
+            dtype=self.dtype,
+            connections=self._connections,
+            depth=self._depth,
+            width=self._width,
+        )
+
+    def restore_cache(self, parameters, state, cache, *, t):
+        """Restore detached traffic with current explicit weights/transform.
+
+        ``parameters`` contains ``weights`` and ``transform_parameters`` as in
+        a Network projection packet. Historical observations and materialized
+        runtime carry are detached, matching native steady-state restoration.
+        """
+        self._validate_source()
+        self._validate_state(state)
+        for name, expected in {**_INITIALIZATION_METHODS, **_CACHE_METHODS}.items():
+            if (
+                name in self._source.__dict__
+                or getattr(type(self._source), name) is not expected
+            ):
+                raise FunctionalizationError(
+                    f"ContinuousCon cache initialization requires its canonical {name} adapter."
+                )
+        if not isinstance(parameters, Mapping) or set(parameters) != {
+            "weights",
+            "transform_parameters",
+        }:
+            raise ValueError(
+                "ContinuousCon cache parameters require weights and transform_parameters"
+            )
+        weights, transform = parameters["weights"], parameters["transform_parameters"]
+        self._validate_tensor(
+            weights,
+            shape=(self._connections,),
+            dtype=self.dtype,
+            device=self.device,
+            label="weights",
+        )
+        self._validate_transform_parameters(transform)
+        if not isinstance(cache, ContinuousCache):
+            cache = self.normalize_cache(cache)
+        validate_continuous_cache(
+            cache,
+            device=self.device,
+            dtype=self.dtype,
+            connections=self._connections,
+            depth=self._depth,
+            width=self._width,
+        )
+        # No historical values exist in an empty mapped invocation. Avoid
+        # evaluating arbitrary transforms whose scalar reductions trigger
+        # PyTorch's empty-batch scalar broadcasting path.
+        empty = any(
+            _has_empty_cache_vmap_axis(value)
+            for value in (
+                weights,
+                cache.raw_history,
+                cache.transformed_history,
+                *(() if transform is None else transform.values()),
+            )
+        )
+        return restore_continuous_cache(
+            state,
+            cache,
+            weights,
+            dt=self._dt,
+            t=t,
+            routes=self._cache_routes,
+            transform=(
+                None
+                if empty
+                else lambda row: self._transform_plan.apply(row, transform)
+            ),
+        )
 
     def read_due(self, state):
         """Read queued payload/presence without mutation or counter advancement."""

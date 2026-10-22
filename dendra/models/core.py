@@ -4515,12 +4515,16 @@ class Population(P, Sliceable):
     def _restore_steady_state(self):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
-            # ``restore`` marks ordinary named-cache restores usable. A
-            # steady-state initialization still replays permissive legacy post
-            # hooks, so keep this transition fail-closed until every hook
-            # succeeds. Structured transforms are fresh-initialization work:
-            # every declared write is already present in the restored snapshot.
+            # ``restore`` marks ordinary named-cache restores usable. Keep
+            # steady-state initialization fail-closed until detachment and
+            # every permissive legacy post hook have completed successfully.
             self.initialized = False
+            # Cached materializations belong to the detached warm-up boundary.
+            # A no-grad state-dict copy can otherwise retain the destination's
+            # old graph after its saved tensors have been overwritten.
+            self.detach()
+            # Structured transforms are fresh-initialization work:
+            # every declared write is already present in the restored snapshot.
             self._restoring_steady_state = True
             try:
                 self.post_initialize()
@@ -9795,20 +9799,46 @@ def _load_population_cache_transactionally(population, state_dict):
     if not isinstance(state_dict, Mapping):
         raise TypeError("Cached population state must be a mapping.")
 
-    live_state = population.state_dict()
-    prepared = dict(state_dict)
-    integrator = getattr(population, "integrator", None)
-    if integrator is not None:
-        prefix = "integrator."
-        # Inject current direct workspace buffers. Nested mechanism state
-        # (``integrator.mech.*``), including unexpected keys, remains part of
-        # the strict snapshot validation.
-        for name in integrator._buffers:
-            key = f"{prefix}{name}"
-            if key in live_state:
-                prepared[key] = live_state[key]
+    # Batched geometry can expose broadcast views, including mechanism areas.
+    # Own their storage before strict copying, preserving every registered
+    # identity alias and restoring the original objects if validation fails.
+    rebound, owned = [], {}
+    try:
+        for module in population.modules():
+            for field, value in module._buffers.items():
+                if (
+                    torch.is_tensor(value)
+                    and value.layout is torch.strided
+                    and any(
+                        size > 1 and stride == 0
+                        for size, stride in zip(value.shape, value.stride())
+                    )
+                ):
+                    if id(value) not in owned:
+                        owned[id(value)] = value.detach().clone(
+                            memory_format=torch.contiguous_format
+                        )
+                    rebound.append((module, field, value))
+                    module._buffers[field] = owned[id(value)]
 
-    result = _load_state_dict_transactionally(population, prepared, strict=True)
+        live_state = population.state_dict()
+        prepared = dict(state_dict)
+        integrator = getattr(population, "integrator", None)
+        if integrator is not None:
+            prefix = "integrator."
+            # Inject current direct workspace buffers. Nested mechanism state
+            # (``integrator.mech.*``), including unexpected keys, remains part of
+            # the strict snapshot validation.
+            for name in integrator._buffers:
+                key = f"{prefix}{name}"
+                if key in live_state:
+                    prepared[key] = live_state[key]
+
+        result = _load_state_dict_transactionally(population, prepared, strict=True)
+    except Exception:
+        for module, field, value in rebound:
+            module._buffers[field] = value
+        raise
     if integrator is not None:
         integrator.initialized = False
     return result

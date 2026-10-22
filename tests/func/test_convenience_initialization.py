@@ -354,8 +354,16 @@ def test_initialization_inputs_are_independent_versioned_editable_leaves():
     with torch.inference_mode():
         runner = _runner(model)
     assert isinstance(runner.initialization_inputs, dn.func.InitializationInput)
-    source_leaves = pytree.tree_leaves(tensors.initialization)
-    owned_leaves = pytree.tree_leaves(runner.initialization_inputs)
+    source_leaves = [
+        value
+        for value in pytree.tree_leaves(tensors.initialization)
+        if torch.is_tensor(value)
+    ]
+    owned_leaves = [
+        value
+        for value in pytree.tree_leaves(runner.initialization_inputs)
+        if torch.is_tensor(value)
+    ]
     assert len(source_leaves) == len(owned_leaves)
     for owned, source in zip(owned_leaves, source_leaves, strict=True):
         assert owned.data_ptr() != source.data_ptr()

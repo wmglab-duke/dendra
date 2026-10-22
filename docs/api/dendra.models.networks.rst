@@ -76,6 +76,12 @@ preserves shared aliases, and follows the accepted simulation clock. An
 explicit ``ve`` input can supply another Population without bound stimulation.
 See :doc:`../advanced/A28_functional_network_extra` for the complete workflow.
 
+Fresh-policy runners honor the source Network's steady-state Population and
+connection caches. Cached Population restoration returns effective parameters
+and constants, while parameter-invariant connection histories use current
+connection values. Cache packets and explicit continuation are described in
+:doc:`../advanced/A29_functional_network_cache_initialization`.
+
 .. autoclass:: dendra.func.CompiledNetworkRunner
    :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
    :special-members: __call__
@@ -94,6 +100,9 @@ See :doc:`../advanced/A28_functional_network_extra` for the complete workflow.
    :members:
 
 .. autoclass:: dendra.func.NetworkInitializationInput
+   :members:
+
+.. autoclass:: dendra.func.NetworkInitializationCache
    :members:
 
 .. autoclass:: dendra.func.CompiledNetworkChunk

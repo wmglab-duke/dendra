@@ -441,6 +441,14 @@ _STANDARD_POPULATION_FRESH_INITIALIZATION = {
         MultiPopulation,
     )
 }
+_STANDARD_OWNED_CACHE_METHODS = {
+    name: inspect.getattr_static(Population, name)
+    for name in (
+        "restore",
+        "_run_initialization_hooks",
+        "_has_random_parameters_resampled_on_initialize",
+    )
+}
 _INTEGRATOR_FRESH_INITIALIZATION_HOOKS = ("init_v",)
 _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
     implementation: {
@@ -3522,6 +3530,13 @@ def _evaluate_timestep_buffers(module, dt) -> Mapping[str, torch.Tensor]:
     return values
 
 
+def _cache_materialization(value, name, cache_values, cache_active):
+    """Select a detached native cache buffer before its numerical consumers."""
+    if cache_values is None or name not in cache_values:
+        return value
+    return torch.where(cache_active, cache_values[name].detach(), value)
+
+
 class _PopulationPreparation(torch.nn.Module):
     """Pure materialization of effective parameters and static workspaces."""
 
@@ -3761,6 +3776,8 @@ class _PopulationPreparation(torch.nn.Module):
         *,
         for_initialization=False,
         material_area=None,
+        cache_values=None,
+        cache_active=None,
     ):
         if for_initialization:
             # INITIAL/defaults and ordinary parameter/derived builders see the
@@ -3781,12 +3798,15 @@ class _PopulationPreparation(torch.nn.Module):
             self.population._buffers["diam"] = diam
 
         bindings = self._registered_input_bindings()
-        population_values = self.population._derive_parameter_buffers()
+        population_values = dict(self.population._derive_parameter_buffers())
         self._assert_registered_inputs_unchanged(
             bindings,
             f"{type(self.population).__qualname__}._derive_parameter_buffers()",
         )
         for name in self.population_parameter_names:
+            population_values[name] = _cache_materialization(
+                population_values[name], name, cache_values, cache_active
+            )
             if name in self.population._buffers:
                 self.population._buffers[name] = population_values[name]
         celsius = population_values["celsius"]
@@ -3852,6 +3872,12 @@ class _PopulationPreparation(torch.nn.Module):
             offset_name = self.offset_names[index]
             if offset_name is not None:
                 value = value + getattr(self, offset_name)
+            value = _cache_materialization(
+                value,
+                f"{entry.module_path}.{entry.buffer_name}",
+                cache_values,
+                cache_active,
+            )
             owner._buffers[entry.buffer_name] = value
             outputs.append((entry.key, value))
 
@@ -3874,6 +3900,12 @@ class _PopulationPreparation(torch.nn.Module):
                 # autograd connection, matching imperative buffer semantics.
                 value = values[entry.buffer_name].clone(
                     memory_format=torch.preserve_format
+                )
+                value = _cache_materialization(
+                    value,
+                    f"{entry.module_path}.{entry.buffer_name}",
+                    cache_values,
+                    cache_active,
                 )
                 owner._buffers[entry.buffer_name] = value
                 outputs.append((entry.key, value))
@@ -4152,7 +4184,16 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
         self.population_parameter_names = tuple(population_values)
         self.audit_builder_inputs = False
 
-    def forward(self, diam, dx, diameters, diam_original):
+    def forward(
+        self,
+        diam,
+        dx,
+        diameters,
+        diam_original,
+        *,
+        cache_values=None,
+        cache_active=None,
+    ):
         """Materialize only effective component-level physical parameters."""
         self.population._buffers["dx"] = dx
         if self.uses_diameter_parametrization:
@@ -4173,7 +4214,10 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             f"{type(self.population).__qualname__}._derive_parameter_buffers()",
         )
         return tuple(
-            population_values[name] for name in self.population_parameter_names
+            _cache_materialization(
+                population_values[name], name, cache_values, cache_active
+            )
+            for name in self.population_parameter_names
         )
 
 
@@ -9213,6 +9257,55 @@ def _compiled_initialization_failures(population) -> tuple[str, ...]:
     return tuple(_functional_initialization_failures(population))
 
 
+def _owned_cache_initialization_failures(population):
+    failures = []
+    profile = _functional_initialization_profile(population)
+    standards = (
+        {} if profile is None else _STANDARD_POPULATION_FRESH_INITIALIZATION[profile[0]]
+    )
+    for name in (
+        "initialize",
+        "build",
+        "build_intra",
+        "_restore_steady_state",
+        "post_initialize",
+        "_clear_duration_remainder",
+    ):
+        if (
+            name not in standards
+            or name in population.__dict__
+            or inspect.getattr_static(type(population), name) is not standards[name]
+        ):
+            failures.append(
+                f"Population steady-state cache replaces canonical {name}; authored cache restoration is currently unsupported"
+            )
+    for name, standard in _STANDARD_OWNED_CACHE_METHODS.items():
+        if (
+            name in population.__dict__
+            or inspect.getattr_static(type(population), name) is not standard
+        ):
+            failures.append(
+                f"Population steady-state cache replaces canonical {name}; authored cache restoration is currently unsupported"
+            )
+    if any(
+        not isinstance(hook, _InitializationTransformHook)
+        for hook in population.post_initialize_hooks
+    ):
+        failures.append(
+            "Population steady-state cache restoration with legacy post-initialize hooks is currently unsupported"
+        )
+    if population._has_random_parameters_resampled_on_initialize():
+        failures.append(
+            "Population steady-state cache invalidation by initialization-time random parameter resampling is currently unsupported"
+        )
+    return tuple(failures)
+
+
+@torch.compiler.assume_constant_result
+def _compiled_owned_cache_initialization_failures(population):
+    return _owned_cache_initialization_failures(population)
+
+
 @torch.compiler.assume_constant_result
 def _compiled_initialization_structure_matches(population, fingerprint) -> bool:
     """Evaluate initializer-only source freshness once per compiled graph."""
@@ -9263,6 +9356,7 @@ class FunctionalPopulation:
         dt: float,
         extra=None,
         _multi_component_candidates: Mapping[str, Population] | None = None,
+        _bind_owned_cache=True,
     ):
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
@@ -9374,6 +9468,14 @@ class FunctionalPopulation:
             )
 
         self._multi_component_plans = ()
+        self._cache_value_specs = ()
+        self._bind_owned_cache = _bind_owned_cache
+        self._owned_cache_bound = (
+            _bind_owned_cache and "_steady_state" in population._caches
+        )
+        self._owned_cache_plan = None
+        self._owned_cache_error = None
+        self._owned_cache_state_template = None
         self._multi_public_constant_shapes = {}
         self._multi_public_constant_dtypes = {}
         self._multi_public_constant_devices = {}
@@ -9867,6 +9969,26 @@ class FunctionalPopulation:
         self._structured_step_graphs = {}
         self._structured_capture_errors = {}
         self._structured_capture_error = None
+        if self._owned_cache_bound:
+            from ._population_cache import PopulationCachePlan
+
+            self._enable_cache_materializations()
+            try:
+                self._owned_cache_plan = PopulationCachePlan(
+                    self, population._caches["_steady_state"]
+                )
+                self._owned_cache_plan.bind_parameter_sources(self._parameter_sources())
+                self._owned_cache_state_template = {}
+                for leaf in self._state_layout:
+                    _put_path(
+                        self._owned_cache_state_template,
+                        leaf.public_path,
+                        _clone_tensor(
+                            _buffer_at(population, leaf.module_path, leaf.buffer_name)
+                        ),
+                    )
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                self._owned_cache_error = str(error)
 
     def _build_multi_component_plans(
         self,
@@ -10524,6 +10646,60 @@ class FunctionalPopulation:
                     f"parameter {name!r} must use {expected_device}/{expected_dtype}"
                 )
 
+    def _enable_cache_materializations(self) -> None:
+        """Expose native effective buffers for a cache-bound Network plan.
+
+        Snapshot extraction leaves these operands inactive. Cached starts
+        activate them independently of the live source's raw parameters.
+        """
+        if self._cache_value_specs:
+            return
+        paths = []
+        for name in self._preparation.population_parameter_names:
+            if name in self._population._buffers:
+                paths.append(name)
+        paths.extend(
+            f"{entry.module_path}.{entry.buffer_name}"
+            for entry in self._prepared_buffers
+            if entry.kind in {"effective_parameter", "derived"}
+        )
+        for record, preparation in zip(
+            self._multi_component_plans,
+            getattr(self._preparation, "component_physical_preparations", ()),
+            strict=True,
+        ):
+            component = self._population.populations[record.name]
+            paths.extend(
+                f"populations.{record.name}.{name}"
+                for name in preparation.population_parameter_names
+                if name in component._buffers
+            )
+        specs = []
+        for path in dict.fromkeys(paths):
+            value = self._population.get_buffer(path)
+            specs.append(
+                (
+                    f"cache.values.{path}",
+                    path,
+                    _shape_tuple(value),
+                    value.dtype,
+                    value.device,
+                )
+            )
+        self._cache_value_specs = tuple(specs)
+
+    def _cache_preparation_inputs(self, constants, *, prefix=""):
+        if not self._cache_value_specs:
+            return None, None
+        return (
+            {
+                path.removeprefix(prefix): constants[name]
+                for name, path, _shape, _dtype, _device in self._cache_value_specs
+                if path.startswith(prefix)
+            },
+            constants["cache.active"],
+        )
+
     def _validate_constants(self, constants) -> None:
         if not isinstance(constants, Mapping):
             raise TypeError("constants must be a mapping of named tensors")
@@ -10540,6 +10716,9 @@ class FunctionalPopulation:
                 "dt",
             }
         )
+        if self._cache_value_specs:
+            expected_names.update(name for name, *_ in self._cache_value_specs)
+            expected_names.add("cache.active")
         if set(constants) != expected_names:
             missing = sorted(expected_names - set(constants))
             unexpected = sorted(set(constants) - expected_names)
@@ -10589,6 +10768,23 @@ class FunctionalPopulation:
                 raise ValueError(
                     f"constant {entry.key!r} must use {entry.device}/{entry.dtype}"
                 )
+        for name, _path, shape, dtype, device in self._cache_value_specs:
+            value = constants[name]
+            if not torch.is_tensor(value) or _shape_tuple(value) != shape:
+                raise ValueError(f"constant {name!r} must have cached shape {shape}")
+            if value.dtype != dtype or value.device != device:
+                raise ValueError(f"constant {name!r} must use {device}/{dtype}")
+        if self._cache_value_specs:
+            active = constants["cache.active"]
+            if (
+                not torch.is_tensor(active)
+                or _shape_tuple(active) != ()
+                or active.dtype != torch.bool
+                or active.device != self.device
+            ):
+                raise ValueError(
+                    f"constant 'cache.active' must be a scalar bool on {self.device}"
+                )
         dt = constants["dt"]
         if not torch.is_tensor(dt) or _shape_tuple(dt) != ():
             raise ValueError("constant 'dt' must be a scalar Tensor")
@@ -10606,6 +10802,47 @@ class FunctionalPopulation:
     def _validate_initialization(self, inputs) -> None:
         if not isinstance(inputs, InitializationInput):
             raise TypeError("inputs must be an InitializationInput")
+        if (
+            self._bind_owned_cache
+            and ("_steady_state" in self._population._caches) != self._owned_cache_bound
+        ):
+            raise FunctionalizationError(
+                "Population steady-state cache presence changed; lower again"
+            )
+        if self._owned_cache_bound:
+            failures = (
+                _compiled_owned_cache_initialization_failures(self._population)
+                if torch.compiler.is_compiling()
+                else _owned_cache_initialization_failures(self._population)
+            )
+            if failures:
+                raise FunctionalizationError("\n".join(failures))
+            if self._owned_cache_error is not None:
+                raise FunctionalizationError(
+                    f"Population steady-state cache cannot be restored: {self._owned_cache_error}"
+                )
+            reference = self._owned_cache_plan._reference
+            if not isinstance(inputs.cache, Mapping) or set(inputs.cache) != set(
+                reference
+            ):
+                raise FunctionalizationError(
+                    "Population steady-state cache schema changed; lower again"
+                )
+            for name, expected in reference.items():
+                value = inputs.cache[name]
+                if (
+                    not torch.is_tensor(value)
+                    or _shape_tuple(value) != _shape_tuple(expected)
+                    or value.dtype != expected.dtype
+                    or value.device != expected.device
+                ):
+                    raise FunctionalizationError(
+                        f"Population steady-state cache {name!r} has incompatible tensor schema"
+                    )
+        elif inputs.cache is not None:
+            raise FunctionalizationError(
+                "This Population plan has no bound steady-state cache; lower again"
+            )
         value = inputs.v_init
         if not torch.is_tensor(value):
             raise TypeError("initialization v_init must be a Tensor")
@@ -10857,6 +11094,16 @@ class FunctionalPopulation:
                     dtype=self.dtype,
                 ),
             }
+        if self._cache_value_specs:
+            constants.update(
+                {
+                    name: population.get_buffer(path).detach().clone()
+                    for name, path, _shape, _dtype, _device in self._cache_value_specs
+                }
+            )
+            constants["cache.active"] = torch.zeros(
+                (), device=self.device, dtype=torch.bool
+            )
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         initialization_states = {}
@@ -10890,6 +11137,14 @@ class FunctionalPopulation:
             v_init=_clone_tensor(population.expanded_v_init(self.shape)),
             states=initialization_states,
             transforms=initialization_transform_values,
+            cache=(
+                None
+                if self._owned_cache_plan is None
+                else {
+                    name: value.detach().clone()
+                    for name, value in self._owned_cache_plan.default.items()
+                }
+            ),
         )
         return PopulationTensors(
             parameters=parameters,
@@ -10915,6 +11170,8 @@ class FunctionalPopulation:
         base_mapping=None,
         for_initialization=False,
         material_area=None,
+        cache_values=None,
+        cache_active=None,
     ):
         preparation = self._preparation if preparation is None else preparation
         base_mapping = (
@@ -10947,6 +11204,8 @@ class FunctionalPopulation:
                 "material_area": (
                     None if material_area is None else material_area.clone()
                 ),
+                "cache_values": cache_values,
+                "cache_active": cache_active,
             },
             tie_weights=False,
         )
@@ -11022,18 +11281,22 @@ class FunctionalPopulation:
         )
 
     def initialize(self, parameters, constants, inputs: InitializationInput):
-        """Purely construct fresh state and initialization-derived parameters.
+        """Purely initialize from declared defaults or a bound steady-state cache.
 
-        Registered pure pre/post transforms consume their explicit
-        ``inputs.transforms`` leaves in imperative registration order. Their
-        raw-parameter and state replacements are returned in the complete
-        bundle; constants pass through unchanged.
+        Without an owned cache, registered pure pre/post transforms consume
+        ``inputs.transforms`` in native registration order and constants pass
+        through unchanged. A bound ``inputs.cache`` restores detached saved
+        state and materializations, skips fresh initialization hooks, and
+        returns effective parameters and constants. Both paths reset the
+        Population clock and duration remainder.
         """
 
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         self._validate_initialization(inputs)
+        if self._owned_cache_bound:
+            return self._initialize_owned_cache(parameters, constants, inputs)
         current_failures = (
             _compiled_initialization_failures(self._population)
             if torch.compiler.is_compiling()
@@ -11154,6 +11417,26 @@ class FunctionalPopulation:
             ),
         )
 
+    def _initialize_owned_cache(self, parameters, constants, inputs):
+        if self._owned_cache_error is not None:
+            raise FunctionalizationError(
+                f"Population steady-state cache cannot be restored: {self._owned_cache_error}"
+            )
+        failures = (
+            _compiled_owned_cache_initialization_failures(self._population)
+            if torch.compiler.is_compiling()
+            else _owned_cache_initialization_failures(self._population)
+        )
+        if failures:
+            raise FunctionalizationError("\n".join(failures))
+        packet = self._owned_cache_plan.restore_owned(
+            parameters, constants, self._owned_cache_state_template, inputs.cache
+        )
+        return packet._replace(
+            state=_reset_functional_initialization_clock(packet.state),
+            initialization=inputs,
+        )
+
     def _prepare_values(
         self,
         parameters,
@@ -11163,6 +11446,29 @@ class FunctionalPopulation:
         preparation_base_mapping=None,
         for_initialization=False,
     ):
+        if self._cache_value_specs:
+            active = constants["cache.active"]
+            # Native cache restoration detaches effective Population buffers.
+            # Cut the raw route before authored transforms as well: masking
+            # only their outputs can multiply a zero adjoint by an inactive
+            # nonfinite derivative and produce a spurious NaN gradient.
+            parameters = {
+                **parameters,
+                **{
+                    name: torch.where(
+                        active, parameters[name].detach(), parameters[name]
+                    )
+                    for name in self._population_parameter_names
+                },
+            }
+            constants = {
+                name: (
+                    value
+                    if name == "dt" or name.startswith("cache.")
+                    else torch.where(active, value.detach(), value)
+                )
+                for name, value in constants.items()
+            }
         if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             return self._prepare_multi_values(
                 parameters,
@@ -11184,6 +11490,7 @@ class FunctionalPopulation:
         xg = constants.get("xg")
         dx = constants["dx"]
         dt = constants["dt"]
+        cache_values, cache_active = self._cache_preparation_inputs(constants)
 
         population_values, mechanism_values, local_geometry_values = (
             self._prepare_parameter_buffers(
@@ -11201,6 +11508,8 @@ class FunctionalPopulation:
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
                 material_area=constants.get("canonical_area_cm2"),
+                cache_values=cache_values,
+                cache_active=cache_active,
             )
         )
         diam = population_values.get("diam", diam)
@@ -11544,6 +11853,9 @@ class FunctionalPopulation:
             component_diam = component_constants.get("diam")
             component_diameters = component_constants.get("diameters")
             component_diam_original = component_constants.get("diam_original")
+            cache_values, cache_active = self._cache_preparation_inputs(
+                constants, prefix=f"populations.{component_record.name}."
+            )
             component_outputs = functional_call(
                 component_preparation,
                 component_mapping,
@@ -11561,6 +11873,7 @@ class FunctionalPopulation:
                         else component_diam_original.clone()
                     ),
                 ),
+                {"cache_values": cache_values, "cache_active": cache_active},
                 tie_weights=False,
             )
             population_values = dict(
@@ -11742,6 +12055,7 @@ class FunctionalPopulation:
         }
         packed_diam = full_fields["diam"]
         packed_dx = full_fields["dx"]
+        cache_values, cache_active = self._cache_preparation_inputs(constants)
 
         population_values, mechanism_values, local_geometry_values = (
             self._prepare_parameter_buffers(
@@ -11759,6 +12073,8 @@ class FunctionalPopulation:
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
                 material_area=full_fields["point_area"],
+                cache_values=cache_values,
+                cache_active=cache_active,
             )
         )
         for name in (
@@ -14218,6 +14534,7 @@ def make_functional(
     *,
     dt: float,
     extra=None,
+    _bind_owned_cache=True,
 ) -> tuple[FunctionalPopulation, PopulationTensors]:
     """Lower an initialized deterministic Population into a pure transition."""
     if isinstance(dt, bool):
@@ -14258,6 +14575,7 @@ def make_functional(
                 dt=dt_value,
                 extra=extra,
                 _multi_component_candidates=multi_component_candidates,
+                _bind_owned_cache=_bind_owned_cache,
             )
             construction_rng = _global_rng_changes(rng_state, device)
             construction_class_state = _restore_class_state(class_state)

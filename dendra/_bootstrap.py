@@ -38,8 +38,18 @@ _TORCH_COMPILER_WARNING_SPECS = (
         r"torch\.jit\._script",
     ),
     (
+        r".*torch\.jit\.script_method.*deprecated.*",
+        FutureWarning,
+        r"torch\.jit\._script",
+    ),
+    (
         r".*torch\.jit\.script.*deprecated.*",
         DeprecationWarning,
+        r"torch\.jit\._script",
+    ),
+    (
+        r".*torch\.jit\.script.*deprecated.*",
+        FutureWarning,
         r"torch\.jit\._script",
     ),
     (

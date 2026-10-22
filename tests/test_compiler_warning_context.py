@@ -20,6 +20,8 @@ def compiler_context(request, monkeypatch):
 _KNOWN_WARNINGS = (
     ("torch.jit.script_method is deprecated", DeprecationWarning, "torch.jit._script"),
     ("torch.jit.script is deprecated", DeprecationWarning, "torch.jit._script"),
+    ("torch.jit.script_method is deprecated", FutureWarning, "torch.jit._script"),
+    ("torch.jit.script is deprecated", FutureWarning, "torch.jit._script"),
     (
         "The .grad attribute of a Tensor that is not a leaf Tensor is being accessed.",
         UserWarning,
@@ -67,7 +69,9 @@ def test_known_warning_is_scoped_and_repeated_calls_still_filter(
         ("unrelated runtime warning", RuntimeWarning, "torch._dynamo"),
         ("unrelated user warning", UserWarning, "torch._dynamo"),
         ("unrelated deprecation", DeprecationWarning, "torch.jit._script"),
+        ("unrelated future warning", FutureWarning, "torch.jit._script"),
         ("torch.jit.script is deprecated", DeprecationWarning, "user_callbacks"),
+        ("torch.jit.script is deprecated", FutureWarning, "user_callbacks"),
         ("torch.jit.script is deprecated", UserWarning, "torch.jit._script"),
     ),
 )

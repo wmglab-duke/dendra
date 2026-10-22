@@ -13,6 +13,20 @@ from ._network_bindings import _canonicalize_mapping_tree
 from ._types import FunctionalizationError, InitializationInput
 
 
+class NetworkInitializationCache(NamedTuple):
+    """Detached steady-state Population and normalized connection cache values.
+
+    Population entries use the native state-dict names. Connection entries are
+    Tensor-only packets normalized for the plan's fixed topology and timestep.
+    Cache leaves are independent editable initialization inputs, not runtime
+    checkpoints; restoration does not differentiate through the warm-up run.
+    """
+
+    populations: Mapping
+    synapses: Mapping
+    continuous_synapses: Mapping
+
+
 class NetworkInitializationInput(NamedTuple):
     """Initialization-only Population values, starting time, and optional draw.
 
@@ -21,12 +35,15 @@ class NetworkInitializationInput(NamedTuple):
     clock's dtype and device. It is detached during initialization, matching
     native clock synchronization. ``netstim_draw`` is an explicit initialization
     packet; the host runner samples one when omitted. Step draw tapes remain
-    separate runtime inputs.
+    separate runtime inputs. A bound Network-wide ``cache`` takes precedence
+    over individual Population caches; otherwise each Population's input
+    controls its own initialization at its position in the authored order.
     """
 
     populations: dict[str, InitializationInput]
     t: torch.Tensor
     netstim_draw: NetStimDraw | None = None
+    cache: NetworkInitializationCache | None = None
 
 
 def initialization_alias_failures(functional):
@@ -36,6 +53,10 @@ def initialization_alias_failures(functional):
     order = {name: index for index, name in enumerate(functional.populations)}
     failures = []
     for name, plan in functional.populations.items():
+        if plan._owned_cache_bound:
+            # Owned-cache initialization skips both pre transforms and
+            # structured post transforms, matching Population.initialize.
+            continue
         population = plan._population
         writes = {
             reference.removeprefix("parameters.")
@@ -76,6 +97,113 @@ def initialization_alias_failures(functional):
                         "currently unsupported; initialize shared runtime parameters "
                         "before their first Population reader"
                     )
+    for owner, (bindings, _replays) in functional._owned_cache_alias_plans.items():
+        for _winner, parameter_groups, _constants, _states in bindings:
+            for paths in parameter_groups:
+                for path in paths:
+                    if (
+                        path[0] == "populations"
+                        and order[path[1]] < order[owner]
+                        and not functional.populations[path[1]]._owned_cache_bound
+                        and "._initial_sources." not in path[2]
+                    ):
+                        failures.append(
+                            f"Population {owner!r} cache writes a shared runtime "
+                            f"parameter of already initialized fresh Population "
+                            f"{path[1]!r}; native initialization retains its earlier "
+                            "materialized coefficients. This ordering is currently "
+                            "unsupported; initialize the cached owner before its "
+                            "fresh parameter readers"
+                        )
+
+    if not functional._owned_cache_alias_plans:
+        return tuple(dict.fromkeys(failures))
+
+    from ._population_cache import _cache_storage_frame
+
+    def overlaps(left, right):
+        if left == right:
+            return True
+        if (
+            left[0] != "storage"
+            or right[0] != "storage"
+            or left[1] != right[1]
+            or left[3] != right[3]
+        ):
+            return False
+
+        def bounds(frame):
+            offset, shape, strides = frame[4:]
+            width = frame[2].itemsize
+            end = offset + sum(
+                (length - 1) * stride
+                for length, stride in zip(shape, strides, strict=True)
+            )
+            return offset * width, (end + 1) * width - 1
+
+        start, end = bounds(left)
+        other_start, other_end = bounds(right)
+        return start <= other_end and other_start <= end
+
+    fresh_materializations = {}
+    for name, plan in functional.populations.items():
+        if plan._owned_cache_bound:
+            continue
+        population = plan._population
+        paths = [
+            name
+            for name in plan._preparation.population_parameter_names
+            if name in population._buffers
+        ]
+        paths.extend(
+            f"{entry.module_path + '.' if entry.module_path else ''}{entry.buffer_name}"
+            for entry in plan._prepared_buffers
+            if entry.kind in {"effective_parameter", "derived"}
+        )
+        for record, preparation in zip(
+            plan._multi_component_plans,
+            getattr(plan._preparation, "component_physical_preparations", ()),
+            strict=True,
+        ):
+            component = population.populations[record.name]
+            paths.extend(
+                f"populations.{record.name}.{field}"
+                for field in preparation.population_parameter_names
+                if field in component._buffers
+            )
+        fresh_materializations[name] = tuple(
+            _cache_storage_frame(
+                population.get_buffer(path), buffer=True, owner=population
+            )
+            for path in dict.fromkeys(paths)
+        )
+    for owner in functional._owned_cache_alias_plans:
+        cache_plan = functional.populations[owner]._owned_cache_plan
+        writes = tuple(cache_plan.storage_frames[key] for key in cache_plan.write_keys)
+        represented = tuple(
+            cache_plan.storage_frames[source]
+            for source in (
+                *cache_plan.parameters.values(),
+                *cache_plan.constants.values(),
+                *(source for _path, source in cache_plan.states),
+            )
+        )
+        for name, materializations in fresh_materializations.items():
+            # Later cache copies can overwrite earlier retained coefficients;
+            # later fresh population can overwrite the cached owner's readers.
+            # Neither mutation is represented by recomputing fresh preparation
+            # beside immutable detached cache materializations.
+            affected = writes if order[name] < order[owner] else represented
+            if any(
+                overlaps(saved, current)
+                for saved in affected
+                for current in materializations
+            ):
+                failures.append(
+                    f"Population {owner!r} cache shares retained materializations "
+                    f"with fresh Population {name!r}. Shared runtime buffers with "
+                    "different initialization materializations are currently unsupported"
+                )
     return tuple(dict.fromkeys(failures))
 
 
@@ -117,6 +245,286 @@ def _propagate_population_parameters(functional, parameters, name, replacement):
     return result
 
 
+def _cache_alias_plan(functional, writers, readers):
+    """Freeze one native cache-copy transaction and all of its readers."""
+    from ._population_cache import _cache_storage_frame, cache_storage_replays
+
+    groups = {}
+    constant_frames = {}
+    frame_sources, writes = {}, []
+    for name, plan in writers.items():
+        for key in plan.write_keys:
+            frame = plan.storage_frames[key]
+            group = groups.setdefault(frame, [None, [], [], []])
+            group[0] = (name, key)
+            frame_sources.setdefault(frame, plan.sources[key])
+            writes.append(((name, key), plan.sources[key], frame))
+
+    def overlaps(frame, other):
+        if (
+            frame[0] != "storage"
+            or other[0] != "storage"
+            or frame[1] != other[1]
+            or frame[3] != other[3]
+        ):
+            return False
+
+        def bounds(value):
+            offset, shape, strides = value[4:]
+            size = value[2].itemsize
+            end = offset + sum(
+                (length - 1) * stride
+                for length, stride in zip(shape, strides, strict=True)
+            )
+            return offset * size, (end + 1) * size - 1
+
+        start, end = bounds(frame)
+        other_start, other_end = bounds(other)
+        return start <= other_end and other_start <= end
+
+    written_frames = tuple(groups)
+    for name, plan in readers.items():
+        for collection, bindings in (
+            (1, plan.parameters.items()),
+            (2, plan.constants.items()),
+            (3, plan.states),
+        ):
+            for public, source in bindings:
+                frame = plan.storage_frames[source]
+                if frame not in groups:
+                    if not any(overlaps(frame, other) for other in written_frames):
+                        continue
+                    groups[frame] = [None, [], [], []]
+                    frame_sources[frame] = plan.sources[source]
+                group = groups[frame]
+                path = (
+                    (name, *public)
+                    if collection == 3
+                    else ("populations", name, public)
+                )
+                group[collection].append(path)
+                if collection == 2:
+                    constant_frames[path] = frame
+    # Some saved Population buffers are exposed only as cache materializations,
+    # so their packet constants intentionally do not share snapshot identity.
+    # Resolve outside execution parameters against the original native Tensor
+    # as well; a native state-dict copy still updates every such reader.
+    from ._continuous_transform import _named_tensors
+    from ._netcon import _effective_tensor
+    from ._network import _tensor_paths
+    from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
+
+    native = {
+        "populations": {},
+        "synapses": {},
+        "continuous_synapses": {},
+        "netstim": None,
+    }
+    for name, plan in functional.populations.items():
+        native["populations"][name] = plan._parameter_sources()
+    for name, plan in functional.synapses.items():
+        connection = plan._source
+        native["synapses"][name] = {
+            "weights": _effective_tensor(connection.weight, "weight"),
+            "delays": _effective_tensor(connection.delay_ms, "delay")
+            if plan._diff_delays
+            else None,
+            "schedule": TensorScheduleTensors(**_TensorSchedulePlan._values(connection))
+            if functional._parameter_schema["synapses"][name]["schedule"] is not None
+            else None,
+        }
+    for name, plan in functional.continuous_synapses.items():
+        connection = plan._source
+        native["continuous_synapses"][name] = {
+            "weights": _effective_tensor(connection.weight, "weight"),
+            "transform_parameters": _named_tensors(connection.transform)
+            if isinstance(connection.transform, torch.nn.Module)
+            else None,
+        }
+    if functional.netstim is not None:
+        source = functional.netstim._source
+        native["netstim"] = {
+            "parameters": {
+                name: getattr(source, name)
+                for name in ("start", "noise", "tau")
+                if torch.is_tensor(getattr(source, name))
+            },
+            "schedule": TensorScheduleTensors(**_TensorSchedulePlan._values(source))
+            if functional._parameter_schema["netstim"]["schedule"] is not None
+            else None,
+        }
+    native_parameters = dict(_tensor_paths(native))
+    parameter_frames = {
+        path: _cache_storage_frame(source) for path, source in native_parameters.items()
+    }
+    for path, frame in parameter_frames.items():
+        if frame not in groups and any(
+            overlaps(frame, other) for other in written_frames
+        ):
+            groups[frame] = [None, [], [], []]
+            frame_sources[frame] = native_parameters[path]
+        if frame in groups:
+            parameters = groups[frame][1]
+            if path not in parameters:
+                parameters.append(path)
+    result, outputs = [], []
+    for frame, (winner, parameters, constants, states) in groups.items():
+        if not (parameters or constants or states):
+            continue
+        changed = True
+        while changed:
+            count = len(parameters) + len(constants)
+            for aliases in functional._parameter_aliases:
+                if any(path in aliases for path in parameters):
+                    parameters.extend(
+                        path
+                        for path in aliases
+                        if path not in parameters
+                        and parameter_frames.get(path) == frame
+                    )
+            for path, constant_paths in functional._parameter_constant_aliases:
+                if parameter_frames.get(path) == frame and (
+                    path in parameters
+                    or any(target in constants for target in constant_paths)
+                ):
+                    if path not in parameters:
+                        parameters.append(path)
+                    constants.extend(
+                        target
+                        for target in constant_paths
+                        if target not in constants
+                        and constant_frames.get(target, frame) == frame
+                    )
+            changed = len(parameters) + len(constants) != count
+        parameter_groups = {}
+        for path in parameters:
+            parameter_groups.setdefault(id(native_parameters[path]), []).append(path)
+        outputs.append((len(result), frame_sources[frame], frame))
+        result.append(
+            (
+                winner,
+                tuple(tuple(paths) for paths in parameter_groups.values()),
+                tuple(constants),
+                tuple(states),
+            )
+        )
+    replays = cache_storage_replays(writes, outputs)
+    resolved = {identifier for replay in replays for identifier in replay.output_ids}
+    if any(
+        winner is None and index not in resolved
+        for index, (winner, *_rest) in enumerate(result)
+    ):
+        raise FunctionalizationError(
+            "Population cache cannot fully restore an external Tensor view; this alias is currently unsupported"
+        )
+    return tuple(result), replays
+
+
+def cache_alias_bindings(functional):
+    """Freeze the complete Network-owned cache-copy phase."""
+    functional._cache_storage_replays = ()
+    if not functional._cache_enabled or functional._cache_error is not None:
+        return ()
+    try:
+        bindings, replays = _cache_alias_plan(
+            functional,
+            functional._population_cache_plans,
+            functional._population_cache_plans,
+        )
+    except (FunctionalizationError, ValueError, TypeError, RuntimeError) as error:
+        functional._cache_error = str(error)
+        return ()
+    functional._cache_storage_replays = replays
+    return bindings
+
+
+def population_cache_alias_bindings(functional):
+    """Freeze individual Population restores without moving their native phase."""
+    if functional._cache_enabled:
+        return {}, None
+    owners = {
+        name: plan._owned_cache_plan
+        for name, plan in functional.populations.items()
+        if plan._owned_cache_plan is not None
+    }
+    if not owners:
+        return {}, None
+    from ._population_cache import PopulationCachePlan
+
+    try:
+        readers = {
+            name: owners[name]
+            if name in owners
+            else PopulationCachePlan(plan, None, bindings_only=True)
+            for name, plan in functional.populations.items()
+        }
+        plans = {
+            name: _cache_alias_plan(functional, {name: owner}, readers)
+            for name, owner in owners.items()
+        }
+    except (FunctionalizationError, ValueError, TypeError, RuntimeError) as error:
+        return {}, str(error)
+    return plans, None
+
+
+def _restore_cache_aliases(
+    functional,
+    parameters,
+    effective,
+    constants,
+    populations,
+    cache,
+    *,
+    bindings=None,
+    replays=None,
+):
+    """Publish final native cache writes before rebuilding runtime workspaces."""
+    from dendra.models.networks._population_cache import (
+        replay_population_cache_storage,
+        restore_population_cache_values,
+    )
+
+    from ._network import _at
+
+    resolved = {}
+    for replay in functional._cache_storage_replays if replays is None else replays:
+        values = replay_population_cache_storage(
+            tuple(_at(cache.populations, path) for path in replay.write_paths),
+            replay.write_indices,
+            replay.output_indices,
+            replay.output_shapes,
+            size=replay.size,
+        )
+        resolved.update(zip(replay.output_ids, values, strict=True))
+    for index, (winner, parameter_groups, constant_paths, state_paths) in enumerate(
+        functional._cache_alias_bindings if bindings is None else bindings
+    ):
+        saved = resolved[index] if index in resolved else _at(cache.populations, winner)
+        for parameter_paths in parameter_groups:
+            reference = _at(parameters, parameter_paths[0])
+            # NetStim and stimulation fields may expose a broadcasted view of
+            # their authored Tensor. Keep that existing explicit packet shape.
+            parameter_saved = saved.expand_as(reference)
+            value = restore_population_cache_values(
+                {"value": reference},
+                {"value": parameter_saved},
+                parameter_names=("value",),
+            )["value"]
+            for path in parameter_paths:
+                effective = _replace_at(effective, path, value)
+        for path in constant_paths:
+            reference = _at(constants, path)
+            constants = _replace_at(
+                constants, path, saved.detach().to(reference).clone()
+            )
+        for path in state_paths:
+            reference = _at(populations, path)
+            populations = _replace_at(
+                populations, path, saved.detach().to(reference).clone()
+            )
+    return effective, constants, populations
+
+
 def _validate(functional, parameters, constants, state, inputs, draw, *, require_draw):
     from ._network import _validate_tree
 
@@ -126,6 +534,7 @@ def _validate(functional, parameters, constants, state, inputs, draw, *, require
     functional._validate_state(state)
     if not isinstance(inputs, NetworkInitializationInput):
         raise TypeError("inputs must be a NetworkInitializationInput")
+    functional._validate_initialization_cache(inputs.cache)
     if not isinstance(inputs.populations, Mapping) or set(inputs.populations) != set(
         functional.populations
     ):
@@ -155,22 +564,58 @@ def _initialize_components(functional, parameters, constants, state, inputs):
     """Complete the native phases preceding NetStim initialization."""
     from ._network import NetworkTensors
 
-    populations = {}
+    populations = dict(state["populations"])
     effective = parameters
+    effective_constants = constants
     with nullcontext() if functional.training else torch.no_grad():
         # Native initialize completes each Population in authored order before
         # resetting connections. Parameter-writing transforms affect every
         # alias before the next Population observes its input frame.
         for name, plan in functional.populations.items():
-            initialized = plan.initialize(
-                effective["populations"][name],
-                constants["populations"][name],
-                inputs.populations[name],
+            incoming_parameters = effective
+            if inputs.cache is None:
+                initialized = plan.initialize(
+                    effective["populations"][name],
+                    effective_constants["populations"][name],
+                    inputs.populations[name],
+                )
+            else:
+                initialized = functional._population_cache_plans[name].restore(
+                    effective["populations"][name],
+                    effective_constants["populations"][name],
+                    state["populations"][name],
+                    inputs.cache.populations[name],
+                )
+            effective_constants = _replace_at(
+                effective_constants, ("populations", name), initialized.constants
             )
             effective = _propagate_population_parameters(
                 functional, effective, name, initialized.parameters
             )
             populations[name] = initialized.state
+            if inputs.cache is None and name in functional._owned_cache_alias_plans:
+                bindings, replays = functional._owned_cache_alias_plans[name]
+                effective, effective_constants, populations = _restore_cache_aliases(
+                    functional,
+                    incoming_parameters,
+                    effective,
+                    effective_constants,
+                    populations,
+                    NetworkInitializationCache(
+                        {name: inputs.populations[name].cache}, {}, {}
+                    ),
+                    bindings=bindings,
+                    replays=replays,
+                )
+        if inputs.cache is not None:
+            effective, effective_constants, populations = _restore_cache_aliases(
+                functional,
+                parameters,
+                effective,
+                effective_constants,
+                populations,
+                inputs.cache,
+            )
         time = inputs.t.detach().clone()
         populations = {
             name: functional._snap_population_clock(value, time)
@@ -192,6 +637,20 @@ def _initialize_components(functional, parameters, constants, state, inputs):
             name: plan.initial_state(state["continuous_synapses"][name], t=time)
             for name, plan in functional.continuous_synapses.items()
         }
+        if inputs.cache is not None:
+            # Native restores cached history after resetting connections and
+            # refreshing their parameters, and before NetStim initialization.
+            for name, cache in inputs.cache.synapses.items():
+                synapses[name] = functional.synapses[name].restore_cache(
+                    effective["synapses"][name], synapses[name], cache, t=time
+                )
+            for name, cache in inputs.cache.continuous_synapses.items():
+                continuous[name] = functional.continuous_synapses[name].restore_cache(
+                    effective["continuous_synapses"][name],
+                    continuous[name],
+                    cache,
+                    t=time,
+                )
         initialized_state = {
             "populations": populations,
             "synapses": synapses,
@@ -199,7 +658,7 @@ def _initialize_components(functional, parameters, constants, state, inputs):
             "netstim": state["netstim"],
             "clock": clock,
         }
-    return NetworkTensors(effective, constants, initialized_state)
+    return NetworkTensors(effective, effective_constants, initialized_state)
 
 
 def _finish_initialization(functional, packet, draw):
@@ -258,4 +717,4 @@ def initialize_host(functional, parameters, constants, state, inputs):
     return _finish_initialization(functional, packet, draw)
 
 
-__all__ = ["NetworkInitializationInput"]
+__all__ = ["NetworkInitializationCache", "NetworkInitializationInput"]

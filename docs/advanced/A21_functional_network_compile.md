@@ -165,9 +165,16 @@ the initialized state and effective parameters:
 :dedent: 4
 ```
 
-Fresh initialization uses the existing frozen topology and current explicit
-parameter values. Random parameter resampling, steady-state cache restoration,
-and custom native initialization/build adapters are currently unsupported.
+Fresh initialization uses the existing frozen topology. When the source
+Network has a Population state cache, it restores the cached Population
+parameters, constants, and carry, and rebuilds connection state using native
+cache semantics. Fresh results return both effective `aux["parameters"]` and
+`aux["constants"]` for explicit continuation. See
+{doc}`A29_functional_network_cache_initialization` for cache capture, current
+connection parameters, gradient boundaries, and required continuation packets.
+Without a cache, fresh initialization uses current explicit parameters as
+described above. Random parameter resampling and custom native
+initialization/build adapters are currently unsupported.
 Initialize shared runtime parameters before the first Population that uses
 them. A transform on a later Population that writes a runtime parameter shared
 with an earlier Population is currently unsupported, because native execution

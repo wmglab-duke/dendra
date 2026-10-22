@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Literal, NamedTuple
 
 import torch
@@ -30,11 +30,17 @@ class InitializationInput(NamedTuple):
     initialization-only values separate from runtime constants makes batching
     and differentiation explicit without invalidating prepared transition
     workspaces.
+
+    ``cache`` contains a Population-owned steady-state snapshot when one was
+    bound during lowering. Cached initialization restores this mapping,
+    skips fresh initialization hooks, and returns effective constants with
+    the initialized parameter and state packet.
     """
 
     v_init: torch.Tensor
     states: dict[str, torch.Tensor] | None = None
     transforms: dict[str, torch.Tensor] | None = None
+    cache: Mapping[str, torch.Tensor] | None = None
 
 
 class PopulationTensors(NamedTuple):

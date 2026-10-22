@@ -34,7 +34,10 @@ from ._netstim import (
 )
 from ._network import FunctionalNetwork, NetworkTensors, make_functional_network
 from ._network_compile import CompiledNetworkRunner
-from ._network_initialization import NetworkInitializationInput
+from ._network_initialization import (
+    NetworkInitializationCache,
+    NetworkInitializationInput,
+)
 from ._network_rollout import CompiledNetworkChunk, NetworkRolloutInput
 from ._population import FunctionalPopulation, make_functional
 from ._runners import longrun, longrun_checkpointed, run
@@ -81,6 +84,7 @@ __all__ = [
     "NetStimOutputs",
     "NetStimTensors",
     "NetworkInitializationInput",
+    "NetworkInitializationCache",
     "NetworkRolloutInput",
     "NetworkTensors",
     "PopulationTensors",

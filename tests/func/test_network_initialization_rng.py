@@ -184,17 +184,42 @@ def test_fresh_network_checkpoint_and_explicit_continuation_keep_rng_and_gradien
     assert all(value.abs().sum() > 0 for value in actual_gradient)
 
 
-@pytest.mark.parametrize("cache", ("_state_cache", "_syn_cache"))
-@pytest.mark.parametrize("when", ("before", "after"))
-def test_fresh_network_rejects_native_state_cache_restoration(cache, when):
+@pytest.mark.parametrize("cached", (False, True))
+def test_fresh_network_cache_presence_is_frozen_at_lowering(cached):
     model, _ = _models(seed=812, noise=0.6)
-    if when == "before":
-        getattr(model, cache)["cell"] = {}
+    if cached:
+        model.cache_state()
     functional, tensors = dn.func.make_functional_network(model)
-    if when == "after":
-        getattr(model, cache)["cell"] = {}
+    assert (functional.initialization_inputs.cache is not None) is cached
+    expected = _fresh(functional, tensors)
+    defaults = _clone(functional.initialization_inputs)
+    if cached:
+        model.clear_state_cache()
+    else:
+        model.cache_state()
+    actual = _fresh(functional, tensors)
+    _close(actual, expected)
+    _close(functional.initialization_inputs, defaults)
+
+
+def test_fresh_network_rejects_a_malformed_captured_population_cache():
+    model, _ = _models(seed=812, noise=0.6)
+    model._state_cache["cell"] = {}
+    functional, tensors = dn.func.make_functional_network(model)
+    untouched = _clone(tensors, detached=True)
     with pytest.raises(dn.func.FunctionalizationError, match="cache"):
         _fresh(functional, tensors)
+    _close(tensors, untouched)
+
+
+def test_fresh_network_ignores_a_connection_cache_without_population_cache():
+    model, native = _models(seed=812, noise=0.6)
+    model._syn_cache["cell"] = {}
+    functional, tensors = dn.func.make_functional_network(model)
+    assert functional.initialization_inputs.cache is None
+    actual = _fresh(functional, tensors)
+    native.initialize(DT, reinit_weights=False, reinit_delays=False)
+    _close(actual.state, functional.extract(native).state)
 
 
 @pytest.mark.parametrize(

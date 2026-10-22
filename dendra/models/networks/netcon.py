@@ -1,5 +1,4 @@
 import hashlib
-import math
 import warnings
 from typing import Any, Dict, Literal
 
@@ -8,11 +7,27 @@ import torch
 from ...helpers import current_native_extension_policy
 from ...utils.tensor_ops import _logical_tensor_bytes
 from ..parametric import Referency
+from ._cache_translation import (
+    _round_half_up_time_index,
+    _round_half_up_time_indices,
+)
 from ._connection_initialization import (
     continuous_initial_step,
     continuous_runtime_reset,
     event_initial_step,
     event_runtime_reset,
+)
+from ._continuous_cache import (
+    _resample_continuous_history_age_rows as _resample_continuous_history_age_rows,
+)
+from ._continuous_cache import (
+    _resample_continuous_time_rows as _resample_continuous_time_rows,
+)
+from ._continuous_cache import (
+    continuous_cache_routes,
+    continuous_history_delivery,
+    normalize_continuous_cache,
+    restore_continuous_cache,
 )
 from ._continuous_delivery import (
     continuous_clear,
@@ -21,6 +36,12 @@ from ._continuous_delivery import (
     continuous_enqueue,
     continuous_project,
     gather_continuous_source,
+)
+from ._event_cache import (
+    event_cache_metadata,
+    event_cache_pending_count,
+    normalize_event_cache,
+    restore_event_cache,
 )
 from ._event_delivery import (
     _clear_dense_slot,
@@ -90,44 +111,6 @@ def _cache_current_slot(step) -> int:
     return int(step)
 
 
-def _round_half_up_time_indices(
-    count: int,
-    numerator_dt: float,
-    denominator_dt: float,
-    *,
-    device,
-) -> torch.Tensor:
-    """Return robust nearest-step indices without device float64 requirements.
-
-    Cache translation is a cold path, so calculate the floating-point positions
-    on CPU.  This keeps the operation compatible with devices such as MPS and a
-    small scale-aware tolerance makes documented half-up ties stable when a
-    decimal ratio (for example 0.3 / 0.2) lands one ULP below its ideal value.
-    """
-    count = int(count)
-    if count <= 0:
-        return torch.empty(0, device=device, dtype=torch.long)
-    positions = torch.arange(count, dtype=torch.float64) * (
-        float(numerator_dt) / float(denominator_dt)
-    )
-    tolerance = (
-        torch.maximum(positions.abs(), torch.ones_like(positions))
-        * torch.finfo(torch.float64).eps
-        * 8.0
-    )
-    indices = torch.floor(positions + 0.5 + tolerance).to(torch.long)
-    return indices.to(device=device)
-
-
-def _round_half_up_time_index(
-    index: int, numerator_dt: float, denominator_dt: float
-) -> int:
-    """Scalar counterpart of :func:`_round_half_up_time_indices`."""
-    value = float(index) * float(numerator_dt) / float(denominator_dt)
-    tolerance = max(abs(value), 1.0) * torch.finfo(torch.float64).eps * 8.0
-    return int(math.floor(value + 0.5 + tolerance))
-
-
 def _dilate_time_rows(
     rows: torch.Tensor,
     old_dt: float,
@@ -162,44 +145,6 @@ def _dilate_time_rows(
     out = torch.zeros((n_limit, E), device=rows.device, dtype=rows.dtype)
     out.index_add_(0, idx, rows)
     return out
-
-
-def _resample_continuous_time_rows(
-    rows: torch.Tensor,
-    old_dt: float,
-    new_dt: float,
-    *,
-    n_limit: int,
-) -> torch.Tensor:
-    """Nearest-neighbor resample a future continuous-signal delay line.
-
-    Continuous projections represent one analog sample at each time row.  Unlike
-    event payloads, two old samples that map to one coarser row must not be
-    summed, and a finer grid must not insert zero-valued gaps.  The connection
-    delays themselves use nearest-step quantization, so nearest-neighbor sampling
-    gives the matching deterministic cache-translation rule.
-    """
-    if rows.ndim != 2:
-        raise ValueError("cached continuous time rows must be 2D")
-    n_limit = int(n_limit)
-    T, E = rows.shape
-    if n_limit <= 0:
-        return rows.new_zeros((0, E))
-    if T == 0:
-        return rows.new_zeros((n_limit, E))
-    if float(old_dt) == float(new_dt) and T == n_limit:
-        return rows.detach().clone()
-
-    old_idx = _round_half_up_time_indices(
-        n_limit,
-        new_dt,
-        old_dt,
-        device=rows.device,
-    )
-    # Endpoint hold is the only stable reconstruction when timestep rounding
-    # makes the new physical horizon slightly longer than the cached one.
-    old_idx.clamp_(0, T - 1)
-    return rows.index_select(0, old_idx).detach().clone()
 
 
 def _dilate_packed_time_rows(
@@ -304,48 +249,6 @@ def _dilate_history_age_rows(
     idx.clamp_(0, n_limit - 1)
     out = torch.zeros((n_limit, E), device=rows.device, dtype=rows.dtype)
     out.index_add_(0, idx, rows)
-    return out
-
-
-def _resample_continuous_history_age_rows(
-    rows: torch.Tensor,
-    old_dt: float,
-    new_dt: float,
-    *,
-    n_limit: int,
-) -> torch.Tensor:
-    """Nearest-neighbor resample age-ordered continuous source values.
-
-    Age row 0 is the next-write ring slot and is not a historical sample.  For
-    finer grids, ages younger than the newest cached sample therefore hold that
-    newest sample.  Requests just outside the cached physical horizon hold the
-    oldest endpoint instead of introducing a discontinuous zero.
-    """
-    if rows.ndim != 2:
-        raise ValueError("cached continuous age rows must be 2D")
-    n_limit = int(n_limit)
-    T, E = rows.shape
-    if n_limit <= 0:
-        return rows.new_zeros((0, E))
-    if T <= 1:
-        return rows.new_zeros((n_limit, E))
-    if float(old_dt) == float(new_dt) and T == n_limit:
-        return rows.detach().clone()
-
-    out = rows.new_zeros((n_limit, E))
-    if n_limit <= 1:
-        return out
-    old_ages = _round_half_up_time_indices(
-        n_limit,
-        new_dt,
-        old_dt,
-        device=rows.device,
-    )[1:]
-    # Age zero is not a sample.  Hold the newest/oldest cached endpoint when a
-    # finer grid or quantized horizon asks just outside the available interval.
-    old_ages.clamp_(1, T - 1)
-    target_ages = torch.arange(1, n_limit, device=rows.device, dtype=torch.long)
-    out.index_copy_(0, target_ages, rows.index_select(0, old_ages))
     return out
 
 
@@ -964,43 +867,20 @@ class ContinuousCon(Referency):
     def _materialize_delivery_from_pre_value_history(
         self, age_history: torch.Tensor, *, apply_transform: bool = True
     ):
-        """Rebuild the dense continuous delay buffer from unweighted value history."""
-        age_history = age_history.detach().to(device=self.device, dtype=self.dtype)
-        if age_history.ndim != 2 or age_history.shape[1] != self._n_conn:
-            raise ValueError(
-                "Cached ContinuousCon pre-value history has incompatible shape: "
-                f"{tuple(age_history.shape)} vs (*, {self._n_conn})."
-            )
-        self.delivery_buffer.zero_()
-        self.delivery_mask.zero_()
-        if self._n_conn == 0 or age_history.shape[0] <= 1:
-            return
-        flat = self.delivery_buffer.view(-1)
-        weight = self.weight().detach().to(device=self.device, dtype=self.dtype)
-        delay_steps = self.delay_steps.to(device=self.device, dtype=torch.long)
-        post_idx = self.post_idx.to(device=self.device, dtype=torch.long)
-        max_age = min(int(age_history.shape[0]), int(self.max_delay_steps))
-        for age in range(1, max_age):
-            remaining = delay_steps - int(age)
-            keep = remaining >= 0
-            if not bool(keep.any()):
-                continue
-            row = age_history[age]
-            if apply_transform and self._has_transform:
-                # Cache reconstruction initializes detached runtime state. Apply
-                # the current memoryless transform to the complete connection
-                # row before selecting the edges whose deliveries remain pending.
-                row = self.transform(row).detach()
-            vals = row.index_select(0, torch.nonzero(keep, as_tuple=False).flatten())
-            if vals.numel() == 0:
-                continue
-            con_idx = torch.nonzero(keep, as_tuple=False).flatten()
-            vals = vals * weight.index_select(0, con_idx)
-            flat_idx = remaining.index_select(
-                0, con_idx
-            ) * self._syn_numel + post_idx.index_select(0, con_idx)
-            flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
-            self.delivery_mask.view(-1).index_fill_(0, flat_idx.reshape(-1), True)
+        """Rebuild detached continuous traffic with the shared pure replay."""
+        queue, presence = continuous_history_delivery(
+            age_history.detach().to(device=self.device, dtype=self.dtype),
+            self.weight(),
+            depth=int(self.max_delay_steps),
+            width=self._syn_numel,
+            delay_steps=self.delay_steps,
+            post_idx=self.post_idx,
+            transform=self.transform
+            if apply_transform and self._has_transform
+            else None,
+        )
+        self.delivery_buffer.copy_(queue)
+        self.delivery_mask.copy_(presence)
 
     def n_connections(self):
         return int(self.n.item())
@@ -1045,110 +925,44 @@ class ContinuousCon(Referency):
     def initialize_from_state_cache(
         self, state_cache, *, dt=None, rebuild_delays: bool = True
     ):
-        """Restore a cache produced by state_cache() after initialize().
+        """Restore detached cached traffic using current weights and integer delays.
 
-        Network calls this after ``initialize(...)`` has already refreshed
-        ``WeightExpander.w`` and, when requested, rebuilt delay metadata.
-        ``rebuild_delays`` remains True for direct calls so the method is
-        self-contained; Network passes False to avoid a redundant second rebuild.
+        Network initialization has already refreshed expanded weights and delay
+        storage. Direct callers retain the default delay rebuild policy.
         """
         if not isinstance(state_cache, dict):
             raise TypeError("ContinuousCon state cache must be a dict")
-        # Cached histories are replayed through the current expanded weights and
-        # current integer delays.  If Network.initialize(...) just rebuilt delay
-        # storage, only clear the buffer; otherwise rebuild from delay_ms.w now.
         if rebuild_delays:
             self._rebuild_delay_buffers()
         else:
             self._align_buffer_devices()
-            self.delivery_buffer.zero_()
-            self.delivery_mask.zero_()
-        old_dt = float(state_cache.get("dt", _cache_dt_value(self.dt)))
-        new_dt = float(_cache_dt_value(self.dt) if dt is None else dt)
-        if "pre_value_history" in state_cache:
-            hist = (
-                state_cache["pre_value_history"]
-                .detach()
-                .to(device=self.device, dtype=self.dtype)
-            )
-            hist = _resample_continuous_history_age_rows(
-                hist,
-                old_dt,
-                new_dt,
-                n_limit=int(self.max_delay_steps),
-            )
-            # Version 2 caches recorded already-transformed values.  Keep those
-            # loadable without applying the transform twice; version 3 stores raw
-            # source values and deliberately replays the current transform.
-            raw_values = (
-                state_cache.get("value_layout") == "raw"
-                or int(state_cache.get("version", 2)) >= 3
-            )
-            self._materialize_delivery_from_pre_value_history(
-                hist, apply_transform=raw_values
-            )
-        else:
-            cached = (
-                state_cache["delivery_buffer"]
-                .detach()
-                .to(device=self.device, dtype=self.dtype)
-            )
-            if cached.ndim != 2 or cached.shape[1] != self._syn_numel:
-                raise ValueError(
-                    "Cached ContinuousCon delivery_buffer has incompatible shape: "
-                    f"{tuple(cached.shape)} vs (*, {self._syn_numel})."
-                )
-            restored = _resample_continuous_time_rows(
-                cached,
-                old_dt,
-                new_dt,
-                n_limit=int(self.delivery_buffer.shape[0]),
-            )
-            if tuple(self.delivery_buffer.shape) != tuple(restored.shape):
-                self._set_buffer(
-                    "delivery_buffer",
-                    torch.zeros_like(restored, device=self.device, dtype=self.dtype),
-                )
-            self.delivery_buffer.copy_(restored)
-            cached_mask = state_cache.get("delivery_mask", None)
-            if cached_mask is None:
-                # Version 3 and older caches did not retain delivery presence.
-                # A nonzero payload is the only recoverable evidence; genuine
-                # scheduled zeros necessarily remain a best-effort limitation.
-                cached_mask = cached != 0
-            elif not torch.is_tensor(cached_mask):
-                raise TypeError("Cached ContinuousCon delivery_mask must be a tensor")
-            else:
-                cached_mask = cached_mask.detach().to(
-                    device=self.device, dtype=torch.bool
-                )
-                if tuple(cached_mask.shape) != tuple(cached.shape):
-                    raise ValueError(
-                        "Cached ContinuousCon delivery_mask has incompatible shape: "
-                        f"{tuple(cached_mask.shape)} vs {tuple(cached.shape)}."
-                    )
-            restored_mask = _resample_continuous_time_rows(
-                cached_mask,
-                old_dt,
-                new_dt,
-                n_limit=int(self.delivery_mask.shape[0]),
-            )
-            if tuple(self.delivery_mask.shape) != tuple(restored_mask.shape):
-                self._set_buffer(
-                    "delivery_mask",
-                    torch.zeros_like(
-                        restored_mask, device=self.device, dtype=torch.bool
-                    ),
-                )
-            self.delivery_mask.copy_(restored_mask)
-        self.current_time_step.zero_()
-        if hasattr(self, "t"):
-            step = torch.round(
-                self.t.to(self.device, dtype=self.dtype) / self.dt.to(self.dtype)
-            ).long()
-            self.global_step.copy_(step.reshape_as(self.global_step))
-        else:
-            self.global_step.zero_()
+        cache = normalize_continuous_cache(
+            state_cache,
+            dt=_cache_dt_value(self.dt),
+            resample_dt=dt,
+            device=self.device,
+            dtype=self.dtype,
+            connections=int(self._n_conn),
+            depth=int(self.max_delay_steps),
+            width=self._syn_numel,
+        )
+        routes = continuous_cache_routes(
+            self.delay_steps,
+            self.post_idx,
+            depth=int(self.max_delay_steps),
+            width=self._syn_numel,
+        )
+        state = restore_continuous_cache(
+            self.state_dict_for_checkpoint(),
+            cache,
+            self.weight(),
+            dt=self.dt,
+            t=self.t if hasattr(self, "t") else 0.0,
+            routes=routes,
+            transform=self.transform if self._has_transform else None,
+        )
+        for name, value in state.items():
+            getattr(self, name).copy_(value)
         self.detach()
         self._configure_advance_impl()
         return self
@@ -5549,253 +5363,100 @@ class NetCon(Referency):
     def initialize_from_state_cache(
         self, state_cache, *, dt=None, rebuild_delays: bool = True
     ):
-        """Restore a cache produced by state_cache() after initialize().
-
-        Network calls this after ``NetCon.initialize(...)`` has already refreshed
-        ``WeightExpander.w`` and, when requested, rebuilt integer delay metadata.
-        ``rebuild_delays`` remains True for direct calls so the method is
-        self-contained; Network passes False to avoid a redundant second rebuild
-        and peak-memory spike.
-        """
-        # Backward compatibility with the legacy Network._syn_cache tuple:
-        # (old_dt, has_spiked, is_spiking, rolled_delivery_buffer).
-        if isinstance(state_cache, tuple):
-            old_dt, has_spiked, is_spiking, delivery_buffer = state_cache
-            state_cache = {
-                "kind": "netcon",
-                "version": 0,
-                "backend": "dense",
-                "dt": float(old_dt),
-                "has_spiked": has_spiked,
-                "is_spiking": is_spiking,
-                "backend_state": {"delivery_buffer": delivery_buffer},
-            }
-
-        if not isinstance(state_cache, dict):
-            raise TypeError("NetCon state cache must be a dict or legacy tuple")
-        cache_backend = state_cache.get("backend", "dense")
-        if cache_backend != self.delay_backend:
-            raise ValueError(
-                "Cannot restore NetCon state cache from backend "
-                f"{cache_backend!r} into backend {self.delay_backend!r}."
-            )
-
-        # Delay parameters may have changed since steady_state() was cached, for
-        # example after an optimizer step.  The expanded delay buffer
-        # ``delay_ms.w`` must already reflect the desired current parameters.
-        # Direct callers can leave rebuild_delays=True; Network.initialize()
-        # passes False because syn.initialize(reinit_delays=True) has already
-        # refreshed metadata.
+        """Restore detached cache history through the shared tensor restorer."""
         if rebuild_delays:
             self._rebuild_delay_buffers()
+        runtime = self._checkpoint_runtime_kind()
+        metadata = event_cache_metadata(self, copy=False)
+        cache = normalize_event_cache(
+            state_cache,
+            backend=self.delay_backend,
+            runtime=runtime,
+            depth=self.max_delay_steps,
+            delivery_depth=self._desired_delivery_buffer_depth(),
+            width=self._syn_numel,
+            dt=float(_cache_dt_value(self.dt) if dt is None else dt),
+            device=self.device,
+            dtype=self.dtype,
+            source_device=self.pre_device,
+            source_dtype=self.pre_dtype,
+            track_events=self.track_events,
+            metadata=metadata,
+            binary_history=not self._source_history_diff_spiking_enabled(),
+        )
         self._ensure_delivery_storage_for_current_mode(clear=True)
-
-        old_dt = float(state_cache.get("dt", _cache_dt_value(self.dt)))
-        new_dt = float(_cache_dt_value(self.dt) if dt is None else dt)
-        backend_state = state_cache.get("backend_state", {})
-
-        if "is_spiking" in state_cache and self.is_spiking.numel() > 0:
-            isp = (
-                state_cache["is_spiking"]
-                .detach()
-                .to(device=self.pre_device, dtype=self.pre_dtype)
-            )
-            if isp.numel() == self.is_spiking.numel():
-                self.is_spiking.copy_(isp.reshape_as(self.is_spiking))
-            else:
-                self.is_spiking = isp.clone()
-
-        # Preferred parameter-invariant cache formats.  These store the
-        # presynaptic event/gate history, not already-weighted future payloads,
-        # so pending deliveries are rebuilt using the *current* weights, delays,
-        # and dt.
-        if (
-            "source_spike_history_packed" in backend_state
-            or "spike_history_packed" in backend_state
-        ):
-            hist = backend_state.get(
-                "source_spike_history_packed",
-                backend_state.get("spike_history_packed", None),
-            )
-            if hist is None:
-                raise KeyError("Bitpacked NetCon cache is missing source spike history")
-            hist = hist.detach().to(device=self.device, dtype=torch.int64)
-            layout = backend_state.get("history_layout", "ring_zero")
-            if layout == "age":
-                age_hist = _dilate_packed_history_age_rows(
-                    hist,
-                    old_dt,
-                    new_dt,
-                    n_limit=int(self.max_delay_steps),
-                )
-            else:
-                # Backward-compatible best effort for caches produced by the
-                # first steady-state refactor, where row 0 was the current ring
-                # slot rather than explicit age 0.
-                ring_hist = _dilate_packed_time_rows(
-                    hist,
-                    old_dt,
-                    new_dt,
-                    n_limit=int(self.max_delay_steps),
-                )
-                age_hist = _ring_rows_to_age_rows(ring_hist, 0)
-
-            if (
-                hasattr(self, "spike_history_packed")
-                and self.spike_history_packed.numel() > 0
+        fields = (
+            "delivery_buffer",
+            "has_spiked",
+            "is_spiking",
+            "events",
+            "event_queue",
+            "current_time_step",
+            "global_step",
+            "source_gate_history",
+            "spike_history_packed",
+            "bitpack_source_has_spiked",
+        )
+        state = {name: getattr(self, name) for name in fields if hasattr(self, name)}
+        if runtime in {"sparse_calendar", "bitpacked_history"}:
+            for prefix, mapping, required in (
+                (
+                    "pending_",
+                    self._sparse_calendar,
+                    event_cache_pending_count(
+                        cache,
+                        self.inference_delay_steps,
+                        metadata,
+                        self.max_delay_steps,
+                    )
+                    if runtime == "sparse_calendar"
+                    else (0 if cache.pending is None else cache.pending.values.numel()),
+                ),
+                (
+                    "event_pending_",
+                    self._sparse_event_calendar,
+                    0
+                    if cache.event_pending is None
+                    else cache.event_pending.values.numel(),
+                ),
             ):
-                if age_hist.shape[1] != self.spike_history_packed.shape[1]:
-                    raise ValueError(
-                        "Cached bitpacked spike history has incompatible word count: "
-                        f"{age_hist.shape[1]} vs {self.spike_history_packed.shape[1]}."
-                    )
-                ring_hist = _age_rows_to_ring_rows(
-                    age_hist,
-                    depth=int(self.spike_history_packed.shape[0]),
+                previous = mapping.tensor_state
+                empty = pending_calendar_empty(
+                    max(previous.values.numel(), required),
+                    device=self.device,
+                    dtype=previous.values.dtype,
                 )
-                self.spike_history_packed.copy_(ring_hist)
-
-            if self._use_bitpacked_history_runtime():
-                self.delivery_buffer.zero_()
-                self._sparse_calendar = _restore_calendar_chunks(
-                    backend_state.get("sparse_calendar", {}),
-                    old_dt=old_dt,
-                    new_dt=new_dt,
-                    depth=self.max_delay_steps,
-                    idx_device=self.device,
-                    idx_dtype=torch.long,
-                    val_device=self.device,
-                    val_dtype=self.dtype,
+                state.update(
+                    (prefix + name, value)
+                    for name, value in zip(CalendarState._fields, empty, strict=True)
                 )
-                self._sparse_event_calendar.clear()
-            elif self._use_source_history_training_runtime():
-                # Source-history training has only a one-row receive scratch.
-                # Restore compact source history rather than materializing future
-                # deliveries into a dense delay ring.
-                self._restore_source_history_training_from_packed_age_history(age_hist)
-            else:
-                # Training/dense runtime: materialize an ordinary future delivery
-                # buffer from the source history and current weights/delays.
-                self._materialize_delivery_from_packed_source_history(age_hist)
-
-        elif "gate_history" in backend_state:
-            gate_hist = (
-                backend_state["gate_history"]
-                .detach()
-                .to(device=self.device, dtype=self.dtype)
-            )
-            gate_hist = _dilate_history_age_rows(
-                gate_hist,
-                old_dt,
-                new_dt,
-                n_limit=int(self.max_delay_steps),
-            )
-            if self._use_source_history_training_runtime():
-                self._restore_source_history_training_from_gate_history(gate_hist)
-            else:
-                self._materialize_delivery_from_gate_history(gate_hist)
-
-        elif self._use_sparse_calendar_runtime():
-            self.delivery_buffer.zero_()
-            self._sparse_calendar = _restore_calendar_chunks(
-                backend_state.get("sparse_calendar", {}),
-                old_dt=old_dt,
-                new_dt=new_dt,
-                depth=self.max_delay_steps,
-                idx_device=self.device,
-                idx_dtype=torch.long,
-                val_device=self.device,
-                val_dtype=self.dtype,
-            )
-            if self.track_events:
-                self._sparse_event_calendar = _restore_calendar_chunks(
-                    backend_state.get("sparse_event_calendar", {}),
-                    old_dt=old_dt,
-                    new_dt=new_dt,
-                    depth=self.max_delay_steps,
-                    idx_device=self.device,
-                    idx_dtype=torch.long,
-                    val_device=self.device,
-                    val_dtype=torch.int32,
-                )
-            else:
-                self._sparse_event_calendar.clear()
-        else:
-            # Legacy/compatibility path: restore already-weighted future payloads.
-            # This is dt-adjustable, but it is tied to the weights/delays that
-            # produced the cache.
-            cached = backend_state.get("delivery_buffer", None)
-            if cached is None:
-                raise KeyError("Dense NetCon cache is missing delivery_buffer")
-            cached = cached.detach().to(device=self.device, dtype=self.dtype)
-            if cached.ndim != 2 or cached.shape[1] != self._syn_numel:
-                raise ValueError(
-                    "Cached NetCon delivery_buffer has incompatible shape: "
-                    f"{tuple(cached.shape)} vs (*, {self._syn_numel})."
-                )
-            restored = _dilate_time_rows(
-                cached,
-                old_dt,
-                new_dt,
-                n_limit=int(self.delivery_buffer.shape[0]),
-            )
-            self.delivery_buffer.copy_(restored)
-            if self.track_events and hasattr(self, "event_queue"):
-                ev = backend_state.get("event_queue", None)
-                if ev is not None:
-                    ev = ev.detach().to(device=self.device, dtype=torch.int32)
-                    ev_restored = _dilate_time_rows(
-                        ev,
-                        old_dt,
-                        new_dt,
-                        n_limit=int(self.event_queue.shape[0]),
-                    )
-                    self.event_queue.copy_(ev_restored)
-
-        # Reapply threshold latches only after reconstructing runtime history.
-        # Compact-history allocation clears these latches as part of its normal
-        # fresh-episode setup; restoring them earlier would spuriously re-arm a
-        # source that was already above threshold at the cache boundary.
-        if "has_spiked" in state_cache:
-            hs = (
-                state_cache["has_spiked"]
-                .detach()
-                .to(device=self.pre_device, dtype=torch.bool)
-            )
-            self._restore_source_has_spiked_from_connection_cache(hs)
-            if self.has_spiked.numel() > 0:
-                if hs.numel() == self.has_spiked.numel():
-                    self.has_spiked.copy_(hs.reshape_as(self.has_spiked))
-                else:
-                    self.has_spiked = hs.clone()
-
-        if (
-            "bitpack_source_has_spiked" in backend_state
-            and hasattr(self, "bitpack_source_has_spiked")
-            and self.bitpack_source_has_spiked.numel() > 0
+        restored = restore_event_cache(
+            state,
+            cache,
+            self.weight(),
+            delay_steps=self.inference_delay_steps,
+            post_idx=self.post_idx,
+            metadata=metadata,
+            runtime=runtime,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            t=self.t if hasattr(self, "t") else 0.0,
+            dt=self.dt,
+            binary_history=not self._source_history_diff_spiking_enabled(),
+        )
+        for name in fields:
+            if name in restored:
+                setattr(self, name, restored[name])
+        for prefix, mapping in (
+            ("pending_", self._sparse_calendar),
+            ("event_pending_", self._sparse_event_calendar),
         ):
-            src_hs = (
-                backend_state["bitpack_source_has_spiked"]
-                .detach()
-                .to(device=self.pre_device, dtype=torch.bool)
-            )
-            self.bitpack_source_has_spiked.copy_(
-                src_hs.reshape_as(self.bitpack_source_has_spiked)
-            )
-            if self.has_spiked.numel() == self._n_conn and src_hs.numel() > 0:
-                source_pos = torch.searchsorted(
-                    self.bitpack_source_pre_idx.to(
-                        device=self.pre_device, dtype=torch.long
-                    ),
-                    self.pre_idx.to(device=self.pre_device, dtype=torch.long),
+            if prefix + "size" in restored:
+                mapping.replace_tensor_state(
+                    CalendarState(
+                        *(restored[prefix + name] for name in CalendarState._fields)
+                    )
                 )
-                self.has_spiked.copy_(src_hs.index_select(0, source_pos))
-
-        self.current_time_step.zero_()
-        if hasattr(self, "t"):
-            self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
-        else:
-            self.global_step.zero_()
         self.detach()
         return self
 

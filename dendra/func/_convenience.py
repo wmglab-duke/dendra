@@ -37,7 +37,11 @@ def _initialization_input_mapping(inputs):
     if not isinstance(inputs, InitializationInput):
         raise TypeError("initialization must be an InitializationInput")
     mappings = []
-    for name, values in (("states", inputs.states), ("transforms", inputs.transforms)):
+    for name, values in (
+        ("states", inputs.states),
+        ("transforms", inputs.transforms),
+        ("cache", inputs.cache),
+    ):
         if values is not None and not isinstance(values, Mapping):
             raise TypeError(f"initialization {name} must be a mapping")
         mappings.append(None if values is None else dict(values))
@@ -63,7 +67,9 @@ class CompiledRunner:
     state argument, the default ``initialization='snapshot'`` restarts from
     :attr:`initial_state`. Opt in to ``initialization='fresh'`` to recompute
     differentiable initial state from current parameters and
-    :attr:`initialization_inputs` instead. Explicit state always continues
+    :attr:`initialization_inputs` instead. A bound Population-owned steady-state
+    cache is restored through ``initialization_inputs.cache``; its saved
+    materializations are detached. Explicit state always continues
     without reinitializing. Parameters
     are independent copies; select differentiable leaves with ``trainable``
     and ``inference=False``, or pass an explicit parameter mapping per call.
@@ -100,9 +106,10 @@ class CompiledRunner:
 
     Fresh calls accept an ``initialization=InitializationInput(...)`` override;
     it cannot be combined with explicit state. Fresh-policy outputs include
-    ``aux['parameters']``, the effective parameter mapping after initialization.
-    If initialization transforms write parameters, pass that mapping explicitly
-    when continuing state. Neither it nor its autograd graph is retained by the
+    ``aux['parameters']`` and ``aux['constants']``, the effective mappings after
+    initialization. Continue parameter-writing initialization with the returned
+    parameters; cached initialization also requires the returned constants.
+    Neither mapping nor its autograd graph is retained by the
     runner. Initialization-only inputs remain separate from runtime parameters.
     """
 
@@ -176,9 +183,12 @@ class CompiledRunner:
                 lambda value: value.detach().clone(),
                 tensors.initialization,
             )
-            self._initialization_writes_parameters = (
-                initialization == "fresh"
-                and _initialization_writes_parameters(self._functional)
+            self._initialization_writes_parameters = initialization == "fresh" and (
+                _initialization_writes_parameters(self._functional)
+                or self._functional._owned_cache_bound
+            )
+            self._initialization_writes_constants = (
+                initialization == "fresh" and self._functional._owned_cache_bound
             )
             self._callbacks = (
                 None
@@ -341,6 +351,7 @@ class CompiledRunner:
         state=None,
         *,
         parameters=None,
+        constants=None,
         inputs=None,
         callback_state=None,
         initialization=None,
@@ -368,8 +379,17 @@ class CompiledRunner:
             and self._initialization_writes_parameters
         ):
             raise ValueError(
-                "initialization transforms write parameters; continue with "
+                "initialization writes parameters; continue with "
                 "parameters=aux['parameters'] from the preceding call"
+            )
+        if (
+            fresh_policy
+            and state is not None
+            and constants is None
+            and self._initialization_writes_constants
+        ):
+            raise ValueError(
+                "cached initialization changes constants; continue with constants=aux['constants'] from the preceding call"
             )
         selected_state = self._initial_state if state is None else state
         # An external Mapping can execute arbitrary Python while materializing
@@ -387,7 +407,7 @@ class CompiledRunner:
             if fresh
             else None
         )
-        selected_constants = self._constants
+        selected_constants = self._constants if constants is None else dict(constants)
         if fresh:
             # Physical preparation requires ordinary, versioned tensors even
             # for inference. Respect the caller's grad context and never retain
@@ -421,7 +441,10 @@ class CompiledRunner:
             )
             prepared = prepare(
                 selected_parameters,
-                cache=self._inference and parameters is None and not fresh_policy,
+                cache=self._inference
+                and parameters is None
+                and constants is None
+                and not fresh_policy,
                 constants=selected_constants,
             )
             bound = (
@@ -456,6 +479,7 @@ class CompiledRunner:
             if fresh_policy:
                 auxiliary = dict(auxiliary)
                 auxiliary["parameters"] = dict(selected_parameters)
+                auxiliary["constants"] = dict(selected_constants)
             return final, auxiliary
 
 
@@ -508,12 +532,14 @@ def compile(
     By default, calls without state restart the captured initialized snapshot.
     Population and Network runners accept ``initialization='fresh'`` to initialize
     from current parameters on each such call; explicit state still continues
-    without reinitialization. Edit
+    without reinitialization. Bound steady-state caches restore their explicit
+    saved state and detached materializations on fresh calls. Edit
     ``runner.initialization_inputs`` or pass an ``InitializationInput`` (Population)
     or ``NetworkInitializationInput`` (Network) as the
     call's ``initialization=`` override. Fresh-policy results expose effective
-    parameters at ``aux['parameters']`` for explicit continuation after
-    parameter-writing initialization transforms.
+    mappings at ``aux['parameters']`` and ``aux['constants']``. Parameter-writing
+    initialization requires the returned parameters for continuation; cached
+    initialization also requires the returned constants.
     For Populations, ``extra=(field, waveform)`` or a sequence of such pairs
     binds extracellular stimulation. For Networks, ``extra`` maps Population
     names to those same bindings. Select independent fields and waveform leaves

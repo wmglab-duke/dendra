@@ -533,20 +533,17 @@ def test_initialize_rechecks_source_initialization_semantics_after_lowering(muta
         )
 
 
-def test_initialize_fails_closed_for_a_cached_steady_state():
+def test_initialize_restores_a_population_owned_steady_state():
     model = _model("sc")
     model.cache("_steady_state")
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match=r"steady.state|steady state",
-    ):
-        functional, tensors = dn.func.make_functional(model, dt=DT)
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    initialized = functional.initialize(
+        tensors.parameters, tensors.constants, tensors.initialization
+    )
+    model.initialize()
+    _assert_tree_close(initialized.state, functional.extract(model).state)
+    assert initialized.constants["cache.active"].item()
 
 
 def test_initialize_rechecks_a_derived_buffer_builder_after_lowering():
