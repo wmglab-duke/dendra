@@ -713,12 +713,19 @@ def run(
         for start, stop in _execution_spans(steps, horizon):
             selected = _slice(tape, start, stop)
             populations = dict(selected["populations"])
+            noise_tapes = functional._rng_plan.sample_noise_tapes(
+                state,
+                stop - start,
+                provided={
+                    name: values["noise"]
+                    for name, values in populations.items()
+                    if values.get("noise") is not None
+                },
+            )
             for name, plan in functional.populations.items():
                 values = populations.get(name, {})
                 if values.get("noise") is None:
-                    noise = plan.sample_noise_draw_tape(
-                        state["populations"][name], stop - start
-                    )
+                    noise = noise_tapes[name]
                     if noise is not None:
                         populations[name] = {**values, "noise": noise}
             selected = {**selected, "populations": populations}

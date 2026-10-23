@@ -304,7 +304,13 @@ def _eligible(network):
 
         visit(population)
         shared = population_modules & owned
-        if shared & (mutable_population_modules | mutable_owned):
+        from dendra.models.rng import RNGModule
+
+        rng_modules = {
+            id(module) for module in population.modules() if type(module) is RNGModule
+        }
+        shared_mutable = shared & (mutable_population_modules | mutable_owned)
+        if shared_mutable - rng_modules:
             raise FunctionalizationError(
                 "Functional Network Populations must own distinct modules; "
                 "share raw parameter Tensors instead."
@@ -426,6 +432,9 @@ class FunctionalNetwork:
             plan._enable_retained_materializations()
             self.populations[name] = plan
             initialization[name] = packet.initialization
+        from ._network_rng import NetworkRNGPlan
+
+        self._rng_plan = NetworkRNGPlan(self, network)
         self._source_table_aliases = network_table_alias_signature(network)
         self._source_mechanism_delay_aliases = network_mechanism_delay_alias_signature(
             network
@@ -724,14 +733,7 @@ class FunctionalNetwork:
         self._validate_initialization_source()
         self._validate_parameters(parameters)
         self._validate_state(state)
-        return {
-            name: None
-            if self._cache_enabled
-            else plan.sample_initialization_draw(
-                parameters["populations"][name], state["populations"][name]
-            )
-            for name, plan in self.populations.items()
-        }
+        return self._rng_plan.sample_init_packets(parameters, state)
 
     def _initialize_host(self, parameters, constants, state, inputs):
         from ._network_initialization import initialize_host
@@ -818,6 +820,7 @@ class FunctionalNetwork:
             raise FunctionalizationError(
                 "Network timestep phases changed; lower again."
             )
+        self._rng_plan.validate_source()
         for plan in (
             *self.populations.values(),
             *self.synapses.values(),
@@ -924,7 +927,7 @@ class FunctionalNetwork:
             constants["populations"][name] = snapshots.tree(
                 native_constants, packet.constants
             )
-            state["populations"][name] = packet.state
+            state["populations"][name] = self._rng_plan.strip_population(packet.state)
         for name, plan in self.synapses.items():
             connection = network.synapses[name]
             sources = self._connection_parameter_plans["synapses", name]
@@ -989,6 +992,8 @@ class FunctionalNetwork:
         sampling = self._connection_sampling_plan.extract(network)
         if sampling is not None:
             state["connection_sampling"] = sampling
+        if self._rng_plan.enabled:
+            state["rng"] = self._rng_plan.extract(network)
         return NetworkTensors(parameters, constants, state)
 
     def extract(self, network=None):
@@ -1008,6 +1013,7 @@ class FunctionalNetwork:
 
     def _validate_compatible(self, network):
         _eligible(network)
+        self._rng_plan.validate_compatible_network(network)
         if (
             network_initialization_source_alias_signature(network)
             != self._source_initialization_source_aliases
@@ -1474,10 +1480,7 @@ class FunctionalNetwork:
         (state,), _ = _canonicalize_mapping_tree((state,))
         self._validate_source()
         self._validate_state(state)
-        return {
-            name: plan.sample_noise_draw_tape(state["populations"][name], steps)
-            for name, plan in self.populations.items()
-        }
+        return self._rng_plan.sample_noise_tapes(state, steps)
 
     def rollout(
         self,
@@ -1614,11 +1617,14 @@ class FunctionalNetwork:
                 )
         inputs, extra, intra = inputs or {}, extra or {}, intra or {}
         clock = state["clock"]
+        rng_pool = state.get("rng", {})
         time = (
             clock["origin"] + clock["step"].to(clock["origin"].dtype) * self.dt
         ).detach()
         states = {
-            name: self._snap_population_clock(value, time)
+            name: self._snap_population_clock(
+                self._rng_plan.expand_population(name, value, rng_pool), time
+            )
             for name, value in state["populations"].items()
         }
         next_stim, stimulus = None, None
@@ -1739,17 +1745,23 @@ class FunctionalNetwork:
             states[name], aux[name] = plan._rollout_values(
                 parameters["populations"][name],
                 prepared["populations"][name],
-                states[name],
+                self._rng_plan.expand_population(name, states[name], rng_pool),
                 rollout,
                 steps=1,
                 extra=extra.get(name),
             )
+            if self._rng_plan.enabled and self._rng_plan.local_streams[name]:
+                rng_pool = self._rng_plan.update_pool(
+                    name, states[name]["random"]["rng"], rng_pool
+                )
         step = clock["step"] + 1
         next_time = (
             clock["origin"] + step.to(clock["origin"].dtype) * self.dt
         ).detach()
         states = {
-            name: self._snap_population_clock(value, next_time)
+            name: self._rng_plan.strip_population(
+                self._snap_population_clock(value, next_time)
+            )
             for name, value in states.items()
         }
         return {
@@ -1768,6 +1780,7 @@ class FunctionalNetwork:
                 if self._connection_sampling_plan.devices
                 else {}
             ),
+            **({"rng": rng_pool} if self._rng_plan.enabled else {}),
         }, {"populations": aux, "netstim": stimulus}
 
     @staticmethod
@@ -1895,14 +1908,22 @@ class FunctionalNetwork:
         # sample graphs instead belong to its private parameter copies.
         random_commits = {
             name: plan._random_plan.prepare_commit(
-                network.populations[name], state["populations"][name]["random"]
+                network.populations[name],
+                self._rng_plan.expand_population(
+                    name, state["populations"][name], state.get("rng", {})
+                )["random"],
             )
             for name, plan in self.populations.items()
             if plan._random_plan is not None
         }
         staged = _deepcopy_execution_module(network)
         for name, plan in self.populations.items():
-            plan.commit_state_(staged.populations[name], state["populations"][name])
+            plan.commit_state_(
+                staged.populations[name],
+                self._rng_plan.expand_population(
+                    name, state["populations"][name], state.get("rng", {})
+                ),
+            )
         for name, plan in self.synapses.items():
             plan.commit_state_(staged.synapses[name], state["synapses"][name])
         for name, plan in self.continuous_synapses.items():

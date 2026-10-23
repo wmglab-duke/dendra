@@ -508,7 +508,7 @@ class RandomParameterPlan:
             for entry in self.entries
         }
 
-    def sample(self, state):
+    def sample(self, state, *, samplers=None):
         from dendra.models.random_parameters import (
             RandomParameterDrawRequest,
             sample_random_parameter_draws,
@@ -568,10 +568,15 @@ class RandomParameterPlan:
         try:
             sampled, checkpoints = sample_random_parameter_draws(
                 requests,
-                {
-                    stream: _rng_extra(values)
-                    for stream, values in state["random"]["rng"].items()
-                },
+                (
+                    {
+                        stream: _rng_extra(values)
+                        for stream, values in state["random"]["rng"].items()
+                    }
+                    if samplers is None
+                    else {}
+                ),
+                samplers=samplers,
             )
         finally:
             changes = _global_rng_changes(snapshot, self.population.device())
@@ -748,7 +753,7 @@ class RandomParameterPlan:
         return result, self.state(result, rng)
 
     def validate_native_cache(self, cache):
-        """Use Native's cold metadata validator before tensor normalization."""
+        """Validate Native RAND provenance before tensor normalization."""
         owners = dict(_owners(self.population))
         seen = set()
         for entry in self.entries:
@@ -761,10 +766,6 @@ class RandomParameterPlan:
             # schemas and values are validated by validate_cache instead.
             if not torch.is_tensor(metadata["version"]):
                 owners[entry.path]._prepare_random_parameter_state(metadata)
-        for path, name in self.streams.values():
-            extra = cache[f"{path + '.' if path else ''}{name}._extra_state"]
-            if not isinstance(extra["base_seed"], dict):
-                RNGModule.from_checkpoint(extra)
 
     def validate_cache(self, cache):
         if any(
@@ -852,7 +853,12 @@ class RandomParameterPlan:
         """Install validated retained graph/numerical/RNG bindings."""
         owners = dict(_owners(population))
         for stream, (path, name) in self.streams.items():
-            getattr(owners[path], name).set_extra_state(prepared["rng"][stream])
+            rng = getattr(owners[path], name)
+            checkpoint = prepared["rng"][stream]
+            # Runtime continuation restores an exact checkpoint, independently
+            # of the state-dict/cache loading policy in set_extra_state.
+            rng.reseed(checkpoint["base_seed"])
+            rng.set_rng_state(checkpoint["rng_state"])
         for entry in self.entries:
             owner = owners[entry.path]
             owner._buffers[entry.name] = prepared["samples"][entry.key]

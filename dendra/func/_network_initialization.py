@@ -734,7 +734,12 @@ def _initialize_components(
     """Complete the native phases preceding NetStim initialization."""
     from ._network import NetworkTensors
 
-    populations = dict(state["populations"])
+    rng_plan = functional._rng_plan
+    rng_pool = state.get("rng", {})
+    populations = {
+        name: rng_plan.expand_population(name, value, rng_pool)
+        for name, value in state["populations"].items()
+    }
     effective = parameters
     effective_constants = functional._bind_parameter_constants(parameters, constants)
     with nullcontext() if functional.training else torch.no_grad():
@@ -743,22 +748,58 @@ def _initialize_components(
         # alias before the next Population observes its input frame.
         for name, plan in functional.populations.items():
             incoming_parameters = effective
+            populations[name] = rng_plan.expand_population(
+                name, populations[name], rng_pool
+            )
             if inputs.cache is None:
+                population_inputs = inputs.populations[name]
+                if (
+                    sample_random
+                    and rng_plan.enabled
+                    and population_inputs.random_draw is None
+                ):
+                    population_inputs = population_inputs._replace(
+                        random_draw=rng_plan.sample_population_initialization_draw(
+                            name,
+                            effective["populations"][name],
+                            populations[name],
+                            rng_pool,
+                        )
+                    )
                 initialize_population = (
-                    plan.initialize_host if sample_random else plan.initialize
+                    plan.initialize_host
+                    if sample_random and not rng_plan.enabled
+                    else plan.initialize
                 )
                 initialized = initialize_population(
                     effective["populations"][name],
                     effective_constants["populations"][name],
-                    inputs.populations[name],
+                    population_inputs,
                     state=populations[name],
                 )
             else:
                 initialized = functional._population_cache_plans[name].restore(
                     effective["populations"][name],
                     effective_constants["populations"][name],
-                    state["populations"][name],
+                    populations[name],
                     inputs.cache.populations[name],
+                )
+            if rng_plan.enabled:
+                cache = (
+                    inputs.cache.populations[name]
+                    if inputs.cache is not None
+                    else population_inputs.cache
+                    if plan._owned_cache_bound
+                    else None
+                )
+                if cache is not None:
+                    rng_pool = rng_plan.cache_pool(name, cache, rng_pool)
+                elif rng_plan.local_streams[name]:
+                    rng_pool = rng_plan.update_pool(
+                        name, initialized.state["random"]["rng"], rng_pool
+                    )
+                initialized = initialized._replace(
+                    state=rng_plan.expand_population(name, initialized.state, rng_pool)
                 )
             population_constants = initialized.constants
             if inputs.cache is None and plan._owned_cache_bound:
@@ -859,7 +900,9 @@ def _initialize_components(
                 )
         time = inputs.t.detach().clone()
         populations = {
-            name: functional._snap_population_clock(value, time)
+            name: rng_plan.strip_population(
+                functional._snap_population_clock(value, time)
+            )
             for name, value in populations.items()
         }
         clock = {
@@ -941,6 +984,7 @@ def _initialize_components(
             "continuous_synapses": continuous,
             "netstim": state["netstim"],
             "clock": clock,
+            **({"rng": rng_pool} if rng_plan.enabled else {}),
             **(
                 {
                     "connection_sampling": {

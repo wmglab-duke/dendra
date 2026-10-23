@@ -191,7 +191,10 @@ Initialization-time RAND declarations use explicit draw and
 RNG packets, including their resampling and ``reseed_on_initialize`` policies;
 see {doc}`A30_functional_random_parameters`. Runtime NOISE declarations use
 per-Population draw/RNG tapes, with automatic host sampling and explicit
-continuation; see {doc}`A31_functional_runtime_noise`. State `DIFFUSION` uses
+continuation; see {doc}`A31_functional_runtime_noise`. RNGModule owners shared
+across Populations use one authoritative carry per stream and preserve native
+sampling and reseeding order; see {doc}`A47_functional_network_rng_sharing`.
+State `DIFFUSION` uses
 the same packet for explicit Wiener draws and RNG carry, with pathwise
 drift/diffusion gradients; see {doc}`A32_functional_state_sde`. Custom native
 initialization/build adapters are currently unsupported.

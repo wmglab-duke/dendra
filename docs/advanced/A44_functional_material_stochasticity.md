@@ -116,8 +116,9 @@ MaterialProcess samples RAND before its initialization NOISE. Initial NOISE
 uses the native initialization scaling timestep of `1.0`; runtime noise uses
 the simulation timestep. Declarations with the same `rng_name` consume one
 shared stream. Sampling leaves the source model and input packets unchanged.
-Sharing mutable RNG owners between different Network Populations is currently
-unsupported.
+RNG owners can be shared between Network Populations. The Network sampler
+preserves their draw ordering, reseeding, and cache restoration boundaries;
+see {doc}`A47_functional_network_rng_sharing`.
 
 ## Continue from an explicit RNG boundary
 

@@ -482,7 +482,7 @@ class RuntimeNoisePlan:
             )
         return values
 
-    def sample(self, state, *, steps=None):
+    def sample(self, state, *, steps=None, samplers=None):
         from dendra.models.random_parameters import (
             RuntimeNoiseDrawRequest,
             sample_runtime_noise_draws,
@@ -496,10 +496,12 @@ class RuntimeNoisePlan:
         from ._random_parameters import _rng_extra, _rng_values
 
         if steps is not None:
-            return self._sample_tape_boundaries(state, steps)
-        checkpoints = {
-            name: _rng_extra(value) for name, value in state["random"]["rng"].items()
-        }
+            return self._sample_tape_boundaries(state, steps, samplers=samplers)
+        checkpoints = (
+            {name: _rng_extra(value) for name, value in state["random"]["rng"].items()}
+            if samplers is None
+            else {}
+        )
         draws = {name: [] for entry in self.runtime for name in entry.draw_names}
         requests = tuple(
             RuntimeNoiseDrawRequest(
@@ -509,7 +511,9 @@ class RuntimeNoisePlan:
         )
         snapshot = _global_rng_snapshot(self.population.device())
         try:
-            sampled, checkpoints = sample_runtime_noise_draws(requests, checkpoints)
+            sampled, checkpoints = sample_runtime_noise_draws(
+                requests, checkpoints, samplers=samplers
+            )
             for entry, draw in zip(self.runtime, sampled, strict=True):
                 leaves, spec = _pytree.tree_flatten(draw)
                 if hasattr(entry, "draw_spec") and spec != entry.draw_spec:
@@ -533,11 +537,11 @@ class RuntimeNoisePlan:
         }
         return RuntimeNoiseDraw(result, rng)
 
-    def _sample_tape_boundaries(self, state, steps):
+    def _sample_tape_boundaries(self, state, steps, *, samplers=None):
         draws, rngs = [], []
         carry = state
         for _index in range(steps):
-            packet = self.sample(carry)
+            packet = self.sample(carry, samplers=samplers)
             draws.append(packet.draws)
             rngs.append(packet.rng)
             carry = {**carry, "random": {**carry["random"], "rng": packet.rng}}
@@ -546,6 +550,16 @@ class RuntimeNoisePlan:
                 _pytree.tree_map(lambda *values: torch.stack(values), *draws),
                 _pytree.tree_map(lambda *values: torch.stack(values), *rngs),
             )
+        from ._random_parameters import _rng_values
+
+        initial_rng = (
+            state["random"]["rng"]
+            if samplers is None
+            else {
+                name: _rng_values(sampler, self.population.device())
+                for name, sampler in samplers.items()
+            }
+        )
         return RuntimeNoiseDraw(
             {
                 name: leaf.new_empty((0, *leaf.shape))
@@ -553,6 +567,6 @@ class RuntimeNoisePlan:
                 for name, leaf in zip(entry.draw_names, entry.leaves, strict=True)
             },
             _pytree.tree_map(
-                lambda value: value.new_empty((0, *value.shape)), state["random"]["rng"]
+                lambda value: value.new_empty((0, *value.shape)), initial_rng
             ),
         )

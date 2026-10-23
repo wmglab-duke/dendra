@@ -103,7 +103,9 @@ compiled or transformed code. Supply them through `StepInput.noise` or
 
 For a Network, `sample_population_noise_tapes(state, steps)` returns one
 packet per top-level Population. Supply the tapes alongside that
-Population's voltage and current inputs:
+Population's voltage and current inputs. Shared RNG owners are sampled in
+timestep/Population order and retain one authoritative stream carry; see
+{doc}`A47_functional_network_rng_sharing`:
 
 ```{literalinclude} ../../examples/functional_runtime_noise.py
 :language: python
@@ -177,8 +179,11 @@ Mechanisms, nested States, and MaterialProcesses sample afterward. Retained
 realizations preserve the distribution parameters at their own sampling
 boundary; see {doc}`A45_functional_stochastic_initialization_ordering`.
 
-Sharing mutable RNGModule owners between different Network Populations is
-currently unsupported. Custom distributions require the split
+RNGModule owners can be shared between Network Populations. Use the Network
+sampling methods to retain the shared draw sequence rather than sampling
+the Populations independently. See {doc}`A47_functional_network_rng_sharing`
+for initialization, reseeding, caches, and continuation. Custom distributions
+require the split
 `draw_sampler=` and pure `transform=` registration contract described in
 {doc}`A30_functional_random_parameters`; legacy sampler-only registrations
 remain available in native execution. The authored transform must remain pure

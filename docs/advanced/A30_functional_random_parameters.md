@@ -136,8 +136,9 @@ NetStim initialization and per-step draw tapes remain separate inputs; see
 {doc}`A14_functional_netstim_renewal` and
 {doc}`A21_functional_network_compile`. A shared `rng_name` within an owner
 retains native draw order across its declarations. Sharing mutable RNGModule
-owners between different Network Populations is currently unsupported, like
-other shared mutable submodules.
+owners between Network Populations retains one authoritative carry per
+stream and preserves native Population sampling order; see
+{doc}`A47_functional_network_rng_sharing`.
 
 Fresh initialization returns effective constants containing the sampled
 realization and its base draws. Continue with both the returned parameters

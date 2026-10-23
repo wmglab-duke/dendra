@@ -54,3 +54,4 @@ Advanced
    advanced/A44_functional_material_stochasticity.md
    advanced/A45_functional_stochastic_initialization_ordering.md
    advanced/A46_functional_noise_workspaces.md
+   advanced/A47_functional_network_rng_sharing.md

@@ -542,7 +542,24 @@ class PopulationCachePlan:
             raise FunctionalizationError(
                 "Population state cache schema changed; lower again"
             )
-        from ._random_parameters import cache_metadata_tensors
+        from dendra.models.rng import RNGModule
+
+        from ._random_parameters import _rng_extra, cache_metadata_tensors
+
+        # Native loading visits registered RNG aliases even when this
+        # Population has no RAND/NOISE declarations of its own. Validate every
+        # saved occurrence before it can become a shared Network RNG suffix.
+        for path, module in self.plan._population.named_modules(remove_duplicate=False):
+            if type(module) is not RNGModule or getattr(
+                module, "_ignore_rng_on_load", False
+            ):
+                continue
+            payload = cache[f"{path + '.' if path else ''}_extra_state"]
+            if isinstance(payload, Mapping) and isinstance(
+                payload.get("base_seed"), Mapping
+            ):
+                payload = _rng_extra({**payload["base_seed"], **payload["rng_state"]})
+            RNGModule.from_checkpoint(payload)
 
         if self.plan._random_plan is not None:
             self.plan._random_plan.validate_native_cache(cache)

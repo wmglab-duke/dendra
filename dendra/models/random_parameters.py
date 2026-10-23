@@ -581,19 +581,26 @@ def prepare_rng_for_random_parameter(
     return reset(generation)
 
 
-def sample_random_parameter_draws(requests, rng_states, *, initialization=True):
+def sample_random_parameter_draws(
+    requests, rng_states, *, initialization=True, samplers=None
+):
     """Sample an ordered draw packet from independent explicit RNG checkpoints.
 
     Requests with the same key consume one shared stream in sequence. The
     returned checkpoints include every supplied stream and retain base seeds
     and deferred per-device state, without mutating a source model or packet.
-    This host adapter is separate from pure distribution evaluation.
+    This host adapter is separate from pure distribution evaluation. An
+    optional caller-owned ``samplers`` mapping lets adjacent owners consume
+    isolated streams in a shared order. Those modules advance in place;
+    ``rng_states`` and source models remain unchanged.
     """
     from .rng import RNGModule
 
-    modules = {
-        key: RNGModule.from_checkpoint(state) for key, state in rng_states.items()
-    }
+    modules = (
+        {key: RNGModule.from_checkpoint(state) for key, state in rng_states.items()}
+        if samplers is None
+        else samplers
+    )
     generation = object() if initialization else None
     draws = []
     for request in requests:
@@ -629,13 +636,16 @@ def sample_random_parameter_draws(requests, rng_states, *, initialization=True):
     }
 
 
-def sample_runtime_noise_draws(requests, rng_states):
-    """Return detached base draws and advanced checkpoints without mutation.
+def sample_runtime_noise_draws(requests, rng_states, *, samplers=None):
+    """Return detached base draws and advanced checkpoints.
 
     This host adapter shares the ordered stream machinery used by RAND
-    initialization. Runtime draws never apply initialization reseeding.
+    initialization, including its optional caller-owned samplers. Runtime
+    draws never apply initialization reseeding.
     """
-    return sample_random_parameter_draws(requests, rng_states, initialization=False)
+    return sample_random_parameter_draws(
+        requests, rng_states, initialization=False, samplers=samplers
+    )
 
 
 def sample_random_parameter(
