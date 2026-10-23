@@ -2,6 +2,7 @@
 
 import itertools
 import math
+import weakref
 from dataclasses import dataclass
 from numbers import Integral
 from types import MethodType
@@ -1339,6 +1340,65 @@ class staticproperty:
         return self.func()  # ignore obj / objtype
 
 
+_instance_property_proxies = {}
+
+
+def _instance_property_proxy(cls):
+    """Look up generated provenance without invoking metaclass hash/equality."""
+    entry = _instance_property_proxies.get(id(cls))
+    return entry[1:] if entry is not None and entry[0]() is cls else None
+
+
+def _remember_instance_property_proxy(cls, parent, references):
+    identity = id(cls)
+
+    def discard(reference):
+        entry = _instance_property_proxies.get(identity)
+        if entry is not None and entry[0] is reference:
+            del _instance_property_proxies[identity]
+
+    _instance_property_proxies[identity] = (
+        weakref.ref(cls, discard),
+        weakref.ref(parent),
+        tuple((name, weakref.ref(value)) for name, value in references.items()),
+        _instance_property_namespace_signature(vars(cls)),
+    )
+
+
+def _instance_property_namespace_signature(namespace):
+    """Fingerprint generated metadata without retaining classes or callbacks."""
+    active = set()
+
+    def signature(value):
+        identity = id(value)
+        kind = type(value)
+        if identity in active:
+            return ("cycle", identity)
+        if (
+            kind is dict
+            or kind is list
+            or kind is tuple
+            or kind is set
+            or kind is frozenset
+        ):
+            active.add(identity)
+            try:
+                if kind is dict:
+                    contents = tuple(
+                        (signature(key), signature(item)) for key, item in value.items()
+                    )
+                elif kind is set or kind is frozenset:
+                    contents = frozenset(signature(item) for item in value)
+                else:
+                    contents = tuple(signature(item) for item in value)
+                return (id(kind), identity, contents)
+            finally:
+                active.remove(identity)
+        return (id(kind), identity)
+
+    return tuple((key, signature(value)) for key, value in namespace.items())
+
+
 def add_instance_property(obj, name, func):
     """
     Attach a computed property to a single instance.
@@ -1352,11 +1412,33 @@ def add_instance_property(obj, name, func):
     func : Callable[[], Any]
         Zero-argument callable returning the property value.
     """
-    sub = type(
-        f"_{obj.__class__.__name__}Proxy",
-        (obj.__class__,),
-        {name: staticproperty(func)},
-    )
+    # References live on private proxy classes because Python resolves
+    # descriptors on the class. Replacing a reference must not inherit its old
+    # proxy: that would retain the previous callback (and its owner) forever,
+    # and grow the MRO every time a copied object is rebound. Collapse only
+    # the exact proxies created here, leaving authored classes untouched.
+    # Dendra declaration hooks add their own class metadata, so record the
+    # complete generated namespace instead of assuming it contains only the
+    # attached descriptors. Weak references avoid a global registry retaining
+    # a callback's owner through the owner's generated class.
+    base = type(obj)
+    references = {}
+    while (entry := _instance_property_proxy(base)) is not None:
+        parent_ref, members, namespace_signature = entry
+        parent = parent_ref()
+        if (
+            parent is None
+            or len(base.__bases__) != 1
+            or base.__bases__[0] is not parent
+            or _instance_property_namespace_signature(vars(base)) != namespace_signature
+        ):
+            break
+        for key, descriptor_ref in members:
+            references.setdefault(key, descriptor_ref())
+        base = parent
+    references[name] = staticproperty(func)
+    sub = type(f"_{base.__name__}Proxy", (base,), references)
+    _remember_instance_property_proxy(sub, base, references)
     obj.__class__ = sub  # replace the instance’s class in‑place
 
 

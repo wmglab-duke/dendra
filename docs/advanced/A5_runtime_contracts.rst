@@ -174,6 +174,37 @@ Use ``clear_jit_cache()`` to discard an owner's compiled callables explicitly.
 ``pickleable(reset_global_compiler=True)`` remains an explicit request to reset
 the process-wide compiler cache; ordinary serialization does not require it.
 
+Branching a native Network
+--------------------------
+
+Use ``copy.deepcopy(network)`` to branch an initialized native simulation:
+
+.. code-block:: python
+
+   import copy
+
+   branch = copy.deepcopy(network)
+   branch.step()
+
+The copy owns its Network, Population, and connection clocks. Advancing either
+Network does not advance the other. Dynamic clock references resolve the
+current owner's time tensor, including after checkpoint restoration replaces
+that tensor. Queues, scheduled-event cursors, RNG state, and exact clock anchors
+retain their copied values. Shared Parameter objects within the model remain
+shared within the copy, with independent storage from the source.
+
+Stored runtime tensors are copied as detached values when they carry an
+autograd graph. The copy does not differentiate through the source's earlier
+trajectory; copied trainable Parameters remain independent leaves. Use explicit
+functional state continuation when gradients must cross the branch boundary.
+
+``branch.initialize(dt, t=...)`` starts a new native episode, resetting state and
+delivery histories according to the ordinary initialization policy. To resume
+saved traffic instead, use ``restore_dict_from_checkpoint(...)`` on a compatible
+initialized Network. Native reinitialization still invalidates frozen functional
+delivery plans; lower or compile again afterward. Cloning does not reset
+PyTorch's process-wide compiler cache.
+
 Functional compiled runner boundaries
 -------------------------------------
 

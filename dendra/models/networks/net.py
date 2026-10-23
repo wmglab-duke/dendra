@@ -323,6 +323,11 @@ def _packed_synapse_local_index_map(
     return mapping
 
 
+def _bind_clock_reference(module, owner):
+    """Resolve a runtime clock from its current owner, including buffer rebinding."""
+    module.setreference("t", lambda owner=owner: owner.t)
+
+
 def _rebind_cloned_population_clocks(populations):
     """Point dynamic mechanism clocks at cloned owners after deepcopy."""
     visited = set()
@@ -335,11 +340,11 @@ def _rebind_cloned_population_clocks(populations):
         mechanism_handler = getattr(population, "mech", None)
         if mechanism_handler is not None:
             for mechanism in mechanism_handler.mechanisms.values():
-                mechanism.setreference("t", lambda population=population: population.t)
+                _bind_clock_reference(mechanism, population)
             for process in getattr(
                 mechanism_handler, "material_processes", {}
             ).values():
-                process.setreference("t", lambda population=population: population.t)
+                _bind_clock_reference(process, population)
 
         for component in getattr(population, "populations", {}).values():
             rebind(component)
@@ -1369,6 +1374,62 @@ class Network(RNGMixin):
         state["_step_eval"] = step
         state["_step"] = step
         return state
+
+    def __deepcopy__(self, memo):
+        """Clone runtime values while severing the source's live training graph.
+
+        Population and NetStim already use detached value copies for non-leaf
+        runtime tensors. Seed the same memo for connection state and the
+        Network clock so all children preserve their intentional tensor aliases
+        without asking PyTorch to deepcopy an active autograd graph.
+        """
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        for module in self.modules():
+            for value in module._buffers.values():
+                if (
+                    torch.is_tensor(value)
+                    and not value.is_leaf
+                    and id(value) not in memo
+                ):
+                    memo[id(value)] = value.detach().clone()
+            for value in vars(module).values():
+                if (
+                    torch.is_tensor(value)
+                    and not value.is_leaf
+                    and id(value) not in memo
+                ):
+                    memo[id(value)] = value.detach().clone()
+        result = self.__class__.__new__(self.__class__)
+        memo[id(self)] = result
+        if self.__class__.__module__ == "torch.nn.utils.parametrize":
+            # PyTorch's generated hook blocks serialization, while a runtime
+            # copy retains the authored Network state/compile cleanup policy.
+            getstate = next(
+                owner.__dict__["__getstate__"]
+                for owner in self.__class__.__mro__[1:]
+                if "__getstate__" in owner.__dict__
+            )
+            source_state = getstate(self)
+        else:
+            source_state = self.__getstate__()
+        state = copy.deepcopy(source_state, memo)
+        result.__setstate__(state)
+        return result
+
+    def __setstate__(self, state):
+        """Restore owner references after the complete module graph is copied."""
+        super().__setstate__(state)
+        self._bind_runtime_clocks()
+
+    def _bind_runtime_clocks(self):
+        """Bind dynamic clocks without resetting queues, RNG, or clock metadata."""
+        _rebind_cloned_population_clocks(self.populations)
+        for synapse in self.synapses.values():
+            _bind_clock_reference(synapse, self)
+        for connection in self.continuous_synapses.values():
+            _bind_clock_reference(connection, self)
 
     def train(self, mode=True):
         """
@@ -3089,7 +3150,7 @@ class Network(RNGMixin):
                 pre_dtype=pre_dtype,
             )
 
-            syn.setreference("t", lambda: self.t)
+            _bind_clock_reference(syn, self)
 
             if self.training:
                 syn.train()
@@ -3184,7 +3245,7 @@ class Network(RNGMixin):
                 pre_dtype=pre_dtype,
             )
 
-            con.setreference("t", lambda: self.t)
+            _bind_clock_reference(con, self)
 
             if self.training:
                 con.train()

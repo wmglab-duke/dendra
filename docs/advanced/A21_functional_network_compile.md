@@ -412,6 +412,12 @@ optimization problem. To continue natively, publish state with
 `runner.functional.commit_state_(matching_network, state)` and align its
 parameters separately; runner calls do not commit anything automatically.
 
+To branch a native Network independently, use `copy.deepcopy(network)`. Its
+event, continuous-connection, and Population clocks refer to the copied owners.
+Stored runtime graphs are detached during copying; use explicit functional
+continuation to retain gradients through a prefix. See
+{ref}`runtime-contract-validation` for native copy and reinitialization semantics.
+
 ## Preserve gradients through checkpoints and continuation
 
 With `inference=False`, `checkpoint_every=H` trades replay of H-step spans for
