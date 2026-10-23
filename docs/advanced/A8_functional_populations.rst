@@ -347,7 +347,7 @@ following properties:
 * ``bwd_euler_sc`` or ``scnv`` for exact standalone ``Population`` and
   ``SingleCompartment``,
   ``bwd_euler_ub`` for ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
-  ``euler``/``rk1``/``eulerv1`` for standard ``Unmyelinated`` and
+  ``euler``/``rk1``/``eulerv1``/``rk2``/``rk4`` for standard ``Unmyelinated`` and
   ``Myelinated`` models,
   ``bwd_euler_bt(method="thomas")`` for ``ExtCellAxon``, ``dhs`` for scalar
   ``Tree``, ``dhs_bt`` for ``ExtCellTree``, or the automatically selected
@@ -355,11 +355,12 @@ following properties:
   ``MultiPopulation``, with optional membrane-current output; and
 * for ``bwd_euler_ub``, a transform-compatible Thomas or PCR solver.
 
-The scalar forward-Euler family retains its native convolution stencil,
+The scalar explicit cable integrators retain their native convolution stencil,
 training-mode symmetry, cylindrical workspace, and explicit timestep stability
 restriction. Networks can mix these Populations with other admitted
-integrators. See :doc:`A51_functional_euler` for trainable stencils, gradients,
-recording, and continuation.
+integrators. See :doc:`A51_functional_euler` and
+:doc:`A52_functional_runge_kutta` for voltage-stage semantics, trainable
+stencils, gradients, recording, and continuation.
 
 Solver tensors declared by nested ``State.STATE``, direct Mechanism and State
 ``CARRY``, saved-current mirrors, Ion and Material fields, and write-only
@@ -2782,7 +2783,7 @@ Fresh functional initialization supports exact ``Population`` and
 ``SingleCompartment`` models using ``bwd_euler_sc`` or ``scnv``; canonical
 ``Unmyelinated``, ``Myelinated``, and native ``Cable`` models using
 ``bwd_euler_ub``; standard ``Unmyelinated`` and ``Myelinated`` models using
-``euler``/``rk1``/``eulerv1``; exact scalar
+``euler``/``rk1``/``eulerv1``/``rk2``/``rk4``; exact scalar
 ``Tree`` models using ``dhs``; and canonical ``ExtCellAxon``/``ExtCellTree``
 models using ``bwd_euler_bt``/``dhs_bt``. Exact ``MultiPopulation`` packs use
 their admitted ``bwd_euler_sc_multi``, ``dhs_multi``, or ``dhs_bt_multi``

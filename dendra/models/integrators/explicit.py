@@ -181,11 +181,11 @@ class _euler(Integrator):
         """Derive the explicit cable workspace from effective model tensors.
 
         Inputs use the public voltage shape and native units: micrometres for
-        ``dx`` and ``diam``, uF/cm^2 for ``cm``, and ohm cm for ``rhoa``. Euler
-        uses each compartment's cylindrical resistance and area, including the
-        materialized node geometry of myelinated models. The timestep does not
-        enter these coefficients. Preparation preserves gradients and never
-        reads or mutates an integrator.
+        ``dx`` and ``diam``, uF/cm^2 for ``cm``, and ohm cm for ``rhoa``. The
+        explicit integrators use each compartment's cylindrical resistance and
+        area, including the materialized node geometry of myelinated models.
+        The timestep does not enter these coefficients. Preparation preserves
+        gradients and never reads or mutates an integrator.
         """
         del dt
         dx = dx / 10000.0  # cm
@@ -258,7 +258,7 @@ class _euler(Integrator):
         solver=None,
         call_local_currents=False,
     ):
-        """Route the common functional signature to the native Euler kernel."""
+        """Route the common functional signature to the native explicit kernel."""
         del solver
         if ve is None:
             ve = self.ve_zero
@@ -339,11 +339,37 @@ class _rk2(_euler):
         If truthy, accumulate membrane currents each step. Default None.
     """
 
-    def _step(self, v, ve, area, dt, temp, cm, intra=None):
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_explicit_path"
+
+    def _step(
+        self, v, ve, area, dt, temp, cm, intra=None, *, call_local_currents=False
+    ):
         self._advance_pre_current(v, dt, temp)
-        K1, _ = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        K2, i2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
-        accepted_frame = self._capture_ion_current_frame()
+        if call_local_currents:
+            K1, _, _ = self._explicit_slope(
+                v,
+                ve,
+                area,
+                self.cm_inv,
+                self.ra_inv,
+                intra,
+                call_local_currents=True,
+            )
+            K2, i2, accepted_frame = self._explicit_slope(
+                v + K1 * dt / 2.0,
+                ve,
+                area,
+                self.cm_inv,
+                self.ra_inv,
+                intra,
+                call_local_currents=True,
+            )
+        else:
+            K1, _ = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
+            K2, i2 = self.FRK(
+                v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra
+            )
+            accepted_frame = self._capture_ion_current_frame()
         v_n = v + K2 * dt
         self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
@@ -367,16 +393,66 @@ class _rk4(_euler):
         If truthy, accumulate membrane currents each step. Default None.
     """
 
-    def _step(self, v, ve, area, dt, temp, cm, intra=None):
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_explicit_path"
+    _FUNCTIONAL_CRITICAL_METHODS = (
+        *_euler._FUNCTIONAL_CRITICAL_METHODS,
+        "_combine_ion_current_frames",
+    )
+
+    def _step(
+        self, v, ve, area, dt, temp, cm, intra=None, *, call_local_currents=False
+    ):
         self._advance_pre_current(v, dt, temp)
-        K1, i1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        frame1 = self._capture_ion_current_frame()
-        K2, i2 = self.FRK(v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
-        frame2 = self._capture_ion_current_frame()
-        K3, i3 = self.FRK(v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra)
-        frame3 = self._capture_ion_current_frame()
-        K4, i4 = self.FRK(v + K3 * dt, ve, area, self.cm_inv, self.ra_inv, intra)
-        frame4 = self._capture_ion_current_frame()
+        if call_local_currents:
+            K1, i1, frame1 = self._explicit_slope(
+                v,
+                ve,
+                area,
+                self.cm_inv,
+                self.ra_inv,
+                intra,
+                call_local_currents=True,
+            )
+            K2, i2, frame2 = self._explicit_slope(
+                v + K1 * dt / 2.0,
+                ve,
+                area,
+                self.cm_inv,
+                self.ra_inv,
+                intra,
+                call_local_currents=True,
+            )
+            K3, i3, frame3 = self._explicit_slope(
+                v + K2 * dt / 2.0,
+                ve,
+                area,
+                self.cm_inv,
+                self.ra_inv,
+                intra,
+                call_local_currents=True,
+            )
+            K4, i4, frame4 = self._explicit_slope(
+                v + K3 * dt,
+                ve,
+                area,
+                self.cm_inv,
+                self.ra_inv,
+                intra,
+                call_local_currents=True,
+            )
+        else:
+            K1, i1 = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
+            frame1 = self._capture_ion_current_frame()
+            K2, i2 = self.FRK(
+                v + K1 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra
+            )
+            frame2 = self._capture_ion_current_frame()
+            K3, i3 = self.FRK(
+                v + K2 * dt / 2.0, ve, area, self.cm_inv, self.ra_inv, intra
+            )
+            frame3 = self._capture_ion_current_frame()
+            K4, i4 = self.FRK(v + K3 * dt, ve, area, self.cm_inv, self.ra_inv, intra)
+            frame4 = self._capture_ion_current_frame()
         v_n = v + (K1 + 2 * K2 + 2 * K3 + K4) * dt / 6.0
         accepted_frame = self._combine_ion_current_frames(
             (frame1, frame2, frame3, frame4),

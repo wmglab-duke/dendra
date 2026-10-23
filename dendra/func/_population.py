@@ -40,7 +40,13 @@ from dendra.models.integrators.cable import (
     _layered_edge_conductance,
 )
 from dendra.models.integrators.core import _FunctionalIntegratorSpec
-from dendra.models.integrators.explicit import SymmetricConv1D, _euler, _eulerv1
+from dendra.models.integrators.explicit import (
+    SymmetricConv1D,
+    _euler,
+    _eulerv1,
+    _rk2,
+    _rk4,
+)
 from dendra.models.integrators.implicit import (
     _bwd_euler_bt,
     _bwd_euler_sc,
@@ -448,14 +454,14 @@ _STANDARD_OWNED_CACHE_METHODS = {
     )
 }
 _INTEGRATOR_FRESH_INITIALIZATION_HOOKS = ("init_v",)
+_SCALAR_EXPLICIT_INTEGRATORS = (_euler, _eulerv1, _rk2, _rk4)
 _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
     implementation: {
         name: inspect.getattr_static(implementation, name)
         for name in _INTEGRATOR_FRESH_INITIALIZATION_HOOKS
     }
     for implementation in (
-        _euler,
-        _eulerv1,
+        *_SCALAR_EXPLICIT_INTEGRATORS,
         _bwd_euler_sc,
         _bwd_euler_sc_skip,
         _bwd_euler_ub,
@@ -470,7 +476,7 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
 
 
 _STANDARD_FUNCTIONAL_INTEGRATOR_STATE_NAMES = {_bwd_euler_sc_skip: ("v",)}
-_STANDARD_EULER_INTEGRATOR_HOOKS = {
+_STANDARD_EXPLICIT_INTEGRATOR_HOOKS = {
     implementation: {
         name: inspect.getattr_static(implementation, name)
         for name in dict.fromkeys(
@@ -484,7 +490,7 @@ _STANDARD_EULER_INTEGRATOR_HOOKS = {
         )
         if hasattr(implementation, name)
     }
-    for implementation in (_euler, _eulerv1)
+    for implementation in _SCALAR_EXPLICIT_INTEGRATORS
 }
 
 
@@ -500,7 +506,7 @@ def _functional_handler_hooks(population):
 def _scalar_path_integrator_profile(integrator):
     """Select the admitted numerical family independently of path geometry."""
     spec = _resolve_functional_integrator_spec(integrator, "scalar_explicit_path")
-    if spec is not None and spec.implementation in (_euler, _eulerv1):
+    if spec is not None and spec.implementation in _SCALAR_EXPLICIT_INTEGRATORS:
         return "scalar_explicit_path", spec.implementation
     return "scalar_path", _bwd_euler_ub
 
@@ -8718,7 +8724,7 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
         )
     if not recognized_type:
         return None
-    standards = _STANDARD_EULER_INTEGRATOR_HOOKS.get(implementation, {})
+    standards = _STANDARD_EXPLICIT_INTEGRATOR_HOOKS.get(implementation, {})
     if any(
         inspect.getattr_static(integrator_type, name) is not standard
         for name, standard in standards.items()
@@ -8753,7 +8759,7 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
     return spec
 
 
-_EULER_STENCIL_CONFIGURATION = (
+_EXPLICIT_STENCIL_CONFIGURATION = (
     "in_channels",
     "out_channels",
     "kernel_size",
@@ -8764,13 +8770,13 @@ _EULER_STENCIL_CONFIGURATION = (
     "padding_mode",
     "_reversed_padding_repeated_twice",
 )
-_STANDARD_EULER_STENCIL_HOOKS = {
+_STANDARD_EXPLICIT_STENCIL_HOOKS = {
     name: inspect.getattr_static(SymmetricConv1D, name)
     for name in ("forward", "_conv_forward")
 }
 
 
-def _euler_stencil_signature(integrator):
+def _explicit_stencil_signature(integrator):
     """Freeze stencil structure while leaving its raw weights explicit."""
     if getattr(integrator, "_FUNCTIONAL_OPERATOR_KIND", None) != "scalar_explicit_path":
         return None
@@ -8784,7 +8790,7 @@ def _euler_stencil_signature(integrator):
                 name,
                 tuple(value) if isinstance(value, (tuple, list)) else value,
             )
-            for name in _EULER_STENCIL_CONFIGURATION
+            for name in _EXPLICIT_STENCIL_CONFIGURATION
             for value in (getattr(stencil, name, None),)
         ),
         tuple(
@@ -8800,17 +8806,20 @@ def _euler_stencil_signature(integrator):
     )
 
 
-def _euler_stencil_failures(integrator):
+def _explicit_stencil_failures(integrator):
     stencil = getattr(integrator, "ssd", None)
     if (
         _canonical_type(stencil) is not SymmetricConv1D
         or any(name in vars(stencil) for name in ("forward", "_conv_forward"))
         or any(
             inspect.getattr_static(type(stencil), name) is not standard
-            for name, standard in _STANDARD_EULER_STENCIL_HOOKS.items()
+            for name, standard in _STANDARD_EXPLICIT_STENCIL_HOOKS.items()
         )
     ):
-        return ["functional Euler requires its canonical SymmetricConv1D stencil"]
+        return [
+            "functional explicit cable integration requires its canonical "
+            "SymmetricConv1D stencil"
+        ]
     if (
         stencil.in_channels != 2
         or stencil.out_channels != 1
@@ -8827,7 +8836,8 @@ def _euler_stencil_failures(integrator):
         or _shape_tuple(stencil.weight) != (1, 2, stencil.kernel_size[0])
     ):
         return [
-            "functional Euler requires a two-input, one-output, odd-width "
+            "functional explicit cable integration requires a two-input, "
+            "one-output, odd-width "
             "reflection stencil with unit stride/dilation and no bias"
         ]
     return []
@@ -9182,10 +9192,14 @@ def _functionalization_failures(
             )
             failures.append(
                 f"{topology} functionalization requires bwd_euler_ub"
-                + (" or canonical Euler/rk1/eulerv1" if not is_native_cable else "")
+                + (
+                    " or canonical Euler/rk1/eulerv1/rk2/rk4"
+                    if not is_native_cable
+                    else ""
+                )
             )
-        elif implementation in (_euler, _eulerv1):
-            failures.extend(_euler_stencil_failures(population.integrator))
+        elif implementation in _SCALAR_EXPLICIT_INTEGRATORS:
+            failures.extend(_explicit_stencil_failures(population.integrator))
         elif population.integrator.use_gc_variant:
             failures.append("the gradient-clipped Thomas variant is not supported yet")
     elif is_scalar_tree:
@@ -9583,7 +9597,9 @@ def _functionalization_failures(
     allowed_shapes = {}
     if _scalar_path_integrator_profile(population.integrator)[
         0
-    ] == "scalar_explicit_path" and not _euler_stencil_failures(population.integrator):
+    ] == "scalar_explicit_path" and not _explicit_stencil_failures(
+        population.integrator
+    ):
         allowed_shapes["integrator.ssd.weight"] = _shape_tuple(
             population.integrator.ssd.weight
         )
@@ -10520,7 +10536,7 @@ def _structure_signature(population) -> tuple:
             getattr(population.integrator, "_FUNCTIONAL_STATE_NAMES", None),
             tuple(population.integrator._PREPARED_WORKSPACE_SCHEMA),
             getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None),
-            _euler_stencil_signature(population.integrator),
+            _explicit_stencil_signature(population.integrator),
             tuple(
                 getattr(
                     population.integrator,
@@ -14173,9 +14189,10 @@ class FunctionalPopulation:
 
         integrator = self._transition.population.integrator
         if integrator._FUNCTIONAL_OPERATOR_KIND == "scalar_explicit_path":
-            # Native Euler uses cylindrical node geometry and raw effective
-            # cm/rhoa, including Myelinated's node transforms. Its coefficients
-            # do not apply the implicit family's independent scale modifiers.
+            # Native explicit integration uses cylindrical node geometry and
+            # raw effective cm/rhoa, including Myelinated's node transforms.
+            # These coefficients do not apply the implicit family's independent
+            # scale modifiers.
             point_area = _cylindrical_membrane_area(diam, dx)
             integrator_workspace = integrator._derive_prepared_workspace(
                 dt,

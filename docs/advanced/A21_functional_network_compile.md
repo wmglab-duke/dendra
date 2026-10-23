@@ -209,9 +209,10 @@ drift/diffusion gradients; see {doc}`A32_functional_state_sde`. Custom native
 initialization/build adapters are currently unsupported.
 
 Scalar `Unmyelinated` and `Myelinated` Populations can use
-`euler`/`rk1`/`eulerv1` alongside other admitted integrators in the same Network;
-see {doc}`A51_functional_euler` for the native stencil, explicit timestep
-restriction, and trainable parameters.
+`euler`/`rk1`/`eulerv1`/`rk2`/`rk4` alongside other admitted integrators in the
+same Network; see {doc}`A51_functional_euler` and
+{doc}`A52_functional_runge_kutta` for the native stencil, voltage-stage
+semantics, explicit timestep restriction, and trainable parameters.
 
 Shared runtime parameters and parameter/configuration aliases follow authored
 Population initialization order. Earlier Populations retain their prepared

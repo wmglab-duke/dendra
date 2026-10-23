@@ -59,3 +59,4 @@ Advanced
    advanced/A49_functional_distribution_sampling.md
    advanced/A50_functional_poisson_stimulation.md
    advanced/A51_functional_euler.md
+   advanced/A52_functional_runge_kutta.md

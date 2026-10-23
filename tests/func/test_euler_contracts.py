@@ -95,7 +95,7 @@ class _CustomEuler(_euler):
     pass
 
 
-@pytest.mark.parametrize("factory", [dn.rk2, dn.rk4, dn.df, dn.dfh, _CustomEuler])
+@pytest.mark.parametrize("factory", [dn.df, dn.dfh, _CustomEuler])
 def test_euler_admission_does_not_authorize_other_explicit_integrators(factory):
     population = _model(factory)
     with pytest.raises(dn.func.FunctionalizationError, match="canonical Euler"):

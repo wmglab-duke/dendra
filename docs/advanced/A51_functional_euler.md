@@ -14,6 +14,7 @@ kernelspec:
 geometry. A Network can combine these Populations with Populations using other
 supported integrators. Initialization, stimulation, connections, recording,
 random draw tapes, and checkpoint continuation use the same functional APIs.
+For multistage voltage integration, see {doc}`A52_functional_runge_kutta`.
 
 The complete
 {download}`functional_euler.py <../../examples/functional_euler.py>` example
@@ -122,10 +123,9 @@ model's RNG.
 
 ## Currently unsupported
 
-Multistage voltage integrators such as `dn.rk2` and `dn.rk4`, custom explicit
-integrator implementations, and modified convolution structures are currently
-unsupported. Generic morphology-backed `Cable` and `Tree` models require their
-supported geometry-aware integrators; the Euler convolution path does not
-implement their canonical edge-conductance equations. Multilayer extracellular
+Custom explicit integrator implementations and modified convolution structures
+are currently unsupported. Generic morphology-backed `Cable` and `Tree` models
+require their supported geometry-aware integrators; the Euler convolution path
+does not implement their canonical edge-conductance equations. Multilayer extracellular
 models and concatenated `MultiPopulation` models do not use this scalar Euler
 path.
