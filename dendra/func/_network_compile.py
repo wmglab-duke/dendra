@@ -181,13 +181,15 @@ class CompiledNetworkRunner:
                     for plan in self._functional._population_cache_plans.values()
                 )
             self._initialization_writes_constants = initialization == "fresh" and (
-                bool(self._functional._connection_sampling_plan.devices)
+                self._initialization_writes_parameters
+                or bool(self._functional._connection_sampling_plan.devices)
                 or any(
                     plan.constants
                     for plan in self._functional._population_cache_plans.values()
                 )
                 or any(
                     plan._owned_cache_bound
+                    or bool(plan._has_snapshot_materialization_offsets)
                     or (
                         plan._random_plan is not None
                         and bool(plan._random_plan.entries)

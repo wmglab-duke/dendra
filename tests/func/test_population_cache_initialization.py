@@ -90,7 +90,16 @@ def test_cached_population_topologies_match_native_restored_state_and_parameters
         **tensors.constants,
         "populations": {
             "cell": {
-                **tensors.constants["populations"]["cell"],
+                **{
+                    name: (
+                        torch.ones_like(value)
+                        if name.startswith("materializations.active.")
+                        else torch.zeros_like(value)
+                        if name.startswith("materializations.baseline.")
+                        else value
+                    )
+                    for name, value in tensors.constants["populations"]["cell"].items()
+                },
                 "cache.active": torch.tensor(True),
             }
         },

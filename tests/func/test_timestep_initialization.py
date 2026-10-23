@@ -758,11 +758,13 @@ def test_zero_context_derived_mutation_fails_without_touching_source(
     owner.reject_zero_context = True
     snapshot = _module_snapshot(model)
     calls = getattr(owner, "zero_context_calls", None)
-    functional, tensors = dn.func.make_functional(model, dt=DT)
-    with pytest.raises(dn.func.FunctionalizationError, match=message):
-        functional.initialize(
-            tensors.parameters, tensors.constants, tensors.initialization
-        )
+    # Mutation detection is an optional diagnostic captured by the plan.
+    with dn.ctx(CHECK_PURITY=True):
+        functional, tensors = dn.func.make_functional(model, dt=DT)
+        with pytest.raises(dn.func.FunctionalizationError, match=message):
+            functional.initialize(
+                tensors.parameters, tensors.constants, tensors.initialization
+            )
     prepared = functional.prepare(tensors.parameters, tensors.constants)
     continued, _ = functional.step(tensors.parameters, prepared, tensors.state)
     assert torch.isfinite(continued["integrator"]["v"]).all()

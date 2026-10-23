@@ -41,7 +41,9 @@ class NetworkInitializationInput(NamedTuple):
     controls its own initialization at its position in the authored order.
     ``reinit_weights`` and ``reinit_delays`` refresh connection materializations
     from their raw sources. A false flag retains the preceding explicit
-    materialization, matching native Network initialization.
+    materialization, matching native Network initialization. Population
+    initialization retains each owner's effective buffers and solver workspaces
+    separately from the final shared raw parameters in the resulting constants.
     ``connection_draw`` supplies parameter-independent connection base draws
     and resulting RNG checkpoints. Pure initialization requires this packet
     when refreshing supported stochastic roles; the host runner samples it
@@ -149,21 +151,12 @@ def nonpersistent_material_cache_failures(functional):
 
 
 def initialization_alias_failures(functional):
-    """Reject native retained materializations absent from the explicit packet."""
+    """Reject initializer aliases without a canonical raw Parameter binding."""
     from ._initialization_sources import (
         initialization_source_constant_slots,
         initialization_source_roots,
     )
-    from ._population import (
-        _initialization_only_parameter_names,
-        _initialization_transform_hooks,
-    )
 
-    order = {name: index for index, name in enumerate(functional.populations)}
-    initial_only = {
-        name: _initialization_only_parameter_names(plan._population)
-        for name, plan in functional.populations.items()
-    }
     failures = []
     initial_constants = {}
     for name, plan in functional.populations.items():
@@ -195,158 +188,6 @@ def initialization_alias_failures(functional):
                 "on the initializer module as a Parameter attribute to preserve "
                 "its canonical shared binding"
             )
-    for name, plan in functional.populations.items():
-        if plan._owned_cache_bound:
-            # Owned-cache initialization skips both pre transforms and
-            # structured post transforms, matching Population.initialize.
-            continue
-        population = plan._population
-        writes = {
-            reference.removeprefix("parameters.")
-            for phase in ("pre", "post")
-            for hook in _initialization_transform_hooks(population, phase)
-            for reference in population._initialization_transforms[
-                hook.action_name
-            ].writes
-            if reference.startswith("parameters.")
-        }
-        for path, constant_paths in functional._parameter_constant_aliases:
-            if path[:2] == ("populations", name) and path[2] in writes:
-                bindings = ", ".join(
-                    ".".join(map(str, target)) for target in constant_paths
-                )
-                failures.append(
-                    f"Population {name!r} initialization writes a parameter shared "
-                    f"with explicit Network constants ({bindings}). These writes "
-                    "are currently unsupported; parameter replacements do not "
-                    "replace constant bindings"
-                )
-        for group in functional._parameter_aliases:
-            if not any(
-                path[:2] == ("populations", name) and path[2] in writes
-                for path in group
-            ):
-                continue
-            for path in group:
-                if (
-                    path[0] == "populations"
-                    and order[path[1]] < order[name]
-                    and path[2] not in initial_only[path[1]]
-                ):
-                    failures.append(
-                        f"Population {name!r} writes a shared runtime parameter of "
-                        f"already initialized Population {path[1]!r}; native initialization "
-                        "retains its earlier materialized coefficients. This ordering is "
-                        "currently unsupported; initialize shared runtime parameters "
-                        "before their first Population reader"
-                    )
-    for owner, (bindings, _replays) in functional._owned_cache_alias_plans.items():
-        for _winner, parameter_groups, _constants, _states in bindings:
-            for paths in parameter_groups:
-                for path in paths:
-                    if (
-                        path[0] == "populations"
-                        and order[path[1]] < order[owner]
-                        and not functional.populations[path[1]]._owned_cache_bound
-                        and path[2] not in initial_only[path[1]]
-                    ):
-                        failures.append(
-                            f"Population {owner!r} cache writes a shared runtime "
-                            f"parameter of already initialized fresh Population "
-                            f"{path[1]!r}; native initialization retains its earlier "
-                            "materialized coefficients. This ordering is currently "
-                            "unsupported; initialize the cached owner before its "
-                            "fresh parameter readers"
-                        )
-
-    if not functional._owned_cache_alias_plans:
-        return tuple(dict.fromkeys(failures))
-
-    from ._population_cache import _cache_storage_frame
-
-    def overlaps(left, right):
-        if left == right:
-            return True
-        if (
-            left[0] != "storage"
-            or right[0] != "storage"
-            or left[1] != right[1]
-            or left[3] != right[3]
-        ):
-            return False
-
-        def bounds(frame):
-            offset, shape, strides = frame[4:]
-            width = frame[2].itemsize
-            end = offset + sum(
-                (length - 1) * stride
-                for length, stride in zip(shape, strides, strict=True)
-            )
-            return offset * width, (end + 1) * width - 1
-
-        start, end = bounds(left)
-        other_start, other_end = bounds(right)
-        return start <= other_end and other_start <= end
-
-    fresh_materializations = {}
-    for name, plan in functional.populations.items():
-        if plan._owned_cache_bound:
-            continue
-        population = plan._population
-        paths = [
-            name
-            for name in plan._preparation.population_parameter_names
-            if name in population._buffers
-        ]
-        paths.extend(
-            f"{entry.module_path + '.' if entry.module_path else ''}{entry.buffer_name}"
-            for entry in plan._prepared_buffers
-            if entry.kind in {"effective_parameter", "derived"}
-        )
-        for record, preparation in zip(
-            plan._multi_component_plans,
-            getattr(plan._preparation, "component_physical_preparations", ()),
-            strict=True,
-        ):
-            component = population.populations[record.name]
-            paths.extend(
-                f"populations.{record.name}.{field}"
-                for field in preparation.population_parameter_names
-                if field in component._buffers
-            )
-        fresh_materializations[name] = tuple(
-            _cache_storage_frame(
-                population.get_buffer(path), buffer=True, owner=population
-            )
-            for path in dict.fromkeys(paths)
-        )
-    for owner in functional._owned_cache_alias_plans:
-        cache_plan = functional.populations[owner]._owned_cache_plan
-        writes = tuple(cache_plan.storage_frames[key] for key in cache_plan.write_keys)
-        represented = tuple(
-            cache_plan.storage_frames[source]
-            for source in (
-                *cache_plan.parameters.values(),
-                *cache_plan.constants.values(),
-                *(source for _path, source in cache_plan.states),
-            )
-        )
-        for name, materializations in fresh_materializations.items():
-            # Later cache copies can overwrite earlier retained coefficients;
-            # later fresh population can overwrite the cached owner's readers.
-            # Neither mutation is represented by recomputing fresh preparation
-            # beside immutable detached cache materializations.
-            affected = writes if order[name] < order[owner] else represented
-            if any(
-                overlaps(saved, current)
-                for saved in affected
-                for current in materializations
-            ):
-                failures.append(
-                    f"Population {owner!r} cache shares retained materializations "
-                    f"with fresh Population {name!r}. Shared runtime buffers with "
-                    "different initialization materializations are currently unsupported"
-                )
     return tuple(dict.fromkeys(failures))
 
 
@@ -644,6 +485,115 @@ def population_cache_alias_bindings(functional):
     return plans, None
 
 
+def population_materialization_alias_bindings(functional):
+    """Freeze fresh copy readers without restricting snapshot-only lowering."""
+    if functional._cache_enabled:
+        return {}, None
+    try:
+        return _population_materialization_alias_bindings(functional), None
+    except (FunctionalizationError, ValueError, TypeError, RuntimeError) as error:
+        return {}, str(error)
+
+
+def _population_materialization_alias_bindings(functional):
+    """Freeze native effective-buffer copies at each fresh Population boundary.
+
+    Ordinary parameter installation copies through existing storage. Authored
+    in-graph transforms and derived buffers instead replace their buffers and
+    therefore do not write through another Population's retained reader.
+    """
+    from ._population_cache import PopulationCachePlan, _cache_storage_frame
+
+    class Writes(NamedTuple):
+        write_keys: tuple
+        sources: dict
+        storage_frames: dict
+
+    readers = {
+        name: PopulationCachePlan(plan, None, bindings_only=True)
+        for name, plan in functional.populations.items()
+    }
+    result = {}
+    for name, plan in functional.populations.items():
+        if plan._owned_cache_bound or not plan._materialization_value_specs:
+            continue
+        population = plan._population
+        paths = {
+            field
+            for field in plan._preparation.population_parameter_names
+            if field in population._buffers
+        }
+        paths.update(
+            f"{entry.module_path + '.' if entry.module_path else ''}{entry.buffer_name}"
+            for entry in plan._prepared_buffers
+            if entry.kind == "effective_parameter"
+        )
+        for record, preparation in zip(
+            plan._multi_component_plans,
+            getattr(plan._preparation, "component_physical_preparations", ()),
+            strict=True,
+        ):
+            component = population.populations[record.name]
+            paths.update(
+                f"populations.{record.name}.{field}"
+                for field in preparation.population_parameter_names
+                if field in component._buffers
+            )
+        sources = {}
+        for _public, path, *_schema in plan._materialization_value_specs:
+            if path not in paths:
+                continue
+            module_path, _separator, field = path.rpartition(".")
+            owner = population.get_submodule(module_path)
+            if field in getattr(owner, "in_graph_parametrizations", {}):
+                continue
+            if field in getattr(owner, "random_parameters", {}):
+                continue
+            sources[path] = population.get_buffer(path)
+        if not sources:
+            continue
+        writer = Writes(
+            tuple(sources),
+            sources,
+            {path: _cache_storage_frame(value) for path, value in sources.items()},
+        )
+        result[name] = _cache_alias_plan(
+            functional,
+            {name: writer},
+            {
+                reader: bindings
+                for reader, bindings in readers.items()
+                if reader != name
+            },
+        )
+    return result
+
+
+def _publish_materialization_aliases(
+    functional, parameters, constants, populations, name
+):
+    """Publish one fresh owner's native copies without transferring its graph."""
+    bindings, replays = functional._materialization_alias_plans.get(name, ((), ()))
+    if not bindings:
+        return parameters, constants, populations
+    values = {
+        path: constants["populations"][name][public]
+        for public, path, *_schema in functional.populations[
+            name
+        ]._materialization_value_specs
+    }
+    return _restore_cache_aliases(
+        functional,
+        parameters,
+        parameters,
+        constants,
+        populations,
+        NetworkInitializationCache({name: values}, {}, {}),
+        bindings=bindings,
+        replays=replays,
+    )
+
+
 def _restore_cache_aliases(
     functional,
     parameters,
@@ -690,9 +640,31 @@ def _restore_cache_aliases(
             for path in parameter_paths:
                 effective = _replace_at(effective, path, value)
         for constant_paths in constant_groups:
-            reference = _at(constants, constant_paths[0])
-            value = saved.detach().to(reference).clone()
+            ordinary = tuple(
+                path
+                for path in constant_paths
+                if not (
+                    path[0] == "populations"
+                    and path[2].startswith("materializations.values.")
+                )
+            )
+            if ordinary:
+                reference = _at(constants, ordinary[0])
+                value = saved.detach().to(reference).clone()
+                for path in ordinary:
+                    constants = _replace_at(constants, path, value)
             for path in constant_paths:
+                if path in ordinary:
+                    continue
+                reference = _at(constants, path)
+                # Retained preparation has an independent graph from another
+                # reader of the same native storage. A copy updates its value
+                # without transferring the writer's graph to that reader.
+                value = restore_population_cache_values(
+                    {"value": reference},
+                    {"value": saved},
+                    parameter_names=("value",),
+                )["value"]
                 constants = _replace_at(constants, path, value)
         for path in state_paths:
             reference = _at(populations, path)
@@ -788,8 +760,16 @@ def _initialize_components(
                     state["populations"][name],
                     inputs.cache.populations[name],
                 )
+            population_constants = initialized.constants
+            if inputs.cache is None and plan._owned_cache_bound:
+                # An owned cache prepares its solver at this Population's
+                # authored boundary, before later owners can change a reader
+                # backed by shared effective-buffer storage.
+                population_constants = plan._retain_materializations(
+                    initialized.parameters, population_constants
+                )
             effective_constants = _replace_at(
-                effective_constants, ("populations", name), initialized.constants
+                effective_constants, ("populations", name), population_constants
             )
             effective = _propagate_population_parameters(
                 functional, effective, name, initialized.parameters
@@ -809,6 +789,12 @@ def _initialize_components(
                     bindings=bindings,
                     replays=replays,
                 )
+            elif inputs.cache is None:
+                effective, effective_constants, populations = (
+                    _publish_materialization_aliases(
+                        functional, effective, effective_constants, populations, name
+                    )
+                )
             # A cache transaction can replace a selectable raw input while
             # restoring the same authored Tensor through a config-buffer slot.
             # The resulting raw input owns all exact-identity config readers.
@@ -827,6 +813,18 @@ def _initialize_components(
             effective_constants = functional._bind_parameter_constants(
                 effective, effective_constants
             )
+            # A Network-owned cache restores every Population before the
+            # solver-initialization loop. Capture preparation only after the
+            # complete shared storage-copy transaction has been published.
+            for name, plan in functional.populations.items():
+                effective_constants = _replace_at(
+                    effective_constants,
+                    ("populations", name),
+                    plan._retain_materializations(
+                        effective["populations"][name],
+                        effective_constants["populations"][name],
+                    ),
+                )
         time = inputs.t.detach().clone()
         populations = {
             name: functional._snap_population_clock(value, time)

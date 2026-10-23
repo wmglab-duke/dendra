@@ -193,14 +193,14 @@ continuation; see {doc}`A31_functional_runtime_noise`. State `DIFFUSION` uses
 the same packet for explicit Wiener draws and RNG carry, with pathwise
 drift/diffusion gradients; see {doc}`A32_functional_state_sde`. Custom native
 initialization/build adapters are currently unsupported.
-Initialize shared runtime parameters before the first Population that uses
-them. A transform on a later Population that writes a runtime parameter shared
-with an earlier Population is currently unsupported, because native execution
-can retain the earlier Population's already materialized numerical values.
-Shared initialization-only sources support ordered writes.
-Initialization writes to a parameter shared with explicit Network constants
-are currently unsupported. Parameter and buffer aliases within one Population
-use its canonical parameter binding when available.
+Shared runtime parameters and parameter/configuration aliases follow authored
+Population initialization order. Earlier Populations retain their prepared
+numerical values when a later initializer writes a shared source; the final raw
+parameter frame preserves its shared aliases. Explicit continuation carries
+those per-Population materializations in the returned constants. See
+{doc}`A43_functional_initialization_ordering` for transforms, gradients, and
+mixed cached/fresh initialization. Parameter and buffer aliases within one
+Population use its canonical parameter binding when available.
 Pure PyTorch `register_parametrization(...)` transforms use the shared
 parameter materializer with explicit original tensors, transform parameters,
 and fixed buffers. Shared trainable parameters retain all their qualified

@@ -3920,17 +3920,57 @@ def _evaluate_timestep_buffers(module, dt) -> Mapping[str, torch.Tensor]:
     return values
 
 
+@dataclass(frozen=True)
+class _RetainedMaterialization:
+    cached: torch.Tensor | None
+    value: torch.Tensor
+    active: torch.Tensor
+    baseline: torch.Tensor | None
+
+
+@dataclass(frozen=True)
+class _SnapshotMaterialization:
+    value: torch.Tensor
+    path: str
+    baselines: dict[str, torch.Tensor]
+
+
 def _cache_materialization(value, name, cache_values, cache_active):
-    """Select a detached native cache buffer before its numerical consumers."""
+    """Select an explicit native materialization before its numerical consumers."""
     if cache_values is None or name not in cache_values:
         return value
-    return torch.where(cache_active, cache_values[name].detach(), value)
+    selected = cache_values[name]
+    if isinstance(selected, _SnapshotMaterialization):
+        # Extraction records each operation's baseline before supplying the
+        # native result to downstream preparation. Integrator baselines must
+        # be measured after native physical buffers are selected.
+        selected.baselines[selected.path] = _clone_tensor(value)
+        return selected.value
+    if isinstance(selected, _RetainedMaterialization):
+        if selected.baseline is not None:
+            # Subtract the computed baseline before adding the native value:
+            # a large raw write must not cancel a small retained native operand.
+            value = (
+                selected.value ^ (value ^ selected.baseline)
+                if value.dtype == torch.bool
+                else selected.value + (value - selected.baseline)
+            )
+        if selected.cached is not None:
+            value = torch.where(cache_active, selected.cached.detach(), value)
+        return torch.where(selected.active, selected.value, value)
+    return torch.where(cache_active, selected.detach(), value)
 
 
 class _PopulationPreparation(torch.nn.Module):
     """Pure materialization of effective parameters and static workspaces."""
 
-    def __init__(self, population: Population, dt):
+    def __init__(
+        self,
+        population: Population,
+        dt,
+        *,
+        retain_initialization_materializations=False,
+    ):
         super().__init__()
         self.population = population
         # Constructor-time materialization is part of the purity boundary too.
@@ -4042,10 +4082,10 @@ class _PopulationPreparation(torch.nn.Module):
                     offset_name = None
                 offset_names.append(offset_name)
 
-            # A DERIVED_BUFFER declaration promises that the builder exactly
-            # reconstructs the already-initialized live workspace. Failing here
-            # prevents lowering a post-initialization mutation or incomplete
-            # migration into a silently different transition.
+            # Standalone preparation reconstructs the initialized workspace.
+            # Ordered Network plans also represent retained native values when
+            # a later owner changed a shared computed property. Their explicit
+            # baseline offsets preserve these values without relaxing schemas.
             for module_path in self.derived_module_paths:
                 owner = _module_at(validation_population, module_path)
                 live_owner = _module_at(population, module_path)
@@ -4063,7 +4103,10 @@ class _PopulationPreparation(torch.nn.Module):
                         _shape_tuple(value) != _shape_tuple(live)
                         or value.dtype != live.dtype
                         or value.device != live.device
-                        or not torch.equal(value, live)
+                        or (
+                            not retain_initialization_materializations
+                            and not torch.equal(value, live)
+                        )
                     ):
                         raise FunctionalizationError(
                             f"{type(owner).__qualname__}.derive_buffers()[{name!r}] "
@@ -4101,7 +4144,9 @@ class _PopulationPreparation(torch.nn.Module):
                             "broadcastable to the initialized timestep-buffer "
                             f"shape {_shape_tuple(live)}"
                         ) from exc
-                    if not torch.equal(value, live):
+                    if not retain_initialization_materializations and not torch.equal(
+                        value, live
+                    ):
                         raise FunctionalizationError(
                             f"{type(owner).__qualname__}.derive_timestep_buffers()"
                             f"[{name!r}] does not exactly reconstruct the "
@@ -4182,6 +4227,7 @@ class _PopulationPreparation(torch.nn.Module):
         dt,
         *,
         for_initialization=False,
+        use_snapshot_offsets=True,
         material_area=None,
         cache_values=None,
         cache_active=None,
@@ -4314,7 +4360,11 @@ class _PopulationPreparation(torch.nn.Module):
             value = owner_parameter_values[entry.module_path][entry.buffer_name]
             value = torch.broadcast_to(value, entry.shape)
             offset_name = self.offset_names[index]
-            if offset_name is not None:
+            if (
+                use_snapshot_offsets
+                and offset_name is not None
+                and not for_initialization
+            ):
                 value = value + getattr(self, offset_name)
             value = _cache_materialization(
                 value,
@@ -4391,6 +4441,12 @@ class _PopulationPreparation(torch.nn.Module):
                         f"timestep-buffer shape {entry.shape}"
                     ) from exc
                 value = value.clone(memory_format=torch.preserve_format)
+                value = _cache_materialization(
+                    value,
+                    f"{entry.module_path}.{entry.buffer_name}",
+                    cache_values,
+                    cache_active,
+                )
                 owner._buffers[entry.buffer_name] = value
                 outputs.append((entry.key, value))
 
@@ -7566,7 +7622,9 @@ def _native_cable_source_binding(population) -> tuple:
     )
 
 
-def _effective_population_parameter_failure(population) -> str | None:
+def _effective_population_parameter_failure(
+    population, *, allow_retained=False
+) -> str | None:
     """Reject live overrides not represented by the functional raw tree."""
     try:
         # Eligibility checks must never execute authored parameter modules on
@@ -7582,7 +7640,7 @@ def _effective_population_parameter_failure(population) -> str | None:
         for name, value in expected.items()
         if not torch.is_tensor(getattr(population, name, None))
         or _shape_tuple(getattr(population, name)) != _shape_tuple(value)
-        or not torch.equal(getattr(population, name), value)
+        or (not allow_retained and not torch.equal(getattr(population, name), value))
     ]
     if mismatched:
         return (
@@ -8369,6 +8427,7 @@ def _functionalization_failures(
     dt: float,
     *,
     multi_component_candidates: dict[str, Population] | None = None,
+    _retain_initialization_materializations=False,
 ) -> list[str]:
     failures = []
     if not isinstance(population, Population):
@@ -8448,7 +8507,13 @@ def _functionalization_failures(
                     f"component {name!r} could not be prepared independently: {exc}"
                 )
                 continue
-            component_failures = _functionalization_failures(candidate, dt)
+            component_failures = _functionalization_failures(
+                candidate,
+                dt,
+                _retain_initialization_materializations=(
+                    _retain_initialization_materializations
+                ),
+            )
             failures.extend(
                 f"component {name!r}: {failure}" for failure in component_failures
             )
@@ -9021,7 +9086,9 @@ def _functionalization_failures(
             or is_scalar_tree
         )
     ):
-        effective_failure = _effective_population_parameter_failure(population)
+        effective_failure = _effective_population_parameter_failure(
+            population, allow_retained=_retain_initialization_materializations
+        )
         if effective_failure is not None:
             failures.append(effective_failure)
 
@@ -10241,6 +10308,7 @@ class FunctionalPopulation:
         extra=None,
         _multi_component_candidates: Mapping[str, Population] | None = None,
         _bind_owned_cache=True,
+        _retain_initialization_materializations=False,
     ):
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
@@ -10407,6 +10475,15 @@ class FunctionalPopulation:
 
         self._multi_component_plans = ()
         self._cache_value_specs = ()
+        self._materialization_value_specs = ()
+        self._materialization_prepared_paths = {}
+        self._has_snapshot_materialization_offsets = None
+        self._retain_initialization_materializations = (
+            _retain_initialization_materializations
+        )
+        self._material_live_parameter_names = frozenset(
+            _material_preparation_parameter_names(population)
+        )
         self._bind_owned_cache = _bind_owned_cache
         self._owned_cache_source_present = "_steady_state" in population._caches
         self._owned_cache_bound = (
@@ -10544,6 +10621,13 @@ class FunctionalPopulation:
         )
         self._initialization_transform_inputs = _initialization_transform_input_layout(
             execution_population
+        )
+        self._post_initialization_writes_parameters = any(
+            reference.startswith("parameters.")
+            for hook in _initialization_transform_hooks(execution_population, "post")
+            for reference in execution_population._initialization_transforms[
+                hook.action_name
+            ].writes
         )
         self._transition = _PopulationTransition(
             execution_population,
@@ -10695,7 +10779,13 @@ class FunctionalPopulation:
         # every discarded child mechanism/integrator/state tree a second time
         # merely to construct the parent preparation skeleton.
         preparation_population = _clone_execution_population(execution_population)
-        self._preparation = _PopulationPreparation(preparation_population, dt_tensor)
+        self._preparation = _PopulationPreparation(
+            preparation_population,
+            dt_tensor,
+            retain_initialization_materializations=(
+                _retain_initialization_materializations
+            ),
+        )
         if _geometry_binding_signature(self._preparation.geometry_bindings) != (
             _geometry_binding_signature(self._geometry_bindings)
         ):
@@ -10717,6 +10807,20 @@ class FunctionalPopulation:
                 for alias in constant.aliases
                 if f"population.{alias}" in self._base_mapping
             )
+        live_constant_slots = {
+            entry.key for entry in self._prepared_buffers if entry.kind == "constant"
+        }
+        self._retained_preparation_constant_names = frozenset(
+            entry.key
+            for entry in self._parametrization_constants
+            if entry.key not in self._torch_constant_names
+            and not live_constant_slots.intersection(entry.aliases)
+            and not any(
+                alias.startswith("_material_geometry.")
+                or ".material_processes." in alias
+                for alias in entry.aliases
+            )
+        )
         self._mechanism_delay_constant_names = tuple(
             (
                 f"{path}.{name}",
@@ -10758,7 +10862,9 @@ class FunctionalPopulation:
             for entry in self._prepared_buffers
             if entry.kind in {"derived", "timestep", "material_process"}
         )
-        if any(name is not None for name in self._preparation.offset_names):
+        if not _retain_initialization_materializations and any(
+            name is not None for name in self._preparation.offset_names
+        ):
             self._initialization_failures = (
                 *self._initialization_failures,
                 "live effective parameters differ from their raw deterministic "
@@ -10992,6 +11098,8 @@ class FunctionalPopulation:
         self._structured_step_graphs = {}
         self._structured_capture_errors = {}
         self._structured_capture_error = None
+        if _retain_initialization_materializations:
+            self._enable_retained_materializations()
         if self._owned_cache_bound:
             from ._population_cache import PopulationCachePlan
 
@@ -11724,7 +11832,10 @@ class FunctionalPopulation:
             failure = _validate_native_cable_source(population)
             if failure is not None:
                 raise FunctionalizationError(failure)
-            failure = _effective_population_parameter_failure(population)
+            failure = _effective_population_parameter_failure(
+                population,
+                allow_retained=self._retain_initialization_materializations,
+            )
             if failure is not None:
                 raise FunctionalizationError(failure)
         elif self._topology_kind == "scalar_tree":
@@ -11735,7 +11846,10 @@ class FunctionalPopulation:
             failure = _validate_scalar_tree_source(population)
             if failure is not None:
                 raise FunctionalizationError(failure)
-            failure = _effective_population_parameter_failure(population)
+            failure = _effective_population_parameter_failure(
+                population,
+                allow_retained=self._retain_initialization_materializations,
+            )
             if failure is not None:
                 raise FunctionalizationError(failure)
         elif self._topology_kind == "extcell_tree":
@@ -11746,7 +11860,10 @@ class FunctionalPopulation:
             failure = _validate_extcell_tree_source(population)
             if failure is not None:
                 raise FunctionalizationError(failure)
-            failure = _effective_population_parameter_failure(population)
+            failure = _effective_population_parameter_failure(
+                population,
+                allow_retained=self._retain_initialization_materializations,
+            )
             if failure is not None:
                 raise FunctionalizationError(failure)
         if _structure_for_plan(self, population) != self._fingerprint:
@@ -11790,14 +11907,8 @@ class FunctionalPopulation:
                     f"parameter {name!r} must use {expected_device}/{expected_dtype}"
                 )
 
-    def _enable_cache_materializations(self) -> None:
-        """Expose native effective buffers for a cache-bound Network plan.
-
-        Snapshot extraction leaves these operands inactive. Cached starts
-        activate them independently of the live source's raw parameters.
-        """
-        if self._cache_value_specs:
-            return
+    def _materialization_source_paths(self):
+        """Registered effective operands shared by cache and ordered initialization."""
         paths = []
         for name in self._preparation.population_parameter_names:
             if name in self._population._buffers:
@@ -11827,31 +11938,151 @@ class FunctionalPopulation:
                 for name in preparation.population_parameter_names
                 if name in component._buffers
             )
+        return tuple(dict.fromkeys(paths))
+
+    def _materialization_specs(self, paths, prefix):
         specs = []
-        for path in dict.fromkeys(paths):
+        for path in paths:
             value = self._population.get_buffer(path)
             specs.append(
                 (
-                    f"cache.values.{path}",
+                    f"{prefix}.values.{path}",
                     path,
                     _shape_tuple(value),
                     value.dtype,
                     value.device,
                 )
             )
-        self._cache_value_specs = tuple(specs)
+        return tuple(specs)
 
-    def _cache_preparation_inputs(self, constants, *, prefix=""):
+    def _enable_cache_materializations(self) -> None:
+        """Expose detached native operands for a cache-bound Population plan."""
         if not self._cache_value_specs:
-            return None, None
-        return (
-            {
-                path.removeprefix(prefix): constants[name]
-                for name, path, _shape, _dtype, _device in self._cache_value_specs
-                if path.startswith(prefix)
-            },
-            constants["cache.active"],
+            self._cache_value_specs = self._materialization_specs(
+                self._materialization_source_paths(), "cache"
+            )
+
+    def _enable_retained_materializations(self) -> None:
+        """Expose independently owned, differentiable initialization operands.
+
+        Network initialization captures each owner's values before later owners
+        can write shared sources. Effective buffers and solver workspaces have
+        separate slots: a later in-place buffer write need not rebuild a solver.
+        """
+        if self._materialization_value_specs:
+            return
+        paths = list(self._materialization_source_paths())
+        paths.extend(
+            f"{entry.module_path}.{entry.buffer_name}"
+            for entry in self._prepared_buffers
+            if entry.kind == "timestep"
         )
+        paths.extend(f"integrator.{name}" for name in self._integrator_workspace_names)
+        self._materialization_value_specs = self._materialization_specs(
+            tuple(dict.fromkeys(paths)), "materializations"
+        )
+        prepared_paths = {}
+        for name in self._preparation.population_parameter_names:
+            prepared_paths[name] = ("population", name)
+        for entry in self._prepared_buffers:
+            if entry.kind != "torch_parameter":
+                prepared_paths[f"{entry.module_path}.{entry.buffer_name}"] = (
+                    "mechanisms",
+                    entry.key,
+                )
+        for name in self._integrator_workspace_names:
+            prepared_paths[f"integrator.{name}"] = ("integrator", name)
+        self._materialization_prepared_paths = prepared_paths
+
+    @staticmethod
+    def _materialization_active_name(path):
+        return f"materializations.active.{path}"
+
+    @staticmethod
+    def _materialization_baseline_name(path):
+        return f"materializations.baseline.{path}"
+
+    def _clear_retained_materializations(self, constants):
+        if not self._materialization_value_specs:
+            return constants
+        # Fresh preparation discards these values. Cut their old graph before
+        # inactive torch.where routes can revisit a completed backward pass.
+        return {
+            **constants,
+            **{
+                name: constants[name].detach()
+                for name, _path, *_schema in self._materialization_value_specs
+            },
+            **{
+                self._materialization_active_name(path): torch.zeros_like(
+                    constants[self._materialization_active_name(path)]
+                )
+                for _name, path, *_schema in self._materialization_value_specs
+            },
+        }
+
+    def _retain_materializations(self, parameters, constants, *, prepared=None):
+        """Capture native preparation without detaching fresh initialization graphs."""
+        if not self._materialization_value_specs:
+            return constants
+        if prepared is None:
+            prepared = self._prepare_values(
+                parameters, constants, use_snapshot_offsets=False
+            )
+        values = prepared.get("materializations", {})
+        return {
+            **constants,
+            **{
+                name: values[path].clone(memory_format=torch.preserve_format)
+                for name, path, *_schema in self._materialization_value_specs
+            },
+            **{
+                self._materialization_active_name(path): torch.ones_like(
+                    constants[self._materialization_active_name(path)]
+                )
+                for _name, path, *_schema in self._materialization_value_specs
+            },
+            **{
+                self._materialization_baseline_name(path): torch.zeros_like(
+                    constants[self._materialization_baseline_name(path)]
+                )
+                for _name, path, *_schema in self._materialization_value_specs
+            },
+        }
+
+    def _cache_preparation_inputs(
+        self,
+        constants,
+        *,
+        prefix="",
+        use_snapshot_offsets=True,
+        snapshot_baseline_capture=None,
+    ):
+        if not self._cache_value_specs and not self._materialization_value_specs:
+            return None, None
+        values = {
+            path.removeprefix(prefix): constants[name]
+            for name, path, _shape, _dtype, _device in self._cache_value_specs
+            if path.startswith(prefix)
+        }
+        for name, path, *_schema in self._materialization_value_specs:
+            if path.startswith(prefix):
+                relative = path.removeprefix(prefix)
+                values[relative] = (
+                    _SnapshotMaterialization(
+                        constants[name], path, snapshot_baseline_capture
+                    )
+                    if snapshot_baseline_capture is not None
+                    else _RetainedMaterialization(
+                        values.get(relative),
+                        constants[name],
+                        constants[self._materialization_active_name(path)],
+                        constants[self._materialization_baseline_name(path)]
+                        if use_snapshot_offsets
+                        else None,
+                    )
+                )
+        return values, constants.get("cache.active")
 
     def _validate_constants(self, constants) -> None:
         if not isinstance(constants, Mapping):
@@ -11874,6 +12105,14 @@ class FunctionalPopulation:
         if self._cache_value_specs:
             expected_names.update(name for name, *_ in self._cache_value_specs)
             expected_names.add("cache.active")
+        for name, path, *_schema in self._materialization_value_specs:
+            expected_names.update(
+                (
+                    name,
+                    self._materialization_active_name(path),
+                    self._materialization_baseline_name(path),
+                )
+            )
         if set(constants) != expected_names:
             missing = sorted(expected_names - set(constants))
             unexpected = sorted(set(constants) - expected_names)
@@ -11951,6 +12190,29 @@ class FunctionalPopulation:
             ):
                 raise ValueError(
                     f"constant 'cache.active' must be a scalar bool on {self.device}"
+                )
+        for name, path, shape, dtype, device in self._materialization_value_specs:
+            for value_name in (name, self._materialization_baseline_name(path)):
+                value = constants[value_name]
+                if (
+                    not torch.is_tensor(value)
+                    or _shape_tuple(value) != shape
+                    or value.dtype != dtype
+                    or value.device != device
+                ):
+                    raise ValueError(
+                        f"constant {value_name!r} has incompatible retained schema"
+                    )
+            active_name = self._materialization_active_name(path)
+            active = constants[active_name]
+            if (
+                not torch.is_tensor(active)
+                or _shape_tuple(active) != ()
+                or active.dtype != torch.bool
+                or active.device != self.device
+            ):
+                raise ValueError(
+                    f"constant {active_name!r} must be a scalar bool on {self.device}"
                 )
         if self._random_plan is not None:
             for name, (shape, dtype, device) in self._random_plan.schema.items():
@@ -12291,8 +12553,63 @@ class FunctionalPopulation:
             constants["cache.active"] = torch.zeros(
                 (), device=self.device, dtype=torch.bool
             )
+        if self._materialization_value_specs:
+            constants.update(
+                {
+                    name: _clone_tensor(population.get_buffer(path))
+                    for name, path, *_schema in self._materialization_value_specs
+                }
+            )
+            constants.update(
+                {
+                    self._materialization_active_name(path): torch.zeros(
+                        (), device=self.device, dtype=torch.bool
+                    )
+                    for _name, path, *_schema in self._materialization_value_specs
+                }
+            )
+            constants.update(
+                {
+                    self._materialization_baseline_name(path): torch.zeros_like(
+                        constants[name]
+                    )
+                    for name, path, *_schema in self._materialization_value_specs
+                }
+            )
         if self._random_plan is not None:
             constants.update(_random_constants)
+        if self._materialization_value_specs:
+            baselines = {}
+            with torch.no_grad():
+                self._prepare_values(
+                    parameters,
+                    constants,
+                    _snapshot_baseline_capture=baselines,
+                )
+            expected_baselines = {
+                path
+                for _name, path, *_schema in self._materialization_value_specs
+                if path != "integrator.dt"
+            }
+            if set(baselines) != expected_baselines:
+                raise FunctionalizationError(
+                    "Snapshot preparation did not visit every retained operand: "
+                    f"missing={sorted(expected_baselines - set(baselines))}, "
+                    f"unexpected={sorted(set(baselines) - expected_baselines)}"
+                )
+            constants.update(
+                {
+                    self._materialization_baseline_name(path): baseline
+                    for path, baseline in baselines.items()
+                }
+            )
+            if self._has_snapshot_materialization_offsets is None:
+                self._has_snapshot_materialization_offsets = any(
+                    not torch.equal(
+                        constants[f"materializations.values.{path}"], baseline
+                    )
+                    for path, baseline in baselines.items()
+                )
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         initialization_states = {}
@@ -12360,6 +12677,7 @@ class FunctionalPopulation:
         preparation=None,
         base_mapping=None,
         for_initialization=False,
+        use_snapshot_offsets=True,
         material_area=None,
         cache_values=None,
         cache_active=None,
@@ -12393,6 +12711,7 @@ class FunctionalPopulation:
             ),
             {
                 "for_initialization": for_initialization,
+                "use_snapshot_offsets": use_snapshot_offsets,
                 "material_area": (
                     None if material_area is None else material_area.clone()
                 ),
@@ -12493,8 +12812,9 @@ class FunctionalPopulation:
         """Purely initialize from declared defaults or a bound steady-state cache.
 
         Without an owned cache, registered pure pre/post transforms consume
-        ``inputs.transforms`` in native registration order and constants pass
-        through unchanged. A bound ``inputs.cache`` restores detached saved
+        ``inputs.transforms`` in native registration order. Network-owned plans
+        also return their differentiable per-Population materializations in the
+        constant frame. A bound ``inputs.cache`` restores detached saved
         state and materializations, skips fresh initialization hooks, and
         returns effective parameters and constants. Both paths reset the
         Population clock and duration remainder. RAND declarations consume an
@@ -12507,6 +12827,7 @@ class FunctionalPopulation:
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         self._validate_initialization(inputs)
+        constants = self._clear_retained_materializations(constants)
         if self._owned_cache_bound and not (
             self._random_plan is not None
             and any(
@@ -12649,6 +12970,16 @@ class FunctionalPopulation:
             state["random"] = self._random_plan.state(
                 constants, selected_random_draw.rng
             )
+        constants = self._retain_materializations(
+            initialized_parameters,
+            constants,
+            prepared=(
+                None
+                if self._post_initialization_writes_parameters
+                or self._preparation.timestep_module_paths
+                else prepared
+            ),
+        )
         self._validate_parameters(initialized_parameters)
         self._validate_state(state)
         return PopulationTensors(
@@ -12767,7 +13098,40 @@ class FunctionalPopulation:
         preparation=None,
         preparation_base_mapping=None,
         for_initialization=False,
+        use_snapshot_offsets=True,
+        _snapshot_baseline_capture=None,
     ):
+        if for_initialization:
+            use_snapshot_offsets = False
+        if self._materialization_value_specs:
+            retained_active = torch.stack(
+                tuple(
+                    constants[self._materialization_active_name(path)]
+                    for _name, path, *_schema in self._materialization_value_specs
+                )
+            ).any()
+            # An inactive rematerialization may have a nonfinite derivative
+            # at a source written by a later owner. Stop that discarded raw
+            # route before authored arithmetic; retained values keep their own
+            # differentiable initialization graphs. Native Torch properties
+            # remain live and consume their explicit original parameters.
+            parameters = {
+                name: (
+                    value
+                    if name in self._torch_parameter_names
+                    or name in self._material_live_parameter_names
+                    else torch.where(retained_active, value.detach(), value)
+                )
+                for name, value in parameters.items()
+            }
+            constants = {
+                name: (
+                    torch.where(retained_active, value.detach(), value)
+                    if name in self._retained_preparation_constant_names
+                    else value
+                )
+                for name, value in constants.items()
+            }
         if self._cache_value_specs:
             active = constants["cache.active"]
             # Native cache restoration detaches effective Population buffers.
@@ -12789,6 +13153,7 @@ class FunctionalPopulation:
                     value
                     if name == "dt"
                     or name.startswith("cache.")
+                    or name.startswith("materializations.")
                     or name in self._torch_constant_names
                     else torch.where(active, value.detach(), value)
                 )
@@ -12801,6 +13166,8 @@ class FunctionalPopulation:
                 preparation=preparation,
                 preparation_base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
+                use_snapshot_offsets=use_snapshot_offsets,
+                _snapshot_baseline_capture=_snapshot_baseline_capture,
             )
 
         shape = self.shape
@@ -12815,7 +13182,11 @@ class FunctionalPopulation:
         xg = constants.get("xg")
         dx = constants["dx"]
         dt = constants["dt"]
-        cache_values, cache_active = self._cache_preparation_inputs(constants)
+        cache_values, cache_active = self._cache_preparation_inputs(
+            constants,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=_snapshot_baseline_capture,
+        )
 
         population_values, mechanism_values, local_geometry_values, random_outputs = (
             self._prepare_parameter_buffers(
@@ -12832,6 +13203,9 @@ class FunctionalPopulation:
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
+                use_snapshot_offsets=(
+                    use_snapshot_offsets and not self._materialization_value_specs
+                ),
                 material_area=constants.get("canonical_area_cm2"),
                 cache_values=cache_values,
                 cache_active=cache_active,
@@ -13113,7 +13487,12 @@ class FunctionalPopulation:
             values["local_geometry"] = local_geometry_values
         if random_outputs is not None:
             values["random"] = random_outputs
-        return values
+        return self._finish_retained_preparation(
+            values,
+            constants,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=_snapshot_baseline_capture,
+        )
 
     def _prepare_multi_values(
         self,
@@ -13123,6 +13502,8 @@ class FunctionalPopulation:
         preparation=None,
         preparation_base_mapping=None,
         for_initialization=False,
+        use_snapshot_offsets=True,
+        _snapshot_baseline_capture=None,
     ):
         """Derive one differentiable packed workspace from component sources."""
         dt = constants["dt"]
@@ -13154,6 +13535,7 @@ class FunctionalPopulation:
         block_shell_edges = []
         block_xc = []
         block_xg = []
+        component_materializations = {}
 
         for index, component_record in enumerate(self._multi_component_plans):
             component_preparation = physical_preparations[index]
@@ -13188,7 +13570,10 @@ class FunctionalPopulation:
             component_diameters = component_constants.get("diameters")
             component_diam_original = component_constants.get("diam_original")
             cache_values, cache_active = self._cache_preparation_inputs(
-                constants, prefix=f"populations.{component_record.name}."
+                constants,
+                prefix=f"populations.{component_record.name}.",
+                use_snapshot_offsets=use_snapshot_offsets,
+                snapshot_baseline_capture=_snapshot_baseline_capture,
             )
             component_outputs = functional_call(
                 component_preparation,
@@ -13207,7 +13592,10 @@ class FunctionalPopulation:
                         else component_diam_original.clone()
                     ),
                 ),
-                {"cache_values": cache_values, "cache_active": cache_active},
+                {
+                    "cache_values": cache_values,
+                    "cache_active": cache_active,
+                },
                 tie_weights=False,
             )
             population_values = dict(
@@ -13217,6 +13605,13 @@ class FunctionalPopulation:
                     strict=True,
                 )
             )
+            if self._materialization_value_specs:
+                component_materializations.update(
+                    {
+                        f"populations.{component_record.name}.{name}": value
+                        for name, value in population_values.items()
+                    }
+                )
             geometry_values = {**component_constants, **population_values}
 
             def expanded(value):
@@ -13387,7 +13782,11 @@ class FunctionalPopulation:
             name: torch.cat(parts, dim=-1).unsqueeze(-2)
             for name, parts in packed_fields.items()
         }
-        cache_values, cache_active = self._cache_preparation_inputs(constants)
+        cache_values, cache_active = self._cache_preparation_inputs(
+            constants,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=_snapshot_baseline_capture,
+        )
         parent_fields = {
             name: _cache_materialization(
                 value,
@@ -13419,6 +13818,9 @@ class FunctionalPopulation:
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
+                use_snapshot_offsets=(
+                    use_snapshot_offsets and not self._materialization_value_specs
+                ),
                 material_area=parent_fields["point_area"],
                 cache_values=cache_values,
                 cache_active=cache_active,
@@ -13443,6 +13845,18 @@ class FunctionalPopulation:
                 area=parent_fields["area"],
             )
         elif self._topology_kind == "multi_block":
+            packed_xc = _cache_materialization(
+                torch.cat(block_xc, dim=-2).reshape(*self.shape, 2),
+                "xc",
+                cache_values,
+                cache_active,
+            )
+            packed_xg = _cache_materialization(
+                torch.cat(block_xg, dim=-2).reshape(*self.shape, 2),
+                "xg",
+                cache_values,
+                cache_active,
+            )
             integrator_workspace = packed_integrator._derive_prepared_workspace(
                 dt,
                 cm=(parent_fields["cm"] * parent_fields["cm_scale"]).reshape(
@@ -13451,18 +13865,8 @@ class FunctionalPopulation:
                 area=parent_fields["area"].reshape(self._solve_shape),
                 intracellular_edge_conductance=torch.cat(compact_edges, dim=-1),
                 extracellular_edge_conductance=torch.cat(block_shell_edges, dim=-2),
-                xc=_cache_materialization(
-                    torch.cat(block_xc, dim=-2).reshape(*self.shape, 2),
-                    "xc",
-                    cache_values,
-                    cache_active,
-                ).reshape(*self._solve_shape, 2),
-                xg=_cache_materialization(
-                    torch.cat(block_xg, dim=-2).reshape(*self.shape, 2),
-                    "xg",
-                    cache_values,
-                    cache_active,
-                ).reshape(*self._solve_shape, 2),
+                xc=packed_xc.reshape(*self._solve_shape, 2),
+                xg=packed_xg.reshape(*self._solve_shape, 2),
                 edge_child_orig=packed_integrator.edge_child_orig,
                 solver_order=packed_integrator.solver_order,
             )
@@ -13492,6 +13896,70 @@ class FunctionalPopulation:
             values["local_geometry"] = local_geometry_values
         if random_outputs is not None:
             values["random"] = random_outputs
+        component_materializations.update(
+            {
+                "diam": parent_fields["diam"],
+                "dx": parent_fields["dx"],
+                "_component_area": parent_fields["point_area"],
+                **(
+                    {
+                        "xc": packed_xc,
+                        "xg": packed_xg,
+                    }
+                    if self._topology_kind == "multi_block"
+                    else {}
+                ),
+            }
+        )
+        return self._finish_retained_preparation(
+            values,
+            constants,
+            extras=component_materializations,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=_snapshot_baseline_capture,
+        )
+
+    def _finish_retained_preparation(
+        self,
+        values,
+        constants,
+        *,
+        extras=None,
+        use_snapshot_offsets=True,
+        snapshot_baseline_capture=None,
+    ):
+        if not self._materialization_value_specs:
+            return values
+        overrides, active = self._cache_preparation_inputs(
+            constants,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=snapshot_baseline_capture,
+        )
+        values["integrator"] = {
+            name: (
+                value
+                if name == "dt"
+                else _cache_materialization(
+                    value,
+                    f"integrator.{name}",
+                    overrides,
+                    active,
+                )
+            )
+            for name, value in values["integrator"].items()
+        }
+        extras = {} if extras is None else extras
+        retained = {}
+        for _name, path, *_schema in self._materialization_value_specs:
+            if path in self._materialization_prepared_paths:
+                section, key = self._materialization_prepared_paths[path]
+                value = values[section][key]
+            elif path in extras and extras[path] is not None:
+                value = extras[path]
+            else:
+                value = values["geometry"][path]
+            retained[path] = value
+        values["materializations"] = retained
         return values
 
     def _validate_prepared_freshness(self, prepared, parameters) -> Mapping:
@@ -13564,6 +14032,8 @@ class FunctionalPopulation:
             expected_sections.add("local_geometry")
         if self._random_plan is not None:
             expected_sections.add("random")
+        if self._materialization_value_specs:
+            expected_sections.add("materializations")
         if not isinstance(values, Mapping) or set(values) != expected_sections:
             raise FunctionalizationError("prepared tensor schema is invalid")
         if not isinstance(values["geometry"], Mapping) or set(
@@ -13663,6 +14133,25 @@ class FunctionalPopulation:
                     f"prepared PointProcess area factor {entry.key} must use "
                     f"{self.device}/{self.dtype}"
                 )
+        if self._materialization_value_specs:
+            retained = values["materializations"]
+            if not isinstance(retained, Mapping) or set(retained) != {
+                path for _name, path, *_schema in self._materialization_value_specs
+            }:
+                raise FunctionalizationError(
+                    "prepared materialization schema is invalid"
+                )
+            for _name, path, shape, dtype, device in self._materialization_value_specs:
+                value = retained[path]
+                if (
+                    not torch.is_tensor(value)
+                    or _shape_tuple(value) != shape
+                    or value.dtype != dtype
+                    or value.device != device
+                ):
+                    raise FunctionalizationError(
+                        f"prepared retained materialization {path!r} has invalid schema"
+                    )
         return values
 
     def _mapping(
@@ -16014,6 +16503,7 @@ def make_functional(
     dt: float,
     extra=None,
     _bind_owned_cache=True,
+    _retain_initialization_materializations=False,
 ) -> tuple[FunctionalPopulation, PopulationTensors]:
     """Lower an initialized Population into a pure transition."""
     if isinstance(dt, bool):
@@ -16039,6 +16529,9 @@ def make_functional(
             population,
             dt_value,
             multi_component_candidates=multi_component_candidates,
+            _retain_initialization_materializations=(
+                _retain_initialization_materializations
+            ),
         )
         if failures:
             details = "\n".join(f"- {failure}" for failure in dict.fromkeys(failures))
@@ -16057,6 +16550,9 @@ def make_functional(
                 extra=extra,
                 _multi_component_candidates=multi_component_candidates,
                 _bind_owned_cache=_bind_owned_cache,
+                _retain_initialization_materializations=(
+                    _retain_initialization_materializations
+                ),
             )
             construction_rng = (
                 _global_rng_changes(rng_state, device) if check_purity else ()

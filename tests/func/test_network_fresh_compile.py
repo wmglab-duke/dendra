@@ -196,7 +196,11 @@ def test_fresh_network_parameter_replacements_are_explicit_and_not_cached():
         torch.testing.assert_close(effective, 0.8 * runner.get_parameter(name))
         with pytest.raises(ValueError, match="parameters|continu"):
             runner(first)
-        continued, continued_aux = runner(first, parameters=auxiliary["parameters"])
+        continued, continued_aux = runner(
+            first,
+            parameters=auxiliary["parameters"],
+            constants=auxiliary["constants"],
+        )
         assert (
             continued_aux["parameters"]["populations"]["cell"][effective_name]
             is effective
@@ -285,37 +289,52 @@ def test_unsupported_fresh_network_initialization_does_not_fall_back_to_snapshot
 
 
 @pytest.mark.parametrize("execution", ("pure", "runner"))
-def test_late_shared_runtime_parameter_writes_fail_before_initialization(execution):
-    with dn.ctx(JIT=0, REQUIRE_GRAD=1, DTYPE=DTYPE, DEVICE="cpu"):
-        populations = {}
-        for name in ("left", "right"):
-            population = dn.SingleCompartment(
-                N=1, C=1, integrator=dn.bwd_euler_sc(imem=False), v_init=-60.0
+def test_late_shared_runtime_parameter_writes_preserve_native_materializations(
+    execution,
+):
+    def network():
+        with dn.ctx(JIT=0, REQUIRE_GRAD=1, DTYPE=DTYPE, DEVICE="cpu"):
+            populations = {}
+            for name in ("left", "right"):
+                population = dn.SingleCompartment(
+                    N=1, C=1, integrator=dn.bwd_euler_sc(imem=False), v_init=-60.0
+                )
+                population.insert(pas, g=0.001, e=-65.0)
+                population.build()
+                populations[name] = population
+            populations["right"].cm_scale_param.rho = populations[
+                "left"
+            ].cm_scale_param.rho
+            model = dn.Network(populations)
+            model.train()
+            model.initialize(DT)
+            # The later write updates the shared raw source, while LEFT retains
+            # the capacitance and solver coefficients prepared before that write.
+            populations["right"].register_pre_initialize_transform(
+                "late_capacitance_scale",
+                _ScaleParameter(),
+                reads=("parameters.cm_scale_param.rho",),
+                writes=("parameters.cm_scale_param.rho",),
+                inputs={"factor": populations["right"].v.new_tensor(1.5)},
             )
-            population.insert(pas, g=0.001, e=-65.0)
-            population.build()
-            populations[name] = population
-        populations["right"].cm_scale_param.rho = populations["left"].cm_scale_param.rho
-        model = dn.Network(populations)
-        model.train()
-        model.initialize(DT)
-        # Registration after ordinary initialization leaves the source's live
-        # effective values coherent and admits ordinary transition lowering.
-        # Reinitializing LEFT before this RIGHT write would retain LEFT's old
-        # capacitance coefficients, which a final shared parameter cannot express.
-        populations["right"].register_pre_initialize_transform(
-            "late_capacitance_scale",
-            _ScaleParameter(),
-            reads=("parameters.cm_scale_param.rho",),
-            writes=("parameters.cm_scale_param.rho",),
-            inputs={"factor": populations["right"].v.new_tensor(1.5)},
-        )
+        return model
+
+    model, native = network(), network()
     functional, tensors = dn.func.make_functional_network(model)
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="shared|earlier Population|initialization",
-    ):
-        if execution == "pure":
-            functional.initialize(*tensors, functional.initialization_inputs)
-        else:
-            _runner(model, inference=False)()
+    frozen = _clone(tensors, detached=True)
+    native.initialize(DT)
+    if execution == "pure":
+        initialized = functional.initialize(*tensors, functional.initialization_inputs)
+        left = initialized.parameters["populations"]["left"]["cm_scale_param.rho"]
+        right = initialized.parameters["populations"]["right"]["cm_scale_param.rho"]
+        assert left is right
+        actual, _ = functional.prepare_and_step(*initialized)
+        native.step()
+    else:
+        runner = _runner(model, inference=False)
+        actual, _ = runner()
+        for _ in range(3):
+            native.step()
+    assert not torch.allclose(native.left.cm_scale, native.right.cm_scale)
+    _close(actual, functional.extract(native).state)
+    _close(tensors, frozen)

@@ -106,10 +106,7 @@ def test_population_cache_and_fresh_transforms_publish_shared_parameter_writes_i
     _close(actual, functional.extract(native).state)
 
 
-@pytest.mark.parametrize("cached_first", (False, True))
-def test_owned_cache_shared_retained_materializations_reject_fresh_but_allow_snapshot(
-    cached_first,
-):
+def _retained_alias_network(cached_first):
     cells = {
         name: dn.SingleCompartment(
             N=1, C=1, integrator=dn.bwd_euler_sc(imem=False), v_init=-50.0
@@ -135,22 +132,37 @@ def test_owned_cache_shared_retained_materializations_reject_fresh_but_allow_sna
         field = "shared_effective_g"
     cells["cached"].cache("_steady_state")
     cells["cached"]._caches["_steady_state"][field].fill_(0.003)
+    return network
+
+
+@pytest.mark.parametrize("cached_first", (False, True))
+def test_owned_cache_shared_retained_materializations_follow_native_order(cached_first):
+    network, native = (
+        _retained_alias_network(cached_first),
+        _retained_alias_network(cached_first),
+    )
     functional, tensors = dn.func.make_functional_network(network)
     before = _clone(tensors, detached=True)
-    with pytest.raises(
-        dn.func.FunctionalizationError, match="retained materializations"
-    ):
-        functional.initialize(*tensors, functional.initialization_inputs)
+    initialized = functional.initialize(*tensors, functional.initialization_inputs)
     _close(tensors, before)
-    functional.prepare_and_step(*tensors)
-    network.initialize(DT)
+    native.initialize(DT)
+    _close(initialized.state, functional.extract(native).state)
+    actual = initialized.state
+    for _ in range(3):
+        actual, _ = functional.prepare_and_step(
+            initialized.parameters, initialized.constants, actual
+        )
+        native.step()
+        _close(actual, functional.extract(native).state)
+    fresh = next(iter(native.populations["fresh"].mech.mechanisms.values()))
+    cached = next(iter(native.populations["cached"].mech.mechanisms.values()))
     expected = 0.001 if cached_first else 0.003
     torch.testing.assert_close(fresh.g, torch.full_like(fresh.g, expected))
     if cached_first:
         torch.testing.assert_close(cached.g, fresh.g)
 
 
-def test_later_owned_cache_shared_runtime_parameter_rejects_earlier_fresh_reader():
+def _late_runtime_cache_network():
     shared = torch.nn.Parameter(torch.tensor(0.001, dtype=DTYPE))
     cells = {
         name: dn.SingleCompartment(N=1, C=1, integrator=dn.bwd_euler_sc(imem=False))
@@ -166,12 +178,31 @@ def test_later_owned_cache_shared_runtime_parameter_rejects_earlier_fresh_reader
     ]
     assert all(mechanism.g_param is shared for mechanism in mechanisms)
     cells["cached"].cache("_steady_state")
+    cells["cached"]._caches["_steady_state"][
+        "integrator.mech.mechanisms.pas.g_param"
+    ].fill_(0.003)
+    return network
+
+
+def test_later_owned_cache_shared_runtime_parameter_preserves_earlier_fresh_reader():
+    network, native = _late_runtime_cache_network(), _late_runtime_cache_network()
     functional, tensors = dn.func.make_functional_network(network)
-    with pytest.raises(
-        dn.func.FunctionalizationError, match="shared runtime parameter"
-    ):
-        functional.initialize(*tensors, functional.initialization_inputs)
-    functional.prepare_and_step(*tensors)
+    frozen = _clone((tensors, functional.initialization_inputs), detached=True)
+    initialized = functional.initialize(*tensors, functional.initialization_inputs)
+    key = "integrator.mech.mechanisms.pas.g_param"
+    assert (
+        initialized.parameters["populations"]["fresh"][key]
+        is initialized.parameters["populations"]["cached"][key]
+    )
+    native.initialize(DT)
+    actual = initialized.state
+    for _ in range(3):
+        actual, _ = functional.prepare_and_step(
+            initialized.parameters, initialized.constants, actual
+        )
+        native.step()
+        _close(actual, functional.extract(native).state)
+    _close((tensors, functional.initialization_inputs), frozen)
 
 
 def test_network_global_cache_takes_precedence_over_population_owned_cache():

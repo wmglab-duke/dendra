@@ -104,9 +104,11 @@ When it is captured, the per-Population `InitializationInput.cache` fields are
 Populations initialize in authored Network order. A cached Population restores
 its saved values at its position in that order; an uncached Population runs its
 fresh initializer there. Shared parameter writes follow that same order.
-Shared runtime buffers between cached and fresh Populations that retain
-different initialization materializations are currently unsupported. Use
-independent buffers for those Populations.
+Shared runtime sources between cached and fresh Populations follow native
+copy and preparation order. Each Population retains its prepared numerical
+operands independently of later writes to shared raw parameters or effective
+buffer storage. See {doc}`A43_functional_initialization_ordering` for examples
+and gradient boundaries.
 
 Standalone `dn.compile(population, initialization="fresh", ...)` also restores
 the Population's own `steady_state` cache. Its mapping is exposed directly at

@@ -419,9 +419,11 @@ class FunctionalNetwork:
                 dt=self.dt,
                 extra=extra.get(name),
                 _bind_owned_cache=not bool(network._state_cache),
+                _retain_initialization_materializations=True,
             )
             if network._state_cache:
                 plan._enable_cache_materializations()
+            plan._enable_retained_materializations()
             self.populations[name] = plan
             initialization[name] = packet.initialization
         self._source_table_aliases = network_table_alias_signature(network)
@@ -575,10 +577,16 @@ class FunctionalNetwork:
         from ._network_initialization import cache_alias_bindings
 
         self._cache_alias_bindings = cache_alias_bindings(self)
-        from ._network_initialization import population_cache_alias_bindings
+        from ._network_initialization import (
+            population_cache_alias_bindings,
+            population_materialization_alias_bindings,
+        )
 
         self._owned_cache_alias_plans, self._owned_cache_alias_error = (
             population_cache_alias_bindings(self)
+        )
+        self._materialization_alias_plans, self._materialization_alias_error = (
+            population_materialization_alias_bindings(self)
         )
         self._initialization_inputs = NetworkInitializationInput(
             populations=initialization,
@@ -621,6 +629,8 @@ class FunctionalNetwork:
             )
         if self._owned_cache_alias_error is not None:
             raise FunctionalizationError(self._owned_cache_alias_error)
+        if self._materialization_alias_error is not None:
+            raise FunctionalizationError(self._materialization_alias_error)
         if self._nonpersistent_material_cache_failures:
             raise FunctionalizationError(
                 "\n".join(self._nonpersistent_material_cache_failures)
@@ -657,8 +667,10 @@ class FunctionalNetwork:
         present. A bound Network-wide cache restores detached Population
         materializations and connection history. Without that cache, each
         Population restores its own bound cache or runs fresh initialization
-        in authored order. Resulting parameters and constants accompany state in
-        :class:`NetworkTensors`.
+        in authored order. Shared raw writes reach later owners, while each
+        Population retains the effective buffers and solver workspaces prepared
+        at its own boundary. Resulting parameters and constants accompany state
+        in :class:`NetworkTensors`; keep all three for explicit continuation.
         """
         from ._network_initialization import initialize
 

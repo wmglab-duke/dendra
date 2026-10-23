@@ -101,10 +101,30 @@ def _callable_binding(value):
     return id(target), id(getattr(target, "__code__", None))
 
 
+class _RawClassDescriptor:
+    """Read one descriptor through a raw class-dictionary comparison.
+
+    Mapping proxies delegate equality to their underlying dictionary. This
+    keeps the raw lookup visible to Dynamo after functional_call has rebound
+    private module dictionaries, without executing a descriptor getter.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.value = None
+
+    def __eq__(self, namespace):
+        if self.name not in namespace:
+            return False
+        self.value = namespace[self.name]
+        return True
+
+
 def _static_descriptor(owner, name):
     for cls in type(owner).__mro__:
-        if name in vars(cls):
-            return vars(cls)[name]
+        lookup = _RawClassDescriptor(name)
+        if cls.__dict__ == lookup:
+            return lookup.value
     return None
 
 

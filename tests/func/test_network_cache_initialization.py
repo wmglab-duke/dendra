@@ -99,6 +99,13 @@ def _cache_initialized_native_packet(functional, native):
     for constants in packet.constants["populations"].values():
         if "cache.active" in constants:
             constants["cache.active"] = torch.ones_like(constants["cache.active"])
+        # Fresh initialization publishes explicit owner materializations;
+        # ordinary extraction keeps its live snapshot bindings inactive.
+        for name, value in tuple(constants.items()):
+            if name.startswith("materializations.active."):
+                constants[name] = torch.ones_like(value)
+            elif name.startswith("materializations.baseline."):
+                constants[name] = torch.zeros_like(value)
     # Fresh connections use their current raw materialization; extraction
     # additionally retains the native initialized output as a snapshot offset.
     for collection in ("synapses", "continuous_synapses"):

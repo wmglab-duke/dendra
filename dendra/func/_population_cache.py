@@ -366,7 +366,10 @@ class PopulationCachePlan:
                 )
                 if source is not None:
                     self.constants[public] = source
-        for public, source, _shape, _dtype, _device in plan._cache_value_specs:
+        for public, source, _shape, _dtype, _device in (
+            *plan._cache_value_specs,
+            *plan._materialization_value_specs,
+        ):
             value = slots[source]
             self.constants[public] = key(value, source)
         represented = {
@@ -533,6 +536,7 @@ class PopulationCachePlan:
             effective_constants["cache.active"] = torch.ones_like(
                 constants["cache.active"]
             )
+        effective_constants = plan._clear_retained_materializations(effective_constants)
         restored_state = {}
         for path, source in self.states:
             reference = _get_path(state, path)

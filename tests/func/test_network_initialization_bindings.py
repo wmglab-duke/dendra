@@ -28,7 +28,7 @@ def _cell():
     return cell
 
 
-def _cross_population_binding(*, shared=True):
+def _cross_population_binding(*, shared=True, reader_first=False):
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, DTYPE=DTYPE, DEVICE="cpu"):
         parameter = torch.nn.Parameter(
             torch.tensor([1.0], dtype=DTYPE), requires_grad=False
@@ -46,7 +46,12 @@ def _cross_population_binding(*, shared=True):
         right.register_parametrization_in_graph(
             "cm", _ScaleByArgument(), args=("factor",)
         )
-        model = dn.Network({"left": left, "right": right})
+        populations = (
+            {"right": right, "left": left}
+            if reader_first
+            else {"left": left, "right": right}
+        )
+        model = dn.Network(populations)
         model.train()
         model.initialize(DT)
         key = next(
@@ -65,24 +70,40 @@ def _cross_population_binding(*, shared=True):
 
 
 @pytest.mark.parametrize("execution", ("pure", "runner"))
-def test_fresh_parameter_writes_shared_with_other_population_constants_fail(execution):
-    model, key = _cross_population_binding()
+@pytest.mark.parametrize("reader_first", (False, True))
+def test_fresh_parameter_writes_publish_config_aliases_and_retain_native_readers(
+    execution, reader_first
+):
+    model, key = _cross_population_binding(reader_first=reader_first)
+    native, _ = _cross_population_binding(reader_first=reader_first)
     functional, tensors = dn.func.make_functional_network(model)
     parameter = tensors.parameters["populations"]["left"][key]
     constant = tensors.constants["populations"]["right"]["parametrizations.factor"]
     assert parameter is constant
-    with pytest.raises(dn.func.FunctionalizationError, match="shared.*constants"):
-        if execution == "pure":
-            functional.initialize(*tensors, functional.initialization_inputs)
-        else:
-            dn.compile(
-                model,
-                dt=DT,
-                steps=1,
-                initialization="fresh",
-                inference=False,
-                disable=True,
-            )()
+    if execution == "pure":
+        initialized = functional.initialize(*tensors, functional.initialization_inputs)
+        replacement = initialized.parameters["populations"]["left"][key]
+        assert (
+            replacement
+            is initialized.constants["populations"]["right"]["parametrizations.factor"]
+        )
+        actual, _ = functional.prepare_and_step(*initialized)
+    else:
+        actual, _ = dn.compile(
+            model,
+            dt=DT,
+            steps=1,
+            initialization="fresh",
+            inference=False,
+            disable=True,
+        )()
+    native.initialize(DT)
+    native.step()
+    _close(actual, functional.extract(native).state)
+    torch.testing.assert_close(
+        native.right.cm,
+        native.right.cm.new_full(native.right.cm.shape, 1.0 if reader_first else 2.0),
+    )
     torch.testing.assert_close(parameter, parameter.new_tensor([1.0]))
     torch.testing.assert_close(model.right.factor, parameter.new_tensor([1.0]))
 
@@ -106,7 +127,9 @@ def test_cross_population_constant_alias_does_not_block_snapshot_or_continuation
         disable=True,
     )
     expected, _ = snapshot()
-    actual, _ = fresh(fresh.initial_state, parameters=fresh.parameters)
+    actual, _ = fresh(
+        fresh.initial_state, parameters=fresh.parameters, constants=fresh.constants
+    )
     _close(actual, expected)
     assert actual["clock"]["step"].item() == 1
 

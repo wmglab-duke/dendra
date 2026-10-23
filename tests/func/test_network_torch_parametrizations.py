@@ -371,11 +371,15 @@ def test_cached_parametrized_effective_buffer_retains_native_transform_gradients
     _close(initialized, _cache_initialized_native_packet(functional, native))
     factor = initialized.parameters["populations"]["left"][key]
     assert factor is initialized.parameters["populations"]["right"][key]
+    # The composed program differentiates its raw input. A later cache write
+    # returns a new effective source tensor; earlier owner materializations
+    # retain their path to the original input before that transaction.
+    input_factor = tensors.parameters["populations"]["left"][key]
     actual, _ = functional.prepare_and_rollout(*initialized, steps=3)
     for _ in range(3):
         native.step()
     _close(actual, functional.extract(native).state)
-    observed = torch.autograd.grad(_loss(actual), factor)[0]
+    observed = torch.autograd.grad(_loss(actual), input_factor)[0]
     oracle = torch.autograd.grad(
         native.left.v.square().sum() + native.right.v.square().sum(),
         native.left.parametrizations.cm[0].factor,
