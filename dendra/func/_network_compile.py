@@ -181,7 +181,8 @@ class CompiledNetworkRunner:
                     for plan in self._functional._population_cache_plans.values()
                 )
             self._initialization_writes_constants = initialization == "fresh" and (
-                any(
+                bool(self._functional._connection_sampling_plan.devices)
+                or any(
                     plan.constants
                     for plan in self._functional._population_cache_plans.values()
                 )

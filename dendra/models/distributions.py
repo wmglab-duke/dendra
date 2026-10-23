@@ -9,6 +9,16 @@ from torch.distributions import Normal as _Normal
 from .parametric import to_param
 
 
+def _normal_draw(shape, dtype, device, generator=None):
+    """Use the same standard-normal kernel as Torch Normal.rsample."""
+    return torch.empty(shape, dtype=dtype, device=device).normal_(generator=generator)
+
+
+def _normal_from_draw(mean, std, draw):
+    """Apply the affine normal reparameterization using explicit base noise."""
+    return mean + draw * std
+
+
 class Distribution(nn.Module):
     """Abstract base class for re-parameterised probability distributions.
 
@@ -78,6 +88,39 @@ class Normal(Distribution):
         return _Normal(self.mean, self._std)
 
     # -------- required API ------------------------------------------------
+    def sample_draw_schema(self, sample_shape=torch.Size()):
+        """Describe the independent standard-normal draw without sampling."""
+        return (
+            torch.Size(sample_shape)
+            + torch.broadcast_shapes(self.mean.shape, self.std.shape),
+            self.mean.dtype,
+            self.mean.device,
+        )
+
+    def sample_draw(self, sample_shape=torch.Size(), *, generator=None):
+        """Draw standard-normal noise for an explicit reparameterization."""
+        distribution = self._dist
+        shape = distribution._extended_shape(torch.Size(sample_shape))
+        return _normal_draw(
+            shape, distribution.loc.dtype, distribution.loc.device, generator
+        )
+
+    def sample_from_draw(self, draw):
+        """Transform an explicit standard-normal draw without consuming RNG."""
+        mean, std = torch.broadcast_tensors(self.mean, self._std)
+        return _normal_from_draw(mean, std, draw)
+
+    def sample_with_draw(self, sample_shape=torch.Size(), *, generator=None):
+        """Sample and retain base noise while evaluating source getters once."""
+        distribution = self._dist
+        draw = _normal_draw(
+            distribution._extended_shape(torch.Size(sample_shape)),
+            distribution.loc.dtype,
+            distribution.loc.device,
+            generator,
+        )
+        return _normal_from_draw(distribution.loc, distribution.scale, draw), draw
+
     def rsample(self, sample_shape=torch.Size()):
         """Draw a differentiable sample.
 
@@ -91,7 +134,11 @@ class Normal(Distribution):
         torch.Tensor
             Sample tensor with shape ``sample_shape + mean.shape``.
         """
-        return self._dist.rsample(sample_shape)
+        if type(self)._dist is not Normal._dist or "_dist" in vars(self):
+            # Authored distribution recipes retain their own sampling method.
+            # The built-in recipe shares the explicit-draw implementation.
+            return self._dist.rsample(sample_shape)
+        return self.sample_with_draw(sample_shape)[0]
 
     def log_prob(self, value):
         """Compute the log-density of ``value``.
@@ -109,7 +156,7 @@ class Normal(Distribution):
         return self._dist.log_prob(value)
 
     def sample(self, n):
-        """Draw ``n`` independent non-differentiable samples."""
+        """Draw ``n`` independent differentiable samples."""
         return self.rsample((n,))
 
 
@@ -124,6 +171,15 @@ def _standard_normal_cdf(x):
 def _standard_normal_icdf(u):
     """Evaluate the inverse CDF (quantile) of the standard normal."""
     return math.sqrt(2.0) * torch.erfinv(2.0 * u - 1.0)
+
+
+def _standardized_normal_bound(bound, mean, std):
+    """Standardize a bound without an infinite scale derivative."""
+    # Infinite truncation limits have constant standardized values. Avoid
+    # differentiating (infinity - mean) / std before selecting those constants:
+    # its backward otherwise multiplies a zero CDF derivative by infinity.
+    safe_bound = torch.where(torch.isinf(bound), mean, bound)
+    return torch.where(torch.isinf(bound), bound, (safe_bound - mean) / std)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -162,17 +218,41 @@ class TruncatedNormal(Distribution):
 
     @property
     def _a(self):  # standardised bounds
-        return (self.low - self.mean) / self.std
+        return _standardized_normal_bound(self.low, self.mean, self.std)
 
     @property
     def _b(self):
-        return (self.high - self.mean) / self.std
+        return _standardized_normal_bound(self.high, self.mean, self.std)
 
     @property
     def _Z(self):  # normalising constant
         return _standard_normal_cdf(self._b) - _standard_normal_cdf(self._a)
 
     # ---------- API ---------------------------------------------------------
+    def sample_draw_schema(self, sample_shape=torch.Size()):
+        """Describe the independent uniform draw without sampling."""
+        return (
+            torch.Size(sample_shape) + self.mean.shape,
+            torch.get_default_dtype(),
+            self.mean.device,
+        )
+
+    def sample_draw(self, sample_shape=torch.Size(), *, generator=None):
+        """Draw uniforms using the native default floating-point dtype."""
+        shape, dtype, device = self.sample_draw_schema(sample_shape)
+        return torch.rand(shape, dtype=dtype, device=device, generator=generator)
+
+    def sample_from_draw(self, draw):
+        """Apply the native inverse-CDF transform without consuming RNG."""
+        p = _standard_normal_cdf(self._a) + draw * self._Z
+        z = _standard_normal_icdf(p)
+        return self.mean + self.std * z
+
+    def sample_with_draw(self, sample_shape=torch.Size(), *, generator=None):
+        """Sample and retain the uniforms used by the inverse-CDF transform."""
+        draw = self.sample_draw(sample_shape, generator=generator)
+        return self.sample_from_draw(draw), draw
+
     def rsample(self, sample_shape=torch.Size()):
         """Draw differentiable samples using inverse-CDF reparameterisation.
 
@@ -186,10 +266,7 @@ class TruncatedNormal(Distribution):
         torch.Tensor
             Sample tensor with shape ``sample_shape + mean.shape``.
         """
-        u = torch.rand(sample_shape + self.mean.shape, device=self.mean.device)
-        p = _standard_normal_cdf(self._a) + u * self._Z
-        z = _standard_normal_icdf(p)
-        return self.mean + self.std * z
+        return self.sample_with_draw(sample_shape)[0]
 
     def log_prob(self, value):
         """Compute the log-density of ``value`` under the truncated normal.
@@ -214,5 +291,48 @@ class TruncatedNormal(Distribution):
 
     # alias for symmetry with Normal
     def sample(self, n):
-        """Draw ``n`` independent non-differentiable samples."""
+        """Draw ``n`` independent differentiable samples."""
         return self.rsample((n,))
+
+
+_CONNECTION_DISTRIBUTION_METHODS = {
+    distribution: {
+        name: getattr(distribution, name)
+        for name in (
+            "sample",
+            "rsample",
+            "sample_draw",
+            "sample_draw_schema",
+            "sample_from_draw",
+            "sample_with_draw",
+        )
+    }
+    for distribution in (Normal, TruncatedNormal)
+}
+
+
+def connection_distribution_is_supported(source):
+    """Recognize built-in draw transforms while preserving authored fallbacks."""
+    from torch.nn.utils import parametrize
+
+    source_type = type(source)
+    if source_type.__module__ == "torch.nn.utils.parametrize" and (
+        parametrize.is_parametrized(source)
+    ):
+        source_type = parametrize.type_before_parametrizations(source)
+    methods = _CONNECTION_DISTRIBUTION_METHODS.get(source_type)
+    if methods is None or any(
+        name in vars(source) or getattr(type(source), name) is not method
+        for name, method in methods.items()
+    ):
+        return False
+    hook_names = (
+        "_forward_pre_hooks",
+        "_forward_hooks",
+        "_backward_pre_hooks",
+        "_backward_hooks",
+    )
+    if any(getattr(source, name) for name in hook_names):
+        return False
+    module_hooks = torch.nn.modules.module
+    return not any(getattr(module_hooks, "_global" + name) for name in hook_names)

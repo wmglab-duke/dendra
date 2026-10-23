@@ -141,6 +141,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "CompiledPopulationChunk",
         "CompiledRunner",
         "ContinuousConTensors",
+        "ConnectionSamplingDraw",
         "AnomalyDetector",
         "ExecutionCapabilities",
         "ExecutionReport",

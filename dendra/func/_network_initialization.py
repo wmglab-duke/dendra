@@ -8,6 +8,7 @@ from typing import NamedTuple
 
 import torch
 
+from ._connection_sampling import ConnectionSamplingDraw
 from ._netstim import NetStimDraw
 from ._network_bindings import _canonicalize_mapping_tree
 from ._types import FunctionalizationError, InitializationInput
@@ -41,6 +42,10 @@ class NetworkInitializationInput(NamedTuple):
     ``reinit_weights`` and ``reinit_delays`` refresh connection materializations
     from their raw sources. A false flag retains the preceding explicit
     materialization, matching native Network initialization.
+    ``connection_draw`` supplies parameter-independent connection base draws
+    and resulting RNG checkpoints. Pure initialization requires this packet
+    when refreshing supported stochastic roles; the host runner samples it
+    after Population/cache writes. Its sampling flags must match this input.
     """
 
     populations: dict[str, InitializationInput]
@@ -49,6 +54,7 @@ class NetworkInitializationInput(NamedTuple):
     cache: NetworkInitializationCache | None = None
     reinit_weights: bool = True
     reinit_delays: bool = True
+    connection_draw: ConnectionSamplingDraw | None = None
 
 
 def nonpersistent_material_cache_failures(functional):
@@ -712,6 +718,22 @@ def _validate(functional, parameters, constants, state, inputs, draw, *, require
         )
     elif draw is not None:
         functional.netstim._validate_draw(draw)
+    sampling = functional._connection_sampling_plan
+    sampling.validate_draw(
+        inputs.connection_draw,
+        reinit_weights=inputs.reinit_weights,
+        reinit_delays=inputs.reinit_delays,
+        required=require_draw
+        and sampling.requires_draw(
+            reinit_weights=inputs.reinit_weights, reinit_delays=inputs.reinit_delays
+        ),
+    )
+    if inputs.connection_draw is not None:
+        _validate_tree(
+            inputs.connection_draw.rng,
+            functional._state_schema["connection_sampling"]["rng"],
+            "initialization.connection_draw.rng",
+        )
 
 
 def _initialize_components(
@@ -798,12 +820,31 @@ def _initialize_components(
                 state["clock"]["duration_remainder"]
             ),
         }
+        draw = inputs.connection_draw
+        if draw is None and sample_random:
+            draw = functional._connection_sampling_plan.sample(
+                effective,
+                effective_constants,
+                state,
+                reinit_weights=inputs.reinit_weights,
+                reinit_delays=inputs.reinit_delays,
+            )
+        functional._connection_sampling_plan.validate_draw(
+            draw,
+            reinit_weights=inputs.reinit_weights,
+            reinit_delays=inputs.reinit_delays,
+            required=functional._connection_sampling_plan.requires_draw(
+                reinit_weights=inputs.reinit_weights,
+                reinit_delays=inputs.reinit_delays,
+            ),
+        )
         for (collection, name), plan in functional._connection_parameter_plans.items():
             connection_constants = plan.initialize_constants(
                 effective[collection][name],
                 effective_constants[collection][name],
                 reinit_weights=inputs.reinit_weights,
                 reinit_delays=inputs.reinit_delays,
+                draws=None if draw is None else draw.values[collection][name],
             )
             effective_constants = _replace_at(
                 effective_constants, (collection, name), connection_constants
@@ -850,6 +891,20 @@ def _initialize_components(
             "continuous_synapses": continuous,
             "netstim": state["netstim"],
             "clock": clock,
+            **(
+                {
+                    "connection_sampling": {
+                        "rng": {
+                            name: value.detach().clone()
+                            for name, value in draw.rng.items()
+                        }
+                    }
+                    if draw is not None
+                    else state["connection_sampling"]
+                }
+                if functional._connection_sampling_plan.devices
+                else {}
+            ),
         }
     return NetworkTensors(effective, effective_constants, initialized_state)
 

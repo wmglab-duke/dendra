@@ -34,10 +34,12 @@ from ..core import (
     _validate_time_scalar,
     make_intra,
 )
+from ..distributions import Normal, connection_distribution_is_supported
 from ..multi import concat_models, offsets
 from ..parametric import cacheable, is_parametric, to_param
 from ..rng import RNGMixin
 from ..slice import SynapseSlots
+from ._connection_sampling import clone_connection_sampling_rng
 from ._population_cache import restore_population_cache_values
 from .netcon import ContinuousCon, NetCon
 from .netstim import NetStim
@@ -716,8 +718,20 @@ class ParameterOrDistributionWrapper(torch.nn.Module):
             ),
         )
 
-    def derive_values(self, n):
-        """Pure deterministic evaluation shared by native and functional setup."""
+    def sampling_draw_schema(self, n):
+        """Describe a supported distribution's independent draw without RNG."""
+        if not connection_distribution_is_supported(self.param):
+            raise TypeError("Connection source has no shared pure sampling recipe.")
+        return self.param.sample_draw_schema((n,))
+
+    def sample_draw(self, n, *, generator=None):
+        """Draw explicit independent noise for a built-in distribution."""
+        if not connection_distribution_is_supported(self.param):
+            raise TypeError("Connection source has no shared pure sampling recipe.")
+        return self.param.sample_draw((n,), generator=generator)
+
+    def derive_values(self, n, draw=None):
+        """Evaluate deterministic sources or a supplied independent draw."""
         if torch.is_tensor(self.param):
             value = self.param.repeat(n)
         elif _connection_source_can_compute_uncached(self.param):
@@ -728,6 +742,8 @@ class ParameterOrDistributionWrapper(torch.nn.Module):
             value = self.param.repeat(n)
         elif self.deterministic():
             value = self.param().repeat(n)
+        elif connection_distribution_is_supported(self.param) and draw is not None:
+            value = self.param.sample_from_draw(draw)
         else:
             raise TypeError("Stochastic connection parameters need explicit sampling.")
         return self._convert(value)
@@ -764,6 +780,7 @@ class WeightExpander(torch.nn.Module):
                 dtype=dtype if dtype is not None else torch.float32,
             ),
         )
+        self._sampling_draws = None
 
     def forward(self):
         return self.w
@@ -771,27 +788,162 @@ class WeightExpander(torch.nn.Module):
     def deterministic(self):
         return all(source.deterministic() for source in self.weights)
 
-    def derive_values(self):
-        """Return deterministic effective values without committing storage."""
+    @property
+    def sampling_draws(self):
+        """Detached base draws for the current sample, or missing legacy data."""
+        return {} if self.deterministic() else self._sampling_draws
+
+    def sample_draws(self, *, generator=None):
+        """Draw stochastic blocks in native order without committing storage.
+
+        ``generator`` may be one Torch generator or a device-to-generator mapping.
+        """
+        draws = {}
+        for index, (source, n) in enumerate(zip(self.weights, self.n, strict=True)):
+            if source.deterministic():
+                continue
+            block_generator = generator
+            if isinstance(generator, Mapping):
+                device = source.sampling_draw_schema(n)[2]
+                block_generator = generator.get(device, generator.get(str(device)))
+                if block_generator is None:
+                    raise ValueError(f"No connection sampling generator for {device}.")
+            draws[str(index)] = source.sample_draw(n, generator=block_generator)
+        return draws
+
+    def derive_values(self, draws=None):
+        """Return effective values without committing storage or consuming RNG."""
+        expected = {
+            str(index)
+            for index, source in enumerate(self.weights)
+            if not source.deterministic()
+        }
+        if expected and (draws is None or set(draws) != expected):
+            raise ValueError("Connection sampling draws must match stochastic blocks.")
+        if not expected and draws:
+            raise ValueError("Deterministic connection sources do not take draws.")
         return torch.cat(
             [
-                source.derive_values(n)
-                for source, n in zip(self.weights, self.n, strict=True)
+                source.derive_values(
+                    n, None if draws is None else draws.get(str(index))
+                )
+                for index, (source, n) in enumerate(
+                    zip(self.weights, self.n, strict=True)
+                )
             ]
         )
 
     def init(self, reinit=True):
         if reinit or not self.w.numel():
-            self.w = (
-                self.derive_values()
-                if self.deterministic()
-                else torch.cat(
-                    [
-                        source.sample(n)
-                        for source, n in zip(self.weights, self.n, strict=True)
-                    ]
+            values, draws = [], {}
+            supported = True
+            for index, (source, n) in enumerate(zip(self.weights, self.n, strict=True)):
+                if source.deterministic():
+                    values.append(source.derive_values(n))
+                elif connection_distribution_is_supported(source.param):
+                    value, draw = source.param.sample_with_draw((n,))
+                    values.append(source._convert(value))
+                    draws[str(index)] = draw.detach().clone()
+                else:
+                    values.append(source.sample(n))
+                    supported = False
+            self.w = torch.cat(values)
+            self._sampling_draws = draws if supported else None
+        return self
+
+    def get_extra_state(self):
+        """Serialize independent draws alongside their effective sample buffer."""
+        return (
+            None
+            if self._sampling_draws is None
+            else {
+                key: value.detach().clone()
+                for key, value in self._sampling_draws.items()
+            }
+        )
+
+    def set_extra_state(self, state):
+        """Restore draw provenance, accepting checkpoints without provenance."""
+        if state is None:
+            self._sampling_draws = None
+            return
+        expected = {
+            str(index): source.param.sample_draw_schema((n,))
+            for index, (source, n) in enumerate(zip(self.weights, self.n, strict=True))
+            if not source.deterministic()
+        }
+        if not isinstance(state, Mapping) or set(state) != set(expected):
+            raise ValueError("Invalid connection sampling provenance blocks.")
+        draws = {}
+        for key, value in state.items():
+            shape, dtype, device = expected[key]
+            if (
+                not torch.is_tensor(value)
+                or value.shape != shape
+                or not value.is_floating_point()
+            ):
+                raise ValueError(
+                    f"Invalid connection sampling provenance for block {key}."
                 )
+            # Normal noise follows its source dtype. TruncatedNormal's uniform
+            # dtype is part of the captured recipe (including scalar promotion).
+            target_dtype = (
+                dtype
+                if isinstance(self.weights[int(key)].param, Normal)
+                else value.dtype
             )
+            draws[key] = value.detach().to(device=device, dtype=target_dtype).clone()
+        self._sampling_draws = draws
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if not self._sampling_draws:
+            # Preserve deterministic checkpoint keys and legacy custom samplers.
+            destination.pop(prefix + "_extra_state", None)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if prefix + "_extra_state" not in state_dict:
+            self._sampling_draws = None
+            if prefix + "_extra_state" in missing_keys:
+                missing_keys.remove(prefix + "_extra_state")
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        if self._sampling_draws is not None:
+            draws = {}
+            for key, value in self._sampling_draws.items():
+                converted = fn(value)
+                if isinstance(self.weights[int(key)].param, Normal):
+                    converted = converted.to(
+                        dtype=self.weights[int(key)].param.sample_draw_schema(
+                            (self.n[int(key)],)
+                        )[1]
+                    )
+                else:
+                    # Uniform dtype belongs to the sampling recipe. Move the
+                    # original draw so a temporary lower-precision conversion
+                    # cannot round its retained values before casting back.
+                    converted = value.to(device=converted.device)
+                draws[key] = converted
+            self._sampling_draws = draws
         return self
 
 
@@ -3181,6 +3333,9 @@ class Network(RNGMixin):
                 self.netstim.set_dt(dt_f)
             self.netstim.initialize()
             self.netstim.detach()
+        # Native initialization uses the ambient Torch generators. Explicit
+        # functional stream checkpoints apply until this new native boundary.
+        self.__dict__.pop("_functional_connection_sampling_rng", None)
         self._mode_requires_initialize = False
         return self
 
@@ -4580,11 +4735,23 @@ class Network(RNGMixin):
             "clock_step": self._clock_step,
             "duration_remainder": self._duration_remainder,
             "structure": self.checkpoint_structure(),
+            **(
+                {
+                    "connection_sampling_rng": clone_connection_sampling_rng(
+                        self._functional_connection_sampling_rng
+                    )
+                }
+                if "_functional_connection_sampling_rng" in vars(self)
+                else {}
+            ),
         }
 
     def _restore_dict_from_checkpoint_unchecked(self, state_dict):
         if not isinstance(state_dict, Mapping):
             raise TypeError("Network checkpoint state must be a mapping.")
+        sampling_rng = clone_connection_sampling_rng(
+            state_dict.get("connection_sampling_rng")
+        )
         missing = [
             name
             for name in ("populations", "netcons", "netstim", "t")
@@ -4795,6 +4962,10 @@ class Network(RNGMixin):
         self._clock_origin = restored_origin
         self._clock_step = restored_step
         self._duration_remainder = restored_remainder
+        if sampling_rng is None:
+            self.__dict__.pop("_functional_connection_sampling_rng", None)
+        else:
+            self._functional_connection_sampling_rng = sampling_rng
         self._sync_runtime_clock()
 
     def restore_dict_from_checkpoint(self, state_dict):

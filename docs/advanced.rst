@@ -48,3 +48,4 @@ Advanced
    advanced/A38_functional_torch_parametrizations.md
    advanced/A39_functional_connection_parameters.md
    advanced/A40_functional_netstim_parameters.md
+   advanced/A41_functional_connection_sampling.md

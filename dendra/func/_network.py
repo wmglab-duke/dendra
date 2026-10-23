@@ -20,6 +20,7 @@ from dendra.models.networks.net import step as _native_step
 
 from . import _network_parameters
 from ._connection_parameters import ConnectionParameterPlan
+from ._connection_sampling import ConnectionSamplingPlan
 from ._continuous import FunctionalContinuousCon
 from ._continuous_transform import _named_tensors
 from ._initialization_sources import (
@@ -446,6 +447,9 @@ class FunctionalNetwork:
             for collection in ("synapses", "continuous_synapses")
             for name, connection in getattr(network, collection).items()
         }
+        self._connection_sampling_plan = ConnectionSamplingPlan(
+            self._connection_parameter_plans
+        )
         for plan in self._connection_parameter_plans.values():
             plan._validate_runtime_ownership(
                 plan._source, owners=network.populations.values()
@@ -970,6 +974,9 @@ class FunctionalNetwork:
             "step": _snapshot(network._clock_step),
             "duration_remainder": _snapshot(network._duration_remainder),
         }
+        sampling = self._connection_sampling_plan.extract(network)
+        if sampling is not None:
+            state["connection_sampling"] = sampling
         return NetworkTensors(parameters, constants, state)
 
     def extract(self, network=None):
@@ -1068,7 +1075,7 @@ class FunctionalNetwork:
             )
 
     def _native_parameter_constant_aliases(self, network):
-        """Inspect exact raw source ties without extracting state or values."""
+        """Inspect exact source bindings, including native cache detach views."""
         parameters, constants = {}, {}
         for name, plan in self.populations.items():
             population = network.populations[name]
@@ -1114,13 +1121,33 @@ class FunctionalNetwork:
                     for name in ("max_spikes", "heap_times", "heap_row_offsets")
                 },
             }
+
+        def frame(value):
+            # Native cache restoration can detach a registered buffer while
+            # preserving its exact storage coordinates. That is still the
+            # same source/config binding, unlike an independent clone or a
+            # differently indexed view. Empty tensors have no storage identity.
+            if value.layout != torch.strided or not value.numel():
+                return ("identity", id(value))
+            return (
+                "storage",
+                value.device,
+                value.dtype,
+                value.untyped_storage().data_ptr(),
+                value.storage_offset(),
+                tuple(value.shape),
+                tuple(value.stride()),
+                value.is_conj(),
+                value.is_neg(),
+            )
+
         readers = {}
         for path, value in _tensor_paths(constants):
-            readers.setdefault(id(value), []).append(path)
+            readers.setdefault(frame(value), []).append(path)
         return tuple(
-            (path, tuple(readers[id(value)]))
+            (path, tuple(readers[frame(value)]))
             for path, value in _tensor_paths(parameters)
-            if id(value) in readers
+            if frame(value) in readers
         )
 
     def prepare(self, parameters, constants):
@@ -1254,6 +1281,38 @@ class FunctionalNetwork:
             None
             if self.netstim is None
             else self.netstim.sample_step_draw(state["netstim"])
+        )
+
+    def sample_connection_initialization_draw(
+        self, parameters, constants, state, *, reinit_weights=True, reinit_delays=True
+    ):
+        """Draw connection initialization inputs from independent explicit RNG.
+
+        The returned packet follows native connection/block order. Sampling
+        consumes no global Torch RNG and changes none of the supplied tensors.
+        Population/cache writes that affect distribution parameters are applied
+        before sampling by the runner's fresh-initialization host adapter.
+        """
+        from ._network_bindings import _canonicalize_mapping_tree
+
+        if torch.compiler.is_compiling() or torch._C._are_functorch_transforms_active():
+            raise FunctionalizationError(
+                "Sample connection initialization draws outside torch.compile and functional transforms."
+            )
+        (parameters, constants, state), _ = _canonicalize_mapping_tree(
+            (parameters, constants, state)
+        )
+        self._validate_initialization_source()
+        self._validate_parameters(parameters)
+        _validate_tree(constants, self._constant_schema, "constants")
+        self._validate_state(state)
+        constants = self._bind_parameter_constants(parameters, constants)
+        return self._connection_sampling_plan.sample(
+            parameters,
+            constants,
+            state,
+            reinit_weights=reinit_weights,
+            reinit_delays=reinit_delays,
         )
 
     def _prepare_values(self, parameters, constants):
@@ -1692,6 +1751,11 @@ class FunctionalNetwork:
                 "step": step,
                 "duration_remainder": clock["duration_remainder"],
             },
+            **(
+                {"connection_sampling": state["connection_sampling"]}
+                if self._connection_sampling_plan.devices
+                else {}
+            ),
         }, {"populations": aux, "netstim": stimulus}
 
     @staticmethod
@@ -1784,6 +1848,13 @@ class FunctionalNetwork:
         self._validate_compatible(network)
         self._validate_state(state)
         self.check_overflow(state)
+        sampling_rng = (
+            self._connection_sampling_plan.validate_rng(
+                state["connection_sampling"]["rng"]
+            )
+            if self._connection_sampling_plan.devices
+            else None
+        )
         clock = state["clock"]
         if (
             not bool(torch.isfinite(clock["origin"]))
@@ -1832,6 +1903,8 @@ class FunctionalNetwork:
         staged._buffers["_clock_origin"] = clock["origin"].clone()
         staged._buffers["_clock_step"] = clock["step"].clone()
         staged._buffers["_duration_remainder"] = clock["duration_remainder"].clone()
+        if sampling_rng is not None:
+            staged._functional_connection_sampling_rng = sampling_rng
         checkpoint = staged.state_dict_for_checkpoint()
         network.restore_dict_from_checkpoint(checkpoint)
         for name, plan in self.synapses.items():

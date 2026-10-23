@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MethodType
 
@@ -15,6 +16,7 @@ from dendra.models.networks.net import (
     ParameterOrDistributionWrapper,
     WeightExpander,
     _connection_source_can_compute_uncached,
+    connection_distribution_is_supported,
 )
 from dendra.models.parametric import Bounded, NegativeParam, is_parametric
 
@@ -74,6 +76,13 @@ def _binding(module, *, identities=True):
                 "forward",
                 "derive_values",
                 "deterministic",
+                "sample",
+                "rsample",
+                "sample_draw",
+                "sample_from_draw",
+                "sample_with_draw",
+                "sample_draw_schema",
+                "sample_draws",
                 "_compute",
                 "repeat",
             )
@@ -104,7 +113,7 @@ def _binding(module, *, identities=True):
                     (name, _trusted_state_signature(value))
                     for name, value in vars(child).items()
                     if not _is_internal_module_state(child, name)
-                    and name != "_cache"
+                    and name not in ("_cache", "_sampling_draws")
                     and not isinstance(value, torch.nn.Module)
                 ),
                 tuple(
@@ -148,8 +157,17 @@ class _DeriveValues(torch.nn.Module):
         super().__init__()
         self.source = source
 
-    def forward(self):
-        return self.source.derive_values()
+    def forward(self, draws=None):
+        return self.source.derive_values(draws=draws)
+
+
+class _SampleDraws(torch.nn.Module):
+    def __init__(self, source):
+        super().__init__()
+        self.source = source
+
+    def forward(self, generators=None):
+        return self.source.sample_draws(generator=generators)
 
 
 @dataclass(frozen=True)
@@ -165,16 +183,19 @@ class _PreparedConnectionParameters:
 class ConnectionParameterPlan:
     """Lower initialized native weight/delay sources to fixed explicit packets.
 
-    Deterministic sources share ``WeightExpander.derive_values`` with native
-    initialization. Distribution-backed expanders expose their initialized
-    effective tensor; fresh implicit sampling requires an explicit RNG design.
+    Deterministic and built-in distribution sources share
+    ``WeightExpander.derive_values`` with native initialization. Random base
+    draws live in the explicit constants packet, separately from raw sources.
     """
 
     def __init__(self, connection):
         self._source = connection
         self._check_purity = current_check_purity()
         self._token = object()
-        self._deterministic = {}
+        self._raw = {}
+        self._draw_schemas = {}
+        self._snapshot_draw_schemas = {}
+        self._alternate_draws = {}
         self._schemas = {}
         self._execution = {}
         self._parameter_paths = {}
@@ -216,8 +237,37 @@ class ConnectionParameterPlan:
                     "Initialize one-dimensional connection parameter storage before lowering."
                 )
             self._schemas[role] = (tuple(value.shape), value.dtype, value.device)
-            self._deterministic[role] = module.deterministic()
-            if not self._deterministic[role]:
+            self._raw[role] = all(
+                source.deterministic()
+                or connection_distribution_is_supported(source.param)
+                for source in module.weights
+            )
+            self._draw_schemas[role] = (
+                {
+                    str(index): source.sampling_draw_schema(count)
+                    for index, (source, count) in enumerate(
+                        zip(module.weights, module.n, strict=True)
+                    )
+                    if not source.deterministic()
+                }
+                if self._raw[role]
+                else {}
+            )
+            provenance = module.sampling_draws if self._raw[role] else None
+            self._snapshot_draw_schemas[role] = {
+                index: (
+                    tuple(shape),
+                    dtype if provenance is None else provenance[index].dtype,
+                    device,
+                )
+                for index, (shape, dtype, device) in self._draw_schemas[role].items()
+            }
+            self._alternate_draws[role] = any(
+                self._snapshot_draw_schemas[role][index]
+                != (tuple(shape), dtype, device)
+                for index, (shape, dtype, device) in self._draw_schemas[role].items()
+            )
+            if not self._raw[role]:
                 key = f"{native}.w"
                 self._parameter_paths[key] = (native, "w")
                 continue
@@ -308,6 +358,7 @@ class ConnectionParameterPlan:
             self._audit_sources()
         parameters, constants = self.parameter_sources(), self.constant_sources()
         for role, native in _ROLES:
+            self._metadata.update(self._sampling_metadata(connection, role, native))
             value = getattr(connection, native).w
             self._metadata[f"stored.{role}"] = _clone(value)
             self._metadata[f"retain_{role}"] = torch.zeros(
@@ -325,8 +376,8 @@ class ConnectionParameterPlan:
                     constants[key]
                 )
             derived = (
-                self._derive(role, parameters, constants)
-                if self._deterministic[role]
+                self._derive(role, parameters, {**constants, **self._metadata})
+                if self._raw[role]
                 else value
             )
             self._metadata[f"baseline_effective.{role}"] = _clone(derived)
@@ -376,6 +427,7 @@ class ConnectionParameterPlan:
         )
         metadata = {}
         for role, native in _ROLES:
+            metadata.update(self._sampling_metadata(connection, role, native))
             value = getattr(connection, native).w
             metadata[f"stored.{role}"] = _clone(value)
             metadata[f"retain_{role}"] = torch.zeros(
@@ -389,12 +441,114 @@ class ConnectionParameterPlan:
             for key in set(self._role_constant_aliases.get(role, {}).values()):
                 metadata[f"baseline.{role}.constants.{key}"] = _clone(constants[key])
             derived = (
-                self._derive(role, parameters, constants)
-                if self._deterministic[role]
+                self._derive(role, parameters, {**constants, **metadata})
+                if self._raw[role]
                 else value
             )
             metadata[f"baseline_effective.{role}"] = _clone(derived)
         return metadata
+
+    def _sampling_metadata(self, connection, role, native):
+        schemas = self._snapshot_draw_schemas[role]
+        if not schemas:
+            return {}
+        module = getattr(connection, native)
+        draws = module.sampling_draws
+        valid = draws is not None
+        if valid and set(draws) != set(schemas):
+            raise FunctionalizationError(
+                "Connection sampling provenance changed block structure; lower again."
+            )
+        result = {
+            f"draw_valid.{role}": torch.tensor(
+                valid, dtype=torch.bool, device=self._schemas[role][2]
+            )
+        }
+        use_fresh = False
+        if valid:
+            snapshot_match = all(
+                (tuple(draws[index].shape), draws[index].dtype, draws[index].device)
+                == (tuple(shape), dtype, device)
+                for index, (shape, dtype, device) in schemas.items()
+            )
+            fresh_match = all(
+                (tuple(draws[index].shape), draws[index].dtype, draws[index].device)
+                == (tuple(shape), dtype, device)
+                for index, (shape, dtype, device) in self._draw_schemas[role].items()
+            )
+            if not snapshot_match:
+                if not self._alternate_draws[role] or not fresh_match:
+                    raise FunctionalizationError(
+                        "Connection sampling provenance changed draw schema; lower again."
+                    )
+                use_fresh = True
+        if self._alternate_draws[role]:
+            result[f"use_fresh_draw.{role}"] = torch.tensor(
+                use_fresh, dtype=torch.bool, device=self._schemas[role][2]
+            )
+        for index, (shape, dtype, device) in schemas.items():
+            value = (
+                draws[index]
+                if valid and not use_fresh
+                else torch.full(
+                    shape,
+                    self._placeholder_draw(role, index),
+                    dtype=dtype,
+                    device=device,
+                )
+            )
+            if (tuple(value.shape), value.dtype, value.device) != (
+                tuple(shape),
+                dtype,
+                device,
+            ):
+                raise FunctionalizationError(
+                    "Connection sampling provenance changed draw schema; lower again."
+                )
+            result[f"draw.{role}.{index}"] = _clone(value)
+            if self._alternate_draws[role]:
+                shape, dtype, device = self._draw_schemas[role][index]
+                value = (
+                    draws[index]
+                    if valid and use_fresh
+                    else torch.full(
+                        shape,
+                        self._placeholder_draw(role, index),
+                        dtype=dtype,
+                        device=device,
+                    )
+                )
+                result[f"fresh_draw.{role}.{index}"] = _clone(value)
+        return result
+
+    def _placeholder_draw(self, role, index):
+        from dendra.models.distributions import TruncatedNormal
+
+        from ._torch_parametrizations import canonical_type
+
+        source = getattr(self._source, dict(_ROLES)[role]).weights[int(index)].param
+        # A missing uniform draw needs an interior placeholder: an endpoint
+        # would evaluate an infinite inverse CDF before snapshot selection.
+        return 0.5 if canonical_type(source) is TruncatedNormal else 0.0
+
+    @property
+    def sampling_devices(self):
+        """Devices whose global random streams native initialization consumes."""
+        return tuple(
+            dict.fromkeys(
+                device
+                for schemas in self._draw_schemas.values()
+                for _shape, _dtype, device in schemas.values()
+            )
+        )
+
+    @property
+    def has_sampling(self):
+        return any(self._draw_schemas.values())
+
+    @property
+    def draw_schemas(self):
+        return {role: dict(schemas) for role, schemas in self._draw_schemas.items()}
 
     def extract(self, snapshots=None, connection=None):
         connection = self._source if connection is None else connection
@@ -545,11 +699,7 @@ class ConnectionParameterPlan:
                         f"Connection {label} {name!r} changed tensor schema."
                     )
 
-    def _derive(self, role, parameters, constants):
-        if not self._deterministic[role]:
-            native = dict(_ROLES)[role]
-            return parameters[f"{native}.w"]
-        execution = self._execution[role]
+    def _mapping(self, role, parameters, constants, execution):
         p = _helpers()
         mapping = {
             name: value.clone() for name, value in p._module_tensor_slots(execution)
@@ -563,7 +713,35 @@ class ConnectionParameterPlan:
             if key not in canonical:
                 canonical[key] = constants[key].clone()
             mapping[f"source.{relative}"] = canonical[key]
-        value = functional_call(execution, mapping, (), tie_weights=False)
+        return mapping
+
+    def _derive(self, role, parameters, constants):
+        if not self._raw[role]:
+            native = dict(_ROLES)[role]
+            return parameters[f"{native}.w"]
+        execution = self._execution[role]
+        draws = {
+            index: constants[f"draw.{role}.{index}"]
+            for index in self._draw_schemas[role]
+        }
+        value = functional_call(
+            execution,
+            self._mapping(role, parameters, constants, execution),
+            (draws,),
+            tie_weights=False,
+        )
+        if self._alternate_draws[role]:
+            fresh_draws = {
+                index: constants[f"fresh_draw.{role}.{index}"]
+                for index in self._draw_schemas[role]
+            }
+            fresh = functional_call(
+                execution,
+                self._mapping(role, parameters, constants, execution),
+                (fresh_draws,),
+                tie_weights=False,
+            )
+            value = torch.where(constants[f"use_fresh_draw.{role}"], fresh, value)
         if (
             not torch.is_tensor(value)
             or (tuple(value.shape), value.dtype, value.device) != self._schemas[role]
@@ -578,7 +756,7 @@ class ConnectionParameterPlan:
         self._validate_packet(parameters, constants)
         values = {}
         for role, _native in _ROLES:
-            if not self._deterministic[role]:
+            if not self._raw[role]:
                 values[role] = self._derive(role, parameters, constants)
                 continue
             baseline = {
@@ -607,12 +785,15 @@ class ConnectionParameterPlan:
                 constants, constant_baseline, parameter_names=constant_baseline
             )
             selected_constants = {
-                key: torch.where(
-                    retain,
-                    restored_constants[key],
-                    constants[key],
-                )
-                for key in constant_baseline
+                **constants,
+                **{
+                    key: torch.where(
+                        retain,
+                        restored_constants[key],
+                        constants[key],
+                    )
+                    for key in constant_baseline
+                },
             }
             # Select raw/config inputs before invoking authored transforms. An
             # inactive invalid source derivative must not poison retained
@@ -650,27 +831,61 @@ class ConnectionParameterPlan:
                 parameter_names=("effective",),
             )["effective"]
             values[role] = torch.where(retain, retained, current)
+            if self._draw_schemas[role]:
+                # Old native checkpoints contain initialized values without
+                # their random base draws. Preserve those values without
+                # inventing a pathwise derivative to a newly guessed draw.
+                values[role] = torch.where(
+                    constants[f"draw_valid.{role}"],
+                    values[role],
+                    constants[f"stored.{role}"],
+                )
         return values
 
     def initialize_constants(
-        self, parameters, constants, *, reinit_weights=True, reinit_delays=True
+        self,
+        parameters,
+        constants,
+        *,
+        reinit_weights=True,
+        reinit_delays=True,
+        draws=None,
     ):
         self.validate_source()
         self._validate_packet(parameters, constants)
         flags = {"weights": reinit_weights, "delays": reinit_delays}
         if any(type(value) is not bool for value in flags.values()):
             raise TypeError("Connection reinitialization flags must be booleans.")
+        if draws is not None and (
+            not isinstance(draws, Mapping) or not set(draws).issubset(flags)
+        ):
+            raise FunctionalizationError(
+                "Connection initialization draws need weight/delay role mappings."
+            )
         for role, refresh in flags.items():
-            if refresh and not self._deterministic[role]:
+            if refresh and not self._raw[role]:
                 raise FunctionalizationError(
-                    f"Fresh stochastic connection {role} sampling is currently unsupported; use reinit_{role}=False with initialized fixed storage."
+                    f"Fresh custom-distribution connection {role} sampling is currently unsupported; use reinit_{role}=False with initialized fixed storage."
                 )
         result = dict(constants)
         for role, refresh in flags.items():
             if not refresh:
                 result[f"retain_{role}"] = torch.ones_like(constants[f"retain_{role}"])
                 continue
-            value = self._derive(role, parameters, constants)
+            if self._draw_schemas[role]:
+                role_draws = None if draws is None else draws.get(role)
+                self._validate_draws(role, role_draws)
+                prefix = "fresh_draw" if self._alternate_draws[role] else "draw"
+                for index, draw in role_draws.items():
+                    result[f"{prefix}.{role}.{index}"] = _clone(draw)
+                if self._alternate_draws[role]:
+                    result[f"use_fresh_draw.{role}"] = torch.ones_like(
+                        constants[f"use_fresh_draw.{role}"]
+                    )
+                result[f"draw_valid.{role}"] = torch.ones_like(
+                    constants[f"draw_valid.{role}"]
+                )
+            value = self._derive(role, parameters, result)
             for key in set(self._role_parameter_aliases[role].values()):
                 result[f"baseline.{role}.parameters.{key}"] = _clone(parameters[key])
             for key in set(self._role_constant_aliases[role].values()):
@@ -681,6 +896,68 @@ class ConnectionParameterPlan:
             result[f"use_offset.{role}"] = torch.zeros_like(
                 constants[f"use_offset.{role}"]
             )
+        return result
+
+    def requires_initialization_draw(self, *, reinit_weights=True, reinit_delays=True):
+        flags = {"weights": reinit_weights, "delays": reinit_delays}
+        if any(type(value) is not bool for value in flags.values()):
+            raise TypeError("Connection reinitialization flags must be booleans.")
+        return any(
+            flags[role] and schemas for role, schemas in self._draw_schemas.items()
+        )
+
+    def _validate_draws(self, role, draws):
+        schemas = self._draw_schemas[role]
+        if not isinstance(draws, Mapping) or set(draws) != set(schemas):
+            raise FunctionalizationError(
+                f"Connection {role} initialization needs explicit base draws for blocks {tuple(schemas)}."
+            )
+        for index, (shape, dtype, device) in schemas.items():
+            value = draws[index]
+            if not torch.is_tensor(value) or (
+                tuple(value.shape),
+                value.dtype,
+                value.device,
+            ) != (tuple(shape), dtype, device):
+                raise FunctionalizationError(
+                    f"Connection {role} base draw {index!r} changed tensor schema."
+                )
+
+    def sample_initialization_draw(
+        self,
+        parameters,
+        constants,
+        *,
+        reinit_weights=True,
+        reinit_delays=True,
+        generators=None,
+    ):
+        """Cold adapter consuming the same streams as native block sampling.
+
+        ``generators`` maps device strings to private generators. Omitting it
+        consumes Torch's global streams, as native initialization does.
+        Numerical initialization uses ``initialize_constants`` and explicit
+        draws, without consuming any generator.
+        """
+        self.validate_source()
+        self._validate_packet(parameters, constants)
+        self.requires_initialization_draw(
+            reinit_weights=reinit_weights, reinit_delays=reinit_delays
+        )
+        flags = {"weights": reinit_weights, "delays": reinit_delays}
+        result = {"weights": {}, "delays": {}}
+        for role, refresh in flags.items():
+            if not refresh or not self._draw_schemas[role]:
+                continue
+            execution = _SampleDraws(self._execution[role].source)
+            draws = functional_call(
+                execution,
+                self._mapping(role, parameters, constants, execution),
+                (generators,),
+                tie_weights=False,
+            )
+            self._validate_draws(role, draws)
+            result[role] = {index: _clone(value) for index, value in draws.items()}
         return result
 
     def prepare(self, parameters, constants):
@@ -727,10 +1004,12 @@ class ConnectionParameterPlan:
     def _audit_sources(self):
         p = _helpers()
         for role, native in _ROLES:
-            if not self._deterministic[role]:
+            if not self._raw[role]:
                 continue
             for source in getattr(self._source, native).weights:
                 module = source.param
+                if not source.deterministic():
+                    continue
                 if not isinstance(module, torch.nn.Module):
                     continue
                 direct_compute = _connection_source_can_compute_uncached(module)
@@ -763,7 +1042,18 @@ class ConnectionParameterPlan:
             }
             try:
                 with torch.no_grad():
-                    first, second = execution(), execution()
+                    draws = {
+                        index: torch.full(
+                            shape,
+                            self._placeholder_draw(role, index),
+                            dtype=dtype,
+                            device=device,
+                        )
+                        for index, (shape, dtype, device) in self._draw_schemas[
+                            role
+                        ].items()
+                    }
+                    first, second = execution(draws), execution(draws)
                 if p._global_rng_changes(rng, device):
                     raise FunctionalizationError(
                         "Connection parameter purity diagnostics observed implicit random draws."
