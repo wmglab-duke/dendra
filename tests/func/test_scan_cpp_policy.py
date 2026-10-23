@@ -171,12 +171,10 @@ def test_scan_capture_selects_cpp_from_original_mode_and_immutable_device(
             [object()],
             None,
             {},
+            None,
             grad_enabled=original_grad_enabled,
         )
-    if original_grad_enabled:
-        assert result.__wrapped__ is marker
-    else:
-        assert result is marker
+    assert result.__wrapped__ is marker
     assert captured["prefer"] is (device == "cpu" and not original_grad_enabled)
     assert captured["pre_dispatch"] is original_grad_enabled
 
@@ -194,7 +192,7 @@ def test_scan_passes_original_gradient_mode_through_forced_no_grad_capture(
         records.append(
             (torch.is_grad_enabled(), options["grad_enabled"], options["block"])
         )
-        return lambda *operands: {}
+        return lambda *operands: ({}, {})
 
     monkeypatch.setattr(chunk, "_capture", capture_stub)
     monkeypatch.setattr(_scan, "_FORWARD_SCAN_BLOCK", 4)

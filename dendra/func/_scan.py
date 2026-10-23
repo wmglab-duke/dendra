@@ -17,7 +17,11 @@ from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._callbacks import _update_callback_values
 from ._carry_packing import _PackedCarryLayout
-from ._hop_inputs import _isolate_lifted_inputs
+from ._hop_inputs import (
+    _input_usage,
+    _isolate_dense_lifted_inputs,
+    _LiftedViewIsolation,
+)
 from ._scan_autograd import guard_scan_outputs
 from ._scan_compat import install_scan_compatibility
 from ._scan_inductor import _compile_scan
@@ -199,11 +203,28 @@ class _CompiledScanPopulationChunk:
             grad_enabled=grad_enabled,
             tracer=make_fx,
         )
+        parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
+            graph, (parameters, prepared, state, carries, invariant_carries, sample)
+        )
+        sample_use = pytree.tree_map(lambda _value: True, sample_use)
+        isolate_views = _LiftedViewIsolation.from_usage(
+            (
+                parameter_use,
+                prepared_use,
+                invariant_use,
+                sample_use.get("ve", False),
+                sample_use.get("intra", False),
+                sample_use.get("noise", False),
+            )
+        )
 
         def execute(parameters, prepared, state, ve, intra, carries, noise):
             carries, invariant_carries = callback_carry.split(carries)
-            if assembly is not None:
-                ve, intra = assembly(parameters, prepared, state, ve, intra)
+            parameters, prepared, invariant_carries, ve, intra, noise = (
+                _isolate_dense_lifted_inputs(
+                    (parameters, prepared, invariant_carries, ve, intra, noise)
+                )
+            )
             samples = {}
             if ve is not None:
                 samples["ve"] = ve
@@ -229,11 +250,6 @@ class _CompiledScanPopulationChunk:
                 if plans is None:
                     return packed
                 return packed, {plan.name: emitted.get(plan.name) for plan in plans}
-            # Every lifted operand must own storage independently of its
-            # siblings, including prepared buffers backed by shared sources.
-            parameters, prepared, invariant_carries, samples = _isolate_lifted_inputs(
-                (parameters, prepared, invariant_carries, samples)
-            )
             if block == 1:
 
                 def combine(carry, sample):
@@ -334,16 +350,30 @@ class _CompiledScanPopulationChunk:
             self._options,
             prefer_cpp_wrapper=not grad_enabled and functional.device.type == "cpu",
         )
-        if (
-            not packed_training
-            and not phase_emissions
-            and not callback_carry.invariant_names
-        ):
-            return compiled
 
         @wraps(compiled)
         def materialize(parameters, prepared, state, ve, intra, carries, noise):
-            result = compiled(parameters, prepared, state, ve, intra, carries, noise)
+            if assembly is not None:
+                ve, intra = assembly(parameters, prepared, state, ve, intra)
+            recurrent, invariant = callback_carry.split(carries)
+            parameters, prepared, invariant, ve, intra, noise = isolate_views(
+                (parameters, prepared, invariant, ve, intra, noise)
+            )
+            result = compiled(
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                callback_carry.merge(recurrent, invariant),
+                noise,
+            )
+            if (
+                not packed_training
+                and not phase_emissions
+                and not callback_carry.invariant_names
+            ):
+                return result
             if phase_emissions:
                 final, updated, phases, tail = result
                 if callback_carry.invariant_names:

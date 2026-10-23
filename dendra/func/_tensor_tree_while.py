@@ -17,7 +17,11 @@ from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._callback_carry import _CallbackCarryPartition
 from ._carry_packing import _PackedCarryLayout
-from ._hop_inputs import _isolate_lifted_inputs
+from ._hop_inputs import (
+    _input_usage,
+    _isolate_dense_lifted_inputs,
+    _LiftedViewIsolation,
+)
 from ._while_inductor import _compile_while
 
 
@@ -169,6 +173,19 @@ class _CompiledTensorTreeWhile:
                 for value in samples
             ),
         )
+        parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
+            graph, (parameters, prepared, state, recurrent, invariant, samples)
+        )
+        isolate_views = _LiftedViewIsolation.from_usage(
+            (
+                parameter_use,
+                prepared_use,
+                invariant_use,
+                # The loop indexes every supplied tape before calling the
+                # authored graph, including tapes that graph does not read.
+                pytree.tree_map(lambda _value: True, sample_use),
+            )
+        )
         # FX already recorded the emission tensors' metadata. Discover their
         # schema without executing another numerical model transition.
         output = next(node for node in graph.graph.nodes if node.op == "output")
@@ -200,11 +217,7 @@ class _CompiledTensorTreeWhile:
 
         def execute(parameters, prepared, state, carries, samples):
             recurrent, invariant = partition.split(carries)
-            # Different effective fields and tape views can share one authored
-            # source. The loop requires independent lifted input storage;
-            # invocation-local copies preserve the caller's canonical leaves
-            # and the capture-time metadata recorded by the authored graph.
-            parameters, prepared, invariant, samples = _isolate_lifted_inputs(
+            parameters, prepared, invariant, samples = _isolate_dense_lifted_inputs(
                 (parameters, prepared, invariant, samples)
             )
             buffers = tuple(
@@ -265,7 +278,17 @@ class _CompiledTensorTreeWhile:
         @wraps(compiled)
         def materialize(parameters, prepared, state, carries, tape):
             samples, _ = self._samples(tape)
-            packed, emitted = compiled(parameters, prepared, state, carries, samples)
+            recurrent, invariant = partition.split(carries)
+            parameters, prepared, invariant, samples = isolate_views(
+                (parameters, prepared, invariant, samples)
+            )
+            packed, emitted = compiled(
+                parameters,
+                prepared,
+                state,
+                partition.merge(recurrent, invariant),
+                samples,
+            )
             final, updated = layout.unpack(packed)
             final = clone_state(final)
             updated = partition.merge(updated, partition.split(carries)[1])

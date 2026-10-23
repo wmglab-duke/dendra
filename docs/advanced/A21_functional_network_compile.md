@@ -77,6 +77,13 @@ unless explicit compiler options choose otherwise. Compilation is lazy,
 and the runner is called from Python. Use the lower-level pure API when
 composing `torch.func` or forward-AD transforms.
 
+Scan and while use the same tensor-view ownership rules as Population chunks.
+Expanded and strided parameter, prepared-buffer, and input-tape views retain
+their authored strides and storage offsets. Invocation-local copies isolate
+loop operands without modifying caller tensors; scan gradients accumulate
+through shared sources and overlapping views across checkpointed spans and
+explicit continuation.
+
 ## Initialize from current parameters
 
 Select `initialization="fresh"` to construct initial state from current

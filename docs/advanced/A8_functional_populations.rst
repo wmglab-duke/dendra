@@ -272,6 +272,13 @@ parameters, explicit inputs, and callback carry. Steps and custom callbacks must
 be pure, deterministic, and replay-safe. Replay retains source and prepared-input
 freshness checks and the scan donation guard.
 
+Scan and while chunks accept expanded and strided parameter, prepared-buffer,
+and input-tape views. Each invocation isolates read-only loop operands while
+preserving their authored strides and storage offsets; caller tensors are not
+modified. Scan gradients accumulate into shared source parameters, including
+through overlapping views. The same ownership rules apply during checkpoint
+recomputation and explicit continuation.
+
 Checkpointing exchanges recomputation for lower saved activation memory; it
 does not remove requested recordings. Full voltage/gate trajectories remain a
 memory floor. Final-state objectives or loss/reducer callbacks that do not emit

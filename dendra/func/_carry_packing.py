@@ -71,12 +71,18 @@ class _PackedCarryLayout:
             for leaf, value in zip(self.leaves, values, strict=True)
         ):
             raise ValueError("packed loop carry changed a static None leaf")
-        # cat owns storage even for a one-leaf group. Never use a no-copy
-        # one-leaf shortcut: unchanged leaves must not alias incoming carry.
-        return tuple(
-            torch.cat([values[index].reshape(-1) for index in indices], dim=0)
-            for indices in self.indices
-        )
+        packs = []
+        for indices in self.indices:
+            pieces = [values[index].reshape(-1) for index in indices]
+            if len(indices) == 1 and self.leaves[indices[0]].numel:
+                # Inductor can elide a one-input cat and return a tape slice
+                # with a nonzero offset as the next HOP carry. The loop's
+                # aligned output contract then fails (notably for bool bytes).
+                # A private padding element forces an owned full-span pack;
+                # unpack exposes only the authored logical leaf.
+                pieces.append(pieces[0].new_zeros((1,)))
+            packs.append(torch.cat(pieces, dim=0))
+        return tuple(packs)
 
     def unpack(self, packs):
         if len(packs) != len(self.groups):

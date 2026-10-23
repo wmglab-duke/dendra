@@ -14,7 +14,11 @@ from torch.utils import _pytree as pytree
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._carry_packing import _PackedCarryLayout
-from ._hop_inputs import _isolate_lifted_inputs
+from ._hop_inputs import (
+    _input_usage,
+    _isolate_dense_lifted_inputs,
+    _LiftedViewIsolation,
+)
 from ._scan_autograd import guard_scan_outputs
 from ._scan_compat import (
     _capture_saved_tensor_identity,
@@ -55,11 +59,7 @@ def _packed_tensor_scan(
     """Execute the shared HOP boundary on fresh dtype/device carry groups."""
     from torch._higher_order_ops.scan import scan
 
-    # Separate lifted read-only operands as well as recurrent carry. Effective
-    # buffers may share a raw Parameter's storage even when their public paths
-    # differ; scan rejects those input aliases. These invocation-local copies
-    # retain their gradient routes into the caller's canonical shared leaves.
-    parameters, prepared, invariant_carries, samples = _isolate_lifted_inputs(
+    parameters, prepared, invariant_carries, samples = _isolate_dense_lifted_inputs(
         (parameters, prepared, invariant_carries, samples)
     )
 
@@ -221,6 +221,17 @@ class _CompiledTensorTreeScan:
             (parameters, prepared, state, mutable, invariant, sample),
             grad_enabled=grad_enabled,
         )
+        parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
+            graph, (parameters, prepared, state, mutable, invariant, sample)
+        )
+        isolate_views = _LiftedViewIsolation.from_usage(
+            (
+                parameter_use,
+                prepared_use,
+                invariant_use,
+                pytree.tree_map(lambda _value: True, sample_use),
+            )
+        )
 
         def execute(parameters, prepared, state, carries, samples):
             mutable, invariant = partition.split(carries)
@@ -239,7 +250,7 @@ class _CompiledTensorTreeScan:
             self._options,
             prefer_cpp_wrapper=not grad_enabled and self._device.type == "cpu",
         )
-        return compiled, layout
+        return compiled, layout, isolate_views
 
     def __call__(self, parameters, prepared, state, carries, input_tape):
         samples, sample_layout = self._samples(input_tape)
@@ -261,8 +272,18 @@ class _CompiledTensorTreeScan:
                     sample_layout,
                     grad_enabled=grad_enabled,
                 )
-        compiled, layout = self._kernels[signature]
-        packed, emitted = compiled(parameters, prepared, state, carries, samples)
+        compiled, layout, isolate_views = self._kernels[signature]
+        mutable, invariant = self._callback_carry.split(carries)
+        parameters, prepared, invariant, samples = isolate_views(
+            (parameters, prepared, invariant, samples)
+        )
+        packed, emitted = compiled(
+            parameters,
+            prepared,
+            state,
+            self._callback_carry.merge(mutable, invariant),
+            samples,
+        )
         final, updated = layout.unpack(packed)
         # Equivalent logical leaves must never escape as duplicate moved C++
         # HOP output handles. Keep these ownership clones outside compilation.
