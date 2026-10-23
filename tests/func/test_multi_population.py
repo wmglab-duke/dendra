@@ -1281,9 +1281,12 @@ def test_failed_multi_child_admission_restores_class_and_global_rng_state():
     expected_torch_rng = torch.random.get_rng_state().clone()
     expected_python_rng = random.getstate()
     expected_numpy_rng = copy.deepcopy(np.random.get_state())
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="class state|RNG state",
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(
+            dn.func.FunctionalizationError,
+            match="class state|RNG state",
+        ),
     ):
         dn.func.make_functional(model, dt=DT)
 

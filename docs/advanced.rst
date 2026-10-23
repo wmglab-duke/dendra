@@ -45,3 +45,4 @@ Advanced
    advanced/A35_functional_mechanism_injections.md
    advanced/A36_functional_initialization_sources.md
    advanced/A37_functional_material_processes.md
+   advanced/A38_functional_torch_parametrizations.md

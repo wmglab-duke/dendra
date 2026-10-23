@@ -407,7 +407,12 @@ def _validate_waveform_contract(
                 )
         _module_python_state_signature(module, module_label)
         if isinstance(module, Waveform):
-            if type(module).__dict__.get(_FUNCTIONAL_PURITY_CAPABILITY) is not True:
+            from ._torch_parametrizations import canonical_type
+
+            if (
+                canonical_type(module).__dict__.get(_FUNCTIONAL_PURITY_CAPABILITY)
+                is not True
+            ):
                 raise FunctionalizationError(
                     f"Waveform {module_label!r} has no functional purity "
                     "contract. Declare FUNCTIONAL_PURE = True on the concrete "
@@ -644,6 +649,11 @@ class _FunctionalWaveformBank:
             _validate_waveform_contract(
                 waveform, f"waveforms.{index}", check_purity=self._check_purity
             )
+            from ._torch_parametrizations import failures, install_output_schemas
+
+            parametrization_failures = failures(waveform, diagnostic=self._check_purity)
+            if parametrization_failures:
+                raise FunctionalizationError("; ".join(parametrization_failures))
             try:
                 clone = copy.deepcopy(waveform)
             except Exception as exc:  # pragma: no cover - custom Waveform detail
@@ -661,6 +671,7 @@ class _FunctionalWaveformBank:
                 if isinstance(module, cacheable) and not isinstance(module, Waveform):
                     module.clear_cache()
                     module.training = True
+            install_output_schemas(clone)
             if self._check_purity:
                 _audit_waveform_purity(
                     clone,

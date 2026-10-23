@@ -196,6 +196,11 @@ Shared initialization-only sources support ordered writes.
 Initialization writes to a parameter shared with explicit Network constants
 are currently unsupported. Parameter and buffer aliases within one Population
 use its canonical parameter binding when available.
+Pure PyTorch `register_parametrization(...)` transforms use the shared
+parameter materializer with explicit original tensors, transform parameters,
+and fixed buffers. Shared trainable parameters retain all their qualified
+Network aliases. See {doc}`A38_functional_torch_parametrizations` for parameter
+selection, initialization, caches, and continued checkpointed gradients.
 Population initialization hooks must satisfy the pure initialization contracts
 in {doc}`A8_functional_populations`; unsupported hooks raise an error without
 falling back to snapshot state. Explicit continuation and snapshot execution

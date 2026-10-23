@@ -100,6 +100,7 @@ from ._stimuli import (
     _is_internal_module_state,
     _numpy_rng_state_equal,
 )
+from ._torch_parametrizations import canonical_type as _canonical_type
 from ._types import (
     FunctionalizationError,
     InitializationInput,
@@ -144,6 +145,7 @@ _CLASS_STATE_METADATA_NAMES = frozenset(
         "__doc__",
         "__module__",
         "__qualname__",
+        "__slotnames__",  # copyreg lazily memoizes inherited slots during deepcopy
         "__weakref__",
     }
 )
@@ -526,7 +528,7 @@ def _functional_initialization_profile(population):
         return Unmyelinated, "scalar_path", _bwd_euler_ub
     if _is_native_cable(population):
         return Cable, "scalar_path", _bwd_euler_ub
-    if type(population) is Tree:
+    if _canonical_type(population) is Tree:
         return Tree, "scalar_tree", _dhs
     return None
 
@@ -3409,6 +3411,21 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     kind="effective_parameter",
                 )
             )
+        registry = module._modules.get("parametrizations")
+        if registry is not None:
+            for name in registry:
+                value = getattr(module, name)
+                effective.append(
+                    _PreparedBuffer(
+                        f"{module_path}.{name}",
+                        module_path,
+                        name,
+                        _shape_tuple(value),
+                        value.dtype,
+                        value.device,
+                        "torch_parameter",
+                    )
+                )
         for name in module.random_parameters:
             buffer = module._buffers[name]
             effective.append(
@@ -3559,6 +3576,30 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
             if (
                 buffer is None
                 or id(buffer) not in initial_buffer_ids
+                or id(buffer) in seen
+                or id(buffer) in parameter_ids
+            ):
+                continue
+            seen.add(id(buffer))
+            tables.append(
+                _PreparedBuffer(
+                    f"{module_path}.{name}",
+                    module_path,
+                    name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "constant",
+                )
+            )
+    from ._torch_parametrizations import buffer_slots as torch_buffer_slots
+
+    torch_buffers = {id(value) for _name, value in torch_buffer_slots(population)}
+    for module_path, module in population.named_modules():
+        for name, buffer in module._buffers.items():
+            if (
+                buffer is None
+                or id(buffer) not in torch_buffers
                 or id(buffer) in seen
                 or id(buffer) in parameter_ids
             ):
@@ -3918,10 +3959,7 @@ class _PopulationPreparation(torch.nn.Module):
                 },
             }.items()
         }
-        self.uses_diameter_parametrization = (
-            hasattr(population, "parametrizations")
-            and "diam" in population.parametrizations
-        )
+        self.uses_diameter_parametrization = isinstance(population, Myelinated)
         self.layout = _prepared_buffer_layout(population)
         self.module_paths = _parameterized_module_paths(population)
         self.geometry_bindings = _geometry_binding_layout(population)
@@ -3996,7 +4034,7 @@ class _PopulationPreparation(torch.nn.Module):
                     )
                 evaluated = owner_parameter_values[entry.module_path][entry.buffer_name]
                 evaluated = torch.broadcast_to(evaluated, entry.shape)
-                offset = owner._buffers[entry.buffer_name] - evaluated
+                offset = getattr(owner, entry.buffer_name) - evaluated
                 if bool(torch.count_nonzero(offset).item()):
                     offset_name = f"_effective_offset_{index}"
                     self.register_buffer(offset_name, _clone_tensor(offset))
@@ -4156,7 +4194,8 @@ class _PopulationPreparation(torch.nn.Module):
             # In particular, a zero workspace is not the result of evaluating
             # an authored timestep builder at dt=0.
             self.population.mech._reset_initialization_timestep()
-        self.population._buffers["dx"] = dx
+        if "dx" in self.population._buffers:
+            self.population._buffers["dx"] = dx
         if self.uses_diameter_parametrization:
             if diameters is None or diam_original is None:
                 raise FunctionalizationError(
@@ -4165,7 +4204,7 @@ class _PopulationPreparation(torch.nn.Module):
                 )
             self.population._buffers["diameters"] = diameters
             self.population.parametrizations.diam.original = diam_original
-        else:
+        elif "diam" in self.population._buffers:
             self.population._buffers["diam"] = diam
 
         bindings = self._registered_input_bindings()
@@ -4200,6 +4239,7 @@ class _PopulationPreparation(torch.nn.Module):
                 self.population._buffers[name] = population_values[name]
         celsius = population_values["celsius"]
         effective_diam = population_values.get("diam", diam)
+        dx = population_values.get("dx", dx)
 
         material_geometry = self.population._modules.get("_material_geometry")
         if material_geometry is not None and self.population.mech.material_processes:
@@ -4282,7 +4322,8 @@ class _PopulationPreparation(torch.nn.Module):
                 cache_values,
                 cache_active,
             )
-            owner._buffers[entry.buffer_name] = value
+            if entry.buffer_name in owner._buffers:
+                owner._buffers[entry.buffer_name] = value
             outputs.append((entry.key, value))
 
         for module_path in self.derived_module_paths:
@@ -4536,10 +4577,7 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
                 f"parameters {leaked_runtime_parameters}."
             )
 
-        self.uses_diameter_parametrization = (
-            hasattr(population, "parametrizations")
-            and "diam" in population.parametrizations
-        )
+        self.uses_diameter_parametrization = isinstance(population, Myelinated)
         self.parametrization_constants = _parametrization_constant_layout_for_owners(
             population, (population,)
         )
@@ -4614,7 +4652,8 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
         cache_active=None,
     ):
         """Materialize only effective component-level physical parameters."""
-        self.population._buffers["dx"] = dx
+        if "dx" in self.population._buffers:
+            self.population._buffers["dx"] = dx
         if self.uses_diameter_parametrization:
             if diameters is None or diam_original is None:
                 raise FunctionalizationError(
@@ -4623,7 +4662,7 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
                 )
             self.population._buffers["diameters"] = diameters
             self.population.parametrizations.diam.original = diam_original
-        else:
+        elif "diam" in self.population._buffers:
             self.population._buffers["diam"] = diam
 
         bindings = self._registered_input_bindings()
@@ -5031,6 +5070,11 @@ def _initialization_receiver_dependency_signature(
         return ("registered-parameter", name)
     if name in owner._buffers:
         return ("registered-buffer", name)
+    from ._torch_parametrizations import property_signature
+
+    parametrized = property_signature(owner, name, label=label, strict=strict)
+    if parametrized is not None:
+        return parametrized
     if name in owner._modules:
         module = owner._modules[name]
         return _unsupported_initialization_dependency(
@@ -7059,7 +7103,7 @@ def _uses_standard_myelinated_parametrizations(population) -> bool:
         return False
 
     parametrizations = getattr(population, "parametrizations", None)
-    if parametrizations is None or set(parametrizations) != {"diam"}:
+    if parametrizations is None or "diam" not in parametrizations:
         return False
     diameter_transforms = parametrizations["diam"]
     if not len(diameter_transforms):
@@ -7141,13 +7185,13 @@ def _is_scalar_point(population) -> bool:
     Private methods and descriptors also change execution, so they do not gain
     admission merely by declaring a RAND or NOISE buffer.
     """
-    if type(population) in (Population, SingleCompartment):
+    if _canonical_type(population) in (Population, SingleCompartment):
         return True
     if not isinstance(population, (Population, SingleCompartment)) or not (
         population.random_parameters or population.runtime_noises
     ):
         return False
-    for cls in type(population).__mro__:
+    for cls in _canonical_type(population).__mro__:
         if cls in (Population, SingleCompartment):
             return True
         if any(
@@ -7166,7 +7210,10 @@ def _is_scalar_point(population) -> bool:
 
 def _is_native_cable(population) -> bool:
     """Return whether ``population`` is an exact canonical generic Cable."""
-    return type(population) is Cable and population.compartment_graph is not None
+    return (
+        _canonical_type(population) is Cable
+        and population.compartment_graph is not None
+    )
 
 
 def _is_scalar_tree(population) -> bool:
@@ -7192,7 +7239,7 @@ def _is_canonical_tree(population) -> bool:
 
 def _is_multi(population) -> bool:
     """Return whether ``population`` is the exact packed population container."""
-    return type(population) is MultiPopulation
+    return _canonical_type(population) is MultiPopulation
 
 
 def _functional_topology_kind(population) -> str | None:
@@ -7720,6 +7767,21 @@ def _parametrization_constant_layout_for_owners(
     from ._tables import table_buffer_slots
 
     for owner in owners:
+        from ._torch_parametrizations import buffer_slots as torch_buffer_slots
+
+        owner_prefix = module_paths[id(owner)]
+        # A registry can also live below a module-valued raw source (for
+        # example PositiveParam.rho), so include its registered descendants.
+        for relative_path, value in torch_buffer_slots(owner):
+            if _is_multi(population) and relative_path.startswith("populations."):
+                continue  # component physical adapters own these private inputs
+            if is_registered_parameter(value):
+                continue
+            full_path = f"{owner_prefix + '.' if owner_prefix else ''}{relative_path}"
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value), f"parametrizations.{full_path}"
+            )
         for relative_path, value in custom_material_constant_slots(owner):
             if is_registered_parameter(value):
                 continue
@@ -7947,6 +8009,9 @@ def _in_graph_transform_parameter_names(population) -> set[str]:
         id(parameter): name for name, parameter in population.named_parameters()
     }
     names = set()
+    from ._torch_parametrizations import parameter_names as torch_parameter_names
+
+    names.update(torch_parameter_names(population))
     for owner in _parameterized_owners(population):
         for transforms in owner.in_graph_parametrizations.values():
             for transform, args in transforms:
@@ -8090,6 +8155,20 @@ def _parameter_buffer_alias_conflicts(population) -> tuple[tuple, ...]:
             )
 
     consumed_parameter_ids = set()
+    from ._torch_parametrizations import registries as torch_registries
+
+    consumed_parameter_ids.update(
+        id(value)
+        for _path, _owner, registry in torch_registries(population)
+        for value in registry.parameters()
+    )
+    from ._torch_parametrizations import buffer_slots as torch_buffer_slots
+
+    consumed_parameter_ids.update(
+        id(value)
+        for _path, value in torch_buffer_slots(population)
+        if id(value) in parameter_name_by_identity
+    )
     material_parameter_names = _material_preparation_parameter_names(population)
     consumed_parameter_ids.update(
         identity
@@ -8296,6 +8375,19 @@ def _functionalization_failures(
         return ["expected an initialized dendra Population"]
     if not population.initialized:
         failures.append("Population must be initialized before functionalization")
+    if isinstance(
+        population, Myelinated
+    ) and not _uses_standard_myelinated_parametrizations(population):
+        return [
+            *failures,
+            "Myelinated functionalization requires the standard registered "
+            "diameter and axial-resistivity parametrizations",
+        ]
+    from ._torch_parametrizations import failures as torch_parametrization_failures
+
+    torch_failures = torch_parametrization_failures(population)
+    if torch_failures:
+        return [*failures, *torch_failures]
     is_multi = _is_multi(population)
     is_single_compartment = _is_scalar_point(population)
     is_extcell_axon = isinstance(population, ExtCellAxon)
@@ -8915,11 +9007,6 @@ def _functionalization_failures(
                 break
         if not parameter_contract_supported:
             break
-        parametrizations = getattr(owner, "parametrizations", None)
-        if parametrizations is not None and len(parametrizations):
-            failures.append("torch parameterizations are not supported yet")
-            parameter_contract_supported = False
-            break
 
     if (
         population.initialized
@@ -8979,9 +9066,14 @@ def _functionalization_failures(
             or is_scalar_tree
             else _UNMYELINATED_POPULATION_PARAMETER_NAMES
         )
-    missing_population_parameters = required_population_parameters - set(
-        named_parameters
-    )
+    from ._torch_parametrizations import original_parameter_paths
+
+    missing_population_parameters = {
+        name
+        for name in required_population_parameters
+        if name not in named_parameters
+        and not original_parameter_paths(population, name)
+    }
     if missing_population_parameters:
         failures.append(
             "required Population parameters are missing: "
@@ -9000,6 +9092,9 @@ def _functionalization_failures(
         }
     regional_parameter_names = _additional_parameter_raw_names(population)
     transform_parameter_names = _in_graph_transform_parameter_names(population)
+    from ._torch_parametrizations import parameter_names as torch_parameter_names
+
+    transform_parameter_names.update(torch_parameter_names(population))
     transform_parameter_names.update(_material_preparation_parameter_names(population))
     from ._tables import table_parameter_names
 
@@ -9626,21 +9721,31 @@ def _parametrization_signatures(population) -> tuple:
         for owner_path, owner in _parameterized_owner_paths(population)
         if owner.in_graph_parametrizations
     )
-    parametrizations = getattr(population, "parametrizations", None)
-    torch_registered = (
-        ()
-        if parametrizations is None
-        else tuple(
-            (
-                name,
-                _shape_tuple(transforms.original),
-                _module_autograd_hook_signature(transforms),
-                tuple(
-                    _transform_contract_signature(transform) for transform in transforms
-                ),
-            )
-            for name, transforms in parametrizations.items()
+    from ._torch_parametrizations import registries as torch_registries
+
+    torch_registered = tuple(
+        (
+            path,
+            name,
+            tuple(
+                (kind, key, _shape_tuple(value), value.dtype, value.device)
+                for kind, values in (
+                    ("parameter", transforms._parameters),
+                    ("buffer", transforms._buffers),
+                )
+                for key, value in values.items()
+                if key.startswith("original") and value is not None
+            ),
+            bool(transforms.is_tensor),
+            bool(transforms.unsafe),
+            _callable_binding_signature(
+                inspect.getattr_static(type(owner), name).fget, include_identity=False
+            ),
+            _module_autograd_hook_signature(transforms),
+            tuple(_transform_contract_signature(transform) for transform in transforms),
         )
+        for path, owner, registry in torch_registries(population)
+        for name, transforms in registry.items()
     )
     return in_graph, torch_registered
 
@@ -10202,6 +10307,22 @@ class FunctionalPopulation:
         self._device = population.device()
         self._population = population
         self._check_purity = current_check_purity()
+        from ._torch_parametrizations import buffer_slots as torch_buffer_slots
+        from ._torch_parametrizations import parameter_names as torch_parameter_names
+
+        self._torch_parameter_names = frozenset(torch_parameter_names(population))
+        torch_buffer_ids = {
+            id(value) for _path, value in torch_buffer_slots(population)
+        }
+        self._torch_constant_names = frozenset(
+            entry.key
+            for entry in self._parametrization_constants
+            if id(_buffer_at(population, entry.module_path, entry.buffer_name))
+            in torch_buffer_ids
+        )
+        from ._torch_parametrizations import source_binding_signature
+
+        self._torch_source_bindings = source_binding_signature(population)
         from ._custom_material_processes import CustomMaterialProcessPlan
 
         self._custom_material_plans = {
@@ -10307,6 +10428,9 @@ class FunctionalPopulation:
         )
 
         execution_population = _clone_execution_population(population)
+        from ._torch_parametrizations import install_output_schemas
+
+        install_output_schemas(execution_population)
         dt_tensor = torch.as_tensor(self.dt, device=self.device, dtype=self.dtype)
         has_timestep_buffers = any(
             _timestep_buffer_names(_module_at(execution_population, module_path))
@@ -10955,6 +11079,9 @@ class FunctionalPopulation:
             if component is None:
                 component = _clone_execution_population(source_component)
                 component.initialize(populate_parameter_buffers=False)
+            from ._torch_parametrizations import install_output_schemas
+
+            install_output_schemas(component)
             topology_kind = _functional_topology_kind(component)
             group_k = (
                 int(packed_integrator.group_K[component_index])
@@ -11304,6 +11431,16 @@ class FunctionalPopulation:
             )
 
     def _validate_source(self) -> None:
+        if self._torch_source_bindings:
+            from ._torch_parametrizations import source_binding_signature
+
+            if (
+                source_binding_signature(self._population)
+                != self._torch_source_bindings
+            ):
+                raise FunctionalizationError(
+                    "Source torch parametrization structure changed; lower again"
+                )
         if self._custom_material_plans:
             if torch.compiler.is_compiling():
                 if (
@@ -11665,6 +11802,15 @@ class FunctionalPopulation:
         for name in self._preparation.population_parameter_names:
             if name in self._population._buffers:
                 paths.append(name)
+        if self._multi_component_plans:
+            # Native packed initialization restores assembled physical buffers
+            # independently of the component getters. Point and block solvers
+            # consume these parent fields; scalar DHS still reads child fields.
+            paths.extend(
+                name
+                for name in ("diam", "dx", "_component_area", "xc", "xg")
+                if name in self._population._buffers
+            )
         paths.extend(
             f"{entry.module_path}.{entry.buffer_name}"
             for entry in self._prepared_buffers
@@ -12635,12 +12781,15 @@ class FunctionalPopulation:
                         active, parameters[name].detach(), parameters[name]
                     )
                     for name in self._population_parameter_names
+                    if name not in self._torch_parameter_names
                 },
             }
             constants = {
                 name: (
                     value
-                    if name == "dt" or name.startswith("cache.")
+                    if name == "dt"
+                    or name.startswith("cache.")
+                    or name in self._torch_constant_names
                     else torch.where(active, value.detach(), value)
                 )
                 for name, value in constants.items()
@@ -12692,6 +12841,10 @@ class FunctionalPopulation:
             )
         )
         diam = population_values.get("diam", diam)
+        dx = population_values.get("dx", dx)
+        xraxial = population_values.get("xraxial", xraxial)
+        xc = population_values.get("xc", xc)
+        xg = population_values.get("xg", xg)
         cm = population_values["cm"]
         rhoa = population_values["rhoa"]
         rhoa_scale = population_values["rhoa_scale"]
@@ -13064,7 +13217,7 @@ class FunctionalPopulation:
                     strict=True,
                 )
             )
-            geometry_values = component_constants
+            geometry_values = {**component_constants, **population_values}
 
             def expanded(value):
                 return torch.broadcast_to(value, component_shape)
@@ -13234,9 +13387,22 @@ class FunctionalPopulation:
             name: torch.cat(parts, dim=-1).unsqueeze(-2)
             for name, parts in packed_fields.items()
         }
-        packed_diam = full_fields["diam"]
-        packed_dx = full_fields["dx"]
         cache_values, cache_active = self._cache_preparation_inputs(constants)
+        parent_fields = {
+            name: _cache_materialization(
+                value,
+                "_component_area" if name == "point_area" else name,
+                cache_values,
+                cache_active,
+            )
+            for name, value in full_fields.items()
+            if name != "area"
+        }
+        parent_fields["area"] = (
+            parent_fields["point_area"] * parent_fields["area_scale"]
+        )
+        packed_diam = parent_fields["diam"]
+        packed_dx = parent_fields["dx"]
 
         population_values, mechanism_values, local_geometry_values, random_outputs = (
             self._prepare_parameter_buffers(
@@ -13253,7 +13419,7 @@ class FunctionalPopulation:
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
-                material_area=full_fields["point_area"],
+                material_area=parent_fields["point_area"],
                 cache_values=cache_values,
                 cache_active=cache_active,
                 random_inputs=None
@@ -13268,25 +13434,35 @@ class FunctionalPopulation:
             "rhoa_scale",
             "area_scale",
         ):
-            population_values[name] = full_fields[name]
+            population_values[name] = parent_fields[name]
 
         if self._topology_kind == "multi_point":
             integrator_workspace = packed_integrator._derive_prepared_workspace(
                 dt,
-                cm=full_fields["cm"] * full_fields["cm_scale"],
-                area=full_fields["area"],
+                cm=parent_fields["cm"] * parent_fields["cm_scale"],
+                area=parent_fields["area"],
             )
         elif self._topology_kind == "multi_block":
             integrator_workspace = packed_integrator._derive_prepared_workspace(
                 dt,
-                cm=(full_fields["cm"] * full_fields["cm_scale"]).reshape(
+                cm=(parent_fields["cm"] * parent_fields["cm_scale"]).reshape(
                     self._solve_shape
                 ),
-                area=full_fields["area"].reshape(self._solve_shape),
+                area=parent_fields["area"].reshape(self._solve_shape),
                 intracellular_edge_conductance=torch.cat(compact_edges, dim=-1),
                 extracellular_edge_conductance=torch.cat(block_shell_edges, dim=-2),
-                xc=torch.cat(block_xc, dim=-2),
-                xg=torch.cat(block_xg, dim=-2),
+                xc=_cache_materialization(
+                    torch.cat(block_xc, dim=-2).reshape(*self.shape, 2),
+                    "xc",
+                    cache_values,
+                    cache_active,
+                ).reshape(*self._solve_shape, 2),
+                xg=_cache_materialization(
+                    torch.cat(block_xg, dim=-2).reshape(*self.shape, 2),
+                    "xg",
+                    cache_values,
+                    cache_active,
+                ).reshape(*self._solve_shape, 2),
                 edge_child_orig=packed_integrator.edge_child_orig,
                 solver_order=packed_integrator.solver_order,
             )
@@ -13303,7 +13479,7 @@ class FunctionalPopulation:
 
         for entry in self._point_area_factors:
             mechanism_values[entry.key] = 1e6 * entry.support_entry.gather(
-                full_fields["point_area"]
+                parent_fields["point_area"]
             )
 
         values = {
@@ -13551,6 +13727,10 @@ class FunctionalPopulation:
             mapping[slot] = mechanism_dt
         for entry in self._prepared_buffers:
             value = read_only(prepared["mechanisms"][entry.key])
+            if entry.kind == "torch_parameter":
+                # Native getters consume the same explicit original/transform
+                # leaves. Binding the property itself would run right_inverse.
+                continue
             if entry.kind == "constant":
                 for slot in self._prepared_constant_aliases[entry.key]:
                     mapping[slot] = value

@@ -50,6 +50,7 @@ def nonpersistent_material_cache_failures(functional):
     """Reject cache writes omitted from another Population's config reader."""
     from ._custom_material_processes import custom_material_constant_slots
     from ._population_cache import _cache_storage_frame
+    from ._torch_parametrizations import buffer_slots as torch_buffer_slots
 
     plans = (
         functional._population_cache_plans
@@ -102,6 +103,10 @@ def nonpersistent_material_cache_failures(functional):
             for process in population.mech.material_processes.values()
             for _slot, value in custom_material_constant_slots(process)
         }
+        torch_config_ids = {
+            id(value) for _slot, value in torch_buffer_slots(population)
+        }
+        config_ids.update(torch_config_ids)
         for entry in population_plan._parametrization_constants:
             if ("populations", name, entry.key) in represented:
                 continue
@@ -121,7 +126,8 @@ def nonpersistent_material_cache_failures(functional):
                 for writer_name, plan in plans.items()
             ):
                 failures.append(
-                    f"Population {name!r} nonpersistent custom MaterialProcess "
+                    f"Population {name!r} nonpersistent "
+                    f"{'torch parametrization' if id(value) in torch_config_ids else 'custom MaterialProcess'} "
                     f"config {entry.key!r} shares storage with another "
                     "Population's cached tensor. This cache restoration is "
                     "currently unsupported; use independent config buffers "

@@ -216,6 +216,7 @@ def _eligible(network):
             "A functional Network needs at least one Population."
         )
     from ._custom_material_processes import custom_material_constant_slots
+    from ._torch_parametrizations import buffer_slots as torch_buffer_slots
 
     custom_config = [
         (name, slot, value)
@@ -223,6 +224,11 @@ def _eligible(network):
         for process in population.mech.material_processes.values()
         for slot, value in custom_material_constant_slots(process)
     ]
+    custom_config.extend(
+        (name, f"torch_parametrizations.{slot}", value)
+        for name, population in network.populations.items()
+        for slot, value in torch_buffer_slots(population)
+    )
     network_parameters = (
         {id(value) for value in network.parameters()} if custom_config else set()
     )
@@ -235,16 +241,21 @@ def _eligible(network):
             continue
         local_parameters = {id(value) for value in population.parameters()}
         for slot, value in slots:
+            kind = (
+                "torch parametrization"
+                if slot.startswith("torch_parametrizations.")
+                else "custom MaterialProcess"
+            )
             if id(value) in runtime_buffers:
                 raise FunctionalizationError(
-                    f"Population {name!r} custom MaterialProcess config "
+                    f"Population {name!r} {kind} config "
                     f"buffer {slot!r} aliases runtime state, geometry, or a "
                     "reconstructed parameter; use an independent config "
                     "buffer or a shared registered raw Parameter."
                 )
             if id(value) in network_parameters - local_parameters:
                 raise FunctionalizationError(
-                    f"Population {name!r} custom MaterialProcess config "
+                    f"Population {name!r} {kind} config "
                     f"buffer {slot!r} aliases a raw parameter registered "
                     "only outside that Population. Cross-Population "
                     "buffer/parameter aliases are currently unsupported; "
@@ -274,6 +285,11 @@ def _eligible(network):
         recipe_roots = waveform_roots | {
             id(source) for _path, source in initialization_source_roots(population)
         }
+        from ._torch_parametrizations import registries as torch_registries
+
+        recipe_roots.update(
+            id(registry) for _path, _owner, registry in torch_registries(population)
+        )
         mutable_owned = set()
 
         def visit(module):

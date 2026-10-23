@@ -538,6 +538,16 @@ def _validate_waveform_dependencies(waveform):
                     continue
                 if name in current._parameters or name in current._buffers:
                     break
+                from ._torch_parametrizations import property_signature
+
+                if (
+                    property_signature(current, name, label=label, strict=True)
+                    is not None
+                ):
+                    # The canonical getter dispatches the registered pure
+                    # transforms; its optional global cache is not authored
+                    # numerical state and is bypassed on execution copies.
+                    break
                 target = inspect.getattr_static(current, name, missing)
                 if target is not missing:
                     visit(current, target, f"{label}.{name}")

@@ -313,6 +313,10 @@ class PopulationCachePlan:
         )
         for name in geometry_names:
             value = _geometry_constant_value(population, name)
+            if name in getattr(population, "parametrizations", {}):
+                # Computed properties have no saved effective storage. Their
+                # original/config tensor bindings restore the native getter.
+                continue
             if (
                 name in {"canonical_area_cm2", "canonical_edge_resistance_ohm"}
                 and special[name] not in reference
@@ -334,6 +338,8 @@ class PopulationCachePlan:
             component = population.populations[record.name]
             entries = {entry.key: entry for entry in record.parametrization_constants}
             for relative, public in record.constant_sources:
+                if relative in getattr(component, "parametrizations", {}):
+                    continue
                 if relative in record.geometry_constant_names:
                     value = _geometry_constant_value(component, relative)
                     fallback = special.get(relative, relative)

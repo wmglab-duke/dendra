@@ -1176,6 +1176,14 @@ The extracted ``PopulationTensors`` contains:
    shape rather than being copied across replicas. Replace ``dt`` and prepare
    again when evaluating another timestep.
 
+   Pure PyTorch tensor parametrizations retain their original registered
+   tensors and transform dependencies as explicit inputs. Original
+   ``Parameter`` tensors and transform parameters appear in ``parameters``;
+   original buffers and registered fixed buffers appear in ``constants``.
+   Shared aliases retain one input binding. See
+   :ref:`functional-torch-parametrizations` for registration, parameter
+   selection, gradients, and checkpoint continuation.
+
    ``MultiPopulation`` instead exposes each component's geometry under
    ``populations.<component>.*`` and assembles packed ``diam``/``dx`` and
    electrical workspaces during preparation. Canonical area and resistance are

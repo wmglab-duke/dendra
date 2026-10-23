@@ -3,6 +3,16 @@ dendra.models.parametric
 
 Tools and mixins for model parameterization.
 
+PyTorch tensor parametrizations registered with
+``torch.nn.utils.parametrize.register_parametrization`` or
+``Population.register_parametrization`` use the shared pure parameter
+materializer in native and functional execution. Registered original tensors,
+transform parameters, and fixed buffers remain explicit inputs, with shared
+aliases preserved. See :ref:`functional-torch-parametrizations` for the pure
+transform contract, training, initialization, caches, and compiled Network
+continuation. Optional ``dn.ctx(CHECK_PURITY=True)`` enables diagnostic checks
+when creating the functional plan; checks are disabled by default.
+
 .. autoclass:: dendra.models.parametric.Bounded
    :members:
    :member-order: groupwise
