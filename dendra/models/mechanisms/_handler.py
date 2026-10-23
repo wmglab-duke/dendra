@@ -18,6 +18,12 @@ from ._material_stochasticity import (
 )
 from ._materials import _canonical_material_name
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
+from ._noise_workspaces import (
+    noise_workspace_slots,
+    reset_noise_workspace_timestep,
+    retain_noise_workspace_once,
+)
+from ._state import _is_unresolved_deferred_buffer
 from ._support import SupportKind
 from ._support_registry import SupportRegistry
 
@@ -189,6 +195,9 @@ def _capture_stochastic_state(states, prefix, module):
         states[key] = getattr(module, parameter_name)
     for suffix, owner, buffer_name in stochastic_material_workspace_slots(module):
         key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}material_workspace.{suffix}"
+        states[key] = owner._buffers[buffer_name]
+    for suffix, owner, buffer_name in noise_workspace_slots(module):
+        key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}noise_workspace.{suffix}"
         states[key] = owner._buffers[buffer_name]
     if getattr(module, "random_parameters", {}):
         key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter_state"
@@ -1785,6 +1794,7 @@ class MechanismHandler(torch.nn.Module):
             if torch.is_tensor(dt):
                 module._buffers["dt"] = torch.zeros_like(dt).detach()
             for owner in (module, *module.DE.values()):
+                reset_noise_workspace_timestep(owner)
                 for name in owner._timestep_buffers:
                     value = owner._buffers.get(name)
                     if torch.is_tensor(value):
@@ -2957,6 +2967,8 @@ class MechanismHandler(torch.nn.Module):
         delay_assignments = plan["delay_assignments"]
         random_parameter_assignments = plan["random_parameter_assignments"]
         material_assignments = plan["material_assignments"]
+        noise_workspace_assignments = plan["noise_workspace_assignments"]
+        noise_workspace_resolutions = plan["noise_workspace_resolutions"]
 
         missing = object()
         original_tensors = [
@@ -2998,6 +3010,14 @@ class MechanismHandler(torch.nn.Module):
             )
             for owner, _staged in material_assignments
         ]
+        original_noise_workspaces = [
+            (module, getattr(module, "_noise_workspace_restored_dt", missing))
+            for module in noise_workspace_assignments
+        ]
+        original_workspace_resolutions = [
+            (module, dict(module._derived_resolved_shapes))
+            for module, _name, _shape in noise_workspace_resolutions
+        ]
         for rng, _, _ in rng_assignments:
             if id(rng) in original_rngs:
                 continue
@@ -3033,7 +3053,19 @@ class MechanismHandler(torch.nn.Module):
                             name, staged._buffers[name], persistent=False
                         )
                 retain_stochastic_material_workspace_once(module)
+            for module in noise_workspace_assignments:
+                module.__dict__.pop("_noise_workspace_restored_dt", None)
+                retain_noise_workspace_once(module)
+            for module, name, shape in noise_workspace_resolutions:
+                module._derived_resolved_shapes[name] = shape
         except Exception:
+            for module, resolutions in original_workspace_resolutions:
+                module._derived_resolved_shapes = resolutions
+            for module, restored_dt in original_noise_workspaces:
+                if restored_dt is missing:
+                    module.__dict__.pop("_noise_workspace_restored_dt", None)
+                else:
+                    module._noise_workspace_restored_dt = restored_dt
             for (
                 module,
                 operators,
@@ -3092,6 +3124,8 @@ class MechanismHandler(torch.nn.Module):
         delay_assignments = []
         random_parameter_assignments = []
         material_assignments = []
+        noise_workspace_assignments = []
+        noise_workspace_resolutions = []
         missing = object()
 
         def add_tensor(
@@ -3182,6 +3216,65 @@ class MechanismHandler(torch.nn.Module):
                     f"random_parameter.{parameter_name}"
                 )
                 add_tensor(module, parameter_name, key)
+            noise_workspace_prefix = (
+                f"{prefix}{_STOCHASTIC_STATE_SEGMENT}noise_workspace."
+            )
+            noise_workspace = {
+                f"{noise_workspace_prefix}{suffix}": (owner, buffer_name)
+                for suffix, owner, buffer_name in noise_workspace_slots(module)
+            }
+            present_noise_workspace = {
+                key
+                for key in state_dict
+                if isinstance(key, str) and key.startswith(noise_workspace_prefix)
+            }
+            if present_noise_workspace:
+                missing_workspace = set(noise_workspace) - present_noise_workspace
+                unexpected_workspace = present_noise_workspace - set(noise_workspace)
+                if missing_workspace:
+                    raise KeyError(
+                        "MechanismHandler NOISE workspace state is missing "
+                        f"entries: {sorted(missing_workspace)}."
+                    )
+                if unexpected_workspace:
+                    raise ValueError(
+                        "MechanismHandler NOISE workspace state has unexpected "
+                        f"entries: {sorted(unexpected_workspace)}."
+                    )
+                for key, (owner, buffer_name) in noise_workspace.items():
+                    candidate = state_dict[key]
+                    if key.endswith(".active") and (
+                        not torch.is_tensor(candidate)
+                        or candidate.ndim != 0
+                        or candidate.dtype != torch.bool
+                    ):
+                        raise ValueError(
+                            "NOISE workspace active flags must be scalar bool tensors."
+                        )
+                    if key.endswith("timestep.dt") and (
+                        not torch.is_tensor(candidate)
+                        or candidate.ndim != 0
+                        or not math.isfinite(float(candidate.item()))
+                        or float(candidate.item()) < 0
+                    ):
+                        raise ValueError(
+                            "NOISE workspace timestep must be a finite nonnegative scalar tensor."
+                        )
+                    if (
+                        ".derived.buffer." in key
+                        and _is_unresolved_deferred_buffer(owner, buffer_name)
+                        and torch.is_tensor(candidate)
+                    ):
+                        reference = owner._buffers[buffer_name].new_empty(
+                            candidate.shape
+                        )
+                        add_tensor(owner, buffer_name, key, reference=reference)
+                        noise_workspace_resolutions.append(
+                            (owner, buffer_name, tuple(candidate.shape))
+                        )
+                    else:
+                        add_tensor(owner, buffer_name, key)
+                noise_workspace_assignments.append(module)
             if not isinstance(module, DiffusionProcess) or not module.runtime_noises:
                 return
             staged = stage_stochastic_material_workspace(
@@ -3410,6 +3503,8 @@ class MechanismHandler(torch.nn.Module):
             "delay_assignments": delay_assignments,
             "random_parameter_assignments": random_parameter_assignments,
             "material_assignments": material_assignments,
+            "noise_workspace_assignments": noise_workspace_assignments,
+            "noise_workspace_resolutions": noise_workspace_resolutions,
         }
 
     def _mutable_state_bindings(self):

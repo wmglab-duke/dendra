@@ -196,6 +196,9 @@ automatically, or ``initial.random_draw`` supplies an explicit packet. See
 shared streams, and custom pure distributions. Inserted Mechanisms and nested
 States can use ``GLOBALNOISE``, ``BATCHNOISE``, and ``RANGENOISE`` with detached
 per-step draws and explicit RNG tapes; see :doc:`A31_functional_runtime_noise`.
+Their pure derived and timestep builders can read these declarations while
+retaining the NOISE selected at initialization or timestep configuration;
+see :doc:`A46_functional_noise_workspaces`.
 State ``DIFFUSION`` uses the shared Euler–Maruyama and Euler–Heun solvers
 with explicit standard-normal draws and RNG carry; see
 :doc:`A32_functional_state_sde`.
@@ -349,8 +352,8 @@ shared-field locals are discovered automatically. Initialization-
 static workspaces declared with ``Mechanism.DERIVED_BUFFER`` or
 ``State.DERIVED_BUFFER`` are rebuilt during preparation from current parameters,
 temperature, and the mechanism's exact support-local geometry, so they remain
-differentiable without becoming explicit state. Timestep workspaces declared with
-``Mechanism.TIMESTEP_BUFFER`` or ``State.TIMESTEP_BUFFER`` are rebuilt in the
+differentiable with respect to their ordinary inputs. Timestep workspaces declared
+with ``Mechanism.TIMESTEP_BUFFER`` or ``State.TIMESTEP_BUFFER`` are rebuilt in the
 same preparation from the explicit ``dt`` constant. Fresh initialization also
 supports these declarations: just as with ``Population.initialize()``, all
 timestep workspaces start as literal zeros in their declared shapes, before
@@ -360,6 +363,10 @@ initialization phase; in particular, their values at ``dt=0`` need not be zero.
 Runtime preparation then rebuilds the workspaces at the actual timestep,
 preserving gradients through their parameters and the explicit ``dt``. State
 variable names are not restricted to those used by the built-in HH mechanism.
+NOISE-dependent builders retain their initialization or timestep-configuration
+sample independently of runtime NOISE refreshes. Explicit state and native
+checkpoints preserve those preparation boundaries; see
+:doc:`A46_functional_noise_workspaces`.
 
 A ``SAVE_CURRENT("i")`` mirror occupies
 ``state["mechanism_buffers"][mechanism_name]["i_"]`` and follows the same raw

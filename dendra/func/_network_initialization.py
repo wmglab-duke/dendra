@@ -807,6 +807,17 @@ def _initialize_components(
                     effective_constants["populations"][name],
                     populations[name],
                 )
+            if inputs.cache is None:
+                population_constants, populations[name] = (
+                    plan._initialize_noise_workspaces(
+                        effective["populations"][name],
+                        effective_constants["populations"][name],
+                        populations[name],
+                    )
+                )
+                effective_constants = _replace_at(
+                    effective_constants, ("populations", name), population_constants
+                )
         if inputs.cache is not None:
             effective, effective_constants, populations = _restore_cache_aliases(
                 functional,
@@ -835,6 +846,16 @@ def _initialize_components(
                     effective["populations"][name],
                     effective_constants["populations"][name],
                     populations[name],
+                )
+                population_constants, populations[name] = (
+                    plan._initialize_noise_workspaces(
+                        effective["populations"][name],
+                        effective_constants["populations"][name],
+                        populations[name],
+                    )
+                )
+                effective_constants = _replace_at(
+                    effective_constants, ("populations", name), population_constants
                 )
         time = inputs.t.detach().clone()
         populations = {

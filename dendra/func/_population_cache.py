@@ -16,6 +16,21 @@ from ._population import _buffer_at, _geometry_constant_value, _get_path, _put_p
 from ._types import FunctionalizationError, PopulationTensors
 
 
+def _complete_legacy_noise_workspace_cache(population, cache):
+    """Apply the native legacy state-dict rule before cold schema validation."""
+    if not isinstance(cache, Mapping):
+        return cache
+    from dendra.models.mechanisms._noise_workspaces import (
+        complete_legacy_noise_workspace_state,
+    )
+
+    for path, owner in population.named_modules(remove_duplicate=False):
+        cache = complete_legacy_noise_workspace_state(
+            owner, cache, prefix=f"{path}." if path else ""
+        )
+    return cache
+
+
 def _cache_storage_frame(value, *, buffer=False, owner=None):
     """Identify an exact native cache-copy destination without tying AD leaves.
 
@@ -196,6 +211,8 @@ class PopulationCachePlan:
             for suffix, _owner, _buffer in stochastic_material_workspace_slots(process)
             if not suffix.startswith("noise.")
         )
+        if not bindings_only:
+            cache = _complete_legacy_noise_workspace_cache(population, cache)
         if not bindings_only and isinstance(cache, Mapping):
             cache = {
                 **cache,
@@ -260,17 +277,33 @@ class PopulationCachePlan:
             for name, value in population.named_parameters()
             if name in plan._population_parameter_names
         }
-        self.states = tuple(
-            (
-                leaf.public_path,
-                key(
-                    _buffer_at(population, leaf.module_path, leaf.buffer_name),
-                    f"{leaf.module_path + '.' if leaf.module_path else ''}{leaf.buffer_name}",
-                ),
+        state_bindings = []
+        for leaf in plan._state_layout:
+            if leaf.public_path[0] == "material_preparation":
+                continue
+            source = f"{leaf.module_path + '.' if leaf.module_path else ''}{leaf.buffer_name}"
+            owner = population.get_submodule(leaf.module_path)
+            if (
+                leaf.public_path[0] == "noise_workspaces"
+                and source not in reference
+                and not aliases.get(self.storage_frames.get(source), ())
+                and leaf.buffer_name in owner._non_persistent_buffers_set
+            ):
+                # Held NOISE provenance is explicit continuation state, while
+                # native state-dict caches leave its nonpersistent storage
+                # alone. Numerical declared workspaces remain ordinary saved
+                # buffers and are restored through their persistent bindings.
+                continue
+            state_bindings.append(
+                (
+                    leaf.public_path,
+                    key(
+                        _buffer_at(population, leaf.module_path, leaf.buffer_name),
+                        source,
+                    ),
+                )
             )
-            for leaf in plan._state_layout
-            if leaf.public_path[0] != "material_preparation"
-        )
+        self.states = tuple(state_bindings)
         self.constants = {}
 
         def constant_source(value, fallback, owner, buffer_name):
@@ -382,6 +415,14 @@ class PopulationCachePlan:
             *plan._materialization_value_specs,
         ):
             value = slots[source]
+            module_path, _, buffer_name = source.rpartition(".")
+            owner = population.get_submodule(module_path)
+            if (
+                source not in reference
+                and not aliases.get(self.storage_frames.get(source), ())
+                and buffer_name in owner._non_persistent_buffers_set
+            ):
+                continue
             self.constants[public] = key(value, source)
         represented = {
             id(slots[source])
@@ -496,6 +537,7 @@ class PopulationCachePlan:
                 raise FunctionalizationError(message)
 
     def normalize(self, cache):
+        cache = _complete_legacy_noise_workspace_cache(self.plan._population, cache)
         if not isinstance(cache, Mapping) or set(cache) != set(self._reference):
             raise FunctionalizationError(
                 "Population state cache schema changed; lower again"
@@ -557,9 +599,24 @@ class PopulationCachePlan:
             reference = _get_path(state, leaf.public_path)
             value = (
                 reference
-                if leaf.public_path[0] == "material_preparation"
+                if leaf.public_path not in sources
                 else cache[sources[leaf.public_path]].detach().to(reference).clone()
             )
+            if (
+                leaf.public_path[0] == "noise_workspaces"
+                and leaf.public_path[-1] == "timestep.active"
+            ):
+                # A state-dict cache restores numerical workspaces separately
+                # from their nonpersistent NOISE provenance. The next runtime
+                # configuration consumes the restored current NOISE frame.
+                value = torch.zeros_like(reference)
+                constant = (
+                    "noise_workspaces."
+                    f"{leaf.module_path + '.' if leaf.module_path else ''}"
+                    f"{leaf.buffer_name}"
+                )
+                if constant in effective_constants:
+                    effective_constants[constant] = value
             _put_path(restored_state, leaf.public_path, value)
         if plan._random_plan is not None:
             effective_constants, restored_state["random"] = (

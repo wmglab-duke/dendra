@@ -296,47 +296,8 @@ class RuntimeNoisePlan:
         return self.sde.values(packet)
 
     def initialization_failures(self):
-        """Audit preparation hooks against initialization-only NOISE phases."""
-        if not self.check_purity:
-            return ()
-        from ._population import (
-            _derived_buffer_names,
-            _initialization_callable_dependency_signature,
-            _module_at,
-            _parameterized_owner_paths,
-            _timestep_buffer_names,
-        )
-
-        noise_buffers = {
-            id(_module_at(self.population, entry.path)._buffers[entry.name])
-            for entry in self.entries
-        }
-        failures = []
-        for path, owner in _parameterized_owner_paths(self.population):
-            names = frozenset(
-                name
-                for name, value in owner._buffers.items()
-                if id(value) in noise_buffers
-            )
-            for hook, declared in (
-                ("derive_buffers", _derived_buffer_names(owner)),
-                ("derive_timestep_buffers", _timestep_buffer_names(owner)),
-            ):
-                if not declared:
-                    continue
-                try:
-                    _initialization_callable_dependency_signature(
-                        getattr(owner, hook),
-                        label=f"{path}.{hook}",
-                        owner=owner,
-                        strict=True,
-                        forbidden_receiver_attributes=names,
-                    )
-                except FunctionalizationError as error:
-                    failures.append(
-                        f"Fresh initialization of NOISE-dependent parameter or workspace builders is currently unsupported: {error}"
-                    )
-        return tuple(failures)
+        """NOISE-backed workspaces use explicit initialization/configuration frames."""
+        return ()
 
     def validate_source(self):
         from ._population import (

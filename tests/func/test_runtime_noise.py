@@ -210,7 +210,7 @@ def test_noise_distribution_diagnostics_retain_the_lowering_policy(enabled):
 
 
 @pytest.mark.parametrize("builder", ("derived", "timestep"))
-def test_noise_dependent_builders_fail_closed_for_fresh_initialization(builder):
+def test_noise_dependent_builders_preserve_native_fresh_initialization(builder):
     class DerivedNoise(Mechanism):
         Mechanism.RANGENOISE("eta", mu=0.0, sigma=1.0, seed=17)
         Mechanism.DERIVED_BUFFER("static")
@@ -225,23 +225,31 @@ def test_noise_dependent_builders_fail_closed_for_fresh_initialization(builder):
         def derive_timestep_buffers(self, dt):
             return {"coefficient": self.eta * dt}
 
+    mechanism = DerivedNoise if builder == "derived" else TimestepNoise
+    source, native = _population(mechanism), _population(mechanism)
     with dn.ctx(CHECK_PURITY=True):
-        functional, tensors = dn.func.make_functional(
-            _population(DerivedNoise if builder == "derived" else TimestepNoise), dt=DT
-        )
+        functional, tensors = dn.func.make_functional(source, dt=DT)
     functional.prepare_and_step(
         tensors.parameters,
         tensors.constants,
         tensors.state,
         dn.func.StepInput(noise=functional.sample_noise_draw(tensors.state)),
     )
-    with pytest.raises(dn.func.FunctionalizationError, match="NOISE-dependent"):
-        functional.initialize_host(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-            state=tensors.state,
-        )
+    initialized = functional.initialize_host(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization,
+        state=tensors.state,
+    )
+    native.initialize()
+    native.integrator._initialize(native, native.t.new_tensor(DT), force=True)
+    prepared = functional.prepare(initialized.parameters, initialized.constants)
+    name = "static" if builder == "derived" else "coefficient"
+    key = f"integrator.mech.mechanisms.{mechanism.__name__}.{name}"
+    torch.testing.assert_close(
+        prepared.values["mechanisms"][key],
+        getattr(next(iter(native.mech.mechanisms.values())), name),
+    )
 
 
 def test_custom_noise_adapter_and_late_rng_override_fail_closed():

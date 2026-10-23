@@ -168,10 +168,11 @@ A NOISE declaration on the Population itself retains native behavior:
 initialization or an explicit native resampling call samples it; the native
 timestep refreshes inserted Mechanisms and nested States. A root
 Population declaration does not add a new recurrent sampling phase.
-Fresh initialization of parameter or workspace builders that read runtime
-NOISE, including `derive_buffers` and `derive_timestep_buffers`, is currently
-unsupported. Snapshot execution remains available. Population-owned RAND
-and NOISE sample before parameter-writing pre-initialize transforms;
+`derive_buffers` and `derive_timestep_buffers` can read declared NOISE. These
+workspaces retain their initialization or timestep-configuration sample
+independently of later runtime refreshes; see
+{doc}`A46_functional_noise_workspaces`. Population-owned RAND and NOISE sample
+before parameter-writing pre-initialize transforms;
 Mechanisms, nested States, and MaterialProcesses sample afterward. Retained
 realizations preserve the distribution parameters at their own sampling
 boundary; see {doc}`A45_functional_stochastic_initialization_ordering`.

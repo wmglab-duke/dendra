@@ -33,6 +33,15 @@ from ._euler_maruyama import build_euler_maruyama
 from ._kinetic import kinetic_to_derivatives
 from ._linearimplicit import build_linearimplicit
 from ._mechanism import classproperty
+from ._noise_workspaces import (
+    capture_noise_workspace,
+    commit_noise_workspace,
+    complete_legacy_noise_workspace_state,
+    current_noise_workspace_values,
+    ensure_noise_workspace_slots,
+    restored_noise_workspace_values,
+    temporary_noise_workspace,
+)
 from ._rosenbrock import build_rosenbrock1
 from ._sde import sample_state_sde_draw, validate_state_sde_draws
 
@@ -1046,14 +1055,18 @@ def _support_visible_value(value, like):
     return value.reshape((1,) * (like.ndim - value.ndim) + tuple(value.shape))
 
 
-def _materialize_derived_buffers(module):
-    """Validate and install one module's initialization-static workspaces."""
+def _stage_derived_buffers(module, *, values=None):
+    """Evaluate and validate one module's initialization-static workspaces."""
 
     expected = set(module._derived_buffers)
     if not expected:
-        return
+        return {}
 
-    values = _evaluate_registered_builder(module, "derive_buffers")
+    if values is None:
+        with temporary_noise_workspace(
+            module, "derived", current_noise_workspace_values(module, "derived")
+        ):
+            values = _evaluate_registered_builder(module, "derive_buffers")
 
     if not isinstance(values, Mapping):
         raise TypeError(
@@ -1109,10 +1122,17 @@ def _materialize_derived_buffers(module):
         # an unwritable checkpoint destination. clone() retains autograd.
         staged[name] = value.clone(memory_format=torch.preserve_format)
 
+    return staged
+
+
+def _materialize_derived_buffers(module, *, values=None):
+    """Publish validated initialization workspaces and their NOISE frame."""
+    staged = _stage_derived_buffers(module, values=values)
     # Install only after the whole mapping has passed validation. Assignment is
     # deliberately out of place so gradients through the builder are retained.
     for name, value in staged.items():
         _install_declared_buffer_value(module, name, value)
+    capture_noise_workspace(module, "derived")
 
 
 def _canonical_timestep_buffer_shape(module, name) -> tuple[int, ...]:
@@ -1144,18 +1164,25 @@ def _timestep_buffer_schema(module, values=None):
     return declarations, realized
 
 
-def _stage_timestep_buffers(module, dt):
+def _stage_timestep_buffers(module, dt, *, values=None):
     """Validate one module's timestep workspaces without installing them."""
 
     expected = set(getattr(module, "_timestep_buffers", ()))
     if not expected:
         return {}
 
-    values = _evaluate_registered_builder(
-        module,
-        "derive_timestep_buffers",
-        dt,
-    )
+    if values is None:
+        restored = restored_noise_workspace_values(module, dt)
+        if restored is not None:
+            return restored
+        with temporary_noise_workspace(
+            module, "timestep", current_noise_workspace_values(module, "timestep")
+        ):
+            values = _evaluate_registered_builder(
+                module,
+                "derive_timestep_buffers",
+                dt,
+            )
 
     if not isinstance(values, Mapping):
         raise TypeError(
@@ -1220,14 +1247,16 @@ def _stage_timestep_buffers(module, dt):
     return staged
 
 
-def _install_timestep_buffers(module, staged):
+def _install_timestep_buffers(module, staged, *, dt=None, update_schema=True):
     """Commit a previously validated timestep-workspace mapping."""
 
     if not staged:
         return
     for name, value in staged.items():
         module._buffers[name] = value
-    module._timestep_buffer_schema = _timestep_buffer_schema(module, staged)
+    if update_schema:
+        module._timestep_buffer_schema = _timestep_buffer_schema(module, staged)
+    commit_noise_workspace(module, dt=dt)
 
 
 # Integration-method registry -------------------------------------------------
@@ -1922,6 +1951,7 @@ class State(Parameterized):
         self._advance_return_names = ()
 
         self._timestep_buffer_schema = _timestep_buffer_schema(self)
+        ensure_noise_workspace_slots(self)
 
         # Integration-method configuration is fixed at State-subclass definition
         # time.  Copy it onto the instance for introspection and to keep generated
@@ -1992,6 +2022,8 @@ class State(Parameterized):
     ):
         """Resolve fresh deferred layouts once from incoming checkpoint tensors."""
 
+        self.__dict__.pop("_noise_workspace_restored_dt", None)
+        state_dict = complete_legacy_noise_workspace_state(self, state_dict, prefix)
         _resolve_deferred_buffers_from_state_dict(self, state_dict, prefix)
         return super()._load_from_state_dict(
             state_dict,

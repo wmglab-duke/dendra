@@ -135,6 +135,10 @@ transforms or draws. See {doc}`A29_functional_network_cache_initialization`
 and {doc}`A43_functional_initialization_ordering` for cache ownership and
 shared deterministic preparation.
 
+NOISE-dependent derived and timestep workspaces retain the samples selected
+at their native preparation boundaries; see
+{doc}`A46_functional_noise_workspaces`.
+
 ```{code-cell} python
 :load: ../../examples/functional_stochastic_initialization_ordering.py
 :tags: [remove-input]

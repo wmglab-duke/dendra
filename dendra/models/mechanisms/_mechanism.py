@@ -31,6 +31,10 @@ from ._delays import (
 from ._injections import expand_injection_value
 from ._ions import VALENCES
 from ._materials import _canonical_material_name
+from ._noise_workspaces import (
+    complete_legacy_noise_workspace_state,
+    ensure_noise_workspace_slots,
+)
 from ._state import (
     State,
     _canonical_timestep_buffer_shape,
@@ -1264,6 +1268,7 @@ class Mechanism(Parameterized):
         self._voltage_schema_validated = False
 
         self._timestep_buffer_schema = _timestep_buffer_schema(self)
+        ensure_noise_workspace_slots(self)
 
         self._all_states = []
         for state_module in self.DE.values():
@@ -1413,6 +1418,8 @@ class Mechanism(Parameterized):
     ):
         """Resolve fresh deferred layouts once from incoming checkpoint tensors."""
 
+        self.__dict__.pop("_noise_workspace_restored_dt", None)
+        state_dict = complete_legacy_noise_workspace_state(self, state_dict, prefix)
         _resolve_deferred_buffers_from_state_dict(self, state_dict, prefix)
         return super()._load_from_state_dict(
             state_dict,
@@ -1559,7 +1566,7 @@ class Mechanism(Parameterized):
         dt_tensor, staged = configuration
         self._buffers["dt"] = dt_tensor
         for module, values in staged:
-            _install_timestep_buffers(module, values)
+            _install_timestep_buffers(module, values, dt=dt_tensor)
 
     def put_no_op(self, ion_conc_u, ion_conc_o, v, clone=True):
         """

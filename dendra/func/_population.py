@@ -11,6 +11,7 @@ import math
 import random
 import types
 from collections.abc import Mapping
+from contextlib import nullcontext
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
@@ -2958,6 +2959,23 @@ def _derived_handler_keys(handler) -> set[str]:
 def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
     """Map checkpoint inventory keys to the public functional state tree."""
     keys = {}
+    from dendra.models.mechanisms._noise_workspaces import noise_workspace_slots
+
+    for collection_name in ("mechanisms", "material_processes"):
+        for mechanism_name, mechanism in getattr(handler, collection_name).items():
+            owners = (
+                ("", mechanism),
+                *((f"DE.{name}.", owner) for name, owner in mechanism.DE.items()),
+            )
+            for relative, owner in owners:
+                path = f"integrator.mech.{collection_name}.{mechanism_name}"
+                if relative:
+                    path += f".{relative.rstrip('.')}"
+                for suffix, _slot_owner, _name in noise_workspace_slots(owner):
+                    keys[
+                        f"{mechanism_name}.{relative}"
+                        f"__dendra_stochastic_state__.noise_workspace.{suffix}"
+                    ] = ("noise_workspaces", path, suffix)
     from ._mechanism_delays import mechanism_delay_state_slots
 
     for mechanism_name, mechanism in handler.mechanisms.items():
@@ -3918,8 +3936,11 @@ def _resolve_parameter_value(owner, parameter_name: str) -> torch.Tensor:
 
 def _evaluate_derived_buffers(module) -> Mapping[str, torch.Tensor]:
     """Evaluate one pure, statically keyed derived-buffer builder."""
+    from ._noise_workspaces import retained_noise_workspace_frame
+
+    with retained_noise_workspace_frame(module, "derived"):
+        values = module.derive_buffers()
     expected = set(_derived_buffer_names(module))
-    values = module.derive_buffers()
     if not isinstance(values, Mapping):
         raise FunctionalizationError(
             f"{type(module).__qualname__}.derive_buffers() must return a mapping"
@@ -3960,7 +3981,10 @@ def _evaluate_derived_buffers(module) -> Mapping[str, torch.Tensor]:
 def _evaluate_timestep_buffers(module, dt) -> Mapping[str, torch.Tensor]:
     """Evaluate one pure, statically keyed timestep-buffer builder."""
     expected = set(_timestep_buffer_names(module))
-    values = module.derive_timestep_buffers(dt)
+    from ._noise_workspaces import retained_noise_workspace_frame
+
+    with retained_noise_workspace_frame(module, "timestep", dt=dt):
+        values = module.derive_timestep_buffers(dt)
     if not isinstance(values, Mapping):
         raise FunctionalizationError(
             f"{type(module).__qualname__}.derive_timestep_buffers() must return "
@@ -4021,6 +4045,27 @@ def _cache_materialization(value, name, cache_values, cache_active):
             value = torch.where(cache_active, selected.cached.detach(), value)
         return torch.where(selected.active, selected.value, value)
     return torch.where(cache_active, selected.detach(), value)
+
+
+def _retained_workspace_builder(module_path, owner, phase, cache_values, cache_active):
+    """Identify wholly discarded preparation before authored getter arithmetic."""
+    from dendra.models.mechanisms._noise_workspaces import noise_workspace_phases
+
+    if cache_values is None or phase not in noise_workspace_phases(owner):
+        return None
+    active = []
+    for name in getattr(owner, f"_{phase}_buffers"):
+        retained = cache_values.get(f"{module_path}.{name}")
+        if isinstance(retained, _RetainedMaterialization):
+            selected = retained.active
+            if retained.cached is not None and cache_active is not None:
+                selected = torch.logical_or(selected, cache_active)
+        elif torch.is_tensor(retained) and cache_active is not None:
+            selected = cache_active
+        else:
+            return None
+        active.append(selected)
+    return torch.stack(active).all() if active else None
 
 
 class _PopulationPreparation(torch.nn.Module):
@@ -4448,15 +4493,21 @@ class _PopulationPreparation(torch.nn.Module):
 
         for module_path in self.derived_module_paths:
             owner = _module_at(self.population, module_path)
-            bindings = self._builder_input_bindings(celsius, effective_diam, dt)
-            values = _evaluate_derived_buffers(owner)
-            self._assert_builder_inputs_unchanged(
-                bindings,
-                celsius,
-                effective_diam,
-                dt,
-                f"{type(owner).__qualname__}.derive_buffers()",
+            from ._noise_workspaces import _masked_workspace_builder_inputs
+
+            retained = _retained_workspace_builder(
+                module_path, owner, "derived", cache_values, cache_active
             )
+            with _masked_workspace_builder_inputs(owner, retained, dt):
+                bindings = self._builder_input_bindings(celsius, effective_diam, dt)
+                values = _evaluate_derived_buffers(owner)
+                self._assert_builder_inputs_unchanged(
+                    bindings,
+                    celsius,
+                    effective_diam,
+                    dt,
+                    f"{type(owner).__qualname__}.derive_buffers()",
+                )
             for entry in self.layout:
                 if entry.kind != "derived" or entry.module_path != module_path:
                     continue
@@ -4482,15 +4533,21 @@ class _PopulationPreparation(torch.nn.Module):
                     if entry.kind == "timestep" and entry.module_path == module_path:
                         outputs.append((entry.key, owner._buffers[entry.buffer_name]))
                 continue
-            bindings = self._builder_input_bindings(celsius, effective_diam, dt)
-            values = _evaluate_timestep_buffers(owner, dt)
-            self._assert_builder_inputs_unchanged(
-                bindings,
-                celsius,
-                effective_diam,
-                dt,
-                f"{type(owner).__qualname__}.derive_timestep_buffers()",
+            from ._noise_workspaces import _masked_workspace_builder_inputs
+
+            retained = _retained_workspace_builder(
+                module_path, owner, "timestep", cache_values, cache_active
             )
+            with _masked_workspace_builder_inputs(owner, retained, dt) as builder_dt:
+                bindings = self._builder_input_bindings(celsius, effective_diam, dt)
+                values = _evaluate_timestep_buffers(owner, builder_dt)
+                self._assert_builder_inputs_unchanged(
+                    bindings,
+                    celsius,
+                    effective_diam,
+                    dt,
+                    f"{type(owner).__qualname__}.derive_timestep_buffers()",
+                )
             for entry in self.layout:
                 if entry.kind != "timestep" or entry.module_path != module_path:
                     continue
@@ -6593,7 +6650,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         unsupported = []
         for leaf in layout:
             path = leaf.public_path
-            if path[0] in {"runtime_noise", "material_preparation"}:
+            if path[0] in {"runtime_noise", "material_preparation", "noise_workspaces"}:
                 continue
             if path in {
                 ("integrator", "v"),
@@ -6923,12 +6980,24 @@ class _PopulationInitialization(torch.nn.Module):
         # rank-padded view exists only to make the shared Ion/Material formulas
         # preserve hidden ``vmap`` lanes, including a zero-sized lane.
         handler._sync_celsius(handler.celsius)
-        handler._initialize_tensor_transaction(
-            initial_voltage,
-            shared_celsius,
-            state_overrides=state_overrides,
-            call_local_currents=True,
+        from ._noise_workspaces import refresh_noise_workspaces
+
+        refresh_noise_workspaces(
+            self.population, self.population.t.new_zeros(()), initialization=True
         )
+        from ._noise_workspaces import audit_noise_workspace_values
+
+        with (
+            audit_noise_workspace_values(self.population)
+            if getattr(self, "_audit_noise_workspaces", False)
+            else nullcontext()
+        ):
+            handler._initialize_tensor_transaction(
+                initial_voltage,
+                shared_celsius,
+                state_overrides=state_overrides,
+                call_local_currents=True,
+            )
 
         outputs = []
         for leaf in self.layout:
@@ -6977,6 +7046,28 @@ class _PopulationInitialization(torch.nn.Module):
         return tuple(outputs)
 
 
+class _PopulationNoiseWorkspaceConfiguration(torch.nn.Module):
+    """Configure declared workspaces without stepping or sampling."""
+
+    def __init__(self, population, layout):
+        super().__init__()
+        self.population = population
+        self.layout = tuple(
+            leaf for leaf in layout if leaf.public_path[0] == "noise_workspaces"
+        )
+
+    def forward(self, dt, initialization=False, phases=("timestep",)):
+        from ._noise_workspaces import refresh_noise_workspaces
+
+        refresh_noise_workspaces(
+            self.population, dt, initialization=initialization, phases=phases
+        )
+        return tuple(
+            _buffer_at(self.population, leaf.module_path, leaf.buffer_name)
+            for leaf in self.layout
+        )
+
+
 class _PopulationTransition(torch.nn.Module):
     """Functional facade over a supported step implementation."""
 
@@ -7005,12 +7096,18 @@ class _PopulationTransition(torch.nn.Module):
         intra,
         steps: int,
         noise_values=None,
+        workspace_frames=None,
     ):
         handler = self.population.mech
         shared_celsius = _pad_to_visible_rank(celsius, v)
         handler._sync_celsius(celsius)
         handler.read_from_ions()
         handler.read_from_materials()
+        from ._noise_workspaces import refresh_noise_workspaces
+
+        refresh_noise_workspaces(
+            self.population, dt, phases=("timestep",), prepared_frames=workspace_frames
+        )
 
         integrator = self.population.integrator
         vc = self.population._buffers.get("vc") if self.block_voltage_state else None
@@ -7031,27 +7128,34 @@ class _PopulationTransition(torch.nn.Module):
             # Publish the explicit carry immediately before each authored step,
             # matching imperative execution where the clock advances afterward.
             self.population._buffers["t"] = t
-            if self.block_voltage_state:
-                vc, v, i_membrane = integrator._step(
-                    vc.reshape(integrator.B, integrator.K, integrator.M),
-                    v,
-                    dt,
-                    shared_celsius,
-                    ve_step,
-                    intra_step,
-                    solver=self.solver,
-                    call_local_currents=True,
-                )
-            else:
-                v, i_membrane = integrator._step(
-                    v,
-                    dt,
-                    shared_celsius,
-                    ve_step,
-                    intra_step,
-                    solver=self.solver,
-                    call_local_currents=True,
-                )
+            from ._noise_workspaces import audit_noise_workspace_values
+
+            with (
+                audit_noise_workspace_values(self.population)
+                if getattr(self, "_audit_noise_workspaces", False)
+                else nullcontext()
+            ):
+                if self.block_voltage_state:
+                    vc, v, i_membrane = integrator._step(
+                        vc.reshape(integrator.B, integrator.K, integrator.M),
+                        v,
+                        dt,
+                        shared_celsius,
+                        ve_step,
+                        intra_step,
+                        solver=self.solver,
+                        call_local_currents=True,
+                    )
+                else:
+                    v, i_membrane = integrator._step(
+                        v,
+                        dt,
+                        shared_celsius,
+                        ve_step,
+                        intra_step,
+                        solver=self.solver,
+                        call_local_currents=True,
+                    )
             # Multiplication by a scalar-shaped tensor preserves hidden vmap
             # lanes (including zero lanes) while keeping dt an explicit
             # differentiable input to both dynamics and the model clock.
@@ -7121,22 +7225,29 @@ class _PopulationReceive(torch.nn.Module):
         handler.read_from_materials()
         handler._bind_ion_current_fields()
         mechanism = handler.mechanisms[self.target]
-        if self.continuous:
-            updates, received = mechanism._derive_continuous_receive_values(
-                payload,
-                dt,
-                mechanism._continuous_receive_value_frame(),
-                received,
-                input=input,
-                reduce=reduce,
-                mask=mask,
-            )
-            mechanism._apply_continuous_receive_updates(updates)
-        else:
-            updates = mechanism._derive_net_receive_values(
-                payload, dt, mechanism._net_receive_value_frame()
-            )
-            mechanism._apply_net_receive_updates(updates)
+        from ._noise_workspaces import audit_noise_workspace_values
+
+        with (
+            audit_noise_workspace_values(self.population)
+            if getattr(self, "_audit_noise_workspaces", False)
+            else nullcontext()
+        ):
+            if self.continuous:
+                updates, received = mechanism._derive_continuous_receive_values(
+                    payload,
+                    dt,
+                    mechanism._continuous_receive_value_frame(),
+                    received,
+                    input=input,
+                    reduce=reduce,
+                    mask=mask,
+                )
+                mechanism._apply_continuous_receive_updates(updates)
+            else:
+                updates = mechanism._derive_net_receive_values(
+                    payload, dt, mechanism._net_receive_value_frame()
+                )
+                mechanism._apply_net_receive_updates(updates)
         outputs = []
         for entry, previous in zip(self.layout, incoming, strict=True):
             path = entry.public_path
@@ -10435,6 +10546,9 @@ class FunctionalPopulation:
         self._dtype = population.dtype()
         self._device = population.device()
         self._population = population
+        from ._noise_workspaces import noise_workspace_constant_values
+
+        self._noise_workspace_constants = noise_workspace_constant_values(population)
         self._check_purity = current_check_purity()
         from ._torch_parametrizations import buffer_slots as torch_buffer_slots
         from ._torch_parametrizations import parameter_names as torch_parameter_names
@@ -10584,7 +10698,15 @@ class FunctionalPopulation:
             _timestep_buffer_names(_module_at(execution_population, module_path))
             for module_path in _parameterized_module_paths(execution_population)
         )
+        from dendra.models.mechanisms._noise_workspaces import (
+            retain_noise_workspace_once,
+        )
+
         from ._material_stochasticity import retained_stochastic_diffusion_noise
+        from ._noise_workspaces import noise_workspace_owners
+
+        for _path, owner in noise_workspace_owners(execution_population):
+            retain_noise_workspace_once(owner)
 
         try:
             with retained_stochastic_diffusion_noise(
@@ -10607,6 +10729,11 @@ class FunctionalPopulation:
                 "timestep-buffer materialization failed while lowering the "
                 f"Population: {exc}"
             ) from exc
+        for _path, owner in noise_workspace_owners(execution_population):
+            # A warm integrator can reuse its configuration without consuming
+            # the native one-shot checkpoint handoff. Functional execution
+            # represents that provenance in tensor carry instead.
+            owner.__dict__.pop("_noise_workspace_restored_dt", None)
         if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             # The packed integrator and consolidated MechanismHandler now own
             # the complete transition. Component Populations are source-side
@@ -10713,6 +10840,9 @@ class FunctionalPopulation:
             execution_population,
             solver,
             self._state_layout,
+        )
+        self._noise_workspace_configuration = _PopulationNoiseWorkspaceConfiguration(
+            execution_population, self._state_layout
         )
         self._receiver_failures = {
             name: tuple(_event_receiver_failures(mechanism))
@@ -12176,6 +12306,7 @@ class FunctionalPopulation:
         )
         if self._random_plan is not None:
             expected_names.update(self._random_plan.schema)
+        expected_names.update(self._noise_workspace_constants)
         if self._cache_value_specs:
             expected_names.update(name for name, *_ in self._cache_value_specs)
             expected_names.add("cache.active")
@@ -12236,6 +12367,9 @@ class FunctionalPopulation:
                 raise ValueError(
                     f"constant {entry.key!r} must use {entry.device}/{entry.dtype}"
                 )
+        from ._noise_workspaces import validate_noise_workspace_constants
+
+        validate_noise_workspace_constants(self._population, constants)
         self._mechanism_delay_plan.validate_constant_values(
             {
                 slot: constants[name]
@@ -12671,6 +12805,9 @@ class FunctionalPopulation:
                     dtype=self.dtype,
                 ),
             }
+        from ._noise_workspaces import noise_workspace_constant_values
+
+        constants.update(noise_workspace_constant_values(population))
         if self._cache_value_specs:
             constants.update(
                 {
@@ -12821,6 +12958,16 @@ class FunctionalPopulation:
         # copies. Invalid writes cannot escape into caller tensors or poison
         # the retained preparation skeleton.
         mapping = {name: value.clone() for name, value in base_mapping.items()}
+        from ._noise_workspaces import noise_workspace_preparation_mapping
+
+        mapping.update(
+            {
+                name: value.clone()
+                for name, value in noise_workspace_preparation_mapping(
+                    parametrization_constants
+                ).items()
+            }
+        )
         for name in self._population_parameter_names:
             value = parameters[name].clone()
             for slot in self._preparation_parameter_slots[name]:
@@ -13028,6 +13175,12 @@ class FunctionalPopulation:
             self._initialization_state_template,
             inputs.v_init,
         )
+        initialization_template = self._initialization_state_template
+        if state is not None and "noise_workspaces" in state:
+            initialization_template = {
+                **initialization_template,
+                "noise_workspaces": state["noise_workspaces"],
+            }
         for entry in self._initialization_state_layout:
             _put_path(
                 pre_state,
@@ -13072,7 +13225,7 @@ class FunctionalPopulation:
         mapping, _dt, _celsius, _v, _t, _duration_remainder = self._mapping(
             initialized_parameters,
             prepared,
-            self._initialization_state_template,
+            initialization_template,
             isolate_read_only=True,
             mechanism_dt=initialization_dt,
         )
@@ -13125,6 +13278,22 @@ class FunctionalPopulation:
             state,
             initialization_transform_values,
         )
+        from ._noise_workspaces import noise_workspace_constants_from_state
+
+        constants = noise_workspace_constants_from_state(
+            self._population, constants, state
+        )
+        if self._post_initialization_writes_parameters:
+            state = self._configure_noise_workspaces(
+                initialized_parameters,
+                constants,
+                state,
+                initialization=True,
+                phases=("derived",),
+            )
+            constants = noise_workspace_constants_from_state(
+                self._population, constants, state
+            )
         state = _reset_functional_initialization_clock(state)
         if self._random_plan is not None:
             constants = self._random_plan.finish_constants(
@@ -13143,6 +13312,7 @@ class FunctionalPopulation:
                 None
                 if self._post_initialization_writes_parameters
                 or self._preparation.timestep_module_paths
+                or self._noise_workspace_constants
                 else prepared
             ),
         )
@@ -13252,16 +13422,99 @@ class FunctionalPopulation:
             parameters, constants, self._owned_cache_state_template, inputs.cache
         )
         state = _reset_functional_initialization_clock(packet.state)
+        from ._noise_workspaces import noise_workspace_constants_from_state
+
+        constants = noise_workspace_constants_from_state(
+            self._population, packet.constants, state
+        )
         if not self._retain_initialization_materializations:
             state = self._initialize_material_workspace(
-                packet.parameters, packet.constants, state
+                packet.parameters, constants, state
             )
         # Network plans configure after publishing the cache's shared alias
         # transaction at this Population's initialization boundary.
         return packet._replace(
+            constants=constants,
             state=state,
             initialization=inputs,
         )
+
+    def _preparation_constants(self, constants):
+        return {
+            **{
+                entry.key: constants[entry.key]
+                for entry in self._parametrization_constants
+            },
+            **{name: constants[name] for name in self._noise_workspace_constants},
+        }
+
+    def _configure_noise_workspaces(
+        self,
+        parameters,
+        constants,
+        state,
+        *,
+        initialization=False,
+        phases=("timestep",),
+    ):
+        """Materialize a native initialization/configuration boundary purely."""
+        configuration = self._noise_workspace_configuration
+        if not configuration.layout:
+            return state
+        prepared = self._prepare_values(parameters, constants)
+        mapping, dt, *_rest = self._mapping(
+            parameters, prepared, state, isolate_read_only=True
+        )
+        if "derived" in phases and "timestep" not in phases:
+            for leaf in configuration.layout:
+                if leaf.public_path[2].startswith("timestep.buffer."):
+                    mapping[f"population.{leaf.module_path}.{leaf.buffer_name}"] = (
+                        _get_path(state, leaf.public_path).clone()
+                    )
+        outputs = functional_call(
+            configuration,
+            mapping,
+            (dt, initialization, phases),
+            tie_weights=False,
+        )
+        frames = {}
+        for leaf, value in zip(configuration.layout, outputs, strict=True):
+            _put_path(frames, leaf.public_path[1:], value)
+        return {**state, "noise_workspaces": frames}
+
+    def _initialize_noise_workspaces(self, parameters, constants, state):
+        """Configure workspaces at a Network's per-Population solver boundary."""
+        if not self._noise_workspace_configuration.layout:
+            return constants, state
+        from ._noise_workspaces import noise_workspace_constants_from_state
+
+        constants = noise_workspace_constants_from_state(
+            self._population, constants, state
+        )
+        state = self._configure_noise_workspaces(
+            parameters, constants, state, initialization=True
+        )
+        state = self._configure_noise_workspaces(parameters, constants, state)
+        constants = noise_workspace_constants_from_state(
+            self._population, constants, state
+        )
+        # A cache or earlier initializer can already retain an older timestep
+        # value. Native solver setup replaces just these numerical workspaces.
+        constants = dict(constants)
+        for leaf in self._noise_workspace_configuration.layout:
+            if not leaf.public_path[2].startswith("timestep.buffer."):
+                continue
+            path = f"{leaf.module_path}.{leaf.buffer_name}"
+            name = f"materializations.values.{path}"
+            if name in constants:
+                constants[name] = _get_path(state, leaf.public_path)
+                constants[self._materialization_active_name(path)] = torch.ones_like(
+                    constants[self._materialization_active_name(path)]
+                )
+                constants[self._materialization_baseline_name(path)] = torch.zeros_like(
+                    constants[self._materialization_baseline_name(path)]
+                )
+        return constants, state
 
     def _prepare_initialization_root(
         self, parameters, constants, *, for_initialization=True
@@ -13276,10 +13529,7 @@ class FunctionalPopulation:
             constants.get("diameters"),
             constants.get("diam_original"),
             constants["dt"],
-            {
-                entry.key: constants[entry.key]
-                for entry in self._parametrization_constants
-            },
+            self._preparation_constants(constants),
             for_initialization=for_initialization,
             use_snapshot_offsets=False,
             random_inputs=(
@@ -13460,10 +13710,7 @@ class FunctionalPopulation:
                 diameters,
                 diam_original,
                 dt,
-                {
-                    entry.key: constants[entry.key]
-                    for entry in self._parametrization_constants
-                },
+                self._preparation_constants(constants),
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
@@ -14077,10 +14324,7 @@ class FunctionalPopulation:
                 None,
                 None,
                 dt,
-                {
-                    entry.key: constants[entry.key]
-                    for entry in self._parametrization_constants
-                },
+                self._preparation_constants(constants),
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
@@ -14195,6 +14439,12 @@ class FunctionalPopulation:
         use_snapshot_offsets=True,
         snapshot_baseline_capture=None,
     ):
+        if self._noise_workspace_constants:
+            from ._noise_workspaces import noise_workspace_preparation_frames
+
+            values["noise_workspaces"] = noise_workspace_preparation_frames(
+                self._population, constants, constants["dt"]
+            )
         if not self._materialization_value_specs:
             return values
         overrides, active = self._cache_preparation_inputs(
@@ -14301,6 +14551,8 @@ class FunctionalPopulation:
             expected_sections.add("random")
         if self._materialization_value_specs:
             expected_sections.add("materializations")
+        if self._noise_workspace_constants:
+            expected_sections.add("noise_workspaces")
         if not isinstance(values, Mapping) or set(values) != expected_sections:
             raise FunctionalizationError("prepared tensor schema is invalid")
         if not isinstance(values["geometry"], Mapping) or set(
@@ -14518,6 +14770,16 @@ class FunctionalPopulation:
 
         state_positionals = {}
         for leaf in self._state_layout:
+            if (
+                leaf.public_path[0] == "noise_workspaces"
+                and ".buffer." in leaf.public_path[2]
+            ):
+                # Preparation preserves cache detachment and independently
+                # retained Population materializations. Its numerical workspace
+                # value owns the current parameter graph; carried provenance
+                # selects whether timestep preparation can be reused or must
+                # be rebuilt from a later configuration realization.
+                continue
             # Authored accepted-step code may legally update declared carry in
             # place. Give the private execution skeleton one
             # differentiable working copy, shared by every registered alias, so
@@ -14596,6 +14858,7 @@ class FunctionalPopulation:
                     facade = _PopulationReceive(
                         population, target, self._state_layout, continuous=continuous
                     )
+                    facade._audit_noise_workspaces = True
                     python_state = _transition_python_state_snapshot(facade)
                     registered = _registered_tensor_bindings(facade)
                     repeated = []
@@ -14718,6 +14981,7 @@ class FunctionalPopulation:
                 ):
                     component_preparation.audit_builder_inputs = True
                 audit_transition = copy.deepcopy(self._transition)
+                audit_transition._audit_noise_workspaces = True
                 _rebind_population_time_references(audit_transition.population)
                 _install_voltage_process_audits(audit_transition.population)
                 _install_state_input_audits(audit_transition.population)
@@ -15005,6 +15269,7 @@ class FunctionalPopulation:
         try:
             with torch.inference_mode(False):
                 audit_initialization = _deepcopy_execution_module(self._initialization)
+                audit_initialization._audit_noise_workspaces = True
                 _rebind_population_time_references(audit_initialization.population)
                 # Initialization exposes zero timestep workspaces to ordinary
                 # builders, unlike runtime preparation. Audit that distinct
@@ -15191,13 +15456,17 @@ class FunctionalPopulation:
                             for slot, value in mapping.items()
                             if slot not in self._mutable_mapping_slots
                         }
-                    state_outputs = functional_call(
-                        audit_initialization,
-                        mapping,
-                        (initialized_v, *initialized_explicit),
-                        _initialization_voltage_kwargs(pre_state),
-                        tie_weights=False,
-                    )
+                    audit_initialization._audit_noise_workspaces = track_read_only
+                    try:
+                        state_outputs = functional_call(
+                            audit_initialization,
+                            mapping,
+                            (initialized_v, *initialized_explicit),
+                            _initialization_voltage_kwargs(pre_state),
+                            tie_weights=False,
+                        )
+                    finally:
+                        audit_initialization._audit_noise_workspaces = True
                     state = {}
                     for leaf, value in zip(
                         self._state_layout,
@@ -15689,6 +15958,7 @@ class FunctionalPopulation:
                 intra,
                 steps,
                 noise_values,
+                prepared.get("noise_workspaces"),
             ),
             tie_weights=False,
         )
