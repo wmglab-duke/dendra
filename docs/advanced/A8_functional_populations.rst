@@ -2735,6 +2735,10 @@ leaves and phase-available ``state.*`` leaves. A pre transform runs before
 State inference; a post transform runs after the accepted initial state is
 constructed. As in imperative initialization, simulation time and the duration
 remainder are reset to zero after the complete post-transform sequence.
+Population-owned RAND and NOISE sample before pre transforms; inserted
+Mechanisms, nested States, and MaterialProcesses sample afterward. Samples
+retain their selected distribution-parameter frames across later shared raw
+writes; see :doc:`A45_functional_stochastic_initialization_ordering`.
 Post transforms may read accepted shared fields through
 ``state.ions.<ion>.<field>`` and
 ``state.materials.<material>.<field>``. These references are post-only and

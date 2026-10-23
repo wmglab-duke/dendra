@@ -199,12 +199,11 @@ heterogeneity does not add random draws to the recurrent timestep. State
 `DIFFUSION` supports explicit Wiener draws and pathwise gradients; see
 {doc}`A32_functional_state_sde`.
 
-Fresh initialization of a Population that declares its own RAND or NOISE
-buffers and has a parameter-writing pre-initialization transform is currently
-unsupported. Native Population sampling precedes those writes, while
-Mechanism and nested State sampling follows them. Mechanism and State RAND
-declarations support parameter-writing pre transforms; snapshot execution
-remains available for Population-level declarations.
+Fresh initialization samples Population-owned RAND and NOISE before
+parameter-writing pre-initialize transforms. Mechanisms, nested States, and
+MaterialProcesses sample afterward. The earlier sample retains its selected
+distribution-parameter frame when a transform changes a shared source; see
+{doc}`A45_functional_stochastic_initialization_ordering` for a complete example.
 
 ## Run the complete example
 

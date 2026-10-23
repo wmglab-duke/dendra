@@ -26,6 +26,12 @@ Every declared initialization path therefore runs once. If any phase fails, the
 model remains uninitialized and cannot be stepped until initialization
 succeeds.
 
+Population-owned RAND and NOISE sample before pre-initialize transforms.
+Mechanisms, nested States, and MaterialProcesses sample afterward, using the
+distribution parameters visible at their own initialization boundaries.
+Pure initialization preserves this order when a transform writes a shared
+parameter; see :doc:`A45_functional_stochastic_initialization_ordering`.
+
 No time-dependent transport occurs at ``t=0``. In particular, additive
 ``USEMATERIAL(..., source=...)`` values and Material processes such as
 diffusion, clearance, and bath exchange first run during the first actual

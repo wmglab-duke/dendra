@@ -14,6 +14,7 @@ from torch.utils import _pytree as pytree
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._carry_packing import _PackedCarryLayout
+from ._hop_inputs import _isolate_lifted_inputs
 from ._scan_autograd import guard_scan_outputs
 from ._scan_compat import (
     _capture_saved_tensor_identity,
@@ -53,6 +54,14 @@ def _packed_tensor_scan(
 ):
     """Execute the shared HOP boundary on fresh dtype/device carry groups."""
     from torch._higher_order_ops.scan import scan
+
+    # Separate lifted read-only operands as well as recurrent carry. Effective
+    # buffers may share a raw Parameter's storage even when their public paths
+    # differ; scan rejects those input aliases. These invocation-local copies
+    # retain their gradient routes into the caller's canonical shared leaves.
+    parameters, prepared, invariant_carries, samples = _isolate_lifted_inputs(
+        (parameters, prepared, invariant_carries, samples)
+    )
 
     def combine(packed, sample):
         state, carries = layout.unpack(packed)

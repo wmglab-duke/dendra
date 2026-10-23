@@ -17,6 +17,7 @@ from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._callback_carry import _CallbackCarryPartition
 from ._carry_packing import _PackedCarryLayout
+from ._hop_inputs import _isolate_lifted_inputs
 from ._while_inductor import _compile_while
 
 
@@ -199,6 +200,13 @@ class _CompiledTensorTreeWhile:
 
         def execute(parameters, prepared, state, carries, samples):
             recurrent, invariant = partition.split(carries)
+            # Different effective fields and tape views can share one authored
+            # source. The loop requires independent lifted input storage;
+            # invocation-local copies preserve the caller's canonical leaves
+            # and the capture-time metadata recorded by the authored graph.
+            parameters, prepared, invariant, samples = _isolate_lifted_inputs(
+                (parameters, prepared, invariant, samples)
+            )
             buffers = tuple(
                 torch.empty((steps, *shape), dtype=dtype, device=device)
                 for shape, dtype, device in shapes

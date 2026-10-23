@@ -108,7 +108,9 @@ Population's packet to `InitializationInput.random_draw`:
 ```
 
 Each packet contains the ordered RAND and initialization NOISE draws and their
-post-draw RNG carry. Within a Population, initialization visits ordinary
+post-draw RNG carry. Population-owned RAND and NOISE sample before its
+pre-initialize transforms; inserted owners sample afterward. Within the
+handler, initialization visits ordinary
 Mechanisms and nested States, then MaterialProcesses in insertion order. Each
 MaterialProcess samples RAND before its initialization NOISE. Initial NOISE
 uses the native initialization scaling timestep of `1.0`; runtime noise uses
@@ -155,6 +157,8 @@ which retains its sample can restore that cache. A Network-global cache
 restores its saved samples, fields, and RNG without fresh draws. See
 {doc}`A29_functional_network_cache_initialization` for cache ownership and
 {doc}`A43_functional_initialization_ordering` for shared initialization writes.
+{doc}`A45_functional_stochastic_initialization_ordering` explains stochastic
+distribution sources shared across pre-initialize parameter transforms.
 
 Runtime checkpoints include sampled provenance, current NOISE buffers, RNG
 carry, and configured spatial workspace with its held NOISE realization.

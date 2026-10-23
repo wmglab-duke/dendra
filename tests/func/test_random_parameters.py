@@ -575,8 +575,9 @@ def test_regional_and_packed_rand_scopes_match_native(packed):
     _close(actual, functional.extract(native).state)
 
 
-def test_population_rand_parameter_writing_pre_transform_fails_closed_for_fresh_only():
+def test_population_rand_parameter_writing_pre_transform_preserves_native_order():
     from tests.func.test_population_initialization_transforms import _Add
+    from tests.func.test_stochastic_initialization_ordering import _native_close
 
     source = _RandomPopulation(N=1, C=1, integrator=dn.bwd_euler_sc(imem=False))
     source.insert(_CustomLeak)
@@ -591,15 +592,19 @@ def test_population_rand_parameter_writing_pre_transform_fails_closed_for_fresh_
     source.integrator._initialize(source, source.t.new_tensor(DT), force=True)
     functional, tensors = dn.func.make_functional(source, dt=DT)
     functional.prepare_and_step(tensors.parameters, tensors.constants, tensors.state)
-    with pytest.raises(
-        dn.func.FunctionalizationError, match="parameter-writing pre-initialize"
-    ):
-        functional.initialize_host(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-            state=tensors.state,
-        )
+    initialized = functional.initialize_host(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization,
+        state=tensors.state,
+    )
+    source.initialize()
+    expected = functional.extract(source)
+    _native_close(initialized.state, expected.state)
+    _close(initialized.parameters, expected.parameters)
+    torch.testing.assert_close(
+        initialized.constants["random.values.factor"], source.factor
+    )
 
 
 @pytest.mark.parametrize("field", ("version", "initialized"))

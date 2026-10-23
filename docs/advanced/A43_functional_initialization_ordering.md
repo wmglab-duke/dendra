@@ -52,6 +52,10 @@ configuration buffer also follows this order: readers initialized before the
 write keep their prepared values; readers initialized afterward see the new
 value. Computed PyTorch parametrization properties retain their getter semantics.
 See {doc}`A38_functional_torch_parametrizations` for raw originals and transforms.
+Population RAND and NOISE sampling precedes pre-initialize parameter writes;
+inserted owners sample afterward. See
+{doc}`A45_functional_stochastic_initialization_ordering` for shared stochastic
+distribution sources on both sides of a transform.
 
 ## Differentiate and continue a rollout
 

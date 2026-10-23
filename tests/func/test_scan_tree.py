@@ -161,3 +161,199 @@ def test_shared_scan_preserves_trainable_leaf_and_nonleaf_parameter_metadata():
         for gradient, reference in zip(actual, expected, strict=True):
             torch.testing.assert_close(gradient, reference)
         assert scale.requires_grad and scale.is_leaf is leaf
+
+
+@pytest.mark.parametrize("view", (False, True))
+@pytest.mark.parametrize("grad_enabled", (False, True))
+def test_shared_scan_isolates_lifted_aliases_and_accumulates_shared_gradient(
+    view, grad_enabled
+):
+    def body(parameters, prepared, state, carries, sample):
+        value = (
+            state["v"]
+            + parameters["scale"] * prepared["left"]
+            + prepared["right"].square()
+            + sample["drive"]
+        )
+        return ({"v": value}, carries), {"v": value}
+
+    scale = torch.nn.Parameter(torch.tensor(0.7, dtype=torch.float64))
+    parameters = {"scale": scale}
+    prepared = {
+        name: scale.view_as(scale) if view else scale for name in ("left", "right")
+    }
+    tape = {"drive": scale.expand(3)}
+    initial = torch.tensor([-0.3, 0.2], dtype=torch.float64)
+    engine = _CompiledTensorTreeScan(
+        body,
+        steps=3,
+        compile_options={"backend": "aot_eager", "fullgraph": True},
+        device="cpu",
+    )
+    with torch.set_grad_enabled(grad_enabled), torch_compiler_warning_context():
+        final, _, emitted = engine(parameters, prepared, {"v": initial}, {}, tape)
+        frames = initial + torch.arange(1, 4, dtype=torch.float64)[:, None] * (
+            2 * scale.square() + scale
+        )
+        torch.testing.assert_close(final["v"], frames[-1])
+        torch.testing.assert_close(emitted["v"], frames)
+        if grad_enabled:
+            actual = torch.autograd.grad(final["v"].sum(), scale)[0]
+            expected = torch.autograd.grad(frames[-1].sum(), scale)[0]
+            torch.testing.assert_close(actual, expected)
+    assert parameters["scale"] is scale and scale.is_leaf
+    assert all(
+        torch._C._is_alias_of(value, scale)
+        for value in (*prepared.values(), tape["drive"])
+    )
+
+
+@pytest.mark.parametrize(
+    "kind", ("slice", "transpose", "expanded", "overlap", "empty", "conj", "neg")
+)
+def test_lifted_input_isolation_preserves_view_layout_and_logical_vjp(kind):
+    from dendra.func._hop_inputs import _isolate_lifted_inputs
+
+    source = torch.nn.Parameter(torch.arange(12.0, dtype=torch.float64))
+    if kind == "transpose":
+        value = source.reshape(3, 4).T
+    elif kind == "expanded":
+        value = source[3:4].expand(3)
+    elif kind == "overlap":
+        value = source.as_strided((2, 3), (1, 1), 2)
+    elif kind == "empty":
+        value = source[5:5]
+    elif kind == "conj":
+        value = torch.complex(source, source)[3:9:2].conj()
+    elif kind == "neg":
+        value = torch._neg_view(source[3:9:2])
+    else:
+        value = source[3:9:2]
+    first, second = _isolate_lifted_inputs((value, value))
+    for copied in (first, second):
+        torch.testing.assert_close(copied, value)
+        assert copied.stride() == value.stride()
+        assert copied.storage_offset() == value.storage_offset()
+        assert copied.is_conj() == value.is_conj()
+        assert copied.is_neg() == value.is_neg()
+        assert not torch._C._is_alias_of(copied, value)
+    assert not torch._C._is_alias_of(first, second)
+    weights = torch.arange(value.numel(), dtype=value.real.dtype).reshape(value.shape)
+    weights = (weights + 0.3).to(value.dtype)
+    if value.is_complex():
+        weights = weights * (1 + 0.5j)
+    logical = torch.autograd.grad(first, value, weights, retain_graph=True)[0]
+    torch.testing.assert_close(logical, weights)
+    actual = torch.autograd.grad(first, source, weights, retain_graph=True)[0]
+    expected = torch.autograd.grad(value, source, weights)[0]
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("kind", ("expanded", "overlap"))
+@pytest.mark.parametrize("backend", ("aot_eager", "inductor"))
+def test_compiled_lifted_view_consumers_keep_logical_and_raw_vjps(kind, backend):
+    from dendra.func._hop_inputs import _isolate_lifted_inputs
+
+    source = torch.nn.Parameter(torch.arange(12.0, dtype=torch.float64))
+    value = (
+        source[3:4].expand(2, 3)
+        if kind == "expanded"
+        else source.as_strided((2, 3), (1, 1), 2)
+    )
+    weights = torch.arange(6.0, dtype=value.dtype).reshape(2, 3) + 0.3
+
+    @torch.compile(backend=backend, fullgraph=True)
+    def objective(value):
+        first, second = _isolate_lifted_inputs((value, value))
+        return (first * weights).sum() + second.sum()
+
+    # Like the loop engines, consume the copies inside the compiled graph.
+    # Each logical coordinate must retain its own cotangent even if the
+    # original view has overlapping storage.
+    result = objective(value)
+    actual = torch.autograd.grad(result, value, retain_graph=True)[0]
+    torch.testing.assert_close(actual, weights + 1)
+    raw = torch.autograd.grad(result, source)[0]
+    expected = torch.autograd.grad((value * (weights + 1)).sum(), source)[0]
+    torch.testing.assert_close(raw, expected)
+
+
+def test_lifted_input_isolation_keeps_nonuniform_strided_jvp():
+    from dendra.func._hop_inputs import _isolate_lifted_inputs
+
+    value = torch.arange(12.0, dtype=torch.float64)[3:9:2]
+    tangent = torch.tensor([0.3, 0.7, 1.2], dtype=value.dtype)
+
+    def view(value):
+        return value.as_strided((2,), value.stride(), value.storage_offset()).square()
+
+    actual = torch.func.jvp(
+        lambda value: view(_isolate_lifted_inputs(value)), (value,), (tangent,)
+    )
+    expected = torch.func.jvp(view, (value,), (tangent,))
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference)
+
+
+@pytest.mark.parametrize("backend", ("aot_eager", "inductor"))
+def test_shared_scan_preserves_explicit_strided_views_and_shared_vjp(backend):
+    def body(parameters, prepared, state, carries, sample):
+        value = parameters["value"]
+        selected = value.as_strided((2,), value.stride(), value.storage_offset())
+        updated = state["value"] + selected.square().sum() + prepared["same"].sum()
+        return ({"value": updated}, carries), {}
+
+    source = torch.nn.Parameter(torch.arange(12.0, dtype=torch.float64))
+    value = source[3:9:2]
+    parameters, prepared = {"value": value}, {"same": value}
+    initial = {"value": torch.tensor(0.0, dtype=value.dtype)}
+    engine = _CompiledTensorTreeScan(
+        body,
+        steps=4,
+        compile_options={"backend": backend, "fullgraph": True},
+        device="cpu",
+    )
+    with torch_compiler_warning_context():
+        final, _, _ = engine(parameters, prepared, initial, {}, None)
+    expected = initial
+    for _ in range(4):
+        (expected, _), _ = body(parameters, prepared, expected, {}, None)
+    torch.testing.assert_close(final["value"], expected["value"])
+    actual = torch.autograd.grad(final["value"], source)[0]
+    reference = torch.autograd.grad(expected["value"], source)[0]
+    torch.testing.assert_close(actual, reference)
+
+
+@pytest.mark.parametrize("leaf", (False, True))
+def test_shared_scan_keeps_weighted_overlapping_parameter_gradients(leaf):
+    source = torch.nn.Parameter(torch.arange(12.0, dtype=torch.float64))
+    value = source.as_strided((2, 3), (1, 1), 2)
+    if leaf:
+        value = torch.nn.Parameter(value)
+    weights = torch.arange(6.0, dtype=value.dtype).reshape(2, 3) + 0.3
+
+    def body(parameters, prepared, state, carries, sample):
+        increment = (parameters["value"] * prepared["weights"]).sum()
+        increment = increment + prepared["same"].sum()
+        return ({"value": state["value"] + increment}, carries), {}
+
+    engine = _CompiledTensorTreeScan(
+        body,
+        steps=4,
+        compile_options={"backend": "aot_eager", "fullgraph": True},
+        device="cpu",
+    )
+    with torch_compiler_warning_context():
+        final, _, _ = engine(
+            {"value": value},
+            {"same": value, "weights": weights},
+            {"value": value.new_zeros(())},
+            {},
+            None,
+        )
+    logical = torch.autograd.grad(final["value"], value, retain_graph=True)[0]
+    torch.testing.assert_close(logical, 4 * (weights + 1))
+    if not leaf:
+        raw = torch.autograd.grad(final["value"], source)[0]
+        expected = torch.autograd.grad(4 * (value * (weights + 1)).sum(), source)[0]
+        torch.testing.assert_close(raw, expected)

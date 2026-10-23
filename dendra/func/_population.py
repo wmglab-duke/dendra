@@ -4294,6 +4294,8 @@ class _PopulationPreparation(torch.nn.Module):
         cache_values=None,
         cache_active=None,
         random_inputs=None,
+        root_only=False,
+        root_random_values=None,
     ):
         random_outputs = {}
         if for_initialization:
@@ -4331,6 +4333,7 @@ class _PopulationPreparation(torch.nn.Module):
                     population_values,
                     random_inputs,
                     check_purity=self.audit_builder_inputs,
+                    materialized=root_random_values,
                 )
             )
             population_values.update(
@@ -4345,6 +4348,11 @@ class _PopulationPreparation(torch.nn.Module):
             )
             if name in self.population._buffers:
                 self.population._buffers[name] = population_values[name]
+        if root_only:
+            # Population sampling precedes pre-initialize transforms. Child
+            # builders belong to the following phase and may require those
+            # transforms to establish their parameter frame first.
+            return population_values, random_outputs
         celsius = population_values["celsius"]
         effective_diam = population_values.get("diam", diam)
         dx = population_values.get("dx", dx)
@@ -6261,14 +6269,6 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             )
 
     failures.extend(_functional_initialization_transform_failures(population))
-    if (population.random_parameters or population.runtime_noises) and any(
-        reference.startswith("parameters.")
-        for hook in _initialization_transform_hooks(population, "pre")
-        for reference in population._initialization_transforms[hook.action_name].writes
-    ):
-        failures.append(
-            "Population RAND/NOISE sampling with parameter-writing pre-initialize transforms is currently unsupported; sample the Population before applying those writes"
-        )
     if (
         "_steady_state" in population._caches
         or bool(population.initializing_from_state_cache)
@@ -6728,16 +6728,16 @@ def _apply_initialization_transforms(
             _initialization_transform_value(parameters, state, reference)
             for reference in action.writes
         )
+        values = (*read_values, *explicit_values)
         padded_values = tuple(
-            _initialization_transform_scalar_input(value) for value in explicit_values
+            _initialization_transform_scalar_input(value) for value in values
         )
-        padded_explicit_inputs = any(
+        padded_inputs = any(
             value.ndim != padded.ndim
-            for value, padded in zip(explicit_values, padded_values, strict=True)
+            for value, padded in zip(values, padded_values, strict=True)
         )
         arguments = tuple(
-            value.clone(memory_format=torch.preserve_format)
-            for value in (*read_values, *padded_values)
+            value.clone(memory_format=torch.preserve_format) for value in padded_values
         )
         versions = (
             None
@@ -6791,7 +6791,7 @@ def _apply_initialization_transforms(
                     f"initialization transform {action.name!r} output "
                     f"{reference!r} must be a Tensor"
                 )
-            if padded_explicit_inputs:
+            if padded_inputs:
                 while value.ndim > target.ndim and value.shape[0] == 1:
                     value = value.squeeze(0)
             value = value.to(device=target.device, dtype=target.dtype)
@@ -10494,6 +10494,16 @@ class FunctionalPopulation:
         self._initialization_fingerprint = _initialization_structure_signature(
             population
         )
+        self._split_stochastic_initialization = bool(
+            (population.random_parameters or population.runtime_noises)
+            and any(
+                reference.startswith("parameters.")
+                for hook in _initialization_transform_hooks(population, "pre")
+                for reference in population._initialization_transforms[
+                    hook.action_name
+                ].writes
+            )
+        )
         self._canonical_source_binding = (
             _multi_canonical_source_binding(population)
             if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
@@ -12800,6 +12810,8 @@ class FunctionalPopulation:
         cache_values=None,
         cache_active=None,
         random_inputs=None,
+        root_only=False,
+        root_random_values=None,
     ):
         preparation = self._preparation if preparation is None else preparation
         base_mapping = (
@@ -12836,9 +12848,13 @@ class FunctionalPopulation:
                 "cache_values": cache_values,
                 "cache_active": cache_active,
                 "random_inputs": random_inputs,
+                "root_only": root_only,
+                "root_random_values": root_random_values,
             },
             tie_weights=False,
         )
+        if root_only:
+            return outputs
         random_outputs = None
         if random_inputs is not None:
             *outputs, random_outputs = outputs
@@ -13018,6 +13034,24 @@ class FunctionalPopulation:
                 entry.public_path,
                 initialization_states[entry.name],
             )
+        root_random_values = None
+        root_noise_values = {}
+        if self._split_stochastic_initialization:
+            root_values, root_random_values = self._prepare_initialization_root(
+                parameters, constants
+            )
+            if self._noise_plan is not None:
+                self._noise_plan.validate(selected_random_draw, initialization=True)
+                root_noise_values = self._noise_plan.values(
+                    {
+                        f"population.{name}": value
+                        for name, value in root_values.items()
+                    },
+                    selected_random_draw,
+                    torch.ones_like(constants["dt"]),
+                    initialization=True,
+                    owner_paths=("",),
+                )
         initialized_parameters, pre_state = _apply_initialization_transforms(
             self._initialization,
             "pre",
@@ -13026,7 +13060,10 @@ class FunctionalPopulation:
             initialization_transform_values,
         )
         prepared = self._prepare_values(
-            initialized_parameters, constants, for_initialization=True
+            initialized_parameters,
+            constants,
+            for_initialization=True,
+            root_random_values=root_random_values,
         )
         # Imperative Mechanism/State initialization and its final current frame
         # run before the integrator configures a timestep. Preserve that exact
@@ -13041,12 +13078,20 @@ class FunctionalPopulation:
         )
         if self._noise_plan is not None:
             self._noise_plan.validate(selected_random_draw, initialization=True)
-            for path, value in self._noise_plan.values(
+            noise_values = self._noise_plan.values(
                 mapping,
                 selected_random_draw,
                 torch.ones_like(initialization_dt),
                 initialization=True,
-            ).items():
+                owner_paths=(
+                    tuple(
+                        entry.path for entry in self._noise_plan.entries if entry.path
+                    )
+                    if self._split_stochastic_initialization
+                    else None
+                ),
+            )
+            for path, value in {**root_noise_values, **noise_values}.items():
                 module_path, _separator, _name = path.rpartition(".")
                 owner = _module_at(self._initialization.population, module_path)
                 mapping[f"population.{path}"] = value.reshape(
@@ -13218,6 +13263,33 @@ class FunctionalPopulation:
             initialization=inputs,
         )
 
+    def _prepare_initialization_root(
+        self, parameters, constants, *, for_initialization=True
+    ):
+        """Evaluate Population samples independently of inserted-owner builders."""
+        return self._prepare_parameter_buffers(
+            parameters,
+            constants.get(
+                "diam", self._preparation_base_mapping.get("population.diam")
+            ),
+            constants.get("dx", self._preparation_base_mapping.get("population.dx")),
+            constants.get("diameters"),
+            constants.get("diam_original"),
+            constants["dt"],
+            {
+                entry.key: constants[entry.key]
+                for entry in self._parametrization_constants
+            },
+            for_initialization=for_initialization,
+            use_snapshot_offsets=False,
+            random_inputs=(
+                None
+                if self._random_plan is None
+                else self._random_plan.inputs(constants)
+            ),
+            root_only=True,
+        )
+
     def _initialize_material_workspace(self, parameters, constants, state):
         """Configure held diffusion coefficients from the initialized NOISE frame."""
         leaves = tuple(
@@ -13265,6 +13337,7 @@ class FunctionalPopulation:
         for_initialization=False,
         use_snapshot_offsets=True,
         _snapshot_baseline_capture=None,
+        root_random_values=None,
     ):
         if for_initialization:
             use_snapshot_offsets = False
@@ -13324,6 +13397,31 @@ class FunctionalPopulation:
                 )
                 for name, value in constants.items()
             }
+        if (
+            self._split_stochastic_initialization
+            and self._population.random_parameters
+            and root_random_values is None
+        ):
+            held_frame = torch.stack(
+                tuple(
+                    constants[f"random.initialization_frame.{entry.key}"]
+                    for entry in self._random_plan.entries
+                    if not entry.path
+                )
+            ).any()
+            # The held distribution operands own their pre-transform graphs.
+            # Stop discarded raw routes before authored parametrizations: a
+            # later write can place an inactive source at a singularity. Keep
+            # the ordinary physical preparation below live, including any
+            # physical parameters sharing those same raw sources.
+            _root_values, root_random_values = self._prepare_initialization_root(
+                {
+                    name: torch.where(held_frame, value.detach(), value)
+                    for name, value in parameters.items()
+                },
+                constants,
+                for_initialization=for_initialization,
+            )
         if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             return self._prepare_multi_values(
                 parameters,
@@ -13333,6 +13431,7 @@ class FunctionalPopulation:
                 for_initialization=for_initialization,
                 use_snapshot_offsets=use_snapshot_offsets,
                 _snapshot_baseline_capture=_snapshot_baseline_capture,
+                root_random_values=root_random_values,
             )
 
         shape = self.shape
@@ -13377,6 +13476,7 @@ class FunctionalPopulation:
                 random_inputs=None
                 if self._random_plan is None
                 else self._random_plan.inputs(constants),
+                root_random_values=root_random_values,
             )
         )
         diam = population_values.get("diam", diam)
@@ -13669,6 +13769,7 @@ class FunctionalPopulation:
         for_initialization=False,
         use_snapshot_offsets=True,
         _snapshot_baseline_capture=None,
+        root_random_values=None,
     ):
         """Derive one differentiable packed workspace from component sources."""
         dt = constants["dt"]
@@ -13992,6 +14093,7 @@ class FunctionalPopulation:
                 random_inputs=None
                 if self._random_plan is None
                 else self._random_plan.inputs(constants),
+                root_random_values=root_random_values,
             )
         )
         for name in (

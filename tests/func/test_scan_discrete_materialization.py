@@ -159,7 +159,80 @@ def test_scan_discrete_examples_unwrap_functional_tensors_without_aliases(
     assert not torch._is_functional_tensor(actual)
     assert not torch._C._is_alias_of(actual, value)
     torch.testing.assert_close(actual, value, rtol=0, atol=0)
-    assert actual.stride() == value.clone().stride()
+    assert actual.stride() == value.stride()
+    assert actual.storage_offset() == value.storage_offset()
+
+
+@pytest.mark.parametrize("functionalize", (False, True))
+@pytest.mark.parametrize("dtype", (torch.float64, torch.int64, torch.bool))
+def test_scan_joint_examples_preserve_explicit_strided_offset_views(
+    functionalize, dtype
+):
+    _scan_compat.install_scan_compatibility()
+    partitioner = importlib.import_module("torch._higher_order_ops.partitioner")
+    values = torch.arange(12.0, dtype=torch.float64, requires_grad=True)
+    operand = torch.arange(12.0, dtype=torch.float64)
+    if dtype == torch.bool:
+        operand = operand.remainder(3).bool()
+    else:
+        operand = operand.to(dtype)
+    operand = operand[3:9:2]
+    if dtype == torch.float64:
+        operand.requires_grad_()
+
+    def objective(values, operand):
+        selected = operand.as_strided((2,), operand.stride(), operand.storage_offset())
+        return ((values[:2] * selected.to(values).square()).sum(),)
+
+    expected = objective(values, operand)[0]
+    differentiable = (values, operand) if dtype == torch.float64 else (values,)
+    reference = torch.autograd.grad(expected, differentiable)
+    joint = partitioner.create_hop_joint_graph(
+        objective, (values, operand), functionalize
+    )
+    # The joint already returns the first-order VJP; do not differentiate its
+    # functionalized copy/scatter implementation a second time.
+    with torch.no_grad():
+        actual, *gradients = joint.joint_gm(values, operand, values.new_ones(()))
+    torch.testing.assert_close(actual, expected)
+    for result, expected_gradient in zip(
+        gradients[: len(reference)], reference, strict=True
+    ):
+        torch.testing.assert_close(result, expected_gradient)
+    if dtype != torch.float64:
+        assert not torch.count_nonzero(gradients[-1])
+
+
+@pytest.mark.parametrize("wrapper", ("ordinary", "functional", "python_functional"))
+@pytest.mark.parametrize("kind", ("slice", "empty", "conjugate", "negative"))
+def test_floating_joint_examples_keep_view_metadata_in_fake_mode(wrapper, kind):
+    utils = importlib.import_module("torch._higher_order_ops.utils")
+    materialize = _scan_compat._make_value_preserving_materializer(utils)
+    convert = materialize.__globals__["_from_fun"]
+    base = torch.arange(12.0, dtype=torch.float64)
+    if kind == "empty":
+        value = base[5:5]
+    elif kind == "conjugate":
+        value = torch.complex(base, base)[3:9:2].conj()
+    elif kind == "negative":
+        value = torch._neg_view(base[3:9:2])
+    else:
+        value = base[3:9:2]
+    value.requires_grad_()
+    wrapped = value
+    if wrapper == "functional":
+        wrapped = torch._to_functional_tensor(value)
+    elif wrapper == "python_functional":
+        with FunctionalTensorMode():
+            wrapped = FunctionalTensor.to_functional(value)
+    with FakeTensorMode(allow_non_fake_inputs=True):
+        actual = convert(wrapped)
+        assert actual.shape == wrapped.shape
+        assert actual.stride() == wrapped.stride()
+        assert actual.storage_offset() == wrapped.storage_offset()
+        assert actual.is_conj() == wrapped.is_conj()
+        assert actual.is_neg() == wrapped.is_neg()
+        assert actual.requires_grad == wrapped.requires_grad
 
 
 @pytest.mark.parametrize(

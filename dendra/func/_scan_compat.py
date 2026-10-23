@@ -15,6 +15,8 @@ those hooks must observe real execution, not replay while tracing fake backward.
 Discrete operands retain their values during joint materialization. Torch's
 shared helper substitutes uninitialized storage for integer inputs; without a
 FakeTensorMode those examples become invalid callback indices/frame counters.
+All examples retain their authored view strides, offsets, and lazy flags so
+explicit strided views use the same storage frame during backward capture.
 Real eager operands also receive a scoped FakeTensorMode during disposable
 materialization, so copied examples cannot execute native resource-owning ops.
 
@@ -360,19 +362,46 @@ def validate_inductor_scan_contract():
 
 
 def _make_value_preserving_materializer(utils):
-    """Isolate scan examples, retaining discrete values and fake op dispatch."""
+    """Isolate scan examples, retaining view metadata and fake op dispatch."""
+    from ._hop_inputs import _copy_view
+
     original_from_fun = utils._from_fun
 
-    def from_fun_preserving_discrete(value):
-        if (
-            not isinstance(value, torch.Tensor)
-            or value.dtype.is_floating_point
-            or value.dtype.is_complex
-        ):
+    def from_fun_preserving_metadata(value):
+        if not isinstance(value, torch.Tensor):
             return original_from_fun(value)
-        # Match the verified helper's Boolean unwrapping/clone semantics for
-        # all discrete tensors. Cloning a functional wrapper alone would keep
-        # its wrapper, rather than produce the required ordinary example.
+        if value.dtype.is_floating_point or value.dtype.is_complex:
+            example = original_from_fun(value)
+            offset = value.storage_offset()
+            conjugate, negative = value.is_conj(), value.is_neg()
+            if offset == 0 and not conjugate and not negative:
+                return example
+            # Torch's empty_strided examples preserve strides but discard the
+            # original offset and lazy flags. Explicit authored as_strided ops
+            # then differentiate against a different input storage frame.
+            # These are metadata-only examples under the materializer's fake
+            # mode; no source values or native resources are evaluated.
+            size = (
+                offset
+                + 1
+                + sum(
+                    (length - 1) * stride
+                    for length, stride in zip(value.shape, value.stride(), strict=True)
+                )
+                if value.numel()
+                else 0
+            )
+            example = example.new_empty((size,), requires_grad=False).as_strided(
+                value.shape, value.stride(), offset
+            )
+            if negative:
+                example = torch._neg_view(example)
+            if conjugate:
+                example = example.conj()
+            return example.requires_grad_(value.requires_grad)
+        # Unwrap discrete operands before copying their addressed storage
+        # span. Floating losses can also read discrete strided views, so their
+        # numerical values and original layout both belong to the example.
         if isinstance(value, utils.FunctionalTensor):
             from torch._functorch.aot_autograd import from_fun
 
@@ -381,11 +410,11 @@ def _make_value_preserving_materializer(utils):
         elif torch._is_functional_tensor(value):
             torch._sync(value)
             value = torch._from_functional_tensor(value)
-        return value.clone()
+        return _copy_view(value)
 
     original = utils.materialize_as_graph
     private_globals = dict(original.__globals__)
-    private_globals["_from_fun"] = from_fun_preserving_discrete
+    private_globals["_from_fun"] = from_fun_preserving_metadata
     materialize = FunctionType(
         original.__code__,
         private_globals,

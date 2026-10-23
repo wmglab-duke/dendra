@@ -170,11 +170,11 @@ timestep refreshes inserted Mechanisms and nested States. A root
 Population declaration does not add a new recurrent sampling phase.
 Fresh initialization of parameter or workspace builders that read runtime
 NOISE, including `derive_buffers` and `derive_timestep_buffers`, is currently
-unsupported. Snapshot execution remains available. Fresh initialization of
-Population-owned RAND or NOISE declarations with parameter-writing
-pre-initialization transforms is also currently unsupported, because native
-root sampling precedes those writes. Mechanism and nested State sampling
-follows the pre-initialization transforms.
+unsupported. Snapshot execution remains available. Population-owned RAND
+and NOISE sample before parameter-writing pre-initialize transforms;
+Mechanisms, nested States, and MaterialProcesses sample afterward. Retained
+realizations preserve the distribution parameters at their own sampling
+boundary; see {doc}`A45_functional_stochastic_initialization_ordering`.
 
 Sharing mutable RNGModule owners between different Network Populations is
 currently unsupported. Custom distributions require the split

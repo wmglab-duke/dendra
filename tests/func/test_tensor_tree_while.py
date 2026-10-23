@@ -153,6 +153,70 @@ def test_shared_loop_without_callbacks_emissions_or_tensor_tapes():
     assert carries == emitted == {}
 
 
+@pytest.mark.parametrize("view", (False, True))
+def test_shared_loop_isolates_shared_lifted_fields_and_tape_views(view):
+    def body(parameters, prepared, state, carries, sample):
+        value = (
+            state["value"]
+            + parameters["scale"] * prepared["left"]
+            + prepared["right"].square()
+            + sample["drive"]
+        )
+        return ({"value": value}, carries), {"value": value}
+
+    source = torch.nn.Parameter(torch.tensor(0.7, dtype=torch.float64))
+    parameters = {"scale": source}
+    prepared = {
+        name: source.view_as(source) if view else source for name in ("left", "right")
+    }
+    tape = {"drive": source.expand(5)}
+    initial = {"value": torch.tensor([-0.3, 0.2], dtype=torch.float64)}
+    engine = _CompiledTensorTreeWhile(
+        body,
+        steps=5,
+        compile_options={"backend": "eager", "fullgraph": True},
+        device="cpu",
+    )
+    with torch.no_grad():
+        final, _, emitted = engine(parameters, prepared, initial, {}, tape)
+        frames = initial["value"] + torch.arange(1, 6, dtype=torch.float64)[:, None] * (
+            2 * source.square() + source
+        )
+    torch.testing.assert_close(final["value"], frames[-1])
+    torch.testing.assert_close(emitted["value"], frames)
+    assert parameters["scale"] is source and source.is_leaf
+    assert all(
+        torch._C._is_alias_of(value, source)
+        for value in (*prepared.values(), tape["drive"])
+    )
+
+
+@pytest.mark.parametrize("backend", ("eager", "inductor"))
+def test_shared_loop_preserves_explicit_strided_views(backend):
+    def body(parameters, prepared, state, carries, sample):
+        value = parameters["value"]
+        selected = value.as_strided((2,), value.stride(), value.storage_offset())
+        updated = state["value"] + selected.square().sum() + prepared["same"].sum()
+        return ({"value": updated}, carries), {}
+
+    source = torch.nn.Parameter(torch.arange(12.0, dtype=torch.float64))
+    value = source[3:9:2]
+    parameters, prepared = {"value": value}, {"same": value}
+    initial = {"value": torch.tensor(0.0, dtype=value.dtype)}
+    engine = _CompiledTensorTreeWhile(
+        body,
+        steps=4,
+        compile_options={"backend": backend, "fullgraph": True},
+        device="cpu",
+    )
+    with torch.no_grad(), torch_compiler_warning_context():
+        final, _, _ = engine(parameters, prepared, initial, {}, None)
+        expected = initial
+        for _ in range(4):
+            (expected, _), _ = body(parameters, prepared, expected, {}, None)
+    torch.testing.assert_close(final["value"], expected["value"])
+
+
 def test_shared_capture_keeps_no_example_operands_and_reuses_explicit_values():
     engine = _CompiledTensorTreeWhile(
         _body,

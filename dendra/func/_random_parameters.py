@@ -189,6 +189,21 @@ class RandomParameterPlan:
     def __init__(self, population):
         self.population = population
         self.check_purity = current_check_purity()
+        from ._population import _initialization_transform_hooks
+
+        # Population sampling precedes authored pre-initialize parameter
+        # writes. Its selected distribution operands therefore own the
+        # incoming graph even after those writes replace the explicit raw
+        # parameter frame used by later preparation.
+        self._retain_population_initialization_frame = bool(
+            population.random_parameters
+        ) and any(
+            reference.startswith("parameters.")
+            for hook in _initialization_transform_hooks(population, "pre")
+            for reference in population._initialization_transforms[
+                hook.action_name
+            ].writes
+        )
         self._declarations = _declaration_signature(population)
         self.entries = []
         from ._runtime_noise import _stream_topology, stream_inventory
@@ -316,6 +331,10 @@ class RandomParameterPlan:
             self.defaults[f"random.fresh.{key}"] = torch.zeros(
                 (), dtype=torch.bool, device=sample.device
             )
+            if self._holds_initialization_frame(entry):
+                self.defaults[f"random.initialization_frame.{key}"] = torch.zeros(
+                    (), dtype=torch.bool, device=sample.device
+                )
             self._bindings.append(
                 (path, name, spec, distribution.draw_sampler, distribution.transform)
             )
@@ -324,6 +343,9 @@ class RandomParameterPlan:
             name: (tuple(value.shape), value.dtype, value.device)
             for name, value in self.defaults.items()
         }
+
+    def _holds_initialization_frame(self, entry):
+        return self._retain_population_initialization_frame and not entry.path
 
     def _constant_value(self, name, value):
         shape, dtype, device = self.schema[name]
@@ -457,6 +479,10 @@ class RandomParameterPlan:
             constants[f"random.fresh.{entry.key}"] = torch.zeros(
                 (), dtype=torch.bool, device=entry.device
             )
+            if self._holds_initialization_frame(entry):
+                constants[f"random.initialization_frame.{entry.key}"] = torch.zeros(
+                    (), dtype=torch.bool, device=entry.device
+                )
         rng = {
             stream: _rng_values(getattr(owners[path], name), population.device())
             for stream, (path, name) in self.streams.items()
@@ -477,6 +503,7 @@ class RandomParameterPlan:
                 },
                 constants[f"random.values.{entry.key}"],
                 constants[f"random.fresh.{entry.key}"],
+                constants.get(f"random.initialization_frame.{entry.key}"),
             )
             for entry in self.entries
         }
@@ -610,6 +637,18 @@ class RandomParameterPlan:
                 device=entry.device,
                 dtype=torch.bool,
             )
+            if self._holds_initialization_frame(entry):
+                # Initialization starts a new incoming parameter frame. Sticky
+                # RAND retains its numerical sample, then reconnects it to the
+                # current pre-transform operands through the ordinary frozen
+                # provenance route; a resampled RAND instead consumes them
+                # directly. Neither route should retain a discarded old graph.
+                result.update(
+                    (name, result[name].detach()) for name in entry.parameter_names
+                )
+                result[f"random.initialization_frame.{entry.key}"] = torch.zeros(
+                    (), device=entry.device, dtype=torch.bool
+                )
         return result
 
     def retain_constants(self, constants, state):
@@ -624,6 +663,11 @@ class RandomParameterPlan:
                     *entry.parameter_names,
                     f"random.values.{entry.key}",
                     f"random.fresh.{entry.key}",
+                    *(
+                        (f"random.initialization_frame.{entry.key}",)
+                        if self._holds_initialization_frame(entry)
+                        else ()
+                    ),
                 )
                 result.update((name, retained[name]) for name in names)
         return result
@@ -633,11 +677,20 @@ class RandomParameterPlan:
         for entry in self.entries:
             sample, parameters = materialized[entry.key]
             result[f"random.values.{entry.key}"] = sample.detach().clone()
+            holds_initialization_frame = self._holds_initialization_frame(entry)
             for p, public in zip(entry.spec.params, entry.parameter_names, strict=True):
-                result[public] = parameters[p].detach().clone()
+                result[public] = (
+                    parameters[p].clone()
+                    if holds_initialization_frame
+                    else parameters[p].detach().clone()
+                )
             result[f"random.fresh.{entry.key}"] = torch.zeros(
                 (), device=entry.device, dtype=torch.bool
             )
+            if holds_initialization_frame:
+                result[f"random.initialization_frame.{entry.key}"] = torch.ones(
+                    (), device=entry.device, dtype=torch.bool
+                )
         return result
 
     def state(self, constants, rng):
@@ -684,6 +737,10 @@ class RandomParameterPlan:
             result[f"random.fresh.{entry.key}"] = torch.zeros(
                 (), device=entry.device, dtype=torch.bool
             )
+            if self._holds_initialization_frame(entry):
+                result[f"random.initialization_frame.{entry.key}"] = torch.zeros(
+                    (), device=entry.device, dtype=torch.bool
+                )
         rng = {}
         for stream, (path, name) in self.streams.items():
             extra = cache[f"{path + '.' if path else ''}{name}._extra_state"]
@@ -811,19 +868,53 @@ class RandomParameterPlan:
         self.publish_commit(population, self.prepare_commit(population, state))
 
 
-def materialize_random_parameters(owner, path, values, inputs, *, check_purity=False):
+def materialize_random_parameters(
+    owner, path, values, inputs, *, check_purity=False, materialized=None
+):
     """Pure distribution evaluation; owner writes remain inside functional_call."""
     from dendra.models.random_parameters import evaluate_random_parameter
 
     outputs = {}
     for name, spec in owner.random_parameters.items():
         key = f"{path + '.' if path else ''}{name}"
-        draw, saved, sample, fresh = inputs[key]
+        if materialized is not None and key in materialized:
+            value, parameters = materialized[key]
+            owner._buffers[name] = value
+            outputs[key] = (value, parameters)
+            continue
+        draw, saved, sample, fresh, initialization_frame = inputs[key]
         current = {p: values[spec.full_parameter_name(p)] for p in spec.params}
         frozen = restore_population_cache_values(
             current, saved, parameter_names=current
         )
         selected = {p: torch.where(fresh, current[p], frozen[p]) for p in current}
+        if initialization_frame is not None:
+            selected = {
+                p: torch.where(initialization_frame, saved[p], selected[p])
+                for p in current
+            }
+        from ._population import _initialization_transform_scalar_input
+
+        # An empty hidden scalar lane cannot broadcast with the sampler's
+        # visible singleton draw on PyTorch's scalar batching path. Pad only
+        # evaluation operands; retained distribution provenance keeps its
+        # declared shape.
+        evaluation_parameters = {
+            name: _initialization_transform_scalar_input(value)
+            for name, value in selected.items()
+        }
+        evaluation_draw = _pytree.tree_map(_initialization_transform_scalar_input, draw)
+        padded_arguments = any(
+            value.ndim != padded.ndim
+            for value, padded in zip(
+                (*selected.values(), *_pytree.tree_leaves(draw)),
+                (
+                    *evaluation_parameters.values(),
+                    *_pytree.tree_leaves(evaluation_draw),
+                ),
+                strict=True,
+            )
+        )
         arguments = (*selected.values(), *_pytree.tree_leaves(draw))
         versions = (
             tuple(value._version for value in arguments)
@@ -833,7 +924,12 @@ def materialize_random_parameters(owner, path, values, inputs, *, check_purity=F
             and not any(torch.is_inference(value) for value in arguments)
             else None
         )
-        evaluated = evaluate_random_parameter(spec, selected, draw)
+        evaluated = evaluate_random_parameter(
+            spec, evaluation_parameters, evaluation_draw
+        )
+        if padded_arguments:
+            while evaluated.ndim > sample.ndim and evaluated.shape[0] == 1:
+                evaluated = evaluated.squeeze(0)
         if versions is not None and any(
             value._version != version
             for value, version in zip(arguments, versions, strict=True)

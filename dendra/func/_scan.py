@@ -17,6 +17,7 @@ from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._callbacks import _update_callback_values
 from ._carry_packing import _PackedCarryLayout
+from ._hop_inputs import _isolate_lifted_inputs
 from ._scan_autograd import guard_scan_outputs
 from ._scan_compat import install_scan_compatibility
 from ._scan_inductor import _compile_scan
@@ -228,6 +229,11 @@ class _CompiledScanPopulationChunk:
                 if plans is None:
                     return packed
                 return packed, {plan.name: emitted.get(plan.name) for plan in plans}
+            # Every lifted operand must own storage independently of its
+            # siblings, including prepared buffers backed by shared sources.
+            parameters, prepared, invariant_carries, samples = _isolate_lifted_inputs(
+                (parameters, prepared, invariant_carries, samples)
+            )
             if block == 1:
 
                 def combine(carry, sample):

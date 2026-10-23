@@ -450,11 +450,15 @@ class RuntimeNoisePlan:
                         f"Runtime NOISE/SDE draw {name!r} has incompatible Tensor schema"
                     )
 
-    def values(self, mapping, packet, dt, *, initialization=False):
+    def values(self, mapping, packet, dt, *, initialization=False, owner_paths=None):
         from dendra.models.random_parameters import evaluate_runtime_noise
+
+        from ._population import _initialization_transform_scalar_input
 
         values = {}
         for entry in self.entries if initialization else self.noise_runtime:
+            if owner_paths is not None and entry.path not in owner_paths:
+                continue
             prefix = f"population.{entry.path + '.' if entry.path else ''}"
             parameters = {
                 name: mapping[f"{prefix}{entry.spec.full_parameter_name(name)}"]
@@ -492,8 +496,18 @@ class RuntimeNoisePlan:
                 )
                 else None
             )
+            # A visible singleton avoids PyTorch's scalar broadcasting rule
+            # selecting lane zero from an empty hidden vmap batch. Only the
+            # evaluation views change; declared operands and output schemas
+            # keep their original shapes.
             value = evaluate_runtime_noise(
-                entry.spec, parameters, draw, dt=dt.detach().clone()
+                entry.spec,
+                {
+                    name: _initialization_transform_scalar_input(value)
+                    for name, value in parameters.items()
+                },
+                _pytree.tree_map(_initialization_transform_scalar_input, draw),
+                dt=_initialization_transform_scalar_input(dt.detach().clone()),
             )
             if versions is not None and versions != tuple(
                 value._version

@@ -278,9 +278,12 @@ def test_network_noise_only_fresh_runner_continues_without_effective_constants()
         checkpoint_every=1,
         backend="aot_eager",
     )
-    prefix, first = runner()
+    before = _clone(runner.functional.extract(), detached=True)
+    prefix, _ = runner()
     final, _ = runner(prefix)
-    _close(first["constants"], runner.functional.extract().constants)
+    # Fresh preparation owns active materializations; native extraction is a
+    # snapshot with inactive graph anchors. The source itself stays unchanged.
+    _close(runner.functional.extract(), before)
     native.initialize(DT, reinit_weights=False, reinit_delays=False)
     for _ in range(4):
         native.step()

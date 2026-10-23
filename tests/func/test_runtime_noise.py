@@ -325,7 +325,7 @@ def test_compatible_population_requires_same_noise_stream_aliases(kind, operatio
     _close(compatible.state_dict(), before)
 
 
-def test_root_population_noise_is_initialization_only_and_pre_transform_order_fails_closed():
+def test_root_population_noise_is_initialization_only_and_preserves_pre_transform_order():
     from tests.func.test_population_initialization_transforms import _Add
 
     class NoisyPopulation(dn.SingleCompartment):
@@ -346,15 +346,16 @@ def test_root_population_noise_is_initialization_only_and_pre_transform_order_fa
     functional, tensors = dn.func.make_functional(population, dt=DT)
     assert functional.sample_noise_draw(tensors.state) is None
     functional.prepare_and_step(tensors.parameters, tensors.constants, tensors.state)
-    with pytest.raises(
-        dn.func.FunctionalizationError, match="parameter-writing pre-initialize"
-    ):
-        functional.initialize_host(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-            state=tensors.state,
-        )
+    initialized = functional.initialize_host(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization,
+        state=tensors.state,
+    )
+    population.initialize()
+    expected = functional.extract(population)
+    _close(initialized.state, expected.state)
+    _close(initialized.parameters, expected.parameters)
 
 
 def test_host_checkpoint_sampling_is_bounded_and_replay_reuses_packets(monkeypatch):
