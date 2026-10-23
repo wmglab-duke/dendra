@@ -160,11 +160,10 @@ The lower-level `make_functional_netstim` API accepts effective numerical
 `interval`, `start`, `noise`, and `tau` tensors. It remains useful when an
 application manages source materialization itself. Source-local stochastic
 sampling and changes to the frozen generator shape are currently unsupported
-by Network source materialization. A parametrized module used as an Ion or
-Material initialization recipe is also currently unsupported by fresh
-initialization. Share a registered raw tensor with an ordinary initializer,
-or use a supported runtime source such as `cm_param`, when those values should
-participate in the same parameter binding.
+by Network source materialization. Registered raw sources can also be shared
+with parametrized Ion or Material initializers and runtime sources such as
+`cm_param`. See {doc}`A42_functional_initialization_parametrizations` for
+initializer bindings, gradients, and continuation.
 
 The complete example executes its native, compiled, and gradient checks:
 

@@ -32,6 +32,8 @@ _NATIVE_SETTER_CODE = _nested_code(parametrize._inject_property, "set_original")
 _NATIVE_CACHED_GETTER_CODE = _nested_code(
     parametrize._inject_property, "get_cached_parametrization"
 )
+_NATIVE_DEEPCOPY_CODE = _nested_code(parametrize._inject_new_class, "default_deepcopy")
+_NATIVE_GETSTATE_CODE = _nested_code(parametrize._inject_new_class, "getstate")
 
 
 def _closure_values(function):
@@ -99,6 +101,13 @@ def _callable_binding(value):
     return id(target), id(getattr(target, "__code__", None))
 
 
+def _static_descriptor(owner, name):
+    for cls in type(owner).__mro__:
+        if name in vars(cls):
+            return vars(cls)[name]
+    return None
+
+
 def source_binding_signature(population):
     """Return only registered layout and execution bindings, without purity scans.
 
@@ -111,7 +120,10 @@ def source_binding_signature(population):
     entries = []
     for path, owner, registry in registries(population):
         for name, transforms in registry.items():
-            descriptor = getattr(type(owner), name, None)
+            descriptor = _static_descriptor(owner, name)
+            if type(descriptor) is not property:
+                entries.append((path, name, "invalid-property", id(descriptor)))
+                continue
             entries.append(
                 (
                     path,
@@ -189,6 +201,30 @@ def canonical_type(module):
     ):
         return parametrize.type_before_parametrizations(module)
     return type(module)
+
+
+def canonical_copy_method(module, name, standard):
+    """Accept generated PyTorch copy hooks without trusting authored hooks.
+
+    PyTorch supplies a default deepcopy only when the original class has none,
+    and always installs a serialization blocker. The original class must still
+    satisfy the caller's copy contract; wrapping a class cannot hide its hooks.
+    """
+    actual = inspect.getattr_static(type(module), name, None)
+    original = canonical_type(module)
+    if original is type(module):
+        return actual is standard
+    if inspect.getattr_static(original, name, None) is not standard:
+        return False
+    expected = {
+        "__deepcopy__": _NATIVE_DEEPCOPY_CODE,
+        "__getstate__": _NATIVE_GETSTATE_CODE,
+    }.get(name)
+    return actual is standard or (
+        expected is not None
+        and _matches_function(actual, expected, vars(parametrize))
+        and not actual.__closure__
+    )
 
 
 def registries(population):
@@ -298,7 +334,7 @@ def failures(population, *, diagnostic=None):
                 | set(getattr(owner, "_carry", {}))
                 | set(getattr(owner, "_assigned", {}))
             )
-            if owner is population:
+            if owner is population and isinstance(owner, p.Population):
                 mutable.update(("v", "vc", "t", "i_membrane", "_duration_remainder"))
             mutable.update(p._derived_buffer_names(owner))
             mutable.update(p._timestep_buffer_names(owner))

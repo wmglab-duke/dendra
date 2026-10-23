@@ -49,3 +49,4 @@ Advanced
    advanced/A39_functional_connection_parameters.md
    advanced/A40_functional_netstim_parameters.md
    advanced/A41_functional_connection_sampling.md
+   advanced/A42_functional_initialization_parametrizations.md

@@ -175,9 +175,10 @@ their native gradients.
 Nonpersistent transform buffers retain their current values unless a
 persistent alias writes the same storage. See
 {doc}`A29_functional_network_cache_initialization` for cache and continuation
-packets. A parametrized module used as an Ion or Material initialization
-recipe is currently unsupported by fresh initialization; sharing a registered
-raw tensor with an ordinary initializer remains supported.
+packets. Ion and Material initialization recipes can also use parametrizations;
+fresh initialization evaluates their transforms from the bound raw sources.
+See {doc}`A42_functional_initialization_parametrizations` for selection, sharing,
+and continuation.
 
 Transform lists, module bindings, original layouts, and aliases are part of
 the lowered model structure. Adding, removing, or reordering parametrizations

@@ -15,6 +15,10 @@ concentration to a nonnegative value, while a custom module can compute a field
 from several parameters. Native initialization and functional fresh
 initialization evaluate the same field derivation machinery.
 
+Initializer parameters can use PyTorch's `register_parametrization(...)`,
+including trainable transforms and shared raw originals. See
+{doc}`A42_functional_initialization_parametrizations` for a complete example.
+
 The complete
 {download}`functional_initialization_sources.py <../../examples/functional_initialization_sources.py>`
 example trains both kinds of source, checks native trajectories, and continues a

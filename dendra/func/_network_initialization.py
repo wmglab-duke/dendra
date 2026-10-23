@@ -85,8 +85,9 @@ def nonpersistent_material_cache_failures(functional):
     )
     represented = {
         path
-        for _winner, _parameters, constants, _states in bindings
-        for path in constants
+        for _winner, _parameters, constant_groups, _states in bindings
+        for paths in constant_groups
+        for path in paths
     }
 
     def overlaps(left, right):
@@ -393,6 +394,7 @@ def _cache_alias_plan(functional, writers, readers):
 
     groups = {}
     constant_frames = {}
+    constant_sources = {}
     frame_sources, writes = {}, []
     for name, plan in writers.items():
         for key in plan.write_keys:
@@ -447,6 +449,7 @@ def _cache_alias_plan(functional, writers, readers):
                 group[collection].append(path)
                 if collection == 2:
                     constant_frames[path] = frame
+                    constant_sources[path] = plan.sources[source]
     # Some saved Population buffers are exposed only as cache materializations,
     # so their packet constants intentionally do not share snapshot identity.
     # Resolve outside execution parameters against the original native Tensor
@@ -461,9 +464,15 @@ def _cache_alias_plan(functional, writers, readers):
         "continuous_synapses": {},
         "netstim": None,
     }
-    native_constants = {"synapses": {}, "continuous_synapses": {}}
+    native_constants = {"populations": {}, "synapses": {}, "continuous_synapses": {}}
     for name, plan in functional.populations.items():
         native["populations"][name] = plan._parameter_sources()
+        native_constants["populations"][name] = {
+            entry.key: plan._population.get_submodule(entry.module_path)._buffers[
+                entry.buffer_name
+            ]
+            for entry in plan._parametrization_constants
+        }
     for name, plan in functional.synapses.items():
         connection = plan._source
         sources = functional._connection_parameter_plans["synapses", name]
@@ -513,6 +522,12 @@ def _cache_alias_plan(functional, writers, readers):
             if path not in parameters:
                 parameters.append(path)
     for path, source in _tensor_paths(native_constants):
+        constant_sources[path] = source
+        # Population cache bindings own their destination frames, including
+        # expanded buffers rebound to owned storage. Missing Population readers
+        # are admitted only by the exact parameter-alias closure below.
+        if path[0] == "populations" or path in constant_frames:
+            continue
         frame = _cache_storage_frame(source)
         if frame not in groups and any(
             overlaps(frame, other) for other in written_frames
@@ -556,12 +571,17 @@ def _cache_alias_plan(functional, writers, readers):
         parameter_groups = {}
         for path in parameters:
             parameter_groups.setdefault(id(native_parameters[path]), []).append(path)
+        # A cache copy updates every reader of the same authored Tensor.
+        # Distinct Tensor views can share a storage frame without sharing identity.
+        constant_groups = {}
+        for path in constants:
+            constant_groups.setdefault(id(constant_sources[path]), []).append(path)
         outputs.append((len(result), frame_sources[frame], frame))
         result.append(
             (
                 winner,
                 tuple(tuple(paths) for paths in parameter_groups.values()),
-                tuple(constants),
+                tuple(tuple(paths) for paths in constant_groups.values()),
                 tuple(states),
             )
         )
@@ -653,7 +673,7 @@ def _restore_cache_aliases(
             size=replay.size,
         )
         resolved.update(zip(replay.output_ids, values, strict=True))
-    for index, (winner, parameter_groups, constant_paths, state_paths) in enumerate(
+    for index, (winner, parameter_groups, constant_groups, state_paths) in enumerate(
         functional._cache_alias_bindings if bindings is None else bindings
     ):
         saved = resolved[index] if index in resolved else _at(cache.populations, winner)
@@ -669,11 +689,11 @@ def _restore_cache_aliases(
             )["value"]
             for path in parameter_paths:
                 effective = _replace_at(effective, path, value)
-        for path in constant_paths:
-            reference = _at(constants, path)
-            constants = _replace_at(
-                constants, path, saved.detach().to(reference).clone()
-            )
+        for constant_paths in constant_groups:
+            reference = _at(constants, constant_paths[0])
+            value = saved.detach().to(reference).clone()
+            for path in constant_paths:
+                constants = _replace_at(constants, path, value)
         for path in state_paths:
             reference = _at(populations, path)
             populations = _replace_at(

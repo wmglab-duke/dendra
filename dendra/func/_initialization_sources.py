@@ -269,6 +269,8 @@ def _structural_source_view(source):
             view.__dict__.pop("forward", None)
         if vars(module).get("_initialization_source_cache_free") is True:
             view.__dict__.pop("_initialization_source_cache_free")
+        if type(module) is torch.nn.utils.parametrize.ParametrizationList:
+            view.__dict__.pop("_functional_output_schema", None)
         object.__setattr__(
             view,
             "_modules",
@@ -280,6 +282,35 @@ def _structural_source_view(source):
         return view
 
     return visit(source)
+
+
+def _receiver_signature(source, method, *, strict):
+    """Audit arithmetic with parametrized fields treated as explicit tensors.
+
+    Generated getters close over PyTorch's optional global cache. Their binding
+    is qualified separately, and their transforms are ordinary registered
+    children. No getter is evaluated or followed during dependency discovery.
+    """
+    from ._torch_parametrizations import property_signature
+
+    registry = source._modules.get("parametrizations")
+    if registry is None:
+        return _function_signature(method, source, strict=strict), ()
+    properties = tuple(
+        property_signature(source, name, label="initial-value source", strict=strict)
+        for name in registry
+    )
+    view = object.__new__(type(source))
+    object.__setattr__(view, "__dict__", dict(vars(source)))
+    object.__setattr__(
+        view, "_parameters", {**source._parameters, **dict.fromkeys(registry)}
+    )
+    rebound = (
+        method.__func__.__get__(view, type(view))
+        if inspect.ismethod(method)
+        else method
+    )
+    return _function_signature(rebound, view, strict=strict), properties
 
 
 def _require_static_method(source, name):
@@ -317,6 +348,14 @@ def _trusted_receiver_signatures(source, *, strict):
         )
         names.update(attributes)
     for name in sorted(names):
+        from ._torch_parametrizations import property_signature
+
+        parametrized = property_signature(
+            source, name, label="canonical initial-value source", strict=strict
+        )
+        if parametrized is not None:
+            signatures.append((name, parametrized))
+            continue
         if (
             name in source._parameters
             or name in source._buffers
@@ -350,7 +389,12 @@ def _trusted_receiver_signatures(source, *, strict):
 def _qualify(source, *, strict):
     """Reuse the continuous-callable proof with narrow native recipe leaves."""
     p = _helpers()
+    from ._torch_parametrizations import canonical_copy_method, failures
+
     modules = _safe_modules(source)
+    errors = failures(source, diagnostic=False)
+    if errors:
+        raise FunctionalizationError("; ".join(errors))
     for _path, child in modules:
         _require_static_method(child, "forward")
         if isinstance(child, cacheable):
@@ -400,11 +444,10 @@ def _qualify(source, *, strict):
                 "Initial-value source call/attribute methods must be defined on its class."
             )
         for name in _COPY_METHODS:
-            actual = inspect.getattr_static(type(child), name, None)
             standard = inspect.getattr_static(torch.nn.Module, name, None)
             if name == "__getstate__" and isinstance(child, cacheable):
                 standard = _CANONICAL_CACHE_STATE
-            if actual is not standard:
+            if not canonical_copy_method(child, name, standard):
                 raise FunctionalizationError(
                     "Initial-value sources cannot override deepcopy/serialization hooks."
                 )
@@ -464,7 +507,7 @@ def _qualify(source, *, strict):
                     method, label="initial-value source", strict=False
                 )
                 if trusted
-                else _function_signature(method, child, strict=strict),
+                else _receiver_signature(child, method, strict=strict),
                 _trusted_receiver_signatures(child, strict=strict) if trusted else (),
             )
         )
@@ -477,6 +520,12 @@ def _qualify(source, *, strict):
 
 def _source_layout_contract(source):
     """Qualify binding and cache dispatch without auditing authored arithmetic."""
+    from ._torch_parametrizations import canonical_copy_method, canonical_type, failures
+
+    _safe_modules(source)
+    errors = failures(source, diagnostic=False)
+    if errors:
+        raise FunctionalizationError("; ".join(errors))
     source = _structural_source_view(source)
     records = []
     aliases = {}
@@ -502,7 +551,7 @@ def _source_layout_contract(source):
                 if name == "__getstate__" and isinstance(child, cacheable)
                 else inspect.getattr_static(torch.nn.Module, name, None)
             )
-            if inspect.getattr_static(type(child), name, None) is not canonical:
+            if not canonical_copy_method(child, name, canonical):
                 raise FunctionalizationError(
                     "Initial-value sources require canonical deepcopy/serialization dispatch."
                 )
@@ -523,7 +572,7 @@ def _source_layout_contract(source):
         records.append(
             (
                 path,
-                type(child),
+                canonical_type(child),
                 child.training,
                 _binding(method),
                 tuple(
@@ -542,7 +591,10 @@ def _source_layout_contract(source):
                     for collection in ("_parameters", "_buffers")
                     for name, value in vars(child)[collection].items()
                 ),
-                tuple((name, type(nested)) for name, nested in child._modules.items()),
+                tuple(
+                    (name, None if nested is None else canonical_type(nested))
+                    for name, nested in child._modules.items()
+                ),
             )
         )
     return tuple(records)
@@ -606,6 +658,9 @@ def _audit_source(source):
             _configure_initial_source_execution,
         )
 
+        from ._torch_parametrizations import install_output_schemas
+
+        install_output_schemas(execution)
         _configure_initial_source_execution(execution)
         call = _SourceCall(execution)
         arguments = {
@@ -798,6 +853,11 @@ def _collect_dependencies(roots):
                 or name in owner._modules
             ):
                 continue
+            registry = owner._modules.get("parametrizations")
+            if registry is not None and name in registry:
+                # The getter's cache closure is framework implementation;
+                # registered transform forwards are visited below instead.
+                continue
             descriptor = inspect.getattr_static(owner, name, None)
             if isinstance(descriptor, property):
                 visit(descriptor.fget.__get__(owner, type(owner)), owner)
@@ -941,8 +1001,19 @@ class InitializationSourcePlan:
             self._class_binding_names = {}
             self._class_members = {}
             self._functions = self._dependencies = self._raw_class_guards = ()
+            self._dispatch_guards = ()
             self._bindings = ()
             return
+        self._dispatch_guards = tuple(
+            record
+            for cls in dict.fromkeys(
+                type(child)
+                for _path, source in roots
+                for _nested, child in _registered_modules(source)
+            )
+            for name in (*_CALL_METHODS, *_COPY_METHODS, "forward", "_compute")
+            for record in _class_member_guards(cls, name)
+        )
         audited = set()
         failures = list(initialization_source_ownership_failures(population))
         for path, source in initialization_source_roots(population):
@@ -1019,10 +1090,26 @@ class InitializationSourcePlan:
         roots = initialization_source_roots(population)
         if not roots:
             return ()
+        from ._torch_parametrizations import source_binding_signature
+
+        torch_bindings = (
+            tuple((path, source_binding_signature(source)) for path, source in roots)
+            if not self.failures
+            else ()
+        )
+        dispatch = tuple(
+            (
+                cls.__dict__ == _RawClassMemberIdentity(name, present, expected),
+                _member_binding(expected),
+            )
+            for cls, name, present, expected in self._dispatch_guards
+        )
         if not self.diagnostic:
             return (
                 tuple((path, _module_bindings(source, {})) for path, source in roots),
                 _alias_signature(population, roots),
+                torch_bindings,
+                dispatch,
             )
         try:
             return (
@@ -1038,6 +1125,8 @@ class InitializationSourcePlan:
                     cls.__dict__ == _RawClassMemberIdentity(name, present, expected)
                     for cls, name, present, expected in self._raw_class_guards
                 ),
+                torch_bindings,
+                dispatch,
             )
         except (
             FunctionalizationError,
