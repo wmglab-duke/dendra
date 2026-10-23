@@ -9,12 +9,16 @@ kernelspec:
 (functional-connection-sampling)=
 # Sample and train connection distributions
 
-`dn.compile(Network)` supports `Normal` and `TruncatedNormal` sources for
-NetCon and ContinuousCon weights and delays. Native and functional execution
+`dn.compile(Network)` supports built-in `Normal`, `TruncatedNormal`, and custom
+`Distribution` sources with explicit-draw hooks for NetCon and ContinuousCon
+weights and delays. Native and functional execution
 share the distribution's pure draw transform and connection materializer.
 Raw distribution parameters, registered PyTorch parametrizations, and shared
 tensor identities remain explicit; sampled effective tensors retain pathwise
 gradients through those sources.
+
+See {doc}`A49_functional_distribution_sampling` to implement a custom
+distribution using the shared draw schema, host sampler, and pure transform.
 
 The complete
 {download}`functional_connection_sampling.py <../../examples/functional_connection_sampling.py>`
@@ -163,9 +167,11 @@ The example compares gradients of the continued voltage loss:
 
 ## Current limits
 
-Built-in Normal and TruncatedNormal sampling hooks are supported. Custom
-distribution sampling implementations retain their initialized effective
-storage; fresh functional sampling through them is currently unsupported.
+Built-in Normal and TruncatedNormal and custom distributions using the shared
+explicit-draw contract support fresh sampling. Custom native sampling adapters
+that override that contract can retain initialized effective storage; fresh
+functional sampling through those adapters is currently unsupported. See
+{doc}`A49_functional_distribution_sampling` for the authoring contract.
 Changing a fixed event/continuous delay's integer route requires lowering
 again. Interpolated event delays can vary within the frozen delay capacity.
 Changing source registration, Python configuration, or the cold sampling

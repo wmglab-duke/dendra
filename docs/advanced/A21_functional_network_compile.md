@@ -255,10 +255,12 @@ and transform parameters. Schedule values retain named fields such as
 shared optimizer leaves, and refresh policies, and
 {doc}`A40_functional_netstim_parameters` for NetStim source selection,
 initialization, and random-state continuation.
-Normal and TruncatedNormal connection distributions retain their raw sources
-and support fresh sampling with explicit draws and RNG carry; see
+Built-in and custom connection distributions with explicit-draw hooks retain
+their raw sources and support fresh sampling with explicit draws and RNG carry;
+see
 {doc}`A41_functional_connection_sampling` for initialization, resampling flags,
-and checkpointed gradients.
+and checkpointed gradients, and {doc}`A49_functional_distribution_sampling`
+for the custom distribution contract.
 
 `trainable` accepts exact names, unique partial names, glob patterns, and
 explicit regex selectors. For example:

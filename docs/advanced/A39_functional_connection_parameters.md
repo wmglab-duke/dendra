@@ -142,13 +142,15 @@ delays retain integer routing frozen by lowering. Their raw sources remain
 explicit, but a source update that changes the rounded routing timestep
 requires lowering the Network again.
 
-`Normal` and `TruncatedNormal` weight/delay distributions retain raw trainable
-sources and support fresh sampling with explicit base draws and RNG carry.
+Built-in and custom weight/delay distributions with explicit-draw hooks retain
+raw trainable sources and support fresh sampling with explicit base draws and
+RNG carry.
 See {doc}`A41_functional_connection_sampling` for resampling, shared sources,
-and checkpoint continuation. Other initialized distribution implementations
-can retain their fixed sampled storage with the corresponding reinitialization
-flag set to `False`; fresh sampling through those implementations is currently
-unsupported.
+and checkpoint continuation, and {doc}`A49_functional_distribution_sampling`
+for the custom distribution contract. Other initialized distribution
+implementations can retain their fixed sampled storage with the corresponding
+reinitialization flag set to `False`; fresh sampling through those native-only
+adapters is currently unsupported.
 
 The lower-level `make_functional_netcon` projection API accepts effective
 numerical weights and interpolated delays. `make_functional_continuous_con`

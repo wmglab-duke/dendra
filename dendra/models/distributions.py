@@ -22,9 +22,60 @@ def _normal_from_draw(mean, std, draw):
 class Distribution(nn.Module):
     """Abstract base class for re-parameterised probability distributions.
 
-    Subclasses must implement :meth:`rsample` and :meth:`log_prob` following the
-    PyTorch distribution API to support differentiable sampling.
+    Implement :meth:`sample_draw_schema`, :meth:`sample_draw`, and
+    :meth:`sample_from_draw` to share explicit sampling between native and
+    functional connections. The inherited sampling adapters retain independent
+    draws for checkpoint continuation and differentiable rematerialization.
+
+    Existing subclasses can implement :meth:`rsample` and :meth:`log_prob`
+    following the PyTorch distribution API for native sampling.
     """
+
+    def sample_draw_schema(self, sample_shape=torch.Size()):
+        """Return the base draw's ``(shape, floating dtype, device)`` metadata.
+
+        The draw may have additional dimensions consumed by the transform; its
+        shape need not equal the resulting sample shape. Metadata must describe
+        the draw without consuming randomness or changing module state.
+        """
+        raise NotImplementedError
+
+    def sample_draw(self, sample_shape=torch.Size(), *, generator=None):
+        """Draw independent base noise using only the supplied generator.
+
+        ``generator=None`` uses the ordinary Torch RNG for the draw's device.
+        Return one Tensor matching :meth:`sample_draw_schema`.
+        """
+        raise NotImplementedError
+
+    def sample_from_draw(self, draw):
+        """Purely transform explicit base noise into differentiable samples."""
+        raise NotImplementedError
+
+    def sample_draw_placeholder(self, sample_shape=torch.Size()):
+        """Return a deterministic valid base draw without consuming randomness.
+
+        The default is zeros. Override this hook when zeros lie outside the
+        transform's domain, such as an inverse CDF requiring interior uniforms.
+        This value permits safe evaluation of inactive legacy-checkpoint paths;
+        it does not replace a sampled draw or reconstruct missing provenance.
+        """
+        shape, dtype, device = connection_distribution_draw_schema(self, sample_shape)
+        return torch.zeros(shape, dtype=dtype, device=device)
+
+    def sample_with_draw(self, sample_shape=torch.Size(), *, generator=None):
+        """Return a differentiable sample and detached independent base draw."""
+        sample_shape = torch.Size(sample_shape)
+        # Validate metadata before consuming the caller's random stream.
+        schema = connection_distribution_draw_schema(self, sample_shape)
+        with torch.no_grad():
+            draw = self.sample_draw(sample_shape, generator=generator)
+        _validate_connection_distribution_draw(draw, schema)
+        draw = draw.detach()
+        value = self.sample_from_draw(draw)
+        if not torch.is_tensor(value):
+            raise TypeError("Connection distribution transforms must return a Tensor.")
+        return value, draw
 
     def rsample(self, sample_shape=torch.Size()):
         """Draw differentiable samples.
@@ -39,7 +90,11 @@ class Distribution(nn.Module):
         torch.Tensor
             Reparameterised sample tensor.
         """
-        raise NotImplementedError
+        return self.sample_with_draw(sample_shape)[0]
+
+    def sample(self, n):
+        """Draw ``n`` independent differentiable samples."""
+        return self.rsample((n,))
 
     def log_prob(self, value):
         """Evaluate the log-likelihood of a given value.
@@ -242,6 +297,11 @@ class TruncatedNormal(Distribution):
         shape, dtype, device = self.sample_draw_schema(sample_shape)
         return torch.rand(shape, dtype=dtype, device=device, generator=generator)
 
+    def sample_draw_placeholder(self, sample_shape=torch.Size()):
+        """Use interior uniforms for safe inactive inverse-CDF evaluation."""
+        shape, dtype, device = self.sample_draw_schema(sample_shape)
+        return torch.full(shape, 0.5, dtype=dtype, device=device)
+
     def sample_from_draw(self, draw):
         """Apply the native inverse-CDF transform without consuming RNG."""
         p = _standard_normal_cdf(self._a) + draw * self._Z
@@ -305,6 +365,7 @@ _CONNECTION_DISTRIBUTION_METHODS = {
             "sample_draw_schema",
             "sample_from_draw",
             "sample_with_draw",
+            "sample_draw_placeholder",
         )
     }
     for distribution in (Normal, TruncatedNormal)
@@ -312,7 +373,7 @@ _CONNECTION_DISTRIBUTION_METHODS = {
 
 
 def connection_distribution_is_supported(source):
-    """Recognize built-in draw transforms while preserving authored fallbacks."""
+    """Recognize explicit draw recipes while preserving authored fallbacks."""
     from torch.nn.utils import parametrize
 
     source_type = type(source)
@@ -321,11 +382,25 @@ def connection_distribution_is_supported(source):
     ):
         source_type = parametrize.type_before_parametrizations(source)
     methods = _CONNECTION_DISTRIBUTION_METHODS.get(source_type)
-    if methods is None or any(
-        name in vars(source) or getattr(type(source), name) is not method
-        for name, method in methods.items()
-    ):
-        return False
+    if methods is not None:
+        if any(
+            name in vars(source) or getattr(type(source), name) is not method
+            for name, method in methods.items()
+        ):
+            return False
+    else:
+        if not isinstance(source, Distribution) or any(
+            name in vars(source)
+            or getattr(type(source), name) is not getattr(Distribution, name)
+            for name in ("sample", "rsample", "sample_with_draw")
+        ):
+            return False
+        if any(
+            name in vars(source)
+            or getattr(type(source), name) is getattr(Distribution, name)
+            for name in ("sample_draw_schema", "sample_draw", "sample_from_draw")
+        ):
+            return False
     hook_names = (
         "_forward_pre_hooks",
         "_forward_hooks",
@@ -336,3 +411,49 @@ def connection_distribution_is_supported(source):
         return False
     module_hooks = torch.nn.modules.module
     return not any(getattr(module_hooks, "_global" + name) for name in hook_names)
+
+
+def connection_distribution_draw_schema(source, sample_shape=torch.Size()):
+    """Validate fixed explicit-draw metadata without drawing random values."""
+    schema = source.sample_draw_schema(torch.Size(sample_shape))
+    if not isinstance(schema, (tuple, list)) or len(schema) != 3:
+        raise ValueError(
+            "Connection distribution draw schema must be (shape, dtype, device)."
+        )
+    shape, dtype, device = schema
+    try:
+        shape = torch.Size(shape)
+        device = torch.device(device)
+    except (TypeError, ValueError, RuntimeError) as error:
+        raise ValueError("Invalid connection distribution draw schema.") from error
+    if any(size < 0 for size in shape) or not (
+        isinstance(dtype, torch.dtype) and dtype.is_floating_point
+    ):
+        raise ValueError(
+            "Connection distribution draws need a nonnegative shape and floating dtype."
+        )
+    return shape, dtype, device
+
+
+def _validate_connection_distribution_draw(draw, schema):
+    shape, dtype, device = schema
+    if not torch.is_tensor(draw) or (
+        draw.shape != shape or draw.dtype != dtype or draw.device != device
+    ):
+        raise ValueError(
+            "Connection distribution draw does not match its shape, dtype, and device schema."
+        )
+    return draw
+
+
+def connection_distribution_validate_draw(source, draw, sample_shape=torch.Size()):
+    """Require one floating Tensor matching the source's declared draw schema."""
+    return _validate_connection_distribution_draw(
+        draw, connection_distribution_draw_schema(source, sample_shape)
+    )
+
+
+def connection_distribution_placeholder(source, sample_shape=torch.Size()):
+    """Obtain a schema-compatible deterministic draw for inactive paths."""
+    draw = source.sample_draw_placeholder(torch.Size(sample_shape))
+    return connection_distribution_validate_draw(source, draw, sample_shape)

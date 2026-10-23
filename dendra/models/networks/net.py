@@ -34,7 +34,13 @@ from ..core import (
     _validate_time_scalar,
     make_intra,
 )
-from ..distributions import Normal, connection_distribution_is_supported
+from ..distributions import (
+    Distribution,
+    Normal,
+    connection_distribution_draw_schema,
+    connection_distribution_is_supported,
+    connection_distribution_validate_draw,
+)
 from ..multi import concat_models, offsets
 from ..parametric import cacheable, is_parametric, to_param
 from ..rng import RNGMixin, _restore_rng_lifecycle, _snapshot_rng_lifecycle
@@ -727,13 +733,15 @@ class ParameterOrDistributionWrapper(torch.nn.Module):
         """Describe a supported distribution's independent draw without RNG."""
         if not connection_distribution_is_supported(self.param):
             raise TypeError("Connection source has no shared pure sampling recipe.")
-        return self.param.sample_draw_schema((n,))
+        return connection_distribution_draw_schema(self.param, (n,))
 
     def sample_draw(self, n, *, generator=None):
-        """Draw explicit independent noise for a built-in distribution."""
+        """Draw explicit independent noise for a shared distribution recipe."""
         if not connection_distribution_is_supported(self.param):
             raise TypeError("Connection source has no shared pure sampling recipe.")
-        return self.param.sample_draw((n,), generator=generator)
+        with torch.no_grad():
+            draw = self.param.sample_draw((n,), generator=generator)
+        return connection_distribution_validate_draw(self.param, draw, (n,)).detach()
 
     def derive_values(self, n, draw=None):
         """Evaluate deterministic sources or a supplied independent draw."""
@@ -748,6 +756,20 @@ class ParameterOrDistributionWrapper(torch.nn.Module):
         elif self.deterministic():
             value = self.param().repeat(n)
         elif connection_distribution_is_supported(self.param) and draw is not None:
+            if type(self.param).sample_with_draw is Distribution.sample_with_draw:
+                shape, _dtype, device = connection_distribution_draw_schema(
+                    self.param, (n,)
+                )
+                # A retained draw can precede a change to the default sampling
+                # dtype. Its original dtype belongs to that sample's recipe.
+                if not torch.is_tensor(draw) or (
+                    draw.shape != shape
+                    or not draw.is_floating_point()
+                    or draw.device != device
+                ):
+                    raise ValueError(
+                        "Connection distribution draw does not match its shape, floating dtype, and device schema."
+                    )
             value = self.param.sample_from_draw(draw)
         else:
             raise TypeError("Stochastic connection parameters need explicit sampling.")
@@ -873,7 +895,7 @@ class WeightExpander(torch.nn.Module):
             self._sampling_draws = None
             return
         expected = {
-            str(index): source.param.sample_draw_schema((n,))
+            str(index): connection_distribution_draw_schema(source.param, (n,))
             for index, (source, n) in enumerate(zip(self.weights, self.n, strict=True))
             if not source.deterministic()
         }
@@ -890,11 +912,13 @@ class WeightExpander(torch.nn.Module):
                 raise ValueError(
                     f"Invalid connection sampling provenance for block {key}."
                 )
-            # Normal noise follows its source dtype. TruncatedNormal's uniform
-            # dtype is part of the captured recipe (including scalar promotion).
+            # The built-in Normal recipe follows source dtype. Other recipes
+            # retain the sampled dtype: fresh schema metadata can depend on an
+            # ambient default that differs from the saved sample's recipe.
             target_dtype = (
                 dtype
-                if isinstance(self.weights[int(key)].param, Normal)
+                if type(self.weights[int(key)].param).sample_with_draw
+                is Normal.sample_with_draw
                 else value.dtype
             )
             draws[key] = value.detach().to(device=device, dtype=target_dtype).clone()
@@ -936,17 +960,19 @@ class WeightExpander(torch.nn.Module):
             draws = {}
             for key, value in self._sampling_draws.items():
                 converted = fn(value)
-                if isinstance(self.weights[int(key)].param, Normal):
-                    converted = converted.to(
-                        dtype=self.weights[int(key)].param.sample_draw_schema(
-                            (self.n[int(key)],)
-                        )[1]
-                    )
-                else:
-                    # Uniform dtype belongs to the sampling recipe. Move the
+                source = self.weights[int(key)].param
+                if type(source).sample_with_draw is not Normal.sample_with_draw:
+                    # Draw dtype belongs to the sampled recipe. Move the
                     # original draw so a temporary lower-precision conversion
                     # cannot round its retained values before casting back.
                     converted = value.to(device=converted.device)
+                else:
+                    converted = value.to(
+                        device=converted.device,
+                        dtype=connection_distribution_draw_schema(
+                            source, (self.n[int(key)],)
+                        )[1],
+                    )
                 draws[key] = converted
             self._sampling_draws = draws
         return self

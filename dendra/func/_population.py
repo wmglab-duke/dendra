@@ -5312,6 +5312,8 @@ def _initialization_receiver_dependency_signature(
 def _direct_receiver_attribute_names(
     target,
     receiver_name: str | None,
+    *,
+    super_receiver_offsets: frozenset[int] = frozenset(),
 ) -> tuple[frozenset[str], tuple[str, ...]]:
     """Return direct receiver attributes and any opaque receiver escapes."""
 
@@ -5323,12 +5325,88 @@ def _direct_receiver_attribute_names(
     for index, instruction in enumerate(instructions[:-1]):
         if instruction.opname != "LOAD_FAST" or instruction.argval != receiver_name:
             continue
+        if instruction.offset in super_receiver_offsets:
+            continue
         following = instructions[index + 1]
         if following.opname in {"LOAD_ATTR", "LOAD_METHOD"}:
             names.add(following.argval)
         elif following.opname != "STORE_ATTR":
             escapes.add(following.opname)
     return frozenset(names), tuple(sorted(escapes))
+
+
+def _initialization_super_dependencies(target, owner, receiver_name, closure):
+    """Resolve direct zero-argument ``super().attribute`` reads statically.
+
+    The implicit class cell identifies dispatch, rather than external numerical
+    state. Only canonical bytecode is accepted; explicit class-cell reads and
+    escaped super objects retain the ordinary conservative diagnostic.
+    """
+    defining_class = closure.nonlocals.get("__class__")
+    if (
+        receiver_name is None
+        or not inspect.isclass(defining_class)
+        or defining_class not in type(owner).__mro__
+        or closure.builtins.get("super") is not builtins.super
+    ):
+        return None
+    instructions = tuple(dis.get_instructions(target))
+    class_offsets, receiver_offsets, names = set(), set(), set()
+    for index, instruction in enumerate(instructions):
+        if instruction.opname != "LOAD_GLOBAL" or instruction.argval != "super":
+            continue
+        following = instructions[index + 1 :]
+        # Python 3.12+ emits the implicit class/receiver and LOAD_SUPER_ATTR.
+        if (
+            len(following) >= 3
+            and following[0].opname == "LOAD_DEREF"
+            and following[0].argval == "__class__"
+            and following[1].opname == "LOAD_FAST"
+            and following[1].argval == receiver_name
+            and following[2].opname == "LOAD_SUPER_ATTR"
+            and not (following[2].arg & 2)  # Explicit two-argument super.
+        ):
+            class_offsets.add(following[0].offset)
+            receiver_offsets.add(following[1].offset)
+            names.add(following[2].argval)
+            continue
+        # Python 3.11 materializes super() before the attribute load.
+        if following and following[0].opname == "PRECALL" and following[0].arg == 0:
+            following = following[1:]
+        if (
+            len(following) >= 2
+            and following[0].opname == "CALL"
+            and following[0].arg == 0
+            and following[1].opname in {"LOAD_ATTR", "LOAD_METHOD"}
+        ):
+            names.add(following[1].argval)
+            continue
+        return None
+    if not names or any(
+        instruction.opname == "LOAD_DEREF"
+        and instruction.argval == "__class__"
+        and instruction.offset not in class_offsets
+        for instruction in instructions
+    ):
+        return None
+    inherited = []
+    parents = type(owner).__mro__[type(owner).__mro__.index(defining_class) + 1 :]
+    for name in sorted(names):
+        for parent in parents:
+            if name not in parent.__dict__:
+                continue
+            value = parent.__dict__[name]
+            if isinstance(value, property):
+                value = value.fget
+            if isinstance(value, (staticmethod, classmethod)) or inspect.isfunction(
+                value
+            ):
+                value = value.__get__(owner, type(owner))
+            inherited.append((name, parent, value))
+            break
+        else:
+            return None
+    return defining_class, frozenset(receiver_offsets), tuple(inherited)
 
 
 def _unsafe_initialization_operations(
@@ -5372,7 +5450,7 @@ def _unsafe_initialization_operations(
             and instruction.argval in _FORBIDDEN_INITIALIZATION_PYTHON_ESCAPES
         ):
             unsafe.add(instruction.argval)
-        if instruction.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
+        if instruction.opname not in {"LOAD_ATTR", "LOAD_METHOD", "LOAD_SUPER_ATTR"}:
             continue
         name = instruction.argval
         if name in (
@@ -5696,6 +5774,7 @@ def _initialization_callable_dependency_signature(
             )
             for name, item in sorted(target.__dict__.items())
         )
+        super_receiver_offsets = frozenset()
         try:
             closure = inspect.getclosurevars(target)
         except (TypeError, ValueError) as exc:
@@ -5707,11 +5786,48 @@ def _initialization_callable_dependency_signature(
                 ) from exc
             closure_signature = (("unsupported-inspection", type(exc).__name__),)
         else:
+            super_dependencies = (
+                _initialization_super_dependencies(
+                    target, owner, receiver_name, closure
+                )
+                if bound_receiver is owner
+                else None
+            )
+            super_signature = None
+            if super_dependencies is not None:
+                defining_class, super_receiver_offsets, inherited = super_dependencies
+                super_signature = (
+                    "implicit-super-class",
+                    defining_class.__module__,
+                    defining_class.__qualname__,
+                    id(defining_class),
+                    tuple(
+                        (
+                            name,
+                            parent.__module__,
+                            parent.__qualname__,
+                            id(parent),
+                            _initialization_dependency_value_signature(
+                                item,
+                                label=f"{label}.super.{name}",
+                                owner=owner,
+                                strict=strict,
+                                seen=seen,
+                                forbidden_receiver_attributes=forbidden_receiver_attributes,
+                            ),
+                        )
+                        for name, parent, item in inherited
+                    ),
+                )
             closure_signature = tuple(
                 (
                     scope,
                     name,
-                    _initialization_dependency_value_signature(
+                    super_signature
+                    if scope == "nonlocal"
+                    and name == "__class__"
+                    and super_signature is not None
+                    else _initialization_dependency_value_signature(
                         item,
                         label=f"{label}.{scope}.{name}",
                         owner=owner,
@@ -5732,6 +5848,7 @@ def _initialization_callable_dependency_signature(
         self_attributes, receiver_escapes = _direct_receiver_attribute_names(
             target,
             receiver_name,
+            super_receiver_offsets=super_receiver_offsets,
         )
         forbidden_receiver_reads = tuple(
             sorted(self_attributes & forbidden_receiver_attributes)

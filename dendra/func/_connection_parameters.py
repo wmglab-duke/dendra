@@ -11,6 +11,7 @@ import torch
 from torch.func import functional_call
 
 from dendra.helpers import current_check_purity
+from dendra.models.distributions import connection_distribution_placeholder
 from dendra.models.networks._population_cache import restore_population_cache_values
 from dendra.models.networks.net import (
     ParameterOrDistributionWrapper,
@@ -82,6 +83,7 @@ def _binding(module, *, identities=True):
                 "sample_from_draw",
                 "sample_with_draw",
                 "sample_draw_schema",
+                "sample_draw_placeholder",
                 "sample_draws",
                 "_compute",
                 "repeat",
@@ -183,7 +185,7 @@ class _PreparedConnectionParameters:
 class ConnectionParameterPlan:
     """Lower initialized native weight/delay sources to fixed explicit packets.
 
-    Deterministic and built-in distribution sources share
+    Deterministic and explicit-draw distribution sources share
     ``WeightExpander.derive_values`` with native initialization. Random base
     draws live in the explicit constants packet, separately from raw sources.
     """
@@ -244,7 +246,7 @@ class ConnectionParameterPlan:
             )
             self._draw_schemas[role] = (
                 {
-                    str(index): source.sampling_draw_schema(count)
+                    str(index): self._sampling_schema(source, count, role=role)
                     for index, (source, count) in enumerate(
                         zip(module.weights, module.n, strict=True)
                     )
@@ -394,6 +396,52 @@ class ConnectionParameterPlan:
         owner = owner.get_submodule(prefix)
         return owner._parameters.get(name, owner._buffers.get(name))
 
+    def _sampling_schema(self, source, count, *, role):
+        if not self._check_purity:
+            return source.sampling_draw_schema(count)
+        # Metadata hooks run before numerical materialization. Probe a private
+        # module so diagnostics can reject mutation without touching the source.
+        p = _helpers()
+        execution = p._deepcopy_execution_module(source)
+        device = self._schemas[role][2]
+        rng = p._global_rng_snapshot(device)
+        before = _binding(execution, identities=False)
+        tensors = {
+            name: (value._version, _clone(value))
+            for name, value in p._module_tensor_slots(execution)
+        }
+        try:
+            with torch.no_grad():
+                first = execution.sampling_draw_schema(count)
+                second = execution.sampling_draw_schema(count)
+                placeholder = connection_distribution_placeholder(
+                    execution.param, (count,)
+                )
+                repeated = connection_distribution_placeholder(
+                    execution.param, (count,)
+                )
+            if p._global_rng_changes(rng, device):
+                raise FunctionalizationError(
+                    "Connection sampling metadata purity diagnostics observed implicit random draws."
+                )
+            if (
+                first != second
+                or not torch.equal(placeholder, repeated)
+                or (before != _binding(execution, identities=False))
+            ):
+                raise FunctionalizationError(
+                    "Connection sampling metadata purity diagnostics observed mutable or nondeterministic state."
+                )
+            for name, value in p._module_tensor_slots(execution):
+                version, saved = tensors[name]
+                if value._version != version or not torch.equal(value, saved):
+                    raise FunctionalizationError(
+                        "Connection sampling metadata purity diagnostics observed an in-place tensor write."
+                    )
+            return first
+        finally:
+            p._restore_global_rng(rng, device)
+
     def parameter_sources(self, connection=None):
         connection = self._source if connection is None else connection
         return {
@@ -490,12 +538,7 @@ class ConnectionParameterPlan:
             value = (
                 draws[index]
                 if valid and not use_fresh
-                else torch.full(
-                    shape,
-                    self._placeholder_draw(role, index),
-                    dtype=dtype,
-                    device=device,
-                )
+                else self._placeholder_draw(role, index, dtype=dtype, device=device)
             )
             if (tuple(value.shape), value.dtype, value.device) != (
                 tuple(shape),
@@ -511,25 +554,19 @@ class ConnectionParameterPlan:
                 value = (
                     draws[index]
                     if valid and use_fresh
-                    else torch.full(
-                        shape,
-                        self._placeholder_draw(role, index),
-                        dtype=dtype,
-                        device=device,
-                    )
+                    else self._placeholder_draw(role, index, dtype=dtype, device=device)
                 )
                 result[f"fresh_draw.{role}.{index}"] = _clone(value)
         return result
 
-    def _placeholder_draw(self, role, index):
-        from dendra.models.distributions import TruncatedNormal
-
-        from ._torch_parametrizations import canonical_type
-
+    def _placeholder_draw(self, role, index, *, dtype=None, device=None):
         source = getattr(self._source, dict(_ROLES)[role]).weights[int(index)].param
-        # A missing uniform draw needs an interior placeholder: an endpoint
-        # would evaluate an infinite inverse CDF before snapshot selection.
-        return 0.5 if canonical_type(source) is TruncatedNormal else 0.0
+        count = getattr(self._source, dict(_ROLES)[role]).n[int(index)]
+        # Recipes provide a valid deterministic draw for inactive paths; zero
+        # is outside the domain of some inverse-CDF transforms. Preserve the
+        # retained lane's dtype when it differs from fresh sampling metadata.
+        value = connection_distribution_placeholder(source, (count,))
+        return _clone(value.to(dtype=dtype, device=device))
 
     @property
     def sampling_devices(self):
@@ -946,17 +983,75 @@ class ConnectionParameterPlan:
         )
         flags = {"weights": reinit_weights, "delays": reinit_delays}
         result = {"weights": {}, "delays": {}}
+        generator_frames = ()
+        if self._check_purity and generators is not None:
+            provided = (
+                generators.values()
+                if isinstance(generators, Mapping)
+                else (generators,)
+            )
+            generator_frames = tuple(
+                {
+                    id(generator): (generator, generator.get_state().clone())
+                    for generator in provided
+                    if isinstance(generator, torch.Generator)
+                }.values()
+            )
         for role, refresh in flags.items():
             if not refresh or not self._draw_schemas[role]:
                 continue
             execution = _SampleDraws(self._execution[role].source)
-            draws = functional_call(
-                execution,
-                self._mapping(role, parameters, constants, execution),
-                (generators,),
-                tie_weights=False,
+            mapping = self._mapping(role, parameters, constants, execution)
+            p = _helpers()
+            device = self._schemas[role][2]
+            rng = (
+                p._global_rng_snapshot(device)
+                if self._check_purity and generators is not None
+                else None
             )
-            self._validate_draws(role, draws)
+            before = (
+                _binding(execution, identities=False) if self._check_purity else None
+            )
+            tensors = (
+                {
+                    name: (value._version, _clone(value))
+                    for name, value in mapping.items()
+                }
+                if self._check_purity
+                else {}
+            )
+            try:
+                draws = functional_call(
+                    execution,
+                    mapping,
+                    (generators,),
+                    tie_weights=False,
+                )
+                if self._check_purity:
+                    if rng is not None and p._global_rng_changes(rng, device):
+                        raise FunctionalizationError(
+                            "Connection sampler purity diagnostics observed implicit random draws instead of the supplied generator."
+                        )
+                    if before != _binding(execution, identities=False):
+                        raise FunctionalizationError(
+                            "Connection sampler purity diagnostics observed mutable state."
+                        )
+                    for name, value in mapping.items():
+                        version, saved = tensors[name]
+                        if value._version != version or not torch.equal(value, saved):
+                            raise FunctionalizationError(
+                                "Connection sampler purity diagnostics observed an in-place tensor write."
+                            )
+                self._validate_draws(role, draws)
+            except Exception:
+                # A diagnostic failure must not consume a caller's explicit
+                # stream, including draws from an earlier successful role.
+                for generator, frame in generator_frames:
+                    generator.set_state(frame)
+                raise
+            finally:
+                if rng is not None:
+                    p._restore_global_rng(rng, device)
             result[role] = {index: _clone(value) for index, value in draws.items()}
         return result
 
@@ -1009,6 +1104,18 @@ class ConnectionParameterPlan:
             for source in getattr(self._source, native).weights:
                 module = source.param
                 if not source.deterministic():
+                    from dendra.models.distributions import Normal, TruncatedNormal
+
+                    from ._torch_parametrizations import canonical_type
+
+                    if canonical_type(module) not in (Normal, TruncatedNormal):
+                        p._initialization_callable_contract_signature(
+                            module.sample_from_draw,
+                            label=f"connection.{native}.sample_from_draw",
+                            owner=module,
+                            strict=True,
+                            diagnostic=True,
+                        )
                     continue
                 if not isinstance(module, torch.nn.Module):
                     continue
@@ -1043,15 +1150,16 @@ class ConnectionParameterPlan:
             try:
                 with torch.no_grad():
                     draws = {
-                        index: torch.full(
-                            shape,
-                            self._placeholder_draw(role, index),
-                            dtype=dtype,
-                            device=device,
+                        index: self._placeholder_draw(
+                            role, index, dtype=dtype, device=device
                         )
                         for index, (shape, dtype, device) in self._draw_schemas[
                             role
                         ].items()
+                    }
+                    input_draws = {
+                        index: (value._version, _clone(value))
+                        for index, value in draws.items()
                     }
                     first, second = execution(draws), execution(draws)
                 if p._global_rng_changes(rng, device):
@@ -1064,6 +1172,12 @@ class ConnectionParameterPlan:
                     raise FunctionalizationError(
                         "Connection parameter purity diagnostics observed mutable or nondeterministic state."
                     )
+                for index, value in draws.items():
+                    version, saved = input_draws[index]
+                    if value._version != version or not torch.equal(value, saved):
+                        raise FunctionalizationError(
+                            "Connection parameter purity diagnostics observed an in-place draw write."
+                        )
                 for name, value in p._module_tensor_slots(execution):
                     version, saved = tensors[name]
                     if value._version != version or not torch.equal(value, saved):
