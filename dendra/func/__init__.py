@@ -52,6 +52,7 @@ from ._types import (
     RolloutInput,
     RuntimeNoiseDraw,
     StepInput,
+    StimulationDraw,
 )
 
 __all__ = [
@@ -98,6 +99,7 @@ __all__ = [
     "Recorder",
     "RolloutInput",
     "RuntimeNoiseDraw",
+    "StimulationDraw",
     "StepInput",
     "StimulusTensors",
     "TensorScheduleTensors",

@@ -7236,7 +7236,10 @@ class _PopulationTransition(torch.nn.Module):
                     owner = _module_at(self.population, module_path)
                     value = values[index]
                     owner._buffers[buffer_name] = value.reshape(
-                        (1,) * max(0, len(owner.shape_f) - value.ndim)
+                        (1,)
+                        * max(
+                            0, len(getattr(owner, "shape_f", value.shape)) - value.ndim
+                        )
                         + tuple(value.shape)
                     )
             ve_step = None if ve is None else ve[index]
@@ -10815,6 +10818,9 @@ class FunctionalPopulation:
         )
 
         execution_population = _clone_execution_population(population)
+        from ._poisson_stimulation import configure_execution
+
+        configure_execution(execution_population)
         from ._torch_parametrizations import install_output_schemas
 
         install_output_schemas(execution_population)
@@ -11339,6 +11345,14 @@ class FunctionalPopulation:
         self._parameter_devices.update(
             {name: contract.device for name, contract in stimulation_schema.items()}
         )
+        from ._poisson_stimulation import PoissonStimulationPlan
+
+        self._poisson_plan = PoissonStimulationPlan(self)
+        if not self._poisson_plan.enabled:
+            self._poisson_plan = None
+        self._stimulation_state_template = (
+            None if self._poisson_plan is None else self._poisson_plan.extract()
+        )
         self._random_plan = None
         from ._random_parameters import RandomParameterPlan, random_declarations
         from ._runtime_noise import RuntimeNoisePlan, noise_declarations
@@ -11361,6 +11375,23 @@ class FunctionalPopulation:
             self._random_plan = RandomParameterPlan(population)
             self._random_plan.noise = self._noise_plan
         self._state_schema = self._make_state_schema(self._state_layout)
+        if self._poisson_plan is not None:
+            self._state_schema["stimulation"] = {}
+            for path, value in _tensor_tree_paths(self._stimulation_state_template):
+                _put_path(
+                    self._state_schema,
+                    ("stimulation", *path),
+                    _StateLeaf(
+                        ("stimulation", *path),
+                        "",
+                        "",
+                        (),
+                        None,
+                        _shape_tuple(value),
+                        value.dtype,
+                        value.device,
+                    ),
+                )
         if self._random_plan is not None:
             _constants, random_state = self._random_plan.extract()
             self._random_plan.rng_reference = random_state["rng"]
@@ -11875,6 +11906,8 @@ class FunctionalPopulation:
                 )
 
     def _validate_source(self) -> None:
+        if self._poisson_plan is not None:
+            self._poisson_plan.validate_source()
         self._validate_rng_load_policies()
         if self._torch_source_bindings:
             from ._torch_parametrizations import source_binding_signature
@@ -12100,6 +12133,8 @@ class FunctionalPopulation:
             self._intra._validate_source()
 
     def _validate_compatible_population(self, population) -> None:
+        if self._poisson_plan is not None:
+            self._poisson_plan.validate_compatible_population(population)
         if not isinstance(population, Population):
             raise TypeError("population must be a dendra Population")
         for name, plan in self._custom_material_plans.items():
@@ -12810,6 +12845,8 @@ class FunctionalPopulation:
             else:
                 value = _buffer_at(population, leaf.module_path, leaf.buffer_name)
             _put_path(state, leaf.public_path, _clone_tensor(value))
+        if self._poisson_plan is not None:
+            state["stimulation"] = self._poisson_plan.extract(population)
         return state
 
     def extract(self, population: Population | None = None) -> PopulationTensors:
@@ -13252,6 +13289,23 @@ class FunctionalPopulation:
             return self._initialize_owned_cache(
                 parameters, constants, inputs, state=state
             )
+        stimulation_state = (
+            None
+            if self._poisson_plan is None
+            else self._stimulation_state_template
+            if state is None
+            else state["stimulation"]
+        )
+        stimulation_draw = inputs.stimulation
+        if self._poisson_plan is None:
+            if stimulation_draw is not None:
+                raise ValueError(
+                    "This Population has no randomized Poisson stimulation"
+                )
+        elif self._poisson_plan.has_initialization:
+            self._poisson_plan.validate(stimulation_draw)
+        elif stimulation_draw is not None:
+            raise ValueError("This Population has no Poisson initialization draws")
         selected_random_draw = None
         if self._random_plan is not None:
             if random_draw is not None and inputs.random_draw is not None:
@@ -13384,8 +13438,12 @@ class FunctionalPopulation:
                 module_path, _separator, _name = path.rpartition(".")
                 owner = _module_at(self._initialization.population, module_path)
                 mapping[f"population.{path}"] = value.reshape(
-                    (1,) * max(0, len(owner.shape_f) - value.ndim) + tuple(value.shape)
+                    (1,)
+                    * max(0, len(getattr(owner, "shape_f", value.shape)) - value.ndim)
+                    + tuple(value.shape)
                 )
+        if stimulation_draw is not None:
+            mapping.update(self._poisson_plan.initialization_mapping(stimulation_draw))
         outputs = functional_call(
             self._initialization,
             mapping,
@@ -13438,6 +13496,14 @@ class FunctionalPopulation:
             state["random"] = self._random_plan.state(
                 constants, selected_random_draw.rng
             )
+        if self._poisson_plan is not None:
+            state["stimulation"] = (
+                stimulation_state
+                if stimulation_draw is None
+                else self._poisson_plan.advance(
+                    stimulation_state, stimulation_draw, initialization=True
+                )
+            )
         state = self._initialize_material_workspace(
             initialized_parameters, constants, state
         )
@@ -13465,6 +13531,7 @@ class FunctionalPopulation:
                 states=initialization_states,
                 transforms=initialization_transform_values,
                 random_draw=selected_random_draw,
+                stimulation=stimulation_draw,
             ),
         )
 
@@ -13478,6 +13545,45 @@ class FunctionalPopulation:
             if self._random_plan is None or self._owned_cache_bound
             else self._random_plan.sample(state)
         )
+
+    def sample_stimulation_initialization_draw(self, state):
+        """Sample Poisson draws for native fresh-initialization current evaluation."""
+        self._validate_source()
+        self._validate_state(state)
+        return (
+            None
+            if self._poisson_plan is None or not self._poisson_plan.has_initialization
+            else self._poisson_plan.sample_initialization(state)
+        )
+
+    def sample_stimulation_draw(self, state):
+        """Sample one Poisson invocation packet from explicit generator carry."""
+        self._validate_source()
+        self._validate_state(state)
+        return None if self._poisson_plan is None else self._poisson_plan.sample(state)
+
+    def sample_stimulation_draw_tape(self, state, steps):
+        """Sample a time-first Poisson draw and generator-state tape."""
+        self._validate_source()
+        self._validate_state(state)
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("steps must be a non-negative integer")
+        return (
+            None
+            if self._poisson_plan is None
+            else self._poisson_plan.sample(state, steps=steps)
+        )
+
+    def _validate_stimulation_draw(self, draw, *, steps=None):
+        if self._poisson_plan is None:
+            if draw is not None:
+                raise ValueError(
+                    "This Population has no randomized Poisson stimulation"
+                )
+            return
+        if steps == 0 and draw is None:
+            return
+        self._poisson_plan.validate(draw, steps=steps)
 
     def sample_noise_draw(self, state):
         """Sample NOISE/SDE draws without changing the source or carry."""
@@ -13540,6 +13646,17 @@ class FunctionalPopulation:
             inputs = inputs._replace(
                 random_draw=self.sample_initialization_draw(parameters, state)
             )
+        if (
+            self._poisson_plan is not None
+            and self._poisson_plan.has_initialization
+            and not self._owned_cache_bound
+            and inputs.stimulation is None
+        ):
+            if state is None:
+                state = self.extract().state
+            inputs = inputs._replace(
+                stimulation=self.sample_stimulation_initialization_draw(state)
+            )
         return self.initialize(parameters, constants, inputs, state=state)
 
     def _initialize_owned_cache(self, parameters, constants, inputs, *, state=None):
@@ -13567,6 +13684,15 @@ class FunctionalPopulation:
                     if state is None
                     else state["random"]["rng"]
                 },
+            }
+        if self._poisson_plan is not None:
+            incoming = {
+                **incoming,
+                "stimulation": (
+                    self._stimulation_state_template
+                    if state is None
+                    else state["stimulation"]
+                ),
             }
         packet = self._owned_cache_plan.restore_owned(
             parameters, constants, incoming, inputs.cache
@@ -14945,6 +15071,8 @@ class FunctionalPopulation:
                 # explicit transition input.
                 if key in self._base_mapping:
                     mapping[key] = value
+        if self._poisson_plan is not None and "stimulation" in state:
+            mapping.update(self._poisson_plan.state_mapping(state["stimulation"]))
         return (
             mapping,
             dt,
@@ -15960,7 +16088,10 @@ class FunctionalPopulation:
         intra,
         steps: int,
         dt,
+        stimulation=None,
     ):
+        if stimulation is not None:
+            parameters = self._poisson_plan.parameters(parameters, stimulation)
         if self._intra.enabled and intra is not None:
             raise ValueError(
                 "explicit intra cannot be combined with registered functional intra"
@@ -16068,6 +16199,7 @@ class FunctionalPopulation:
         intra,
         steps,
         noise=None,
+        stimulation=None,
     ):
         """Execute the established authored transition with a Python loop."""
         mapping, dt, celsius, v, t, duration_remainder = self._mapping(
@@ -16095,6 +16227,23 @@ class FunctionalPopulation:
             noise_values = {
                 name: torch.stack(values) for name, values in noise_values.items()
             }
+        if stimulation is not None:
+            if noise_values is None:
+                noise_values = {}
+            schedule_values = {}
+            for index in range(steps):
+                packet = torch.utils._pytree.tree_map(
+                    lambda value: value[index], stimulation
+                )
+                for slot, value in self._poisson_plan.mapping(packet).items():
+                    if index == 0:
+                        mapping[slot] = value
+                    schedule_values.setdefault(
+                        slot.removeprefix("population."), []
+                    ).append(value)
+            noise_values.update(
+                {name: torch.stack(values) for name, values in schedule_values.items()}
+            )
         outputs = functional_call(
             self._transition,
             mapping,
@@ -16144,6 +16293,14 @@ class FunctionalPopulation:
                     ),
                 }
             )
+        if self._poisson_plan is not None:
+            next_state["stimulation"] = (
+                state["stimulation"]
+                if stimulation is None or not steps
+                else self._poisson_plan.advance(
+                    state["stimulation"], stimulation, tape=True
+                )
+            )
         return next_state, {"v": next_state["integrator"]["v"]}
 
     def _clone_state_tree(self, state):
@@ -16163,6 +16320,11 @@ class FunctionalPopulation:
             cloned["random"] = torch.utils._pytree.tree_map(
                 lambda value: value.clone(memory_format=torch.contiguous_format),
                 state["random"],
+            )
+        if self._poisson_plan is not None:
+            cloned["stimulation"] = torch.utils._pytree.tree_map(
+                lambda value: value.clone(memory_format=torch.contiguous_format),
+                state["stimulation"],
             )
         return cloned
 
@@ -16339,6 +16501,8 @@ class FunctionalPopulation:
     def _reset_continuous_inputs_values(self, state, targets):
         """Shared reset for an explicitly selected native target schedule."""
         result = {"random": state["random"]} if self._random_plan is not None else {}
+        if self._poisson_plan is not None:
+            result["stimulation"] = state["stimulation"]
         for leaf in self._state_layout:
             _put_path(result, leaf.public_path, _get_path(state, leaf.public_path))
         scratch = {}
@@ -16366,6 +16530,8 @@ class FunctionalPopulation:
             tie_weights=False,
         )
         result = {"random": state["random"]} if self._random_plan is not None else {}
+        if self._poisson_plan is not None:
+            result["stimulation"] = state["stimulation"]
         for leaf, value in zip(self._state_layout, outputs[:-1], strict=True):
             if (
                 not torch.is_tensor(value)
@@ -16392,6 +16558,8 @@ class FunctionalPopulation:
             tie_weights=False,
         )
         result = {"random": state["random"]} if self._random_plan is not None else {}
+        if self._poisson_plan is not None:
+            result["stimulation"] = state["stimulation"]
         for leaf, value in zip(self._state_layout, outputs, strict=True):
             if (
                 not torch.is_tensor(value)
@@ -16517,17 +16685,24 @@ class FunctionalPopulation:
             name="intra",
             steps=resolved_steps,
         )
-        if inputs.noise is not None:
-            lengths = [
-                int(value.shape[0])
-                for value in torch.utils._pytree.tree_leaves(inputs.noise)
+        stochastic_inputs = (inputs.noise, inputs.stimulation)
+        if any(value is not None for value in stochastic_inputs):
+            leaves = [
+                value
+                for value in torch.utils._pytree.tree_leaves(stochastic_inputs)
+                if value is not None
             ]
+            if any(not torch.is_tensor(value) for value in leaves):
+                raise TypeError("Stochastic draw tapes must contain Tensors")
+            if any(value.ndim < 1 for value in leaves):
+                raise ValueError("Stochastic draw tapes need a leading time axis")
+            lengths = [int(value.shape[0]) for value in leaves]
             if lengths and (
                 len(set(lengths)) != 1
                 or resolved_steps is not None
                 and resolved_steps != lengths[0]
             ):
-                raise ValueError("NOISE tape length does not match rollout steps")
+                raise ValueError("Stochastic tape length does not match rollout steps")
             if lengths:
                 resolved_steps = lengths[0]
         if resolved_steps is None:
@@ -16543,8 +16718,41 @@ class FunctionalPopulation:
         intra,
         steps,
         noise=None,
+        stimulation=None,
     ):
         """Execute already validated tensor inputs through the selected path."""
+        if stimulation is not None:
+            auxiliary = {"v": state["integrator"]["v"]}
+            for index in range(steps):
+                packet = torch.utils._pytree.tree_map(
+                    lambda value: value[index], stimulation
+                )
+                ve_step, intra_step = self._assemble_bound_inputs(
+                    parameters,
+                    state,
+                    None if ve is None else ve[index : index + 1],
+                    None if intra is None else intra[index : index + 1],
+                    1,
+                    prepared["integrator"]["dt"],
+                    packet,
+                )
+                state, auxiliary = self._transition_rollout_values(
+                    parameters,
+                    prepared,
+                    state,
+                    ve_step,
+                    intra_step,
+                    1,
+                    None
+                    if noise is None
+                    else torch.utils._pytree.tree_map(
+                        lambda value: value[index : index + 1], noise
+                    ),
+                    torch.utils._pytree.tree_map(
+                        lambda value: value[index : index + 1], stimulation
+                    ),
+                )
+            return state, auxiliary
         ve, intra = self._assemble_bound_inputs(
             parameters,
             state,
@@ -16595,6 +16803,7 @@ class FunctionalPopulation:
         callbacks,
         callback_state,
         noise=None,
+        stimulation=None,
     ):
         """Execute a fixed-step rollout while threading pure callback carry."""
 
@@ -16611,17 +16820,17 @@ class FunctionalPopulation:
         else:
             callback_state = callbacks._validate_state(callback_state)
 
-        # Bound stimulation is evaluated once for the complete time horizon,
-        # then sliced beside explicit drives. The no-callback rollout remains
-        # on its established fused transition path.
-        ve, intra = self._assemble_bound_inputs(
-            parameters,
-            state,
-            ve,
-            intra,
-            steps,
-            prepared["integrator"]["dt"],
-        )
+        # Deterministic bound stimulation is evaluated for the complete horizon.
+        # Explicit Poisson packets preserve one invocation per accepted step.
+        if stimulation is None:
+            ve, intra = self._assemble_bound_inputs(
+                parameters,
+                state,
+                ve,
+                intra,
+                steps,
+                prepared["integrator"]["dt"],
+            )
         emissions = []
         auxiliary = {"v": state["integrator"]["v"]}
         if steps == 0:
@@ -16635,7 +16844,12 @@ class FunctionalPopulation:
             )
         else:
             for index in range(steps):
-                state, auxiliary = self._transition_rollout_values(
+                execute = (
+                    self._transition_rollout_values
+                    if stimulation is None
+                    else self._execute_rollout_values
+                )
+                state, auxiliary = execute(
                     parameters,
                     prepared,
                     state,
@@ -16646,6 +16860,11 @@ class FunctionalPopulation:
                     if noise is None
                     else torch.utils._pytree.tree_map(
                         lambda value: value[index : index + 1], noise
+                    ),
+                    None
+                    if stimulation is None
+                    else torch.utils._pytree.tree_map(
+                        lambda value: value[index : index + 1], stimulation
                     ),
                 )
                 callback_state, emitted = callbacks._update(
@@ -16707,6 +16926,11 @@ class FunctionalPopulation:
             else torch.utils._pytree.tree_map(
                 lambda value: value.unsqueeze(0), inputs.noise
             ),
+            None
+            if inputs.stimulation is None
+            else torch.utils._pytree.tree_map(
+                lambda value: value.unsqueeze(0), inputs.stimulation
+            ),
         )
 
     def _rollout_values(
@@ -16723,7 +16947,9 @@ class FunctionalPopulation:
     ):
         ve, intra, resolved_steps = self._resolve_rollout_inputs(inputs, steps)
         noise = None if inputs is None else inputs.noise
+        stimulation = None if inputs is None else inputs.stimulation
         self._validate_noise_draw(noise, steps=resolved_steps)
+        self._validate_stimulation_draw(stimulation, steps=resolved_steps)
         if extra is not None:
             if self._extra.enabled:
                 raise ValueError(
@@ -16736,6 +16962,7 @@ class FunctionalPopulation:
                 extra if isinstance(extra, FunctionalExtra) else self.make_extra(extra)
             )
             self._validate_extra_plan(extra_plan)
+            extra_plan._validate_deterministic_assembly()
             if extra_plan.enabled:
                 extra_tensors = extra_plan.extract()
                 ve = extra_plan.assemble_tensors(
@@ -16757,6 +16984,7 @@ class FunctionalPopulation:
                 intra,
                 resolved_steps,
                 noise,
+                stimulation,
             )
         from ._callbacks import FunctionalCallbacks
 
@@ -16775,6 +17003,7 @@ class FunctionalPopulation:
             callbacks,
             callback_state,
             noise,
+            stimulation,
         )
 
     def rollout(
@@ -16870,6 +17099,11 @@ class FunctionalPopulation:
                 else torch.utils._pytree.tree_map(
                     lambda value: value.unsqueeze(0), inputs.noise
                 ),
+                stimulation=None
+                if inputs.stimulation is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value.unsqueeze(0), inputs.stimulation
+                ),
             ),
             steps=1,
             extra=extra,
@@ -16905,6 +17139,11 @@ class FunctionalPopulation:
                 if inputs.noise is None
                 else torch.utils._pytree.tree_map(
                     lambda value: value.unsqueeze(0), inputs.noise
+                ),
+                stimulation=None
+                if inputs.stimulation is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value.unsqueeze(0), inputs.stimulation
                 ),
             ),
             steps=1,
@@ -17050,6 +17289,8 @@ class FunctionalPopulation:
         """Explicitly commit validated functional carry into a compatible model."""
         self._validate_compatible_population(population)
         self._validate_state(state)
+        if self._poisson_plan is not None:
+            self._poisson_plan.validate_state(state["stimulation"])
         remainder = state["control"]["duration_remainder"]
         remainder_value = remainder.item()
         if not math.isfinite(remainder_value) or remainder_value < 0.0:
@@ -17143,6 +17384,8 @@ class FunctionalPopulation:
                 # its staged, validated copy only after checkpoint restoration
                 # succeeds; the remaining assignment cannot invoke authored code.
                 population._buffers["v"] = staged_population._buffers["v"]
+            if self._poisson_plan is not None:
+                self._poisson_plan.commit(population, state["stimulation"])
             return population
 
         write_back = bool(population.integrator.write_back)
@@ -17240,6 +17483,8 @@ class FunctionalPopulation:
                     "not recover the previous packed/component state."
                 ) from rollback_error
             raise
+        if self._poisson_plan is not None:
+            self._poisson_plan.commit(population, state["stimulation"])
         return population
 
 
@@ -17320,6 +17565,9 @@ def make_functional(
                     + "."
                 )
             tensors = functional.extract(population)
+            from ._poisson_invocations import validate_poisson_invocations
+
+            validate_poisson_invocations(functional, tensors)
         if check_purity:
             functional._audit_read_only_workspaces(tensors)
             functional._audit_event_receivers(tensors)

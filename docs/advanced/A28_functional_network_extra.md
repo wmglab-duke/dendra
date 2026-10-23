@@ -86,8 +86,10 @@ contact. Tensor temporal specifications are currently unsupported in these
 bindings. Already sampled stimulation uses an explicit time-first `ve` tape,
 as described below. Deterministic built-in waveforms, compositions, and
 supported custom pure Waveforms follow the contract in
-{doc}`A8_functional_populations`. Hidden random draws, waveform hooks, and
-Poisson waveforms with `randomize_every_call=True` are currently unsupported.
+{doc}`A8_functional_populations`. Finite-count Poisson waveforms with
+`randomize_every_call=True` use explicit stimulation draw/RNG packets;
+see {doc}`A50_functional_poisson_stimulation`. Hidden random draws and waveform
+hooks are currently unsupported.
 
 ## Select and inspect trainable stimulation
 

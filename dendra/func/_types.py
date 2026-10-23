@@ -32,6 +32,13 @@ class RuntimeNoiseDraw(NamedTuple):
     rng: dict[str, dict[str, torch.Tensor]]
 
 
+class StimulationDraw(NamedTuple):
+    """Detached Poisson draws and resulting generator-state bytes."""
+
+    draws: dict[str, torch.Tensor]
+    rng: dict[str, torch.Tensor]
+
+
 class InitializationInput(NamedTuple):
     """Explicit tensor inputs consumed only while constructing initial state.
 
@@ -52,6 +59,8 @@ class InitializationInput(NamedTuple):
     and NOISE base draws and resulting stream state from
     ``sample_initialization_draw``.
     Host runners sample an independent packet when this field is omitted.
+    ``stimulation`` supplies Poisson draws and generator carry for mechanism
+    currents evaluated during fresh initialization.
     """
 
     v_init: torch.Tensor
@@ -59,6 +68,7 @@ class InitializationInput(NamedTuple):
     transforms: dict[str, torch.Tensor] | None = None
     cache: Mapping[str, object] | None = None
     random_draw: RandomParameterDraw | None = None
+    stimulation: StimulationDraw | None = None
 
 
 class PopulationTensors(NamedTuple):
@@ -203,19 +213,21 @@ class PopulationTensors(NamedTuple):
 
 
 class StepInput(NamedTuple):
-    """Assembled voltage/current inputs and an explicit single-step NOISE packet."""
+    """Assembled voltage/current inputs and explicit stochastic draw packets."""
 
     ve: torch.Tensor | None = None
     intra: torch.Tensor | None = None
     noise: RuntimeNoiseDraw | None = None
+    stimulation: StimulationDraw | None = None
 
 
 class RolloutInput(NamedTuple):
-    """Time-first voltage/current inputs and an explicit NOISE draw/RNG tape."""
+    """Time-first voltage/current inputs and explicit stochastic draw/RNG tapes."""
 
     ve: torch.Tensor | None = None
     intra: torch.Tensor | None = None
     noise: RuntimeNoiseDraw | None = None
+    stimulation: StimulationDraw | None = None
 
 
 class FunctionalizationError(RuntimeError):
@@ -227,6 +239,7 @@ __all__ = [
     "InitializationInput",
     "RandomParameterDraw",
     "RuntimeNoiseDraw",
+    "StimulationDraw",
     "PopulationTensors",
     "RolloutInput",
     "StepInput",

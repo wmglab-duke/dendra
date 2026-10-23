@@ -539,11 +539,10 @@ def test_owned_injection_fresh_and_cached_initialization(network, cache):
         functional, tensors = dn.func.make_functional_network(source)
         initialized = functional.initialize(*tensors, functional.initialization_inputs)
         native.initialize(DT, reinit_weights=False, reinit_delays=False)
-        expected = (
-            _cache_initialized_native_packet(functional, native)
-            if cache
-            else functional.extract(native)
-        )
+        # Fresh initialization retains each Population's native materialized
+        # buffers in both cached and uncached execution. Snapshot extraction
+        # leaves those provenance selectors inactive.
+        expected = _cache_initialized_native_packet(functional, native)
         _close(initialized, expected)
         final, _ = functional.prepare_and_step(*initialized)
         native.step()

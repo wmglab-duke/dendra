@@ -120,6 +120,13 @@ from dendra.models.rng import (
 )
 from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
+from dendra.models.stim.waveform._poisson import (
+    apply_prepared_poisson_state,
+    poisson_state_dict_for_checkpoint,
+    prepare_poisson_state_from_checkpoint,
+    restore_poisson_rng_lifecycle,
+    snapshot_poisson_rng_lifecycle,
+)
 from dendra.units import mm
 
 from .slice import IndexSpec, Slice, Sliceable, parse_key
@@ -6719,6 +6726,9 @@ class Population(P, Sliceable):
             }
 
         result = {"buffers": buffers, "rng_states": rng_states}
+        poisson = poisson_state_dict_for_checkpoint(self)
+        if poisson["modules"]:
+            result["poisson"] = poisson
         if self.random_parameters:
             result["random_parameter_state"] = (
                 self._random_parameter_state_for_checkpoint()
@@ -6785,14 +6795,15 @@ class Population(P, Sliceable):
         provenance = self._prepare_random_parameter_state(
             state_dict.get("random_parameter_state")
         )
-        return prepared_buffers, prepared_rng_states, provenance
+        poisson = prepare_poisson_state_from_checkpoint(self, state_dict.get("poisson"))
+        return prepared_buffers, prepared_rng_states, provenance, poisson
 
     def _apply_prepared_stochastic_state(self, prepared_state):
         """Apply state returned by
         :meth:`_prepare_stochastic_state_from_checkpoint`.
         """
 
-        buffers, rng_states, provenance = prepared_state
+        buffers, rng_states, provenance, poisson = prepared_state
         for name, restored in buffers.items():
             setattr(self, name, restored)
         for name, (base_seed, rng_state) in rng_states.items():
@@ -6805,6 +6816,7 @@ class Population(P, Sliceable):
                 allow_legacy=True,
             )
         self._apply_random_parameter_state(provenance)
+        apply_prepared_poisson_state(poisson)
 
     def _restore_stochastic_state_from_checkpoint(self, state_dict):
         """Restore a Population stochastic checkpoint payload."""
@@ -6943,12 +6955,14 @@ class Population(P, Sliceable):
         """
         previous = self.state_dict_for_checkpoint()
         rng_lifecycle = _snapshot_rng_lifecycle(self)
+        poisson_lifecycle = snapshot_poisson_rng_lifecycle(self)
         try:
             self._restore_dict_from_checkpoint_unchecked(state_dict)
         except Exception:
             try:
                 _restore_rng_lifecycle(rng_lifecycle)
                 self._restore_dict_from_checkpoint_unchecked(previous)
+                restore_poisson_rng_lifecycle(poisson_lifecycle)
             except Exception as rollback_error:
                 raise RuntimeError(
                     "Population checkpoint restore failed and rollback could not "

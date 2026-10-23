@@ -736,8 +736,14 @@ def _initialize_components(
 
     rng_plan = functional._rng_plan
     rng_pool = state.get("rng", {})
+    stimulation_plan = functional._stimulation_plan
+    stimulation_pool = state.get("stimulation_rng", {})
     populations = {
-        name: rng_plan.expand_population(name, value, rng_pool)
+        name: functional._stimulation_plan.expand(
+            name,
+            rng_plan.expand_population(name, value, rng_pool),
+            stimulation_pool,
+        )
         for name, value in state["populations"].items()
     }
     effective = parameters
@@ -750,6 +756,9 @@ def _initialize_components(
             incoming_parameters = effective
             populations[name] = rng_plan.expand_population(
                 name, populations[name], rng_pool
+            )
+            populations[name] = stimulation_plan.expand(
+                name, populations[name], stimulation_pool
             )
             if inputs.cache is None:
                 population_inputs = inputs.populations[name]
@@ -764,6 +773,18 @@ def _initialize_components(
                             effective["populations"][name],
                             populations[name],
                             rng_pool,
+                        )
+                    )
+                if (
+                    sample_random
+                    and plan._poisson_plan is not None
+                    and plan._poisson_plan.has_initialization
+                    and not plan._owned_cache_bound
+                    and population_inputs.stimulation is None
+                ):
+                    population_inputs = population_inputs._replace(
+                        stimulation=plan.sample_stimulation_initialization_draw(
+                            populations[name]
                         )
                     )
                 initialize_population = (
@@ -784,6 +805,9 @@ def _initialize_components(
                     populations[name],
                     inputs.cache.populations[name],
                 )
+            stimulation_pool = stimulation_plan.update(
+                name, initialized.state, stimulation_pool
+            )
             if rng_plan.enabled:
                 cache = (
                     inputs.cache.populations[name]
@@ -899,9 +923,20 @@ def _initialize_components(
                     effective_constants, ("populations", name), population_constants
                 )
         time = inputs.t.detach().clone()
+        populations = functional._stimulation_plan.canonicalize(
+            populations,
+            initialization=True,
+            cached={
+                name
+                for name, plan in functional.populations.items()
+                if inputs.cache is not None or plan._owned_cache_bound
+            },
+        )
         populations = {
-            name: rng_plan.strip_population(
-                functional._snap_population_clock(value, time)
+            name: functional._stimulation_plan.strip(
+                rng_plan.strip_population(
+                    functional._snap_population_clock(value, time)
+                )
             )
             for name, value in populations.items()
         }
@@ -918,7 +953,7 @@ def _initialize_components(
             draw = functional._connection_sampling_plan.sample(
                 effective,
                 effective_constants,
-                state,
+                functional._connection_rng_from_stimulation(state, stimulation_pool),
                 reinit_weights=inputs.reinit_weights,
                 reinit_delays=inputs.reinit_delays,
             )
@@ -931,6 +966,10 @@ def _initialize_components(
                 reinit_delays=inputs.reinit_delays,
             ),
         )
+        if draw is not None:
+            stimulation_pool = functional._stimulation_rng_after_connections(
+                stimulation_pool, draw.rng
+            )
         for (collection, name), plan in functional._connection_parameter_plans.items():
             connection_constants = plan.initialize_constants(
                 effective[collection][name],
@@ -979,6 +1018,11 @@ def _initialize_components(
                     t=time,
                 )
         initialized_state = {
+            **(
+                {"stimulation_rng": stimulation_pool}
+                if functional._stimulation_plan.enabled
+                else {}
+            ),
             "populations": populations,
             "synapses": synapses,
             "continuous_synapses": continuous,
@@ -1018,6 +1062,8 @@ def _finish_initialization(functional, packet, draw):
         )
     functional._validate_parameters(packet.parameters)
     functional._validate_state(state)
+    if functional._stimulation_plan.enabled:
+        state = {name: state[name] for name in functional._state_schema}
     return NetworkTensors(packet.parameters, packet.constants, state)
 
 

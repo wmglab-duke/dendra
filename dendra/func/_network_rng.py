@@ -227,7 +227,12 @@ class NetworkRNGPlan:
                 name: None
                 if self.functional._cache_enabled
                 else plan.sample_initialization_draw(
-                    parameters["populations"][name], state["populations"][name]
+                    parameters["populations"][name],
+                    self.functional._stimulation_plan.expand(
+                        name,
+                        state["populations"][name],
+                        state.get("stimulation_rng", {}),
+                    ),
                 )
                 for name, plan in self.populations.items()
             }
@@ -268,7 +273,14 @@ class NetworkRNGPlan:
             return {
                 name: provided[name]
                 if name in provided
-                else plan.sample_noise_draw_tape(state["populations"][name], steps)
+                else plan.sample_noise_draw_tape(
+                    self.functional._stimulation_plan.expand(
+                        name,
+                        state["populations"][name],
+                        state.get("stimulation_rng", {}),
+                    ),
+                    steps,
+                )
                 for name, plan in self.populations.items()
             }
         samplers = self._samplers(state["rng"])

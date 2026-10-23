@@ -57,3 +57,4 @@ Advanced
    advanced/A47_functional_network_rng_sharing.md
    advanced/A48_functional_rng_load_policies.md
    advanced/A49_functional_distribution_sampling.md
+   advanced/A50_functional_poisson_stimulation.md

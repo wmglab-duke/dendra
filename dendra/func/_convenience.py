@@ -45,7 +45,9 @@ def _initialization_input_mapping(inputs):
         if values is not None and not isinstance(values, Mapping):
             raise TypeError(f"initialization {name} must be a mapping")
         mappings.append(None if values is None else dict(values))
-    return InitializationInput(inputs.v_init, *mappings, inputs.random_draw)
+    return InitializationInput(
+        inputs.v_init, *mappings, inputs.random_draw, inputs.stimulation
+    )
 
 
 def _initialization_writes_parameters(functional):
@@ -352,6 +354,7 @@ class CompiledRunner:
             intra,
             carry.carries,
             None if inputs is None else inputs.noise,
+            None if inputs is None else inputs.stimulation,
         )
         if kernel is None:
             raise FunctionalizationError(f"execution='while' is unavailable: {reason}")
@@ -477,6 +480,16 @@ class CompiledRunner:
             if self._execution == "while" and inputs.noise is None:
                 inputs = inputs._replace(
                     noise=self._functional.sample_noise_draw_tape(
+                        selected_state, self._steps
+                    )
+                )
+            if (
+                self._execution == "while"
+                and inputs.stimulation is None
+                and getattr(self._functional, "_poisson_plan", None) is not None
+            ):
+                inputs = inputs._replace(
+                    stimulation=self._functional.sample_stimulation_draw_tape(
                         selected_state, self._steps
                     )
                 )

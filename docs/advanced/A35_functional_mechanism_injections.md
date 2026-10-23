@@ -162,15 +162,18 @@ continuation, native checkpoint restoration, and `commit_state_` retain the
 same injection ownership. There is no separate waveform clock or hidden cursor.
 
 Waveforms used during functional execution must be pure. Custom `Waveform`
-subclasses declare `FUNCTIONAL_PURE = True` on each concrete class after
-ensuring evaluation is deterministic and read-only. Custom modules that
-mutate their inputs or persistent state are currently unsupported. Numerical
+subclasses keep evaluation deterministic and read-only. Optional diagnostics
+enabled with `dn.ctx(CHECK_PURITY=True)` require `FUNCTIONAL_PURE = True` on
+each concrete class and audit that contract; default execution trusts it.
+Custom modules that mutate their inputs or persistent state are currently
+unsupported. Numerical
 dependencies used by waveform helpers belong in registered parameters or
 buffers. Define custom recipes with `fn` or `forward`; overriding module call
-or attribute dispatch is currently unsupported. Waveforms that draw randomness
-during evaluation and hooks on source
-waveform modules or their parameters are currently unsupported. Changing the
-registration count, targets, groups, or ownership after lowering requires a new
+or attribute dispatch is currently unsupported. Randomized Poisson wrappers
+use explicit draws and RNG carry, as described in
+{doc}`A50_functional_poisson_stimulation`. Other hidden random draws and hooks
+on source waveform modules or their parameters are currently unsupported.
+Changing the registration count, targets, groups, or ownership after lowering requires a new
 functional plan. Runtime injection registration inside captured execution is
 currently unsupported.
 

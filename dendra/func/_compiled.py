@@ -88,7 +88,10 @@ class CompiledPopulationChunk:
         self._noise_while = None
         if (
             execution == "default"
-            and functional._noise_plan is not None
+            and (
+                functional._noise_plan is not None
+                or getattr(functional, "_poisson_plan", None) is not None
+            )
             and not options.get("disable", False)
         ):
             from ._recorder_while import _RecorderWhileExecutor
@@ -193,7 +196,7 @@ class CompiledPopulationChunk:
                 operands = operands._replace(state=state)
         if (
             self._noise_while is not None
-            and operands.noise is not None
+            and (operands.noise is not None or operands.stimulation is not None)
             and not grad_enabled
         ):
             kernel, reason = self._noise_while.kernel_for(
@@ -204,6 +207,7 @@ class CompiledPopulationChunk:
                 operands.intra,
                 (),
                 operands.noise,
+                operands.stimulation,
             )
             if kernel is not None:
                 final, auxiliary, _carries, _emitted = kernel(
@@ -214,12 +218,14 @@ class CompiledPopulationChunk:
                     operands.intra,
                     (),
                     operands.noise,
+                    operands.stimulation,
                 )
                 self._record_execution("compiled_while_loop", grad_enabled=False)
                 return final, auxiliary
         if (
             self._execution == "default"
             and operands.noise is None
+            and operands.stimulation is None
             and prewarm_structured
             and not torch.is_grad_enabled()
         ):
@@ -260,10 +266,10 @@ class CompiledPopulationChunk:
                 "compiled_unrolled",
                 "The chunk is shorter than one inference loop block.",
             )
-        if operands.noise is not None:
+        if operands.noise is not None or operands.stimulation is not None:
             return (
                 "compiled_unrolled",
-                "No captured NOISE inference step graph is available.",
+                "No captured stochastic inference step graph is available.",
             )
         signature = (
             operands.ve is not None or self._functional.extra.enabled,
@@ -319,6 +325,11 @@ class CompiledPopulationChunk:
             else torch.utils._pytree.tree_map(
                 lambda value: value.unsqueeze(0), inputs.noise
             ),
+            None
+            if inputs.stimulation is None
+            else torch.utils._pytree.tree_map(
+                lambda value: value.unsqueeze(0), inputs.stimulation
+            ),
         )
         # A one-step kernel has no large rollout graph to bound, so the
         # inference-only structured prewarm is unnecessary in this hot path.
@@ -334,6 +345,7 @@ class CompiledPopulationChunk:
             inputs.intra,
             None,
             inputs.noise,
+            inputs.stimulation,
         )
         return self._execute_operands(
             operands,
@@ -369,6 +381,11 @@ class CompiledPopulationChunk:
                 else torch.utils._pytree.tree_map(
                     lambda value: value.unsqueeze(0), inputs.noise
                 ),
+                stimulation=None
+                if inputs.stimulation is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value.unsqueeze(0), inputs.stimulation
+                ),
             )
         functional = self._functional
         functional._validate_state(state)
@@ -400,9 +417,13 @@ class CompiledPopulationChunk:
             intra,
             None,
             None if inputs is None else inputs.noise,
+            None if inputs is None else inputs.stimulation,
         )
         functional._validate_noise_draw(
             None if inputs is None else inputs.noise, steps=self._steps
+        )
+        functional._validate_stimulation_draw(
+            None if inputs is None else inputs.stimulation, steps=self._steps
         )
         return self._execute_operands(operands, prewarm_structured=True)
 
@@ -457,6 +478,7 @@ class _CompiledCallbackPopulationChunk:
             inputs.intra,
             carries,
             inputs.noise,
+            inputs.stimulation,
         )
         transform_active = torch._C._are_functorch_transforms_active()
         forward_ad_active = torch.autograd.forward_ad._current_level >= 0
@@ -480,6 +502,7 @@ class _CompiledCallbackPopulationChunk:
                     inputs.intra,
                     carries,
                     inputs.noise,
+                    inputs.stimulation,
                 )
             while_kernel = None
             if self._recorder_while is not None and not grad_enabled:

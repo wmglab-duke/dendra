@@ -37,7 +37,17 @@ class _RecorderWhileExecutor:
         self._kernels = {}
         self._capture_errors = {}
 
-    def kernel_for(self, parameters, prepared, state, ve, intra, carries, noise=None):
+    def kernel_for(
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries,
+        noise=None,
+        stimulation=None,
+    ):
         from ._population import _STRUCTURED_ROLLOUT_CHUNK
 
         if self._steps < _STRUCTURED_ROLLOUT_CHUNK:
@@ -53,7 +63,9 @@ class _RecorderWhileExecutor:
         # baseline. Compile the selected route rather than choosing behavior
         # from a patch-version label.
         signature = (
-            _schema((parameters, prepared, state, ve, intra, carries, noise)),
+            _schema(
+                (parameters, prepared, state, ve, intra, carries, noise, stimulation)
+            ),
             MEMBRANE_ASSEMBLY.value,
         )
         if signature in self._capture_errors:
@@ -64,7 +76,14 @@ class _RecorderWhileExecutor:
                 # invocation itself uses inference_mode. They are never kept.
                 with torch.inference_mode(False), torch.no_grad():
                     self._kernels[signature] = self._capture(
-                        parameters, prepared, state, ve, intra, carries, noise
+                        parameters,
+                        prepared,
+                        state,
+                        ve,
+                        intra,
+                        carries,
+                        noise,
+                        stimulation,
                     )
             except Exception as error:
                 reason = (
@@ -75,7 +94,9 @@ class _RecorderWhileExecutor:
                 return None, reason
         return self._kernels[signature], None
 
-    def _capture(self, parameters, prepared, state, ve, intra, carries, noise):
+    def _capture(
+        self, parameters, prepared, state, ve, intra, carries, noise, stimulation
+    ):
         functional, plans = self._functional, self._plans
 
         def body(parameters, prepared, current, current_carries, sample):
@@ -102,13 +123,22 @@ class _RecorderWhileExecutor:
             compiler=_compile_while,
         )
         kernel = engine.kernel_for(
-            parameters, prepared, state, carries, (ve, intra, noise)
+            parameters, prepared, state, carries, (ve, intra, noise, stimulation)
         )
 
         @wraps(kernel)
-        def materialize(parameters, prepared, state, ve, intra, carries, noise=None):
+        def materialize(
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            carries,
+            noise=None,
+            stimulation=None,
+        ):
             final, final_carries, observed = kernel(
-                parameters, prepared, state, carries, (ve, intra, noise)
+                parameters, prepared, state, carries, (ve, intra, noise, stimulation)
             )
             emitted = {plan.name: observed.get(plan.name) for plan in plans}
             return final, {"v": final["integrator"]["v"]}, final_carries, emitted

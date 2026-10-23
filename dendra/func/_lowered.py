@@ -31,6 +31,7 @@ class _PopulationChunkOperands(NamedTuple):
     intra: torch.Tensor | None
     carries: object = None
     noise: object = None
+    stimulation: object = None
 
 
 class _LoweredPopulationChunk:
@@ -89,6 +90,9 @@ class _LoweredPopulationChunk:
         functional._validate_noise_draw(
             None if inputs is None else inputs.noise, steps=self._steps
         )
+        functional._validate_stimulation_draw(
+            None if inputs is None else inputs.stimulation, steps=self._steps
+        )
         return _PopulationChunkOperands(
             parameters,
             prepared_values,
@@ -97,13 +101,22 @@ class _LoweredPopulationChunk:
             intra,
             None,
             None if inputs is None else inputs.noise,
+            None if inputs is None else inputs.stimulation,
         )
 
     def __call__(
-        self, parameters, prepared, state, ve, intra, carries=None, noise=None
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries=None,
+        noise=None,
+        stimulation=None,
     ):
         """Execute the pure tensor transition for exactly ``steps`` steps."""
-        if self._stepwise_stimulation:
+        if self._stepwise_stimulation or stimulation is not None:
             # A host step samples bound Waveforms at its accepted clock. A
             # vector start + arange * dt can round differently from repeated
             # clock additions and miss narrow pulses. Preserve that recurrence
@@ -120,6 +133,11 @@ class _LoweredPopulationChunk:
                         if noise is None
                         else torch.utils._pytree.tree_map(
                             lambda value: value[index], noise
+                        ),
+                        stimulation=None
+                        if stimulation is None
+                        else torch.utils._pytree.tree_map(
+                            lambda value: value[index], stimulation
                         ),
                     ),
                 )
@@ -168,7 +186,17 @@ class _LoweredCallbackPopulationChunk:
         self._steps = steps
         self._plans = plans
 
-    def __call__(self, parameters, prepared, state, ve, intra, carries, noise=None):
+    def __call__(
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries,
+        noise=None,
+        stimulation=None,
+    ):
         emissions = []
         for index in range(self._steps):
             # Sample bound waveforms at the accepted clock each time, matching
@@ -184,6 +212,11 @@ class _LoweredCallbackPopulationChunk:
                     if noise is None
                     else torch.utils._pytree.tree_map(
                         lambda value: value[index], noise
+                    ),
+                    stimulation=None
+                    if stimulation is None
+                    else torch.utils._pytree.tree_map(
+                        lambda value: value[index], stimulation
                     ),
                 ),
             )

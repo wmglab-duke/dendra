@@ -332,6 +332,13 @@ def _module_python_state_signature(
     for name, value in sorted(vars(module).items()):
         if _is_internal_module_state(module, name):
             continue
+        if name == "_functional_poisson_rng":
+            continue
+        from dendra.models.stim.waveform.core import _randomized_poisson
+
+        if type(module) is _randomized_poisson and name == "generator":
+            state.append((name, ("poisson-generator", str(value.device))))
+            continue
         if name == "_cache" and isinstance(module, cacheable):
             continue
         if not check_purity:
@@ -389,12 +396,13 @@ def _validate_waveform_contract(
                 )
         if not check_purity:
             continue
-        if bool(getattr(module, "randomize_every_call", False)):
-            raise FunctionalizationError(
-                f"Waveform {module_label!r} randomizes its Poisson schedule on "
-                "every call. Functional stimulation requires deterministic "
-                "waveforms; use a fixed schedule or make RNG state explicit."
-            )
+        from dendra.models.stim.waveform.core import _randomized_poisson
+
+        shared_poisson = type(module) is _randomized_poisson
+        if shared_poisson:
+            from ._poisson_stimulation import randomized_nodes
+
+            randomized_nodes(module)
         for name, value in vars(module).items():
             if _is_internal_module_state(module, name):
                 continue
@@ -412,6 +420,7 @@ def _validate_waveform_contract(
             if (
                 canonical_type(module).__dict__.get(_FUNCTIONAL_PURITY_CAPABILITY)
                 is not True
+                and not shared_poisson
             ):
                 raise FunctionalizationError(
                     f"Waveform {module_label!r} has no functional purity "
@@ -663,6 +672,15 @@ class _FunctionalWaveformBank:
             # This mutates only the private execution copy.  In particular, a
             # CPU-authored Waveform is never moved out from under its caller.
             clone.to(device=device, dtype=dtype)
+            from ._poisson_stimulation import configure_execution, randomized_nodes
+
+            randomized_nodes(waveform)
+            for path, source in randomized_nodes(waveform):
+                from ._poisson_stimulation import normalize_schedule
+
+                target = clone.get_submodule(path) if path else clone
+                target._spike_times = normalize_schedule(source, target._spike_times)
+            configure_execution(clone)
             # Preserve every authored Waveform/module train/eval flag. Only
             # cache-bearing parameter modules use training mode internally so
             # explicit functional leaves remain authoritative and evaluation
@@ -716,8 +734,16 @@ class _FunctionalWaveformBank:
                         f"Waveform buffer layout for contact {index} is not "
                         "stable under deepcopy."
                     )
-                public_name = canonical_constants.setdefault(
-                    id(value), self._public_name(index, source_name)
+                parent, _separator, field = source_name.rpartition(".")
+                owner = source.get_submodule(parent) if parent else source
+                from dendra.models.stim.waveform.core import _randomized_poisson
+
+                public_name = (
+                    self._public_name(index, source_name)
+                    if field == "_spike_times" and type(owner) is _randomized_poisson
+                    else canonical_constants.setdefault(
+                        id(value), self._public_name(index, source_name)
+                    )
                 )
                 constant_leaves.append(
                     _BankLeaf(
@@ -792,6 +818,15 @@ class _FunctionalWaveformBank:
             source = dict(self._sources[leaf.waveform_index].named_buffers())[
                 leaf.source_name
             ]
+            parent, _separator, field = leaf.source_name.rpartition(".")
+            from dendra.models.stim.waveform.core import _randomized_poisson
+
+            owner = self._sources[leaf.waveform_index]
+            owner = owner.get_submodule(parent) if parent else owner
+            if field == "_spike_times" and type(owner) is _randomized_poisson:
+                from ._poisson_stimulation import normalize_schedule
+
+                source = normalize_schedule(owner, source)
             constants[leaf.public_name] = (
                 source.detach()
                 .to(
@@ -827,6 +862,16 @@ class _FunctionalStimulus:
 
     _parameter_schema: dict[str, TensorSchema]
     _constant_schema: dict[str, TensorSchema]
+
+    def _validate_deterministic_assembly(self):
+        from ._poisson_stimulation import randomized_nodes
+
+        if any(randomized_nodes(waveform) for waveform in self._waveforms._sources):
+            raise FunctionalizationError(
+                "Randomized Poisson stimulation requires explicit draws and RNG "
+                "carry; bind it through make_functional(..., extra=...) or "
+                "dn.compile and use the Population stimulation input."
+            )
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -1096,6 +1141,17 @@ def _waveform_layout_signature(
         check_purity = current_check_purity()
     modules = []
     for path, module in waveform.named_modules():
+        from dendra.models.stim.waveform.core import _randomized_poisson
+
+        def buffer_shape(name, value):
+            if (
+                name == "_spike_times"
+                and type(module) is _randomized_poisson
+                and module.n is not None
+            ):
+                return (max(module.n, 1),) + (1,) * module._spike_time_trailing_dims
+            return _shape(value)
+
         module_label = "waveform" if not path else f"waveform.{path}"
         static = _module_python_state_signature(
             module,
@@ -1112,7 +1168,7 @@ def _waveform_layout_signature(
                     for name, value in module.named_parameters(recurse=False)
                 ),
                 tuple(
-                    (name, _shape(value), value.dtype)
+                    (name, buffer_shape(name, value), value.dtype)
                     for name, value in module.named_buffers(recurse=False)
                 ),
                 static,
@@ -1301,6 +1357,7 @@ class FunctionalIntra(_FunctionalStimulus):
     ) -> torch.Tensor | None:
         """Assemble a contiguous ``[time, *population.shape]`` current."""
 
+        self._validate_deterministic_assembly()
         self._validate_source()
         self._validate_inputs(parameters, constants)
         if not self.enabled:
@@ -1594,6 +1651,7 @@ class FunctionalExtra(_FunctionalStimulus):
         total_steps: int | None = None,
     ) -> torch.Tensor | None:
         """Assemble contiguous extracellular voltage ``[time, *shape]``."""
+        self._validate_deterministic_assembly()
 
         self._validate_inputs(parameters, constants)
         if not self.enabled:

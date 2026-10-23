@@ -36,10 +36,10 @@ class NetworkRolloutInput(NamedTuple):
     """Time-leading per-Population inputs and explicit stochastic draw tapes.
 
     ``populations`` maps names to :class:`RolloutInput`, including each
-    Population's ``noise`` draw/RNG tape. ``netstim`` is a
+    Population's ``noise`` and ``stimulation`` draw/RNG tapes. ``netstim`` is a
     :class:`NetStimDraw` whose two Tensor fields have one leading time axis.
     Keep draw values and their matching post-draw RNG bytes together. Pure
-    rollout/chunk calls require tapes for recurrent NOISE and NetStim;
+    rollout/chunk calls require tapes for recurrent NOISE, stimulation and NetStim;
     the host ``run`` scheduler can sample bounded tapes from explicit carry.
     """
 
@@ -121,12 +121,15 @@ def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
         ve, intra, _ = plan._resolve_rollout_inputs(selected, steps)
         if selected.noise is not None or not allow_missing_draws:
             plan._validate_noise_draw(selected.noise, steps=steps)
+        if selected.stimulation is not None or not allow_missing_draws:
+            plan._validate_stimulation_draw(selected.stimulation, steps=steps)
         normalized_values = {
             key: value
             for key, value in (
                 ("ve", ve),
                 ("intra", intra),
                 ("noise", selected.noise),
+                ("stimulation", selected.stimulation),
             )
             if value is not None
         }
@@ -210,7 +213,10 @@ def _auxiliary(functional, state, *, scan=False):
 def _step(functional, parameters, prepared, state, sample):
     inputs = {
         name: StepInput(
-            selected.get("ve"), selected.get("intra"), selected.get("noise")
+            selected.get("ve"),
+            selected.get("intra"),
+            selected.get("noise"),
+            selected.get("stimulation"),
         )
         for name, selected in sample.get("populations", {}).items()
     }
@@ -462,6 +468,18 @@ class CompiledNetworkChunk:
                 for leaf in population._state_layout
                 if leaf.public_path[0] == "runtime_noise"
             )
+            if population._poisson_plan is not None:
+                detached.extend(
+                    (
+                        "network",
+                        "populations",
+                        name,
+                        "stimulation",
+                        "schedules",
+                        entry.key,
+                    )
+                    for entry in population._poisson_plan.entries
+                )
         return _CompiledTensorTreeScan(
             body,
             steps=self.steps,
@@ -722,8 +740,22 @@ def run(
                     if values.get("noise") is not None
                 },
             )
+            stimulation_tapes = functional.sample_population_stimulation_tapes(
+                state,
+                stop - start,
+                provided={
+                    name: values["stimulation"]
+                    for name, values in populations.items()
+                    if values.get("stimulation") is not None
+                },
+            )
             for name, plan in functional.populations.items():
                 values = populations.get(name, {})
+                if values.get("stimulation") is None:
+                    stimulation = stimulation_tapes[name]
+                    if stimulation is not None:
+                        values = {**values, "stimulation": stimulation}
+                        populations[name] = values
                 if values.get("noise") is None:
                     noise = noise_tapes[name]
                     if noise is not None:

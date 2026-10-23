@@ -435,6 +435,10 @@ class FunctionalNetwork:
         from ._network_rng import NetworkRNGPlan
 
         self._rng_plan = NetworkRNGPlan(self, network)
+        from ._poisson_stimulation import NetworkStimulationPlan
+
+        self._extra_order = tuple(extra)
+        self._stimulation_plan = NetworkStimulationPlan(self)
         self._source_table_aliases = network_table_alias_signature(network)
         self._source_mechanism_delay_aliases = network_mechanism_delay_alias_signature(
             network
@@ -770,6 +774,7 @@ class FunctionalNetwork:
         raise FunctionalizationError("Continuous target must belong to this Network.")
 
     def _validate_source(self):
+        self._stimulation_plan.validate_source()
         network = self._source
         if (
             type(network) is not Network
@@ -927,7 +932,9 @@ class FunctionalNetwork:
             constants["populations"][name] = snapshots.tree(
                 native_constants, packet.constants
             )
-            state["populations"][name] = self._rng_plan.strip_population(packet.state)
+            state["populations"][name] = self._stimulation_plan.strip(
+                self._rng_plan.strip_population(packet.state)
+            )
         for name, plan in self.synapses.items():
             connection = network.synapses[name]
             sources = self._connection_parameter_plans["synapses", name]
@@ -994,6 +1001,9 @@ class FunctionalNetwork:
             state["connection_sampling"] = sampling
         if self._rng_plan.enabled:
             state["rng"] = self._rng_plan.extract(network)
+        if self._stimulation_plan.enabled:
+            state["stimulation_rng"] = self._stimulation_plan.extract(network)
+            state = self._connection_rng_from_stimulation(state)
         return NetworkTensors(parameters, constants, state)
 
     def extract(self, network=None):
@@ -1013,6 +1023,7 @@ class FunctionalNetwork:
 
     def _validate_compatible(self, network):
         _eligible(network)
+        self._stimulation_plan.validate_compatible_network(network)
         self._rng_plan.validate_compatible_network(network)
         if (
             network_initialization_source_alias_signature(network)
@@ -1482,6 +1493,47 @@ class FunctionalNetwork:
         self._validate_state(state)
         return self._rng_plan.sample_noise_tapes(state, steps)
 
+    def sample_population_stimulation_tapes(self, state, steps, provided=None):
+        """Sample invocation-ordered Poisson tapes from explicit shared carry."""
+        if not self._stimulation_plan.enabled:
+            return dict.fromkeys(self.populations)
+        self._validate_source()
+        self._validate_state(state)
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("steps must be a non-negative integer")
+        return self._stimulation_plan.sample_tapes(state, steps, provided)
+
+    def _expand_population_state(self, name, population_state, state):
+        return self._stimulation_plan.expand(
+            name,
+            self._rng_plan.expand_population(
+                name, population_state, state.get("rng", {})
+            ),
+            state.get("stimulation_rng", {}),
+        )
+
+    def _connection_rng_from_stimulation(self, state, pool=None):
+        if not self._stimulation_plan.enabled or "connection_sampling" not in state:
+            return state
+        pool = state["stimulation_rng"] if pool is None else pool
+        rng = dict(state["connection_sampling"]["rng"])
+        for canonical, device in self._stimulation_plan.default_streams.items():
+            if device in rng:
+                rng[device] = pool[canonical]
+        return {**state, "connection_sampling": {"rng": rng}}
+
+    def _stimulation_rng_after_connections(self, pool, rng):
+        if not self._stimulation_plan.enabled:
+            return pool
+        return {
+            **pool,
+            **{
+                canonical: rng[device]
+                for canonical, device in self._stimulation_plan.default_streams.items()
+                if device in rng
+            },
+        }
+
     def rollout(
         self,
         parameters,
@@ -1618,12 +1670,18 @@ class FunctionalNetwork:
         inputs, extra, intra = inputs or {}, extra or {}, intra or {}
         clock = state["clock"]
         rng_pool = state.get("rng", {})
+        stimulation_pool = state.get("stimulation_rng", {})
         time = (
             clock["origin"] + clock["step"].to(clock["origin"].dtype) * self.dt
         ).detach()
         states = {
             name: self._snap_population_clock(
-                self._rng_plan.expand_population(name, value, rng_pool), time
+                self._stimulation_plan.expand(
+                    name,
+                    self._rng_plan.expand_population(name, value, rng_pool),
+                    stimulation_pool,
+                ),
+                time,
             )
             for name, value in state["populations"].items()
         }
@@ -1741,6 +1799,9 @@ class FunctionalNetwork:
                 noise=pytree.tree_map_only(
                     torch.Tensor, lambda value: value.unsqueeze(0), selected.noise
                 ),
+                stimulation=pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), selected.stimulation
+                ),
             )
             states[name], aux[name] = plan._rollout_values(
                 parameters["populations"][name],
@@ -1754,17 +1815,23 @@ class FunctionalNetwork:
                 rng_pool = self._rng_plan.update_pool(
                     name, states[name]["random"]["rng"], rng_pool
                 )
+            stimulation_pool = self._stimulation_plan.update(
+                name, states[name], stimulation_pool
+            )
         step = clock["step"] + 1
         next_time = (
             clock["origin"] + step.to(clock["origin"].dtype) * self.dt
         ).detach()
+        states = self._stimulation_plan.canonicalize(states)
         states = {
-            name: self._rng_plan.strip_population(
-                self._snap_population_clock(value, next_time)
+            name: self._stimulation_plan.strip(
+                self._rng_plan.strip_population(
+                    self._snap_population_clock(value, next_time)
+                )
             )
             for name, value in states.items()
         }
-        return {
+        next_state = {
             "populations": states,
             "synapses": events,
             "continuous_synapses": continuous,
@@ -1781,7 +1848,16 @@ class FunctionalNetwork:
                 else {}
             ),
             **({"rng": rng_pool} if self._rng_plan.enabled else {}),
-        }, {"populations": aux, "netstim": stimulus}
+            **(
+                {"stimulation_rng": stimulation_pool}
+                if self._stimulation_plan.enabled
+                else {}
+            ),
+        }
+        return self._connection_rng_from_stimulation(next_state), {
+            "populations": aux,
+            "netstim": stimulus,
+        }
 
     @staticmethod
     def _snap_population_clock(state, time):
@@ -1872,6 +1948,7 @@ class FunctionalNetwork:
         self._validate_source()
         self._validate_compatible(network)
         self._validate_state(state)
+        self._stimulation_plan.validate_state(state)
         self.check_overflow(state)
         sampling_rng = (
             self._connection_sampling_plan.validate_rng(
@@ -1909,9 +1986,9 @@ class FunctionalNetwork:
         random_commits = {
             name: plan._random_plan.prepare_commit(
                 network.populations[name],
-                self._rng_plan.expand_population(
-                    name, state["populations"][name], state.get("rng", {})
-                )["random"],
+                self._expand_population_state(name, state["populations"][name], state)[
+                    "random"
+                ],
             )
             for name, plan in self.populations.items()
             if plan._random_plan is not None
@@ -1920,9 +1997,7 @@ class FunctionalNetwork:
         for name, plan in self.populations.items():
             plan.commit_state_(
                 staged.populations[name],
-                self._rng_plan.expand_population(
-                    name, state["populations"][name], state.get("rng", {})
-                ),
+                self._expand_population_state(name, state["populations"][name], state),
             )
         for name, plan in self.synapses.items():
             plan.commit_state_(staged.synapses[name], state["synapses"][name])

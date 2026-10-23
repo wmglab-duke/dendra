@@ -1015,7 +1015,7 @@ def test_lowering_late_off_dtype_injection_does_not_move_the_source_waveform():
     _assert_module_unchanged(waveform, snapshot)
 
 
-def test_randomized_poisson_fails_closed_but_a_fixed_schedule_is_supported():
+def test_randomized_poisson_replays_explicit_draws_and_fixed_schedules_need_none():
     randomized = _model()
     randomized[:, 1].inject(
         dn.mono_rect(amp=0.2 * nA, pw=0.05).poisson(
@@ -1025,8 +1025,18 @@ def test_randomized_poisson_fails_closed_but_a_fixed_schedule_is_supported():
             generator=torch.Generator().manual_seed(12),
         )
     )
-    with pytest.raises(dn.func.FunctionalizationError, match="randomizes"):
-        dn.func.make_functional(randomized, dt=DT)
+    functional, tensors = dn.func.make_functional(randomized, dt=DT)
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
+    with pytest.raises(
+        (ValueError, dn.func.FunctionalizationError), match="draw|stimulation"
+    ):
+        functional.step(tensors.parameters, prepared, tensors.state)
+    draw = functional.sample_stimulation_draw(tensors.state)
+    assert draw is not None
+    inputs = dn.func.StepInput(stimulation=draw)
+    first, _ = functional.step(tensors.parameters, prepared, tensors.state, inputs)
+    replay, _ = functional.step(tensors.parameters, prepared, tensors.state, inputs)
+    torch.testing.assert_close(first, replay)
 
     fixed = _model()
     fixed[:, 1].inject(

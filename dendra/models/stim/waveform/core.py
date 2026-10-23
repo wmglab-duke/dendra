@@ -8,6 +8,13 @@ import torch
 from dendra.models.parametric import SimpleParameterized
 
 from ._gates import _rect_gate
+from ._poisson import (
+    evaluate_poisson_schedule,
+    poisson_interval_from_uniform,
+    poisson_schedule_from_draws,
+    restore_pending_poisson_rng,
+    sample_poisson_draws,
+)
 
 
 class Waveform(SimpleParameterized):
@@ -34,13 +41,13 @@ class Waveform(SimpleParameterized):
         1. Define parameters using the PARAMETER class method
         2. Implement the fn(t) method to define the waveform's behavior
 
-    Custom subclasses used by :mod:`dendra.func` must additionally declare
-    ``FUNCTIONAL_PURE = True`` on each concrete class.  This is a promise that
-    evaluating the waveform is deterministic and does not mutate registered
-    tensors, Python instance state, or random-number-generator state. Functional
-    lowering audits the declaration and fails closed when it cannot establish a
-    safe contract. The default is ``False`` so purity is never inherited by
-    accident when a subclass changes behavior.
+    Custom subclasses used by :mod:`dendra.func` must evaluate deterministically
+    without mutating registered tensors, Python instance state, or random-number
+    generators. Functional execution trusts this contract by default. Optional
+    diagnostics enabled with ``dn.ctx(CHECK_PURITY=True)`` require each concrete
+    class to declare ``FUNCTIONAL_PURE = True`` and audit its evaluation. The
+    marker defaults to ``False`` and diagnostics do not inherit a parent's
+    declaration when a subclass changes behavior.
 
     Examples
     --------
@@ -623,26 +630,34 @@ class _poisson(Waveform):
         if self.noise == 0.0:
             # perfectly regular
             return self.interval
-        # exponential sample (mean = interval)
-        u = torch.rand((), generator=gen, device=gen.device)  # uniform (0,1)
-        exp_sample = -u.log() * self.interval  # Exp(λ=1/interval)
-        return (1.0 - self.noise) * self.interval + self.noise * exp_sample.item()
+        u = torch.rand((), generator=gen, device=gen.device)
+        return poisson_interval_from_uniform(
+            u, interval=self.interval, noise=self.noise
+        ).item()
 
     def _make_schedule(self, gen: torch.Generator) -> torch.Tensor:
         """Generate all spike onset times once, store as buffer."""
-        times = []
-        t = self.start
-        k = 0
-        while t < self.off and (self.n is None or k < self.n):
-            times.append(t)
-            t += self._next_dt(gen)
-            k += 1
-        if not times:  # handle edge‑case: no spikes at all
-            times.append(torch.inf)
+        restore_pending_poisson_rng(self)
+        draws, count = sample_poisson_draws(
+            interval=self.interval,
+            n=self.n,
+            start=self.start,
+            noise=self.noise,
+            off=self.off,
+            generator=gen,
+        )
         ref = next(self.waveform.parameters(), None)
         if ref is None:
             ref = next(self.waveform.buffers(), torch.empty(()))
-        return torch.tensor(times, device=ref.device, dtype=ref.dtype)
+        return poisson_schedule_from_draws(
+            draws[:count],
+            interval=self.interval,
+            start=self.start,
+            noise=self.noise,
+            off=self.off,
+            device=ref.device,
+            dtype=ref.dtype,
+        )
 
     def regenerate_schedule_(self) -> None:
         schedule = self._make_schedule(self.generator)
@@ -675,11 +690,7 @@ class _poisson(Waveform):
         # Evaluate each onset independently so the spike axis can never alias a
         # population, compartment, oscillator-component, or other leading axis
         # of the wrapped waveform merely because their lengths happen to match.
-        responses = [
-            self.waveform.fn(t - onset.unsqueeze(-1))
-            for onset in self._spike_times.unbind(dim=0)
-        ]
-        return torch.stack(responses, dim=0).sum(dim=0)
+        return evaluate_poisson_schedule(self.waveform.fn, t, self._spike_times)
 
     def __repr__(self):
         return f"Poisson({self.waveform}, interval={self.interval}, noise={self.noise})"

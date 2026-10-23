@@ -81,6 +81,7 @@ class _CompiledScanPopulationChunk:
         intra,
         carries,
         noise,
+        stimulation=None,
         *,
         block=1,
         grad_enabled=True,
@@ -90,7 +91,7 @@ class _CompiledScanPopulationChunk:
         functional = self._functional
         plans = self._plans
         steps = self._steps
-        stepwise = self._stepwise
+        stepwise = self._stepwise or stimulation is not None
         phase_emissions = (
             not grad_enabled
             and block > 1
@@ -98,8 +99,8 @@ class _CompiledScanPopulationChunk:
             and functional.device.type == "cpu"
         )
         state = functional._clone_state_tree(state)
-        parameters, prepared, state, ve, intra, carries, noise = _detach(
-            (parameters, prepared, state, ve, intra, carries, noise)
+        parameters, prepared, state, ve, intra, carries, noise, stimulation = _detach(
+            (parameters, prepared, state, ve, intra, carries, noise, stimulation)
         )
         callback_carry = _CallbackCarryPartition.from_plans(plans)
         carries, invariant_carries = callback_carry.split(carries)
@@ -140,6 +141,8 @@ class _CompiledScanPopulationChunk:
             sample["intra"] = intra[0]
         if noise is not None:
             sample["noise"] = pytree.tree_map(lambda value: value[0], noise)
+        if stimulation is not None:
+            sample["stimulation"] = pytree.tree_map(lambda value: value[0], stimulation)
         if not sample:
             # Scan requires a leading iteration axis even without input drives.
             sample["index"] = torch.zeros(
@@ -153,7 +156,10 @@ class _CompiledScanPopulationChunk:
                     prepared,
                     state,
                     StepInput(
-                        sample.get("ve"), sample.get("intra"), sample.get("noise")
+                        sample.get("ve"),
+                        sample.get("intra"),
+                        sample.get("noise"),
+                        sample.get("stimulation"),
                     ),
                 )
             else:
@@ -215,14 +221,25 @@ class _CompiledScanPopulationChunk:
                 sample_use.get("ve", False),
                 sample_use.get("intra", False),
                 sample_use.get("noise", False),
+                sample_use.get("stimulation", False),
             )
         )
 
-        def execute(parameters, prepared, state, ve, intra, carries, noise):
+        def execute(
+            parameters, prepared, state, ve, intra, carries, noise, stimulation=None
+        ):
             carries, invariant_carries = callback_carry.split(carries)
-            parameters, prepared, invariant_carries, ve, intra, noise = (
+            parameters, prepared, invariant_carries, ve, intra, noise, stimulation = (
                 _isolate_dense_lifted_inputs(
-                    (parameters, prepared, invariant_carries, ve, intra, noise)
+                    (
+                        parameters,
+                        prepared,
+                        invariant_carries,
+                        ve,
+                        intra,
+                        noise,
+                        stimulation,
+                    )
                 )
             )
             samples = {}
@@ -232,6 +249,8 @@ class _CompiledScanPopulationChunk:
                 samples["intra"] = intra
             if noise is not None:
                 samples["noise"] = noise
+            if stimulation is not None:
+                samples["stimulation"] = stimulation
             if not samples:
                 samples["index"] = torch.arange(
                     steps, dtype=torch.int64, device=functional.device
@@ -352,12 +371,16 @@ class _CompiledScanPopulationChunk:
         )
 
         @wraps(compiled)
-        def materialize(parameters, prepared, state, ve, intra, carries, noise):
+        def materialize(
+            parameters, prepared, state, ve, intra, carries, noise, stimulation=None
+        ):
             if assembly is not None:
                 ve, intra = assembly(parameters, prepared, state, ve, intra)
             recurrent, invariant = callback_carry.split(carries)
-            parameters, prepared, invariant, ve, intra, noise = isolate_views(
-                (parameters, prepared, invariant, ve, intra, noise)
+            parameters, prepared, invariant, ve, intra, noise, stimulation = (
+                isolate_views(
+                    (parameters, prepared, invariant, ve, intra, noise, stimulation)
+                )
             )
             result = compiled(
                 parameters,
@@ -367,6 +390,7 @@ class _CompiledScanPopulationChunk:
                 intra,
                 callback_carry.merge(recurrent, invariant),
                 noise,
+                stimulation,
             )
             if (
                 not packed_training
@@ -426,7 +450,15 @@ class _CompiledScanPopulationChunk:
         return materialize
 
     def __call__(
-        self, parameters, prepared, state, ve, intra, carries=None, noise=None
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries=None,
+        noise=None,
+        stimulation=None,
     ):
         grad_enabled = torch.is_grad_enabled()
         # Apply the measured block policy to CPU forward execution. Accelerator
@@ -443,6 +475,7 @@ class _CompiledScanPopulationChunk:
             ve is not None,
             intra is not None,
             noise is not None,
+            stimulation is not None,
             MEMBRANE_ASSEMBLY.value,
             grad_enabled,
             block,
@@ -459,6 +492,7 @@ class _CompiledScanPopulationChunk:
                     intra,
                     {} if carries is None else carries,
                     noise,
+                    stimulation,
                     block=block,
                     # Capture runs under no_grad even for a training kernel.
                     # Preserve the caller's mode when choosing its compiler.
@@ -472,11 +506,14 @@ class _CompiledScanPopulationChunk:
             intra,
             {} if carries is None else carries,
             noise,
+            stimulation,
         )
         result = guard_scan_outputs(result)
         # Scan's AD wrapper marks floating carry outputs differentiable even
         # when their authored update is detached. Runtime NOISE retains its
-        # native stop-gradient boundary when exposed as public carry.
-        if "runtime_noise" in result[0]:
-            result[0]["runtime_noise"] = _detach(result[0]["runtime_noise"])
+        # native stop-gradient boundary when exposed as public carry. Poisson
+        # event times and generator frames retain the same detached contract.
+        for name in ("runtime_noise", "stimulation"):
+            if name in result[0]:
+                result[0][name] = _detach(result[0][name])
         return result

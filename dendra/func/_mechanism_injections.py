@@ -105,6 +105,9 @@ def configure_mechanism_injection_execution(population):
     """Disable derived parameter caches only on private execution copies."""
     for _path, owner in mechanism_injection_owners(population):
         for waveform in owner.injected_waveforms:
+            from ._poisson_stimulation import configure_execution
+
+            configure_execution(waveform)
             for module in waveform.modules():
                 if isinstance(module, cacheable) and not isinstance(module, Waveform):
                     module.clear_cache()
@@ -146,6 +149,16 @@ def mechanism_injection_constant_slots(owner):
     waveforms = getattr(owner, "injected_waveforms", None)
     if waveforms is not None:
         for name, value in waveforms.named_buffers(remove_duplicate=False):
+            parent, _separator, field = name.rpartition(".")
+            from dendra.models.stim.waveform.core import _randomized_poisson
+
+            if field == "_spike_times" and (
+                type(waveforms.get_submodule(parent)) is _randomized_poisson
+                or getattr(
+                    waveforms.get_submodule(parent), "_functional_poisson_recipe", False
+                )
+            ):
+                continue  # Runtime schedules live in explicit stimulation carry.
             yield f"injected_waveforms.{name}", value
 
 
@@ -830,7 +843,6 @@ class MechanismInjectionPlan:
                 _validate_waveform_contract(
                     waveform, "mechanism injection", check_purity=self.check_purity
                 )
-                _validate_waveform_dependencies(waveform)
                 class_state = _class_state_snapshot(
                     _authored_workspace_classes(waveform)
                 )
@@ -842,6 +854,7 @@ class MechanismInjectionPlan:
                             "Mechanism injection Waveform could not be isolated by deepcopy"
                         ) from exc
                     self._configure_waveform(clone)
+                    _validate_waveform_dependencies(clone)
                     _audit_waveform_purity(
                         clone,
                         label="mechanism injection",
@@ -859,6 +872,9 @@ class MechanismInjectionPlan:
 
     @staticmethod
     def _configure_waveform(waveform):
+        from ._poisson_stimulation import configure_execution
+
+        configure_execution(waveform)
         for module in waveform.modules():
             if isinstance(module, cacheable) and not isinstance(module, Waveform):
                 module.clear_cache()

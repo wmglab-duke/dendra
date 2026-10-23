@@ -1600,21 +1600,24 @@ cannot be combined with an explicit ``StepInput.intra`` or
 ``ve``; and runtime ``extra`` cannot be combined with an ``extra`` already
 bound by ``make_functional``.
 
-Functional waveforms must be deterministic and side-effect-free when
-evaluated. All deterministic built-in Waveforms are supported, including
-compositions, fixed-schedule Poisson waveforms, and ``arbitrary`` sampled
-waveforms. The latter remains compatible with ``jacrev``, ``jacfwd``, ``vmap``,
-and compiled functional calls.
+Functional waveform evaluation must be deterministic and side-effect-free
+for its explicit inputs. All deterministic built-in Waveforms are supported,
+including compositions, fixed-schedule Poisson waveforms, and ``arbitrary``
+sampled waveforms. The latter remains compatible with ``jacrev``, ``jacfwd``,
+``vmap``, and compiled functional calls. Randomized Poisson stimulation uses
+explicit draw/RNG packets; see :doc:`A50_functional_poisson_stimulation`.
 
 Mechanism-owned injections follow their declared ownership and timing; see
 :doc:`A35_functional_mechanism_injections`. Waveform hooks are currently
-unsupported. Poisson waveforms must use ``randomize_every_call=False`` to
-satisfy the deterministic evaluation contract. A fixed Poisson schedule is
-supported as an explicit tensor leaf. To choose another random schedule, call
-``regenerate_schedule_()`` before lowering and keep
-``randomize_every_call=False``. Other explicit setup operations, such as
-``expand()`` and ``reshape_for_intra()``, are likewise outside the evaluation
-purity contract and should be completed before ``make_functional``.
+unsupported. A fixed Poisson schedule is supported as an explicit tensor
+leaf. To choose another fixed schedule, call ``regenerate_schedule_()`` before
+lowering and keep ``randomize_every_call=False``. For a schedule regenerated
+on each functional step, use finite ``n`` and ``randomize_every_call=True``;
+the pure API requires ``StepInput.stimulation`` or
+``RolloutInput.stimulation``, and compiled host runners supply missing packets.
+Other explicit setup operations, such as ``expand()`` and
+``reshape_for_intra()``, are outside the evaluation purity contract and should
+be completed before ``make_functional``.
 
 A custom Waveform must keep evaluation deterministic and read-only.
 With ``CHECK_PURITY=True``, declare ``FUNCTIONAL_PURE = True`` directly on its

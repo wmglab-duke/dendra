@@ -652,6 +652,32 @@ class PopulationCachePlan:
             )
         plan._validate_parameters(effective)
         plan._validate_constants(effective_constants)
+        if plan._poisson_plan is not None:
+            from ._poisson_stimulation import normalize_schedule
+
+            schedules = dict(state["stimulation"]["schedules"])
+            restored_schedules = {}
+            for entry in plan._poisson_plan.entries:
+                if entry.kind == "mechanism" and entry.parameter in cache:
+                    restored_schedules[id(entry.source)] = normalize_schedule(
+                        entry.source,
+                        cache[entry.parameter],
+                        dtype=entry.dtype,
+                        device=entry.device,
+                    ).reshape(-1)
+            # A registered cache load changes the physical waveform buffer,
+            # including aliases bound through Intra or external stimulation.
+            # Registered load order determines the last value for each source.
+            schedules = {
+                entry.key: restored_schedules.get(
+                    id(entry.source), schedules[entry.key]
+                )
+                for entry in plan._poisson_plan.entries
+            }
+            restored_state["stimulation"] = {
+                "rng": state["stimulation"]["rng"],
+                "schedules": schedules,
+            }
         plan._validate_state(restored_state)
         return PopulationTensors(effective, effective_constants, restored_state, None)
 

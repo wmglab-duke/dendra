@@ -486,7 +486,9 @@ def _validate_rollout_input_container(inputs: RolloutInput | None):
 
 def _resolve_inputs(functional, inputs: RolloutInput, steps: int | None):
     ve, intra, resolved_steps = functional._resolve_rollout_inputs(inputs, steps)
-    return RolloutInput(ve=ve, intra=intra, noise=inputs.noise), resolved_steps
+    return RolloutInput(
+        ve=ve, intra=intra, noise=inputs.noise, stimulation=inputs.stimulation
+    ), resolved_steps
 
 
 def _slice_inputs(inputs: RolloutInput, start: int, stop: int) -> RolloutInput:
@@ -497,6 +499,11 @@ def _slice_inputs(inputs: RolloutInput, start: int, stop: int) -> RolloutInput:
         if inputs.noise is None
         else torch.utils._pytree.tree_map(
             lambda value: value[start:stop], inputs.noise
+        ),
+        stimulation=None
+        if inputs.stimulation is None
+        else torch.utils._pytree.tree_map(
+            lambda value: value[start:stop], inputs.stimulation
         ),
     )
 
@@ -512,6 +519,14 @@ def _prepare_extra(functional, extra, inputs):
         raise ValueError("explicit ve cannot be combined with extra")
     plan = extra if isinstance(extra, FunctionalExtra) else functional.make_extra(extra)
     functional._validate_extra_plan(plan)
+    from ._poisson_stimulation import randomized_nodes
+
+    if any(randomized_nodes(waveform) for waveform in plan._waveforms._sources):
+        raise FunctionalizationError(
+            "Randomized Poisson extra must be bound through "
+            "make_functional(..., extra=...) or dn.compile(..., extra=...); "
+            "call-local extra has no explicit stimulation RNG carry."
+        )
     return plan, plan.extract()
 
 
@@ -588,6 +603,11 @@ def _execute_steps(step, state, inputs: RolloutInput, steps: int):
                 else torch.utils._pytree.tree_map(
                     lambda value: value[index], inputs.noise
                 ),
+                stimulation=None
+                if inputs.stimulation is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value[index], inputs.stimulation
+                ),
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -647,6 +667,11 @@ def _execute_steps_with_callbacks(
                 if inputs.noise is None
                 else torch.utils._pytree.tree_map(
                     lambda value: value[index], inputs.noise
+                ),
+                stimulation=None
+                if inputs.stimulation is None
+                else torch.utils._pytree.tree_map(
+                    lambda value: value[index], inputs.stimulation
                 ),
             ),
         )
@@ -823,9 +848,20 @@ def _execute_chunks(
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
-        if chunk_inputs.noise is None:
+        if (
+            functional._noise_plan is not None
+            and functional._noise_plan.runtime
+            and chunk_inputs.noise is None
+        ):
             chunk_inputs = chunk_inputs._replace(
                 noise=functional.sample_noise_draw_tape(state, stop - start)
+            )
+        if (
+            getattr(functional, "_poisson_plan", None) is not None
+            and chunk_inputs.stimulation is None
+        ):
+            chunk_inputs = chunk_inputs._replace(
+                stimulation=functional.sample_stimulation_draw_tape(state, stop - start)
             )
         extra_ve = _assemble_extra_chunk(
             functional,
@@ -839,7 +875,10 @@ def _execute_chunks(
         )
         if extra_ve is not None:
             chunk_inputs = RolloutInput(
-                ve=extra_ve, intra=chunk_inputs.intra, noise=chunk_inputs.noise
+                ve=extra_ve,
+                intra=chunk_inputs.intra,
+                noise=chunk_inputs.noise,
+                stimulation=chunk_inputs.stimulation,
             )
         state, auxiliary = _execute_steps(
             step,
@@ -877,9 +916,20 @@ def _execute_chunks_with_callbacks(
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
-        if chunk_inputs.noise is None:
+        if (
+            functional._noise_plan is not None
+            and functional._noise_plan.runtime
+            and chunk_inputs.noise is None
+        ):
             chunk_inputs = chunk_inputs._replace(
                 noise=functional.sample_noise_draw_tape(state, stop - start)
+            )
+        if (
+            getattr(functional, "_poisson_plan", None) is not None
+            and chunk_inputs.stimulation is None
+        ):
+            chunk_inputs = chunk_inputs._replace(
+                stimulation=functional.sample_stimulation_draw_tape(state, stop - start)
             )
         extra_ve = _assemble_extra_chunk(
             functional,
@@ -893,7 +943,10 @@ def _execute_chunks_with_callbacks(
         )
         if extra_ve is not None:
             chunk_inputs = RolloutInput(
-                ve=extra_ve, intra=chunk_inputs.intra, noise=chunk_inputs.noise
+                ve=extra_ve,
+                intra=chunk_inputs.intra,
+                noise=chunk_inputs.noise,
+                stimulation=chunk_inputs.stimulation,
             )
         state, auxiliary, callback_state, emitted = _execute_steps_with_callbacks(
             step,
@@ -952,9 +1005,20 @@ def _execute_checkpointed_chunks(
         chunk_steps = stop - start
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
-        if chunk_inputs.noise is None:
+        if (
+            functional._noise_plan is not None
+            and functional._noise_plan.runtime
+            and chunk_inputs.noise is None
+        ):
             chunk_inputs = chunk_inputs._replace(
                 noise=functional.sample_noise_draw_tape(state, stop - start)
+            )
+        if (
+            getattr(functional, "_poisson_plan", None) is not None
+            and chunk_inputs.stimulation is None
+        ):
+            chunk_inputs = chunk_inputs._replace(
+                stimulation=functional.sample_stimulation_draw_tape(state, stop - start)
             )
         checkpoint_inputs = _materialize_checkpoint_tree(
             (
@@ -963,6 +1027,7 @@ def _execute_checkpointed_chunks(
                 chunk_inputs.ve,
                 chunk_inputs.intra,
                 chunk_inputs.noise,
+                chunk_inputs.stimulation,
                 None if extra_tensors is None else extra_tensors.parameters,
                 None if extra_tensors is None else extra_tensors.constants,
             )
@@ -974,6 +1039,7 @@ def _execute_checkpointed_chunks(
             ve,
             intra,
             noise,
+            stimulation,
             extra_parameters,
             extra_constants,
             chunk_steps=chunk_steps,
@@ -1010,13 +1076,15 @@ def _execute_checkpointed_chunks(
                 return _execute_steps(
                     chunk_execution,
                     state_in,
-                    RolloutInput(ve=ve, intra=intra, noise=noise),
+                    RolloutInput(
+                        ve=ve, intra=intra, noise=noise, stimulation=stimulation
+                    ),
                     chunk_steps,
                 )
             return _execute_steps_with_callbacks(
                 chunk_execution,
                 state_in,
-                RolloutInput(ve=ve, intra=intra, noise=noise),
+                RolloutInput(ve=ve, intra=intra, noise=noise, stimulation=stimulation),
                 chunk_steps,
                 callbacks,
                 callback_state_in,
@@ -1167,7 +1235,10 @@ def _run_validated_schedule(
     inputs = _validate_rollout_input_container(inputs)
     extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
     has_drives = (
-        inputs.ve is not None or inputs.intra is not None or inputs.noise is not None
+        inputs.ve is not None
+        or inputs.intra is not None
+        or inputs.noise is not None
+        or inputs.stimulation is not None
     )
     if legacy_input_horizon:
         if has_drives:
@@ -1180,6 +1251,8 @@ def _run_validated_schedule(
     inputs, steps = _resolve_inputs(functional, inputs, steps)
     if inputs.noise is not None or steps == 0:
         functional._validate_noise_draw(inputs.noise, steps=steps)
+    if inputs.stimulation is not None or steps == 0:
+        functional._validate_stimulation_draw(inputs.stimulation, steps=steps)
     chunklength = max(steps, 1) if span is None else span
     use_checkpoint = checkpointed and torch.is_grad_enabled() and steps > 0
     if use_checkpoint:

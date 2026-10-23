@@ -45,6 +45,12 @@ from ..multi import concat_models, offsets
 from ..parametric import cacheable, is_parametric, to_param
 from ..rng import RNGMixin, _restore_rng_lifecycle, _snapshot_rng_lifecycle
 from ..slice import SynapseSlots
+from ..stim.waveform._poisson import (
+    coalesce_pending_poisson_rng,
+    restore_poisson_rng_lifecycle,
+    snapshot_poisson_rng_lifecycle,
+    validate_poisson_checkpoint_stream_aliases,
+)
 from ._connection_sampling import clone_connection_sampling_rng
 from ._population_cache import restore_population_cache_values
 from .netcon import ContinuousCon, NetCon
@@ -4850,6 +4856,10 @@ class Network(RNGMixin):
             raise TypeError("Network checkpoint populations must be a mapping.")
         if not isinstance(state_dict["netcons"], Mapping):
             raise TypeError("Network checkpoint netcons must be a mapping.")
+        if set(state_dict["populations"]) == set(self.populations):
+            validate_poisson_checkpoint_stream_aliases(
+                self.populations, state_dict["populations"]
+            )
 
         checkpoint_t = state_dict["t"]
         if not torch.is_tensor(checkpoint_t):
@@ -5054,17 +5064,20 @@ class Network(RNGMixin):
         else:
             self._functional_connection_sampling_rng = sampling_rng
         self._sync_runtime_clock()
+        coalesce_pending_poisson_rng(self)
 
     def restore_dict_from_checkpoint(self, state_dict):
         """Restore a whole-network runtime checkpoint atomically."""
         previous = _clone_checkpoint_state(self.state_dict_for_checkpoint())
         rng_lifecycle = _snapshot_rng_lifecycle(self)
+        poisson_lifecycle = snapshot_poisson_rng_lifecycle(self)
         try:
             self._restore_dict_from_checkpoint_unchecked(state_dict)
         except Exception as restore_error:
             try:
                 _restore_rng_lifecycle(rng_lifecycle)
                 self._restore_dict_from_checkpoint_unchecked(previous)
+                restore_poisson_rng_lifecycle(poisson_lifecycle)
             except Exception as rollback_error:
                 raise RuntimeError(
                     "Network checkpoint restore failed and rollback could not "
