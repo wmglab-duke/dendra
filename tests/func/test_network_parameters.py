@@ -6,7 +6,7 @@ import pytest
 import torch
 
 import dendra as dn
-from tests.func.test_network import DTYPE, _close, _loss, _mixed_network
+from tests.func.test_network import DT, DTYPE, _close, _loss, _mixed_network
 
 pytestmark = pytest.mark.cpu
 
@@ -172,12 +172,13 @@ def test_inference_construction_returns_versioned_independent_trainable_aliases(
 def test_native_shared_weights_keep_one_optimizer_leaf_and_summed_rollout_gradient():
     model = _mixed_network()
     connections = tuple(model.synapses.values())
-    connections[1].weight.w = connections[0].weight.w
+    connections[1].weight.weights[0].param = connections[0].weight.weights[0].param
+    model.initialize(DT)
     functional, tensors = dn.func.make_functional_network(model)
     event_names = [
         name
         for name in tensors.named_parameters
-        if name.startswith("synapses.") and name.endswith(".weights")
+        if name.startswith("synapses.") and name.endswith(".weight.weights.0.param.rho")
     ]
     assert len(event_names) == 2
     independent = tensors.independent_parameters(event_names[1])

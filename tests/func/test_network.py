@@ -16,6 +16,7 @@ from tests.networks.test_functional_event_delivery import ThresholdRelay
 pytestmark = pytest.mark.cpu
 DT = 0.125
 DTYPE = torch.float64
+_RAW_WEIGHT = "weight.weights.0.param.rho"
 
 
 class _Release(torch.nn.Module):
@@ -205,10 +206,10 @@ def test_mixed_recurrent_network_native_order_gradients_and_no_source_mutation(
                 queue["has_spiked"].all() for queue in state["synapses"].values()
             )
     event_weights = tuple(
-        values["weights"] for values in tensors.parameters["synapses"].values()
+        values[_RAW_WEIGHT] for values in tensors.parameters["synapses"].values()
     )
     continuous_weights = tuple(
-        values["weights"]
+        values[_RAW_WEIGHT]
         for values in tensors.parameters["continuous_synapses"].values()
     )
     transform_parameters = tuple(
@@ -223,8 +224,14 @@ def test_mixed_recurrent_network_native_order_gradients_and_no_source_mutation(
     )
     native_inputs = (
         native_level,
-        *(connection.weight.w for connection in native.synapses.values()),
-        *(connection.weight.w for connection in native.continuous_synapses.values()),
+        *(
+            connection.weight.weights[0].param.rho
+            for connection in native.synapses.values()
+        ),
+        *(
+            connection.weight.weights[0].param.rho
+            for connection in native.continuous_synapses.values()
+        ),
         *(
             value
             for connection in native.continuous_synapses.values()
@@ -263,7 +270,7 @@ def test_split_checkpoint_preserves_prefix_gradients_and_commits_a_complete_boun
         )
         _close(replay, trajectory[index])
     weights = tuple(
-        values["weights"] for values in tensors.parameters["synapses"].values()
+        values[_RAW_WEIGHT] for values in tensors.parameters["synapses"].values()
     )
     gradients = torch.autograd.grad(_loss(state), weights, retain_graph=True)
     replay_gradients = torch.autograd.grad(_loss(replay), weights)
@@ -314,13 +321,16 @@ def test_netstim_draws_and_rng_checkpoint_continuation_match_native_network():
 def test_shared_connection_parameters_keep_one_explicit_gradient_leaf():
     model = _mixed_network()
     connections = tuple(model.synapses.values())
-    connections[1].weight.w = connections[0].weight.w
+    connections[1].weight.weights[0].param = connections[0].weight.weights[0].param
+    model.initialize(DT)
     functional, tensors = dn.func.make_functional_network(model)
     weights = tuple(
-        values["weights"] for values in tensors.parameters["synapses"].values()
+        values[_RAW_WEIGHT] for values in tensors.parameters["synapses"].values()
     )
     assert weights[0] is weights[1]
-    assert weights[0].data_ptr() != connections[0].weight.w.data_ptr()
+    assert (
+        weights[0].data_ptr() != connections[0].weight.weights[0].param.rho.data_ptr()
+    )
     state = tensors.state
     for _ in range(5):
         state, _ = functional.prepare_and_step(
@@ -427,7 +437,7 @@ def test_netstim_surrogate_gradients_reach_connected_population(compiled):
         )
         native_loss = native_loss + (index + 1) * native.cell.v.square().sum()
     parameters = tensors.parameters["netstim"]["parameters"]
-    weights = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    weights = next(iter(tensors.parameters["synapses"].values()))[_RAW_WEIGHT]
     actual = torch.autograd.grad(
         functional_loss,
         (parameters["interval"], parameters["noise"], parameters["tau"], weights),
@@ -438,7 +448,7 @@ def test_netstim_surrogate_gradients_reach_connected_population(compiled):
             native.netstim.interval.rho,
             native.netstim.noise,
             native.netstim.tau,
-            next(iter(native.synapses.values())).weight.w,
+            next(iter(native.synapses.values())).weight.weights[0].param.rho,
         ),
     )
     adjusted = (
@@ -696,8 +706,8 @@ def test_typed_carry_sources_use_native_floating_cast_for_both_projection_kinds(
             == dtype
         )
     weights = (
-        next(iter(tensors.parameters["synapses"].values()))["weights"],
-        next(iter(tensors.parameters["continuous_synapses"].values()))["weights"],
+        next(iter(tensors.parameters["synapses"].values()))[_RAW_WEIGHT],
+        next(iter(tensors.parameters["continuous_synapses"].values()))[_RAW_WEIGHT],
     )
     actual = torch.autograd.grad(
         state["populations"]["post"]["integrator"]["v"].square().sum(), weights
@@ -705,8 +715,8 @@ def test_typed_carry_sources_use_native_floating_cast_for_both_projection_kinds(
     expected = torch.autograd.grad(
         native.post.v.square().sum(),
         (
-            next(iter(native.synapses.values())).weight.w,
-            next(iter(native.continuous_synapses.values())).weight.w,
+            next(iter(native.synapses.values())).weight.weights[0].param.rho,
+            next(iter(native.continuous_synapses.values())).weight.weights[0].param.rho,
         ),
     )
     _close(actual, expected)

@@ -11,6 +11,7 @@ import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.mod import pas
 from tests.func.test_network import (
+    _RAW_WEIGHT,
     DT,
     DTYPE,
     _clone,
@@ -67,8 +68,8 @@ def _callbacks(functional):
 def _mixed_targets(parameters, initial_level):
     return (
         initial_level,
-        *(value["weights"] for value in parameters["synapses"].values()),
-        *(value["weights"] for value in parameters["continuous_synapses"].values()),
+        *(value[_RAW_WEIGHT] for value in parameters["synapses"].values()),
+        *(value[_RAW_WEIGHT] for value in parameters["continuous_synapses"].values()),
         *(
             leaf
             for value in parameters["continuous_synapses"].values()
@@ -81,8 +82,14 @@ def _mixed_targets(parameters, initial_level):
 def _native_mixed_targets(network, initial_level):
     return (
         initial_level,
-        *(connection.weight.w for connection in network.synapses.values()),
-        *(connection.weight.w for connection in network.continuous_synapses.values()),
+        *(
+            connection.weight.weights[0].param.rho
+            for connection in network.synapses.values()
+        ),
+        *(
+            connection.weight.weights[0].param.rho
+            for connection in network.continuous_synapses.values()
+        ),
         *(
             leaf
             for connection in network.continuous_synapses.values()
@@ -364,7 +371,7 @@ def test_explicit_netstim_draw_tape_preserves_native_rng_clock_and_gradients(exe
         auxiliary["callbacks"]["trace"]["cell.v"], torch.stack(native_voltage)
     )
     values = tensors.parameters["netstim"]["parameters"]
-    weights = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    weights = next(iter(tensors.parameters["synapses"].values()))[_RAW_WEIGHT]
     actual_loss = auxiliary["callbacks"]["trace"]["cell.v"].square().sum()
     expected_loss = torch.stack(native_voltage).square().sum()
     actual = torch.autograd.grad(
@@ -376,7 +383,7 @@ def test_explicit_netstim_draw_tape_preserves_native_rng_clock_and_gradients(exe
             native.netstim.interval.rho,
             native.netstim.noise,
             native.netstim.tau,
-            next(iter(native.synapses.values())).weight.w,
+            next(iter(native.synapses.values())).weight.weights[0].param.rho,
         ),
     )
     _close(
@@ -516,7 +523,7 @@ def test_noisy_netstim_host_checkpoint_chunks_replay_explicit_rng_tape():
     _close(actual, expected)
     _close(actual_aux["callbacks"]["trace"], expected_aux["callbacks"]["trace"])
     values = tensors.parameters["netstim"]["parameters"]
-    weights = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    weights = next(iter(tensors.parameters["synapses"].values()))[_RAW_WEIGHT]
     targets = (values["noise"], values["interval"], weights, tape.netstim.exp_rand)
     actual_gradients = torch.autograd.grad(
         actual_aux["callbacks"]["trace"]["cell.v"].square().sum(), targets
@@ -556,10 +563,11 @@ def test_noisy_netstim_host_checkpoint_chunks_replay_explicit_rng_tape():
 def test_checkpoint_backward_preserves_shared_parameter_identity_and_gradient():
     model = _mixed_network()
     connections = tuple(model.synapses.values())
-    connections[1].weight.w = connections[0].weight.w
+    connections[1].weight.weights[0].param = connections[0].weight.weights[0].param
+    model.initialize(DT)
     functional, tensors = dn.func.make_functional_network(model)
     values = tuple(tensors.parameters["synapses"].values())
-    assert values[0]["weights"] is values[1]["weights"]
+    assert values[0][_RAW_WEIGHT] is values[1][_RAW_WEIGHT]
     expected, _ = functional.prepare_and_rollout(
         tensors.parameters, tensors.constants, tensors.state, steps=7
     )
@@ -572,7 +580,7 @@ def test_checkpoint_backward_preserves_shared_parameter_identity_and_gradient():
         checkpoint_every=3,
     )
     _close(actual, expected)
-    target = values[0]["weights"]
+    target = values[0][_RAW_WEIGHT]
     actual_gradient = torch.autograd.grad(_loss(actual), target)[0]
     expected_gradient = torch.autograd.grad(_loss(expected), target)[0]
     torch.testing.assert_close(actual_gradient, expected_gradient)
@@ -629,7 +637,7 @@ def test_checkpoint_replay_rejects_changed_parameters_tapes_and_source(mutation)
         checkpoint_every=3,
         callbacks=callbacks,
     )
-    target = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    target = next(iter(tensors.parameters["synapses"].values()))[_RAW_WEIGHT]
     if mutation == "source":
         model.eval()
     else:
@@ -685,7 +693,7 @@ def test_unrolled_compiled_network_chunk_preserves_values_and_gradients():
     )
     actual, _ = chunk(tensors.parameters, prepared, tensors.state)
     _close(actual, expected)
-    target = next(iter(tensors.parameters["continuous_synapses"].values()))["weights"]
+    target = next(iter(tensors.parameters["continuous_synapses"].values()))[_RAW_WEIGHT]
     actual_gradient = torch.autograd.grad(_loss(actual), target)[0]
     expected_gradient = torch.autograd.grad(_loss(expected), target)[0]
     torch.testing.assert_close(actual_gradient, expected_gradient)
@@ -737,7 +745,7 @@ def test_network_scan_rejects_higher_order_backward():
     prepared = functional.prepare(tensors.parameters, tensors.constants)
     chunk = functional.compile_rollout_chunk(2, execution="scan", backend="aot_eager")
     final, _ = chunk(tensors.parameters, prepared, tensors.state)
-    target = next(iter(tensors.parameters["continuous_synapses"].values()))["weights"]
+    target = next(iter(tensors.parameters["continuous_synapses"].values()))[_RAW_WEIGHT]
     with pytest.raises(dn.func.FunctionalizationError, match="first-order"):
         torch.autograd.grad(_loss(final), target, create_graph=True)
 
@@ -749,13 +757,15 @@ def test_cached_network_chunk_consumes_fresh_preparations_after_backward():
     for scale in (0.7, 1.3):
         parameters = _clone(tensors.parameters, detached=True)
         selected = next(iter(parameters["continuous_synapses"].values()))
-        selected["weights"] = (scale * selected["weights"]).requires_grad_()
+        selected[_RAW_WEIGHT] = (scale * selected[_RAW_WEIGHT]).requires_grad_()
         prepared = functional.prepare(parameters, tensors.constants)
         expected, _ = functional.rollout(parameters, prepared, tensors.state, steps=3)
         actual, _ = chunk(parameters, prepared, tensors.state)
         _close(actual, expected)
-        actual_gradient = torch.autograd.grad(_loss(actual), selected["weights"])[0]
-        expected_gradient = torch.autograd.grad(_loss(expected), selected["weights"])[0]
+        actual_gradient = torch.autograd.grad(_loss(actual), selected[_RAW_WEIGHT])[0]
+        expected_gradient = torch.autograd.grad(_loss(expected), selected[_RAW_WEIGHT])[
+            0
+        ]
         torch.testing.assert_close(actual_gradient, expected_gradient)
         assert actual_gradient.abs().sum() > 0
         voltages.append(actual["populations"]["cell"]["integrator"]["v"])

@@ -137,7 +137,9 @@ def test_checkpoint_snapshots_inference_owned_draws_and_drives_for_parameter_gra
         inputs.populations["cell"].intra.add_(1.0)
         inputs.netstim.exp_rand.add_(0.5)
     noise = tensors.parameters["netstim"]["parameters"]["noise"]
-    weights = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    weights = next(iter(tensors.parameters["synapses"].values()))[
+        "weight.weights.0.param.rho"
+    ]
     actual_loss = actual_aux["callbacks"]["trace"]["cell.v"].square().sum()
     expected_loss = expected_aux["callbacks"]["trace"]["cell.v"].square().sum()
     observed = torch.autograd.grad(actual_loss, (noise, weights))

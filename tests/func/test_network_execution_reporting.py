@@ -126,7 +126,9 @@ def test_network_checkpoint_replay_can_replace_the_shared_report():
             callbacks=callbacks,
         )
     original = kernel.execution_report()
-    weight = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    weight = next(iter(tensors.parameters["synapses"].values()))[
+        "weight.weights.0.param.rho"
+    ]
     gradient = torch.autograd.grad(
         _loss(final) + auxiliary["callbacks"]["trace"]["cell.v"].square().sum(), weight
     )[0]
@@ -285,7 +287,7 @@ def test_compiled_network_read_only_packets_reuse_fresh_preparation_and_gradient
             netstim=functional.sample_draw_tape(state, steps)
         )
     kernel = functional.compile_rollout_chunk(steps, backend="aot_eager")
-    weight = next(iter(parameters["synapses"].values()))["weights"]
+    weight = next(iter(parameters["synapses"].values()))["weight.weights.0.param.rho"]
     for _ in range(2):
         prepared = functional.prepare(parameters, constants)
         final, _ = kernel(parameters, prepared, state, inputs)

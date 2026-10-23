@@ -205,7 +205,9 @@ def test_owned_cache_restart_rng_recording_and_checkpoint_continuation_match_nat
         "initialization": "fresh",
         "execution": execution,
         "inference": execution == "while",
-        "trainable": (f"synapses.{next(iter(source.synapses))}.weights",),
+        "trainable": (
+            f"synapses.{next(iter(source.synapses))}.weight.weights.0.param.rho",
+        ),
         "callbacks": {"trace": dn.func.Recorder(("cell.v", "t"))},
         "backend": "aot_eager",
     }
@@ -235,7 +237,9 @@ def test_owned_cache_restart_rng_recording_and_checkpoint_continuation_match_nat
     torch.testing.assert_close(trace, torch.stack(frames))
     assert trace.shape[0] == 9
     if execution == "scan":
-        weight = runner.parameters["synapses"][next(iter(source.synapses))]["weights"]
+        weight = runner.parameters["synapses"][next(iter(source.synapses))][
+            "weight.weights.0.param.rho"
+        ]
         gradient = torch.autograd.grad(trace.sum(), weight)[0]
         assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
     else:

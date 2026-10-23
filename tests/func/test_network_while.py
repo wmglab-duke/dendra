@@ -361,13 +361,13 @@ def test_while_runner_preserves_shared_parameter_aliases_and_explicit_override_l
         steps=4,
         execution="while",
         inference=True,
-        trainable="synapses.*.weights",
+        trainable="synapses.*.weight.weights.0.param.rho",
         backend="aot_eager",
     )
     names = [
         name
         for name in runner.named_parameters
-        if name.startswith("synapses.") and name.endswith(".weights")
+        if name.startswith("synapses.") and name.endswith(".weight.weights.0.param.rho")
     ]
     assert len(names) == 2
     first, second = (runner.get_parameter(name) for name in names)
@@ -381,7 +381,7 @@ def test_while_runner_preserves_shared_parameter_aliases_and_explicit_override_l
     parameters = {
         **runner._parameters,
         "synapses": {
-            name: {**values, "weights": shared}
+            name: {**values, "weight.weights.0.param.rho": shared}
             for name, values in runner._parameters["synapses"].items()
         },
     }
@@ -392,7 +392,8 @@ def test_while_runner_preserves_shared_parameter_aliases_and_explicit_override_l
     actual, _ = runner(parameters=parameters)
     _close(actual, expected)
     assert all(
-        values["weights"] is shared for values in parameters["synapses"].values()
+        values["weight.weights.0.param.rho"] is shared
+        for values in parameters["synapses"].values()
     )
     assert shared.requires_grad and shared.grad_fn is not None
     assert not actual["populations"]["cell"]["integrator"]["v"].requires_grad
@@ -404,7 +405,9 @@ def test_while_runner_preserves_shared_parameter_aliases_and_explicit_override_l
             name: {**values} for name, values in parameters["synapses"].items()
         },
     }
-    next(iter(broken["synapses"].values()))["weights"] = shared.clone()
+    next(iter(broken["synapses"].values()))["weight.weights.0.param.rho"] = (
+        shared.clone()
+    )
     with pytest.raises(ValueError, match="shared|aliases"):
         runner(parameters=broken)
     assert runner.execution_report() is prior
@@ -503,7 +506,10 @@ def test_while_inference_keeps_training_source_history_and_differentiable_delay_
         steps=steps,
         execution="while",
         inference=True,
-        trainable=("synapses.*.weights", "synapses.*.delays"),
+        trainable=(
+            "synapses.*.weight.weights.0.param.rho",
+            "synapses.*.delay_ms.weights.0.param.rho",
+        ),
         backend="aot_eager",
         callbacks={"trace": dn.func.Recorder(("cell.v", "t"))},
     )
@@ -513,7 +519,7 @@ def test_while_inference_keeps_training_source_history_and_differentiable_delay_
         plan.runtime == "source_history" for plan in functional.synapses.values()
     )
     assert all(
-        values["delays"] is not None
+        values["delay_ms.weights.0.param.rho"] is not None
         for values in runner._parameters["synapses"].values()
     )
     inputs = dn.func.NetworkRolloutInput(
@@ -601,7 +607,9 @@ def test_while_rejects_ordinary_training_gradients_and_scan_retains_them():
         dn.compile(model, dt=DT, steps=4, execution="while", inference=False)
     scan = functional.compile_rollout_chunk(4, execution="scan", backend="aot_eager")
     final, _ = scan(tensors.parameters, prepared, tensors.state)
-    weights = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    weights = next(iter(tensors.parameters["synapses"].values()))[
+        "weight.weights.0.param.rho"
+    ]
     gradient = torch.autograd.grad(_loss(final), weights)[0]
     assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
 

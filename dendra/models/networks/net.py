@@ -35,7 +35,7 @@ from ..core import (
     make_intra,
 )
 from ..multi import concat_models, offsets
-from ..parametric import is_parametric, to_param
+from ..parametric import cacheable, is_parametric, to_param
 from ..rng import RNGMixin
 from ..slice import SynapseSlots
 from ._population_cache import restore_population_cache_values
@@ -648,67 +648,155 @@ def batchify_index(old_shape, n: int, i: torch.Tensor) -> torch.Tensor:
     return i_n.reshape(-1)
 
 
-def make_weight(weights, n, *, device=None, dtype=None):
-    class ParameterOrDistributionWrapper(torch.nn.Module):
-        """A simple wrapper for parameters or distributions that can be sampled."""
+def _connection_source_can_compute_uncached(source):
+    """Bypass only the unmodified, hook-free cacheable call adapter."""
+    if not (
+        isinstance(source, cacheable)
+        and type(source).repeat is cacheable.repeat
+        and type(source).forward is cacheable.forward
+        and "repeat" not in vars(source)
+        and "forward" not in vars(source)
+    ):
+        return False
+    hook_names = (
+        "_forward_pre_hooks",
+        "_forward_hooks",
+        "_backward_pre_hooks",
+        "_backward_hooks",
+    )
+    if any(getattr(source, name) for name in hook_names):
+        return False
+    module_hooks = torch.nn.modules.module
+    return not any(getattr(module_hooks, "_global" + name) for name in hook_names)
 
-        def __init__(self, param):
-            super().__init__()
-            if isinstance(param, torch.nn.Module) and (
-                device is not None or dtype is not None
-            ):
-                try:
-                    param = param.to(device=device, dtype=dtype)
-                except TypeError:
-                    param = param.to(device=device)
+
+class ParameterOrDistributionWrapper(torch.nn.Module):
+    """One deterministic parameter source or explicitly sampled distribution."""
+
+    def __init__(self, param, *, device=None, dtype=None):
+        super().__init__()
+        if isinstance(param, torch.nn.Module) and (
+            device is not None or dtype is not None
+        ):
+            try:
+                param = param.to(device=device, dtype=dtype)
+            except TypeError:
+                param = param.to(device=device)
+        if torch.is_tensor(param) and not isinstance(param, torch.nn.Parameter):
+            # Tensor sources were ordinary attributes in native checkpoints.
+            # Register them for explicit functional binding/device placement
+            # without adding a required state-dict key.
+            self.register_buffer("param", param, persistent=False)
+        else:
             self.param = param
+        self.output_device = None if device is None else torch.device(device)
+        self.output_dtype = dtype
 
-        def sample(self, n):
-            if is_parametric(self.param):
-                out = self.param.repeat(n)
-            else:
-                out = self.param.sample(n)
-            if torch.is_tensor(out) and (device is not None or dtype is not None):
-                out = out.to(
-                    device=device if device is not None else out.device,
-                    dtype=(
-                        dtype
-                        if dtype is not None and torch.is_floating_point(out)
-                        else out.dtype
-                    ),
+    def deterministic(self):
+        return (
+            torch.is_tensor(self.param)
+            or is_parametric(self.param)
+            or (
+                isinstance(self.param, torch.nn.Module)
+                and not callable(getattr(self.param, "sample", None))
+            )
+        )
+
+    def _convert(self, value):
+        if not torch.is_tensor(value):
+            raise TypeError("Connection parameter sources must return a Tensor.")
+        return value.to(
+            device=self.output_device
+            if self.output_device is not None
+            else value.device,
+            dtype=(
+                self.output_dtype
+                if self.output_dtype is not None and value.is_floating_point()
+                else value.dtype
+            ),
+        )
+
+    def derive_values(self, n):
+        """Pure deterministic evaluation shared by native and functional setup."""
+        if torch.is_tensor(self.param):
+            value = self.param.repeat(n)
+        elif _connection_source_can_compute_uncached(self.param):
+            # Parameter materialization must not reuse an inference cache from
+            # an older raw tensor generation.
+            value = self.param._compute().repeat(n)
+        elif is_parametric(self.param):
+            value = self.param.repeat(n)
+        elif self.deterministic():
+            value = self.param().repeat(n)
+        else:
+            raise TypeError("Stochastic connection parameters need explicit sampling.")
+        return self._convert(value)
+
+    def sample(self, n):
+        if self.deterministic():
+            return self.derive_values(n)
+        return self._convert(self.param.sample(n))
+
+
+class WeightExpander(torch.nn.Module):
+    """Materialize connection blocks while keeping initialized reads stable."""
+
+    _effective_value_buffer = "w"
+
+    def __init__(self, weights, n, *, device=None, dtype=None):
+        super().__init__()
+        self.weights = torch.nn.ModuleList(
+            [
+                ParameterOrDistributionWrapper(w, device=device, dtype=dtype)
+                for w in weights
+            ]
+        )
+        self.n = tuple(n)
+        if len(self.weights) != len(self.n):
+            raise ValueError(
+                "Connection parameter blocks and repeat counts must match."
+            )
+        self.register_buffer(
+            "w",
+            torch.empty(
+                0,
+                device=device if device is not None else None,
+                dtype=dtype if dtype is not None else torch.float32,
+            ),
+        )
+
+    def forward(self):
+        return self.w
+
+    def deterministic(self):
+        return all(source.deterministic() for source in self.weights)
+
+    def derive_values(self):
+        """Return deterministic effective values without committing storage."""
+        return torch.cat(
+            [
+                source.derive_values(n)
+                for source, n in zip(self.weights, self.n, strict=True)
+            ]
+        )
+
+    def init(self, reinit=True):
+        if reinit or not self.w.numel():
+            self.w = (
+                self.derive_values()
+                if self.deterministic()
+                else torch.cat(
+                    [
+                        source.sample(n)
+                        for source, n in zip(self.weights, self.n, strict=True)
+                    ]
                 )
-            return out
-
-    class WeightExpander(torch.nn.Module):
-        # Internal value-storage contract shared by NetCon's eager adapter and
-        # functional extraction. Initialization has already materialized the
-        # effective per-connection tensor; neither path re-samples it on read.
-        _effective_value_buffer = "w"
-
-        def __init__(self, weights, n):
-            super(WeightExpander, self).__init__()
-            self.weights = torch.nn.ModuleList(
-                [ParameterOrDistributionWrapper(w) for w in weights]
             )
-            self.n = n
-            self.register_buffer(
-                "w",
-                torch.empty(
-                    0,
-                    device=device if device is not None else None,
-                    dtype=dtype if dtype is not None else torch.float32,
-                ),
-            )
+        return self
 
-        def forward(self):
-            return self.w
 
-        def init(self, reinit=True):
-            if reinit or not self.w.numel():
-                self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
-            return self
-
-    return WeightExpander(weights, n)
+def make_weight(weights, n, *, device=None, dtype=None):
+    return WeightExpander(weights, n, device=device, dtype=dtype)
 
 
 def dilate(

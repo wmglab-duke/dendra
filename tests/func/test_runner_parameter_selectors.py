@@ -82,7 +82,11 @@ def test_population_runner_glob_regex_inspection_and_training_gradients():
 @pytest.mark.parametrize("kind", ("population", "network"))
 def test_runner_inspection_tracks_live_freezing_and_ignores_call_overrides(kind):
     model = _population() if kind == "population" else _mixed_network()
-    selector = "*.pas.*_param" if kind == "population" else "synapses.*.weights"
+    selector = (
+        "*.pas.*_param"
+        if kind == "population"
+        else "synapses.*.weight.weights.0.param.rho"
+    )
     runner = _compile(model, selector)
     selected = tuple(runner.trainable_parameters)
     value = runner.trainable_parameters[selected[0]]
@@ -104,16 +108,21 @@ def test_runner_inspection_tracks_live_freezing_and_ignores_call_overrides(kind)
 def test_network_alias_selection_reports_every_alias_and_accumulates_one_gradient():
     model = _mixed_network()
     connections = tuple(model.synapses.values())
-    connections[1].weight.w = connections[0].weight.w
-    names = tuple(f"synapses.{name}.weights" for name in model.synapses)
+    connections[1].weight.weights[0].param = connections[0].weight.weights[0].param
+    connections[1].weight.init()
+    names = tuple(
+        f"synapses.{name}.weight.weights.0.param.rho" for name in model.synapses
+    )
     runner = _compile(model, re.compile(re.escape(names[1]) + "$"))
     assert tuple(runner.trainable_parameters) == names
     first, second = runner.trainable_parameters.values()
     assert first is second
     assert runner.parameter_name("glob:" + names[1]) == names[1]
-    assert tuple(runner.find_parameters("synapses.*.weights")) == names
+    assert (
+        tuple(runner.find_parameters("synapses.*.weight.weights.0.param.rho")) == names
+    )
     with pytest.raises(KeyError, match="ambiguous"):
-        runner.parameter_name("synapses.*.weights")
+        runner.parameter_name("synapses.*.weight.weights.0.param.rho")
     final, _ = runner()
     gradient = torch.autograd.grad(_loss(final), first)[0]
     assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
@@ -124,7 +133,11 @@ def test_network_alias_selection_reports_every_alias_and_accumulates_one_gradien
 @pytest.mark.parametrize("kind", ("population", "network"))
 def test_inference_reports_selected_leaves_but_suppresses_execution_gradients(kind):
     model = _population() if kind == "population" else _mixed_network()
-    selector = "*.pas.*_param" if kind == "population" else "synapses.*.weights"
+    selector = (
+        "*.pas.*_param"
+        if kind == "population"
+        else "synapses.*.weight.weights.0.param.rho"
+    )
     runner = _compile(model, selector, inference=True)
     assert len(runner.trainable_parameters) == 2
     final, _ = runner()

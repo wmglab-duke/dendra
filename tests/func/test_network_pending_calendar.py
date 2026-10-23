@@ -99,14 +99,22 @@ def test_connected_schedules_preserve_enqueue_weights_and_native_checkpoint(
     checkpoint = _clone(native.state_dict_for_checkpoint(), detached=True)
     resumed.restore_dict_from_checkpoint(checkpoint)
     original = tensors.parameters["synapses"][name]
-    assert original["delays"] is None
-    weights = original["weights"] * 4
+    assert not next(iter(functional.synapses.values()))._diff_delays
+    initial_weights = native.synapses[name].weight.w.detach().clone()
+    weights = (
+        native.synapses[name]
+        .weight.weights[0]
+        .param._inverse_transform(initial_weights * 4)
+    )
     parameters = {
         **tensors.parameters,
-        "synapses": {name: {**original, "weights": weights}},
+        "synapses": {name: {**original, "weight.weights.0.param.rho": weights}},
     }
+    effective_weights = functional._materialize_connections(
+        parameters, tensors.constants
+    )["synapses"][name]["weights"]
     for target in (native, resumed):
-        target.synapses[name].weight.w = weights.detach().clone()
+        target.synapses[name].weight.w = effective_weights.detach().clone()
     deliveries = []
     for _ in range(12):
         incoming = state
@@ -127,7 +135,7 @@ def test_connected_schedules_preserve_enqueue_weights_and_native_checkpoint(
     factors = [10.25, 5.0] if backend == "bitpacked_history" else [7.25, 2.0]
     torch.testing.assert_close(
         torch.stack(deliveries).sum(dim=0).flatten(),
-        original["weights"] * torch.tensor(factors, dtype=DTYPE),
+        initial_weights * torch.tensor(factors, dtype=DTYPE),
     )
     assert _pending_count(native) == 0
     _close(tensors, frozen)

@@ -223,8 +223,8 @@ def run_demo(*, compiled=False):
     event = next(iter(parameters["synapses"].values()))
     continuous = next(iter(parameters["continuous_synapses"].values()))
     targets = (
-        event["weights"],
-        continuous["weights"],
+        event["weight.weights.0.param.rho"],
+        continuous["weight.weights.0.param.rho"],
         continuous["transform_parameters"]["scale"],
         parameters["netstim"]["parameters"]["noise"],
         left_current,

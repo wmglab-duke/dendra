@@ -113,15 +113,18 @@ when constructing an optimizer from that mapping. `runner.get_parameter(...)`
 resolves one exact, partial, glob, or regular-expression query. The runner's
 parameters remain independent of the source Network.
 
-Connection weight/delay sources and NetStim parameter sources do not retain
-their raw transformations in functional packets. Connection weights, event
-delays selected for differentiation, and NetStim's `interval`, `start`,
-`noise`, and `tau` are exposed as effective numerical values. Trainable
-selectors refer to those effective fields; parameters inside their source
-modules are currently unavailable as optimizer leaves. Fixed connection
-delays and NetStim's integer `max_spikes` remain configuration, rather than
-trainable parameters. Registering a PyTorch parametrization directly on
-NetStim is currently unsupported. Continuous connections retain their separately
+Connection weight/delay sources retain their original and transform tensors
+under raw paths such as `weight.weights.0.param.parametrizations.rho.original`.
+They use the same native source evaluation during functional preparation; see
+{doc}`A39_functional_connection_parameters` for registration, parameter
+selection, and initialization examples. Fixed connection delays retain their
+frozen routing schema.
+
+NetStim's `interval`, `start`, `noise`, and `tau` are exposed as effective
+numerical values. Parameters inside those source modules are currently
+unavailable as optimizer leaves, and registering a PyTorch parametrization
+directly on NetStim is currently unsupported. NetStim's integer `max_spikes`
+remains configuration. Continuous connections retain their separately
 registered stateless transform parameters, and tensor schedules retain their
 explicit times and amplitudes. See
 {doc}`A18_functional_continuous_connectivity` and

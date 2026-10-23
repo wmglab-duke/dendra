@@ -106,7 +106,9 @@ def test_host_normalizes_public_packets_before_coefficient_preparation(
         tensors.parameters, tensors.constants, tensors.state, steps=5
     )
     _close(actual, expected)
-    weight = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    weight = next(iter(tensors.parameters["synapses"].values()))[
+        "weight.weights.0.param.rho"
+    ]
     observed = torch.autograd.grad(_loss(actual), weight)[0]
     oracle = torch.autograd.grad(_loss(expected), weight)[0]
     torch.testing.assert_close(observed, oracle)
@@ -145,7 +147,9 @@ def test_normalized_checkpoint_operands_keep_original_public_rebinding_guards(pa
         key = next(iter(values))
         values[key] = values[key].clone()
         owner["populations"] = populations
-    weight = next(iter(tensors.parameters["synapses"].values()))["weights"]
+    weight = next(iter(tensors.parameters["synapses"].values()))[
+        "weight.weights.0.param.rho"
+    ]
     with pytest.raises(
         dn.func.FunctionalizationError, match="changed after checkpoint"
     ):

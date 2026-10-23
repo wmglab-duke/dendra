@@ -162,8 +162,8 @@ def run_demo(*, compiled=False):
     event = next(iter(parameters["synapses"].values()))
     continuous = next(iter(parameters["continuous_synapses"].values()))
     targets = (
-        event["weights"],
-        continuous["weights"],
+        event["weight.weights.0.param.rho"],
+        continuous["weight.weights.0.param.rho"],
         continuous["transform_parameters"]["scale"],
     )
     gradients = torch.autograd.grad(functional_loss(state), targets, retain_graph=True)
@@ -173,8 +173,8 @@ def run_demo(*, compiled=False):
     native_gradients = torch.autograd.grad(
         native_loss(reference),
         (
-            native_event.weight.w,
-            native_continuous.weight.w,
+            native_event.weight.weights[0].param.rho,
+            native_continuous.weight.weights[0].param.rho,
             native_continuous.transform.scale,
         ),
     )

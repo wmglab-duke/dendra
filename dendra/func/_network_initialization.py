@@ -38,12 +38,17 @@ class NetworkInitializationInput(NamedTuple):
     separate runtime inputs. A bound Network-wide ``cache`` takes precedence
     over individual Population caches; otherwise each Population's input
     controls its own initialization at its position in the authored order.
+    ``reinit_weights`` and ``reinit_delays`` refresh connection materializations
+    from their raw sources. A false flag retains the preceding explicit
+    materialization, matching native Network initialization.
     """
 
     populations: dict[str, InitializationInput]
     t: torch.Tensor
     netstim_draw: NetStimDraw | None = None
     cache: NetworkInitializationCache | None = None
+    reinit_weights: bool = True
+    reinit_delays: bool = True
 
 
 def nonpersistent_material_cache_failures(functional):
@@ -441,7 +446,6 @@ def _cache_alias_plan(functional, writers, readers):
     # Resolve outside execution parameters against the original native Tensor
     # as well; a native state-dict copy still updates every such reader.
     from ._continuous_transform import _named_tensors
-    from ._netcon import _effective_tensor
     from ._network import _tensor_paths
     from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
 
@@ -451,27 +455,31 @@ def _cache_alias_plan(functional, writers, readers):
         "continuous_synapses": {},
         "netstim": None,
     }
+    native_constants = {"synapses": {}, "continuous_synapses": {}}
     for name, plan in functional.populations.items():
         native["populations"][name] = plan._parameter_sources()
     for name, plan in functional.synapses.items():
         connection = plan._source
+        sources = functional._connection_parameter_plans["synapses", name]
         native["synapses"][name] = {
-            "weights": _effective_tensor(connection.weight, "weight"),
-            "delays": _effective_tensor(connection.delay_ms, "delay")
-            if plan._diff_delays
-            else None,
+            **sources.parameter_sources(connection),
             "schedule": TensorScheduleTensors(**_TensorSchedulePlan._values(connection))
             if functional._parameter_schema["synapses"][name]["schedule"] is not None
             else None,
         }
+        native_constants["synapses"][name] = sources.cache_constant_sources(connection)
     for name, plan in functional.continuous_synapses.items():
         connection = plan._source
+        sources = functional._connection_parameter_plans["continuous_synapses", name]
         native["continuous_synapses"][name] = {
-            "weights": _effective_tensor(connection.weight, "weight"),
+            **sources.parameter_sources(connection),
             "transform_parameters": _named_tensors(connection.transform)
             if isinstance(connection.transform, torch.nn.Module)
             else None,
         }
+        native_constants["continuous_synapses"][name] = sources.cache_constant_sources(
+            connection
+        )
     if functional.netstim is not None:
         source = functional.netstim._source
         native["netstim"] = {
@@ -498,6 +506,18 @@ def _cache_alias_plan(functional, writers, readers):
             parameters = groups[frame][1]
             if path not in parameters:
                 parameters.append(path)
+    for path, source in _tensor_paths(native_constants):
+        frame = _cache_storage_frame(source)
+        if frame not in groups and any(
+            overlaps(frame, other) for other in written_frames
+        ):
+            groups[frame] = [None, [], [], []]
+            frame_sources[frame] = source
+        if frame in groups:
+            constants = groups[frame][2]
+            if path not in constants:
+                constants.append(path)
+            constant_frames[path] = frame
     result, outputs = [], []
     for frame, (winner, parameters, constants, states) in groups.items():
         if not (parameters or constants or states):
@@ -665,6 +685,9 @@ def _validate(functional, parameters, constants, state, inputs, draw, *, require
     functional._validate_state(state)
     if not isinstance(inputs, NetworkInitializationInput):
         raise TypeError("inputs must be a NetworkInitializationInput")
+    for name in ("reinit_weights", "reinit_delays"):
+        if type(getattr(inputs, name)) is not bool:
+            raise TypeError(f"initialization.{name} must be a bool")
     functional._validate_initialization_cache(inputs.cache)
     if not isinstance(inputs.populations, Mapping) or set(inputs.populations) != set(
         functional.populations
@@ -766,6 +789,19 @@ def _initialize_components(
                 state["clock"]["duration_remainder"]
             ),
         }
+        for (collection, name), plan in functional._connection_parameter_plans.items():
+            connection_constants = plan.initialize_constants(
+                effective[collection][name],
+                effective_constants[collection][name],
+                reinit_weights=inputs.reinit_weights,
+                reinit_delays=inputs.reinit_delays,
+            )
+            effective_constants = _replace_at(
+                effective_constants, (collection, name), connection_constants
+            )
+        connections = functional._materialize_connections(
+            effective, effective_constants
+        )
         synapses = {
             name: plan.initial_state(state["synapses"][name], t=time)
             for name, plan in functional.synapses.items()
@@ -779,11 +815,22 @@ def _initialize_components(
             # refreshing their parameters, and before NetStim initialization.
             for name, cache in inputs.cache.synapses.items():
                 synapses[name] = functional.synapses[name].restore_cache(
-                    effective["synapses"][name], synapses[name], cache, t=time
+                    {
+                        **connections["synapses"][name],
+                        "schedule": effective["synapses"][name]["schedule"],
+                    },
+                    synapses[name],
+                    cache,
+                    t=time,
                 )
             for name, cache in inputs.cache.continuous_synapses.items():
                 continuous[name] = functional.continuous_synapses[name].restore_cache(
-                    effective["continuous_synapses"][name],
+                    {
+                        "weights": connections["continuous_synapses"][name]["weights"],
+                        "transform_parameters": effective["continuous_synapses"][name][
+                            "transform_parameters"
+                        ],
+                    },
                     continuous[name],
                     cache,
                     t=time,

@@ -23,7 +23,7 @@ def test_network_constructor_under_inference_mode_owns_versioned_restart_operand
     inference,
 ):
     model = _mixed_network()
-    name = f"synapses.{next(iter(model.synapses))}.weights"
+    name = f"synapses.{next(iter(model.synapses))}.weight.weights.0.param.rho"
     with torch.inference_mode():
         runner = dn.compile(
             model,

@@ -13,6 +13,7 @@ from torch.utils import _pytree as pytree
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from tests.func.test_network import (
+    _RAW_WEIGHT,
     DT,
     DTYPE,
     _clone,
@@ -43,7 +44,7 @@ def _mutable(tree):
 
 
 def _event_names(model):
-    return tuple(f"synapses.{name}.weights" for name in model.synapses)
+    return tuple(f"synapses.{name}.{_RAW_WEIGHT}" for name in model.synapses)
 
 
 def _targets(runner, names):
@@ -154,16 +155,19 @@ def test_network_runner_keeps_parameter_tree_readonly_and_live_tensor_leaves():
     selected = runner.get_parameter(name)
     assert isinstance(selected, torch.nn.Parameter)
     assert runner.named_parameters[name] is selected
-    assert runner.parameters["synapses"][connection]["weights"] is selected
+    assert runner.parameters["synapses"][connection][_RAW_WEIGHT] is selected
     assert runner.parameter_name(name) == name
-    assert selected.data_ptr() != model.synapses[connection].weight.w.data_ptr()
+    assert (
+        selected.data_ptr()
+        != model.synapses[connection].weight.weights[0].param.rho.data_ptr()
+    )
     assert all(
         not value.requires_grad
         for key, value in runner.named_parameters.items()
         if key != name
     )
     with pytest.raises(TypeError):
-        runner.parameters["synapses"][connection]["weights"] = selected.clone()
+        runner.parameters["synapses"][connection][_RAW_WEIGHT] = selected.clone()
     with pytest.raises(TypeError):
         runner.named_parameters[name] = selected.clone()
     with pytest.raises(TypeError):
@@ -183,7 +187,8 @@ def test_network_runner_keeps_parameter_tree_readonly_and_live_tensor_leaves():
 def test_network_trainable_selection_and_checkpoint_preserve_shared_weight_identity():
     model = _mixed_network()
     first, second = tuple(model.synapses.values())
-    second.weight.w = first.weight.w
+    second.weight.weights[0].param = first.weight.weights[0].param
+    model.initialize(DT)
     names = _event_names(model)
     runner = _compile(
         model,
@@ -195,7 +200,7 @@ def test_network_trainable_selection_and_checkpoint_preserve_shared_weight_ident
     target = runner.get_parameter(names[0])
     assert target is runner.get_parameter(names[1])
     assert isinstance(target, torch.nn.Parameter)
-    assert target.data_ptr() != first.weight.w.data_ptr()
+    assert target.data_ptr() != first.weight.weights[0].param.rho.data_ptr()
     expected, _ = runner.functional.prepare_and_rollout(
         runner.parameters, runner.constants, runner.initial_state, steps=7
     )
@@ -207,7 +212,7 @@ def test_network_trainable_selection_and_checkpoint_preserve_shared_weight_ident
     assert torch.isfinite(actual_gradient).all() and actual_gradient.abs().sum() > 0
     broken = _mutable(runner.parameters)
     second_name = tuple(model.synapses)[1]
-    broken["synapses"][second_name]["weights"] = target.clone()
+    broken["synapses"][second_name][_RAW_WEIGHT] = target.clone()
     with pytest.raises(ValueError, match="shared|alias"):
         runner(parameters=broken)
 
@@ -361,7 +366,7 @@ def test_external_network_parameters_keep_user_history_without_replacing_default
     defaults = _clone(_mutable(runner.parameters), detached=True)
     gain = torch.tensor(1.2, dtype=DTYPE, requires_grad=True)
     parameters = _mutable(runner.parameters)
-    parameters["synapses"][connection]["weights"] = runner.get_parameter(name) * gain
+    parameters["synapses"][connection][_RAW_WEIGHT] = runner.get_parameter(name) * gain
     expected, _ = runner.functional.prepare_and_rollout(
         parameters, runner.constants, runner.initial_state, steps=4
     )

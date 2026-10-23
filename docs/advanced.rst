@@ -46,3 +46,4 @@ Advanced
    advanced/A36_functional_initialization_sources.md
    advanced/A37_functional_material_processes.md
    advanced/A38_functional_torch_parametrizations.md
+   advanced/A39_functional_connection_parameters.md

@@ -26,7 +26,9 @@ STEPS = 3
 def run_demo():
     # region fresh-compile
     model = make_network()
-    event_names = tuple(f"synapses.{name}.weights" for name in model.synapses)
+    event_names = tuple(
+        f"synapses.{name}.weight.weights.0.param.rho" for name in model.synapses
+    )
     callbacks = {"trace": dn.func.Recorder(("left.v", "right.v", "t"))}
     runner = dn.compile(
         model,
@@ -69,6 +71,7 @@ def run_demo():
     final, final_aux = runner(
         prefix,
         parameters=prefix_aux["parameters"],
+        constants=prefix_aux["constants"],
         inputs=slice_inputs(inputs, STEPS, 2 * STEPS),
         callback_state=prefix_aux["callbacks"].state,
     )

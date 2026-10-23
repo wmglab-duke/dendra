@@ -93,7 +93,10 @@ def run_demo(runtime="bitpacked_history", *, backend="aot_eager"):
     parameters["synapses"] = {
         name: {
             **parameters["synapses"][name],
-            "weights": parameters["synapses"][name]["weights"] * 2,
+            "weight.weights.0.param.rho": parameters["synapses"][name][
+                "weight.weights.0.param.rho"
+            ]
+            + 0.2,
         }
     }
     final, second = runner(
@@ -102,7 +105,10 @@ def run_demo(runtime="bitpacked_history", *, backend="aot_eager"):
         callback_state=first["callbacks"].state,
     )
     # endregion continuation
-    native.synapses[name].weight.w = parameters["synapses"][name]["weights"].clone()
+    effective = runner.functional._materialize_connections(
+        parameters, runner.constants
+    )["synapses"][name]["weights"]
+    native.synapses[name].weight.w = effective.clone()
     for _ in range(STEPS):
         native.step()
         trace.append(native.cell.v.clone())
@@ -118,7 +124,7 @@ def run_demo(runtime="bitpacked_history", *, backend="aot_eager"):
     restored = make_network(runtime)
     restored.restore_dict_from_checkpoint(checkpoint)
     for target in (resumed, restored):
-        target.synapses[name].weight.w = parameters["synapses"][name]["weights"].clone()
+        target.synapses[name].weight.w = effective.clone()
         for _ in range(STEPS):
             target.step()
         assert_tree(final, runner.functional.extract(target).state)

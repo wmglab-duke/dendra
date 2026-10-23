@@ -394,7 +394,6 @@ class FunctionalNetCon:
         self._post_idx = _snapshot(netcon.post_idx)
         self._delay_steps = _snapshot(netcon.inference_delay_steps)
         self._dt = _snapshot(netcon.dt)
-        self._physical_delays = _snapshot(_effective_tensor(netcon.delay_ms, "delay"))
         self._track_events = bool(netcon.track_events)
         # NetStim gates are already generated activity. Its adapter never uses
         # the NetCon threshold, even when a default finite threshold was stored.
@@ -746,7 +745,11 @@ class FunctionalNetCon:
             or (
                 not self._diff_delays
                 and not torch.equal(
-                    _effective_tensor(netcon.delay_ms, "delay"), self._physical_delays
+                    (_effective_tensor(netcon.delay_ms, "delay") / netcon.dt)
+                    .round()
+                    .long()
+                    .clamp_min(1),
+                    self._delay_steps,
                 )
             )
         ):

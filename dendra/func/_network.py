@@ -19,6 +19,7 @@ from dendra.models.networks.net import (
 from dendra.models.networks.net import step as _native_step
 
 from . import _network_parameters
+from ._connection_parameters import ConnectionParameterPlan
 from ._continuous import FunctionalContinuousCon
 from ._continuous_transform import _named_tensors
 from ._initialization_sources import (
@@ -29,7 +30,7 @@ from ._initialization_sources import (
 )
 from ._mechanism_delays import network_mechanism_delay_alias_signature
 from ._mechanism_injections import network_mechanism_injection_alias_signature
-from ._netcon import FunctionalNetCon, _effective_tensor, _snapshot
+from ._netcon import FunctionalNetCon, _snapshot
 from ._netstim import FunctionalNetStim
 from ._network_bindings import AliasSnapshots, SourceBinding
 from ._network_initialization import (
@@ -50,7 +51,7 @@ class NetworkTensors(NamedTuple):
     """Aggregate parameters, constants, and complete-boundary carry.
 
     Extraction produces independent snapshots retaining genuine shared
-    parameter identities. Fresh initialization returns effective parameters,
+    parameter identities. Fresh initialization returns the resulting raw parameters,
     preserving unchanged explicit leaves and their gradient history. Component
     names match the ordinary Network's collections. Clock and RNG byte tensors
     retain their native devices, including CPU clock metadata in an otherwise
@@ -337,9 +338,9 @@ class FunctionalNetwork:
     timestep. Complete-boundary carry contains clocks, queues and RNG state;
     receiver scratch is local to a single invocation.
 
-    Parameters/constants follow the component adapters' conventions. Extracted
-    Population parameters are raw parameters, while projection and NetStim
-    parameters are effective values. Snapshot extraction is detached and does
+    Parameters/constants follow the component adapters' conventions. Population
+    and connection parameters retain their raw source coordinates and shared
+    identities; NetStim parameters are effective values. Snapshot extraction is detached and does
     not perform fresh initialization. ``commit_state_`` publishes runtime carry
     only; align native parameters/schedules separately before continuation.
     Topology, source bindings, mode, timestep, and native phase ordering are
@@ -439,6 +440,15 @@ class FunctionalNetwork:
             name: FunctionalContinuousCon(connection)
             for name, connection in self._schedule.continuous_synapses
         }
+        self._connection_parameter_plans = {
+            (collection, name): ConnectionParameterPlan(connection)
+            for collection in ("synapses", "continuous_synapses")
+            for name, connection in getattr(network, collection).items()
+        }
+        for plan in self._connection_parameter_plans.values():
+            plan._validate_runtime_ownership(
+                plan._source, owners=network.populations.values()
+            )
         self.netstim = (
             None if network.netstim is None else FunctionalNetStim(network.netstim)
         )
@@ -771,6 +781,8 @@ class FunctionalNetwork:
             *self.continuous_synapses.values(),
         ):
             plan._validate_source()
+        for plan in self._connection_parameter_plans.values():
+            plan.validate_source()
         if network_table_alias_signature(network) != self._source_table_aliases:
             raise FunctionalizationError(
                 "The Network TABLE tensor aliases changed; lower again."
@@ -841,7 +853,12 @@ class FunctionalNetwork:
             "continuous_synapses": {},
             "netstim": None,
         }
-        constants = {"populations": {}, "netstim": None}
+        constants = {
+            "populations": {},
+            "synapses": {},
+            "continuous_synapses": {},
+            "netstim": None,
+        }
         state = {
             "populations": {},
             "synapses": {},
@@ -866,45 +883,37 @@ class FunctionalNetwork:
             state["populations"][name] = packet.state
         for name, plan in self.synapses.items():
             connection = network.synapses[name]
+            sources = self._connection_parameter_plans["synapses", name]
+            source_parameters, source_constants = sources.extract(snapshots, connection)
             packet = plan.extract(connection)
             schedule = (
                 None
                 if packet.schedule is None
                 else TensorScheduleTensors(**_TensorSchedulePlan._values(connection))
             )
-            parameters["synapses"][name] = snapshots.tree(
-                {
-                    "weights": _effective_tensor(connection.weight, "weight"),
-                    "delays": _effective_tensor(connection.delay_ms, "delay")
-                    if packet.delays is not None
-                    else None,
-                    "schedule": schedule,
-                },
-                {
-                    "weights": packet.weights,
-                    "delays": packet.delays,
-                    "schedule": packet.schedule,
-                },
-            )
+            parameters["synapses"][name] = {
+                **source_parameters,
+                "schedule": snapshots.tree(schedule, packet.schedule),
+            }
+            constants["synapses"][name] = source_constants
             state["synapses"][name] = packet.state
         for name, plan in self.continuous_synapses.items():
             connection = network.continuous_synapses[name]
+            sources = self._connection_parameter_plans["continuous_synapses", name]
+            source_parameters, source_constants = sources.extract(snapshots, connection)
             packet = plan.extract(connection)
             native_transform = (
                 _named_tensors(connection.transform)
                 if isinstance(connection.transform, torch.nn.Module)
                 else None
             )
-            parameters["continuous_synapses"][name] = snapshots.tree(
-                {
-                    "weights": _effective_tensor(connection.weight, "weight"),
-                    "transform_parameters": native_transform,
-                },
-                {
-                    "weights": packet.weights,
-                    "transform_parameters": packet.transform_parameters,
-                },
-            )
+            parameters["continuous_synapses"][name] = {
+                **source_parameters,
+                "transform_parameters": snapshots.tree(
+                    native_transform, packet.transform_parameters
+                ),
+            }
+            constants["continuous_synapses"][name] = source_constants
             state["continuous_synapses"][name] = packet.state
         if self.netstim is not None:
             source = network.netstim
@@ -1010,9 +1019,15 @@ class FunctionalNetwork:
                 )
         if (network.netstim is None) != (self.netstim is None):
             raise FunctionalizationError("Network NetStim presence does not match.")
+        for (collection, name), plan in self._connection_parameter_plans.items():
+            connection = getattr(network, collection)[name]
+            plan.validate_source(connection)
+            plan._validate_runtime_ownership(
+                connection, owners=network.populations.values()
+            )
 
     def prepare(self, parameters, constants):
-        """Prepare reusable Population coefficients outside compiled code."""
+        """Prepare reusable Population and connection values outside compiled code."""
         self._validate_source()
         self._validate_parameters(parameters)
         _validate_tree(constants, self._constant_schema, "constants")
@@ -1024,6 +1039,55 @@ class FunctionalNetwork:
                 for name, plan in self.populations.items()
             },
             "netstim": constants["netstim"],
+            "connections": {
+                collection: {
+                    name: plan.prepare(
+                        parameters[collection][name], constants[collection][name]
+                    )
+                    for (kind, name), plan in self._connection_parameter_plans.items()
+                    if kind == collection
+                }
+                for collection in ("synapses", "continuous_synapses")
+            },
+        }
+
+    def _connection_values(self, collection, name, values):
+        projection = getattr(self, collection)[name]
+        if collection == "continuous_synapses" or not projection._diff_delays:
+            steps = (values["delays"] / projection._dt).round().long()
+            if collection == "synapses":
+                steps = steps.clamp_min(1)
+            valid = (steps == projection._delay_steps).all()
+            message = "Connection delays change frozen integer routing; lower the Network again"
+            if torch.compiler.is_compiling():
+                torch._assert_async(valid, message)
+            elif torch._C._are_functorch_transforms_active():
+                # The predicate carries no gradient. Inspect every physical
+                # lane without sending a BatchedTensor through _assert_async,
+                # whose operator has no vmap batching rule.
+                functorch = torch._C._functorch
+                while functorch.is_functorch_wrapped_tensor(valid):
+                    valid = functorch.get_unwrapped(valid)
+                torch._assert_async(valid.all(), message)
+            elif not bool(valid):
+                raise FunctionalizationError(message)
+            return {**values, "delays": None}
+        return values
+
+    def _materialize_connections(self, parameters, constants):
+        return {
+            collection: {
+                name: self._connection_values(
+                    collection,
+                    name,
+                    plan.materialize(
+                        parameters[collection][name], constants[collection][name]
+                    ),
+                )
+                for (kind, name), plan in self._connection_parameter_plans.items()
+                if kind == collection
+            }
+            for collection in ("synapses", "continuous_synapses")
         }
 
     def sample_step_draw(self, state):
@@ -1045,14 +1109,23 @@ class FunctionalNetwork:
                 for name, plan in self.populations.items()
             },
             "netstim": constants["netstim"],
+            "connections": self._materialize_connections(parameters, constants),
         }
 
     def _validate_prepared(self, prepared, parameters):
         if (
             not isinstance(prepared, Mapping)
-            or set(prepared) != {"populations", "netstim"}
+            or set(prepared) != {"populations", "netstim", "connections"}
             or not isinstance(prepared["populations"], Mapping)
             or set(prepared["populations"]) != set(self.populations)
+            or not isinstance(prepared["connections"], Mapping)
+            or set(prepared["connections"]) != {"synapses", "continuous_synapses"}
+            or any(
+                not isinstance(prepared["connections"][collection], Mapping)
+                or set(prepared["connections"][collection])
+                != set(getattr(self, collection))
+                for collection in ("synapses", "continuous_synapses")
+            )
         ):
             raise ValueError("prepared must match this Network's component plans")
         _validate_tree(
@@ -1066,6 +1139,21 @@ class FunctionalNetwork:
                 for name, plan in self.populations.items()
             },
             "netstim": prepared["netstim"],
+            "connections": {
+                collection: {
+                    name: self._connection_values(
+                        collection,
+                        name,
+                        plan.validate_prepared(
+                            prepared["connections"][collection][name],
+                            parameters[collection][name],
+                        ),
+                    )
+                    for (kind, name), plan in self._connection_parameter_plans.items()
+                    if kind == collection
+                }
+                for collection in ("synapses", "continuous_synapses")
+            },
         }
 
     def make_callbacks(self, callbacks):
@@ -1289,7 +1377,7 @@ class FunctionalNetwork:
                 "continuous_synapses", name, parameters, prepared, states, stimulus
             )
             queue, payload, mask = plan._advance_values(
-                value["weights"],
+                prepared["connections"]["continuous_synapses"][name]["weights"],
                 queue,
                 source,
                 transform_parameters=value["transform_parameters"],
@@ -1310,10 +1398,11 @@ class FunctionalNetwork:
         events = {}
         for name, plan in self.synapses.items():
             value = parameters["synapses"][name]
+            effective = prepared["connections"]["synapses"][name]
             queue, payload = plan.read_due(
                 state["synapses"][name],
-                weights=value["weights"],
-                delays=value["delays"],
+                weights=effective["weights"],
+                delays=effective["delays"],
             )
             post, target = self._targets["synapses", name]
             receiver = self.populations[post]
@@ -1329,10 +1418,10 @@ class FunctionalNetwork:
                 "synapses", name, parameters, prepared, states, stimulus
             )
             events[name] = plan.advance(
-                value["weights"],
+                effective["weights"],
                 queue,
                 source,
-                delays=value["delays"],
+                delays=effective["delays"],
                 schedule=value["schedule"],
             )
         aux = {}

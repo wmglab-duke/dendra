@@ -85,7 +85,8 @@ def _stimulus(*, noise=0.6, schedule=None, long_interval=False, twins=False):
         _initialize(network)
         if twins:
             first, second = network.synapses.values()
-            second.weight.w = first.weight.w
+            second.weight.weights[0].param = first.weight.weights[0].param
+            second.weight.init()
         if schedule in ("tensor", "mixed"):
             stimulus.schedule(
                 [0, 1, 1],
@@ -176,13 +177,21 @@ def test_packed_pending_source_uses_delivery_time_weights_and_fixed_offsets():
     _close(state, functional.extract(native).state)
     assert state["netstim"]["spike_counts"].eq(1).all()
     original = tensors.parameters["synapses"][name]
-    assert original["delays"] is None
-    weights = original["weights"] * 4.0
+    assert not next(iter(functional.synapses.values()))._diff_delays
+    initial_weights = native.synapses[name].weight.w.detach().clone()
+    weights = (
+        native.synapses[name]
+        .weight.weights[0]
+        .param._inverse_transform(initial_weights * 4.0)
+    )
     parameters = {
         **tensors.parameters,
-        "synapses": {name: {**original, "weights": weights}},
+        "synapses": {name: {**original, "weight.weights.0.param.rho": weights}},
     }
-    native.synapses[name].weight.w = weights.detach().clone()
+    effective_weights = functional._materialize_connections(
+        parameters, tensors.constants
+    )["synapses"][name]["weights"]
+    native.synapses[name].weight.w = effective_weights.detach().clone()
     scratch = []
     for _ in range(8):
         state, _ = functional.prepare_and_step(
@@ -196,7 +205,9 @@ def test_packed_pending_source_uses_delivery_time_weights_and_fixed_offsets():
         scratch.append(state["synapses"][name]["delivery_buffer"].clone())
     # The source emitted before replacement; its two distinct initialized
     # integer delays still deliver the replacement weights exactly once.
-    torch.testing.assert_close(torch.stack(scratch).sum(dim=0).reshape(-1), weights)
+    torch.testing.assert_close(
+        torch.stack(scratch).sum(dim=0).reshape(-1), effective_weights
+    )
     assert state["synapses"][name]["delivery_buffer"].count_nonzero() == 0
 
 
@@ -301,7 +312,7 @@ def test_compiled_packed_inference_restarts_and_continues_nonempty_carry(
         inference=True,
         initialization=initialization,
         backend="aot_eager",
-        trainable="synapses.*.weights",
+        trainable="synapses.*.weight.weights.0.param.rho",
         callbacks={"trace": dn.func.Recorder(("cell.v", "t"))},
     )
     initial = _clone(runner.initial_state, detached=True)

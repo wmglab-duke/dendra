@@ -142,7 +142,12 @@ Initialization follows native order: Populations in declaration order, Network
 clock reset and Population clock synchronization, event connections,
 continuous connections, then NetStim. Parameter replacements from each
 Population initialization propagate across every shared parameter alias before
-the next Population initializes. Fresh-policy calls return the resulting
+the next Population initializes or connections materialize their weights and
+delays. `NetworkInitializationInput.reinit_weights` and `reinit_delays` default
+to `True`, refreshing those values from their raw sources. Set either flag to
+`False` to retain its preceding explicit materialization. Return and reuse
+`aux["constants"]` to preserve that materialization across fresh initialization
+boundaries. Fresh-policy calls return the resulting
 effective parameter packet in `aux["parameters"]`; initialization does not
 overwrite the runner's independent optimizer leaves. If an initialization
 transform writes parameters, continue with that effective packet explicitly:
@@ -220,13 +225,18 @@ under collection/component-qualified dotted names:
 :dedent: 4
 ```
 
-For example, Population names prefix their raw parameter paths, while
-connection weights use `synapses.<connection-name>.weights`. Continuous
+For example, Population names prefix their raw parameter paths. A connection
+weight supplied as a `PositiveParam` uses a raw path such as
+`synapses.<connection-name>.weight.weights.0.param.rho`. Delay sources use the
+corresponding `delay_ms.weights` path. The numerical weight and physical delay
+are derived during preparation, retaining their constraints and any supported
+PyTorch parametrizations. Continuous
 transform parameters use
 `continuous_synapses.<connection-name>.transform_parameters.<parameter-name>`.
 NetStim renewal parameters appear under `netstim.parameters`, and schedule
 values retain named fields such as `schedule.times` and
-`schedule.amplitudes`.
+`schedule.amplitudes`. See {doc}`A39_functional_connection_parameters` for
+connection source registration, shared optimizer leaves, and refresh policies.
 
 `trainable` accepts exact names, unique partial names, glob patterns, and
 explicit regex selectors. For example:
@@ -237,17 +247,20 @@ import re
 runner = dn.compile(
     network, dt=dt, steps=100, inference=False,
     trainable=(
-        "synapses.*.weights",
+        "synapses.*.weight.weights.*.param.*",
         re.compile(r"^populations\.cell\..*\.leak\.g_param$"),
     ),
 )
 ```
 
 Globs match the complete dotted name case-sensitively; `*` spans dots.
-`glob:synapses.*.weights` is equivalent to the bare glob above. Regex selectors
+`glob:synapses.*.weight.weights.*.param.*` is equivalent to the bare glob above.
+Regex selectors
 use `re:` strings or compiled string patterns, with regex `search` semantics.
-For example, `r"re:^synapses\..*\.(weights|delays)$"` selects event weights and
-explicit differentiable delays. Empty/invalid selectors and unmatched
+For example, `r"re:^synapses\..*\.(weight|delay_ms)\.weights\."` selects the
+available raw event weight and delay source parameters. A fixed delay remains
+frozen routing configuration; changing its rounded timestep requires lowering
+the Network again. Empty/invalid selectors and unmatched
 `trainable` selectors raise an error. A plain substring still must identify
 one name, while a pattern can select several. Selected leaves must have a
 floating-point or complex dtype; narrow broad patterns that also match
@@ -259,8 +272,8 @@ Preview candidates before compiling, or search a runner's independent copies:
 
 ```python
 _, tensors = dn.func.make_functional_network(network)
-print(tuple(tensors.find_parameters("synapses.*.weights")))
-print(tuple(runner.find_parameters(r"re:\.(weights|delays)$")))
+print(tuple(tensors.find_parameters("synapses.*.weight.weights.*")))
+print(tuple(runner.find_parameters(r"re:\.(weight|delay_ms)\.weights\.")))
 ```
 
 `runner.parameter_name(query)` resolves an exact name or one unique selector

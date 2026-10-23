@@ -55,7 +55,7 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         "initialization": "fresh",
         "execution": execution,
         "inference": execution == "while",
-        "trainable": (f"synapses.{connection}.weights",),
+        "trainable": (f"synapses.{connection}.weight.weights.0.param.rho",),
         "callbacks": {"trace": dn.func.Recorder(("cell.v", "t"))},
         "backend": backend,
     }
@@ -67,11 +67,13 @@ def run_demo(*, execution="scan", backend="aot_eager"):
     assert isinstance(cache, dn.func.NetworkInitializationCache)
     # endregion compile
     # region current-weights
-    weight = runner.parameters["synapses"][connection]["weights"]
+    weight = runner.parameters["synapses"][connection]["weight.weights.0.param.rho"]
     with torch.no_grad():
-        weight.mul_(1.5)
-        uninterrupted.parameters["synapses"][connection]["weights"].mul_(1.5)
-    # Raw source histories are replayed with these current connection values.
+        weight.add_(0.4)
+        uninterrupted.parameters["synapses"][connection][
+            "weight.weights.0.param.rho"
+        ].add_(0.4)
+    # Raw source histories are replayed with weights derived from these sources.
     initialized = runner.functional.initialize(
         runner.parameters,
         runner.constants,

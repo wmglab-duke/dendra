@@ -69,7 +69,10 @@ def run_demo(*, surrogate=True, backend="aot_eager"):
         steps=STEPS,
         initialization="fresh",
         inference=False,
-        trainable=(f"synapses.{name}.weights", f"synapses.{name}.delays"),
+        trainable=(
+            f"synapses.{name}.weight.weights.0.param.rho",
+            f"synapses.{name}.delay_ms.weights.0.param.rho",
+        ),
         checkpoint_every=3,
         backend=backend,
         callbacks={"trace": dn.func.Recorder(("cell.v",))},
@@ -77,10 +80,11 @@ def run_demo(*, surrogate=True, backend="aot_eager"):
     assert runner.functional.synapses[name].runtime == "source_history"
     # endregion compile
     before = runner.functional.extract().state
-    weights = runner.get_parameter(f"synapses.{name}.weights")
-    delays = runner.get_parameter(f"synapses.{name}.delays")
+    weights = runner.get_parameter(f"synapses.{name}.weight.weights.0.param.rho")
+    delays = runner.get_parameter(f"synapses.{name}.delay_ms.weights.0.param.rho")
     connection = native.synapses[name]
-    native_weights, native_delays = connection.weight.w, connection.delay_ms.w
+    native_weights = connection.weight.weights[0].param.rho
+    native_delays = connection.delay_ms.weights[0].param.rho
     native_trace = [native.cell.v.clone()]
     prefix, first = runner()
     for _ in range(STEPS):
@@ -92,15 +96,27 @@ def run_demo(*, surrogate=True, backend="aot_eager"):
     parameters["synapses"] = dict(parameters["synapses"])
     parameters["synapses"][name] = {
         **parameters["synapses"][name],
-        "weights": weights * 1.4,
-        "delays": delays * 0.85,
+        "weight.weights.0.param.rho": weights + 0.2,
+        "delay_ms.weights.0.param.rho": delays - 0.15,
     }
     final, second = runner(
         prefix, parameters=parameters, callback_state=first["callbacks"].state
     )
     # endregion changed-parameters
-    connection.weight.w = native_weights * 1.4
-    connection.delay_ms.w = native_delays * 0.85
+    # Native transport reads initialized effective tensors. Materialize the same
+    # raw-coordinate edits using the shared connection source plan.
+    native_parameters = runner.functional.extract(native).parameters
+    native_parameters["synapses"][name].update(
+        {
+            "weight.weights.0.param.rho": native_weights + 0.2,
+            "delay_ms.weights.0.param.rho": native_delays - 0.15,
+        }
+    )
+    effective = runner.functional._materialize_connections(
+        native_parameters, first["constants"]
+    )["synapses"][name]
+    connection.weight.w = effective["weights"]
+    connection.delay_ms.w = effective["delays"]
     for _ in range(STEPS):
         native.step()
         native_trace.append(native.cell.v.clone())

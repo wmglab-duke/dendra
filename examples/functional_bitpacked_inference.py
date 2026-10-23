@@ -99,7 +99,10 @@ def run_demo(*, initialization="snapshot", backend="aot_eager"):
     parameters["synapses"] = dict(parameters["synapses"])
     parameters["synapses"][name] = {
         **parameters["synapses"][name],
-        "weights": parameters["synapses"][name]["weights"] * 1.5,
+        "weight.weights.0.param.rho": parameters["synapses"][name][
+            "weight.weights.0.param.rho"
+        ]
+        + 0.2,
     }
     final, second = runner(
         prefix,
@@ -107,7 +110,10 @@ def run_demo(*, initialization="snapshot", backend="aot_eager"):
         callback_state=first["callbacks"].state,
     )
     # endregion continuation
-    native.synapses[name].weight.w = native.synapses[name].weight.w * 1.5
+    effective = runner.functional._materialize_connections(
+        parameters, first.get("constants", runner.constants)
+    )["synapses"][name]["weights"]
+    native.synapses[name].weight.w = effective.clone()
     for _ in range(STEPS):
         native.step()
         observations.append(native.cell.v.clone())
@@ -119,9 +125,7 @@ def run_demo(*, initialization="snapshot", backend="aot_eager"):
     assert not trace.requires_grad
     # region commit
     resumed = make_network()
-    resumed.synapses[name].weight.w = (
-        parameters["synapses"][name]["weights"].detach().clone()
-    )
+    resumed.synapses[name].weight.w = effective.detach().clone()
     runner.functional.commit_state_(resumed, final)
     resumed.step()
     native.step()

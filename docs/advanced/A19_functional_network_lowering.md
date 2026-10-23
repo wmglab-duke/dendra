@@ -68,10 +68,10 @@ Population's parameter namespace; see {doc}`A28_functional_network_extra`.
 | Tree | Contents |
 | --- | --- |
 | `parameters["populations"]` | Raw Population parameter mappings. |
-| `parameters["synapses"]` | Event weights, optional differentiable delays, and schedule packets. |
-| `parameters["continuous_synapses"]` | Continuous weights and explicit transform parameters/buffers. |
+| `parameters["synapses"]` | Raw event weight/delay source parameters and schedule packets. |
+| `parameters["continuous_synapses"]` | Raw continuous weight/delay source parameters and explicit transform parameters/buffers. |
 | `parameters["netstim"]` | NetStim parameter mapping and schedule packet, or `None`. |
-| `constants` | Population constants and optional NetStim calendar constants. |
+| `constants` | Population constants, fixed connection source buffers and initialization values, and optional NetStim calendar constants. |
 | `state` | Population carry, event queue/history and continuous queue carry, optional NetStim clock/RNG carry, and the Network clock. |
 
 Extraction creates independent tensor storage and detaches existing native

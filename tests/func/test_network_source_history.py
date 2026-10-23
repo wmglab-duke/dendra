@@ -98,7 +98,8 @@ def _stim_history(
         _configure(network, surrogate=surrogate, taps=taps)
         if twins:
             first, second = network.synapses.values()
-            second.weight.w = first.weight.w
+            second.weight.weights[0].param = first.weight.weights[0].param
+            second.weight.init()
         return network
 
 
@@ -172,17 +173,23 @@ def test_auto_source_history_native_order_values_and_gradients(
             )
     targets = (
         initial,
-        *(value["weights"] for value in tensors.parameters["synapses"].values()),
+        *(
+            value["weight.weights.0.param.rho"]
+            for value in tensors.parameters["synapses"].values()
+        ),
     )
     native_targets = (
         native_initial,
-        *(value.weight.w for value in native.synapses.values()),
+        *(value.weight.weights[0].param.rho for value in native.synapses.values()),
     )
     if taps:
         targets += tuple(
-            value["delays"] for value in tensors.parameters["synapses"].values()
+            value["delay_ms.weights.0.param.rho"]
+            for value in tensors.parameters["synapses"].values()
         )
-        native_targets += tuple(value.delay_ms.w for value in native.synapses.values())
+        native_targets += tuple(
+            value.delay_ms.weights[0].param.rho for value in native.synapses.values()
+        )
     observed = torch.autograd.grad(_relay_loss(state), targets)
     expected = torch.autograd.grad(_native_relay_loss(native), native_targets)
     _close(observed, expected)
@@ -207,18 +214,34 @@ def test_delivery_uses_weight_and_delay_values_supplied_after_source_emission(ta
     _close(prefix, functional.extract(native).state)
     assert prefix["netstim"]["spike_counts"].eq(1).all()
     original = tensors.parameters["synapses"][name]
-    weights = original["weights"].detach().mul(2.5).requires_grad_()
+    weights = (
+        native_connection.weight.weights[0]
+        .param._inverse_transform(native_connection.weight.w.detach() * 2.5)
+        .requires_grad_()
+    )
     delays = (
-        original["delays"].detach().new_tensor([1.6 * DT, 2.3 * DT]).requires_grad_()
+        native_connection.delay_ms.weights[0]
+        .param._inverse_transform(
+            original["delay_ms.weights.0.param.rho"].new_tensor([1.6 * DT, 2.3 * DT])
+        )
+        .requires_grad_()
     )
     parameters = {
         **tensors.parameters,
-        "synapses": {name: {**original, "weights": weights, "delays": delays}},
+        "synapses": {
+            name: {
+                **original,
+                "weight.weights.0.param.rho": weights,
+                "delay_ms.weights.0.param.rho": delays,
+            }
+        },
     }
-    native_weights = weights.detach().clone().requires_grad_()
-    native_delays = delays.detach().clone().requires_grad_()
-    native_connection.weight.w = native_weights
-    native_connection.delay_ms.w = native_delays
+    native_weights = torch.nn.Parameter(weights.detach().clone())
+    native_delays = torch.nn.Parameter(delays.detach().clone())
+    native_connection.weight.weights[0].param.rho = native_weights
+    native_connection.weight.init()
+    native_connection.delay_ms.weights[0].param.rho = native_delays
+    native_connection.delay_ms.init()
     state = prefix
     for _ in range(8):
         draw = functional.sample_step_draw(state)
@@ -230,7 +253,9 @@ def test_delivery_uses_weight_and_delay_values_supplied_after_source_emission(ta
     loss = state["populations"]["cell"]["mechanisms"]["syn"]["g"].sum()
     expected_loss = native.cell.mech.syn.g.sum()
     actual = torch.autograd.grad(
-        loss, (weights, delays, original["weights"]), allow_unused=True
+        loss,
+        (weights, delays, original["weight.weights.0.param.rho"]),
+        allow_unused=True,
     )
     expected = torch.autograd.grad(expected_loss, (native_weights, native_delays))
     _close(actual[:2], expected)
@@ -277,8 +302,8 @@ def test_noisy_history_network_matches_native_rng_drive_and_parameter_gradients(
     gradients = torch.autograd.grad(
         loss,
         (
-            connection["weights"],
-            connection["delays"],
+            connection["weight.weights.0.param.rho"],
+            connection["delay_ms.weights.0.param.rho"],
             tensors.parameters["netstim"]["parameters"]["noise"],
             drive,
         ),
@@ -286,8 +311,8 @@ def test_noisy_history_network_matches_native_rng_drive_and_parameter_gradients(
     expected = torch.autograd.grad(
         native_loss,
         (
-            native_connection.weight.w,
-            native_connection.delay_ms.w,
+            native_connection.weight.weights[0].param.rho,
+            native_connection.delay_ms.weights[0].param.rho,
             native.netstim.noise,
             native_drive,
         ),
@@ -316,11 +341,16 @@ def test_compiled_history_checkpoint_continuation_keeps_shared_parameters_inputs
         initialization=initialization,
         checkpoint_every=3,
         backend="aot_eager",
-        trainable=(f"synapses.{names[1]}.weights", "netstim.parameters.noise"),
+        trainable=(
+            f"synapses.{names[1]}.weight.weights.0.param.rho",
+            "netstim.parameters.noise",
+        ),
         callbacks={"trace": dn.func.Recorder(("cell.v", "t"))},
     )
-    shared = runner.get_parameter(f"synapses.{names[0]}.weights")
-    assert shared is runner.get_parameter(f"synapses.{names[1]}.weights")
+    shared = runner.get_parameter(f"synapses.{names[0]}.weight.weights.0.param.rho")
+    assert shared is runner.get_parameter(
+        f"synapses.{names[1]}.weight.weights.0.param.rho"
+    )
     assert isinstance(shared, torch.nn.Parameter)
     assert all(
         plan.runtime == "source_history" for plan in runner.functional.synapses.values()

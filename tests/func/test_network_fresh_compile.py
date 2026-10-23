@@ -79,7 +79,7 @@ def test_fresh_network_initialization_gradients_span_explicit_continuation(
     checkpoint_every,
 ):
     model = _mixed_network()
-    name = f"synapses.{next(iter(model.synapses))}.weights"
+    name = f"synapses.{next(iter(model.synapses))}.weight.weights.0.param.rho"
     runner = _runner(
         model,
         inference=False,
@@ -135,7 +135,7 @@ def test_fresh_netstim_draw_and_initialization_run_once_outside_checkpoint_repla
     monkeypatch,
 ):
     model = _stim_network()
-    name = f"synapses.{next(iter(model.synapses))}.weights"
+    name = f"synapses.{next(iter(model.synapses))}.weight.weights.0.param.rho"
     runner = _runner(model, inference=False, checkpoint_every=2, trainable=(name,))
     source = runner.functional.extract().state
     calls = {"sample": 0, "initialize": 0}

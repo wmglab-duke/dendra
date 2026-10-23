@@ -162,7 +162,6 @@ class FunctionalContinuousCon:
         self._cache_routes = continuous_cache_routes(
             self._delay_steps, self._post_idx, depth=self._depth, width=self._width
         )
-        self._physical_delays = _snapshot(_effective_tensor(con.delay_ms, "delay"))
         self._zero_idx = _snapshot(con.zero_con_idx)
         self._nonzero_idx = _snapshot(con.nonzero_con_idx)
         self._post_nonzero = _snapshot(con.post_idx_nz)
@@ -266,7 +265,8 @@ class FunctionalContinuousCon:
             or not torch.equal(con.delay_steps, self._delay_steps)
             or not torch.equal(con.dt, self._dt)
             or not torch.equal(
-                _effective_tensor(con.delay_ms, "delay"), self._physical_delays
+                (_effective_tensor(con.delay_ms, "delay") / con.dt).round().long(),
+                self._delay_steps,
             )
         ):
             raise FunctionalizationError(
@@ -278,6 +278,13 @@ class FunctionalContinuousCon:
             dtype=self.dtype,
             device=self.device,
             label="effective weights",
+        )
+        self._validate_tensor(
+            _effective_tensor(con.delay_ms, "delay"),
+            shape=(self._connections,),
+            dtype=self.dtype,
+            device=self.device,
+            label="effective delays",
         )
         self._transform_plan.validate_compatible(con.transform)
         self._validate_state(con.state_dict_for_checkpoint())
@@ -346,8 +353,9 @@ class FunctionalContinuousCon:
         """Restore detached traffic with current explicit weights/transform.
 
         ``parameters`` contains ``weights`` and ``transform_parameters`` as in
-        a Network projection packet. Historical observations and materialized
-        runtime carry are detached, matching native steady-state restoration.
+        the low-level ContinuousCon projection API. Historical observations and
+        materialized runtime carry are detached, matching native steady-state
+        restoration.
         """
         self._validate_source()
         self._validate_state(state)

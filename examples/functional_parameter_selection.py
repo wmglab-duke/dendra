@@ -101,18 +101,22 @@ def network_demo(*, backend="aot_eager"):
             diff_scheduled_times=False,
         )
         first, second = network.synapses.values()
-        second.weight.w = first.weight.w
+        second.weight.weights[0].param = first.weight.weights[0].param
+        network.initialize(DT)
     # region network-select
     runner = dn.compile(
         network,
         dt=DT,
         steps=6,
         inference=False,
-        trainable=("synapses.*.weights", r"re:^populations\.cell\..*\.leak\.g_param$"),
+        trainable=(
+            "synapses.*.weight.weights.*.param.rho",
+            r"re:^populations\.cell\..*\.leak\.g_param$",
+        ),
         callbacks={"trace": dn.func.Recorder(("cell.v",))},
         backend=backend,
     )
-    weights = runner.find_parameters("synapses.*.weights")
+    weights = runner.find_parameters("synapses.*.weight.weights.*.param.rho")
     assert len(weights) == 2
     assert len({id(value) for value in weights.values()}) == 1
     assert len(runner.trainable_parameters) == 3

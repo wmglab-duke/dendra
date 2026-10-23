@@ -27,7 +27,9 @@ def clone_tree(tree):
 def run_demo(*, initialization="snapshot", backend="aot_eager"):
     model = make_network()  # Two Populations, recurrent event/continuous traffic.
     connections = tuple(model.synapses.values())
-    connections[1].weight.w = connections[0].weight.w
+    connections[1].weight.weights[0].param = connections[0].weight.weights[0].param
+    connections[1].weight.n = connections[0].weight.n
+    model.initialize(DT)
     with torch.no_grad():
         for _ in range(2):
             model.step()
@@ -58,8 +60,8 @@ def run_demo(*, initialization="snapshot", backend="aot_eager"):
     initial = clone_tree(runner.initial_state)
     names = tuple(model.synapses)
     assert (
-        runner.parameters["synapses"][names[0]]["weights"]
-        is runner.parameters["synapses"][names[1]]["weights"]
+        runner.parameters["synapses"][names[0]]["weight.weights.0.param.rho"]
+        is runner.parameters["synapses"][names[1]]["weight.weights.0.param.rho"]
     )
     # region inputs
     voltage = initial["populations"]["left"]["integrator"]["v"]
@@ -112,12 +114,15 @@ def run_demo(*, initialization="snapshot", backend="aot_eager"):
     # endregion report
     # region checkpoint
     resumed = make_network()
-    shared = {}
+    connections = tuple(resumed.synapses.values())
+    connections[1].weight.weights[0].param = connections[0].weight.weights[0].param
+    connections[1].weight.n = connections[0].weight.n
+    resumed.initialize(DT)
+    effective = runner.functional._materialize_connections(
+        runner.parameters, runner.constants
+    )["synapses"]
     for name, connection in resumed.synapses.items():
-        weight = runner.parameters["synapses"][name]["weights"]
-        if id(weight) not in shared:
-            shared[id(weight)] = weight.detach().clone()
-        connection.weight.w = shared[id(weight)]
+        connection.weight.w = effective[name]["weights"].detach().clone()
     runner.functional.commit_state_(resumed, final)
     with torch.no_grad():
         continued, _ = runner.functional.prepare_and_step(

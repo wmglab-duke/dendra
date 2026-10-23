@@ -45,8 +45,14 @@ def run_demo():
     # region compile
     model = make_network()  # Ordinary, initialized two-Population Network.
     event_connections = tuple(model.synapses.values())
-    event_connections[1].weight.w = event_connections[0].weight.w
-    event_names = tuple(f"synapses.{name}.weights" for name in model.synapses)
+    event_connections[1].weight.weights[0].param = (
+        event_connections[0].weight.weights[0].param
+    )
+    event_connections[1].weight.n = event_connections[0].weight.n
+    model.initialize(DT)
+    event_names = tuple(
+        f"synapses.{name}.weight.weights.0.param.rho" for name in model.synapses
+    )
     callbacks = {"trace": dn.func.Recorder(("left.v", "right.v", "t"))}
     runner = dn.compile(
         model,
@@ -68,7 +74,10 @@ def run_demo():
     shared_weight = runner.get_parameter(event_names[0])
     assert shared_weight is runner.get_parameter(event_names[1])
     assert isinstance(shared_weight, torch.nn.Parameter)
-    assert shared_weight.data_ptr() != event_connections[0].weight.w.data_ptr()
+    assert (
+        shared_weight.data_ptr()
+        != event_connections[0].weight.weights[0].param.rho.data_ptr()
+    )
     # Both qualified names refer to one independent optimizer leaf.
     assert (
         runner.named_parameters[event_names[0]]

@@ -99,6 +99,13 @@ def _cache_initialized_native_packet(functional, native):
     for constants in packet.constants["populations"].values():
         if "cache.active" in constants:
             constants["cache.active"] = torch.ones_like(constants["cache.active"])
+    # Fresh connections use their current raw materialization; extraction
+    # additionally retains the native initialized output as a snapshot offset.
+    for collection in ("synapses", "continuous_synapses"):
+        for constants in packet.constants[collection].values():
+            for role in ("weights", "delays"):
+                key = f"use_offset.{role}"
+                constants[key] = torch.zeros_like(constants[key])
     return packet
 
 
@@ -246,7 +253,7 @@ def test_cache_boundary_detaches_pending_history_but_later_steps_keep_weight_gra
         steps=4,
         initialization="fresh",
         inference=False,
-        trainable=(f"synapses.{name}.weights",),
+        trainable=(f"synapses.{name}.weight.weights.0.param.rho",),
         checkpoint_every=2,
         callbacks=_trace(),
         backend="aot_eager",
@@ -258,8 +265,8 @@ def test_cache_boundary_detaches_pending_history_but_later_steps_keep_weight_gra
         runner.initialization_inputs,
     )
     assert (
-        initialized.parameters["synapses"][name]["weights"]
-        is runner.parameters["synapses"][name]["weights"]
+        initialized.parameters["synapses"][name]["weight.weights.0.param.rho"]
+        is runner.parameters["synapses"][name]["weight.weights.0.param.rho"]
     )
     assert all(
         value.grad_fn is None
@@ -272,7 +279,7 @@ def test_cache_boundary_detaches_pending_history_but_later_steps_keep_weight_gra
     )
     loss = final["populations"]["cell"]["mechanism_buffers"]["relay"]["ledger"].sum()
     gradient = torch.autograd.grad(
-        loss, runner.get_parameter(f"synapses.{name}.weights")
+        loss, runner.get_parameter(f"synapses.{name}.weight.weights.0.param.rho")
     )[0]
     assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
     assert second["callbacks"].state["trace"] == ()
