@@ -2634,32 +2634,76 @@ class MechanismHandler(torch.nn.Module):
         )
 
     def iexp(self, v):
-        local_voltages = self._gather_support_fields(
-            v,
-            self._current_support_entries,
+        current, _frame = self._evaluate_explicit_current_frame(
+            v, scratch=self._buf_i if self.currents else None
         )
-        for mech, support_index in self._current_assigned_plan:
-            mech._evaluate_assigned(local_voltages[support_index])
+        return current
+
+    def _evaluate_explicit_current_frame(self, v, *, scratch=None):
+        """Evaluate explicit authored currents and aligned ionic-current frames.
+
+        ``scratch=None`` uses out-of-place support reductions for functional
+        transforms. Passing the native current-buffer list preserves the
+        imperative accumulation policy. Both paths evaluate ASSIGNED products,
+        current hooks, support groups, and current categories in the same order;
+        conductance hooks are not evaluated. Registered mechanism state must be
+        isolated by the functional caller around this method.
+        """
+        local_voltages = self._gather_assigned_current_fields(v)
 
         if not self.currents:
-            return torch.zeros_like(v)
+            current_frame = tuple(
+                torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+                for ion in self._ion_current_frame_ions
+            )
+            return torch.zeros_like(v), current_frame
 
-        for i, buf in enumerate(self._buf_i):
-            self._buf_i[i] = torch.zeros_like(buf)
+        call_local = scratch is None
+        if call_local:
+            buf_i = [None for _ in self._buf_i]
+            zero_field = v.new_zeros(()).expand(v.shape)
+        else:
+            if len(scratch) != len(self._buf_i):
+                raise ValueError(
+                    "explicit current scratch must have one buffer per current category"
+                )
+            buf_i = scratch
+            for index, value in enumerate(buf_i):
+                buf_i[index] = torch.zeros_like(value)
 
         for c_idx, support_index, support_entry, entries in self._map_exp_grouped:
             local_i = None
             local_voltage = local_voltages[support_index]
             for mech, fn, scale_f in entries:
                 i = scale_f(getattr(mech, fn)(local_voltage))
-                i = _current_value_for_buffer(i, self._buf_i[c_idx])
+                i = _current_value_for_buffer(i, v if call_local else buf_i[c_idx])
+                if call_local:
+                    i = torch.broadcast_to(i, local_voltage.shape)
                 local_i = i if local_i is None else local_i + i
-            support_entry.scatter_add_(self._buf_i[c_idx], local_i)
+            if call_local:
+                if support_entry.spec.kind is SupportKind.DENSE:
+                    buf_i[c_idx] = (
+                        local_i if buf_i[c_idx] is None else buf_i[c_idx] + local_i
+                    )
+                else:
+                    destination = zero_field if buf_i[c_idx] is None else buf_i[c_idx]
+                    buf_i[c_idx] = support_entry.scatter_add(destination, local_i)
+            else:
+                support_entry.scatter_add_(buf_i[c_idx], local_i)
 
-        # sum up currents and conductances
-        tot_i = torch.stack(self._buf_i).sum(dim=0)
+        if call_local:
+            buf_i = [torch.zeros_like(v) if value is None else value for value in buf_i]
 
-        return tot_i
+        current_frame = tuple(
+            buf_i[current_index]
+            if current_index >= 0
+            else torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+            for ion, current_index in zip(
+                self._ion_current_frame_ions,
+                self._ion_current_frame_indices,
+            )
+        )
+        return torch.stack(buf_i).sum(dim=0), current_frame
 
     def idf(self, v, v_prev):
         local_voltages = self._gather_support_fields(

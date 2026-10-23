@@ -36,11 +36,54 @@ def _reflect_pad_last(x: torch.Tensor, padding: Tuple[int, int]) -> torch.Tensor
     return x.index_select(-1, indices)
 
 
+@torch.compiler.assume_constant_result
+def _has_empty_stencil_vmap_axis(value):
+    """Inspect hidden transform shapes without reading numerical tensor data."""
+    functorch = torch._C._functorch
+    while functorch.is_functorch_wrapped_tensor(value):
+        is_batched = functorch.is_batchedtensor(value)
+        batch_axis = functorch.maybe_get_bdim(value)
+        value = functorch.get_unwrapped(value)
+        if is_batched and value.shape[batch_axis] == 0:
+            return True
+    return False
+
+
+def _empty_weight_conv1d(conv, x, weight, padding):
+    """Retain empty hidden weight lanes unsupported by Conv1d's batching rule.
+
+    The ordinary convolution kernel retains ownership of every nonempty
+    evaluation. Only a zero-sized hidden weight batch uses this equivalent
+    tensor expression; no numerical tensor values are inspected or unwrapped.
+    """
+    if conv.padding_mode == "reflect":
+        x = _reflect_pad_last(x, padding)
+    elif conv.padding_mode == "zeros":
+        x = F.pad(x, padding)
+    else:
+        x = F.pad(x, padding, mode=conv.padding_mode)
+    dilation = int(conv.dilation[0])
+    width = (int(weight.shape[-1]) - 1) * dilation + 1
+    windows = x.unfold(-1, width, int(conv.stride[0]))[..., ::dilation]
+    result = (windows.unsqueeze(1) * weight.unsqueeze(0).unsqueeze(-2)).sum(
+        dim=(-1, -3)
+    )
+    if conv.bias is not None:
+        result = result + conv.bias.reshape(1, -1, 1)
+    return result
+
+
 def _conv1d_forward(
     conv: torch.nn.Conv1d, x: torch.Tensor, weight: torch.Tensor
 ) -> torch.Tensor:
     """Run Conv1d with robust reflection padding for short final axes."""
     padding = tuple(int(value) for value in conv._reversed_padding_repeated_twice)
+    if (
+        conv.groups == 1
+        and torch._C._are_functorch_transforms_active()
+        and _has_empty_stencil_vmap_axis(weight)
+    ):
+        return _empty_weight_conv1d(conv, x, weight, padding)
     if conv.padding_mode == "reflect" and (
         padding[0] >= x.shape[-1] or padding[1] >= x.shape[-1]
     ):
@@ -102,6 +145,16 @@ class _euler(Integrator):
         If truthy, accumulate membrane currents each step. Default None.
     """
 
+    _PREPARED_WORKSPACE_SCHEMA = (
+        ("cm_inv", "node"),
+        ("ra_inv", "node"),
+        ("cm_c", "node"),
+        ("area_c", "node"),
+        ("ve_zero", "node"),
+    )
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_explicit_path"
+    _FUNCTIONAL_CRITICAL_METHODS = ("_functional_step", "_explicit_slope", "FRK")
+
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
 
@@ -123,28 +176,66 @@ class _euler(Integrator):
         for p in self.ssd.parameters():
             p.requires_grad = False
 
-    def initialize(self, model, dt) -> None:
-        dx = _broadcast_to_shape(model.dx, model.shape) / 10000.0  # cm
-        diam = _broadcast_to_shape(model.diam, model.shape)
-        area = torch.pi * (diam / 10000.0) * dx  # cm^2
-        cm = _broadcast_to_shape(model.cm, model.shape) / 1000.0 * area
-        ra = (_broadcast_to_shape(model.rhoa, model.shape) * dx) / (
-            torch.pi * (diam / 20000.0) ** 2
-        )
-        self.cm_inv = 1.0 / cm
-        self.ra_inv = 1.0 / ra
-        self.cm_c = cm
-        self.area_c = area
-        self.ve_zero = torch.zeros_like(model.v)
+    @staticmethod
+    def _prepare_workspace(dt, *, dx, diam, cm, rhoa):
+        """Derive the explicit cable workspace from effective model tensors.
 
-    def FRK(self, v, ve, area, cm, ra, intra=None):
+        Inputs use the public voltage shape and native units: micrometres for
+        ``dx`` and ``diam``, uF/cm^2 for ``cm``, and ohm cm for ``rhoa``. Euler
+        uses each compartment's cylindrical resistance and area, including the
+        materialized node geometry of myelinated models. The timestep does not
+        enter these coefficients. Preparation preserves gradients and never
+        reads or mutates an integrator.
+        """
+        del dt
+        dx = dx / 10000.0  # cm
+        area = torch.pi * (diam / 10000.0) * dx  # cm^2
+        cm = cm / 1000.0 * area
+        ra = (rhoa * dx) / (torch.pi * (diam / 20000.0) ** 2)
+        return {
+            "cm_inv": 1.0 / cm,
+            "ra_inv": 1.0 / ra,
+            "cm_c": cm,
+            "area_c": area,
+            "ve_zero": torch.zeros_like(cm),
+        }
+
+    def initialize(self, model, dt) -> None:
+        workspace = self._derive_prepared_workspace(
+            dt,
+            dx=_broadcast_to_shape(model.dx, model.shape),
+            diam=_broadcast_to_shape(model.diam, model.shape),
+            cm=_broadcast_to_shape(model.cm, model.shape),
+            rhoa=_broadcast_to_shape(model.rhoa, model.shape),
+        )
+        self._install_prepared_workspace(workspace)
+
+    def _explicit_slope(self, v, ve, area, cm, ra, intra, *, call_local_currents):
+        """Evaluate one explicit stage with shared native/current arithmetic."""
         d2v = _conv_last(self.ssd, v, ve)
-        i_ion = self.mech.iexp(v) * area
+        if call_local_currents:
+            evaluate = getattr(self.mech, "_evaluate_explicit_current_frame", None)
+            if evaluate is None:
+                raise RuntimeError(
+                    "call-local explicit current evaluation requires a "
+                    "MechanismHandler with _evaluate_explicit_current_frame()"
+                )
+            current, current_frame = evaluate(v)
+        else:
+            current = self.mech.iexp(v)
+            current_frame = None
+        i_ion = current * area
         i_drive = i_ion
         if intra is not None:
             intra = _broadcast_to_shape(intra, tuple(v.shape))
             i_drive = i_drive - intra
-        return cm * ((ra * d2v) - i_drive), i_ion
+        return cm * ((ra * d2v) - i_drive), i_ion, current_frame
+
+    def FRK(self, v, ve, area, cm, ra, intra=None):
+        slope, ionic, _frame = self._explicit_slope(
+            v, ve, area, cm, ra, intra, call_local_currents=False
+        )
+        return slope, ionic
 
     def step(self, model, dt, ve=None, intra=None):
         if ve is None:
@@ -156,10 +247,49 @@ class _euler(Integrator):
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _step(self, v, ve, area, dt, temp, cm, intra):
+    def _functional_step(
+        self,
+        v,
+        dt,
+        temp,
+        ve=None,
+        intra=None,
+        *,
+        solver=None,
+        call_local_currents=False,
+    ):
+        """Route the common functional signature to the native Euler kernel."""
+        del solver
+        if ve is None:
+            ve = self.ve_zero
+        return self._step(
+            v,
+            ve,
+            self.area_c,
+            dt,
+            temp,
+            self.cm_c,
+            intra,
+            call_local_currents=call_local_currents,
+        )
+
+    def _step(
+        self, v, ve, area, dt, temp, cm, intra=None, *, call_local_currents=False
+    ):
         self._advance_pre_current(v, dt, temp)
-        K1, i_ion = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        accepted_frame = self._capture_ion_current_frame()
+        if call_local_currents:
+            K1, i_ion, accepted_frame = self._explicit_slope(
+                v,
+                ve,
+                area,
+                self.cm_inv,
+                self.ra_inv,
+                intra,
+                call_local_currents=True,
+            )
+        else:
+            K1, i_ion = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
+            accepted_frame = self._capture_ion_current_frame()
         v_n = v + K1 * dt
         self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
@@ -171,12 +301,10 @@ class _euler(Integrator):
 
 class _eulerv1(_euler):
     r"""
-    Forward Euler integrator with a first-order Dufort-Frankel-style correction.
+    Single-stage forward Euler integrator for scalar cable models.
 
-    Uses the same explicit stencil as :class:`_euler` but applies the FRK update
-    to the current voltage rather than the stored inverse capacitance/axial
-    resistances, providing a slightly more stable first-order method for stiff
-    cable dynamics.
+    Uses the same voltage update, cylindrical coefficients, and symmetric
+    spatial stencil as :class:`_euler`.
 
     Parameters
     ----------
@@ -184,17 +312,8 @@ class _eulerv1(_euler):
         If truthy, accumulate membrane currents each step. Default None.
     """
 
-    def _step(self, v, ve, area, dt, temp, cm, intra=None):
-        self._advance_pre_current(v, dt, temp)
-        K1, i_ion = self.FRK(v, ve, area, self.cm_inv, self.ra_inv, intra)
-        accepted_frame = self._capture_ion_current_frame()
-        v_n = v + K1 * dt
-        self._advance_post_current(v, dt, temp, accepted_frame)
-        i_membrane = None
-        if self.imem:
-            i_cap = cm * (v_n - v) / dt
-            i_membrane = i_cap + i_ion
-        return v_n, i_membrane
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_explicit_path"
+    _step = _euler._step
 
 
 _rk1 = _euler

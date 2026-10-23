@@ -40,6 +40,7 @@ from dendra.models.integrators.cable import (
     _layered_edge_conductance,
 )
 from dendra.models.integrators.core import _FunctionalIntegratorSpec
+from dendra.models.integrators.explicit import SymmetricConv1D, _euler, _eulerv1
 from dendra.models.integrators.implicit import (
     _bwd_euler_bt,
     _bwd_euler_sc,
@@ -184,9 +185,10 @@ _FUNCTIONAL_HANDLER_HOOKS = (
     "_evaluate_direct_membrane_coefficients",
     "_gather_assigned_current_fields",
 )
+_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS = ("_evaluate_explicit_current_frame", "iexp")
 _STANDARD_FUNCTIONAL_HANDLER_HOOKS = {
     name: inspect.getattr_static(MechanismHandler, name)
-    for name in _FUNCTIONAL_HANDLER_HOOKS
+    for name in (*_FUNCTIONAL_HANDLER_HOOKS, *_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS)
 }
 _MATERIAL_FUNCTIONAL_COMMON_HOOKS = (
     "material_fields",
@@ -452,6 +454,8 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
         for name in _INTEGRATOR_FRESH_INITIALIZATION_HOOKS
     }
     for implementation in (
+        _euler,
+        _eulerv1,
         _bwd_euler_sc,
         _bwd_euler_sc_skip,
         _bwd_euler_ub,
@@ -466,6 +470,39 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
 
 
 _STANDARD_FUNCTIONAL_INTEGRATOR_STATE_NAMES = {_bwd_euler_sc_skip: ("v",)}
+_STANDARD_EULER_INTEGRATOR_HOOKS = {
+    implementation: {
+        name: inspect.getattr_static(implementation, name)
+        for name in dict.fromkeys(
+            (
+                *_FUNCTIONAL_INTEGRATOR_HOOKS,
+                *implementation._FUNCTIONAL_CRITICAL_METHODS,
+                "_FUNCTIONAL_OPERATOR_KIND",
+                "_PREPARED_WORKSPACE_SCHEMA",
+                "_FUNCTIONAL_CRITICAL_METHODS",
+            )
+        )
+        if hasattr(implementation, name)
+    }
+    for implementation in (_euler, _eulerv1)
+}
+
+
+def _functional_handler_hooks(population):
+    if (
+        getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None)
+        == "scalar_explicit_path"
+    ):
+        return (*_FUNCTIONAL_HANDLER_HOOKS, *_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS)
+    return _FUNCTIONAL_HANDLER_HOOKS
+
+
+def _scalar_path_integrator_profile(integrator):
+    """Select the admitted numerical family independently of path geometry."""
+    spec = _resolve_functional_integrator_spec(integrator, "scalar_explicit_path")
+    if spec is not None and spec.implementation in (_euler, _eulerv1):
+        return "scalar_explicit_path", spec.implementation
+    return "scalar_path", _bwd_euler_ub
 
 
 def _functional_initialization_profile(population):
@@ -524,9 +561,9 @@ def _functional_initialization_profile(population):
             _bwd_euler_sc,
         )
     if isinstance(population, Myelinated):
-        return Myelinated, "scalar_path", _bwd_euler_ub
+        return Myelinated, *_scalar_path_integrator_profile(population.integrator)
     if isinstance(population, Unmyelinated):
-        return Unmyelinated, "scalar_path", _bwd_euler_ub
+        return Unmyelinated, *_scalar_path_integrator_profile(population.integrator)
     if _is_native_cable(population):
         return Cable, "scalar_path", _bwd_euler_ub
     if _canonical_type(population) is Tree:
@@ -6405,7 +6442,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         )
         if spec is None or spec.implementation is not implementation:
             failures.append(
-                "functional initialization requires the canonical implicit "
+                "functional initialization requires the canonical "
                 f"integrator for {population_family.__qualname__}: "
                 f"{implementation.__qualname__}"
             )
@@ -7196,6 +7233,9 @@ class _PopulationTransition(torch.nn.Module):
         self.block_voltage_state = _functional_voltage_state_names(
             population.integrator
         ) == ("v", "vc")
+        self.explicit_voltage_step = (
+            population.integrator._FUNCTIONAL_OPERATOR_KIND == "scalar_explicit_path"
+        )
         object.__setattr__(
             self,
             "_state_owners",
@@ -7267,7 +7307,12 @@ class _PopulationTransition(torch.nn.Module):
                         call_local_currents=True,
                     )
                 else:
-                    v, i_membrane = integrator._step(
+                    step = (
+                        integrator._functional_step
+                        if self.explicit_voltage_step
+                        else integrator._step
+                    )
+                    v, i_membrane = step(
                         v,
                         dt,
                         shared_celsius,
@@ -8673,6 +8718,12 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
         )
     if not recognized_type:
         return None
+    standards = _STANDARD_EULER_INTEGRATOR_HOOKS.get(implementation, {})
+    if any(
+        inspect.getattr_static(integrator_type, name) is not standard
+        for name, standard in standards.items()
+    ):
+        return None
 
     try:
         methods_match = all(
@@ -8700,6 +8751,86 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
     ):
         return None
     return spec
+
+
+_EULER_STENCIL_CONFIGURATION = (
+    "in_channels",
+    "out_channels",
+    "kernel_size",
+    "stride",
+    "padding",
+    "dilation",
+    "groups",
+    "padding_mode",
+    "_reversed_padding_repeated_twice",
+)
+_STANDARD_EULER_STENCIL_HOOKS = {
+    name: inspect.getattr_static(SymmetricConv1D, name)
+    for name in ("forward", "_conv_forward")
+}
+
+
+def _euler_stencil_signature(integrator):
+    """Freeze stencil structure while leaving its raw weights explicit."""
+    if getattr(integrator, "_FUNCTIONAL_OPERATOR_KIND", None) != "scalar_explicit_path":
+        return None
+    stencil = getattr(integrator, "ssd", None)
+    if not isinstance(stencil, torch.nn.Module):
+        return None
+    return (
+        _canonical_type(stencil),
+        tuple(
+            (
+                name,
+                tuple(value) if isinstance(value, (tuple, list)) else value,
+            )
+            for name in _EULER_STENCIL_CONFIGURATION
+            for value in (getattr(stencil, name, None),)
+        ),
+        tuple(
+            (
+                name,
+                _effective_hook_identity(stencil, name)
+                if hasattr(stencil, name)
+                else None,
+            )
+            for name in ("forward", "_conv_forward")
+        ),
+        getattr(stencil, "bias", False) is None,
+    )
+
+
+def _euler_stencil_failures(integrator):
+    stencil = getattr(integrator, "ssd", None)
+    if (
+        _canonical_type(stencil) is not SymmetricConv1D
+        or any(name in vars(stencil) for name in ("forward", "_conv_forward"))
+        or any(
+            inspect.getattr_static(type(stencil), name) is not standard
+            for name, standard in _STANDARD_EULER_STENCIL_HOOKS.items()
+        )
+    ):
+        return ["functional Euler requires its canonical SymmetricConv1D stencil"]
+    if (
+        stencil.in_channels != 2
+        or stencil.out_channels != 1
+        or stencil.groups != 1
+        or stencil.stride != (1,)
+        or stencil.dilation != (1,)
+        or stencil.padding != "same"
+        or stencil.padding_mode != "reflect"
+        or stencil.bias is not None
+        or len(stencil.kernel_size) != 1
+        or stencil.kernel_size[0] % 2 != 1
+        or tuple(stencil._reversed_padding_repeated_twice)
+        != (stencil.kernel_size[0] // 2,) * 2
+        or _shape_tuple(stencil.weight) != (1, 2, stencil.kernel_size[0])
+    ):
+        return [
+            "functional Euler requires a two-input, one-output, odd-width "
+            "reflection stencil with unit stride/dilation and no bias"
+        ]
+    return []
 
 
 def _functional_device_failures(device, dtype):
@@ -9032,10 +9163,15 @@ def _functionalization_failures(
                 "bwd_euler_sc or scnv"
             )
     elif is_unmyelinated or is_myelinated or is_native_cable:
+        operator_kind, implementation = (
+            _scalar_path_integrator_profile(population.integrator)
+            if not is_native_cable
+            else ("scalar_path", _bwd_euler_ub)
+        )
         if (
             _resolve_functional_integrator_spec(
                 population.integrator,
-                "scalar_path",
+                operator_kind,
             )
             is None
         ):
@@ -9044,7 +9180,12 @@ def _functionalization_failures(
                 if is_native_cable
                 else ("Myelinated" if is_myelinated else "Unmyelinated")
             )
-            failures.append(f"{topology} functionalization requires bwd_euler_ub")
+            failures.append(
+                f"{topology} functionalization requires bwd_euler_ub"
+                + (" or canonical Euler/rk1/eulerv1" if not is_native_cable else "")
+            )
+        elif implementation in (_euler, _eulerv1):
+            failures.extend(_euler_stencil_failures(population.integrator))
         elif population.integrator.use_gc_variant:
             failures.append("the gradient-clipped Thomas variant is not supported yet")
     elif is_scalar_tree:
@@ -9059,13 +9200,14 @@ def _functionalization_failures(
 
     handler = getattr(population, "mech", None)
     if handler is not None:
+        handler_hooks = _functional_handler_hooks(population)
         handler_contract_matches = (
             type(handler) is MechanismHandler
-            and not (set(_FUNCTIONAL_HANDLER_HOOKS) & set(handler.__dict__))
+            and not (set(handler_hooks) & set(handler.__dict__))
             and all(
                 inspect.getattr_static(type(handler), name)
                 is _STANDARD_FUNCTIONAL_HANDLER_HOOKS[name]
-                for name in _FUNCTIONAL_HANDLER_HOOKS
+                for name in handler_hooks
             )
         )
         if not handler_contract_matches:
@@ -9439,16 +9581,24 @@ def _functionalization_failures(
             f"{sorted(missing_population_parameters)}"
         )
     allowed_shapes = {}
+    if _scalar_path_integrator_profile(population.integrator)[
+        0
+    ] == "scalar_explicit_path" and not _euler_stencil_failures(population.integrator):
+        allowed_shapes["integrator.ssd.weight"] = _shape_tuple(
+            population.integrator.ssd.weight
+        )
     if is_native_cable or is_scalar_tree or is_extcell_tree:
         compartment_shape = (
             (1, int(population.core_shape()[-1]))
             if is_scalar_tree or is_extcell_tree
             else (int(population.core_shape()[-1]),)
         )
-        allowed_shapes = {
-            "cm_param.rho": compartment_shape,
-            "rhoa_param.rho": compartment_shape,
-        }
+        allowed_shapes.update(
+            {
+                "cm_param.rho": compartment_shape,
+                "rhoa_param.rho": compartment_shape,
+            }
+        )
     regional_parameter_names = _additional_parameter_raw_names(population)
     transform_parameter_names = _in_graph_transform_parameter_names(population)
     from ._torch_parametrizations import parameter_names as torch_parameter_names
@@ -10370,6 +10520,7 @@ def _structure_signature(population) -> tuple:
             getattr(population.integrator, "_FUNCTIONAL_STATE_NAMES", None),
             tuple(population.integrator._PREPARED_WORKSPACE_SCHEMA),
             getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None),
+            _euler_stencil_signature(population.integrator),
             tuple(
                 getattr(
                     population.integrator,
@@ -10400,7 +10551,7 @@ def _structure_signature(population) -> tuple:
             type(handler).__qualname__,
             tuple(
                 (name, _effective_hook_identity(handler, name))
-                for name in _FUNCTIONAL_HANDLER_HOOKS
+                for name in _functional_handler_hooks(population)
             ),
         ),
         tuple(
@@ -10886,6 +11037,10 @@ class FunctionalPopulation:
             "multi_scalar": "scalar_multi",
             "multi_block": "block_multi_tree",
         }.get(self._topology_kind, "scalar_path")
+        if self._topology_kind in {"unmyelinated", "myelinated"}:
+            operator_kind, _implementation = _scalar_path_integrator_profile(
+                execution_population.integrator
+            )
         integrator_spec = _resolve_functional_integrator_spec(
             execution_population.integrator,
             operator_kind,
@@ -10914,6 +11069,8 @@ class FunctionalPopulation:
             "block_matrix": self._solve_shape + (block_size, block_size),
             "shell_node": self._solve_shape + (block_size - 1,),
         }
+        if operator_kind == "scalar_explicit_path":
+            workspace_shapes["node"] = self.shape
         if self._topology_kind == "multi_point":
             workspace_shapes["parameter"] = self.shape
             workspace_shapes["geometry"] = self.shape
@@ -13504,6 +13661,7 @@ class FunctionalPopulation:
                     stimulation_state, stimulation_draw, initialization=True
                 )
             )
+        state = {name: state[name] for name in self._state_schema}
         state = self._initialize_material_workspace(
             initialized_parameters, constants, state
         )
@@ -14014,7 +14172,19 @@ class FunctionalPopulation:
         area_scale = population_values["area_scale"]
 
         integrator = self._transition.population.integrator
-        if self._topology_kind == "single_compartment":
+        if integrator._FUNCTIONAL_OPERATOR_KIND == "scalar_explicit_path":
+            # Native Euler uses cylindrical node geometry and raw effective
+            # cm/rhoa, including Myelinated's node transforms. Its coefficients
+            # do not apply the implicit family's independent scale modifiers.
+            point_area = _cylindrical_membrane_area(diam, dx)
+            integrator_workspace = integrator._derive_prepared_workspace(
+                dt,
+                dx=torch.broadcast_to(dx, shape),
+                diam=torch.broadcast_to(diam, shape),
+                cm=torch.broadcast_to(cm, shape),
+                rhoa=torch.broadcast_to(rhoa, shape),
+            )
+        elif self._topology_kind == "single_compartment":
             # The scalar integrator deliberately retains two different
             # broadcastable layouts: capacitance follows RANGE parameter shape
             # (including singleton explicit-batch prefixes), while membrane
@@ -16301,6 +16471,7 @@ class FunctionalPopulation:
                     state["stimulation"], stimulation, tape=True
                 )
             )
+        next_state = {name: next_state[name] for name in self._state_schema}
         return next_state, {"v": next_state["integrator"]["v"]}
 
     def _clone_state_tree(self, state):
@@ -16326,7 +16497,7 @@ class FunctionalPopulation:
                 lambda value: value.clone(memory_format=torch.contiguous_format),
                 state["stimulation"],
             )
-        return cloned
+        return {name: cloned[name] for name in self._state_schema}
 
     def _validate_receive(self, target, payload):
         if not isinstance(target, str):

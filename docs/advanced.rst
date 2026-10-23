@@ -58,3 +58,4 @@ Advanced
    advanced/A48_functional_rng_load_policies.md
    advanced/A49_functional_distribution_sampling.md
    advanced/A50_functional_poisson_stimulation.md
+   advanced/A51_functional_euler.md

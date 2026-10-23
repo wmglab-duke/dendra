@@ -207,6 +207,12 @@ State `DIFFUSION` uses
 the same packet for explicit Wiener draws and RNG carry, with pathwise
 drift/diffusion gradients; see {doc}`A32_functional_state_sde`. Custom native
 initialization/build adapters are currently unsupported.
+
+Scalar `Unmyelinated` and `Myelinated` Populations can use
+`euler`/`rk1`/`eulerv1` alongside other admitted integrators in the same Network;
+see {doc}`A51_functional_euler` for the native stencil, explicit timestep
+restriction, and trainable parameters.
+
 Shared runtime parameters and parameter/configuration aliases follow authored
 Population initialization order. Earlier Populations retain their prepared
 numerical values when a later initializer writes a shared source; the final raw
