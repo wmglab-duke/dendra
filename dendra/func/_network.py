@@ -32,6 +32,7 @@ from ._mechanism_delays import network_mechanism_delay_alias_signature
 from ._mechanism_injections import network_mechanism_injection_alias_signature
 from ._netcon import FunctionalNetCon, _snapshot
 from ._netstim import FunctionalNetStim
+from ._netstim_parameters import NetStimParameterPlan
 from ._network_bindings import AliasSnapshots, SourceBinding
 from ._network_initialization import (
     NetworkInitializationCache,
@@ -340,7 +341,7 @@ class FunctionalNetwork:
 
     Parameters/constants follow the component adapters' conventions. Population
     and connection parameters retain their raw source coordinates and shared
-    identities; NetStim parameters are effective values. Snapshot extraction is detached and does
+    identities, including NetStim renewal sources. Snapshot extraction is detached and does
     not perform fresh initialization. ``commit_state_`` publishes runtime carry
     only; align native parameters/schedules separately before continuation.
     Topology, source bindings, mode, timestep, and native phase ordering are
@@ -452,6 +453,13 @@ class FunctionalNetwork:
         self.netstim = (
             None if network.netstim is None else FunctionalNetStim(network.netstim)
         )
+        self._netstim_parameter_plan = (
+            None
+            if network.netstim is None
+            else NetStimParameterPlan(
+                network.netstim, owners=network.populations.values()
+            )
+        )
         self._bindings, self._targets, self._continuous_inputs = {}, {}, {}
         for collection in ("synapses", "continuous_synapses"):
             for name, connection in getattr(network, collection).items():
@@ -516,6 +524,9 @@ class FunctionalNetwork:
             (path, tuple(constant_aliases[id(value)]))
             for path, value in _tensor_paths(tensors.parameters)
             if id(value) in constant_aliases
+        )
+        self._source_parameter_constant_aliases = (
+            self._native_parameter_constant_aliases(network)
         )
         self._population_cache_plans = {}
         self._cache_enabled = bool(network._state_cache)
@@ -642,7 +653,7 @@ class FunctionalNetwork:
         present. A bound Network-wide cache restores detached Population
         materializations and connection history. Without that cache, each
         Population restores its own bound cache or runs fresh initialization
-        in authored order. Effective parameters and constants accompany state in
+        in authored order. Resulting parameters and constants accompany state in
         :class:`NetworkTensors`.
         """
         from ._network_initialization import initialize
@@ -651,21 +662,37 @@ class FunctionalNetwork:
             self, parameters, constants, state, inputs, netstim_draw=netstim_draw
         )
 
-    def sample_initialization_draw(self, parameters, state):
-        """Sample one initialization packet from independent explicit RNG carry."""
+    def sample_initialization_draw(self, parameters, state, *, constants=None):
+        """Sample one initialization packet from independent explicit RNG carry.
+
+        Supply ``constants`` when a renewal transform reads registered config
+        buffers, including values restored by Population initialization caches.
+        """
         from ._network_bindings import _canonicalize_mapping_tree
 
-        (parameters, state), _ = _canonicalize_mapping_tree((parameters, state))
+        (parameters, state, constants), _ = _canonicalize_mapping_tree(
+            (parameters, state, constants)
+        )
         self._validate_initialization_source()
         self._validate_parameters(parameters)
         self._validate_state(state)
-        return (
-            None
-            if self.netstim is None
-            else self.netstim.sample_initialization_draw(
-                parameters["netstim"]["parameters"], state["netstim"]
-            )
+        if self.netstim is None:
+            return None
+        if constants is None:
+            if self._constant_schema["netstim"]["sources"]:
+                raise ValueError(
+                    "Supply constants when sampling NetStim sources with configuration buffers."
+                )
+            source_constants = {}
+        else:
+            _validate_tree(constants, self._constant_schema, "constants")
+            source_constants = self._bind_parameter_constants(parameters, constants)[
+                "netstim"
+            ]["sources"]
+        effective = self._netstim_parameter_plan.materialize(
+            parameters["netstim"]["parameters"], source_constants
         )
+        return self.netstim.sample_initialization_draw(effective, state["netstim"])
 
     def sample_population_initialization_draws(self, parameters, state):
         """Draw Population initialization packets without changing the carry.
@@ -810,6 +837,7 @@ class FunctionalNetwork:
             )
         if self.netstim is not None:
             self.netstim._validate_source()
+            self._netstim_parameter_plan.validate_source()
 
     def _validate_parameters(self, parameters):
         _validate_tree(parameters, self._parameter_schema, "parameters")
@@ -918,22 +946,23 @@ class FunctionalNetwork:
         if self.netstim is not None:
             source = network.netstim
             packet = self.netstim.extract(source)
-            native_values = {"start": source.start, "noise": source.noise}
-            if torch.is_tensor(source.tau):
-                native_values["tau"] = source.tau
+            raw_parameters, source_constants = self._netstim_parameter_plan.extract(
+                snapshots, source
+            )
             schedule = (
                 None
                 if packet.schedule is None
                 else TensorScheduleTensors(**_TensorSchedulePlan._values(source))
             )
-            parameters["netstim"] = snapshots.tree(
-                {"parameters": native_values, "schedule": schedule},
-                {"parameters": packet.parameters, "schedule": packet.schedule},
-            )
+            parameters["netstim"] = {
+                "parameters": raw_parameters,
+                "schedule": snapshots.tree(schedule, packet.schedule),
+            }
             constants["netstim"] = snapshots.tree(
                 {name: getattr(source, name) for name in packet.constants},
                 packet.constants,
             )
+            constants["netstim"]["sources"] = source_constants
             state["netstim"] = packet.state
         state["clock"] = {
             "t": _snapshot(network.t),
@@ -1019,18 +1048,87 @@ class FunctionalNetwork:
                 )
         if (network.netstim is None) != (self.netstim is None):
             raise FunctionalizationError("Network NetStim presence does not match.")
+        if self.netstim is not None:
+            self._netstim_parameter_plan.validate_source(network.netstim)
+            self._netstim_parameter_plan._validate_runtime_ownership(
+                network.netstim, owners=network.populations.values()
+            )
         for (collection, name), plan in self._connection_parameter_plans.items():
             connection = getattr(network, collection)[name]
             plan.validate_source(connection)
             plan._validate_runtime_ownership(
                 connection, owners=network.populations.values()
             )
+        if (
+            self._native_parameter_constant_aliases(network)
+            != self._source_parameter_constant_aliases
+        ):
+            raise FunctionalizationError(
+                "Network parameter/config source sharing does not match this plan"
+            )
+
+    def _native_parameter_constant_aliases(self, network):
+        """Inspect exact raw source ties without extracting state or values."""
+        parameters, constants = {}, {}
+        for name, plan in self.populations.items():
+            population = network.populations[name]
+            parameters["populations", name] = plan._parameter_sources(population)
+            constants["populations", name] = {
+                entry.key: population.get_submodule(entry.module_path)._buffers[
+                    entry.buffer_name
+                ]
+                for entry in plan._parametrization_constants
+            }
+        for (collection, name), plan in self._connection_parameter_plans.items():
+            connection = getattr(network, collection)[name]
+            sources = plan.parameter_sources(connection)
+            if collection == "synapses":
+                sources = {
+                    **sources,
+                    "schedule": TensorScheduleTensors(
+                        **_TensorSchedulePlan._values(connection)
+                    ),
+                }
+            else:
+                sources = {
+                    **sources,
+                    "transform_parameters": _named_tensors(connection.transform)
+                    if isinstance(connection.transform, torch.nn.Module)
+                    else None,
+                }
+            parameters[collection, name] = sources
+            constants[collection, name] = plan.constant_sources(connection)
+        if self.netstim is not None:
+            source = network.netstim
+            plan = self._netstim_parameter_plan
+            parameters["netstim"] = {
+                "parameters": plan.parameter_sources(source),
+                "schedule": TensorScheduleTensors(
+                    **_TensorSchedulePlan._values(source)
+                ),
+            }
+            constants["netstim"] = {
+                "sources": plan.constant_sources(source),
+                **{
+                    name: getattr(source, name)
+                    for name in ("max_spikes", "heap_times", "heap_row_offsets")
+                },
+            }
+        readers = {}
+        for path, value in _tensor_paths(constants):
+            readers.setdefault(id(value), []).append(path)
+        return tuple(
+            (path, tuple(readers[id(value)]))
+            for path, value in _tensor_paths(parameters)
+            if id(value) in readers
+        )
 
     def prepare(self, parameters, constants):
-        """Prepare reusable Population and connection values outside compiled code."""
+        """Prepare reusable Population, connection, and NetStim values."""
         self._validate_source()
         self._validate_parameters(parameters)
         _validate_tree(constants, self._constant_schema, "constants")
+        constants = self._bind_parameter_constants(parameters, constants)
         return {
             "populations": {
                 name: plan.prepare(
@@ -1038,7 +1136,14 @@ class FunctionalNetwork:
                 )
                 for name, plan in self.populations.items()
             },
-            "netstim": constants["netstim"],
+            "netstim": None
+            if self.netstim is None
+            else {
+                "parameters": self._netstim_parameter_plan.prepare(
+                    parameters["netstim"]["parameters"], constants["netstim"]["sources"]
+                ),
+                "constants": self._netstim_constants(constants),
+            },
             "connections": {
                 collection: {
                     name: plan.prepare(
@@ -1074,7 +1179,40 @@ class FunctionalNetwork:
             return {**values, "delays": None}
         return values
 
+    def _bind_parameter_constants(self, parameters, constants):
+        """Resolve shared config readers against their canonical raw input.
+
+        A native Tensor can be a selectable input of one component and a
+        registered config buffer of another. Parameters own that shared input;
+        cloning or replacing their packet must update every config reader too.
+        Keep the caller's constants untouched, including retained cache values.
+        """
+        from ._network_initialization import _replace_at
+
+        for path, readers in self._parameter_constant_aliases:
+            value = _at(parameters, path)
+            for reader in readers:
+                if _at(constants, reader) is not value:
+                    constants = _replace_at(constants, reader, value)
+        return constants
+
+    @staticmethod
+    def _prepared_constant(prepared, path):
+        collection, *rest = path
+        if collection == "populations":
+            name, key = rest
+            return prepared["populations"][name].constant_sources[key]
+        if collection in {"synapses", "continuous_synapses"}:
+            name, key = rest
+            return prepared["connections"][collection][name].constants[key]
+        if collection == "netstim":
+            if rest[0] == "sources":
+                return prepared["netstim"]["parameters"].constants[rest[1]]
+            return prepared["netstim"]["constants"][rest[0]]
+        raise FunctionalizationError("Prepared shared constant binding is invalid")
+
     def _materialize_connections(self, parameters, constants):
+        constants = self._bind_parameter_constants(parameters, constants)
         return {
             collection: {
                 name: self._connection_values(
@@ -1090,6 +1228,24 @@ class FunctionalNetwork:
             for collection in ("synapses", "continuous_synapses")
         }
 
+    @staticmethod
+    def _netstim_constants(constants):
+        if constants["netstim"] is None:
+            return None
+        return {
+            name: value
+            for name, value in constants["netstim"].items()
+            if name != "sources"
+        }
+
+    def _materialize_netstim_parameters(self, parameters, constants):
+        if self.netstim is None:
+            return None
+        constants = self._bind_parameter_constants(parameters, constants)
+        return self._netstim_parameter_plan.materialize(
+            parameters["netstim"]["parameters"], constants["netstim"]["sources"]
+        )
+
     def sample_step_draw(self, state):
         """Sample a replayable packet from an independent explicit RNG copy."""
         self._validate_source()
@@ -1101,6 +1257,7 @@ class FunctionalNetwork:
         )
 
     def _prepare_values(self, parameters, constants):
+        constants = self._bind_parameter_constants(parameters, constants)
         return {
             "populations": {
                 name: plan._prepare_values(
@@ -1108,7 +1265,14 @@ class FunctionalNetwork:
                 )
                 for name, plan in self.populations.items()
             },
-            "netstim": constants["netstim"],
+            "netstim": None
+            if self.netstim is None
+            else {
+                "parameters": self._materialize_netstim_parameters(
+                    parameters, constants
+                ),
+                "constants": self._netstim_constants(constants),
+            },
             "connections": self._materialize_connections(parameters, constants),
         }
 
@@ -1128,17 +1292,74 @@ class FunctionalNetwork:
             )
         ):
             raise ValueError("prepared must match this Network's component plans")
-        _validate_tree(
-            prepared["netstim"], self._constant_schema["netstim"], "prepared.netstim"
-        )
-        return {
-            "populations": {
-                name: plan._validate_prepared(
-                    prepared["populations"][name], parameters["populations"][name]
+        for path, readers in self._parameter_constant_aliases:
+            value = _at(parameters, path)
+            try:
+                changed = any(
+                    self._prepared_constant(prepared, reader) is not value
+                    for reader in readers
                 )
-                for name, plan in self.populations.items()
-            },
-            "netstim": prepared["netstim"],
+            except (AttributeError, KeyError, TypeError) as error:
+                raise FunctionalizationError(
+                    "Prepared shared constant binding is invalid"
+                ) from error
+            if changed:
+                raise FunctionalizationError(
+                    "Shared parameters changed after prepare(); call prepare() again"
+                )
+        netstim = prepared["netstim"]
+        if self.netstim is None:
+            if netstim is not None:
+                raise ValueError(
+                    "A Network without NetStim requires prepared.netstim=None"
+                )
+        else:
+            if not isinstance(netstim, Mapping) or set(netstim) != {
+                "parameters",
+                "constants",
+            }:
+                raise ValueError(
+                    "prepared.netstim must match this Network's source plan"
+                )
+            _validate_tree(
+                netstim["constants"],
+                {
+                    name: value
+                    for name, value in self._constant_schema["netstim"].items()
+                    if name != "sources"
+                },
+                "prepared.netstim.constants",
+            )
+            netstim = {
+                "parameters": self._netstim_parameter_plan.validate_prepared(
+                    netstim["parameters"], parameters["netstim"]["parameters"]
+                ),
+                "constants": netstim["constants"],
+            }
+        populations = {
+            name: plan._validate_prepared(
+                prepared["populations"][name], parameters["populations"][name]
+            )
+            for name, plan in self.populations.items()
+        }
+        # Shared config inputs can require gradients even when the Population's
+        # own raw parameter packet is unchanged. Rebuild those coefficients
+        # for this invocation after validating the opaque preparation, so
+        # independent backwards never reuse a previous materialization graph.
+        shared_populations = {
+            reader[1]
+            for _path, readers in self._parameter_constant_aliases
+            for reader in readers
+            if reader[0] == "populations"
+        }
+        for name in shared_populations:
+            populations[name] = self.populations[name]._prepare_values(
+                parameters["populations"][name],
+                prepared["populations"][name].constant_sources,
+            )
+        return {
+            "populations": populations,
+            "netstim": netstim,
             "connections": {
                 collection: {
                     name: self._connection_values(
@@ -1336,8 +1557,8 @@ class FunctionalNetwork:
         else:
             stim = parameters["netstim"]
             next_stim, stimulus = self.netstim.step(
-                stim["parameters"],
-                prepared["netstim"],
+                prepared["netstim"]["parameters"],
+                prepared["netstim"]["constants"],
                 state["netstim"],
                 time,
                 netstim_draw,

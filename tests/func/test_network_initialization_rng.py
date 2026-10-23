@@ -117,7 +117,7 @@ def test_network_initialization_random_kick_is_detached_but_renewal_keeps_gradie
     functional, tensors = dn.func.make_functional_network(model)
     parameters = tensors.parameters["netstim"]["parameters"]
     targets = tuple(
-        parameters[name].requires_grad_() for name in ("interval", "noise", "start")
+        parameters[name].requires_grad_() for name in ("interval.rho", "noise", "start")
     )
     draw = functional.sample_initialization_draw(tensors.parameters, tensors.state)
     draw = draw._replace(exp_rand=draw.exp_rand.requires_grad_())
@@ -139,11 +139,19 @@ def test_network_initialization_random_kick_is_detached_but_renewal_keeps_gradie
     assert gradient[1].abs().sum() > 0
     assert gradient[2] is None
     assert gradient[3] is None
-    torch.testing.assert_close(
-        gradient[0], 1 - parameters["noise"] + parameters["noise"] * step_draw.exp_rand
+    effective = functional._materialize_netstim_parameters(
+        initialized.parameters, initialized.constants
     )
+    expected_interval_gradient = torch.autograd.grad(
+        (
+            effective["interval"]
+            * (1 - effective["noise"] + effective["noise"] * step_draw.exp_rand)
+        ).sum(),
+        targets[0],
+    )[0]
+    torch.testing.assert_close(gradient[0], expected_interval_gradient)
     torch.testing.assert_close(
-        gradient[1], parameters["interval"] * (step_draw.exp_rand - 1)
+        gradient[1], effective["interval"] * (step_draw.exp_rand - 1)
     )
 
 
@@ -151,7 +159,9 @@ def test_fresh_network_checkpoint_and_explicit_continuation_keep_rng_and_gradien
     model, _ = _models(seed=None, noise=0.6)
     functional, tensors = dn.func.make_functional_network(model)
     parameters = tensors.parameters["netstim"]["parameters"]
-    targets = tuple(parameters[name].requires_grad_() for name in ("interval", "noise"))
+    targets = tuple(
+        parameters[name].requires_grad_() for name in ("interval.rho", "noise")
+    )
     initialized = _fresh(functional, tensors)
     expected, _ = functional.run(
         initialized.parameters, initialized.constants, initialized.state, steps=8

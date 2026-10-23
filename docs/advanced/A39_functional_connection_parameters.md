@@ -153,8 +153,10 @@ The lower-level `make_functional_netcon` projection API accepts effective
 numerical weights and interpolated delays. `make_functional_continuous_con`
 accepts effective weights and retains its frozen integer delay routes. These
 APIs remain useful when an application manages source materialization itself.
-NetStim's renewal parameters currently retain their effective-value API; this
-tutorial concerns connection sources.
+NetStim source parameters retain their raw originals and registered transform
+dependencies through the same Network preparation boundary. See
+{doc}`A40_functional_netstim_parameters` for renewal-source selection and
+initialization examples.
 
 The complete example executes its native, compiled, and gradient checks:
 

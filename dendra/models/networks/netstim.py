@@ -19,6 +19,11 @@ from ._heap_calendar import (
     pack_heap_calendar,
     validate_heap_calendar,
 )
+from ._netstim_parameters import (
+    broadcast_netstim_parameter,
+    evaluate_netstim_interval,
+    materialize_netstim_parameters,
+)
 from ._netstim_renewal import (
     NetStimState,
     broadcast_netstim_time,
@@ -320,7 +325,10 @@ class NetStim(DNModule, Sliceable):
 
         result = self.__class__.__new__(self.__class__)
         memo[id(self)] = result
-        state = copy.deepcopy(self.__getstate__(), memo)
+        # PyTorch installs a serialization-only __getstate__ blocker on
+        # generated parametrization classes; structural clones retain their
+        # registered originals and transforms through Module's ordinary state.
+        state = copy.deepcopy(torch.nn.Module.__getstate__(self), memo)
         result.__setstate__(state)
         return result
 
@@ -429,19 +437,21 @@ class NetStim(DNModule, Sliceable):
         device: torch.device,
         name: str,
     ) -> torch.Tensor:
-        value = torch.as_tensor(value, device=device, dtype=dtype)
-        try:
-            return torch.broadcast_to(value, self.shape)
-        except RuntimeError as direct_exc:
-            if value.ndim > 0:
-                try:
-                    return torch.broadcast_to(value.unsqueeze(-1), self.shape)
-                except RuntimeError:
-                    pass
-            raise ValueError(
-                f"{name} with shape {tuple(value.shape)} cannot be broadcast "
-                f"to NetStim state shape {self.shape}."
-            ) from direct_exc
+        return broadcast_netstim_parameter(
+            value, self.shape, device=device, dtype=dtype, name=name
+        )
+
+    def renewal_parameters(self):
+        """Derive renewal inputs from their current registered raw sources."""
+        return materialize_netstim_parameters(
+            evaluate_netstim_interval(self.interval),
+            self.start,
+            self.noise,
+            self.tau,
+            self.shape,
+            device=self.device(),
+            dtype=self.dtype(),
+        )
 
     def _broadcast_time_to_state(self, t) -> torch.Tensor:
         return broadcast_netstim_time(
@@ -669,7 +679,7 @@ class NetStim(DNModule, Sliceable):
                 ).clamp_min(eps)
                 # Use a detached interval here; we don't want grads through this random kick.
                 interval0 = self._broadcast_to_state(
-                    self.interval().detach(),
+                    evaluate_netstim_interval(self.interval).detach(),
                     dtype=dtype,
                     device=device,
                     name="interval",
@@ -1372,20 +1382,15 @@ class NetStim(DNModule, Sliceable):
             self.shape, generator=self._rng, device=device, dtype=dtype
         ).clamp_min(eps)
         exp_rand = -torch.log(U)
-        interval = self._broadcast_to_state(
-            self.interval(), dtype=dtype, device=device, name="interval"
-        )
-        noise = self._broadcast_to_state(
-            self.noise, dtype=dtype, device=device, name="noise"
-        )
+        parameters = self.renewal_parameters()
         transition = netstim_renewal(
             NetStimState(self.next_stoch_time, self.spike_counts, self.t_last),
-            interval,
-            noise,
+            parameters["interval"],
+            parameters["noise"],
             max_spikes,
             t,
             exp_rand,
-            tau=self.tau,
+            tau=parameters["tau"],
             bptt=bptt,
             next_sched_time=self.next_sched_time,
             scheduled_gate=sched_gate,

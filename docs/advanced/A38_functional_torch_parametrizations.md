@@ -120,11 +120,13 @@ They use the same native source evaluation during functional preparation; see
 selection, and initialization examples. Fixed connection delays retain their
 frozen routing schema.
 
-NetStim's `interval`, `start`, `noise`, and `tau` are exposed as effective
-numerical values. Parameters inside those source modules are currently
-unavailable as optimizer leaves, and registering a PyTorch parametrization
-directly on NetStim is currently unsupported. NetStim's integer `max_spikes`
-remains configuration. Continuous connections retain their separately
+NetStim sources retain their raw originals and registered transform tensors
+beneath `netstim.parameters`, including `interval.rho` and originals such as
+`interval.parametrizations.rho.original`. Parametrizations registered directly
+on NetStim fields such as `noise` retain their original source paths too. See
+{doc}`A40_functional_netstim_parameters` for selection, shared sources, and
+initialization. NetStim's integer `max_spikes` remains configuration.
+Continuous connections retain their separately
 registered stateless transform parameters, and tensor schedules retain their
 explicit times and amplitudes. See
 {doc}`A18_functional_continuous_connectivity` and
@@ -173,7 +175,9 @@ their native gradients.
 Nonpersistent transform buffers retain their current values unless a
 persistent alias writes the same storage. See
 {doc}`A29_functional_network_cache_initialization` for cache and continuation
-packets.
+packets. A parametrized module used as an Ion or Material initialization
+recipe is currently unsupported by fresh initialization; sharing a registered
+raw tensor with an ordinary initializer remains supported.
 
 Transform lists, module bindings, original layouts, and aliases are part of
 the lowered model structure. Adding, removing, or reordering parametrizations

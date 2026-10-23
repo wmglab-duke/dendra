@@ -375,7 +375,7 @@ def test_explicit_netstim_draw_tape_preserves_native_rng_clock_and_gradients(exe
     actual_loss = auxiliary["callbacks"]["trace"]["cell.v"].square().sum()
     expected_loss = torch.stack(native_voltage).square().sum()
     actual = torch.autograd.grad(
-        actual_loss, (values["interval"], values["noise"], values["tau"], weights)
+        actual_loss, (values["interval.rho"], values["noise"], values["tau"], weights)
     )
     expected = torch.autograd.grad(
         expected_loss,
@@ -386,15 +386,7 @@ def test_explicit_netstim_draw_tape_preserves_native_rng_clock_and_gradients(exe
             next(iter(native.synapses.values())).weight.weights[0].param.rho,
         ),
     )
-    _close(
-        (
-            actual[0] * torch.sigmoid(native.netstim.interval.rho),
-            actual[1],
-            actual[2].sum(),
-            actual[3],
-        ),
-        expected,
-    )
+    _close(actual, expected)
     assert all(
         torch.isfinite(value).all() and value.abs().sum() > 0 for value in actual
     )
@@ -524,7 +516,7 @@ def test_noisy_netstim_host_checkpoint_chunks_replay_explicit_rng_tape():
     _close(actual_aux["callbacks"]["trace"], expected_aux["callbacks"]["trace"])
     values = tensors.parameters["netstim"]["parameters"]
     weights = next(iter(tensors.parameters["synapses"].values()))[_RAW_WEIGHT]
-    targets = (values["noise"], values["interval"], weights, tape.netstim.exp_rand)
+    targets = (values["noise"], values["interval.rho"], weights, tape.netstim.exp_rand)
     actual_gradients = torch.autograd.grad(
         actual_aux["callbacks"]["trace"]["cell.v"].square().sum(), targets
     )

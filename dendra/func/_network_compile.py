@@ -158,7 +158,9 @@ class CompiledNetworkRunner:
                     "inference=False requires a Network initialized in training mode; call train() and initialize() before compiling"
                 )
             self._parameters = tensors.independent_parameters(trainable)
-            self._constants = _map_containers(tensors.constants, dict)
+            self._constants = self._functional._bind_parameter_constants(
+                self._parameters, _map_containers(tensors.constants, dict)
+            )
             self._initial_state = pytree.tree_map_only(
                 torch.Tensor, lambda value: value.detach().clone(), tensors.state
             )
@@ -349,6 +351,9 @@ class CompiledNetworkRunner:
         selected_constants = (
             self._constants if constants is None else _map_containers(constants, dict)
         )
+        selected_constants = self._functional._bind_parameter_constants(
+            selected_parameters, selected_constants
+        )
         previous = self._kernel.execution_report()
         try:
             if fresh:
@@ -372,6 +377,9 @@ class CompiledNetworkRunner:
                 selected_parameters = initialized.parameters
                 selected_constants = initialized.constants
                 selected_state = initialized.state
+            selected_constants = self._functional._bind_parameter_constants(
+                selected_parameters, selected_constants
+            )
             with torch.inference_mode() if self._inference else nullcontext():
                 final, auxiliary = self._functional.run(
                     selected_parameters,

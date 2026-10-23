@@ -596,13 +596,23 @@ class ConnectionParameterPlan:
                     for key in baseline
                 },
             }
+            constant_baseline = {
+                key: constants[f"baseline.{role}.constants.{key}"]
+                for key in set(self._role_constant_aliases[role].values())
+            }
+            # A local config buffer can be a selectable raw source elsewhere
+            # in a Network. Retention evaluates its stored source value while
+            # preserving that shared input's reverse- and forward-mode identity.
+            restored_constants = restore_population_cache_values(
+                constants, constant_baseline, parameter_names=constant_baseline
+            )
             selected_constants = {
                 key: torch.where(
                     retain,
-                    constants[f"baseline.{role}.constants.{key}"],
+                    restored_constants[key],
                     constants[key],
                 )
-                for key in set(self._role_constant_aliases[role].values())
+                for key in constant_baseline
             }
             # Select raw/config inputs before invoking authored transforms. An
             # inactive invalid source derivative must not poison retained

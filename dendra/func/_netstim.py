@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from typing import NamedTuple
 
@@ -26,6 +27,7 @@ from dendra.models.networks.netstim import NetStim
 from dendra.models.parametric import PositiveParam
 
 from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
+from ._torch_parametrizations import canonical_type
 from ._types import FunctionalizationError
 
 
@@ -66,7 +68,7 @@ def _snapshot(value, *, parameter=False):
 
 
 def _eligible(source):
-    if type(source) is not NetStim:
+    if canonical_type(source) is not NetStim:
         raise FunctionalizationError("Expected an initialized canonical NetStim.")
     if not getattr(source, "_renewal_initialized", False):
         raise FunctionalizationError("Initialize the NetStim before lowering it.")
@@ -77,12 +79,18 @@ def _eligible(source):
         )
     interval = source.interval
     if (
-        type(interval) is not PositiveParam
+        canonical_type(interval) is not PositiveParam
         or "forward" in interval.__dict__
         or "_compute" in interval.__dict__
         or interval._forward_hooks
         or interval._forward_pre_hooks
         or "forward" in source.__dict__
+        or any(
+            name in vars(source)
+            or inspect.getattr_static(type(source), name)
+            is not inspect.getattr_static(NetStim, name)
+            for name in ("renewal_parameters", "_broadcast_to_state")
+        )
         or source._forward_hooks
         or source._forward_pre_hooks
     ):
@@ -173,7 +181,7 @@ class FunctionalNetStim:
     def _validate_source(self):
         source = self._source
         if (
-            type(source) is not NetStim
+            canonical_type(source) is not NetStim
             or not source._renewal_initialized
             or source._renewal_generation != self._generation
             or source._renewal_config_generation != self._config_generation
@@ -333,18 +341,10 @@ class FunctionalNetStim:
             )
         source = self._source if source is None else source
         self._validate_compatible(source)
-        # Bypass PositiveParam's eval cache, which is mutable derived state.
-        # Materialization is a cold value read: preserve the native parameter's
-        # gradient convention even when extraction runs under no_grad/inference.
-        with torch.inference_mode(False), torch.no_grad():
-            interval = source.interval._compute()
-            interval.requires_grad_(source.interval.rho.requires_grad)
-        values = {
-            "interval": interval,
-            "start": source.start,
-            "noise": source.noise,
-            "tau": torch.as_tensor(source.tau, device=self.device, dtype=self.dtype),
-        }
+        # The native materializer bypasses canonical inference caches while
+        # using the same broadcast/cast policy and parametrization getters.
+        with torch.inference_mode(False), torch.enable_grad():
+            values = source.renewal_parameters()
         parameters = {
             name: _snapshot(torch.broadcast_to(value, self.shape), parameter=True)
             for name, value in values.items()

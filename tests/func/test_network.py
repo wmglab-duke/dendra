@@ -440,7 +440,7 @@ def test_netstim_surrogate_gradients_reach_connected_population(compiled):
     weights = next(iter(tensors.parameters["synapses"].values()))[_RAW_WEIGHT]
     actual = torch.autograd.grad(
         functional_loss,
-        (parameters["interval"], parameters["noise"], parameters["tau"], weights),
+        (parameters["interval.rho"], parameters["noise"], parameters["tau"], weights),
     )
     expected = torch.autograd.grad(
         native_loss,
@@ -451,13 +451,7 @@ def test_netstim_surrogate_gradients_reach_connected_population(compiled):
             next(iter(native.synapses.values())).weight.weights[0].param.rho,
         ),
     )
-    adjusted = (
-        actual[0] * torch.sigmoid(native.netstim.interval.rho),
-        actual[1],
-        actual[2].sum(),
-        actual[3],
-    )
-    _close(adjusted, expected)
+    _close(actual, expected)
     assert all(
         torch.isfinite(value).all() and value.abs().sum() > 0 for value in actual
     )

@@ -47,3 +47,4 @@ Advanced
    advanced/A37_functional_material_processes.md
    advanced/A38_functional_torch_parametrizations.md
    advanced/A39_functional_connection_parameters.md
+   advanced/A40_functional_netstim_parameters.md

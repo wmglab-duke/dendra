@@ -233,10 +233,14 @@ are derived during preparation, retaining their constraints and any supported
 PyTorch parametrizations. Continuous
 transform parameters use
 `continuous_synapses.<connection-name>.transform_parameters.<parameter-name>`.
-NetStim renewal parameters appear under `netstim.parameters`, and schedule
-values retain named fields such as `schedule.times` and
-`schedule.amplitudes`. See {doc}`A39_functional_connection_parameters` for
-connection source registration, shared optimizer leaves, and refresh policies.
+NetStim renewal sources appear under `netstim.parameters`, including the
+positive interval's raw `interval.rho` and PyTorch parametrization originals
+and transform parameters. Schedule values retain named fields such as
+`schedule.times` and `schedule.amplitudes`. See
+{doc}`A39_functional_connection_parameters` for connection source registration,
+shared optimizer leaves, and refresh policies, and
+{doc}`A40_functional_netstim_parameters` for NetStim source selection,
+initialization, and random-state continuation.
 
 `trainable` accepts exact names, unique partial names, glob patterns, and
 explicit regex selectors. For example:

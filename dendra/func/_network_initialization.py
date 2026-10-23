@@ -482,15 +482,15 @@ def _cache_alias_plan(functional, writers, readers):
         )
     if functional.netstim is not None:
         source = functional.netstim._source
+        sources = functional._netstim_parameter_plan
         native["netstim"] = {
-            "parameters": {
-                name: getattr(source, name)
-                for name in ("start", "noise", "tau")
-                if torch.is_tensor(getattr(source, name))
-            },
+            "parameters": sources.parameter_sources(source),
             "schedule": TensorScheduleTensors(**_TensorSchedulePlan._values(source))
             if functional._parameter_schema["netstim"]["schedule"] is not None
             else None,
+        }
+        native_constants["netstim"] = {
+            "sources": sources.cache_constant_sources(source)
         }
     native_parameters = dict(_tensor_paths(native))
     parameter_frames = {
@@ -722,7 +722,7 @@ def _initialize_components(
 
     populations = dict(state["populations"])
     effective = parameters
-    effective_constants = constants
+    effective_constants = functional._bind_parameter_constants(parameters, constants)
     with nullcontext() if functional.training else torch.no_grad():
         # Native initialize completes each Population in authored order before
         # resetting connections. Parameter-writing transforms affect every
@@ -767,6 +767,12 @@ def _initialize_components(
                     bindings=bindings,
                     replays=replays,
                 )
+            # A cache transaction can replace a selectable raw input while
+            # restoring the same authored Tensor through a config-buffer slot.
+            # The resulting raw input owns all exact-identity config readers.
+            effective_constants = functional._bind_parameter_constants(
+                effective, effective_constants
+            )
         if inputs.cache is not None:
             effective, effective_constants, populations = _restore_cache_aliases(
                 functional,
@@ -775,6 +781,9 @@ def _initialize_components(
                 effective_constants,
                 populations,
                 inputs.cache,
+            )
+            effective_constants = functional._bind_parameter_constants(
+                effective, effective_constants
             )
         time = inputs.t.detach().clone()
         populations = {
@@ -851,8 +860,10 @@ def _finish_initialization(functional, packet, draw):
     state = dict(packet.state)
     if functional.netstim is not None:
         state["netstim"] = functional.netstim.initial_state(
-            packet.parameters["netstim"]["parameters"],
-            packet.constants["netstim"],
+            functional._materialize_netstim_parameters(
+                packet.parameters, packet.constants
+            ),
+            functional._netstim_constants(packet.constants),
             state["netstim"],
             draw,
         )
@@ -899,7 +910,9 @@ def initialize_host(functional, parameters, constants, state, inputs):
     if functional.netstim is not None and draw is None:
         # Native initialization samples last. Population transforms may have
         # changed a parameter shared with NetStim, including conditional noise.
-        draw = functional.sample_initialization_draw(packet.parameters, packet.state)
+        draw = functional.sample_initialization_draw(
+            packet.parameters, packet.state, constants=packet.constants
+        )
     return _finish_initialization(functional, packet, draw)
 
 

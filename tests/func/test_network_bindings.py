@@ -170,6 +170,29 @@ def test_alias_snapshots_reject_incompatible_effective_component_schemas():
         aliases.snapshot(native, native.reshape(2, 1))
 
 
+@pytest.mark.parametrize("trainable_first", (False, True))
+def test_alias_snapshots_merge_reader_trainability_without_mutating_sources(
+    trainable_first,
+):
+    native = torch.tensor([0.2, 0.4], dtype=DTYPE, requires_grad=True)
+    aliases = AliasSnapshots()
+    first = native if trainable_first else native.detach()
+    second = native.detach() if trainable_first else native
+    with torch.inference_mode():
+        left = aliases.snapshot(native, first)
+        right = aliases.snapshot(native, second)
+    assert left is right
+    assert left.is_leaf and left.requires_grad
+    assert not left.is_inference()
+    assert left.data_ptr() != native.data_ptr()
+    with torch.no_grad():
+        left.add_(0.3)
+    torch.testing.assert_close(native, torch.tensor([0.2, 0.4], dtype=DTYPE))
+    assert native.requires_grad
+    gradient = torch.autograd.grad((left + right).square().sum(), left)[0]
+    torch.testing.assert_close(gradient, 8 * left)
+
+
 def test_duplicate_population_owners_reject_instead_of_losing_native_state_aliases():
     network = _network(duplicate_owner=True)
     assert network.cell is network.alias

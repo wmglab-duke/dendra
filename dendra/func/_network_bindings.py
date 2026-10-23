@@ -170,7 +170,7 @@ class AliasSnapshots:
             return value
         source = native if torch.is_tensor(native) else value
         identity = id(source)
-        schema = (tuple(value.shape), value.dtype, value.device, value.requires_grad)
+        schema = (tuple(value.shape), value.dtype, value.device)
         if identity in self._memo:
             _, previous_schema, copied = self._memo[identity]
             if schema != previous_schema:
@@ -178,6 +178,12 @@ class AliasSnapshots:
                     "A shared Network Tensor has incompatible explicit component schemas; "
                     "use separate native tensors or a matching parameterization."
                 )
+            # A raw source may be a trainable input to one component and a
+            # config buffer to another. Keep their common owned leaf while
+            # retaining the trainability requested by either reader.
+            if value.requires_grad and not copied.requires_grad:
+                with torch.inference_mode(False):
+                    copied.requires_grad_(True)
             return copied
         with torch.inference_mode(False):
             copied = value.detach().clone(memory_format=torch.preserve_format)
