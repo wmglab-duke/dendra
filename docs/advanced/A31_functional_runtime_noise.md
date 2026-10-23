@@ -10,8 +10,8 @@ kernelspec:
 # Compile models with runtime noise
 
 `GLOBALNOISE`, `BATCHNOISE`, and `RANGENOISE` declare detached stochastic
-buffers. Mechanisms and nested States refresh these buffers before their
-state transition on each timestep. Functional Population and Network
+buffers. Mechanisms, nested States, and MaterialProcesses refresh these buffers
+before the Population transition on each timestep. Functional Population and Network
 execution uses the same distribution transforms and timestep scaling as
 native execution, with explicit base draws and RNG carry.
 
@@ -67,8 +67,12 @@ Use RAND declarations for sampled parameter heterogeneity with optional
 reparameterized distribution gradients; see
 {doc}`A30_functional_random_parameters`. Use State `DIFFUSION` for Itô or
 Stratonovich dynamics with differentiable drift, diffusion, and timestep;
-see {doc}`A32_functional_state_sde`. Runtime NOISE declarations on
-MaterialProcess objects are currently unsupported.
+see {doc}`A32_functional_state_sde`. MaterialProcesses use explicit NOISE with
+their native preparation and Material phase ordering; see
+{doc}`A44_functional_material_stochasticity`. Pointwise/custom processes use
+the current step's sample. Spatial diffusion retains the realization used
+when `set_dt` configured its operator, alongside the independently refreshed
+runtime buffer, and preserves that configured realization in checkpoints.
 
 ## Supply draw and RNG tapes
 
@@ -131,8 +135,9 @@ performing fresh sampling; see
 {doc}`A29_functional_network_cache_initialization`. RAND declarations can
 invalidate a Population-owned cache according to their resampling policy.
 
-Within each Population timestep, Mechanism NOISE is refreshed before nested
-State NOISE and the state/voltage transition. Network connection delivery
+Within each Population timestep, each Mechanism's NOISE is refreshed before its
+nested State NOISE, followed by MaterialProcess NOISE in insertion order and
+then the state/voltage transition. Network connection delivery
 precedes Population stepping, so a connection whose `pre_var` observes a
 NOISE buffer reads its retained value from the incoming boundary.
 Repeated preparation and checkpoint backward do not consume additional

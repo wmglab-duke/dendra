@@ -2012,6 +2012,14 @@ class Population(P, Sliceable):
         integrator = getattr(self, "integrator", None)
         if integrator is not None:
             integrator.initialized = False
+        handler = getattr(self, "mech", None)
+        for process in getattr(handler, "material_processes", {}).values():
+            if hasattr(process, "_spatial_configured"):
+                # A regular state-dict load restores parameter/noise inputs;
+                # its next timestep configuration owns the spatial workspace.
+                # Runtime checkpoint restoration follows a separate path and
+                # retains the held operator and its stochastic provenance.
+                process._spatial_configured = False
 
         if not has_remainder:
             if strict:
@@ -4457,24 +4465,26 @@ class Population(P, Sliceable):
         self.populate()
 
     def _has_random_parameters_resampled_on_initialize(self):
-        """Return True if this population or any mechanism redraws on initialize."""
+        """Return True if this population or any inserted owner redraws."""
 
         if any(spec.resample_on_initialize for spec in self.random_parameters.values()):
             return True
         mech_handler = getattr(self, "mech", None)
         if mech_handler is None:
             return False
-        for mech in getattr(mech_handler, "mechanisms", {}).values():
-            if any(
-                spec.resample_on_initialize for spec in mech.random_parameters.values()
-            ):
-                return True
-            for state_module in getattr(mech, "DE", {}).values():
+        for collection_name in ("mechanisms", "material_processes"):
+            for mech in getattr(mech_handler, collection_name, {}).values():
                 if any(
                     spec.resample_on_initialize
-                    for spec in state_module.random_parameters.values()
+                    for spec in mech.random_parameters.values()
                 ):
                     return True
+                for state_module in getattr(mech, "DE", {}).values():
+                    if any(
+                        spec.resample_on_initialize
+                        for spec in state_module.random_parameters.values()
+                    ):
+                        return True
         return False
 
     def resample_random_parameters(self, *names, force: bool = True):

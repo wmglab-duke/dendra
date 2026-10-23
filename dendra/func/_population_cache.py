@@ -186,6 +186,16 @@ class PopulationCachePlan:
         population = plan._population
         reference = population.state_dict(keep_vars=True)
         preserved = {f"integrator.{name}" for name in population.integrator._buffers}
+        from dendra.models.mechanisms._material_stochasticity import (
+            stochastic_material_workspace_slots,
+        )
+
+        preserved.update(
+            f"integrator.mech.material_processes.{name}._spatial_operators.{suffix}"
+            for name, process in population.mech.material_processes.items()
+            for suffix, _owner, _buffer in stochastic_material_workspace_slots(process)
+            if not suffix.startswith("noise.")
+        )
         if not bindings_only and isinstance(cache, Mapping):
             cache = {
                 **cache,
@@ -259,6 +269,7 @@ class PopulationCachePlan:
                 ),
             )
             for leaf in plan._state_layout
+            if leaf.public_path[0] != "material_preparation"
         )
         self.constants = {}
 
@@ -537,11 +548,19 @@ class PopulationCachePlan:
                 constants["cache.active"]
             )
         effective_constants = plan._clear_retained_materializations(effective_constants)
+        # Native cache initialization configures spatial operators after the
+        # restored NOISE/parameter transaction. Keep only a schema template
+        # until the Population/Network owner reaches that shared boundary.
         restored_state = {}
-        for path, source in self.states:
-            reference = _get_path(state, path)
-            value = cache[source].detach().to(reference).clone()
-            _put_path(restored_state, path, value)
+        sources = dict(self.states)
+        for leaf in plan._state_layout:
+            reference = _get_path(state, leaf.public_path)
+            value = (
+                reference
+                if leaf.public_path[0] == "material_preparation"
+                else cache[sources[leaf.public_path]].detach().to(reference).clone()
+            )
+            _put_path(restored_state, leaf.public_path, value)
         if plan._random_plan is not None:
             effective_constants, restored_state["random"] = (
                 plan._random_plan.restore_cache(cache, effective_constants)

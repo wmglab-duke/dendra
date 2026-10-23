@@ -465,6 +465,8 @@ def custom_material_constant_slots(process):
         "component_area",
         "dt",
         *p._parameter_materialization_output_names(process),
+        *process.random_parameters,
+        *process.runtime_noises,
         *getattr(process, "_functional_material_slots", ()),
     }
     for path, child in _safe_modules(process):

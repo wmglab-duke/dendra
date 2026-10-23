@@ -51,3 +51,4 @@ Advanced
    advanced/A41_functional_connection_sampling.md
    advanced/A42_functional_initialization_parametrizations.md
    advanced/A43_functional_initialization_ordering.md
+   advanced/A44_functional_material_stochasticity.md

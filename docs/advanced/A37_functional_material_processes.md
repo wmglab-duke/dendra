@@ -41,8 +41,10 @@ The three pure hooks have separate roles:
 - `prepare_materials(fields, dt)` returns a tensor-only PyTree of numerical
   workspace, or an empty tuple when no workspace is needed. `None` is reserved
   by the native adapter. Preparation uses current explicit parameters, geometry,
-  timestep, and field schemas. It runs outside the functional accepted-step
-  loop, so it must not read evolving field values. In the example, `pool`
+  timestep, and field schemas. Deterministic preparation runs outside the
+  functional accepted-step loop; custom processes with NOISE prepare at their
+  Material phase using the current explicit noise. It must not read evolving field
+  values. In the example, `pool`
   supplies the shape, dtype, and device needed to resolve the rate;
   `fraction` is independent of the stored amount.
 - `material_updates(fields, prepared)` reads the current complete fields and
@@ -82,9 +84,13 @@ from `MaterialProcess`. The shared native `advance_materials` adapter calls
 these pure numerical hooks and commits their replacements. Custom imperative
 lifecycle overrides are currently unsupported by functional lowering. Ordinary
 Mechanism `STATE`, `CARRY`, `initial_values`, `advance`, and workspace phases
-do not apply to MaterialProcesses. Process-level `RAND` and `NOISE`, implicit
-random draws, execution hooks, hidden dependencies, and persistent mutation
-are currently unsupported.
+do not apply to MaterialProcesses. Process-level `RAND` and `NOISE` use
+explicit draws and RNG carry; see {doc}`A44_functional_material_stochasticity`.
+Named NOISE operands resolved with `_resolve_quantity` are copied for the
+accepted step. Direct reads such as `self.eta` need an explicit `.clone()` when
+backward may save that sample, because native sampling refreshes it in place.
+Implicit random draws, execution hooks, hidden dependencies, and persistent
+mutation are currently unsupported.
 
 ## Insert the same process in native Populations
 

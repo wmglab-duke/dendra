@@ -11,6 +11,11 @@ from dendra.helpers import MEMBRANE_ASSEMBLY
 from ..rng import _validate_rng_checkpoint_payload
 from ._inputs import InputBinding, _input_path
 from ._material_process import DiffusionProcess, MaterialProcess
+from ._material_stochasticity import (
+    retain_stochastic_material_workspace_once,
+    stage_stochastic_material_workspace,
+    stochastic_material_workspace_slots,
+)
 from ._materials import _canonical_material_name
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
 from ._support import SupportKind
@@ -182,6 +187,9 @@ def _capture_stochastic_state(states, prefix, module):
     for parameter_name in sorted(getattr(module, "random_parameters", {})):
         key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter.{parameter_name}"
         states[key] = getattr(module, parameter_name)
+    for suffix, owner, buffer_name in stochastic_material_workspace_slots(module):
+        key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}material_workspace.{suffix}"
+        states[key] = owner._buffers[buffer_name]
     if getattr(module, "random_parameters", {}):
         key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter_state"
         states[key] = module._random_parameter_state_for_checkpoint()
@@ -2948,6 +2956,7 @@ class MechanismHandler(torch.nn.Module):
         rng_assignments = plan["rng_assignments"]
         delay_assignments = plan["delay_assignments"]
         random_parameter_assignments = plan["random_parameter_assignments"]
+        material_assignments = plan["material_assignments"]
 
         missing = object()
         original_tensors = [
@@ -2978,6 +2987,17 @@ class MechanismHandler(torch.nn.Module):
             for module, _ in random_parameter_assignments
         ]
         original_rngs = {}
+        original_materials = [
+            (
+                owner,
+                owner._spatial_operators,
+                owner._spatial_configured,
+                dict(owner._buffers),
+                set(owner._non_persistent_buffers_set),
+                getattr(owner, "_material_restored_workspace_dt", missing),
+            )
+            for owner, _staged in material_assignments
+        ]
         for rng, _, _ in rng_assignments:
             if id(rng) in original_rngs:
                 continue
@@ -3001,7 +3021,35 @@ class MechanismHandler(torch.nn.Module):
                 module._sync_delay_history_shapes()
             for module, provenance in random_parameter_assignments:
                 module._apply_random_parameter_state(provenance)
+            for module, staged in material_assignments:
+                module._spatial_operators = staged._spatial_operators
+                module._spatial_configured = True
+                for name in module.runtime_noises:
+                    name = f"_material_held_noise_{name}"
+                    if name in module._buffers:
+                        module._buffers[name] = staged._buffers[name]
+                    else:
+                        module.register_buffer(
+                            name, staged._buffers[name], persistent=False
+                        )
+                retain_stochastic_material_workspace_once(module)
         except Exception:
+            for (
+                module,
+                operators,
+                configured,
+                buffers,
+                nonpersistent,
+                restored_dt,
+            ) in original_materials:
+                module._spatial_operators = operators
+                module._spatial_configured = configured
+                module._buffers = buffers
+                module._non_persistent_buffers_set = nonpersistent
+                if restored_dt is missing:
+                    module.__dict__.pop("_material_restored_workspace_dt", None)
+                else:
+                    module._material_restored_workspace_dt = restored_dt
             for owner, name, original in reversed(original_tensors):
                 if original is missing:
                     if hasattr(owner, name):
@@ -3043,6 +3091,7 @@ class MechanismHandler(torch.nn.Module):
         rng_assignments = []
         delay_assignments = []
         random_parameter_assignments = []
+        material_assignments = []
         missing = object()
 
         def add_tensor(
@@ -3133,6 +3182,45 @@ class MechanismHandler(torch.nn.Module):
                     f"random_parameter.{parameter_name}"
                 )
                 add_tensor(module, parameter_name, key)
+            if not isinstance(module, DiffusionProcess) or not module.runtime_noises:
+                return
+            staged = stage_stochastic_material_workspace(
+                module,
+                state_dict,
+                prefix=f"{prefix}{_STOCHASTIC_STATE_SEGMENT}",
+            )
+            workspace_owner = module if staged is None else staged
+            if staged is not None:
+                material_assignments.append((module, staged))
+            workspace_prefix = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}material_workspace."
+            workspace = {
+                f"{workspace_prefix}{suffix}": (owner, buffer_name)
+                for suffix, owner, buffer_name in stochastic_material_workspace_slots(
+                    workspace_owner
+                )
+            }
+            present = {
+                key
+                for key in state_dict
+                if isinstance(key, str) and key.startswith(workspace_prefix)
+            }
+            if present:
+                missing_workspace = set(workspace) - present
+                unexpected_workspace = present - set(workspace)
+                if missing_workspace:
+                    raise KeyError(
+                        "MechanismHandler material workspace state is missing "
+                        f"entries: {sorted(missing_workspace)}."
+                    )
+                if unexpected_workspace:
+                    raise ValueError(
+                        "MechanismHandler material workspace state has unexpected "
+                        f"entries: {sorted(unexpected_workspace)}."
+                    )
+            for key, (owner, buffer_name) in workspace.items():
+                # Only an entirely absent namespace has the legacy behavior of
+                # retaining the target's configured operator and provenance.
+                add_tensor(owner, buffer_name, key, optional=not present)
 
         def require_integer_tensor(key, expected_shape):
             if key not in state_dict:
@@ -3321,6 +3409,7 @@ class MechanismHandler(torch.nn.Module):
             "rng_assignments": rng_assignments,
             "delay_assignments": delay_assignments,
             "random_parameter_assignments": random_parameter_assignments,
+            "material_assignments": material_assignments,
         }
 
     def _mutable_state_bindings(self):

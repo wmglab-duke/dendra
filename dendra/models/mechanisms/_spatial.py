@@ -13,6 +13,7 @@ from collections import deque
 from collections.abc import Mapping
 from functools import partial
 from math import prod
+from numbers import Number
 from typing import Literal
 
 import numpy as np
@@ -49,6 +50,8 @@ except Exception:  # pragma: no cover - triton may be unavailable
 def _as_tensor_like(value, like: torch.Tensor) -> torch.Tensor:
     if torch.is_tensor(value):
         return value.to(device=like.device, dtype=like.dtype)
+    if isinstance(value, Number):
+        return like.new_full((), value)
     return torch.as_tensor(value, device=like.device, dtype=like.dtype)
 
 
@@ -63,7 +66,12 @@ def _broadcast_to(value, target: torch.Tensor) -> torch.Tensor:
 
 def _broadcast_mask_to(value, target: torch.Tensor) -> torch.Tensor:
     """Broadcast a structural boolean mask without adopting target dtype."""
-    value = torch.as_tensor(value, device=target.device, dtype=torch.bool)
+    if isinstance(value, bool):
+        value = target.new_full((), value, dtype=torch.bool)
+    elif torch.is_tensor(value):
+        value = value.to(device=target.device, dtype=torch.bool)
+    else:
+        value = torch.as_tensor(value, device=target.device, dtype=torch.bool)
     if value.ndim == 0:
         return value.expand(target.shape)
     while value.ndim < target.ndim:
@@ -757,10 +765,16 @@ class SpatialOperator1D(torch.nn.Module):
             relax_rhs=workspace["relax_rhs"] + reaction_rhs,
         )
 
+    def _prepared_buffer_names(self) -> tuple[str, ...]:
+        """Inventory the shared numerical export without cloning its tensors."""
+        self._require_configured()
+        return tuple(self._buffers)
+
     def prepared_buffers(self) -> dict[str, torch.Tensor]:
         """Export an independent, differentiable numerical workspace."""
-        self._require_configured()
-        return {name: value.clone() for name, value in self._buffers.items()}
+        return {
+            name: self._buffers[name].clone() for name in self._prepared_buffer_names()
+        }
 
     def prepare_diffusion(self, c_like, dt, D_um2_per_ms, diam_um, dx_um, **kwargs):
         """Build explicit tensor workspace without changing this operator.
@@ -1860,14 +1874,20 @@ class SpatialOperatorTree(torch.nn.Module):
             relax_rhs=workspace["relax_rhs"] + mass_rate * target_s,
         )
 
-    def prepared_buffers(self) -> dict[str, torch.Tensor]:
-        """Export numerical coefficients, excluding fixed topology metadata."""
+    def _prepared_buffer_names(self) -> tuple[str, ...]:
+        """Inventory numerical coefficients independently of fixed topology."""
         self._require_configured()
-        return {
-            name: value.clone()
-            for name, value in self._buffers.items()
+        return tuple(
+            name
+            for name in self._buffers
             if name not in self._FUNCTIONAL_TOPOLOGY_BUFFERS
             and name != "native_edge_factor"
+        )
+
+    def prepared_buffers(self) -> dict[str, torch.Tensor]:
+        """Export numerical coefficients, excluding fixed topology metadata."""
+        return {
+            name: self._buffers[name].clone() for name in self._prepared_buffer_names()
         }
 
     def prepare_diffusion(self, c_like, dt, D_um2_per_ms, model, **kwargs):

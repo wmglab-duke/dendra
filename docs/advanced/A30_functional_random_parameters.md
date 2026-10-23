@@ -46,8 +46,10 @@ the selection. The sample itself is not an independent optimizer leaf.
 | `BATCHRAND` | The owner's BATCH layout, shared over compartments. |
 | `RANGERAND` | The owner's RANGE layout, including regional mechanism support. |
 
-Declarations on supported Populations, Mechanisms, and nested States use their
-own native scopes and ordering. A `Population` or `SingleCompartment` subclass
+Declarations on supported Populations, Mechanisms, nested States, and
+MaterialProcesses use their own native scopes and ordering. See
+{doc}`A44_functional_material_stochasticity` for sampled full-field processes.
+A `Population` or `SingleCompartment` subclass
 may add RAND declarations while inheriting every numerical and lifecycle
 method; custom execution overrides remain unsupported. The built-in
 distributions are `normal`,

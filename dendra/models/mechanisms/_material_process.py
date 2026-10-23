@@ -595,8 +595,22 @@ class MaterialProcess(Mechanism):
                         "_batch_n",
                     )
                 )
+                if self.key is not None:
+                    stochastic = self.random_parameters.get(
+                        value, self.runtime_noises.get(value)
+                    )
+                    local = local or (
+                        stochastic is not None
+                        and stochastic.scope in {"range", "batch"}
+                    )
+                operand = getattr(self, value)
+                if value in self.runtime_noises:
+                    # Native sampling refreshes these buffers in place. An
+                    # accepted step owns its detached realization, including
+                    # values saved for another operand's backward pass.
+                    operand = operand.detach().clone()
                 return self._expand_material_operand(
-                    getattr(self, value).to(device=like.device, dtype=like.dtype),
+                    operand.to(device=like.device, dtype=like.dtype),
                     like,
                     local=local,
                 )
@@ -612,6 +626,8 @@ class MaterialProcess(Mechanism):
             return self._expand_material_operand(
                 value.to(device=like.device, dtype=like.dtype), like
             )
+        if isinstance(value, Number):
+            return like.new_full((), value)
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
 
     def advance_materials(self, dt, *, prepared=None):
@@ -2651,6 +2667,7 @@ class DiffusionProcess(MaterialProcess):
     def _reset_initialization_timestep(self):
         """Release configured diffusion operators and their autograd graphs."""
 
+        self.__dict__.pop("_material_restored_workspace_dt", None)
         self._spatial_operators = self._new_spatial_operators()
         self._spatial_configured = False
         return None
@@ -2864,7 +2881,12 @@ class DiffusionProcess(MaterialProcess):
     def _resolve_quantity(self, value, like: torch.Tensor):
         if isinstance(value, str):
             if hasattr(self, value):
-                return getattr(self, value)
+                resolved = getattr(self, value)
+                return (
+                    resolved.detach().clone()
+                    if value in self.runtime_noises
+                    else resolved
+                )
             population_buffer = getattr(
                 self, "_diffusion_population_quantities", {}
             ).get(value)
@@ -2879,6 +2901,8 @@ class DiffusionProcess(MaterialProcess):
                 ) from exc
         if torch.is_tensor(value):
             return value.to(device=like.device, dtype=like.dtype)
+        if isinstance(value, Number):
+            return like.new_full((), value)
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
 
     def _resolve_spatial_quantity(self, value, like: torch.Tensor):
@@ -2897,6 +2921,14 @@ class DiffusionProcess(MaterialProcess):
         range_names = set()
         for declaration in ("range", "range_p", "range_n"):
             range_names.update(getattr(self, declaration, {}).keys())
+        range_names.update(
+            name
+            for name, spec in (
+                *self.random_parameters.items(),
+                *self.runtime_noises.items(),
+            )
+            if spec.scope in {"range", "batch"}
+        )
         if value not in range_names:
             return resolved
 
@@ -3003,7 +3035,7 @@ class DiffusionProcess(MaterialProcess):
                 if spatial
                 else resolved
             )
-        return torch.as_tensor(value, device=like.device, dtype=dtype)
+        return like.new_full((), value, dtype=dtype)
 
     def _diffusion_edge_operand(self, value, like):
         """Lift component-local edge values into the packed forest edge order."""
@@ -3277,7 +3309,12 @@ class DiffusionProcess(MaterialProcess):
         dt_new.fill_(dt)
         dt_new = dt_new.detach()
         if hasattr(self, "_material_resolver"):
-            self.configure_spatial_operators(dt)
+            from ._material_stochasticity import (
+                consume_stochastic_material_workspace_restore,
+            )
+
+            if not consume_stochastic_material_workspace_restore(self, dt):
+                self.configure_spatial_operators(dt)
         self.dt = dt_new
         return None
 
@@ -3322,6 +3359,9 @@ class DiffusionProcess(MaterialProcess):
                 operator.validate_explicit()
         self._spatial_operators = staged_operators
         self._spatial_configured = True
+        from ._material_stochasticity import capture_stochastic_material_noise
+
+        capture_stochastic_material_noise(self)
         return None
 
     def advance_materials(self, dt, *, prepared=None):

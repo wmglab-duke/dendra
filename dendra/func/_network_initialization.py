@@ -801,6 +801,12 @@ def _initialize_components(
             effective_constants = functional._bind_parameter_constants(
                 effective, effective_constants
             )
+            if inputs.cache is None and plan._owned_cache_bound:
+                populations[name] = plan._initialize_material_workspace(
+                    effective["populations"][name],
+                    effective_constants["populations"][name],
+                    populations[name],
+                )
         if inputs.cache is not None:
             effective, effective_constants, populations = _restore_cache_aliases(
                 functional,
@@ -824,6 +830,11 @@ def _initialize_components(
                         effective["populations"][name],
                         effective_constants["populations"][name],
                     ),
+                )
+                populations[name] = plan._initialize_material_workspace(
+                    effective["populations"][name],
+                    effective_constants["populations"][name],
+                    populations[name],
                 )
         time = inputs.t.detach().clone()
         populations = {

@@ -2773,10 +2773,46 @@ def _material_process_geometry_sources(process):
 
 def _prepared_material_advance(self, dt):
     """Private adapter: returned replacements publish only to explicit carry."""
-    values = tuple(self._buffers[name] for name in self._functional_material_slots)
-    prepared = torch.utils._pytree.tree_unflatten(
-        values, self._functional_material_tree_spec
-    )
+    if self.runtime_noises:
+        # Pointwise/custom processes consume this step's NOISE. Diffusion uses
+        # the realization held at its native timestep-configuration boundary.
+        # Reusing pure preparation retains derivatives of other coefficients
+        # and geometry without changing that stochastic timing.
+        fields = {
+            key: self._get_material(key[0])._buffers[key[1]]
+            for key in self.material_fields
+        }
+        current_noise = {}
+        for suffix, slot in getattr(self, "_functional_material_workspace_slots", ()):
+            if suffix.startswith("noise."):
+                name = suffix.removeprefix("noise.")
+                current_noise[name] = self._buffers[name]
+                self._buffers[name] = self._buffers[slot]
+        try:
+            prepared = self.prepare_materials(fields, dt)
+        finally:
+            self._buffers.update(current_noise)
+        leaves, tree_spec = torch.utils._pytree.tree_flatten(prepared)
+        if tree_spec != self._functional_material_tree_spec or any(
+            not torch.is_tensor(value)
+            or (_shape_tuple(value), value.dtype, value.device) != schema
+            for value, schema in zip(
+                leaves, self._functional_material_prepared_schema, strict=True
+            )
+        ):
+            raise FunctionalizationError(
+                "Material preparation changed its tensor schema"
+            )
+        if isinstance(self, DiffusionProcess):
+            for slot, value in zip(
+                self._functional_material_slots, leaves, strict=True
+            ):
+                self._buffers[slot] = value
+    else:
+        values = tuple(self._buffers[name] for name in self._functional_material_slots)
+        prepared = torch.utils._pytree.tree_unflatten(
+            values, self._functional_material_tree_spec
+        )
     MaterialProcess.advance_materials(self, dt, prepared=prepared)
 
 
@@ -2797,6 +2833,16 @@ def _retain_material_spatial_plan_at_initialization(self):
 
 def _install_material_preparation(population, dt, *, custom_plans=None):
     """Give the private transition fixed tensor slots for pure process outputs."""
+    from ._material_stochasticity import (
+        bind_stochastic_diffusion_workspaces,
+        stochastic_diffusion_workspace_bindings,
+    )
+
+    stochastic_bindings = stochastic_diffusion_workspace_bindings(population)
+    retained_workspaces = {
+        prepared: _clone_tensor(_buffer_at(population, *native.rsplit(".", 1)))
+        for prepared, native in stochastic_bindings.items()
+    }
     for process_name, process in population.mech.material_processes.items():
         contract = _material_process_contract(process)
         if contract.family is MaterialProcess:
@@ -2844,6 +2890,9 @@ def _install_material_preparation(population, dt, *, custom_plans=None):
             process.register_buffer(name, _clone_tensor(value), persistent=False)
         process._functional_material_slots = slots
         process._functional_material_tree_spec = tree_spec
+        process._functional_material_prepared_schema = tuple(
+            (_shape_tuple(value), value.dtype, value.device) for value in leaves
+        )
         # Canonical pointwise families use full-field arithmetic, so singleton
         # axes avoid the empty-vmap scalar/spatial broadcast limitation. Custom
         # workspace leaves retain their authored ranks: reducing one dimension
@@ -2870,6 +2919,9 @@ def _install_material_preparation(population, dt, *, custom_plans=None):
                 for name in tuple(operator._buffers):
                     if name not in topology:
                         del operator._buffers[name]
+    bind_stochastic_diffusion_workspaces(population, stochastic_bindings)
+    for path, value in retained_workspaces.items():
+        _set_buffer(population, *path.rsplit(".", 1), value)
 
 
 def _timestep_buffer_shape_specs(module) -> tuple[tuple[str, object], ...]:
@@ -2944,6 +2996,14 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
                 )
 
     for process_name, process in handler.material_processes.items():
+        from dendra.models.mechanisms._material_stochasticity import (
+            stochastic_material_workspace_slots,
+        )
+
+        for suffix, _owner, _name in stochastic_material_workspace_slots(process):
+            keys[
+                f"{process_name}.__dendra_stochastic_state__.material_workspace.{suffix}"
+            ] = ("material_preparation", process_name, suffix)
         for state in process.DE.values():
             for state_name in sorted(state._state):
                 keys[f"{process_name}.{state_name}"] = (
@@ -3228,9 +3288,11 @@ def _state_layout_signature(layout: tuple[_StateLeaf, ...]) -> tuple:
     return tuple(
         (
             leaf.public_path,
-            leaf.module_path,
-            leaf.buffer_name,
-            leaf.mapping_slots,
+            None if leaf.public_path[0] == "material_preparation" else leaf.module_path,
+            None if leaf.public_path[0] == "material_preparation" else leaf.buffer_name,
+            None
+            if leaf.public_path[0] == "material_preparation"
+            else leaf.mapping_slots,
             leaf.checkpoint_key,
             leaf.shape,
             leaf.dtype,
@@ -6531,7 +6593,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         unsupported = []
         for leaf in layout:
             path = leaf.public_path
-            if path[0] == "runtime_noise":
+            if path[0] in {"runtime_noise", "material_preparation"}:
                 continue
             if path in {
                 ("integrator", "v"),
@@ -7879,6 +7941,8 @@ def _parametrization_constant_layout_for_owners(
                 for buffer_name, value in transform.named_buffers(recurse=False):
                     record(value, (f"{transform_path}.{buffer_name}",))
         available_names = _parameter_materialization_output_names(owner)
+        available_names.update(owner.random_parameters)
+        available_names.update(owner.runtime_noises)
         available_names.update({"diam", "diameters", "dx", "celsius"})
         for kind, name in _material_process_operand_references(owner):
             if kind == "buffer" or (kind == "named" and name not in available_names):
@@ -8817,13 +8881,10 @@ def _functionalization_failures(
                 f"MaterialProcess {name!r}: {failure}"
                 for failure in table_failures(process)
             )
-            if (
-                process.random_parameters
-                or process.runtime_noises
-                or getattr(process, "_diffusion", None)
-            ):
+            if getattr(process, "_diffusion", None):
                 failures.append(
-                    f"MaterialProcess {name!r} uses random parameters or stochastic state"
+                    f"MaterialProcess {name!r} uses stochastic state; "
+                    "MaterialProcess SDE declarations are currently unsupported"
                 )
     for mechanism in stateful_modules:
         mechanism_label = getattr(mechanism, "name", type(mechanism).__qualname__)
@@ -10146,7 +10207,7 @@ def _structure_ids(population) -> tuple[int, ...]:
 def _structure_for_plan(functional, population=None) -> tuple:
     """Revalidate bindings with the diagnostic policy retained by the plan."""
     population = functional._population if population is None else population
-    with ctx(CHECK_PURITY=functional._check_purity):
+    with ctx(CHECK_PURITY=functional._check_purity), torch._C._DisableFuncTorch():
         return _structure_signature(population)
 
 
@@ -10193,13 +10254,13 @@ def _compiled_validate_custom_material_sources(functional) -> None:
 
 def _initialization_failures_for_plan(functional) -> tuple[str, ...]:
     """Revalidate with the diagnostic policy retained by the lowered plan."""
-    with ctx(CHECK_PURITY=functional._check_purity):
+    with ctx(CHECK_PURITY=functional._check_purity), torch._C._DisableFuncTorch():
         return tuple(_functional_initialization_failures(functional._population))
 
 
 def _initialization_structure_for_plan(functional, population=None) -> tuple:
     population = functional._population if population is None else population
-    with ctx(CHECK_PURITY=functional._check_purity):
+    with ctx(CHECK_PURITY=functional._check_purity), torch._C._DisableFuncTorch():
         return _initialization_structure_signature(population)
 
 
@@ -10513,13 +10574,22 @@ class FunctionalPopulation:
             _timestep_buffer_names(_module_at(execution_population, module_path))
             for module_path in _parameterized_module_paths(execution_population)
         )
+        from ._material_stochasticity import retained_stochastic_diffusion_noise
+
         try:
-            execution_population.integrator._initialize(
-                execution_population,
-                dt_tensor,
-                force=execution_population.force_integrator_reinit(),
-                compile_scope="population",
-            )
+            with retained_stochastic_diffusion_noise(
+                execution_population, population, self.dt
+            ):
+                execution_population.integrator._initialize(
+                    execution_population,
+                    dt_tensor,
+                    force=execution_population.force_integrator_reinit()
+                    or any(
+                        getattr(process, "_spatial_configured", True) is False
+                        for process in execution_population.mech.material_processes.values()
+                    ),
+                    compile_scope="population",
+                )
         except (TypeError, ValueError, RuntimeError) as exc:
             if not has_timestep_buffers:
                 raise
@@ -11109,15 +11179,9 @@ class FunctionalPopulation:
                     self, population._caches["_steady_state"]
                 )
                 self._owned_cache_plan.bind_parameter_sources(self._parameter_sources())
-                self._owned_cache_state_template = {}
-                for leaf in self._state_layout:
-                    _put_path(
-                        self._owned_cache_state_template,
-                        leaf.public_path,
-                        _clone_tensor(
-                            _buffer_at(population, leaf.module_path, leaf.buffer_name)
-                        ),
-                    )
+                self._owned_cache_state_template = self._extract_native_state(
+                    population
+                )
             except (KeyError, TypeError, ValueError, RuntimeError) as error:
                 self._owned_cache_error = str(error)
         if self._noise_plan is not None:
@@ -11871,7 +11935,7 @@ class FunctionalPopulation:
                 "Population structure does not match this functional execution plan."
             )
         if (
-            _state_layout_signature(_state_layout(population))
+            _state_layout_signature(self._native_state_layout(population))
             != self._state_layout_signature
         ):
             raise FunctionalizationError(
@@ -12414,6 +12478,63 @@ class FunctionalPopulation:
         sources.update(self._extra._tensor_sources())
         return sources
 
+    def _native_state_layout(self, population):
+        """Match configured native workspaces and cold solver templates."""
+        layout = {leaf.public_path: leaf for leaf in _state_layout(population)}
+        for leaf in self._state_layout:
+            if leaf.public_path[0] != "material_preparation":
+                continue
+            if leaf.public_path not in layout:
+                process = population.mech.material_processes[leaf.public_path[1]]
+                if not process._spatial_configured:
+                    # A freshly initialized native Population configures its
+                    # solver at the first run boundary. Lowering has already
+                    # configured an isolated clone at this plan's timestep.
+                    layout[leaf.public_path] = leaf
+        ordered = tuple(
+            layout.pop(leaf.public_path)
+            for leaf in self._state_layout
+            if leaf.public_path in layout
+        )
+        return (*ordered, *layout.values())
+
+    def _extract_native_state(self, population):
+        from ._material_stochasticity import stochastic_diffusion_timestep_matches
+
+        state = {}
+        configured = None
+        if any(
+            leaf.public_path[0] == "material_preparation"
+            and not stochastic_diffusion_timestep_matches(
+                population.mech.material_processes[leaf.public_path[1]], self.dt
+            )
+            for leaf in self._state_layout
+        ):
+            configured = _clone_execution_population(population)
+            for process in configured.mech.material_processes.values():
+                if isinstance(process, DiffusionProcess) and process.runtime_noises:
+                    process.set_dt(
+                        torch.as_tensor(self.dt, device=self.device, dtype=self.dtype)
+                    )
+            configured = {
+                leaf.public_path: _buffer_at(
+                    configured, leaf.module_path, leaf.buffer_name
+                )
+                for leaf in _state_layout(configured)
+                if leaf.public_path[0] == "material_preparation"
+            }
+        for leaf in self._native_state_layout(population):
+            if leaf.public_path[
+                0
+            ] == "material_preparation" and not stochastic_diffusion_timestep_matches(
+                population.mech.material_processes[leaf.public_path[1]], self.dt
+            ):
+                value = configured[leaf.public_path]
+            else:
+                value = _buffer_at(population, leaf.module_path, leaf.buffer_name)
+            _put_path(state, leaf.public_path, _clone_tensor(value))
+        return state
+
     def extract(self, population: Population | None = None) -> PopulationTensors:
         """Extract explicit initialization, constants/state, and raw parameters."""
         population = self._population if population is None else population
@@ -12426,10 +12547,7 @@ class FunctionalPopulation:
                 "Population initialization structure does not match this "
                 "functional execution plan."
             )
-        state = {}
-        for leaf in _state_layout(population):
-            value = _buffer_at(population, leaf.module_path, leaf.buffer_name)
-            _put_path(state, leaf.public_path, _clone_tensor(value))
+        state = self._extract_native_state(population)
         if self._random_plan is not None:
             _random_constants, state["random"] = self._random_plan.extract(population)
         self._validate_state(state)
@@ -12970,6 +13088,9 @@ class FunctionalPopulation:
             state["random"] = self._random_plan.state(
                 constants, selected_random_draw.rng
             )
+        state = self._initialize_material_workspace(
+            initialized_parameters, constants, state
+        )
         constants = self._retain_materializations(
             initialized_parameters,
             constants,
@@ -13085,10 +13206,54 @@ class FunctionalPopulation:
         packet = self._owned_cache_plan.restore_owned(
             parameters, constants, self._owned_cache_state_template, inputs.cache
         )
+        state = _reset_functional_initialization_clock(packet.state)
+        if not self._retain_initialization_materializations:
+            state = self._initialize_material_workspace(
+                packet.parameters, packet.constants, state
+            )
+        # Network plans configure after publishing the cache's shared alias
+        # transaction at this Population's initialization boundary.
         return packet._replace(
-            state=_reset_functional_initialization_clock(packet.state),
+            state=state,
             initialization=inputs,
         )
+
+    def _initialize_material_workspace(self, parameters, constants, state):
+        """Configure held diffusion coefficients from the initialized NOISE frame."""
+        leaves = tuple(
+            leaf
+            for leaf in self._state_layout
+            if leaf.public_path[0] == "material_preparation"
+        )
+        if not leaves:
+            return state
+        mapping = dict(self._preparation_base_mapping)
+        mapping.update(
+            {
+                f"population.{path}": value
+                for path, value in state.get("runtime_noise", {}).items()
+            }
+        )
+        prepared = self._prepare_values(
+            parameters,
+            constants,
+            preparation_base_mapping=mapping,
+            use_snapshot_offsets=False,
+        )
+        workspace = {}
+        for leaf in leaves:
+            key = f"{leaf.module_path}.{leaf.buffer_name}"
+            suffix = leaf.public_path[2]
+            value = (
+                state["runtime_noise"][
+                    f"integrator.mech.material_processes.{leaf.public_path[1]}."
+                    f"{suffix.removeprefix('noise.')}"
+                ].clone()
+                if suffix.startswith("noise.")
+                else prepared["mechanisms"][key]
+            )
+            _put_path(workspace, leaf.public_path[1:], value)
+        return {**state, "material_preparation": workspace}
 
     def _prepare_values(
         self,
@@ -16374,6 +16539,32 @@ class FunctionalPopulation:
             else self._random_plan.prepare_commit(population, state["random"])
         )
         staged_population = _clone_execution_population(population)
+        if self._random_plan is not None:
+            self._random_plan.commit(staged_population, state["random"])
+        spatial_owners = []
+        if "material_preparation" in state:
+            for name in state["material_preparation"]:
+                process = staged_population.mech.material_processes[name]
+                if not process._spatial_configured:
+                    current_noise = {
+                        noise_name: process._buffers[noise_name]
+                        for noise_name in process.runtime_noises
+                    }
+                    try:
+                        for noise_name in current_noise:
+                            process._buffers[noise_name] = state[
+                                "material_preparation"
+                            ][name][f"noise.{noise_name}"]
+                        process.set_dt(
+                            torch.as_tensor(
+                                self.dt, device=self.device, dtype=self.dtype
+                            )
+                        )
+                    finally:
+                        process._buffers.update(current_noise)
+                target = population.mech.material_processes[name]
+                if not target._spatial_configured:
+                    spatial_owners.append(target)
         staged_layout = _state_layout(staged_population)
         for leaf in staged_layout:
             _set_buffer(
@@ -16382,13 +16573,45 @@ class FunctionalPopulation:
                 leaf.buffer_name,
                 _get_path(state, leaf.public_path).clone(),
             )
-        if self._random_plan is not None:
-            self._random_plan.commit(staged_population, state["random"])
         staged_population.mech.read_from_ions()
         staged_population.mech.read_from_materials()
         checkpoint = staged_population.state_dict_for_checkpoint()
+        previous_spatial = tuple(
+            (
+                owner,
+                owner._spatial_operators,
+                owner._spatial_configured,
+                dict(owner._buffers),
+                set(owner._non_persistent_buffers_set),
+                owner.__dict__.get("_material_restored_workspace_dt"),
+            )
+            for owner in spatial_owners
+        )
+
+        def restore_spatial_layout():
+            for (
+                owner,
+                operators,
+                configured,
+                buffers,
+                nonpersistent,
+                restored_dt,
+            ) in previous_spatial:
+                owner._spatial_operators = operators
+                owner._spatial_configured = configured
+                owner._buffers = buffers
+                owner._non_persistent_buffers_set = nonpersistent
+                if restored_dt is None:
+                    owner.__dict__.pop("_material_restored_workspace_dt", None)
+                else:
+                    owner._material_restored_workspace_dt = restored_dt
+
         if self._topology_kind not in {"multi_point", "multi_scalar", "multi_block"}:
-            population.restore_dict_from_checkpoint(checkpoint)
+            try:
+                population.restore_dict_from_checkpoint(checkpoint)
+            except Exception:
+                restore_spatial_layout()
+                raise
             if self._random_plan is not None:
                 self._random_plan.publish_commit(population, random_commit)
             if isinstance(population.integrator, _bwd_euler_sc_skip):
@@ -16488,6 +16711,7 @@ class FunctionalPopulation:
         except Exception:
             try:
                 restore_previous_bindings()
+                restore_spatial_layout()
             except Exception as rollback_error:  # pragma: no cover - catastrophic
                 raise RuntimeError(
                     "MultiPopulation functional commit failed and rollback could "
