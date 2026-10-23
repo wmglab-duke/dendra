@@ -120,6 +120,9 @@ def _validate_rng_adapter(rng):
             "init",
             "get_extra_state",
             "set_extra_state",
+            "restore_rng_checkpoint",
+            "reseed",
+            "set_rng_state",
             "reseed_for_generation",
         )
     ):

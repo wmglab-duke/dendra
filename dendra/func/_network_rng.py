@@ -7,7 +7,7 @@ from collections.abc import Mapping
 import torch
 from torch.utils import _pytree
 
-from dendra.models.rng import RNGModule
+from dendra.models.rng import RNGModule, should_restore_rng
 
 from ._random_parameters import _rng_extra, _rng_values
 from ._types import FunctionalizationError, RuntimeNoiseDraw
@@ -172,7 +172,10 @@ class NetworkRNGPlan:
             return pool
         result = dict(pool)
         for path, canonical, source in self._cache_paths[name]:
-            if getattr(source, "_ignore_rng_on_load", False):
+            if not should_restore_rng(
+                policy="cache",
+                ignore_rng_on_load=getattr(source, "_ignore_rng_on_load", False),
+            ):
                 continue
             extra = cache[path]
             if isinstance(extra["base_seed"], Mapping):

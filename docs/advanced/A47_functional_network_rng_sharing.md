@@ -121,6 +121,8 @@ Runtime checkpoints preserve the canonical carry and restore the original
 stream aliases; incompatible state or changed ownership is rejected before
 native publication. `commit_state_` restores the supplied RNG position even
 when `ignore_rng_on_load=True`; that flag controls state-dict loading.
+Use `stream.ignore_rng_on_load(...)` before lowering to select each stream's
+model/cache load policy; see {doc}`A48_functional_rng_load_policies`.
 
 RAND retains its distribution's reparameterized gradients. NOISE samples
 remain detached from distribution parameters and base draws. State SDE

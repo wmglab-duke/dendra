@@ -542,19 +542,28 @@ class PopulationCachePlan:
             raise FunctionalizationError(
                 "Population state cache schema changed; lower again"
             )
-        from dendra.models.rng import RNGModule
+        from dendra.models.rng import RNGModule, should_restore_rng
 
         from ._random_parameters import _rng_extra, cache_metadata_tensors
 
         # Native loading visits registered RNG aliases even when this
         # Population has no RAND/NOISE declarations of its own. Validate every
         # saved occurrence before it can become a shared Network RNG suffix.
+        cache = dict(cache)
         for path, module in self.plan._population.named_modules(remove_duplicate=False):
-            if type(module) is not RNGModule or getattr(
-                module, "_ignore_rng_on_load", False
-            ):
+            if type(module) is not RNGModule:
                 continue
-            payload = cache[f"{path + '.' if path else ''}_extra_state"]
+            key = f"{path + '.' if path else ''}_extra_state"
+            if not should_restore_rng(
+                policy="cache",
+                ignore_rng_on_load=getattr(module, "_ignore_rng_on_load", False),
+            ):
+                # Native ignores this payload before parsing it. Normalize a
+                # valid schema placeholder; restoration keeps the incoming
+                # explicit stream, rather than this captured reference.
+                cache[key] = self._reference[key]
+                continue
+            payload = cache[key]
             if isinstance(payload, Mapping) and isinstance(
                 payload.get("base_seed"), Mapping
             ):
@@ -637,7 +646,9 @@ class PopulationCachePlan:
             _put_path(restored_state, leaf.public_path, value)
         if plan._random_plan is not None:
             effective_constants, restored_state["random"] = (
-                plan._random_plan.restore_cache(cache, effective_constants)
+                plan._random_plan.restore_cache(
+                    cache, effective_constants, state["random"]["rng"]
+                )
             )
         plan._validate_parameters(effective)
         plan._validate_constants(effective_constants)

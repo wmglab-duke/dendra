@@ -113,7 +113,11 @@ from dendra.models.parametric import (
     staticproperty,
     to_param,
 )
-from dendra.models.rng import _validate_rng_checkpoint_payload
+from dendra.models.rng import (
+    _restore_rng_lifecycle,
+    _snapshot_rng_lifecycle,
+    _validate_rng_checkpoint_payload,
+)
 from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
 from dendra.units import mm
@@ -6793,12 +6797,13 @@ class Population(P, Sliceable):
             setattr(self, name, restored)
         for name, (base_seed, rng_state) in rng_states.items():
             rng = getattr(self, name)
-            if base_seed is None:
-                # Early checkpoint payloads stored only the raw device-state
-                # mapping. Preserve the target's constructor seed for reset_rng().
-                rng.set_rng_state(rng_state)
-            else:
-                rng.set_extra_state({"base_seed": base_seed, "rng_state": rng_state})
+            rng.restore_rng_checkpoint(
+                rng_state
+                if base_seed is None
+                else {"base_seed": base_seed, "rng_state": rng_state},
+                policy="checkpoint",
+                allow_legacy=True,
+            )
         self._apply_random_parameter_state(provenance)
 
     def _restore_stochastic_state_from_checkpoint(self, state_dict):
@@ -6937,10 +6942,12 @@ class Population(P, Sliceable):
             State dictionary containing model parameters and buffers.
         """
         previous = self.state_dict_for_checkpoint()
+        rng_lifecycle = _snapshot_rng_lifecycle(self)
         try:
             self._restore_dict_from_checkpoint_unchecked(state_dict)
         except Exception:
             try:
+                _restore_rng_lifecycle(rng_lifecycle)
                 self._restore_dict_from_checkpoint_unchecked(previous)
             except Exception as rollback_error:
                 raise RuntimeError(

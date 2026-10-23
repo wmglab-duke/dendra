@@ -3031,9 +3031,13 @@ class MechanismHandler(torch.nn.Module):
 
         try:
             for rng, base_seed, rng_state in rng_assignments:
-                if base_seed is not None:
-                    rng.reseed(base_seed)
-                rng.set_rng_state(rng_state)
+                rng.restore_rng_checkpoint(
+                    rng_state
+                    if base_seed is None
+                    else {"base_seed": base_seed, "rng_state": rng_state},
+                    policy="checkpoint",
+                    allow_legacy=True,
+                )
             for owner, name, value in assignments:
                 setattr(owner, name, value)
             for module, specs in delay_assignments:

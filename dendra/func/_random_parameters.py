@@ -221,6 +221,18 @@ class RandomParameterPlan:
             stream: getattr(owners[path], name)
             for stream, (path, name) in self.streams.items()
         }
+        stream_by_identity = {
+            id(rng): stream for stream, rng in self._rng_bindings.items()
+        }
+        self._rng_cache_bindings = tuple(
+            (
+                f"{path + '.' if path else ''}_extra_state",
+                stream_by_identity[id(module)],
+                module,
+            )
+            for path, module in population.named_modules(remove_duplicate=False)
+            if id(module) in stream_by_identity
+        )
         self.noise = None
         for path, name, spec in random_declarations(population):
             owner = owners[path]
@@ -281,6 +293,7 @@ class RandomParameterPlan:
                     "init",
                     "get_extra_state",
                     "set_extra_state",
+                    "restore_rng_checkpoint",
                     "reseed_for_generation",
                 )
             ):
@@ -381,6 +394,7 @@ class RandomParameterPlan:
                         "init",
                         "get_extra_state",
                         "set_extra_state",
+                        "restore_rng_checkpoint",
                         "reseed_for_generation",
                     )
                 )
@@ -708,7 +722,9 @@ class RandomParameterPlan:
             },
         }
 
-    def restore_cache(self, cache, constants):
+    def restore_cache(self, cache, constants, incoming_rng):
+        from dendra.models.rng import should_restore_rng
+
         self.validate_cache(cache)
         result = dict(constants)
         for entry in self.entries:
@@ -746,10 +762,19 @@ class RandomParameterPlan:
                 result[f"random.initialization_frame.{entry.key}"] = torch.zeros(
                     (), device=entry.device, dtype=torch.bool
                 )
-        rng = {}
-        for stream, (path, name) in self.streams.items():
-            extra = cache[f"{path + '.' if path else ''}{name}._extra_state"]
-            rng[stream] = {**_clone(extra["base_seed"]), **_clone(extra["rng_state"])}
+        rng = dict(incoming_rng)
+        for path, stream, source in self._rng_cache_bindings:
+            if not should_restore_rng(
+                policy="cache",
+                ignore_rng_on_load=getattr(source, "_ignore_rng_on_load", False),
+            ):
+                continue
+            extra = cache[path]
+            values = {**extra["base_seed"], **extra["rng_state"]}
+            rng[stream] = {
+                key: value.detach().to(rng[stream][key]).clone()
+                for key, value in values.items()
+            }
         return result, self.state(result, rng)
 
     def validate_native_cache(self, cache):
@@ -768,13 +793,6 @@ class RandomParameterPlan:
                 owners[entry.path]._prepare_random_parameter_state(metadata)
 
     def validate_cache(self, cache):
-        if any(
-            getattr(rng, "_ignore_rng_on_load", False)
-            for rng in self._rng_bindings.values()
-        ):
-            raise FunctionalizationError(
-                "Cached RAND initialization with ignore_rng_on_load is currently unsupported"
-            )
         if torch._C._are_functorch_transforms_active():
             return
         for entry in self.entries:
@@ -857,8 +875,7 @@ class RandomParameterPlan:
             checkpoint = prepared["rng"][stream]
             # Runtime continuation restores an exact checkpoint, independently
             # of the state-dict/cache loading policy in set_extra_state.
-            rng.reseed(checkpoint["base_seed"])
-            rng.set_rng_state(checkpoint["rng_state"])
+            rng.restore_rng_checkpoint(checkpoint, policy="checkpoint")
         for entry in self.entries:
             owner = owners[entry.path]
             owner._buffers[entry.name] = prepared["samples"][entry.key]

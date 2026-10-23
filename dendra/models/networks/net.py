@@ -37,7 +37,7 @@ from ..core import (
 from ..distributions import Normal, connection_distribution_is_supported
 from ..multi import concat_models, offsets
 from ..parametric import cacheable, is_parametric, to_param
-from ..rng import RNGMixin
+from ..rng import RNGMixin, _restore_rng_lifecycle, _snapshot_rng_lifecycle
 from ..slice import SynapseSlots
 from ._connection_sampling import clone_connection_sampling_rng
 from ._population_cache import restore_population_cache_values
@@ -5032,10 +5032,12 @@ class Network(RNGMixin):
     def restore_dict_from_checkpoint(self, state_dict):
         """Restore a whole-network runtime checkpoint atomically."""
         previous = _clone_checkpoint_state(self.state_dict_for_checkpoint())
+        rng_lifecycle = _snapshot_rng_lifecycle(self)
         try:
             self._restore_dict_from_checkpoint_unchecked(state_dict)
         except Exception as restore_error:
             try:
+                _restore_rng_lifecycle(rng_lifecycle)
                 self._restore_dict_from_checkpoint_unchecked(previous)
             except Exception as rollback_error:
                 raise RuntimeError(

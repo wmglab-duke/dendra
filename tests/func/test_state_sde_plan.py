@@ -270,7 +270,10 @@ def test_sde_generated_equations_cannot_mutate_ephemeral_state_inputs(method):
             return {"x": torch.zeros_like(v)}
 
     population, _state = _population(MutatingInput)
-    with pytest.raises(dn.func.FunctionalizationError, match="read-only INPUT"):
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(dn.func.FunctionalizationError, match="read-only INPUT"),
+    ):
         dn.func.make_functional(population, dt=0.125)
 
 

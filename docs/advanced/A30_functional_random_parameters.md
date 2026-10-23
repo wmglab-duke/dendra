@@ -140,6 +140,10 @@ owners between Network Populations retains one authoritative carry per
 stream and preserves native Population sampling order; see
 {doc}`A47_functional_network_rng_sharing`.
 
+`stream.ignore_rng_on_load(True)` retains the incoming RNG seed and position
+when a valid steady-state cache restores sampled values. Runtime checkpoint
+restoration remains exact; see {doc}`A48_functional_rng_load_policies`.
+
 Fresh initialization returns effective constants containing the sampled
 realization and its base draws. Continue with both the returned parameters
 and constants, together with simulation and callback state:

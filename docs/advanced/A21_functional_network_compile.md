@@ -189,7 +189,9 @@ continued Network runs. MaterialProcess RAND and NOISE declarations use the
 same explicit sampling packets; see {doc}`A44_functional_material_stochasticity`.
 Initialization-time RAND declarations use explicit draw and
 RNG packets, including their resampling and ``reseed_on_initialize`` policies;
-see {doc}`A30_functional_random_parameters`. Runtime NOISE declarations use
+see {doc}`A30_functional_random_parameters`. Per-stream model/cache load
+policies use `ignore_rng_on_load(...)`; see
+{doc}`A48_functional_rng_load_policies`. Runtime NOISE declarations use
 per-Population draw/RNG tapes, with automatic host sampling and explicit
 continuation; see {doc}`A31_functional_runtime_noise`. RNGModule owners shared
 across Populations use one authoritative carry per stream and preserve native

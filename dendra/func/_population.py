@@ -10604,6 +10604,14 @@ class FunctionalPopulation:
             self._initialization_source_plan.source_binding_signature()
         )
         self._source_ids = _structure_ids(population)
+        from dendra.models.rng import RNGMixin
+
+        # Ignored cache payloads are normalized away under this fixed policy.
+        self._source_rng_load_policies = tuple(
+            (name, module, bool(module._ignore_rng_on_load))
+            for name, module in population.named_modules()
+            if isinstance(module, RNGMixin)
+        )
         self._fingerprint = _structure_signature(population)
         self._initialization_fingerprint = _initialization_structure_signature(
             population
@@ -11742,7 +11750,15 @@ class FunctionalPopulation:
                 "FunctionalPopulation plan"
             )
 
+    def _validate_rng_load_policies(self) -> None:
+        for name, rng, ignore in self._source_rng_load_policies:
+            if bool(rng._ignore_rng_on_load) != ignore:
+                raise FunctionalizationError(
+                    f"RNG load policy for {name!r} changed; lower the Population again"
+                )
+
     def _validate_source(self) -> None:
+        self._validate_rng_load_policies()
         if self._torch_source_bindings:
             from ._torch_parametrizations import source_binding_signature
 
@@ -12681,6 +12697,7 @@ class FunctionalPopulation:
 
     def extract(self, population: Population | None = None) -> PopulationTensors:
         """Extract explicit initialization, constants/state, and raw parameters."""
+        self._validate_rng_load_policies()
         population = self._population if population is None else population
         self._validate_compatible_population(population)
         if (
@@ -13115,7 +13132,9 @@ class FunctionalPopulation:
                 entry.spec.resample_on_initialize for entry in self._random_plan.entries
             )
         ):
-            return self._initialize_owned_cache(parameters, constants, inputs)
+            return self._initialize_owned_cache(
+                parameters, constants, inputs, state=state
+            )
         selected_random_draw = None
         if self._random_plan is not None:
             if random_draw is not None and inputs.random_draw is not None:
@@ -13406,7 +13425,7 @@ class FunctionalPopulation:
             )
         return self.initialize(parameters, constants, inputs, state=state)
 
-    def _initialize_owned_cache(self, parameters, constants, inputs):
+    def _initialize_owned_cache(self, parameters, constants, inputs, *, state=None):
         if self._owned_cache_error is not None:
             raise FunctionalizationError(
                 f"Population steady-state cache cannot be restored: {self._owned_cache_error}"
@@ -13418,8 +13437,22 @@ class FunctionalPopulation:
         )
         if failures:
             raise FunctionalizationError("\n".join(failures))
+        incoming = self._owned_cache_state_template
+        if self._random_plan is not None:
+            if state is not None:
+                self._validate_state(state)
+            # Cached fields replace ordinary carry; ignored streams inherit
+            # the caller's frame or the captured default when it is omitted.
+            incoming = {
+                **incoming,
+                "random": {
+                    "rng": self._random_plan.rng_reference
+                    if state is None
+                    else state["random"]["rng"]
+                },
+            }
         packet = self._owned_cache_plan.restore_owned(
-            parameters, constants, self._owned_cache_state_template, inputs.cache
+            parameters, constants, incoming, inputs.cache
         )
         state = _reset_functional_initialization_clock(packet.state)
         from ._noise_workspaces import noise_workspace_constants_from_state

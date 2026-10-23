@@ -55,3 +55,4 @@ Advanced
    advanced/A45_functional_stochastic_initialization_ordering.md
    advanced/A46_functional_noise_workspaces.md
    advanced/A47_functional_network_rng_sharing.md
+   advanced/A48_functional_rng_load_policies.md

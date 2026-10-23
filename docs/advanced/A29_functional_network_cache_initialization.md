@@ -17,6 +17,11 @@ Populations use ordinary pure fresh initialization as described in
 {doc}`A21_functional_network_compile`. Calls with explicit state continue that
 state without restoring either kind of cache.
 
+RNG streams honor `ignore_rng_on_load(...)` during cache restoration. An
+ignored stream retains its incoming seed and position while saved numerical
+state and sampled values restore. Runtime checkpoints preserve their exact
+RNG boundary; see {doc}`A48_functional_rng_load_policies`.
+
 This supports repeated trials that begin from a saved resting state while
 using current connection weights, delays, and continuous transforms. It is
 different from snapshot restart: a snapshot retains already prepared runtime
