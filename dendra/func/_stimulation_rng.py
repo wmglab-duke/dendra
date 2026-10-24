@@ -12,6 +12,7 @@ from dendra.models.random_parameters import sample_random_parameter_draw
 from dendra.models.rng import RNGModule
 
 from ._random_parameters import _rng_extra, _rng_values
+from ._rng_diagnostics import _rng_diagnostic_scope
 from ._types import FunctionalizationError, RuntimeNoiseDraw, StimulationDraw
 
 
@@ -415,16 +416,9 @@ class StimulationRNGPlan:
             )
             context["positions"][entry.key] += 1
             return
-        snapshot = None
-        if self.functional._check_purity:
-            from ._population import (
-                _global_rng_changes,
-                _global_rng_snapshot,
-                _restore_global_rng,
-            )
-
-            snapshot = _global_rng_snapshot(self.functional.device)
-        try:
+        with _rng_diagnostic_scope(
+            self.functional.device, enabled=self.functional._check_purity
+        ) as diagnostic:
             draw = sample_random_parameter_draw(
                 entry.spec,
                 context["random_samplers"][entry.stream],
@@ -432,11 +426,7 @@ class StimulationRNGPlan:
                 device=entry.device,
                 dtype=entry.dtype,
             )
-        finally:
-            if snapshot is not None:
-                changes = _global_rng_changes(snapshot, self.functional.device)
-                _restore_global_rng(snapshot, self.functional.device)
-        if snapshot is not None and changes:
+        if diagnostic.changes:
             raise FunctionalizationError(
                 "Stochastic draw sampler consumed global RNG; use its explicit RNGModule"
             )

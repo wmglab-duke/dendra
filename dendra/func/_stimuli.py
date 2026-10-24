@@ -30,6 +30,7 @@ from dendra.models.stim.intra import (
 from dendra.models.stim.waveform import Waveform
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
+from ._rng_diagnostics import _numpy_rng_state_equal
 from ._types import FunctionalizationError
 
 
@@ -506,14 +507,6 @@ def _module_tree_state_signature(
             ),
         )
         for path, module in waveform.named_modules()
-    )
-
-
-def _numpy_rng_state_equal(left, right) -> bool:
-    return (
-        left[0] == right[0]
-        and np.array_equal(left[1], right[1])
-        and left[2:] == right[2:]
     )
 
 

@@ -8,7 +8,6 @@ import dis
 import hashlib
 import inspect
 import math
-import random
 import types
 from collections.abc import Mapping
 from contextlib import nullcontext
@@ -106,11 +105,15 @@ from dendra.models.stim.waveform.core import Waveform
 from dendra.models.tree import Tree
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
+from ._rng_diagnostics import (
+    _global_rng_changes,
+    _global_rng_snapshot,
+    _restore_global_rng,
+)
 from ._stimuli import (
     FunctionalExtra,
     FunctionalIntra,
     _is_internal_module_state,
-    _numpy_rng_state_equal,
 )
 from ._tensor_contracts import (
     _has_inference_tensor_component,
@@ -1724,48 +1727,6 @@ def _restore_class_state(snapshot) -> set[str]:
                     restored_value = original if current is not original else restored
                 setattr(cls, name, restored_value)
     return changed
-
-
-def _global_rng_snapshot(device: torch.device) -> dict[str, object]:
-    snapshot = {
-        "torch": torch.random.get_rng_state(),
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-    }
-    if device.type == "cuda":
-        snapshot["cuda"] = torch.cuda.get_rng_state(device)
-    if device.type == "mps" and hasattr(torch.mps, "get_rng_state"):
-        snapshot["mps"] = torch.mps.get_rng_state()
-    return snapshot
-
-
-def _global_rng_changes(snapshot, device: torch.device) -> set[str]:
-    changed = set()
-    if not torch.equal(torch.random.get_rng_state(), snapshot["torch"]):
-        changed.add("global PyTorch")
-    if random.getstate() != snapshot["python"]:
-        changed.add("global Python")
-    if not _numpy_rng_state_equal(np.random.get_state(), snapshot["numpy"]):
-        changed.add("global NumPy")
-    if "cuda" in snapshot and not torch.equal(
-        torch.cuda.get_rng_state(device), snapshot["cuda"]
-    ):
-        changed.add("CUDA")
-    if "mps" in snapshot and not torch.equal(
-        torch.mps.get_rng_state(), snapshot["mps"]
-    ):
-        changed.add("MPS")
-    return changed
-
-
-def _restore_global_rng(snapshot, device: torch.device) -> None:
-    torch.random.set_rng_state(snapshot["torch"])
-    random.setstate(snapshot["python"])
-    np.random.set_state(snapshot["numpy"])
-    if "cuda" in snapshot:
-        torch.cuda.set_rng_state(snapshot["cuda"], device)
-    if "mps" in snapshot:
-        torch.mps.set_rng_state(snapshot["mps"])
 
 
 def _deepcopy_execution_module(module: torch.nn.Module) -> torch.nn.Module:

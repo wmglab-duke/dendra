@@ -12,6 +12,7 @@ from dendra.helpers import current_check_purity
 from dendra.models.random_parameters import get_random_distribution
 from dendra.models.rng import RNGModule
 
+from ._rng_diagnostics import _rng_diagnostic_scope
 from ._types import FunctionalizationError, RuntimeNoiseDraw
 
 
@@ -138,11 +139,8 @@ class RuntimeNoisePlan:
         from dendra.models.random_parameters import sample_runtime_noise_draw
 
         from ._population import (
-            _global_rng_changes,
-            _global_rng_snapshot,
             _initialization_callable_dependency_signature,
             _module_at,
-            _restore_global_rng,
         )
 
         self.population = population
@@ -180,10 +178,9 @@ class RuntimeNoisePlan:
                 else ()
             )
             value = owner._buffers[name]
-            snapshot = (
-                _global_rng_snapshot(population.device()) if self.check_purity else None
-            )
-            try:
+            with _rng_diagnostic_scope(
+                population.device(), enabled=self.check_purity
+            ) as diagnostic:
                 draw = sample_runtime_noise_draw(
                     spec,
                     RNGModule.from_checkpoint(rng.get_extra_state()),
@@ -191,15 +188,7 @@ class RuntimeNoisePlan:
                     device=value.device,
                     dtype=value.dtype,
                 )
-            finally:
-                changes = (
-                    _global_rng_changes(snapshot, population.device())
-                    if self.check_purity
-                    else ()
-                )
-                if self.check_purity:
-                    _restore_global_rng(snapshot, population.device())
-            if changes:
+            if diagnostic.changes:
                 raise FunctionalizationError(
                     "NOISE draw sampler consumed global RNG; use its explicit RNGModule"
                 )
@@ -230,22 +219,13 @@ class RuntimeNoisePlan:
                 if self.check_purity
                 else None
             )
-            snapshot = (
-                _global_rng_snapshot(population.device()) if self.check_purity else None
-            )
-            try:
+            with _rng_diagnostic_scope(
+                population.device(), enabled=self.check_purity
+            ) as diagnostic:
                 probe = evaluate_runtime_noise(
                     spec, audit_parameters, audit_draw, dt=audit_dt
                 )
-            finally:
-                changes = (
-                    _global_rng_changes(snapshot, population.device())
-                    if self.check_purity
-                    else ()
-                )
-                if self.check_purity:
-                    _restore_global_rng(snapshot, population.device())
-            if changes or (
+            if diagnostic.changes or (
                 versions is not None
                 and versions != tuple(_audit_tensor_binding(leaf) for leaf in audited)
             ):

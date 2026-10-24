@@ -17,6 +17,7 @@ from dendra.models.random_parameters import (
 )
 from dendra.models.rng import RNGModule
 
+from ._rng_diagnostics import _rng_diagnostic_scope
 from ._types import FunctionalizationError, RandomParameterDraw
 
 
@@ -78,14 +79,7 @@ def _current_draw_leaves(
     distribution, rng, sample, captured_spec, captured_leaves, *, check_purity=False
 ):
     """Probe a target's draw schema without consuming its retained stream."""
-    from ._population import (
-        _global_rng_changes,
-        _global_rng_snapshot,
-        _restore_global_rng,
-    )
-
-    snapshot = _global_rng_snapshot(sample.device) if check_purity else None
-    try:
+    with _rng_diagnostic_scope(sample.device, enabled=check_purity) as diagnostic:
         draw = sample_random_parameter_draw(
             distribution,
             RNGModule.from_checkpoint(rng.get_extra_state()),
@@ -93,13 +87,9 @@ def _current_draw_leaves(
             device=sample.device,
             dtype=sample.dtype,
         )
-    finally:
-        changes = _global_rng_changes(snapshot, sample.device) if check_purity else ()
-        if check_purity:
-            _restore_global_rng(snapshot, sample.device)
-    if changes:
+    if diagnostic.changes:
         raise FunctionalizationError(
-            f"RAND draw sampler consumed global RNG state {sorted(changes)}; use its explicit RNGModule"
+            f"RAND draw sampler consumed global RNG state {sorted(diagnostic.changes)}; use its explicit RNGModule"
         )
     leaves, spec = _pytree.tree_flatten(draw)
     if (
