@@ -428,8 +428,8 @@ outside the RAND/NOISE declaration-only contract above, nested ``MultiPopulation
 and mixtures of scalar and
 finite-extracellular components), Cable/Axon/Tree subclasses with unrecognized
 custom geometry, stateful
-or unregistered parameter transforms, custom integrator subclasses, the SPD
-block solver, and non-CUDA accelerators (including MPS). Row-regular
+or unregistered parameter transforms, custom integrator subclasses,
+and non-CUDA accelerators (including MPS). Row-regular
 selectors authored through the normal Population indexing API are already
 represented as packed support and are supported; users do not need to choose a
 different input form.
@@ -924,10 +924,11 @@ nonnegative diffusivity/storage and strictly positive selected storage or
 edge distances wherever required by the chosen method. Implicit Tree
 diffusion retains support for zero-volume algebraic junctions.
 
-Native Thomas, PCR, and dense 1-D solves, and native DHS/dense Tree solves are
+Native Thomas, PCR, SPD, and dense 1-D solves, and native DHS/dense Tree solves are
 supported, with CUDA-compatible solver facades on CUDA. The implicit CPU SPD
-transport solver remains imperative-only; functional lowering does not
-silently substitute another solver. Explicit Tree diffusion rejects active
+transport solver uses the shared pure Cholesky facade and retains its symmetry
+and numerical repair requirements. See :doc:`A54_functional_spd_solvers`.
+Explicit Tree diffusion rejects active
 zero-volume junctions, for which implicit diffusion is required.
 
 Concatenation preserves component material declarations, initial sources,
@@ -2619,9 +2620,10 @@ differences can therefore trigger strict repeated-output checks when
 hardware-validation risk for branched models, not a verified deterministic GPU
 execution guarantee.
 
-CUDA retains the Population admission restrictions above: the SPD block solver
-and arbitrary custom geometry/integrators are
-currently unsupported. Network event delivery uses the composed Network plan
+CUDA retains the Population admission restrictions above: arbitrary custom
+geometry/integrators are currently unsupported. The block SPD facade retains
+its native diagonal-repair and gradient policy, described in
+:doc:`A54_functional_spd_solvers`. Network event delivery uses the composed Network plan
 described in :doc:`A19_functional_network_lowering`.
 MPS, float16 and bfloat16 are currently unsupported.
 

@@ -61,3 +61,4 @@ Advanced
    advanced/A51_functional_euler.md
    advanced/A52_functional_runge_kutta.md
    advanced/A53_functional_dufort_frankel.md
+   advanced/A54_functional_spd_solvers.md

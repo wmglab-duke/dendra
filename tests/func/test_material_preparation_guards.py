@@ -14,6 +14,7 @@ import torch
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
+from dendra.models.mechanisms._spatial import _FUNCTIONAL_SCALAR_SPD
 from tests.func.test_clearance_process import (
     DT,
     NAI,
@@ -119,12 +120,26 @@ def test_raw_chemical_topology_changes_invalidate_source_and_relowering():
         dn.func.make_functional(model, dt=DT)
 
 
-def test_functional_lowering_rejects_imperative_only_material_spd_solver():
+@pytest.mark.skipif(
+    _FUNCTIONAL_SCALAR_SPD is None,
+    reason="dendra-solvers pure scalar SPD facade is required",
+)
+def test_functional_material_spd_solver_matches_native_without_changing_source():
     model = _model("path", solver="spd")
-    with pytest.raises(
-        dn.func.FunctionalizationError, match="SPD|transform.compatible"
-    ):
-        dn.func.make_functional(model, dt=DT)
+    native = _model("path", solver="spd")
+    before = _module_snapshot(model)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    actual, _ = functional.prepare_and_step(
+        tensors.parameters, tensors.constants, tensors.state
+    )
+    dt = tensors.constants["dt"]
+    native.integrator._initialize(native, dt, force=True, compile_scope="population")
+    native.integrator.step(native, dt)
+    native.t = native.t + dt
+    torch.testing.assert_close(
+        actual, functional.extract(native).state, rtol=3e-10, atol=3e-11
+    )
+    _assert_module_snapshot(model, before)
 
 
 def _chemical_loss(recorded):

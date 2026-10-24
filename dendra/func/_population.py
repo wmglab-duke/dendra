@@ -9313,10 +9313,6 @@ def _functionalization_failures(
             failures.append(
                 "ExtCellAxon functionalization requires exactly bwd_euler_bt"
             )
-        elif population.integrator.method == "spd":
-            failures.append(
-                "functional bwd_euler_bt currently supports the Thomas method only"
-            )
         if tuple(population.integrator.v_vars) != ("v", "vc"):
             failures.append(
                 "functional bwd_euler_bt must declare exactly the ('v', 'vc') "

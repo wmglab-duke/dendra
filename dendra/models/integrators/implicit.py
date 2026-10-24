@@ -38,6 +38,19 @@ from .triton import (
     thomas_solve_cuda_t,
 )
 
+# Older solver packages expose identically named reverse-only SPD wrappers.
+# Admit only the framework-owned pure facades that declare the transform
+# contract, and retain their identities when validating a configured solver.
+_FUNCTIONAL_SCALAR_SPD = getattr(dendra_solvers, "solve_tri_spd", None)
+if not getattr(_FUNCTIONAL_SCALAR_SPD, "_DENDRA_FUNC_COMPATIBLE", False):
+    _FUNCTIONAL_SCALAR_SPD = None
+_FUNCTIONAL_BLOCK_SPD = getattr(dendra_solvers, "solve_bt_spd", None)
+if not getattr(_FUNCTIONAL_BLOCK_SPD, "_DENDRA_FUNC_COMPATIBLE", False):
+    _FUNCTIONAL_BLOCK_SPD = None
+_NATIVE_BLOCK_SPD_CONSUME = getattr(
+    dendra_solvers, "solve_bt_spd_consume_unchecked", None
+)
+
 # Only exact, framework-owned Thomas/PCR solves are authorized to receive a
 # voltage-increment RHS. A custom callable keeps its historical absolute-RHS
 # contract, even when it shares a standard solver's name or wrapped metadata.
@@ -430,6 +443,8 @@ class _bwd_euler_ub(Integrator):
     def _functional_solver(self):
         """Return the transform-compatible facade for the selected UB solver."""
         solver = self._solve
+        if solver is not None and solver is _FUNCTIONAL_SCALAR_SPD:
+            return solver
         if solver is not None and solver is thomas_solve_cuda_t:
             from ._cuda_functional import thomas_solve
 
@@ -462,8 +477,9 @@ class _bwd_euler_ub(Integrator):
             return solver
 
         raise RuntimeError(
-            "The selected bwd_euler_ub solver is not yet transform-compatible. "
-            "Use method='thomas' with current dendra-solvers or method='pcr'."
+            "The selected bwd_euler_ub solver is not transform-compatible. "
+            "Use a dendra-solvers build with pure SPD facades for method='spd', "
+            "or select method='thomas' or method='pcr'."
         )
 
     @staticmethod
@@ -756,10 +772,22 @@ class _bwd_euler_bt(Integrator):
     def _functional_solver(self):
         """Return a transform-compatible block solver facade.
 
-        Current dendra-solvers releases expose the native block-Thomas kernel
-        through a ``torch.func``-aware Python facade. Older installations retain
-        correctness through the portable pure-Torch PCR implementation.
+        Native consuming SPD execution and this nonmutating facade share the
+        same factorization and cached-Cholesky adjoint kernels.
         """
+        if (
+            self._solve is not None
+            and self._solve is solve_bt_spd_cuda_consume_unchecked
+        ):
+            from ._cuda_functional import block_spd_solve
+
+            return block_spd_solve
+        if (
+            self._solve is not None
+            and self._solve is _NATIVE_BLOCK_SPD_CONSUME
+            and _FUNCTIONAL_BLOCK_SPD is not None
+        ):
+            return _FUNCTIONAL_BLOCK_SPD
         if self._solve is not None and self._solve is thomas_solve_cuda_bt:
             from ._cuda_functional import block_thomas_solve
 
@@ -773,8 +801,9 @@ class _bwd_euler_bt(Integrator):
             native = getattr(dendra_solvers, "solve_bt", None)
             return native if callable(native) else block_pcr_solve_t
         raise RuntimeError(
-            "The selected block-Thomas solver is not transform-compatible. "
-            "Use the standard CPU or CUDA method='thomas' implementation."
+            "The selected block solver is not transform-compatible. "
+            "Use a dendra-solvers build with pure SPD facades for method='spd', "
+            "or the standard CPU or CUDA method='thomas' implementation."
         )
 
     @staticmethod

@@ -139,8 +139,13 @@ def _assert_tensor_snapshot(tensor, snapshot):
     # Numeric equality would reject unchanged NaNs in torch.empty scratch and
     # would miss changes to NaN payloads or the sign of zero.
     torch.testing.assert_close(
-        tensor.detach().reshape(-1).contiguous().view(torch.uint8),
-        value.reshape(-1).contiguous().view(torch.uint8),
+        tensor.detach()
+        .reshape(-1)
+        .clone(memory_format=torch.contiguous_format)
+        .view(torch.uint8),
+        value.reshape(-1)
+        .clone(memory_format=torch.contiguous_format)
+        .view(torch.uint8),
         rtol=0.0,
         atol=0.0,
     )

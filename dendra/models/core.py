@@ -4909,7 +4909,7 @@ class Population(P, Sliceable):
                 inj for inj, ok in zip(self.injections, accepted) if not ok
             ]
             if solver_injections:
-                return Intra(self, solver_injections)
+                return Intra(self, solver_injections).train(self.training)
         return None
 
     def _invalidate_mechanism_structure(self):

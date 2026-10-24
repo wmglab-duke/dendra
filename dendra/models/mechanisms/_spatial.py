@@ -24,7 +24,12 @@ try:  # Registers torch.ops.dendra_solvers when available.
 
     DENDRA_SOLVERS_AVAILABLE = True
 except ImportError:  # pragma: no cover - depends on local installation
+    dendra_solvers = None
     DENDRA_SOLVERS_AVAILABLE = False
+
+_FUNCTIONAL_SCALAR_SPD = getattr(dendra_solvers, "solve_tri_spd", None)
+if not getattr(_FUNCTIONAL_SCALAR_SPD, "_DENDRA_FUNC_COMPATIBLE", False):
+    _FUNCTIONAL_SCALAR_SPD = None
 
 try:
     from dendra.models.integrators.tridiag import (
@@ -824,6 +829,8 @@ class SpatialOperator1D(torch.nn.Module):
         solver = self._solve
         if solver is None:
             return None
+        if solver is _FUNCTIONAL_SCALAR_SPD:
+            return solver
         if solver is thomas_solve_cuda_t:
             from dendra.models.integrators._cuda_functional import thomas_solve
 
@@ -840,9 +847,9 @@ class SpatialOperator1D(torch.nn.Module):
         if solver in {pcr_solve_t, pcr_solve_parallel_t}:
             return solver
         raise RuntimeError(
-            f"Material diffusion solver {self.solver_name!r} is not yet "
-            "transform-compatible; use the native Thomas, PCR, or dense solver. "
-            "The CPU SPD solver currently remains imperative-only."
+            f"Material diffusion solver {self.solver_name!r} is not "
+            "transform-compatible; use a dendra-solvers build with pure SPD "
+            "facades, or select the native Thomas, PCR, or dense solver."
         )
 
     def _require_configured(self) -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import torch
 
+from ._symmetry import _symmetric_part
 from .triton._contracts import (
     flatten_vmap_solver_batch,
     restore_vmap_solver_batch,
@@ -61,6 +62,64 @@ def _launch_multi(main, edge, rhs, *plan):
     from .triton.dhs_kernel_multi import _dhs_multi_adjoint
 
     return _dhs_multi_adjoint(main, edge, rhs, *plan)
+
+
+def _launch_block_spd(lower, main, upper, rhs):
+    from .triton.bt_spd_kernel import solve_bt_spd_fwd_consume_impl
+
+    # Factorization owns these disposable buffers. Caller tensors, including
+    # shared prepared diagonals, are never passed to a consuming kernel.
+    return solve_bt_spd_fwd_consume_impl(
+        lower,
+        main.clone(memory_format=torch.contiguous_format),
+        upper,
+        rhs.clone(memory_format=torch.contiguous_format),
+    )
+
+
+def _launch_block_spd_chol(lower, upper, chol, rhs):
+    from .triton.bt_spd_kernel import solve_bt_spd_solve_with_chol_impl
+
+    return solve_bt_spd_solve_with_chol_impl(lower, upper, chol, rhs)
+
+
+@torch.library.custom_op("dendra_functional_cuda::block_spd", mutates_args=())
+def _raw_block_spd(
+    lower: torch.Tensor,
+    main: torch.Tensor,
+    upper: torch.Tensor,
+    rhs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _launch_block_spd(lower, main, upper, rhs)
+
+
+@_raw_block_spd.register_fake
+def _fake_block_spd(lower, main, upper, rhs):
+    return rhs.new_empty(rhs.shape), rhs.new_empty((*rhs.shape[:2], 9))
+
+
+@torch.library.custom_op("dendra_functional_cuda::block_spd_chol", mutates_args=())
+def _raw_block_spd_chol(
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    chol: torch.Tensor,
+    rhs: torch.Tensor,
+) -> torch.Tensor:
+    return _launch_block_spd_chol(lower, upper, chol, rhs)
+
+
+@_raw_block_spd_chol.register_fake
+def _fake_block_spd_chol(lower, upper, chol, rhs):
+    return rhs.new_empty(rhs.shape)
+
+
+@_raw_block_spd_chol.register_vmap
+def _vmap_block_spd_chol(info, in_dims, lower, upper, chol, rhs):
+    flat, batch = flatten_vmap_solver_batch(info, in_dims, lower, upper, chol, rhs)
+    result = (
+        _empty_solution(flat) if info.batch_size == 0 else _raw_block_spd_chol(*flat)
+    )
+    return restore_vmap_solver_batch(result, info.batch_size, batch), 0
 
 
 @torch.library.custom_op("dendra_functional_cuda::tridiagonal", mutates_args=())
@@ -242,6 +301,65 @@ class _TridiagonalSolve(torch.autograd.Function):
             else _apply_tridiagonal(*flat, block, pcr)
         )
         return restore_vmap_solver_batch(result, info.batch_size, batch), 0
+
+
+class _BlockSPDSolve(torch.autograd.Function):
+    @staticmethod
+    def forward(lower, main, upper, rhs):
+        return _raw_block_spd(lower, main, upper, rhs)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        lower, _main, upper, _rhs = inputs
+        x, chol = output
+        _save(ctx, lower, upper, x, chol)
+        ctx.mark_non_differentiable(chol)
+        ctx.set_materialize_grads(False)
+
+    @staticmethod
+    def backward(ctx, grad_x, _grad_chol):
+        lower, upper, x, chol = ctx.saved_tensors
+        if grad_x is None:
+            return None, None, None, None
+        # Retain the native SPD adjoint: reuse its saved factorization and
+        # return the symmetric main-block cotangent, with independent bands.
+        g = _raw_block_spd_chol(lower, upper, chol, grad_x)
+        gx = g.unsqueeze(-1) * x.unsqueeze(-2)
+        return (
+            -(g[:, 1:, :] * x[:, :-1, :]),
+            -_symmetric_part(gx),
+            -(g[:, :-1, :] * x[:, 1:, :]),
+            g,
+        )
+
+    @staticmethod
+    def jvp(ctx, lower_t, main_t, upper_t, rhs_t):
+        lower, upper, x, chol = ctx.saved_tensors
+        tangent = torch.zeros_like(x) if rhs_t is None else rhs_t
+        if main_t is not None:
+            # The reverse rule treats main as a symmetric matrix parameter.
+            # Its forward dual must project onto the same symmetric domain.
+            symmetric = _symmetric_part(main_t)
+            tangent = tangent - (symmetric @ x.unsqueeze(-1)).squeeze(-1)
+        pad = torch.zeros_like(x[:, :1, :])
+        if lower_t is not None:
+            tangent = tangent - torch.cat((pad, lower_t * x[:, :-1, :]), dim=-2)
+        if upper_t is not None:
+            tangent = tangent - torch.cat((upper_t * x[:, 1:, :], pad), dim=-2)
+        return _raw_block_spd_chol(lower, upper, chol, tangent), None
+
+    @staticmethod
+    def vmap(info, in_dims, lower, main, upper, rhs):
+        flat, batch = flatten_vmap_solver_batch(info, in_dims, lower, main, upper, rhs)
+        if info.batch_size == 0:
+            x = _empty_solution(flat)
+            chol = x.new_empty((*x.shape[:2], 9))
+        else:
+            x, chol = _apply_block_spd(*flat)
+        return (
+            restore_vmap_solver_batch(x, info.batch_size, batch),
+            restore_vmap_solver_batch(chol, info.batch_size, batch),
+        ), (0, 0)
 
 
 def _tree_edge_gradient(x, g, parent, *, block):
@@ -440,6 +558,10 @@ _raw_tridiagonal.register_autograd(
     _TridiagonalSolve.backward, setup_context=_TridiagonalSolve.setup_context
 )
 _raw_tridiagonal.register_vmap(_TridiagonalSolve.vmap)
+_raw_block_spd.register_autograd(
+    _BlockSPDSolve.backward, setup_context=_BlockSPDSolve.setup_context
+)
+_raw_block_spd.register_vmap(_BlockSPDSolve.vmap)
 _raw_tree.register_autograd(_TreeSolve.backward, setup_context=_TreeSolve.setup_context)
 _raw_tree.register_vmap(_TreeSolve.vmap)
 _raw_multi.register_autograd(
@@ -452,6 +574,11 @@ _raw_multi.register_vmap(_MultiSolve.vmap)
 def _apply_tridiagonal(a, b, c, rhs, block, pcr):
     """Leave custom JVP handling to AOTAutograd rather than Dynamo inlining."""
     return _TridiagonalSolve.apply(a, b, c, rhs, block, pcr)
+
+
+@torch.compiler.allow_in_graph
+def _apply_block_spd(lower, main, upper, rhs):
+    return _BlockSPDSolve.apply(lower, main, upper, rhs)
 
 
 @torch.compiler.allow_in_graph
@@ -477,6 +604,12 @@ def pcr_solve(a, b, c, rhs):
 def block_thomas_solve(lower, main, upper, rhs):
     validate_block_tridiagonal(lower, main, upper, rhs)
     return _apply_tridiagonal(lower, main, upper, rhs, True, False)
+
+
+def block_spd_solve(lower, main, upper, rhs):
+    """Nonmutating 3x3 SPD solve with the native cached-Cholesky AD rule."""
+    validate_block_tridiagonal(lower, main, upper, rhs)
+    return _apply_block_spd(lower, main, upper, rhs)[0]
 
 
 def dhs_solve(main, edge, rhs, parent, order, layers, *, threads):

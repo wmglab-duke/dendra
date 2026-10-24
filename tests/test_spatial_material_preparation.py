@@ -4,7 +4,11 @@ import pytest
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 
-from dendra.models.mechanisms._spatial import SpatialOperator1D, SpatialOperatorTree
+from dendra.models.mechanisms._spatial import (
+    _FUNCTIONAL_SCALAR_SPD,
+    SpatialOperator1D,
+    SpatialOperatorTree,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -17,7 +21,21 @@ def _restore_thread_count():
 
 
 @pytest.mark.parametrize("threads", [1, 4])
-@pytest.mark.parametrize("solver", ["dense", "thomas", "pcr"])
+@pytest.mark.parametrize(
+    "solver",
+    [
+        "dense",
+        "thomas",
+        "pcr",
+        pytest.param(
+            "spd",
+            marks=pytest.mark.skipif(
+                _FUNCTIONAL_SCALAR_SPD is None,
+                reason="dendra-solvers pure SPD facade is required",
+            ),
+        ),
+    ],
+)
 @pytest.mark.parametrize("method", ["implicit", "explicit"])
 def test_chain_preparation_transforms_and_exact_imperative_parity(
     threads, solver, method
@@ -216,18 +234,26 @@ def test_single_node_prepared_relaxation_is_independent_of_template(kind, thread
     assert operator.diffuse_implicit_configured(c) is c
 
 
-def test_spd_functional_solver_fails_closed_without_changing_imperative_selection():
+@pytest.mark.skipif(
+    _FUNCTIONAL_SCALAR_SPD is None,
+    reason="dendra-solvers pure SPD facade is required",
+)
+def test_spd_functional_solver_preserves_imperative_selection_and_workspace():
     c = torch.ones((1, 3), dtype=torch.float64)
     op = SpatialOperator1D(solver="spd")
     op.configure_diffusion(c, 0.02, 0.3, c, c)
     assert op.solver_name == "spd_cpu"
     selected = op._solve
-    with pytest.raises(
-        RuntimeError, match="SPD solver currently remains imperative-only"
-    ):
-        op._functional_solver()
+    functional = op._functional_solver()
+    assert functional is selected is _FUNCTIONAL_SCALAR_SPD
     assert op._solve is selected
-    torch.testing.assert_close(op.diffuse_implicit_configured(c), c)
+    snapshots = {name: value.clone() for name, value in op._buffers.items()}
+    native = op.diffuse_implicit_configured(c)
+    pure = op.diffuse_implicit_prepared(c, op.prepared_buffers(), solve=functional)
+    torch.testing.assert_close(pure, native, rtol=0, atol=0)
+    torch.testing.assert_close(native, c)
+    for name, value in snapshots.items():
+        torch.testing.assert_close(op._buffers[name], value, rtol=0, atol=0)
 
 
 def test_zero_volume_tree_workspace_has_finite_float32_zero_cotangent_backward():
