@@ -307,7 +307,7 @@ def test_make_functional_preserves_single_compartment_imem_recording():
     )
 
 
-def test_make_functional_rejects_single_compartment_subclasses():
+def test_make_functional_accepts_single_compartment_construction_subclasses():
     class CustomSingleCompartment(dn.SingleCompartment):
         pass
 
@@ -316,11 +316,11 @@ def test_make_functional_rejects_single_compartment_subclasses():
         model.insert(pas)
         model.initialize()
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="exact SingleCompartment",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    initialized = functional.initialize(
+        tensors.parameters, tensors.constants, tensors.initialization
+    )
+    torch.testing.assert_close(initialized.state["integrator"]["v"], model.v)
 
 
 def test_make_functional_rejects_uninitialized_population():
@@ -802,7 +802,7 @@ def test_make_functional_rejects_subclasses_with_unlowered_geometry_semantics():
     model.insert(hh)
     model.initialize()
 
-    with pytest.raises(dn.func.FunctionalizationError, match="exactly Unmyelinated"):
+    with pytest.raises(dn.func.FunctionalizationError, match="area|geometry"):
         dn.func.make_functional(model, dt=DT)
 
 

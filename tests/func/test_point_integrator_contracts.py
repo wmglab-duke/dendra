@@ -159,7 +159,7 @@ def test_point_integrator_support_does_not_admit_custom_population_geometry(meth
             return 2.0 * super().area
 
     source = _point(method, population_type=CustomPoint)
-    with pytest.raises(dn.func.FunctionalizationError, match="supported topologies"):
+    with pytest.raises(dn.func.FunctionalizationError, match="area"):
         dn.func.make_functional(source, dt=DT)
 
 

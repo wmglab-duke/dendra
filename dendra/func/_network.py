@@ -41,7 +41,11 @@ from ._network_initialization import (
 )
 from ._population import (
     _deepcopy_execution_module,
-    _RawClassHookIdentity,
+    _subclass_contract_failures,
+    _subclass_contract_matches,
+    _subclass_slot_contract,
+    _subclass_slot_contract_failures,
+    _subclass_slot_contract_matches,
     make_functional,
 )
 from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
@@ -176,6 +180,7 @@ _NETWORK_INITIALIZATION_METHODS = {
     name: inspect.getattr_static(Network, name)
     for name in (
         "initialize",
+        "_refresh_compile_config_from_ctx",
         "build",
         "init_synapses",
         "initialize_pops_from_state_cache",
@@ -185,6 +190,42 @@ _NETWORK_INITIALIZATION_METHODS = {
         "_set_duration_remainder",
     )
 }
+_NETWORK_SUBCLASS_METHODS = {
+    name: inspect.getattr_static(Network, name)
+    for name in dict.fromkeys(
+        (
+            *_NETWORK_METHODS,
+            *_NETWORK_INITIALIZATION_METHODS,
+            "train",
+            "eval",
+            "devices",
+            "dtypes",
+            "device",
+            "dtype",
+            "_device_signature",
+            "_require_mode_runtime_ready",
+            "_validate_population_runtime_contracts",
+            "_bind_runtime_clocks",
+            "_reanchor_runtime_clock_from_time",
+            "build_synapses",
+            "build_continuous_synapses",
+            "populations_state_dict_for_checkpoint",
+            "netcons_state_dict_for_checkpoint",
+            "netstim_state_dict_for_checkpoint",
+            "checkpoint_structure",
+            "_restore_dict_from_checkpoint_unchecked",
+            "_rebuild_loaded_population_workspaces",
+            "__getattribute__",
+            "__getattr__",
+            "__setattr__",
+            "__delattr__",
+            "__deepcopy__",
+            "__getstate__",
+            "__setstate__",
+        )
+    )
+    if hasattr(Network, name)
+}
 _COLLECTIONS = ("populations", "synapses", "continuous_synapses", "continuous_targets")
 _CACHES = (
     "_population_step_items",
@@ -192,11 +233,42 @@ _CACHES = (
     "_continuous_synapse_step_items",
     "_continuous_target_step_items",
 )
+_NETWORK_SUBCLASS_SLOTS = _subclass_slot_contract(
+    Network,
+    (
+        *_COLLECTIONS,
+        *_CACHES,
+        "netstim",
+        "dt",
+        "t",
+        "training",
+        "built",
+        "_mode_requires_initialize",
+        "_step",
+        "_step_train",
+        "_step_eval",
+        "_runtime_clock",
+        "_clock_origin",
+        "_clock_step",
+        "_duration_remainder",
+        "_state_cache",
+        "_syn_cache",
+    ),
+)
 
 
 def _eligible(network):
+    if not isinstance(network, Network):
+        raise FunctionalizationError("Expected an initialized Network.")
     if type(network) is not Network:
-        raise FunctionalizationError("Expected an initialized canonical Network.")
+        failures = _subclass_contract_failures(
+            network, Network, _NETWORK_SUBCLASS_METHODS
+        )
+        failures.extend(
+            _subclass_slot_contract_failures(network, Network, _NETWORK_SUBCLASS_SLOTS)
+        )
+        if failures:
+            raise FunctionalizationError("\n".join(failures))
     for name, expected in _NETWORK_METHODS.items():
         if (
             name in network.__dict__
@@ -376,6 +448,7 @@ class FunctionalNetwork:
 
     def __init__(self, network, *, extra=None, pending_capacity=None):
         _eligible(network)
+        self._source_type = type(network)
         if extra is not None and not isinstance(extra, Mapping):
             raise TypeError("extra must map Population names to stimulation bindings")
         extra = {} if extra is None else dict(extra)
@@ -651,13 +724,7 @@ class FunctionalNetwork:
         if not self._cache_enabled and self._initialization_alias_failures:
             raise FunctionalizationError("\n".join(self._initialization_alias_failures))
         for name, expected in _NETWORK_INITIALIZATION_METHODS.items():
-            namespace = type(network).__dict__
-            matches = (
-                namespace == _RawClassHookIdentity(name, expected)
-                if torch.compiler.is_compiling()
-                else namespace.get(name) is expected
-            )
-            if name in network.__dict__ or not matches:
+            if not _subclass_contract_matches(network, Network, {name: expected}):
                 raise FunctionalizationError(
                     f"Fresh Network initialization requires its canonical {name} adapter"
                 )
@@ -774,11 +841,21 @@ class FunctionalNetwork:
         raise FunctionalizationError("Continuous target must belong to this Network.")
 
     def _validate_source(self):
-        self._stimulation_plan.validate_source()
         network = self._source
+        if type(network) is not self._source_type:
+            raise FunctionalizationError(
+                "The Network configuration changed; initialize and lower again."
+            )
+        hooks = (
+            _NETWORK_METHODS if type(network) is Network else _NETWORK_SUBCLASS_METHODS
+        )
+        if not _subclass_contract_matches(network, Network, hooks) or not (
+            _subclass_slot_contract_matches(network, Network, _NETWORK_SUBCLASS_SLOTS)
+        ):
+            raise FunctionalizationError("Network adapters changed; lower again.")
+        self._stimulation_plan.validate_source()
         if (
-            type(network) is not Network
-            or not network.built
+            not network.built
             or network._mode_requires_initialize
             or network.dt != self.dt
             or bool(network.training) != self.training
@@ -809,15 +886,6 @@ class FunctionalNetwork:
                     raise FunctionalizationError(
                         "Network phase ordering changed; lower again."
                     )
-        for name, expected in _NETWORK_METHODS.items():
-            namespace = type(network).__dict__
-            matches = (
-                namespace == _RawClassHookIdentity(name, expected)
-                if torch.compiler.is_compiling()
-                else namespace.get(name) is expected
-            )
-            if name in network.__dict__ or not matches:
-                raise FunctionalizationError("Network adapters changed; lower again.")
         if any(
             getattr(network, name) is not _native_step
             for name in ("_step", "_step_train", "_step_eval")

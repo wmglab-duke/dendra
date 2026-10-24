@@ -16,6 +16,11 @@ Network declarations, pure mechanism hooks, event delivery, and continuous
 transforms follow the contracts in {doc}`A19_functional_network_lowering` and
 {doc}`A20_functional_network_rollout`.
 
+Compatible Network and Population-family subclasses can assemble models and
+connections in constructors while inheriting their supported execution hooks.
+See {doc}`A56_functional_population_subclasses` for subclass contracts and a
+complete example.
+
 Networks can combine supported scalar and 3×3 block SPD Populations while
 retaining native initialization and checkpoint behavior. See
 {doc}`A54_functional_spd_solvers` for solver selection, matrix requirements,

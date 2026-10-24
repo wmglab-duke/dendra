@@ -1316,7 +1316,7 @@ def test_multi_functionalization_rejects_noncanonical_component_subclasses():
 
     with pytest.raises(
         dn.func.FunctionalizationError,
-        match=r"component 'custom': the current supported topologies",
+        match=r"component 'custom':.*(?:area|geometry|canonical)",
     ):
         dn.func.make_functional(model, dt=DT)
 
@@ -1489,13 +1489,26 @@ def test_multi_commit_rolls_back_a_failure_after_parent_restore(monkeypatch):
             raise RuntimeError("injected restore failure")
         return result
 
-    monkeypatch.setattr(
-        target,
-        "restore_dict_from_checkpoint",
-        fail_after_first_restore,
-    )
-    with pytest.raises(RuntimeError, match="injected restore failure"):
-        functional.commit_state_(target, checkpoint)
+    original_validate = functional._validate_compatible_population
+    with monkeypatch.context() as fault:
+        # Canonical lifecycle hooks are validated before commit. Inject the
+        # restore fault after that preflight to exercise the later rollback
+        # transaction, rather than the rejection of an unsupported override.
+        def validate_then_inject(population):
+            original_validate(population)
+            fault.setitem(
+                target.__dict__,
+                "restore_dict_from_checkpoint",
+                fail_after_first_restore,
+            )
+
+        fault.setitem(
+            functional.__dict__,
+            "_validate_compatible_population",
+            validate_then_inject,
+        )
+        with pytest.raises(RuntimeError, match="injected restore failure"):
+            functional.commit_state_(target, checkpoint)
 
     assert restore_calls == 1
     _assert_tree_close(functional.extract(target).state, target_before)

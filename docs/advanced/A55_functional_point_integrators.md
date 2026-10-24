@@ -14,6 +14,8 @@ kernelspec:
 `SingleCompartment` containers. These methods use the same pure numerical
 kernels as native execution and the supported scalar cable models. A Network
 can combine them with other admitted integrators.
+Compatible model subclasses use the same paths; see
+{doc}`A56_functional_population_subclasses` for construction and execution contracts.
 
 Use `N=count, C=1` for independent single-compartment cells. With `C>1`, these
 explicit and Dufort–Frankel methods retain their native spatial coupling along

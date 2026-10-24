@@ -460,11 +460,12 @@ class _CustomPopulation(dn.Population):
     pass
 
 
-def test_plain_population_support_does_not_admit_custom_subclasses_or_generic_axon(
+def test_plain_population_support_admits_construction_subclasses_but_not_generic_axon(
     cpu_threads,
 ):
-    with pytest.raises(dn.func.FunctionalizationError):
-        dn.func.make_functional(_model(model_class=_CustomPopulation), dt=DT)
+    model = _model(model_class=_CustomPopulation)
+    _, tensors = dn.func.make_functional(model, dt=DT)
+    torch.testing.assert_close(tensors.state["integrator"]["v"], model.v)
     # Base Axon expects a family-owned _x() implementation. Classify its exact
     # type without constructing geometry or broadening the generic Axon API.
     assert _functional_topology_kind(object.__new__(dn.Axon)) is None

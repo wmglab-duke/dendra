@@ -317,17 +317,16 @@ models outside that initializer contract can still start from the extracted
 The current transition API supports initialized models with all of the
 following properties:
 
-* either a point model using standard Population area geometry (an exact
-  ``Population`` or ``SingleCompartment`` container, or a RAND/NOISE declaration-only
-  subclass inheriting every numerical and lifecycle method), an
+* either a point model using standard Population area geometry (a
+  ``Population`` or ``SingleCompartment`` container), an
   ``Unmyelinated`` topology with standard
   cylindrical cable geometry, a ``Myelinated`` model with Dendra's standard
   geometry and parameter transforms, an ``ExtCellAxon`` model with standard
-  cylindrical membrane and extracellular-layer geometry, an exact ``Cable`` built from a
+  cylindrical membrane and extracellular-layer geometry, a ``Cable`` built from a
   canonical Morphology, a scalar ``Tree`` built from a canonical
   ``CompartmentGraph``, or an ``ExtCellTree`` built from a canonical
   ``CompartmentGraph`` with Dendra's standard finite-extracellular geometry,
-  or an exact ``MultiPopulation`` returned by ``dn.concat_models`` whose
+  or a ``MultiPopulation`` whose
   components each satisfy an admitted scalar topology contract above, or
   whose components are all admitted ``ExtCellAxon``/``ExtCellTree`` models.
   Point-only packs use ``bwd_euler_sc_multi``, mixed scalar point, path, and
@@ -344,7 +343,7 @@ following properties:
 * pure ``VoltageProcess`` updates, including ``fire``, ``fire_r``, ``fire_d``,
   and ``fire_r_d``, with their declared reset and refractory carry;
 * deterministic CPU or CUDA execution in float32 or float64;
-* ``bwd_euler_sc`` or ``scnv`` for exact standalone ``Population`` and
+* ``bwd_euler_sc`` or ``scnv`` for standalone ``Population`` and
   ``SingleCompartment``,
   ``bwd_euler_ub`` for ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
   ``euler``/``rk1``/``eulerv1``/``rk2``/``rk4`` or ``df``/``dfh`` for canonical
@@ -355,6 +354,10 @@ following properties:
   ``bwd_euler_sc_multi``/``dhs_multi``/``dhs_bt_multi`` integrator for
   ``MultiPopulation``, with optional membrane-current output; and
 * for ``bwd_euler_ub``, a transform-compatible Thomas, PCR, or SPD solver.
+
+Compatible subclasses of these families inherit their numerical, geometry,
+initialization, RNG, and checkpoint hooks while customizing construction,
+declarations, and convenience methods. See :doc:`A56_functional_population_subclasses`.
 
 Point containers with these explicit or Dufort--Frankel integrators retain
 native spatial coupling when ``C>1``. Use ``N=count, C=1`` for independent
@@ -428,8 +431,8 @@ legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, func
 callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
 ``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
 Population topologies
-(including generic ``Axon``, ``Population``/``SingleCompartment`` subclasses
-outside the RAND/NOISE declaration-only contract above, nested ``MultiPopulation``,
+(including generic ``Axon``, subclasses that replace supported execution hooks,
+nested ``MultiPopulation``,
 and mixtures of scalar and
 finite-extracellular components), Cable/Axon/Tree subclasses with unrecognized
 custom geometry, stateful
@@ -718,7 +721,7 @@ Mechanism-owned voltage with scnv
 
 ``dn.scnv()`` advances mechanisms and evaluates their actual currents while
 skipping the membrane-voltage solve. Functional execution supports this
-integrator on exact standalone ``Population`` and ``SingleCompartment`` models,
+integrator on compatible standalone ``Population`` and ``SingleCompartment`` models,
 including explicit batches. A pure ``VoltageProcess`` can own the voltage in
 declared ``CARRY`` and return it explicitly:
 
@@ -860,8 +863,9 @@ State-dependent algebra belongs in the field-update computation.
 Regional insertion of the Clearance/Clamp/Exchange families uses the declared
 process support, intersected with material-field availability. Custom processes
 use the shared ``_resolve_quantity`` and ``_mask_material_updates`` helpers for
-the same full-field parameter and support semantics. Custom imperative lifecycle
-overrides, process-level RAND/NOISE, hidden tensor dependencies, mutation, and
+the same full-field parameter and support semantics. Process-level RAND/NOISE
+uses explicit draw and RNG packets; see :doc:`A44_functional_material_stochasticity`.
+Custom imperative lifecycle overrides, hidden tensor dependencies, mutation, and
 implicit random draws are currently unsupported by functional lowering.
 
 ``ClampProcess`` uses the same pipeline for hard assignments, lower/upper
@@ -992,16 +996,16 @@ timestep:
        dn.func.StepInput(ve=ve, intra=intra),
    )
 
-Exact plain ``Population`` and ``SingleCompartment`` models use the same
+Plain ``Population`` and ``SingleCompartment`` models and compatible subclasses use the same
 functional calls with ``dn.bwd_euler_sc(imem=False)``, their default solver.
 With this solver, every ``(N, C)`` slot is an independent membrane compartment,
 including when ``C > 1``: for example, ``dn.Population(N=2, C=3)`` contains six independent
 compartments, not two three-compartment cables. Intracellular current affects
 each compartment's voltage, while an extracellular ``ve`` input has no effect
 because there are no axial connections. Use an admitted cable or Tree model
-when spatial voltage coupling is intended. Both exact point-model classes
-support fresh functional initialization; custom subclasses and generic
-``Axon`` models are not admitted. Compatible extraction and commit retain the
+when spatial voltage coupling is intended. Both point-model families
+support fresh functional initialization, including compatible subclasses;
+generic ``Axon`` models are not admitted. Compatible extraction and commit retain the
 same concrete model class rather than treating ``Population`` and
 ``SingleCompartment`` as interchangeable plans.
 These standalone topologies also admit ``dn.scnv()`` for mechanism-owned
@@ -1034,7 +1038,7 @@ The block path participates in the same lifecycle as the scalar paths:
 ``commit_state_`` all preserve the complete ``v``/``vc`` state. Preparation is
 still performed once outside the runner or compiled chunk.
 
-An exact native ``Cable`` constructed with ``Cable.from_morphology`` or
+A native ``Cable`` or compatible subclass constructed with ``Cable.from_morphology`` or
 ``Cable.from_compartment_graph`` uses the same calls with ``bwd_euler_ub``.
 Its compiled membrane areas and edge resistances remain the electrical source
 of truth; Dendra does not approximate tapered or heterogeneous Sections as
@@ -1073,10 +1077,10 @@ Triton block-DHS solver on CUDA. Optional membrane-current output uses the same
 Packed MultiPopulations
 ------------------------------
 
-An exact ``MultiPopulation`` produced by ``dn.concat_models`` uses the same
-functional API. A scalar pack contains independently admitted exact
+``MultiPopulation`` and compatible subclasses use the same
+functional API. A scalar pack contains independently admitted
 ``Population`` or ``SingleCompartment``, ``Unmyelinated``/``Myelinated`` and
-their admitted subclasses, exact native ``Cable``, or canonical scalar ``Tree``
+their admitted subclasses, native ``Cable``, or canonical scalar ``Tree``
 components.
 Point components using ``scnv`` are excluded from functional packs.
 Packed point execution uses the selected packed implicit solver; it does not
@@ -2794,15 +2798,16 @@ Arbitrary callbacks registered with ``register_pre_initialize_hook`` or
 ``register_post_initialize_hook`` remain available imperatively but are not
 guessed or traced by the functional initializer.
 
-Fresh functional initialization supports exact ``Population`` and
+Fresh functional initialization supports ``Population`` and
 ``SingleCompartment`` models using ``bwd_euler_sc`` or ``scnv``; canonical
 ``Unmyelinated``, ``Myelinated``, and native ``Cable`` models using
-``bwd_euler_ub``; standard ``Unmyelinated`` and ``Myelinated`` models using
-``euler``/``rk1``/``eulerv1``/``rk2``/``rk4``/``df``/``dfh``; exact scalar
+``bwd_euler_ub``; standard point, ``Unmyelinated``, and ``Myelinated`` models using
+``euler``/``rk1``/``eulerv1``/``rk2``/``rk4``/``df``/``dfh``; scalar
 ``Tree`` models using ``dhs``; and canonical ``ExtCellAxon``/``ExtCellTree``
-models using ``bwd_euler_bt``/``dhs_bt``. Exact ``MultiPopulation`` packs use
+models using ``bwd_euler_bt``/``dhs_bt``. ``MultiPopulation`` packs use
 their admitted ``bwd_euler_sc_multi``, ``dhs_multi``, or ``dhs_bt_multi``
-integrator. Transition geometry and integrator restrictions still apply.
+integrator. Compatible subclasses use the same transaction; transition geometry
+and integrator restrictions still apply.
 The Tree path reuses its admitted immutable geometry and support maps, copies
 the explicit initial voltage across every solver node, and recomputes mechanism
 state only at each mechanism's declared support. Zero-area junction voltages

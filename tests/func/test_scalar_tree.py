@@ -771,7 +771,7 @@ def test_scalar_tree_custom_exact_geometry_override_fails_closed():
 
     with pytest.raises(
         dn.func.FunctionalizationError,
-        match="standard exact area",
+        match="area",
     ):
         dn.func.make_functional(model, dt=DT)
 

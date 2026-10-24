@@ -939,7 +939,7 @@ def test_extcell_tree_imem_is_explicit_functional_state():
                 _branched_nonzero_root_graph(),
                 model_type=_AreaOverrideExtCellTree,
             ),
-            "standard exact area",
+            "area",
         ),
     ],
 )

@@ -250,11 +250,15 @@ def test_tree_initializer_rechecks_imperative_lifecycle_after_lowering(mutation)
         _initialize(functional, tensors, tensors.initialization.v_init)
 
 
-def test_tree_subclass_initialization_stays_outside_exact_type_admission():
+def test_tree_construction_subclass_initialization_uses_canonical_transaction():
     model = _model(population_type=_TreeSubclass)
     functional, tensors = dn.func.make_functional(model, dt=DT)
-    with pytest.raises(dn.func.FunctionalizationError, match="exact scalar Tree"):
-        _initialize(functional, tensors, tensors.initialization.v_init)
+    voltage = _voltage(model)
+    initialized = _initialize(functional, tensors, voltage)
+    native = _model(population_type=_TreeSubclass)
+    native.set_v_init(voltage)
+    native.initialize()
+    _assert_tree_close(initialized.state, functional.extract(native).state)
 
 
 def test_tree_initializer_compile_composes_with_voltage_derivative():

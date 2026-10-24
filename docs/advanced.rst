@@ -63,3 +63,4 @@ Advanced
    advanced/A53_functional_dufort_frankel.md
    advanced/A54_functional_spd_solvers.md
    advanced/A55_functional_point_integrators.md
+   advanced/A56_functional_population_subclasses.md

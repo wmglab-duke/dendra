@@ -24,6 +24,7 @@ from torch.fx.experimental.proxy_tensor import make_fx
 
 from dendra.helpers import MEMBRANE_ASSEMBLY, ctx, current_check_purity
 from dendra.models.core import (
+    Axon,
     Cable,
     Myelinated,
     Population,
@@ -31,6 +32,7 @@ from dendra.models.core import (
     Unmyelinated,
     _PassiveEndDiameter,
 )
+from dendra.models.core import step as _standard_population_step
 from dendra.models.extcell import ExtCellAxon, ExtCellTree
 from dendra.models.initialization import _InitializationTransformHook
 from dendra.models.integrators.cable import (
@@ -452,6 +454,171 @@ _STANDARD_POPULATION_FRESH_INITIALIZATION = {
         MultiPopulation,
     )
 }
+_POPULATION_EXECUTION_HOOK_NAMES = (
+    *_POPULATION_FRESH_INITIALIZATION_HOOKS,
+    "_refresh_compile_config_from_ctx",
+    "__getattribute__",
+    "__getattr__",
+    "__setattr__",
+    "__delattr__",
+    "__deepcopy__",
+    "__getstate__",
+    "__setstate__",
+    "shape",
+    "graph",
+    "compartment_graph",
+    "area",
+    "edge_resistance_ohm",
+    "material_volume",
+    "material_edge_index",
+    "material_edges",
+    "preserve_mechanism_population_axis",
+    "device",
+    "dtype",
+    "core_shape",
+    "batched_shape",
+    "_calc_shape_p",
+    "n_batch_dimensions",
+    "n",
+    "is_batched",
+    "numel",
+    "numelc",
+    "expanded_v_init",
+    "step",
+    "init_v",
+    "prep_intra",
+    "_call_make_intra",
+    "_broadcast_step_value",
+    "_normalize_spatial",
+    "_normalize_precomputed_ve",
+    "_normalize_temporal_values",
+    "_prepare_extra",
+    "_compute_extra_chunk",
+    "_duration_budget",
+    "_set_duration_remainder",
+    "force_integrator_reinit",
+    "_complete_integrator_reinitialization",
+    "_runtime_workspace_rebuild_pending",
+    "_validate_runtime_contracts",
+    "_validate_static_runtime_contracts",
+    "_validate_integrator_workspace_contracts",
+    "_validate_integrator_rebuild_contracts",
+    "_integrator_workspace_contract_signature",
+    "_record_integrator_workspace_contracts",
+    "_record_unversioned_integrator_workspace_values",
+    "_unversioned_integrator_workspace_values_match",
+    "_validate_canonical_geometry",
+    "_validate_canonical_workspace",
+    "populate",
+    "_derive_parameter_buffers",
+    "_install_parameter_buffers",
+    "make_contiguous",
+    "_sample_random_parameters",
+    "sample_runtime_noises_",
+    "resample_random_parameters",
+    "resample_runtime_noise",
+    "init_rng",
+    "reset_rng",
+    "_random_parameter_shape",
+    "_runtime_noise_shape",
+    "_stochastic_shape",
+    "_has_random_parameters_resampled_on_initialize",
+    "_run_initialization_hooks",
+    "_initialization_transform_argument",
+    "_initialization_transform_numpy_rng_equal",
+    "_evaluate_initialization_transform",
+    "_execute_initialization_transform",
+    "_deterministically_rematerialize_initialization_parameters",
+    "clear_cache",
+    "_invalidate_integrator_after_initialization_transform",
+    "_resolve_initialization_transform_reference",
+    "_normalize_initialization_transform_output",
+    "_rematerialize_parameter_owner",
+    "_preserved_stochastic_parameter_buffers",
+    "_refresh_component_fields",
+    "_refresh_material_geometry",
+    "_refresh_named_material_geometry",
+    "_sync_core_buffers_to_population_device",
+    "restore",
+    "detach",
+    "state_dict",
+    "load_state_dict",
+    "state_dict_for_checkpoint",
+    "restore_dict_from_checkpoint",
+    "_restore_dict_from_checkpoint_unchecked",
+    "_stochastic_state_dict_for_checkpoint",
+    "_prepare_stochastic_state_from_checkpoint",
+    "_apply_prepared_stochastic_state",
+    "_restore_stochastic_state_from_checkpoint",
+    "_random_parameter_state_for_checkpoint",
+    "_prepare_random_parameter_state",
+    "_apply_random_parameter_state",
+    "_save_to_state_dict",
+    "_load_from_state_dict",
+    "_apply",
+)
+_STANDARD_POPULATION_EXECUTION_HOOKS = {
+    family: {
+        name: inspect.getattr_static(family, name, None)
+        for name in dict.fromkeys(_POPULATION_EXECUTION_HOOK_NAMES)
+        if hasattr(family, name) or name == "clear_cache"
+    }
+    for family in _STANDARD_POPULATION_FRESH_INITIALIZATION
+}
+_POPULATION_RESERVED_ATTRIBUTE_NAMES = (
+    "v",
+    "vc",
+    "t",
+    "i_membrane",
+    "v_prev",
+    "_df_history_valid",
+    "_df_history_dt",
+    "diam",
+    "diameters",
+    "dx",
+    "cm",
+    "rhoa",
+    "celsius",
+    "cm_scale",
+    "rhoa_scale",
+    "area_scale",
+    "shape_f",
+    "shape_p",
+    "np",
+    "nc",
+    "mech",
+    "integrator",
+    "intra",
+    "injections",
+    "mechanism_injections",
+    "mechanism_injection_accepted",
+    "training",
+    "initialized",
+    "is_built",
+    "_flag_rebuild",
+    "_duration_remainder",
+    "_step",
+    "populations",
+    "_compartment_graph",
+    "_graph",
+    "xraxial",
+    "xc",
+    "xg",
+    "n_layers",
+    "random_parameters",
+    "runtime_noises",
+    "in_graph_parametrizations",
+    "_buffers",
+    "_parameters",
+    "_modules",
+    "_caches",
+    "_initialization_transforms",
+    "pre_initialize_hooks",
+    "post_initialize_hooks",
+    "_restoring_steady_state",
+    "initializing_from_state_cache",
+    "_integrator_reinit_pending",
+)
 _STANDARD_OWNED_CACHE_METHODS = {
     name: inspect.getattr_static(Population, name)
     for name in (
@@ -557,13 +724,10 @@ def _scalar_point_integrator_profile(integrator):
 def _functional_initialization_profile(population):
     """Return the audited initializer family for ``population``.
 
-    Population and SingleCompartment lowering remain exact-type because general
-    subclasses are not admitted by the transition contract. Their selected
-    integrator determines independent-compartment or spatial explicit
-    equations. Unmyelinated subclasses may add
-    mechanisms and construction-time parameterization while retaining the same
-    scalar-path voltage and lifecycle semantics; their inherited hooks are
-    checked against the canonical base separately. Canonical scalar Trees use
+    Compatible subclasses inherit the native family's execution contracts;
+    their construction and parameter declarations remain part of the model.
+    The selected point integrator determines independent-compartment or spatial
+    explicit equations. Canonical scalar Trees use
     the same voltage initialization and support-local mechanism transaction;
     their already-lowered graph supplies immutable geometry and support maps.
     Myelinated and extracellular families use that same declaration-driven
@@ -605,7 +769,7 @@ def _functional_initialization_profile(population):
         return Unmyelinated, *_scalar_path_integrator_profile(population.integrator)
     if _is_native_cable(population):
         return Cable, "scalar_path", _bwd_euler_ub
-    if _canonical_type(population) is Tree:
+    if _is_scalar_tree(population):
         return Tree, "scalar_tree", _dhs
     return None
 
@@ -693,6 +857,174 @@ class _RawClassHookIdentity:
 
     def __eq__(self, namespace):
         return namespace.get(self.name) is self.expected
+
+
+def _subclass_contract_matches(owner, base, hooks):
+    """Compare inherited execution hooks without evaluating descriptors.
+
+    Raw MRO entries remain visible to Dynamo so a warmed graph cannot keep
+    executing a private copy after an instance or class hook is replaced.
+    Constructors and construction-only helpers are outside this contract.
+    """
+    for name, standard in hooks.items():
+        for cls in _canonical_type(owner).__mro__:
+            if name in cls.__dict__:
+                if not (cls.__dict__ == _RawClassHookIdentity(name, standard)):
+                    return False
+                break
+        else:
+            # An absent optional hook, such as clear_cache during parameter
+            # rematerialization, has the same native behavior as None. A
+            # subclass must not add callable work that pure lowering omits.
+            if standard is not None:
+                return False
+    if any(name in owner.__dict__ for name in hooks):
+        return False
+    for name, standard in hooks.items():
+        # nn.Module dictionary-membership checks alone do not guard an absent
+        # instance override in a warmed Dynamo graph. Reading canonical method
+        # bindings records the function identity that execution depends on.
+        # Parametrized modules supply generated serialization adapters; their
+        # own binding plan qualifies those wrappers separately.
+        if name in {"__deepcopy__", "__getstate__"}:
+            continue
+        if standard is None:
+            if getattr(owner, name, None) is not None:
+                return False
+            continue
+        expected = (
+            standard.__func__
+            if isinstance(standard, (classmethod, staticmethod))
+            else standard
+        )
+        if isinstance(expected, types.FunctionType):
+            method = getattr(owner, name)
+            if isinstance(standard, staticmethod):
+                if method is not expected:
+                    return False
+            elif (
+                not isinstance(method, types.MethodType)
+                or method.__func__ is not expected
+                or method.__self__
+                is not (type(owner) if isinstance(standard, classmethod) else owner)
+            ):
+                return False
+    return True
+
+
+def _subclass_contract_failures(owner, base, hooks):
+    """Reject numerical/lifecycle replacements without invoking authored hooks."""
+    namespace = object.__getattribute__(owner, "__dict__")
+    replaced = [
+        name
+        for name, standard in hooks.items()
+        if name in namespace
+        or inspect.getattr_static(_canonical_type(owner), name, None) is not standard
+    ]
+    if not replaced:
+        return []
+    return [
+        f"{type(owner).__qualname__} replaces canonical {base.__qualname__} "
+        f"execution hooks {replaced}; compatible subclasses may customize "
+        "construction and declarations while inheriting numerical, geometry, "
+        "initialization, and checkpoint behavior"
+    ]
+
+
+def _subclass_slot_contract(base, names):
+    """Capture canonical class bindings for attributes owned by runtime slots."""
+    slots = {}
+    for name in names:
+        for cls in base.__mro__:
+            if name in cls.__dict__:
+                slots[name] = (True, cls.__dict__[name])
+                break
+        else:
+            slots[name] = (False, None)
+    return slots
+
+
+def _subclass_slot_contract_matches(owner, base, slots):
+    """Keep authored class descriptors from masking native runtime attributes.
+
+    PyTorch's generated parametrization class is checked by its own binding
+    plan. Compare the original authored class against the native family here.
+    """
+    for name, (present, standard) in slots.items():
+        for cls in _canonical_type(owner).__mro__:
+            if name in cls.__dict__:
+                if not present or not (
+                    cls.__dict__ == _RawClassHookIdentity(name, standard)
+                ):
+                    return False
+                break
+        else:
+            if present:
+                return False
+    return True
+
+
+def _subclass_slot_contract_failures(owner, base, slots):
+    replaced = [
+        name
+        for name, binding in slots.items()
+        if not _subclass_slot_contract_matches(owner, base, {name: binding})
+    ]
+    if not replaced:
+        return []
+    return [
+        f"{type(owner).__qualname__} masks canonical {base.__qualname__} "
+        f"runtime attributes {replaced}; use registered parameter declarations "
+        "and inherited runtime attributes"
+    ]
+
+
+_STANDARD_POPULATION_SLOT_CONTRACTS = {
+    family: _subclass_slot_contract(family, _POPULATION_RESERVED_ATTRIBUTE_NAMES)
+    for family in _STANDARD_POPULATION_EXECUTION_HOOKS
+}
+
+
+def _population_family(population):
+    """Resolve the nearest native family while retaining the authored class."""
+    return next(
+        (
+            cls
+            for cls in _canonical_type(population).__mro__
+            if cls in _STANDARD_POPULATION_EXECUTION_HOOKS
+        ),
+        None,
+    )
+
+
+def _population_subclass_failures(population, _seen=None):
+    family = _population_family(population)
+    if family is None:
+        return []
+    failures = _subclass_contract_failures(
+        population, family, _STANDARD_POPULATION_EXECUTION_HOOKS[family]
+    )
+    failures.extend(
+        _subclass_slot_contract_failures(
+            population, family, _STANDARD_POPULATION_SLOT_CONTRACTS[family]
+        )
+    )
+    if object.__getattribute__(population, "__dict__").get("_step") is not (
+        _standard_population_step
+    ):
+        failures.append(
+            "Population replaces the canonical native timestep adapter _step"
+        )
+    if not failures and family is MultiPopulation:
+        seen = set() if _seen is None else _seen
+        if id(population) not in seen:
+            seen.add(id(population))
+            for name, component in population.populations.items():
+                failures.extend(
+                    f"component {name!r}: {failure}"
+                    for failure in _population_subclass_failures(component, seen)
+                )
+    return failures
 
 
 _STATE_IMPERATIVE_INITIALIZATION_HOOKS = (
@@ -989,7 +1321,7 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
         if not isinstance(child, (Mechanism, State, cacheable, Waveform))
     }
     physical_populations = [population] if isinstance(population, Population) else []
-    if type(population) is MultiPopulation:
+    if _is_multi(population):
         physical_populations.extend(population.populations.values())
     component_adapter_type = globals().get("_ComponentPhysicalPreparation")
     if component_adapter_type is not None:
@@ -1670,7 +2002,7 @@ def _initialization_only_parameter_names(population) -> frozenset[str]:
                     source_prefixes.append(allowed + ".")
                 else:
                     source_parameters.add(allowed)
-        if type(owner) is MultiPopulation:
+        if _is_multi(owner):
             for name, component in owner.populations.items():
                 collect(component, f"{prefix}populations.{name}.")
 
@@ -6463,10 +6795,10 @@ def _functional_initialization_failures(population: Population) -> list[str]:
     profile = _functional_initialization_profile(population)
     if profile is None:
         failures.append(
-            "functional initialization currently supports exact "
+            "functional initialization currently supports canonical "
             "Population, SingleCompartment, native Cable, and MultiPopulation, "
-            "plus exact scalar Tree and structurally canonical Unmyelinated, "
-            "Myelinated, ExtCellAxon, and ExtCellTree models"
+            "plus scalar Tree, Unmyelinated, Myelinated, ExtCellAxon, and "
+            "ExtCellTree models and compatible subclasses"
         )
         population_family = None
         operator_kind = None
@@ -7677,39 +8009,15 @@ def _uses_standard_single_compartment_geometry(population) -> bool:
 
 
 def _is_scalar_point(population) -> bool:
-    """Admit canonical point containers and RAND/NOISE declaration-only subclasses.
-
-    A declaration-only subclass inherits every numerical/lifecycle method.
-    Private methods and descriptors also change execution, so they do not gain
-    admission merely by declaring a RAND or NOISE buffer.
-    """
-    if _canonical_type(population) in (Population, SingleCompartment):
-        return True
-    if not isinstance(population, (Population, SingleCompartment)) or not (
-        population.random_parameters or population.runtime_noises
-    ):
-        return False
-    for cls in _canonical_type(population).__mro__:
-        if cls in (Population, SingleCompartment):
-            return True
-        if any(
-            not name.startswith("_")
-            or callable(value)
-            or isinstance(value, (property, classmethod, staticmethod))
-            or (
-                inspect.isdatadescriptor(value)
-                and name not in {"__dict__", "__weakref__"}
-            )
-            for name, value in vars(cls).items()
-        ):
-            return False
-    return False
+    """Identify point families without swallowing cable, tree, or packed models."""
+    return _population_family(population) in (Population, SingleCompartment)
 
 
 def _is_native_cable(population) -> bool:
-    """Return whether ``population`` is an exact canonical generic Cable."""
+    """Return whether ``population`` owns canonical generic Cable geometry."""
     return (
-        _canonical_type(population) is Cable
+        _population_family(population) is Cable
+        and not isinstance(population, Axon)
         and population.compartment_graph is not None
     )
 
@@ -7736,8 +8044,8 @@ def _is_canonical_tree(population) -> bool:
 
 
 def _is_multi(population) -> bool:
-    """Return whether ``population`` is the exact packed population container."""
-    return _canonical_type(population) is MultiPopulation
+    """Identify the canonical packed family, including compatible subclasses."""
+    return _population_family(population) is MultiPopulation
 
 
 def _functional_topology_kind(population) -> str | None:
@@ -8224,7 +8532,7 @@ def _parametrization_constant_layout_for_owners(
     initial_aliases = {}
     seen_initial_modules = set()
     for path, module in modules:
-        if type(population) is MultiPopulation and path.startswith("populations."):
+        if _is_multi(population) and path.startswith("populations."):
             continue
         if id(module) in seen_initial_modules:
             continue
@@ -9054,6 +9362,9 @@ def _functionalization_failures(
     failures = []
     if not isinstance(population, Population):
         return ["expected an initialized dendra Population"]
+    subclass_failures = _population_subclass_failures(population)
+    if subclass_failures:
+        return subclass_failures
     if not population.initialized:
         failures.append("Population must be initialized before functionalization")
     if isinstance(
@@ -9195,10 +9506,11 @@ def _functionalization_failures(
             failures.append(canonical_failure)
     else:
         failures.append(
-            "the current supported topologies are exact Population, exact SingleCompartment, and "
-            "Unmyelinated or Myelinated with standard geometry, plus exact "
-            "native Cable, scalar Tree, or ExtCellTree instances built from a "
-            "canonical morphology"
+            "the current supported topologies are Population, SingleCompartment, "
+            "Unmyelinated, Myelinated, ExtCellAxon, and MultiPopulation, plus "
+            "native Cable, scalar Tree, and ExtCellTree models built from a "
+            "canonical morphology; subclasses must inherit native execution "
+            "and geometry behavior"
         )
 
     if is_extcell_axon or is_extcell_tree:
@@ -10963,6 +11275,29 @@ class FunctionalPopulation:
         _bind_owned_cache=True,
         _retain_initialization_materializations=False,
     ):
+        subclass_failures = _population_subclass_failures(population)
+        if subclass_failures:
+            raise FunctionalizationError("; ".join(subclass_failures))
+        self._population_contract_family = _population_family(population)
+        self._population_contract_hooks = _STANDARD_POPULATION_EXECUTION_HOOKS[
+            self._population_contract_family
+        ]
+        self._population_slot_contract = _STANDARD_POPULATION_SLOT_CONTRACTS[
+            self._population_contract_family
+        ]
+        source_owners = [population]
+        if _is_multi(population):
+            source_owners.extend(population.populations.values())
+        self._population_source_contracts = tuple(
+            (
+                owner,
+                family,
+                _STANDARD_POPULATION_EXECUTION_HOOKS[family],
+                _STANDARD_POPULATION_SLOT_CONTRACTS[family],
+            )
+            for owner in source_owners
+            for family in (_population_family(owner),)
+        )
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
         ):
@@ -12283,6 +12618,17 @@ class FunctionalPopulation:
                 )
 
     def _validate_source(self) -> None:
+        for owner, family, hooks, slots in self._population_source_contracts:
+            if (
+                not _subclass_contract_matches(owner, family, hooks)
+                or not _subclass_slot_contract_matches(owner, family, slots)
+                or owner._step is not _standard_population_step
+            ):
+                raise FunctionalizationError(
+                    "The source Population or packed component canonical execution "
+                    "or runtime-attribute contract changed after make_functional(); "
+                    "lower it again"
+                )
         if self._poisson_plan is not None:
             self._poisson_plan.validate_source()
         self._validate_rng_load_policies()
@@ -12510,6 +12856,9 @@ class FunctionalPopulation:
             self._intra._validate_source()
 
     def _validate_compatible_population(self, population) -> None:
+        subclass_failures = _population_subclass_failures(population)
+        if subclass_failures:
+            raise FunctionalizationError("; ".join(subclass_failures))
         if self._poisson_plan is not None:
             self._poisson_plan.validate_compatible_population(population)
         if not isinstance(population, Population):
@@ -12556,7 +12905,7 @@ class FunctionalPopulation:
         if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             if not _is_multi(population):
                 raise FunctionalizationError(
-                    "Population is not an exact MultiPopulation."
+                    "Population is not a compatible MultiPopulation."
                 )
             if _multi_component_topology_signature(
                 population
@@ -12576,7 +12925,7 @@ class FunctionalPopulation:
         elif self._topology_kind == "native_cable":
             if not _is_native_cable(population):
                 raise FunctionalizationError(
-                    "Population is not an exact canonical native Cable."
+                    "Population is not a compatible canonical native Cable."
                 )
             failure = _validate_native_cable_source(population)
             if failure is not None:
@@ -17921,6 +18270,13 @@ def make_functional(
         raise FunctionalizationError(
             "Population cannot be functionalized by the current capability slice:\n"
             "- expected an initialized dendra Population"
+        )
+    subclass_failures = _population_subclass_failures(population)
+    if subclass_failures:
+        details = "\n".join(f"- {failure}" for failure in subclass_failures)
+        raise FunctionalizationError(
+            "Population cannot be functionalized by the current capability "
+            f"slice:\n{details}"
         )
     device = population.device()
     check_purity = current_check_purity()

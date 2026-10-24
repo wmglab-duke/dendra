@@ -704,7 +704,7 @@ def test_rand_declaration_does_not_admit_private_population_execution_overrides(
     source = _AuthoredPoint(N=1, C=1, integrator=dn.bwd_euler_sc(imem=False))
     source.insert(_CustomLeak)
     source.initialize()
-    with pytest.raises(dn.func.FunctionalizationError, match="topologies"):
+    with pytest.raises(dn.func.FunctionalizationError, match="_step|timestep"):
         dn.func.make_functional(source, dt=DT)
 
 

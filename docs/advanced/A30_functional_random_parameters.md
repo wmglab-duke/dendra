@@ -49,9 +49,10 @@ the selection. The sample itself is not an independent optimizer leaf.
 Declarations on supported Populations, Mechanisms, nested States, and
 MaterialProcesses use their own native scopes and ordering. See
 {doc}`A44_functional_material_stochasticity` for sampled full-field processes.
-A `Population` or `SingleCompartment` subclass
-may add RAND declarations while inheriting every numerical and lifecycle
-method; custom execution overrides remain unsupported. The built-in
+Compatible Population-family subclasses may add constructors and RAND
+declarations while inheriting their numerical and lifecycle methods; see
+{doc}`A56_functional_population_subclasses`. Custom execution overrides remain
+unsupported. The built-in
 distributions are `normal`,
 `lognormal`, `uniform`, and `truncated_normal`. Structural changes to
 declarations, distribution registrations, scopes, or RNG bindings require a
