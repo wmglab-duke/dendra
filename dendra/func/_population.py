@@ -649,6 +649,21 @@ _STANDARD_OWNED_CACHE_METHODS = {
 _INTEGRATOR_FRESH_INITIALIZATION_HOOKS = ("init_v",)
 _SCALAR_EXPLICIT_INTEGRATORS = (_euler, _eulerv1, _rk2, _rk4)
 _SCALAR_DUFORT_INTEGRATORS = (_dufort_frankel, _dufort_frankel_homogeneous)
+_PACKED_OPERATOR_PROFILES = {
+    "scalar_multi_point": ("multi_point", _bwd_euler_sc_multi),
+    "scalar_multi": ("multi_scalar", _dhs_multi),
+    "block_multi_tree": ("multi_block", _dhs_bt_multi),
+}
+_FIXED_OPERATOR_PROFILES = {
+    "native_cable": ("scalar_path", _bwd_euler_ub),
+    "scalar_tree": ("scalar_tree", _dhs),
+    "extcell_axon": ("block_path", _bwd_euler_bt),
+    "extcell_tree": ("block_tree", _dhs_bt),
+    **{
+        topology: (operator, implementation)
+        for operator, (topology, implementation) in _PACKED_OPERATOR_PROFILES.items()
+    },
+}
 _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
     implementation: {
         name: inspect.getattr_static(implementation, name)
@@ -761,18 +776,14 @@ def _functional_initialization_profile(population):
             "_FUNCTIONAL_OPERATOR_KIND",
             None,
         )
-        implementation = {
-            "scalar_multi_point": _bwd_euler_sc_multi,
-            "scalar_multi": _dhs_multi,
-            "block_multi_tree": _dhs_bt_multi,
-        }.get(operator_kind)
-        if implementation is not None:
-            return MultiPopulation, operator_kind, implementation
+        profile = _PACKED_OPERATOR_PROFILES.get(operator_kind)
+        if profile is not None:
+            return MultiPopulation, operator_kind, profile[1]
         return None
     if isinstance(population, ExtCellAxon):
-        return ExtCellAxon, "block_path", _bwd_euler_bt
+        return ExtCellAxon, *_FIXED_OPERATOR_PROFILES["extcell_axon"]
     if _is_extcell_tree(population):
-        return ExtCellTree, "block_tree", _dhs_bt
+        return ExtCellTree, *_FIXED_OPERATOR_PROFILES["extcell_tree"]
     if _is_scalar_point(population):
         return (
             (
@@ -787,9 +798,9 @@ def _functional_initialization_profile(population):
     if isinstance(population, Unmyelinated):
         return Unmyelinated, *_scalar_path_integrator_profile(population.integrator)
     if _is_native_cable(population):
-        return Cable, "scalar_path", _bwd_euler_ub
+        return Cable, *_FIXED_OPERATOR_PROFILES["native_cable"]
     if _is_scalar_tree(population):
-        return Tree, "scalar_tree", _dhs
+        return Tree, *_FIXED_OPERATOR_PROFILES["scalar_tree"]
     return None
 
 
@@ -7900,11 +7911,8 @@ def _functional_topology_kind(population) -> str | None:
             "_FUNCTIONAL_OPERATOR_KIND",
             None,
         )
-        return {
-            "scalar_multi_point": "multi_point",
-            "scalar_multi": "multi_scalar",
-            "block_multi_tree": "multi_block",
-        }.get(operator_kind)
+        profile = _PACKED_OPERATOR_PROFILES.get(operator_kind)
+        return None if profile is None else profile[0]
     if isinstance(population, ExtCellAxon):
         return "extcell_axon"
     if _is_extcell_tree(population):
@@ -11417,15 +11425,13 @@ class FunctionalPopulation:
         point_kind, _point_implementation = _scalar_point_integrator_profile(
             execution_population.integrator
         )
-        operator_kind = {
-            "single_compartment": point_kind,
-            "extcell_axon": "block_path",
-            "extcell_tree": "block_tree",
-            "scalar_tree": "scalar_tree",
-            "multi_point": "scalar_multi_point",
-            "multi_scalar": "scalar_multi",
-            "multi_block": "block_multi_tree",
-        }.get(self._topology_kind, "scalar_path")
+        operator_kind = (
+            point_kind
+            if self._topology_kind == "single_compartment"
+            else _FIXED_OPERATOR_PROFILES.get(
+                self._topology_kind, _FIXED_OPERATOR_PROFILES["native_cable"]
+            )[0]
+        )
         if self._topology_kind in {"unmyelinated", "myelinated"}:
             operator_kind, _implementation = _scalar_path_integrator_profile(
                 execution_population.integrator
