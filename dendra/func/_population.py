@@ -9379,8 +9379,6 @@ def _functionalization_failures(
             failures.extend(_explicit_stencil_failures(population.integrator))
         elif implementation in _SCALAR_DUFORT_INTEGRATORS:
             failures.extend(_dufort_configuration_failures(population.integrator))
-        elif population.integrator.use_gc_variant:
-            failures.append("the gradient-clipped Thomas variant is not supported yet")
     elif is_scalar_tree:
         if (
             _resolve_functional_integrator_spec(
@@ -10720,7 +10718,6 @@ def _structure_signature(population) -> tuple:
             getattr(population.integrator, "threads", None),
             getattr(population.integrator, "write_back", None),
             bool(population.integrator.imem),
-            bool(getattr(population.integrator, "use_gc_variant", False)),
             tuple(population.integrator.v_vars),
             getattr(population.integrator, "_FUNCTIONAL_STATE_NAMES", None),
             tuple(population.integrator._PREPARED_WORKSPACE_SCHEMA),

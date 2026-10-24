@@ -311,16 +311,12 @@ class _bwd_euler_ub(Integrator):
 
     Builds a tridiagonal system from the cable diffusion operator and ionic
     linearization, then solves it each step with a selectable solver backend.
-    Supports optional gradient-clipped Thomas kernels on CUDA.
 
     Parameters
     ----------
     method : {"thomas", "inv", "spd", "pcr"}, optional
         Solver backend: Thomas (default; ``"inv"`` maps to ``"thomas"``),
         SPD tridiagonal (CPU only), or PCR (CPU/CUDA fallback).
-    clip_scale_backward : float, optional
-        Enable gradient clipping in the CUDA Thomas kernel by this scale factor
-        (only applicable when ``method="thomas"``). Default None disables.
     imem : bool or None, optional
         If truthy, accumulate membrane currents each step. Default None.
     """
@@ -342,25 +338,11 @@ class _bwd_euler_ub(Integrator):
     _FUNCTIONAL_OPERATOR_KIND = "scalar_path"
     _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver",)
 
-    def __init__(
-        self, model, mech, method: str = "inv", clip_scale_backward=None, **kw
-    ):
+    def __init__(self, model, mech, method: str = "inv", **kw):
         super().__init__(model, mech, **kw)
         if method == "inv":
             method = "thomas"
         self.method = method.lower()
-
-        # GC-variant (gradient clipping inside Thomas kernel) only makes sense for method="thomas"
-        self.use_gc_variant = False
-        if clip_scale_backward is not None:
-            if self.method != "thomas":
-                warnings.warn(
-                    f"clip_scale_backward is only supported for method='thomas'; "
-                    f"ignoring for method='{self.method}'."
-                )
-            else:
-                self.register_buffer("clip_scale", torch.tensor(clip_scale_backward))
-                self.use_gc_variant = True
 
         B, K = _model_solve_shape(model)
         self.B = B
@@ -427,10 +409,7 @@ class _bwd_euler_ub(Integrator):
             self._solve = thomas_solve_cuda_t
         elif dev == "cpu":
             if DENDRA_SOLVERS_AVAILABLE:
-                if self.use_gc_variant:
-                    self._solve = torch.ops.dendra_solvers.thomas_solve_t_gc
-                else:
-                    self._solve = torch.ops.dendra_solvers.thomas_solve_t
+                self._solve = torch.ops.dendra_solvers.thomas_solve_t
             else:
                 warnings.warn(
                     "Using `bwd_euler_ub` on CPU without dendra-solvers installed. "
@@ -588,13 +567,10 @@ class _bwd_euler_ub(Integrator):
         v_flat = _flatten_to_solve(v, self.K, self.base_shape)
         gtot = _flatten_to_solve(gtot, self.K, self.base_shape)
         solve = self._solve if solver is None else solver
-        # Gradient-clipped Thomas has an intentional surrogate backward; a
-        # shifted RHS must not silently change that policy. The SPD facade can
-        # regularize pivots, so it is also excluded from the exact-solve list.
+        # The SPD facade can regularize pivots, so it is excluded from the
+        # exact-solve list.
         # Unsupported/custom solvers retain the absolute-voltage RHS contract.
-        increment = not self.use_gc_variant and any(
-            solve is standard for standard in _BWD_EULER_INCREMENT_SOLVERS
-        )
+        increment = any(solve is standard for standard in _BWD_EULER_INCREMENT_SOLVERS)
         if itot is None:
             source = _flatten_to_solve(membrane_source, self.K, self.base_shape)
             f_n = (source - gtot * v_flat if increment else source) * self.scale
@@ -643,16 +619,7 @@ class _bwd_euler_ub(Integrator):
         if self.K == 1:
             v_np1 = rhs / main
         else:
-            if self.use_gc_variant:
-                v_np1 = solve(
-                    self.lower,
-                    main,
-                    self.upper,
-                    rhs,
-                    self.clip_scale,
-                )
-            else:
-                v_np1 = solve(self.lower, main, self.upper, rhs)
+            v_np1 = solve(self.lower, main, self.upper, rhs)
 
         if increment:
             v_np1 = v_flat + v_np1

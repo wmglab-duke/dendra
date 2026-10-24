@@ -3,6 +3,22 @@
 Upgrading Dendra
 ================
 
+Gradient-clipped Thomas
+-----------------------
+
+Remove ``clip_scale_backward`` from ``bwd_euler_ub(...)`` calls. The option is
+unsupported and raises ``TypeError``; ordinary Thomas execution uses the
+unmodified solve derivatives. The low-level ``thomas_solve_t_gc`` operator is
+also unavailable.
+
+Strict state-dictionary loading rejects the obsolete ``integrator.clip_scale``
+buffer from a clipped configuration. Reconstruct an ordinary model when
+loading compatible parameters. Native runtime checkpoints store simulation
+state rather than clipping configuration and remain compatible with an
+otherwise matching model, but do not reproduce the former clipped gradients.
+Rebuild models saved as full-object pickles that reference the removed
+operator or constructor option.
+
 Dendra 0.25: custom Mechanism and State classes
 -----------------------------------------------
 

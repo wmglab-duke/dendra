@@ -145,11 +145,7 @@ This is shared Dendra assembly, not a requirement for a fused native solver.
 Custom unbranched solver callables retain their historical absolute-voltage RHS
 contract. The SPD backend also retains legacy assembly because its optional
 pivot regularization need not solve the original matrix exactly; shifting the
-RHS could change that existing numerical policy. The optional gradient-clipped
-Thomas variant likewise retains legacy assembly: its deliberately modified
-backward rule is not an exact linear-solve adjoint, so changing the RHS
-representation could change that surrogate-gradient policy even when the
-forward solutions are mathematically equivalent.
+RHS could change that existing numerical policy.
 Membrane-current reporting and ion lifecycle hooks retain their existing
 physical-current conventions.
 

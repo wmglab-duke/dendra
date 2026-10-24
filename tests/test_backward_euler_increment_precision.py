@@ -468,7 +468,7 @@ def test_chain_reversal_or_point_permutation_preserves_physical_solution(kind):
 
 
 def _legacy_absolute(step, *args):
-    """Literal old UB RHS, specifically for custom/surrogate-policy tests."""
+    """Literal old UB RHS for custom-solver and SPD-policy tests."""
     v, amplitude, *tail = args
     channels, (cm, area, rhoa, ve) = tail[:6], tail[6:]
     conductance, source = _hh(v, channels)
@@ -498,8 +498,6 @@ def _legacy_absolute(step, *args):
     if step.k == 1:
         return rhs / main, rhs
     arguments = (workspace["lower"], main, workspace["upper"], rhs)
-    if step.integrator.use_gc_variant:
-        arguments = (*arguments, step.integrator.clip_scale)
     solver = step.integrator._solve if step.solver is None else step.solver
     return solver(*arguments), rhs
 
@@ -533,33 +531,6 @@ def test_custom_solver_binding_keeps_absolute_rhs_and_k1_bypass(k, binding):
     else:
         assert len(seen) == 2
         torch.testing.assert_close(seen[0], rhs, rtol=0, atol=0)
-
-
-@pytest.mark.skipif(
-    not implicit.DENDRA_SOLVERS_AVAILABLE, reason="native clipped Thomas required"
-)
-@pytest.mark.parametrize("k", (1, 5))
-def test_clipped_thomas_retains_legacy_primal_and_surrogate_gradients(k):
-    step = _Step("thomas", k=k)
-    step.integrator.use_gc_variant = True
-    step.integrator.register_buffer(
-        "clip_scale", torch.tensor(0.02, dtype=torch.float64)
-    )
-    step.solver = torch.ops.dendra_solvers.thomas_solve_t_gc
-    args = tuple(value.requires_grad_() for value in _arguments(torch.float64, k=k))
-    reference = tuple(value.detach().clone().requires_grad_() for value in args)
-    actual = step.response(*args)
-    expected, _ = _legacy_absolute(step, *reference)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    gradients = torch.autograd.grad(actual.square().mean(), args, allow_unused=True)
-    targets = torch.autograd.grad(
-        expected.square().mean(), reference, allow_unused=True
-    )
-    for gradient, target in zip(gradients, targets, strict=True):
-        if target is None:
-            assert gradient is None
-        else:
-            torch.testing.assert_close(gradient, target, rtol=0, atol=0)
 
 
 @pytest.mark.skipif(
