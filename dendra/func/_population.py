@@ -10,7 +10,7 @@ import inspect
 import math
 import types
 from collections.abc import Mapping
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
@@ -109,6 +109,7 @@ from ._rng_diagnostics import (
     _global_rng_changes,
     _global_rng_snapshot,
     _restore_global_rng,
+    _rng_diagnostic_scope,
 )
 from ._stimuli import (
     FunctionalExtra,
@@ -1727,6 +1728,17 @@ def _restore_class_state(snapshot) -> set[str]:
                     restored_value = original if current is not original else restored
                 setattr(cls, name, restored_value)
     return changed
+
+
+@contextmanager
+def _class_state_diagnostic_scope(classes: tuple[type, ...]):
+    """Restore authored class state while exposing only mutation findings."""
+    snapshot = _class_state_snapshot(classes)
+    changed = set()
+    try:
+        yield changed
+    finally:
+        changed.update(_restore_class_state(snapshot))
 
 
 def _deepcopy_execution_module(module: torch.nn.Module) -> torch.nn.Module:
@@ -5089,11 +5101,11 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             # user's source or the packed execution skeleton.
             registered = self._registered_input_bindings()
             python_state = _transition_python_state_snapshot(self)
-            rng_state = _global_rng_snapshot(device)
-            class_state = _class_state_snapshot(authored_classes)
-            mutated_class_state = set()
             mutated_python_state = set()
-            try:
+            with (
+                _rng_diagnostic_scope(device, enabled=True) as rng_diagnostic,
+                _class_state_diagnostic_scope(authored_classes) as mutated_class_state,
+            ):
                 with torch.no_grad():
                     population_values = population._derive_parameter_buffers()
                 self._assert_registered_inputs_unchanged(
@@ -5106,12 +5118,7 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
                     for name in set(python_state) | set(current_python_state)
                     if python_state.get(name) != current_python_state.get(name)
                 }
-            finally:
-                try:
-                    mutated_class_state.update(_restore_class_state(class_state))
-                finally:
-                    consumed_rng = _global_rng_changes(rng_state, device)
-                    _restore_global_rng(rng_state, device)
+            consumed_rng = rng_diagnostic.changes
             if mutated_python_state:
                 raise FunctionalizationError(
                     "Packed component physical preparation observed authored "
@@ -15850,13 +15857,12 @@ class FunctionalPopulation:
         receivers = self._continuous_receivers if continuous else self._receivers
         if not receivers:
             return
-        rng_state = _global_rng_snapshot(self.device)
-        class_state = _class_state_snapshot(
-            _authored_workspace_classes(self._transition)
-        )
-        mutated_class_state = set()
-        consumed_rng = set()
-        try:
+        with (
+            _rng_diagnostic_scope(self.device, enabled=True) as rng_diagnostic,
+            _class_state_diagnostic_scope(
+                _authored_workspace_classes(self._transition)
+            ) as mutated_class_state,
+        ):
             with torch.inference_mode(False), torch.no_grad():
                 parameters = {
                     name: value.detach().clone()
@@ -15962,12 +15968,7 @@ class FunctionalPopulation:
                             f"Synapse {target!r} receiver returned "
                             "non-deterministic results from identical explicit inputs"
                         )
-        finally:
-            try:
-                mutated_class_state.update(_restore_class_state(class_state))
-            finally:
-                consumed_rng.update(_global_rng_changes(rng_state, self.device))
-                _restore_global_rng(rng_state, self.device)
+        consumed_rng = rng_diagnostic.changes
         if mutated_class_state or consumed_rng:
             raise FunctionalizationError(
                 "pure receiver audit observed class mutation or RNG "
