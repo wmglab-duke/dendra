@@ -156,3 +156,10 @@ Custom Dufort–Frankel integrators and modified convolution structures are
 currently unsupported. Generic morphology-backed `Cable` and `Tree` models
 require their supported geometry-aware integrators. Multilayer extracellular
 and concatenated `MultiPopulation` models do not use this scalar cable path.
+
+## Run the complete example
+
+```{code-cell} python
+:load: ../../examples/functional_dufort_frankel.py
+:tags: [remove-input]
+```

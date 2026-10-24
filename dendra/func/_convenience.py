@@ -30,6 +30,8 @@ from ._types import FunctionalizationError, InitializationInput, RolloutInput
 _OWNED_PREPARE = FunctionalPopulation.prepare
 _OWNED_BIND = CompiledPopulationChunk.bind
 _OWNED_RUN = run
+_OWNED_NOISE_TAPE = FunctionalPopulation.sample_noise_draw_tape
+_OWNED_STIMULATION_TAPE = FunctionalPopulation.sample_stimulation_draw_tape
 
 
 def _initialization_input_mapping(inputs):
@@ -447,6 +449,23 @@ class CompiledRunner:
             and getattr(self._kernel.bind, "__self__", None) is self._kernel
             and getattr(self._kernel.bind, "__func__", None) is _OWNED_BIND
             and run is _OWNED_RUN
+            and (
+                self._execution != "while"
+                or all(
+                    getattr(sampler, "__self__", None) is self._functional
+                    and getattr(sampler, "__func__", None) is original
+                    for sampler, original in (
+                        (
+                            self._functional.sample_noise_draw_tape,
+                            _OWNED_NOISE_TAPE,
+                        ),
+                        (
+                            self._functional.sample_stimulation_draw_tape,
+                            _OWNED_STIMULATION_TAPE,
+                        ),
+                    )
+                )
+            )
         )
         context = torch.inference_mode() if self._inference else nullcontext()
         with context:
@@ -478,22 +497,32 @@ class CompiledRunner:
             if not isinstance(inputs, RolloutInput):
                 raise TypeError("inputs must be a RolloutInput or None")
             if self._execution == "while" and inputs.noise is None:
+                sample_noise = (
+                    self._functional._sample_noise_draw_tape_source_validated
+                    if owned_boundaries
+                    else self._functional.sample_noise_draw_tape
+                )
                 inputs = inputs._replace(
-                    noise=self._functional.sample_noise_draw_tape(
-                        selected_state, self._steps
-                    )
+                    noise=sample_noise(selected_state, self._steps)
                 )
             if (
                 self._execution == "while"
                 and inputs.stimulation is None
                 and getattr(self._functional, "_poisson_plan", None) is not None
             ):
+                sample_stimulation = (
+                    self._functional._sample_stimulation_draw_tape_source_validated
+                    if owned_boundaries
+                    else self._functional.sample_stimulation_draw_tape
+                )
                 inputs = inputs._replace(
-                    stimulation=self._functional.sample_stimulation_draw_tape(
-                        selected_state, self._steps
-                    )
+                    stimulation=sample_stimulation(selected_state, self._steps)
                 )
             if self._execution == "while":
+                if not owned_boundaries:
+                    # A replaced public sampler can run user code after its
+                    # own check. Recheck before preflight captures a step.
+                    self._functional._validate_source()
                 self._require_while(
                     bound._parameters, prepared, selected_state, inputs, callback_state
                 )

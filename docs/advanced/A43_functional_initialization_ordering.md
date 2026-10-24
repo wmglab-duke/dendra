@@ -121,3 +121,10 @@ native execution. See {doc}`A29_functional_network_cache_initialization` for
 cache replacement and connection restoration. Initialization does not mutate
 the source Network or incoming packets. Structural changes to transforms,
 sharing, or cache ownership require lowering the Network again.
+
+## Run the complete example
+
+```{code-cell} python
+:load: ../../examples/functional_initialization_ordering.py
+:tags: [remove-input]
+```

@@ -115,3 +115,10 @@ repair shift as fixed; when a repair is triggered they exclude the shift's
 dependence on the coefficients. Use well-conditioned SPD systems when exact
 coefficient sensitivities are required. MPS functional execution is currently
 unsupported.
+
+## Run the complete example
+
+```{code-cell} python
+:load: ../../examples/functional_spd_solvers.py
+:tags: [remove-input]
+```

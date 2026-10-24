@@ -70,8 +70,20 @@ def test_scan_graph_cache_is_partitioned_by_policy_without_executing_scan(monkey
     captured = []
 
     def capture(
-        self, parameters, prepared, state, ve, intra, carries, *, block, grad_enabled
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries,
+        noise,
+        stimulation,
+        *,
+        block,
+        grad_enabled,
     ):
+        assert noise is None and stimulation is None
         policy = dn.current_membrane_assembly()
         captured.append(policy)
         return lambda *operands: policy

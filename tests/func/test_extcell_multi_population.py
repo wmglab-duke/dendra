@@ -666,9 +666,23 @@ def test_extcell_multi_failed_commit_restores_exact_v_and_vc_bindings(
         original_restore(checkpoint)
         raise RuntimeError("injected post-restore failure")
 
-    monkeypatch.setattr(target, "restore_dict_from_checkpoint", failing_restore)
-    with pytest.raises(RuntimeError, match="injected post-restore failure"):
-        functional.commit_state_(target, checkpoint)
+    original_validate = functional._validate_compatible_population
+    with monkeypatch.context() as fault:
+        # Canonical checkpoint hooks are checked before commit. Inject the
+        # restore failure after that preflight to exercise the transaction.
+        def validate_then_inject(population):
+            original_validate(population)
+            fault.setitem(
+                target.__dict__, "restore_dict_from_checkpoint", failing_restore
+            )
+
+        fault.setitem(
+            functional.__dict__,
+            "_validate_compatible_population",
+            validate_then_inject,
+        )
+        with pytest.raises(RuntimeError, match="injected post-restore failure"):
+            functional.commit_state_(target, checkpoint)
     assert restore_calls == 1
     _close(functional.extract(target).state, before_state)
     for name, tensor in target.named_buffers(remove_duplicate=False):

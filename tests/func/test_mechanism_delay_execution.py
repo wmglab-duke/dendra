@@ -423,11 +423,9 @@ def test_fresh_network_delay_initialization_restores_cache_or_clears_history(
     before = _clone(tensors)
     initialized = functional.initialize(*tensors, functional.initialization_inputs)
     native.initialize(DT, reinit_weights=False, reinit_delays=False)
-    expected = (
-        _cache_initialized_native_packet(functional, native)
-        if cache
-        else functional.extract(native)
-    )
+    # Fresh initialization publishes each owner's native materializations in
+    # both modes; snapshot extraction leaves their provenance selectors inactive.
+    expected = _cache_initialized_native_packet(functional, native)
     _close(initialized, expected)
     for population in initialized.state["populations"].values():
         history = population["mechanism_buffers"]["delays"]["signal_delay_buffer"]

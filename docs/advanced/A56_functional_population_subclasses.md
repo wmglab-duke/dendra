@@ -122,3 +122,10 @@ different subclass is not automatically interchangeable because it inherits
 the same base. Changes to execution hooks or structure require rebuilding and
 lowering again. Subclass support does not add support for new geometries,
 custom numerical integrators, or additional devices.
+
+## Run the complete example
+
+```{code-cell} python
+:load: ../../examples/functional_population_subclasses.py
+:tags: [remove-input]
+```

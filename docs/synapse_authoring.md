@@ -172,7 +172,9 @@ with explicit draws and clock/RNG state is described in
 {doc}`advanced/A14_functional_netstim_renewal`. Shared tensor schedules and
 indexed bindings are described in {doc}`advanced/A15_functional_tensor_schedules`.
 Consuming heap calendars are described in {doc}`advanced/A16_functional_heap_schedules`.
-Complete Network execution still uses the ordinary Network API. See
+Construct connected Networks with the ordinary Network API, then execute them
+natively or with `dn.compile(network)`. See
+{doc}`advanced/A21_functional_network_compile` for compiled execution and
 {ref}`functional-event-receive` for the full functional receive contract.
 
 The complete event example runs here:

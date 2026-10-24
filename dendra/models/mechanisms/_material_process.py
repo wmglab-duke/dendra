@@ -626,8 +626,7 @@ class MaterialProcess(Mechanism):
             return self._expand_material_operand(
                 value.to(device=like.device, dtype=like.dtype), like
             )
-        if isinstance(value, Number):
-            return like.new_full((), value)
+        # Construct literals independently of the field's hidden vmap axes.
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
 
     def advance_materials(self, dt, *, prepared=None):

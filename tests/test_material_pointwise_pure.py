@@ -720,3 +720,58 @@ def test_pure_exchange_supports_grad_and_empty_vmap_without_bound_field_reads(
         assert torch.isfinite(value).all()
     assert versions == tuple(value._version for value in (a, b, dt))
     assert materials["a"]._buffers["c"] is stale
+
+
+@pytest.mark.parametrize("mode", ["set", "min", "max", "range"])
+@pytest.mark.parametrize("batch_size", [0, 3])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_pure_clamp_literals_preserve_empty_vmap_lanes_and_field_gradients(
+    mode, batch_size, dtype, monkeypatch
+):
+    class Clamp(ClampProcess):
+        ClampProcess.CLAMP(
+            "pool",
+            field="c",
+            value=(1.2, 1.8) if mode == "range" else 1.2,
+            mode=mode,
+        )
+
+    stale = torch.full((1, 3), 9.0, dtype=dtype)
+    process, materials = _process(Clamp, {KEY: stale})
+
+    def forbidden_resolver(*args, **kwargs):
+        raise AssertionError("Pure Clamp read a bound Material instead of its inputs")
+
+    monkeypatch.setattr(process, "_get_material", forbidden_resolver)
+
+    def values(c):
+        fields = {KEY: c}
+        prepared = process.prepare_materials(fields, c.new_tensor(0.125))
+        for operand in torch.utils._pytree.tree_leaves(prepared):
+            assert operand.shape == ()
+            assert operand.dtype == c.dtype and operand.device == c.device
+            assert not operand.requires_grad
+        return process.material_updates(fields, prepared)[KEY]
+
+    def reference(c):
+        if mode == "set":
+            return torch.full_like(c, 1.2)
+        if mode == "min":
+            return torch.clamp_min(c, 1.2)
+        if mode == "max":
+            return torch.clamp_max(c, 1.2)
+        return torch.clamp(c, 1.2, 1.8)
+
+    c = torch.linspace(-0.7, 2.5, batch_size * 3, dtype=dtype).reshape(batch_size, 1, 3)
+    version = c._version
+    actual = torch.vmap(values)(c)
+    expected = torch.vmap(reference)(c)
+    assert actual.shape == (batch_size, 1, 3)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    gradients = torch.vmap(torch.func.grad(lambda value: values(value).sum()))(c)
+    oracle = torch.vmap(torch.func.grad(lambda value: reference(value).sum()))(c)
+    assert gradients.shape == c.shape
+    torch.testing.assert_close(gradients, oracle, rtol=0, atol=0)
+    assert torch.isfinite(gradients).all()
+    assert c._version == version
+    assert materials["pool"]._buffers["c"] is stale

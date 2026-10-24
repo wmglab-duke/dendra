@@ -304,7 +304,7 @@ Supported models
 The topology list below describes functional *transition* support from an
 initialized tensor state. Fresh functional initialization also supports the
 canonical point, cable, myelinated, Tree, finite-extracellular, and packed
-families with their admitted integrators, including ``scnv`` for standalone
+families with their admitted integrators, including ``scnv`` for unpacked
 point models. It has additional lifecycle requirements: initialization must be
 declaration-driven or use registered pure
 transforms rather than arbitrary imperative hooks. Population-owned
@@ -343,7 +343,7 @@ following properties:
 * pure ``VoltageProcess`` updates, including ``fire``, ``fire_r``, ``fire_d``,
   and ``fire_r_d``, with their declared reset and refractory carry;
 * deterministic CPU or CUDA execution in float32 or float64;
-* ``bwd_euler_sc`` or ``scnv`` for standalone ``Population`` and
+* ``bwd_euler_sc`` or ``scnv`` for unpacked ``Population`` and
   ``SingleCompartment``,
   ``bwd_euler_ub`` for ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
   ``euler``/``rk1``/``eulerv1``/``rk2``/``rk4`` or ``df``/``dfh`` for canonical
@@ -712,7 +712,9 @@ Shared tensor schedules and indexed bindings are described in
 :ref:`functional-tensor-schedules`. Consuming heap calendars and explicit
 cursor state are described in :ref:`functional-heap-schedules`.
 Shared differentiable delays are described in :ref:`functional-delay-interpolation`.
-Complete connected Network lowering remains separate work.
+Connected Network lowering and compiled execution use these shared components;
+see :doc:`A19_functional_network_lowering` and
+:doc:`A21_functional_network_compile`.
 
 .. _functional-scnv:
 
@@ -721,9 +723,10 @@ Mechanism-owned voltage with scnv
 
 ``dn.scnv()`` advances mechanisms and evaluates their actual currents while
 skipping the membrane-voltage solve. Functional execution supports this
-integrator on compatible standalone ``Population`` and ``SingleCompartment`` models,
-including explicit batches. A pure ``VoltageProcess`` can own the voltage in
-declared ``CARRY`` and return it explicitly:
+integrator on compatible unpacked ``Population`` and ``SingleCompartment`` models,
+including explicit batches and Populations within Networks. A pure
+``VoltageProcess`` can own the voltage in declared ``CARRY`` and return it
+explicitly:
 
 .. code-block:: python
 
@@ -761,8 +764,9 @@ No current, capacitance, or raw ``intra``/``ve`` input produces a voltage solve.
 In the example, ``pas`` contributes current but does not change the ramp voltage.
 With ``imem=True``, ``i_membrane`` includes the evaluated current and the
 capacitive current from the imposed voltage change, following the shared
-membrane-current contract. Mechanism-owned waveform injections remain
-unsupported.
+membrane-current contract. Mechanisms can accept waveform injections and
+evaluate them with ``injection_values`` in their pure hooks; see
+:doc:`A35_functional_mechanism_injections` for current and voltage examples.
 
 The established phase order also applies when a mechanism's ``advance`` hook
 updates its voltage carry: public ``v`` may then contain the value exposed by

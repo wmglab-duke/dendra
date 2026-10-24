@@ -1,12 +1,19 @@
+"""Helpers for training a cable model against extracellular teacher responses.
+
+Import this module to construct spatial/temporal input tapes and call ``distill``
+with student and teacher models, an optimizer, and a loss function. The caller
+selects the models and starts the training campaign explicitly.
+"""
+
 import math
 from typing import Tuple
 
 import torch
 from tqdm.auto import tqdm
 
-from ..dendra.models.backend import Backend as A
-from ..dendra.models.callbacks import Recorder
-from ..dendra.models.core import Axon
+from dendra.models.backend import Backend as A
+from dendra.models.callbacks import Recorder
+from dendra.models.core import Axon
 
 
 def num_rows_to_zero(A: int, x: float) -> int:
@@ -134,6 +141,13 @@ def generator(
         yield ve_student, ve_teacher
 
 
+def _elastic_net_penalty(parameters, lambduh, alpha):
+    """Reduce each raw tensor before combining differently shaped parameters."""
+    l1 = sum(parameter.abs().sum() for parameter in parameters)
+    l2 = sum(parameter.square().sum() for parameter in parameters)
+    return lambduh * alpha * l1 + lambduh / 2 * (1 - alpha) * l2
+
+
 def distill(
     student: Axon,
     teacher: Axon,
@@ -160,12 +174,9 @@ def distill(
     for p in l1_parameters:
         p.requires_grad = True
 
-    all_p = []
-    for p in parameters:
-        all_p.append(p)
-    for p in l1_parameters:
-        if p not in all_p:
-            all_p.append(p)
+    # Shared trainable and regularized tensors enter the optimizer once. Tensor
+    # equality compares values rather than identifying shared parameters.
+    all_p = list({id(p): p for p in (*parameters, *l1_parameters)}.values())
 
     rec_v_student = Recorder(["v"])
     rec_v_teacher = Recorder(["v"])
@@ -227,17 +238,7 @@ def distill(
                 continue
 
             pbar.set_description(f"Chunk {i}: {loss.item():.4f}")
-            loss = loss + (
-                lambduh
-                * alpha
-                * torch.sum(torch.stack([torch.abs(p) for p in l1_parameters]))
-            )
-            loss = loss + (
-                lambduh
-                / 2
-                * (1 - alpha)
-                * torch.sum(torch.stack([torch.square(p) for p in l1_parameters]))
-            )
+            loss = loss + _elastic_net_penalty(l1_parameters, lambduh, alpha)
 
             loss = loss / n_splits
             # Backward pass and optimization

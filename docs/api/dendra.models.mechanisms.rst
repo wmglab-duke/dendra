@@ -566,7 +566,7 @@ provides Euler-Heun support for Stratonovich stochastic state variables. The
 Euler-Heun builder averages the old and predicted diffusion coefficients; pass
 ``average_drift=True`` to average the deterministic drift term as well. These
 methods apply only to ``State`` updates; stochastic voltage/cable solvers are
-intentionally separate future work.
+currently unsupported.
 
 Material management
 -------------------
@@ -645,8 +645,11 @@ must be a tensor-only PyTree with a fixed schema; an empty tuple represents
 no workspace. ``None`` is reserved by the native adapter. Returned replacements
 use a fixed subset of the declared field keys and match the complete input
 field's shape, dtype, and device. Custom imperative lifecycle overrides,
-process-level RAND/NOISE, implicit random draws, hidden tensor dependencies,
-and persistent mutation are currently unsupported by functional lowering.
+implicit random draws, hidden tensor dependencies, and persistent mutation
+are currently unsupported by functional lowering. Process-level RAND and
+NOISE declarations use explicit draws and RNG carry; see
+:doc:`../advanced/A44_functional_material_stochasticity` for sampling,
+gradients, and checkpoint continuation.
 
 Global and regional insertion, including concatenated ``MultiPopulation``
 components, retain their native field layouts. Use

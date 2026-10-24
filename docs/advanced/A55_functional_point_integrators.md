@@ -132,3 +132,10 @@ or learned stencils. Choose a timestep appropriate for the complete model.
 Custom numerical integrators, modified convolution structures, and packed
 `MultiPopulation` execution with these point-integrator profiles are currently
 unsupported.
+
+## Run the complete example
+
+```{code-cell} python
+:load: ../../examples/functional_point_integrators.py
+:tags: [remove-input]
+```

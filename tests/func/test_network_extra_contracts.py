@@ -151,7 +151,10 @@ def test_bound_extra_and_explicit_ve_conflict_only_for_the_selected_population()
 )
 def test_network_extra_reuses_population_waveform_purity_checks(waveform_type):
     network = _network()
-    with pytest.raises(dn.func.FunctionalizationError):
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(dn.func.FunctionalizationError),
+    ):
         dn.func.make_functional_network(
             network, extra={"left": (torch.ones_like(network.left.v), waveform_type())}
         )

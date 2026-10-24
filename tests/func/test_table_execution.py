@@ -435,16 +435,49 @@ def test_fresh_network_initialization_preserves_learned_table_values_and_cache(
         ]
         assert len(selected) == 1
         _close(selected[0], expected_y)
-    expected = (
-        _cache_initialized_native_packet(functional, native)
-        if cache
-        else functional.extract(native)
-    )
+    # Fresh initialization retains each Population's native materializations
+    # in both modes; ordinary extraction describes snapshot provenance.
+    expected = _cache_initialized_native_packet(functional, native)
     _close(initialized, expected)
+    if not cache and native.left.mech.tabulated.DE:
+        key = next(
+            name
+            for name in parameters["populations"]["left"]
+            if name.endswith("curve_table.y")
+        )
+        leaf = parameters["populations"]["left"][key]
+        initial_x = initialized.state["populations"]["left"]["mechanisms"]["tabulated"][
+            "x"
+        ]
+        # Pure initialization preserves inferred-default gradients. Native
+        # initialization detaches these defaults, so use the independent
+        # interpolation oracle at -47 mV for this initialization contribution.
+        expected_x = (leaf[3] * (7.0 / 15.0) + leaf[4] * (8.0 / 15.0)).expand_as(
+            initial_x
+        )
+        _close(initial_x, expected_x)
+        actual_gradient = torch.autograd.grad(initial_x.sum(), leaf, retain_graph=True)[
+            0
+        ]
+        expected_gradient = torch.autograd.grad(
+            expected_x.sum(), leaf, retain_graph=True
+        )[0]
+        assert expected_gradient.abs().sum() > 0
+        _close(actual_gradient, expected_gradient)
+        # The initial gate and first CNEXP target are the same interpolation.
+        # Uniform fields have zero axial current, giving this independent
+        # backward-Euler voltage and complete one-step TABLE VJP oracle.
+        initial_v = initialized.state["populations"]["left"]["integrator"]["v"]
+        g = native.left.mech.tabulated.g.detach()
+        e = native.left.mech.tabulated.e.detach()
+        cmdt = native.left.integrator.cmdt.detach()
+        expected_v = initial_v + g * expected_x * (e - initial_v) / (
+            cmdt + g * expected_x
+        )
     actual, _ = functional.prepare_and_step(*initialized)
     native.step()
     _close(actual, functional.extract(native).state)
-    if cache:
+    if cache or not native.left.mech.tabulated.DE:
         key = next(
             name
             for name in parameters["populations"]["left"]
@@ -458,6 +491,15 @@ def test_fresh_network_initialization_preserves_learned_table_values_and_cache(
             native.left.v.square().sum(), native_leaf
         )[0]
         assert expected_gradient.abs().sum() > 0
+        _close(actual_gradient, expected_gradient)
+    else:
+        next_x = actual["populations"]["left"]["mechanisms"]["tabulated"]["x"]
+        next_v = actual["populations"]["left"]["integrator"]["v"]
+        _close(next_x, expected_x)
+        _close(next_v, expected_v)
+        actual_gradient = torch.autograd.grad(next_v.square().sum(), leaf)[0]
+        expected_gradient = torch.autograd.grad(expected_v.square().sum(), leaf)[0]
+        assert expected_gradient.isfinite().all() and expected_gradient.abs().sum() > 0
         _close(actual_gradient, expected_gradient)
     _close(tensors, before)
 

@@ -283,12 +283,18 @@ def test_every_pure_builtin_waveform_functionalizes(waveform_factory):
 def test_subclass_of_marked_builtin_must_redeclare_purity():
     unmarked = _model()
     unmarked[:, 1].inject(_UnmarkedSin(amp=0.2, freq=0.7))
-    with pytest.raises(dn.func.FunctionalizationError, match="FUNCTIONAL_PURE"):
+    with dn.ctx(CHECK_PURITY=False):
+        dn.func.make_functional(unmarked, dt=DT)
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(dn.func.FunctionalizationError, match="FUNCTIONAL_PURE"),
+    ):
         dn.func.make_functional(unmarked, dt=DT)
 
     marked = _model()
     marked[:, 1].inject(_MarkedSin(amp=0.2, freq=0.7))
-    functional, tensors = dn.func.make_functional(marked, dt=DT)
+    with dn.ctx(CHECK_PURITY=True):
+        functional, tensors = dn.func.make_functional(marked, dt=DT)
     prepared = functional.prepare(tensors.parameters, tensors.constants)
     state, _auxiliary = functional.step(
         tensors.parameters,
@@ -312,7 +318,10 @@ def test_purity_validation_is_recursive_and_does_not_trust_module_names(waveform
     model = _model()
     model[:, 1].inject(waveform)
 
-    with pytest.raises(dn.func.FunctionalizationError, match="FUNCTIONAL_PURE"):
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(dn.func.FunctionalizationError, match="FUNCTIONAL_PURE"),
+    ):
         dn.func.make_functional(model, dt=DT)
 
 
@@ -321,9 +330,12 @@ def test_purity_audit_includes_non_waveform_module_children():
     waveform = _MarkedWaveformWithMutatingChild()
     model[:, 1].inject(waveform)
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="mutated Python instance state",
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(
+            dn.func.FunctionalizationError,
+            match="mutated Python instance state",
+        ),
     ):
         dn.func.make_functional(model, dt=DT)
 
@@ -439,7 +451,8 @@ def test_purity_audit_accepts_deterministic_nan_values():
     model = _model()
     model[:, 1].inject(dn.constant(value=torch.nan))
 
-    functional, _tensors = dn.func.make_functional(model, dt=DT)
+    with dn.ctx(CHECK_PURITY=True):
+        functional, _tensors = dn.func.make_functional(model, dt=DT)
     stimulation = functional.intra.extract()
     assembled = functional.intra.assemble_tensors(
         stimulation,
@@ -454,7 +467,8 @@ def test_purity_audit_accepts_stable_numpy_nan_state():
     model = _model()
     model[:, 1].inject(_MarkedWaveformWithNumpyNaN())
 
-    functional, tensors = dn.func.make_functional(model, dt=DT)
+    with dn.ctx(CHECK_PURITY=True):
+        functional, tensors = dn.func.make_functional(model, dt=DT)
     prepared = functional.prepare(tensors.parameters, tensors.constants)
     state, _auxiliary = functional.step(
         tensors.parameters,

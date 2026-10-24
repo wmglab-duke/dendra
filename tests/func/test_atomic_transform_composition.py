@@ -263,9 +263,12 @@ def test_audit_clone_clock_reference_is_isolated_and_mutation_fails_closed(
         capture_accepted_clock,
     )
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match=r"read-only transition inputs.*positional:t",
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(
+            dn.func.FunctionalizationError,
+            match=r"read-only transition inputs.*positional:t",
+        ),
     ):
         dn.func.make_functional(model, dt=DT)
 

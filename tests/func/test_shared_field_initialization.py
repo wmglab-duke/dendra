@@ -674,7 +674,8 @@ def test_state_initial_values_reject_hidden_shared_alias_reads():
         model.insert(_HiddenSharedAliasMechanism)
         model.initialize()
 
-    functional, tensors = dn.func.make_functional(model, dt=DT)
+    with dn.ctx(CHECK_PURITY=True):
+        functional, tensors = dn.func.make_functional(model, dt=DT)
     with pytest.raises(
         dn.func.FunctionalizationError,
         match=r"reads receiver attributes.*nai.*values mapping",
@@ -739,18 +740,30 @@ def test_replaced_outer_initialization_hooks_fail_closed(
 ):
     model = _model()
     owner = model if owner_kind == "population" else model.integrator
+    calls = []
 
     def replacement(self, *args, **kwargs):
         del self, args, kwargs
+        calls.append(hook_name)
 
     setattr(owner, hook_name, MethodType(replacement, owner))
-    functional, tensors = dn.func.make_functional(model, dt=DT)
-    with pytest.raises(dn.func.FunctionalizationError, match=message):
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
+    if owner_kind == "population":
+        # Canonical Population lifecycle bindings are required at admission,
+        # before a functional plan or initializer can invoke the replacement.
+        with pytest.raises(
+            dn.func.FunctionalizationError,
+            match=rf"{type(model).__name__} replaces canonical .*execution hooks.*{hook_name}",
+        ):
+            dn.func.make_functional(model, dt=DT)
+    else:
+        functional, tensors = dn.func.make_functional(model, dt=DT)
+        with pytest.raises(dn.func.FunctionalizationError, match=message):
+            functional.initialize(
+                tensors.parameters,
+                tensors.constants,
+                tensors.initialization,
+            )
+    assert calls == []
 
 
 @pytest.mark.parametrize("owner_kind", ["ion", "material"])

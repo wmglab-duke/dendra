@@ -1,40 +1,52 @@
 """Local Inductor lowering for copy-view operators in the scan body.
 
-The scan partitioner functionalizes views into copy operators. Inductor does
-not decompose select_copy/slice_copy in the verified Torch releases, leaving
-opaque copy/dispatch boundaries between otherwise fusible numerical kernels.
-An owned decomposition table preserves their copy semantics while allowing
-normal Inductor fusion. Explicit storage views also retain conditional operand
-layout constraints after scan functionalization. Nothing is registered or
-patched globally.
+The scan partitioner functionalizes views into copy operators. Lower these
+operators after autograd partitioning so the backward scan retains its time
+axis even when its derivatives use only loop-invariant operands. Explicit
+views followed by independent contiguous clones preserve copy semantics,
+conditional operand layouts, and normal Inductor fusion. The graph pass and
+authored-derivative decompositions belong only to this backend.
 """
 
 from __future__ import annotations
 
 import torch
+from torch._inductor.custom_graph_pass import (
+    CustomGraphPass,
+    get_custom_graph_passes,
+    get_hash_for_files,
+)
 
 from dendra._bootstrap import isolate_compilation_callable
 
 
-def _select_copy(value, dim, index):
-    return torch.ops.aten.select.int(value, dim, index).clone(
-        memory_format=torch.contiguous_format
-    )
+class _CopyViewLowering(CustomGraphPass):
+    """Expose copy-view layouts after AOT has saved the backward time axis."""
 
+    def uuid(self):
+        return get_hash_for_files((__file__,))
 
-def _slice_copy(value, dim=0, start=None, end=None, step=1):
-    return torch.ops.aten.slice.Tensor(value, dim, start, end, step).clone(
-        memory_format=torch.contiguous_format
-    )
-
-
-def _as_strided_copy(value, size, stride, storage_offset=None):
-    # The FX-visible storage view constrains its producer's exact strides.
-    # Inductor's direct copy-view lowering otherwise hides that requirement
-    # from outer conditional graphs after scan's view functionalization.
-    return torch.ops.aten.as_strided.default(value, size, stride, storage_offset).clone(
-        memory_format=torch.contiguous_format
-    )
+    def __call__(self, graph):
+        targets = {
+            torch.ops.aten.select_copy.int: torch.ops.aten.select.int,
+            torch.ops.aten.slice_copy.Tensor: torch.ops.aten.slice.Tensor,
+            torch.ops.aten.as_strided_copy.default: torch.ops.aten.as_strided.default,
+        }
+        for node in list(graph.nodes):
+            if node.op != "call_function" or node.target not in targets:
+                continue
+            with graph.inserting_before(node):
+                view = graph.call_function(targets[node.target], node.args, node.kwargs)
+                result = graph.call_function(
+                    torch.ops.aten.clone.default,
+                    (view,),
+                    {"memory_format": torch.contiguous_format},
+                )
+                # Only the clone has the original copy's layout. Inductor's
+                # following fake-tensor update computes the new view metadata.
+                result.meta = dict(node.meta)
+            node.replace_all_uses_with(result)
+            graph.erase_node(node)
 
 
 class _ScanInductorBackend(torch._TorchCompileInductorWrapper):
@@ -62,9 +74,16 @@ class _ScanInductorBackend(torch._TorchCompileInductorWrapper):
                 patches.get("_pre_fusion_custom_pass", config._pre_fusion_custom_pass),
                 receipts=donation_receipts,
             )
-        decompositions[torch.ops.aten.select_copy.int] = _select_copy
-        decompositions[torch.ops.aten.slice_copy.Tensor] = _slice_copy
-        decompositions[torch.ops.aten.as_strided_copy.default] = _as_strided_copy
+            previous = patches.get(
+                "post_grad_custom_post_pass", config.post_grad_custom_post_pass
+            )
+            # Keep user callbacks intact, including their inference-aware
+            # protocol and cache identity. Torch applies this pass to HOP
+            # subgraphs as well as their containing forward/backward graphs.
+            patches["post_grad_custom_post_pass"] = (
+                *get_custom_graph_passes(previous),
+                _CopyViewLowering(),
+            )
         from ._dufort_autograd import _inductor_decompositions
 
         decompositions.update(_inductor_decompositions())

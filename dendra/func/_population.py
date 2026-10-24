@@ -14292,6 +14292,10 @@ class FunctionalPopulation:
     def sample_stimulation_draw_tape(self, state, steps):
         """Sample a time-first Poisson draw and generator-state tape."""
         self._validate_source()
+        return self._sample_stimulation_draw_tape_source_validated(state, steps)
+
+    def _sample_stimulation_draw_tape_source_validated(self, state, steps):
+        """Sample within an invocation whose source structure is already checked."""
         self._validate_state(state)
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
             raise ValueError("steps must be a non-negative integer")
@@ -14325,6 +14329,10 @@ class FunctionalPopulation:
     def sample_noise_draw_tape(self, state, steps):
         """Sample a bounded time-first draw and RNG tape from an explicit carry."""
         self._validate_source()
+        return self._sample_noise_draw_tape_source_validated(state, steps)
+
+    def _sample_noise_draw_tape_source_validated(self, state, steps):
+        """Sample within an invocation whose source structure is already checked."""
         self._validate_state(state)
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
             raise ValueError("steps must be a non-negative integer")

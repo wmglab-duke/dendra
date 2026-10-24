@@ -634,7 +634,10 @@ def test_continuation_samples_pulse_at_recurrent_clock_boundary(execution, cpu_t
 )
 def test_extra_rejects_undeclared_mutating_and_stochastic_waveforms(waveform_type):
     model = _model()
-    with pytest.raises(dn.func.FunctionalizationError):
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(dn.func.FunctionalizationError),
+    ):
         dn.compile(
             model,
             dt=DT,

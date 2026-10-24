@@ -25,8 +25,10 @@ Run it with `python examples/functional_network_lowering.py`.
 
 ## Declare the ordinary Network
 
-Functional lowering supports initialized canonical Networks whose simulation
-components use one device. Event connections support dense queues and compact
+Functional lowering supports initialized Networks and compatible subclasses
+whose simulation components use one device. Model subclasses retain their base
+family's execution contract; see {doc}`A56_functional_population_subclasses`.
+Event connections support dense queues and compact
 source-history training, including compatible native `auto` selections, and
 packed-history inference with connection schedules, and sparse-calendar
 inference. Pending calendar capacity and overflow handling are described in

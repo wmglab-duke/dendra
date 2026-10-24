@@ -609,12 +609,6 @@ def test_later_population_cache_preserves_prior_initializer_fields_and_runtime_a
         source.raw.fill_(180)
     native = copy.deepcopy(network)
     functional, tensors = dn.func.make_functional_network(network)
-    if runtime_alias:
-        with pytest.raises(
-            dn.func.FunctionalizationError, match="earlier materialized coefficients"
-        ):
-            functional.initialize(*tensors, functional.initialization_inputs)
-        return
     initialized = functional.initialize(*tensors, functional.initialization_inputs)
     native.initialize(DT)
     _assert_tree_close(initialized.state, functional.extract(native).state)
@@ -622,9 +616,12 @@ def test_later_population_cache_preserves_prior_initializer_fields_and_runtime_a
     torch.testing.assert_close(
         left["ions"]["na"]["nao"], torch.full_like(left["ions"]["na"]["nao"], 180.5)
     )
-    raw = initialized.parameters["populations"]["left"][
-        _source_name(initialized.parameters["populations"]["left"])
-    ]
+    left_name = (
+        "integrator.mech.mechanisms.leak.g_param"
+        if runtime_alias
+        else _source_name(initialized.parameters["populations"]["left"])
+    )
+    raw = initialized.parameters["populations"]["left"][left_name]
     torch.testing.assert_close(raw, raw.new_tensor(120))
     assert (
         raw
@@ -632,6 +629,33 @@ def test_later_population_cache_preserves_prior_initializer_fields_and_runtime_a
             _source_name(initialized.parameters["populations"]["right"])
         ]
     )
+    if runtime_alias:
+        # LEFT retains the coefficient built before RIGHT restores the shared
+        # raw source. Runtime preparation must use 180 even though raw is 120.
+        torch.testing.assert_close(
+            native.left.mech.leak.g,
+            torch.full_like(native.left.mech.leak.g, 180),
+        )
+    final, _ = functional.prepare_and_rollout(*initialized, steps=STEPS)
+    for _ in range(STEPS):
+        native.step()
+    _assert_tree_close(final, functional.extract(native).state)
+    initial_raw = tensors.parameters["populations"]["left"][left_name]
+    torch.testing.assert_close(initial_raw, initial_raw.new_tensor(180))
+    torch.testing.assert_close(source.raw, source.raw.new_tensor(180))
+    actual = torch.autograd.grad(
+        sum(
+            population["integrator"]["v"].square().sum()
+            for population in final["populations"].values()
+        ),
+        initial_raw,
+    )[0]
+    expected = torch.autograd.grad(
+        sum(population.v.square().sum() for population in native.populations.values()),
+        native.left.mech.ions["na"].o_init.raw,
+    )[0]
+    torch.testing.assert_close(actual, expected, rtol=2e-10, atol=2e-11)
+    assert actual.isfinite().all() and actual.abs().sum() > 0
 
 
 @pytest.mark.cpu

@@ -800,13 +800,80 @@ def _network(process=_RandomTransfer):
     return network
 
 
-def test_material_stochastic_network_rejects_rng_modules_shared_between_populations():
-    source = _network()
-    source.right.mech.material_processes[
-        "random"
-    ].stream = source.left.mech.material_processes["random"].stream
-    with pytest.raises(dn.func.FunctionalizationError, match="distinct modules"):
-        dn.func.make_functional_network(source)
+def test_material_stochastic_network_shares_rng_modules_between_populations():
+    source, native = _network(), _network()
+    for network in (source, native):
+        network.right.mech.material_processes[
+            "random"
+        ].stream = network.left.mech.material_processes["random"].stream
+        assert (
+            network.right.mech.material_processes["random"].stream
+            is network.left.mech.current.stream
+        )
+        assert network.right.mech.current.stream is not network.left.mech.current.stream
+    _sync_stimulus(source, native)
+    snapshot = _clone(source.state_dict_for_checkpoint(), detached=True)
+    global_rng = torch.get_rng_state().clone()
+    functional, tensors = dn.func.make_functional_network(source)
+    frozen = _clone(tensors, detached=True)
+    # Shared streams have one Network-owned carry per physical RNGModule.
+    # RIGHT's current retains its independent stream; both material operators
+    # consume LEFT's stream in native Population/declaration order.
+    assert len(tensors.state["rng"]) == 2
+    assert all(
+        "rng" not in population["random"]
+        for population in tensors.state["populations"].values()
+    )
+    packets = functional.sample_population_initialization_draws(
+        tensors.parameters, tensors.state
+    )
+    defaults = functional.initialization_inputs
+    initialization = defaults._replace(
+        populations={
+            name: value._replace(random_draw=packets[name])
+            for name, value in defaults.populations.items()
+        },
+        netstim_draw=functional.sample_initialization_draw(
+            tensors.parameters, tensors.state, constants=tensors.constants
+        ),
+        reinit_weights=False,
+        reinit_delays=False,
+    )
+    initialized = functional.initialize(*tensors, initialization)
+    native.initialize(DT, reinit_weights=False, reinit_delays=False)
+    _close(initialized.state, functional.extract(native).state)
+    tapes = functional.sample_population_noise_tapes(initialized.state, 4)
+    _close(tapes, functional.sample_population_noise_tapes(initialized.state, 4))
+    inputs = dn.func.NetworkRolloutInput(
+        populations={
+            name: dn.func.RolloutInput(noise=tape) for name, tape in tapes.items()
+        },
+        netstim=functional.sample_draw_tape(initialized.state, 4),
+    )
+    prepared = functional.prepare(initialized.parameters, initialized.constants)
+    state = initialized.state
+    for index in range(4):
+        selected = pytree.tree_map_only(
+            torch.Tensor, lambda value: value[index : index + 1], inputs
+        )
+        state, _ = functional.rollout(
+            initialized.parameters, prepared, state, selected, steps=1
+        )
+        native.step()
+        _close(state, functional.extract(native).state)
+        if index == 1:
+            prefix = _clone(state, detached=True)
+    continued, _ = functional.rollout(
+        initialized.parameters,
+        prepared,
+        prefix,
+        pytree.tree_map_only(torch.Tensor, lambda value: value[2:], inputs),
+        steps=2,
+    )
+    _close(continued, state)
+    _close(tensors, frozen)
+    _close(source.state_dict_for_checkpoint(), snapshot)
+    torch.testing.assert_close(torch.get_rng_state(), global_rng, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("execution", ("scan", "while"))

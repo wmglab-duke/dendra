@@ -132,3 +132,10 @@ require their supported geometry-aware integrators; the Euler convolution path
 does not implement their canonical edge-conductance equations. Multilayer extracellular
 models and concatenated `MultiPopulation` models do not use this scalar Euler
 path.
+
+## Run the complete example
+
+```{code-cell} python
+:load: ../../examples/functional_euler.py
+:tags: [remove-input]
+```

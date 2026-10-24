@@ -148,3 +148,10 @@ not implement their canonical edge-conductance equations. Multilayer
 extracellular and concatenated `MultiPopulation` models do not use this scalar
 path. For two-level Dufort–Frankel integration, see
 {doc}`A53_functional_dufort_frankel`.
+
+## Run the complete example
+
+```{code-cell} python
+:load: ../../examples/functional_runge_kutta.py
+:tags: [remove-input]
+```

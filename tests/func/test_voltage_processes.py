@@ -58,7 +58,9 @@ def _compiler_warnings():
 
 
 def _clone(tree):
-    return pytree.tree_map(lambda value: value.detach().clone(), tree)
+    return pytree.tree_map_only(
+        torch.Tensor, lambda value: value.detach().clone(), tree
+    )
 
 
 def _model(

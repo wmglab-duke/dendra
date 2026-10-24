@@ -1,17 +1,27 @@
 """Scan-local copy lowering and preservation of compiler selection/options."""
 
 from copy import deepcopy
+from itertools import combinations
 
 import pytest
 import torch
 
 from dendra.func._scan_inductor import (
-    _as_strided_copy,
     _compile_scan,
+    _CopyViewLowering,
     _ScanInductorBackend,
-    _select_copy,
-    _slice_copy,
 )
+
+
+def _lowered_copy(operator, value, *arguments):
+    graph = torch.fx.Graph()
+    source = graph.placeholder("value")
+    graph.output(graph.call_function(operator, (source, *arguments)))
+    module = torch.fx.GraphModule({}, graph)
+    _CopyViewLowering()(graph)
+    graph.lint()
+    module.recompile()
+    return module(value)
 
 
 @pytest.mark.parametrize("layout", ["contiguous", "transposed", "expanded", "empty"])
@@ -27,14 +37,14 @@ def test_scan_copy_lowering_preserves_semantics(layout, dtype):
     value = raw.to(dtype)
     before = value.clone()
     cases = [
-        (_select_copy, torch.ops.aten.select_copy.int, (0, -1)),
-        (_slice_copy, torch.ops.aten.slice_copy.Tensor, (-1, None, None, 1)),
-        (_slice_copy, torch.ops.aten.slice_copy.Tensor, (0, 0, 1, 1)),
-        (_slice_copy, torch.ops.aten.slice_copy.Tensor, (1, 0, 3, 2)),
-        (_slice_copy, torch.ops.aten.slice_copy.Tensor, (0, 1, 1, 1)),
+        (torch.ops.aten.select_copy.int, (0, -1)),
+        (torch.ops.aten.slice_copy.Tensor, (-1, None, None, 1)),
+        (torch.ops.aten.slice_copy.Tensor, (0, 0, 1, 1)),
+        (torch.ops.aten.slice_copy.Tensor, (1, 0, 3, 2)),
+        (torch.ops.aten.slice_copy.Tensor, (0, 1, 1, 1)),
     ]
-    for replacement, original, arguments in cases:
-        actual = replacement(value, *arguments)
+    for original, arguments in cases:
+        actual = _lowered_copy(original, value, *arguments)
         expected = original(value, *arguments)
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         assert actual.stride() == expected.stride()
@@ -165,9 +175,12 @@ def test_scan_inductor_owns_decompositions_and_forwards_overrides(monkeypatch):
     assert backend.config["compile_threads"] == 1
     selected = captured["decompositions"]
     assert selected is not shared
-    assert selected[torch.ops.aten.select_copy.int] is _select_copy
-    assert selected[torch.ops.aten.slice_copy.Tensor] is _slice_copy
-    assert selected[torch.ops.aten.as_strided_copy.default] is _as_strided_copy
+    for operator in (
+        torch.ops.aten.select_copy.int,
+        torch.ops.aten.slice_copy.Tensor,
+        torch.ops.aten.as_strided_copy.default,
+    ):
+        assert selected.get(operator) is before.get(operator)
     for operator, decomposition in _inductor_decompositions().items():
         assert selected[operator] is decomposition
     assert shared == before
@@ -182,11 +195,77 @@ def test_scan_inductor_owns_decompositions_and_forwards_overrides(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "container",
+    ["none", "callback", "custom", "inference", "uncached", "list", "tuple"],
+)
+def test_scan_inductor_preserves_user_graph_passes(monkeypatch, container):
+    from torch._inductor import compile_fx as compile_module
+    from torch._inductor import config
+    from torch._inductor.custom_graph_pass import (
+        CustomGraphPass,
+        CustomInferenceAwareGraphPass,
+        get_custom_graph_passes,
+    )
+
+    class Cached(CustomGraphPass):
+        def __call__(self, graph):
+            pass
+
+        def uuid(self):
+            return "user-copy-test"
+
+    class InferenceAware(CustomInferenceAwareGraphPass):
+        def __call__(self, graph, is_inference):
+            pass
+
+        def uuid(self):
+            return "user-inference-test"
+
+    class Uncached(Cached):
+        def uuid(self):
+            return None
+
+    def callback(graph):
+        pass
+
+    custom, inference, uncached = Cached(), InferenceAware(), Uncached()
+    previous = {
+        "none": None,
+        "callback": callback,
+        "custom": custom,
+        "inference": inference,
+        "uncached": uncached,
+        "list": [callback, custom, inference, uncached],
+        "tuple": (inference, custom, callback, uncached),
+    }[container]
+    captured = {}
+
+    def compile_stub(graph, inputs, **kwargs):
+        captured.update(kwargs)
+
+    monkeypatch.setattr(compile_module, "compile_fx", compile_stub)
+    with config.patch(post_grad_custom_post_pass=previous):
+        _ScanInductorBackend(None, {}, False, None)(object(), [])
+        assert config.post_grad_custom_post_pass is previous
+    passes = captured["config_patches"]["post_grad_custom_post_pass"]
+    original = get_custom_graph_passes(previous)
+    assert len(passes) == len(original) + 1
+    assert all(left is right for left, right in zip(passes[:-1], original, strict=True))
+    assert isinstance(passes[-1], _CopyViewLowering)
+    assert passes[-1].uuid() and passes[-1].uuid() == _CopyViewLowering().uuid()
+    assert uncached.uuid() is None
+    assert not isinstance(callback, CustomGraphPass)
+
+
 def test_scan_inductor_real_compiled_copy_gradients():
     def operators(value):
         selected = torch.ops.aten.select_copy.int(value, 0, 1)
         sliced = torch.ops.aten.slice_copy.Tensor(selected, -1, 1, 4, 2)
-        return (sliced.sin() * sliced).sum()
+        storage_view = torch.ops.aten.as_strided_copy.default(
+            selected, (2, 2), (3, 1), 1
+        )
+        return selected, sliced, storage_view
 
     compiled = _compile_scan(
         operators,
@@ -194,15 +273,25 @@ def test_scan_inductor_real_compiled_copy_gradients():
     )
     left = torch.linspace(-0.7, 0.8, 24, dtype=torch.float64).reshape(2, 3, 4)
     left = left.transpose(1, 2).detach().requires_grad_()
+    before = left.detach().clone()
     right = left.detach().clone().requires_grad_()
     actual = compiled(left)
     expected = operators(right)
-    torch.testing.assert_close(actual, expected, rtol=1e-12, atol=1e-12)
-    actual_gradient = torch.autograd.grad(actual, left)[0]
-    expected_gradient = torch.autograd.grad(expected, right)[0]
+    for result, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(result, reference, rtol=0, atol=0)
+        assert result.stride() == reference.stride()
+        assert not torch._C._is_alias_of(result, left)
+    for first, second in combinations(actual, 2):
+        assert not torch._C._is_alias_of(first, second)
+    actual_loss = sum((value.sin() * value).sum() for value in actual)
+    expected_loss = sum((value.sin() * value).sum() for value in expected)
+    actual_gradient = torch.autograd.grad(actual_loss, left)[0]
+    expected_gradient = torch.autograd.grad(expected_loss, right)[0]
     torch.testing.assert_close(
         actual_gradient, expected_gradient, rtol=1e-12, atol=1e-12
     )
+    assert torch.autograd.gradcheck(compiled, (left,), fast_mode=True)
+    torch.testing.assert_close(left, before, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.int64, torch.bool])
@@ -220,7 +309,9 @@ def test_scan_storage_view_copy_preserves_offsets_layouts_and_independent_storag
 ):
     value = torch.arange(32).to(dtype)[4:28].reshape(4, 6)
     before = value.clone()
-    actual = _as_strided_copy(value, size, stride, offset)
+    actual = _lowered_copy(
+        torch.ops.aten.as_strided_copy.default, value, size, stride, offset
+    )
     expected = torch.ops.aten.as_strided_copy.default(value, size, stride, offset)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     assert actual.stride() == expected.stride()
@@ -233,7 +324,9 @@ def test_scan_storage_view_copy_preserves_offsets_layouts_and_independent_storag
 def test_scan_storage_view_copy_preserves_repeated_element_gradients():
     raw = torch.linspace(-1, 1, 32, dtype=torch.float64, requires_grad=True)
     value = raw[4:28].reshape(4, 6)
-    actual = _as_strided_copy(value, (2, 3), (0, 1), 6)
+    actual = _lowered_copy(
+        torch.ops.aten.as_strided_copy.default, value, (2, 3), (0, 1), 6
+    )
     expected = torch.ops.aten.as_strided_copy.default(value, (2, 3), (0, 1), 6)
     weights = torch.arange(1, 7, dtype=torch.float64).reshape(2, 3)
     actual_gradient = torch.autograd.grad((actual * weights).sum(), raw)[0]
