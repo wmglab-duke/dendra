@@ -555,7 +555,8 @@ class PopulationCachePlan:
             )
         from dendra.models.rng import RNGModule, should_restore_rng
 
-        from ._random_parameters import _rng_extra, cache_metadata_tensors
+        from ._random_parameters import cache_metadata_tensors
+        from ._rng_frames import _rng_extra
 
         # Native loading visits registered RNG aliases even when this
         # Population has no RAND/NOISE declarations of its own. Validate every

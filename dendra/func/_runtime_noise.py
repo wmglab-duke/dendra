@@ -476,7 +476,7 @@ class RuntimeNoisePlan:
             _global_rng_snapshot,
             _restore_global_rng,
         )
-        from ._random_parameters import _rng_extra, _rng_values
+        from ._rng_frames import _rng_extra, _rng_values
 
         if steps is not None:
             return self._sample_tape_boundaries(state, steps, samplers=samplers)
@@ -533,7 +533,7 @@ class RuntimeNoisePlan:
                 _pytree.tree_map(lambda *values: torch.stack(values), *draws),
                 _pytree.tree_map(lambda *values: torch.stack(values), *rngs),
             )
-        from ._random_parameters import _rng_values
+        from ._rng_frames import _rng_values
 
         initial_rng = (
             state["random"]["rng"]

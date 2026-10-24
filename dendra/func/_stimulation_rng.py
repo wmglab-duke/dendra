@@ -11,8 +11,8 @@ from torch.utils import _pytree
 from dendra.models.random_parameters import sample_random_parameter_draw
 from dendra.models.rng import RNGModule
 
-from ._random_parameters import _rng_extra, _rng_values
 from ._rng_diagnostics import _rng_diagnostic_scope
+from ._rng_frames import _rng_values, _sampler_from_frame
 from ._types import FunctionalizationError, RuntimeNoiseDraw, StimulationDraw
 
 
@@ -380,7 +380,7 @@ class StimulationRNGPlan:
             {}
             if self.random is None
             else {
-                stream: RNGModule.from_checkpoint(_rng_extra(frame))
+                stream: _sampler_from_frame(frame)
                 for stream, frame in state["random"]["rng"].items()
             }
             if samplers is None

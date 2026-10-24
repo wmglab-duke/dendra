@@ -9,7 +9,7 @@ from torch.utils import _pytree
 
 from dendra.models.rng import RNGModule, should_restore_rng
 
-from ._random_parameters import _rng_extra, _rng_values
+from ._rng_frames import _rng_extra, _rng_values, _sampler_from_frame
 from ._types import FunctionalizationError, RuntimeNoiseDraw
 
 
@@ -190,10 +190,7 @@ class NetworkRNGPlan:
 
     @staticmethod
     def _samplers(pool):
-        return {
-            key: RNGModule.from_checkpoint(_rng_extra(values))
-            for key, values in pool.items()
-        }
+        return {key: _sampler_from_frame(values) for key, values in pool.items()}
 
     def _local_samplers(self, name, samplers):
         return {
@@ -210,7 +207,7 @@ class NetworkRNGPlan:
             return None
         local = self.expand_population(name, state, pool)
         samplers = {
-            stream: RNGModule.from_checkpoint(_rng_extra(pool[canonical]))
+            stream: _sampler_from_frame(pool[canonical])
             for stream, canonical in self.local_streams[name].items()
         }
         return plan._random_plan.sample(local, samplers=samplers)
@@ -255,7 +252,7 @@ class NetworkRNGPlan:
                 for key in {
                     canonical for _path, canonical, _source in self._cache_paths[name]
                 }:
-                    samplers[key] = RNGModule.from_checkpoint(_rng_extra(pool[key]))
+                    samplers[key] = _sampler_from_frame(pool[key])
                 result[name] = None
             elif plan._random_plan is None:
                 result[name] = None
@@ -301,9 +298,7 @@ class NetworkRNGPlan:
                         lambda value: value[_index], provided[name]
                     )
                     for local, canonical in self.local_streams[name].items():
-                        samplers[canonical] = RNGModule.from_checkpoint(
-                            _rng_extra(packet.rng[local])
-                        )
+                        samplers[canonical] = _sampler_from_frame(packet.rng[local])
                 else:
                     packet = plan._noise_plan.sample(
                         state["populations"][name],
