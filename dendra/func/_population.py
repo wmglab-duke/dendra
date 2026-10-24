@@ -17471,7 +17471,7 @@ class FunctionalPopulation:
         return carry, {"v": carry["integrator"]["v"]}
 
     def _resolve_rollout_inputs(self, inputs, steps):
-        """Validate public rollout inputs and resolve their common length."""
+        """Normalize rollout drives and resolve their common time axis."""
         if inputs is None:
             inputs = RolloutInput()
         if not isinstance(inputs, RolloutInput):
@@ -17519,6 +17519,20 @@ class FunctionalPopulation:
         if resolved_steps is None:
             raise ValueError("steps is required when both rollout inputs are None")
         return ve, intra, resolved_steps
+
+    def _resolve_rollout_input_packets(self, inputs, steps):
+        """Resolve a strict rollout and validate the packets it consumes.
+
+        Host schedules use the normalizer separately while stochastic tapes
+        may still be omitted for automatic sampling.
+        """
+        ve, intra, resolved_steps = self._resolve_rollout_inputs(inputs, steps)
+        noise = None if inputs is None else inputs.noise
+        stimulation = None if inputs is None else inputs.stimulation
+        self._validate_noise_draw(noise, steps=resolved_steps)
+        self._validate_stimulation_draw(stimulation, steps=resolved_steps)
+        self._stimulation_rng_plan.validate_packets(noise, stimulation)
+        return RolloutInput(ve, intra, noise, stimulation), resolved_steps
 
     def _execute_rollout_values(
         self,
@@ -17756,12 +17770,8 @@ class FunctionalPopulation:
         callbacks=None,
         callback_state=None,
     ):
-        ve, intra, resolved_steps = self._resolve_rollout_inputs(inputs, steps)
-        noise = None if inputs is None else inputs.noise
-        stimulation = None if inputs is None else inputs.stimulation
-        self._validate_noise_draw(noise, steps=resolved_steps)
-        self._validate_stimulation_draw(stimulation, steps=resolved_steps)
-        self._stimulation_rng_plan.validate_packets(noise, stimulation)
+        resolved, resolved_steps = self._resolve_rollout_input_packets(inputs, steps)
+        ve, intra, noise, stimulation = resolved
         if extra is not None:
             if self._extra.enabled:
                 raise ValueError(

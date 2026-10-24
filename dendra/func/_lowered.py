@@ -83,29 +83,19 @@ class _LoweredPopulationChunk:
         functional._validate_parameters(parameters)
         functional._validate_state(state)
         prepared_values = functional._validate_prepared(prepared, parameters)
-        ve, intra, _resolved_steps = functional._resolve_rollout_inputs(
+        resolved, _resolved_steps = functional._resolve_rollout_input_packets(
             inputs,
             self._steps,
-        )
-        functional._validate_noise_draw(
-            None if inputs is None else inputs.noise, steps=self._steps
-        )
-        functional._validate_stimulation_draw(
-            None if inputs is None else inputs.stimulation, steps=self._steps
-        )
-        functional._stimulation_rng_plan.validate_packets(
-            None if inputs is None else inputs.noise,
-            None if inputs is None else inputs.stimulation,
         )
         return _PopulationChunkOperands(
             parameters,
             prepared_values,
             state,
-            ve,
-            intra,
+            resolved.ve,
+            resolved.intra,
             None,
-            None if inputs is None else inputs.noise,
-            None if inputs is None else inputs.stimulation,
+            resolved.noise,
+            resolved.stimulation,
         )
 
     def __call__(
