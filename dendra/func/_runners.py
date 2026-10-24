@@ -16,8 +16,9 @@ from dendra.models.core import _duration_step_budget, _validate_time_scalar
 
 from ._binding import BoundPopulation
 from ._callbacks import FunctionalCallbackResults, FunctionalCallbacks
-from ._population import FunctionalPopulation, _tensor_binding
+from ._population import FunctionalPopulation
 from ._stimuli import FunctionalExtra, StimulusTensors
+from ._tensor_contracts import _tensor_binding
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
 _StepCallable = Callable[[Mapping[str, object], StepInput], tuple[object, object]]

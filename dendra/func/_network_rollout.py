@@ -21,7 +21,6 @@ from ._execution import (
 from ._netstim import NetStimDraw, NetStimOutputs
 from ._network import _schema, _tensor_paths, _validate_tree
 from ._network_bindings import _canonicalize_mapping_tree
-from ._population import _tensor_tree_binding
 from ._runners import (
     _attach_callback_results,
     _checkpoint_tensor_tree,
@@ -29,6 +28,7 @@ from ._runners import (
     _prepare_callback_collection,
     _validate_chunklength,
 )
+from ._tensor_contracts import _tensor_tree_binding
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
 

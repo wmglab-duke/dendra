@@ -31,6 +31,7 @@ from dendra.models.networks.utils import make_getattr
 
 from ._continuous_transform import ContinuousTransformPlan
 from ._netcon import _effective_tensor, _snapshot, _source_tensor
+from ._tensor_contracts import validate_tensor
 from ._types import FunctionalizationError
 
 
@@ -180,16 +181,7 @@ class FunctionalContinuousCon:
         }
         self._validate_compatible(con)
 
-    @staticmethod
-    def _validate_tensor(value, *, shape, dtype, device, label):
-        if not torch.is_tensor(value):
-            raise TypeError(f"{label} must be a Tensor")
-        if (
-            tuple(value.shape) != shape
-            or value.dtype != dtype
-            or value.device != device
-        ):
-            raise ValueError(f"{label} must match {device}/{dtype}/{shape}")
+    _validate_tensor = staticmethod(validate_tensor)
 
     def _validate_state(self, state):
         if not isinstance(state, Mapping) or set(state) != set(self._state_schema):

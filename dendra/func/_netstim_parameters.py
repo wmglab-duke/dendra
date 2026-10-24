@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass
 
 import torch
 from torch.func import functional_call
@@ -23,6 +22,11 @@ from ._connection_parameters import (
     _registered,
 )
 from ._network_bindings import AliasSnapshots
+from ._prepared_values import (
+    _capture_prepared_values,
+    _validate_prepared_freshness,
+    _validate_prepared_owner,
+)
 from ._torch_parametrizations import (
     canonical_type,
     failures,
@@ -87,16 +91,6 @@ class _MaterializeNetStim(torch.nn.Module):
             dtype=self.dtype,
             device=self.device,
         )
-
-
-@dataclass(frozen=True)
-class _PreparedNetStimParameters:
-    token: object
-    parameter_binding: tuple
-    constant_binding: tuple
-    constants: dict
-    value_binding: tuple
-    values: dict
 
 
 class NetStimParameterPlan:
@@ -457,37 +451,25 @@ class NetStimParameterPlan:
         return result
 
     def prepare(self, parameters, constants):
-        p = _helpers()
-        values = {
-            key: _clone(value)
-            for key, value in self.materialize(parameters, constants).items()
-        }
-        return _PreparedNetStimParameters(
+        values = self.materialize(parameters, constants)
+        return _capture_prepared_values(
             self._token,
-            p._tensor_binding(parameters),
-            p._tensor_binding(constants),
+            parameters,
             constants,
-            p._tensor_tree_binding(values),
             values,
         )
 
     def validate_prepared(self, prepared, parameters):
-        p = _helpers()
-        if (
-            not isinstance(prepared, _PreparedNetStimParameters)
-            or prepared.token is not self._token
-        ):
-            raise FunctionalizationError(
-                "Prepared NetStim parameters belong to another plan."
-            )
-        if (
-            prepared.parameter_binding != p._tensor_binding(parameters)
-            or prepared.constant_binding != p._tensor_binding(prepared.constants)
-            or prepared.value_binding != p._tensor_tree_binding(prepared.values)
-        ):
-            raise FunctionalizationError(
-                "NetStim parameters, constants, or prepared values changed; prepare again."
-            )
+        _validate_prepared_owner(
+            prepared,
+            self._token,
+            message="Prepared NetStim parameters belong to another plan.",
+        )
+        _validate_prepared_freshness(
+            prepared,
+            parameters,
+            message="NetStim parameters, constants, or prepared values changed; prepare again.",
+        )
         return self.materialize(parameters, prepared.constants)
 
     def _audit_sources(self):

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping
-from dataclasses import dataclass
 from types import MethodType
 
 import torch
@@ -22,6 +21,11 @@ from dendra.models.networks.net import (
 from dendra.models.parametric import Bounded, NegativeParam, is_parametric
 
 from ._network_bindings import AliasSnapshots
+from ._prepared_values import (
+    _capture_prepared_values,
+    _validate_prepared_freshness,
+    _validate_prepared_owner,
+)
 from ._types import FunctionalizationError
 
 _ROLES = (("weights", "weight"), ("delays", "delay_ms"))
@@ -170,16 +174,6 @@ class _SampleDraws(torch.nn.Module):
 
     def forward(self, generators=None):
         return self.source.sample_draws(generator=generators)
-
-
-@dataclass(frozen=True)
-class _PreparedConnectionParameters:
-    token: object
-    parameter_binding: tuple
-    constant_binding: tuple
-    constants: dict
-    value_binding: tuple
-    values: dict
 
 
 class ConnectionParameterPlan:
@@ -1056,44 +1050,27 @@ class ConnectionParameterPlan:
         return result
 
     def prepare(self, parameters, constants):
-        p = _helpers()
-        # Prepared values support inspection and freshness checking. Each
-        # consumption builds its own graph from the explicit raw leaves, so
-        # one prepared packet can serve independent backward passes/chunks.
-        values = {
-            name: _clone(value)
-            for name, value in self.materialize(parameters, constants).items()
-        }
-        return _PreparedConnectionParameters(
+        values = self.materialize(parameters, constants)
+        return _capture_prepared_values(
             self._token,
-            p._tensor_binding({key: parameters[key] for key in self._parameter_paths}),
-            p._tensor_binding(constants),
+            parameters,
             constants,
-            p._tensor_tree_binding(values),
             values,
+            parameter_names=self._parameter_paths,
         )
 
     def validate_prepared(self, prepared, parameters):
-        p = _helpers()
         self.validate_source()
-        if (
-            not isinstance(prepared, _PreparedConnectionParameters)
-            or prepared.token is not self._token
-        ):
-            raise FunctionalizationError(
-                "Prepared connection parameters belong to another plan."
-            )
-        if (
-            prepared.parameter_binding
-            != p._tensor_binding(
-                {key: parameters[key] for key in self._parameter_paths}
-            )
-            or prepared.constant_binding != p._tensor_binding(prepared.constants)
-            or prepared.value_binding != p._tensor_tree_binding(prepared.values)
-        ):
-            raise FunctionalizationError(
-                "Connection parameters, constants, or prepared values changed; prepare again."
-            )
+        _validate_prepared_owner(
+            prepared,
+            self._token,
+            message="Prepared connection parameters belong to another plan.",
+        )
+        _validate_prepared_freshness(
+            prepared,
+            {key: parameters[key] for key in self._parameter_paths},
+            message="Connection parameters, constants, or prepared values changed; prepare again.",
+        )
         return self.materialize(parameters, prepared.constants)
 
     def _audit_sources(self):

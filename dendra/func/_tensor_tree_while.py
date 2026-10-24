@@ -22,6 +22,7 @@ from ._hop_inputs import (
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
 )
+from ._tensor_contracts import capture_schema as _schema
 from ._while_inductor import _compile_while
 
 
@@ -30,27 +31,6 @@ def _clone_tree(tree):
         torch.Tensor,
         lambda value: value.clone(memory_format=torch.contiguous_format),
         tree,
-    )
-
-
-def _schema(tree):
-    values, spec = pytree.tree_flatten(tree)
-    return spec, tuple(
-        (
-            tuple(value.shape),
-            value.dtype,
-            value.device,
-            tuple(value.stride()),
-            value.storage_offset(),
-            value.requires_grad,
-            value.is_leaf,
-            value.is_conj(),
-            value.is_neg(),
-            torch.is_inference(value),
-        )
-        if torch.is_tensor(value)
-        else (type(value), value)
-        for value in values
     )
 
 

@@ -25,6 +25,7 @@ from ._scan_compat import (
     install_scan_compatibility,
 )
 from ._scan_inductor import _compile_scan
+from ._tensor_contracts import capture_schema as _schema
 
 
 def _clone_tree(tree):
@@ -73,29 +74,6 @@ def _packed_tensor_scan(
         return layout.pack(updated), emitted
 
     return scan(combine, layout.pack(initial), samples)
-
-
-def _schema(tree):
-    values, spec = pytree.tree_flatten(tree)
-    return spec, tuple(
-        (
-            (
-                tuple(value.shape),
-                value.dtype,
-                value.device,
-                tuple(value.stride()),
-                value.storage_offset(),
-                value.requires_grad,
-                value.is_leaf,
-                value.is_conj(),
-                value.is_neg(),
-                torch.is_inference(value),
-            )
-            if torch.is_tensor(value)
-            else (type(value), value)
-        )
-        for value in values
-    )
 
 
 def _get_path(tree, path):
