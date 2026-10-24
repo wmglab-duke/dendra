@@ -674,13 +674,20 @@ class _FunctionalWaveformBank:
             clone.to(device=device, dtype=dtype)
             from ._poisson_stimulation import configure_execution, randomized_nodes
 
-            randomized_nodes(waveform)
-            for path, source in randomized_nodes(waveform):
+            poisson_nodes = randomized_nodes(waveform)
+            for path, source in poisson_nodes:
                 from ._poisson_stimulation import normalize_schedule
 
                 target = clone.get_submodule(path) if path else clone
                 target._spike_times = normalize_schedule(source, target._spike_times)
-            configure_execution(clone)
+            if poisson_nodes:
+                configure_execution(clone)
+            else:
+                from ._poisson_execution import isolate_waveform_aliases
+
+                # Every explicit alias path must have its own registration
+                # owner so functional_call restores caller operands exactly.
+                isolate_waveform_aliases(clone)
             # Preserve every authored Waveform/module train/eval flag. Only
             # cache-bearing parameter modules use training mode internally so
             # explicit functional leaves remain authoritative and evaluation
@@ -700,15 +707,15 @@ class _FunctionalWaveformBank:
             clones.append(clone)
 
         self._bank = _WaveformBank(clones)
-        template_parameters = dict(self._bank.named_parameters())
-        template_constants = dict(self._bank.named_buffers())
+        template_parameters = dict(self._bank.named_parameters(remove_duplicate=False))
+        template_constants = dict(self._bank.named_buffers(remove_duplicate=False))
         parameter_leaves: list[_BankLeaf] = []
         constant_leaves: list[_BankLeaf] = []
         canonical_parameters: dict[int, str] = {}
         canonical_constants: dict[int, str] = {}
 
         for index, source in enumerate(self._sources):
-            for source_name, value in source.named_parameters():
+            for source_name, value in source.named_parameters(remove_duplicate=False):
                 internal_name = f"waveforms.{index}.{source_name}"
                 if internal_name not in template_parameters:
                     raise FunctionalizationError(
@@ -727,7 +734,7 @@ class _FunctionalWaveformBank:
                         _schema(template_parameters[internal_name]),
                     )
                 )
-            for source_name, value in source.named_buffers():
+            for source_name, value in source.named_buffers(remove_duplicate=False):
                 internal_name = f"waveforms.{index}.{source_name}"
                 if internal_name not in template_constants:
                     raise FunctionalizationError(
@@ -789,7 +796,9 @@ class _FunctionalWaveformBank:
         ):
             for leaf in leaves:
                 waveform = self._sources[leaf.waveform_index]
-                source = dict(getattr(waveform, accessor)())[leaf.source_name]
+                source = dict(getattr(waveform, accessor)(remove_duplicate=False))[
+                    leaf.source_name
+                ]
                 if (
                     leaf.public_name in sources
                     and sources[leaf.public_name] is not source
@@ -805,9 +814,11 @@ class _FunctionalWaveformBank:
         parameters: dict[str, torch.Tensor] = {}
         constants: dict[str, torch.Tensor] = {}
         for leaf in self._parameter_leaves:
-            source = dict(self._sources[leaf.waveform_index].named_parameters())[
-                leaf.source_name
-            ]
+            source = dict(
+                self._sources[leaf.waveform_index].named_parameters(
+                    remove_duplicate=False
+                )
+            )[leaf.source_name]
             # Device/dtype conversion is differentiable and does not mutate the
             # authored source Parameter.  Matching leaves remain the originals.
             parameters[leaf.public_name] = source.to(
@@ -815,9 +826,9 @@ class _FunctionalWaveformBank:
                 dtype=leaf.schema.dtype,
             )
         for leaf in self._constant_leaves:
-            source = dict(self._sources[leaf.waveform_index].named_buffers())[
-                leaf.source_name
-            ]
+            source = dict(
+                self._sources[leaf.waveform_index].named_buffers(remove_duplicate=False)
+            )[leaf.source_name]
             parent, _separator, field = leaf.source_name.rpartition(".")
             from dendra.models.stim.waveform.core import _randomized_poisson
 
@@ -848,6 +859,23 @@ class _FunctionalWaveformBank:
             mapping[leaf.internal_name] = parameters[leaf.public_name]
         for leaf in self._constant_leaves:
             mapping[leaf.internal_name] = constants[leaf.public_name]
+            if leaf.internal_name.endswith("._spike_times"):
+                from dendra.models.stim.waveform._poisson import (
+                    POISSON_INVOCATION_POSITION,
+                    POISSON_INVOCATION_STACK,
+                )
+
+                path = leaf.internal_name.rsplit(".", 1)[0]
+                owner = self._bank.get_submodule(path)
+                if getattr(owner, "_functional_poisson_recipe", False):
+                    stack = constants.get(
+                        leaf.public_name + ".__invocations",
+                        getattr(owner, POISSON_INVOCATION_STACK),
+                    )
+                    mapping[f"{path}.{POISSON_INVOCATION_STACK}"] = stack
+                    mapping[f"{path}.{POISSON_INVOCATION_POSITION}"] = torch.zeros(
+                        (1,), dtype=torch.int64, device=stack.device
+                    )
         return functional_call(
             self._bank,
             mapping,

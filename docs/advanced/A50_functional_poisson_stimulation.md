@@ -11,15 +11,17 @@ kernelspec:
 
 `Waveform.poisson(randomize_every_call=True)` regenerates a schedule whenever
 the waveform is evaluated. Functional Populations and Networks represent that
-randomness as input data: independent uniform draws for one step and the
-generator state after those draws. The numerical transition builds the
-schedule and evaluates the waveform without calling a random generator or
-modifying the source model.
+randomness as input data: independent uniform draws for each waveform
+invocation and the generator state after those draws. The numerical transition
+builds the schedule and evaluates the waveform without calling a random
+generator or modifying the source model.
 
 The complete
 {download}`functional_poisson_stimulation.py <../../examples/functional_poisson_stimulation.py>`
-example compares native values and amplitude gradients, replays an explicit
-draw tape, and continues a compiled rollout. Run it from the repository root
+example evaluates a shared waveform twice, compares native values and amplitude
+gradients, replays an explicit draw tape, and continues a compiled rollout. It
+covers both intracellular stimulation and a mechanism that evaluates its
+injections twice. Run it from the repository root
 with `python examples/functional_poisson_stimulation.py`.
 
 ## Make randomness explicit
@@ -45,7 +47,28 @@ intervals and combines them with `interval`, `start`, `noise`, and `off`.
 It preserves native scalar draw order, including the interval drawn after the
 last emitted event. `noise=0` generates periodic events without consuming
 randomness. Finite schedules use fixed-size tensors; unused event positions
-are masked before waveform evaluation.
+do not contribute to the resulting waveform.
+
+The expression `pulse + pulse` evaluates the same Poisson waveform twice. Each
+evaluation regenerates its schedule, so the two terms receive independent
+draws while sharing the pulse amplitude parameter and generator. Waveform
+arithmetic, `repeat()`, and fixed-count nested Poisson expressions preserve their
+native evaluation order. A mechanism can also evaluate the same registered
+injection more than once in a hook:
+
+```{literalinclude} ../../examples/functional_poisson_stimulation.py
+:language: python
+:start-after: "# region repeated-mechanism"
+:end-before: "# endregion repeated-mechanism"
+```
+
+The two `injection_values` calls evaluate `pulse + pulse` twice, consuming four
+Poisson invocations in total. Its initialization and accepted
+steps have separate invocation profiles. The sampling helpers allocate a
+fixed-size packet for the bound profiles: a waveform with one invocation uses
+an event vector, and a waveform with multiple invocations uses an invocation
+axis before its event axis. A rollout adds the leading time axis. Unused
+invocation slots do not consume randomness.
 
 For the explicit Population API, sample from the incoming state and pass the
 packet in `RolloutInput.stimulation`:
@@ -76,6 +99,8 @@ as `InitializationInput.stimulation`. Intra and extra assembly do not consume
 Poisson draws during initialization. Host runners using
 `initialization="fresh"` supply missing initialization packets, and cached
 initialization follows native restoration and draw rules.
+Native `initial_values` and `derive_buffers` hooks require pure builders;
+randomized waveform evaluation belongs in current hooks such as `assigned_values`.
 
 ## Gradients and compiled execution
 
@@ -111,6 +136,11 @@ stimulation schedule belong to that state; retaining only voltages loses the
 random-stream continuation. Callback state is separate and must also be
 passed when continuing a recording.
 
+After a step, every alias of a shared Poisson waveform retains the schedule
+from its final invocation. Checkpoint continuation needs that latest schedule
+and one generator state per physical stream, rather than the complete history
+of invocation draws.
+
 `commit_state_` restores model-owned intracellular and mechanism stimulation
 when publishing functional state to a native model. Bound `extra` waveforms
 remain external objects, so native commit and the model's native checkpoint
@@ -133,22 +163,29 @@ That call regenerates one schedule for the vector. Repeated native steps and
 functional rollouts regenerate at each step, so the same initial seed need
 not produce the same stimulation as a horizon-level native run.
 
-Functional randomized Poisson schedules require finite `n`. Nested randomized
-Poisson schedules, repeated references to one randomized node within a single
-waveform expression, and invocation paths whose count or order depends on
-runtime values are currently unsupported. Custom outer `Waveform` subclasses
-containing randomized Poisson children are also currently unsupported; compose
-these children using waveform arithmetic or `repeat()`. Custom waveform leaves
-wrapped by `.poisson(...)` are supported. A physical mechanism-owned
-randomized waveform can be evaluated at most once per Population step and
-at most once during that Population's fresh initialization. Multiple local
-evaluations require distinct Poisson wrapper instances; their wrapped
-waveforms can share parameters. Randomized extracellular waveforms must be
-bound through `make_functional(..., extra=...)` or
+Functional randomized Poisson schedules require finite `n` and a fixed
+invocation structure. Supported nested parents include finite `n` with infinite
+`off`, deterministic parents with `noise=0` and finite `off`, and parents with
+`n=1` and finite `off`. An empty parent schedule retains the native single
+infinity sentinel and its child evaluation. Randomized parents with finite
+`off` whose event count changes the number of randomized child evaluations
+are currently unsupported. Invocation paths whose count or order depends on
+runtime values are also currently unsupported.
+
+Nested sampling validates that the draws preserve the bound invocation
+profile. Draws that shorten a parent schedule, such as a zero uniform producing
+an infinite interval, are rejected. This check applies to host sampling and
+explicit draw packets.
+
+Custom outer `Waveform` subclasses containing randomized Poisson children are
+currently unsupported; compose these children using waveform arithmetic or
+`repeat()`. Custom waveform leaves wrapped by `.poisson(...)` are supported.
+Randomized extracellular waveforms must be bound through
+`make_functional(..., extra=...)` or
 `dn.compile(..., extra=...)`; runtime `extra` and standalone public stimulus
 assembly cannot supply the owning RNG carry. Fixed Poisson schedules
-(`randomize_every_call=False`) remain ordinary explicit waveform data and do
-not require a stimulation draw tape.
+(`randomize_every_call=False`) without randomized descendants remain ordinary
+explicit waveform data and do not require a stimulation draw tape.
 
 A Poisson generator can be shared with other Poisson waveforms across
 Populations. Sharing the default Torch generator with connection sampling is

@@ -9,8 +9,12 @@ from dendra.models.parametric import SimpleParameterized
 
 from ._gates import _rect_gate
 from ._poisson import (
+    POISSON_EVENT_SLOTS,
+    POISSON_INVOCATION_POSITION,
+    POISSON_INVOCATION_STACK,
     evaluate_poisson_schedule,
     poisson_interval_from_uniform,
+    poisson_invocation_schedule,
     poisson_schedule_from_draws,
     restore_pending_poisson_rng,
     sample_poisson_draws,
@@ -690,7 +694,16 @@ class _poisson(Waveform):
         # Evaluate each onset independently so the spike axis can never alias a
         # population, compartment, oscillator-component, or other leading axis
         # of the wrapped waveform merely because their lengths happen to match.
-        return evaluate_poisson_schedule(self.waveform.fn, t, self._spike_times)
+        schedule = self._spike_times
+        invocations = getattr(self, POISSON_INVOCATION_STACK, None)
+        if invocations is not None and invocations.shape[0]:
+            position = getattr(self, POISSON_INVOCATION_POSITION)
+            schedule, following = poisson_invocation_schedule(invocations, position)
+            position.copy_(following)
+        event_slots = getattr(self, POISSON_EVENT_SLOTS, None)
+        if event_slots is not None:
+            schedule = schedule[:event_slots]
+        return evaluate_poisson_schedule(self.waveform.fn, t, schedule)
 
     def __repr__(self):
         return f"Poisson({self.waveform}, interval={self.interval}, noise={self.noise})"

@@ -10,6 +10,51 @@ from collections.abc import Mapping
 
 import torch
 
+POISSON_INVOCATION_STACK = "_poisson_invocation_stack"
+POISSON_INVOCATION_POSITION = "_poisson_invocation_position"
+POISSON_EVENT_SLOTS = "_poisson_event_slots"
+
+
+def poisson_invocation_schedule(schedules, position):
+    """Select one invocation and return its next explicit position.
+
+    The position is a one-element integer tensor.  Copying that index keeps
+    autograd's saved index independent of any caller-owned scratch update.
+    Neither input is mutated, and the returned position has no persistent
+    ownership or random-number-generator state.
+    """
+    selected = torch.index_select(schedules, 0, position.clone()).squeeze(0)
+    return selected, position + 1
+
+
+def configure_poisson_invocations(module, *, event_slots=None):
+    """Install invocation operands on an isolated waveform execution copy.
+
+    The schedule stack defaults to an empty tensor so cold profiling and snapshot
+    evaluation retain the ordinary fixed-schedule path.  An execution adapter
+    supplies the stack and a fresh position tensor for each evaluation.  These
+    scratch buffers never become part of native checkpoints.
+
+    ``event_slots`` can retain a statically known native schedule length when
+    an execution adapter pads the schedule.  The empty-schedule infinity
+    sentinel occupies one event slot.
+    """
+    if event_slots is not None and (type(event_slots) is not int or event_slots < 1):
+        raise ValueError("Poisson event slots must be a positive integer or None.")
+    if POISSON_INVOCATION_STACK not in module._buffers:
+        module.register_buffer(
+            POISSON_INVOCATION_STACK,
+            module._spike_times.new_empty((0, *module._spike_times.shape)),
+            persistent=False,
+        )
+    if POISSON_INVOCATION_POSITION not in module._buffers:
+        module.register_buffer(
+            POISSON_INVOCATION_POSITION,
+            torch.zeros((1,), dtype=torch.int64, device=module._spike_times.device),
+            persistent=False,
+        )
+    setattr(module, POISSON_EVENT_SLOTS, event_slots)
+
 
 def poisson_interval_from_uniform(draw, *, interval, noise):
     """Return a detached float64 interval with native scalar arithmetic.
@@ -47,6 +92,27 @@ def poisson_schedule_from_draws(
         onsets.append(torch.where(active, current, torch.inf))
         current = current + delta
     return torch.stack(onsets).to(device=device, dtype=dtype).detach()
+
+
+def poisson_invocation_event_count(draws, *, interval, start, noise, off):
+    """Return the native child-call count for one invocation's uniform draws.
+
+    Native schedule construction stops on its float64 clock before converting
+    onsets to the waveform dtype. Counting in that clock's dtype distinguishes
+    a genuinely terminated schedule from finite onsets which overflow during
+    a float32 conversion. An empty schedule still invokes its child once for
+    the infinity sentinel.
+    """
+    schedule = poisson_schedule_from_draws(
+        draws,
+        interval=interval,
+        start=start,
+        noise=noise,
+        off=off,
+        dtype=torch.float64,
+        device=draws.device,
+    )
+    return torch.isfinite(schedule).sum().clamp_min(1)
 
 
 def sample_poisson_draws(*, interval, n, start, noise, off, generator, dtype=None):

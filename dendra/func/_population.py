@@ -16836,6 +16836,15 @@ class FunctionalPopulation:
     def _stimulus_values(plan, parameters):
         stimulus_parameters = {name: parameters[name] for name in plan.parameter_names}
         stimulus_constants = {name: parameters[name] for name in plan.constant_names}
+        # Per-call stacks accompany their registered schedule leaves without
+        # becoming part of the public parameter or checkpoint schema.
+        stimulus_constants.update(
+            {
+                name + ".__invocations": parameters[name + ".__invocations"]
+                for name in plan.constant_names
+                if name + ".__invocations" in parameters
+            }
+        )
         return stimulus_parameters, stimulus_constants
 
     def _stimulation_times(self, state, steps: int, dt=None) -> torch.Tensor:
@@ -17592,7 +17601,7 @@ class FunctionalPopulation:
             callback_state = callbacks._validate_state(callback_state)
 
         # Deterministic bound stimulation is evaluated for the complete horizon.
-        # Explicit Poisson packets preserve one invocation per accepted step.
+        # Explicit Poisson packets preserve native invocation ordering per step.
         if stimulation is None:
             ve, intra = self._assemble_bound_inputs(
                 parameters,

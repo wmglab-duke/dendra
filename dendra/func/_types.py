@@ -33,7 +33,13 @@ class RuntimeNoiseDraw(NamedTuple):
 
 
 class StimulationDraw(NamedTuple):
-    """Detached Poisson draws and resulting generator-state bytes."""
+    """Detached Poisson draws and resulting generator-state bytes.
+
+    Each registration uses an event vector for one invocation, or an
+    invocation-by-event matrix for a repeated evaluation. Rollout packets
+    prepend the timestep axis. Sampling helpers supply the fixed schema
+    bound by the Population or Network's initialization and runtime profiles.
+    """
 
     draws: dict[str, torch.Tensor]
     rng: dict[str, torch.Tensor]

@@ -6,6 +6,7 @@ from __future__ import annotations
 import torch
 
 import dendra as dn
+from dendra.models.mechanisms import Mechanism
 from dendra.models.mod import pas
 from dendra.units import nA
 
@@ -14,7 +15,34 @@ STEPS = 8
 DTYPE = torch.float64
 
 
-def make_population():
+# region repeated-mechanism
+class TwiceDrivenLeak(Mechanism):
+    Mechanism.RANGE(g=0.001, e=-65.0, gain=0.002)
+    Mechanism.ASSIGNED("i_inj")
+    Mechanism.NONSPECIFIC_CURRENT("i")
+    Mechanism.AFFINE("i")
+
+    def inject(self, waveform, *, index=None, model_shape=None, model=None, **kwargs):
+        del kwargs
+        return self.register_waveform_injection(
+            waveform, index=index, model_shape=model_shape, model=model
+        )
+
+    def assigned_values(self, v, values):
+        del values
+        first = self.injection_values(v, t=self.t)
+        second = self.injection_values(v, t=self.t)
+        return {"i_inj": first + 0.25 * second}
+
+    def i_affine_terms(self, v):
+        del v
+        return self.g, self.g * self.e + self.gain * self.i_inj
+
+
+# endregion repeated-mechanism
+
+
+def make_population(*, mechanism=False):
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, IMEM=False, DTYPE=DTYPE, DEVICE="cpu"):
         population = dn.Unmyelinated(
             [2.0],
@@ -24,9 +52,9 @@ def make_population():
             dtype=DTYPE,
             integrator=dn.bwd_euler_ub(method="pcr", imem=False),
         )
-        population.insert(pas, g=0.001, e=-65.0)
+        population.insert(TwiceDrivenLeak if mechanism else pas, g=0.001, e=-65.0)
         # region waveform
-        waveform = dn.mono_rect(amp=0.2 * nA, pw=0.045).poisson(
+        pulse = dn.mono_rect(amp=0.2 if mechanism else 0.2 * nA, pw=0.045).poisson(
             interval=0.055,
             n=5,
             start=-0.035,
@@ -34,17 +62,18 @@ def make_population():
             randomize_every_call=True,
             generator=torch.Generator().manual_seed(17),
         )
+        waveform = pulse + pulse
         population[:, 1].inject(waveform)
         # endregion waveform
         population.train()
         population.initialize()
         population.detach()
-    return population, waveform
+    return population, pulse
 
 
-def run_demo():
-    population, waveform = make_population()
-    native, native_waveform = make_population()
+def run_demo(*, mechanism=False):
+    population, waveform = make_population(mechanism=mechanism)
+    native, native_waveform = make_population(mechanism=mechanism)
     source_rng = waveform.generator.get_state().clone()
     global_rng = torch.get_rng_state().clone()
     # region explicit-draws
@@ -106,11 +135,14 @@ def run_demo():
     torch.testing.assert_close(torch.get_rng_state(), global_rng)
     torch.testing.assert_close(prefix["integrator"]["v"], final["integrator"]["v"])
     assert torch.isfinite(continued["integrator"]["v"]).all()
+    owner = "Mechanism" if mechanism else "Intracellular"
     print(
-        "Explicit Poisson replay, gradients, compiled continuation, and RNG isolation passed."
+        f"{owner} Poisson invocations: replay, gradients, compiled continuation, "
+        "and RNG isolation passed."
     )
 
 
 if __name__ == "__main__":
     torch.set_num_threads(1)
     run_demo()
+    run_demo(mechanism=True)

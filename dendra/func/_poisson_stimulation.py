@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass
 
@@ -41,10 +42,9 @@ def normalize_schedule(module, raw, *, dtype=None, device=None):
 
 
 def randomized_nodes(waveform):
-    """Visit invocation paths, retaining independent registration occurrences."""
-    seen = set()
+    """Visit authored registration paths, including shared physical nodes."""
 
-    def visit(module, path, poisson_parent=False):
+    def visit(module, path):
         canonical = (
             _randomized_poisson,
             _poisson,
@@ -69,28 +69,105 @@ def randomized_nodes(waveform):
                 raise FunctionalizationError(
                     "Functional randomized Poisson stimulation requires finite n."
                 )
-            if poisson_parent or id(module) in seen:
-                raise FunctionalizationError(
-                    "Nested or repeatedly referenced randomized Poisson waveforms "
-                    "within one expression are currently unsupported."
-                )
-            seen.add(id(module))
             yield path, module
+        if isinstance(module, _poisson) and any(
+            type(child) is _randomized_poisson for child in module.waveform.modules()
+        ):
+            poisson_event_slots(module)
         for name, child in module._modules.items():
             if child is not None:
                 yield from visit(
                     child,
                     f"{path}.{name}" if path else name,
-                    poisson_parent or isinstance(module, _poisson),
                 )
 
     return tuple(visit(waveform, ""))
 
 
+def poisson_event_slots(module):
+    """Resolve the fixed native loop width around randomized descendants."""
+    if type(module) is _randomized_poisson:
+        if module.n is None:
+            raise FunctionalizationError(
+                "Functional randomized Poisson requires finite n."
+            )
+        if module.n == 0 or module.start >= module.off:
+            return 1  # Native empty schedules still evaluate one infinity sentinel.
+        if module.n == 1:
+            return 1  # The interval drawn after the only event cannot add a slot.
+        if module.noise == 0.0:
+            _, count = sample_poisson_draws(
+                interval=module.interval,
+                n=module.n,
+                start=module.start,
+                noise=module.noise,
+                off=module.off,
+                generator=torch.Generator(device=module.generator.device),
+            )
+            return max(count, 1)
+        if module.off == float("inf"):
+            return module.n
+        raise FunctionalizationError(
+            "Nested randomized Poisson invocation counts depending on random draws "
+            "are currently unsupported; use a fixed outer count or noise=0."
+        )
+    return int(module._spike_times.shape[0])
+
+
+def randomized_invocations(waveform):
+    """Unfold canonical waveform calls in their native evaluation order."""
+    result = []
+
+    def visit(module, path):
+        if type(module) is _randomized_poisson:
+            result.append(path)
+        if isinstance(module, _poisson):
+            if any(
+                type(child) is _randomized_poisson
+                for child in module.waveform.modules()
+            ):
+                for _ in range(poisson_event_slots(module)):
+                    visit(module.waveform, f"{path}.waveform" if path else "waveform")
+        elif type(module) in (Sum, Product):
+            for index, child in enumerate(module.waveforms):
+                visit(child, f"{path + '.' if path else ''}waveforms.{index}")
+        elif type(module) is Reciprocal:
+            visit(module.wf, f"{path}.wf" if path else "wf")
+        elif type(module) is _repeat:
+            visit(module.waveform, f"{path}.waveform" if path else "waveform")
+
+    visit(waveform, "")
+    return tuple(result)
+
+
 def configure_execution(module):
     """Remove RNG dispatch only from an isolated execution module."""
+    from dendra.models.stim.waveform._poisson import configure_poisson_invocations
+
+    from ._poisson_execution import isolate_waveform_aliases
+
+    if not any(
+        type(child) is _randomized_poisson
+        or getattr(child, "_functional_poisson_recipe", False)
+        for child in module.modules()
+    ):
+        return
+    isolate_waveform_aliases(module)
     for child in module.modules():
+        if (
+            isinstance(child, _poisson)
+            and not hasattr(child, "_poisson_event_slots")
+            and any(
+                type(descendant) is _randomized_poisson
+                or getattr(descendant, "_functional_poisson_recipe", False)
+                for descendant in child.waveform.modules()
+            )
+        ):
+            child._poisson_event_slots = poisson_event_slots(child)
         if type(child) is _randomized_poisson:
+            configure_poisson_invocations(
+                child, event_slots=getattr(child, "_poisson_event_slots", None)
+            )
             child._functional_poisson_recipe = True
             child.__class__ = _poisson
 
@@ -154,12 +231,13 @@ class PoissonStimulationPlan:
     def __init__(self, functional):
         self.functional = functional
         self.population = functional._population
-        entries, streams, identities = [], {}, {}
+        entries, streams, identities, bank_calls = [], {}, {}, []
         # Native step evaluates extracellular contacts before intracellular
         # injections, then enters mechanism evaluation.
         for kind, plan in (("extra", functional._extra), ("intra", functional._intra)):
             bank = plan._waveforms
             for index, waveform in enumerate(bank._sources):
+                local_entries = {}
                 for path, source in randomized_nodes(waveform):
                     relative = f"{path + '.' if path else ''}_spike_times"
                     parameter = bank._public_name(index, relative)
@@ -181,6 +259,10 @@ class PoissonStimulationPlan:
                             path,
                         )
                     )
+                    local_entries[path] = entries[-1]
+                bank_calls.extend(
+                    local_entries[path] for path in randomized_invocations(waveform)
+                )
         from ._mechanism_injections import mechanism_injection_owners
 
         for owner_path, owner in mechanism_injection_owners(self.population):
@@ -206,6 +288,14 @@ class PoissonStimulationPlan:
                         )
                     )
         self.entries, self.streams = tuple(entries), streams
+        self._event_slots = {
+            entry.key: poisson_event_slots(entry.source)
+            for entry in entries
+            if any(
+                type(child) is _randomized_poisson
+                for child in entry.source.waveform.modules()
+            )
+        }
         self.enabled = bool(entries)
         self.has_initialization = any(entry.kind == "mechanism" for entry in entries)
         self._runtime_keys = frozenset(entry.key for entry in self.entries)
@@ -216,6 +306,9 @@ class PoissonStimulationPlan:
         self._initialization_entries = tuple(
             entry for entry in self.entries if entry.kind == "mechanism"
         )
+        self._bank_entries = tuple(bank_calls)
+        self._runtime_entries = self._bank_entries + self._initialization_entries
+        self._set_capacities()
         self.draw_dtype = torch.get_default_dtype()
         self._aliases = _alias_signature(entry.source for entry in self.entries)
         self._rng_shapes = {
@@ -227,19 +320,16 @@ class PoissonStimulationPlan:
     def set_invocation_profile(
         self, *, runtime, initialization, runtime_order=None, initialization_order=None
     ):
-        """Freeze the admitted zero-or-one call profile of mechanism hooks."""
+        """Freeze each execution phase's ordered invocation recipe."""
         mechanism = {entry.key for entry in self.entries if entry.kind == "mechanism"}
         if set(runtime) != mechanism or set(initialization) != mechanism:
             raise FunctionalizationError(
                 "Poisson mechanism invocation profiles changed registration keys."
             )
         for profile in (runtime, initialization):
-            if any(
-                type(value) is not int or value not in (0, 1)
-                for value in profile.values()
-            ):
+            if any(type(value) is not int or value < 0 for value in profile.values()):
                 raise FunctionalizationError(
-                    "A registered Poisson waveform may be evaluated at most once per mechanism phase."
+                    "Poisson invocation counts must be non-negative integers."
                 )
         self._runtime_keys = frozenset(
             {entry.key for entry in self.entries if entry.kind != "mechanism"}
@@ -255,21 +345,63 @@ class PoissonStimulationPlan:
             (runtime, runtime_order),
             (initialization, initialization_order),
         ):
-            expected = {key for key, count in profile.items() if count}
             if order is None:
                 order = tuple(
-                    entry.key for entry in self.entries if entry.key in expected
+                    entry.key
+                    for entry in self.entries
+                    for _ in range(profile.get(entry.key, 0))
                 )
-            if len(order) != len(expected) or set(order) != expected:
+            if Counter(order) != Counter(
+                {key: count for key, count in profile.items() if count}
+            ):
                 raise FunctionalizationError(
                     "Poisson mechanism invocation order does not match its active registrations."
                 )
             orders.append(tuple(by_key[key] for key in order))
-        self._runtime_entries = (
-            tuple(entry for entry in self.entries if entry.kind != "mechanism")
-            + orders[0]
-        )
+        self._runtime_entries = self._bank_entries + orders[0]
         self._initialization_entries = orders[1]
+        self._set_capacities()
+
+    def _set_capacities(self):
+        runtime = Counter(entry.key for entry in self._runtime_entries)
+        initialization = Counter(entry.key for entry in self._initialization_entries)
+        self._runtime_counts = {entry.key: runtime[entry.key] for entry in self.entries}
+        self._initialization_counts = {
+            entry.key: initialization[entry.key] for entry in self.entries
+        }
+        self._capacities = {
+            entry.key: max(runtime[entry.key], initialization[entry.key], 1)
+            for entry in self.entries
+        }
+
+    def _draw_shape(self, entry):
+        count = self._capacities[entry.key]
+        return (entry.source.n,) if count == 1 else (count, entry.source.n)
+
+    def _assign_draw(self, draws, entry, index, value):
+        if self._capacities[entry.key] == 1:
+            draws[entry.key] = value.detach().clone()
+        else:
+            draws[entry.key][index] = value.detach()
+
+    def _sample_entry(self, entry, generator):
+        source = entry.source
+        draw, count = sample_poisson_draws(
+            interval=source.interval,
+            n=source.n,
+            start=source.start,
+            noise=source.noise,
+            off=source.off,
+            generator=generator,
+            dtype=self.draw_dtype,
+        )
+        expected = self._event_slots.get(entry.key)
+        if expected is not None and max(count, 1) != expected:
+            raise FunctionalizationError(
+                "Poisson draws change the fixed nested invocation count; "
+                "draw-dependent invocation counts are currently unsupported."
+            )
+        return draw
 
     def _entries_for_phase(self, kind, *, initialization=False):
         entries = (
@@ -359,18 +491,11 @@ class PoissonStimulationPlan:
         """Sample mechanism-owned initialization calls without drawing bank stimuli."""
         samplers = self._samplers(state, samplers)
         draws = self._placeholder_draws()
+        positions = Counter()
         for entry in self._initialization_entries:
-            source = entry.source
-            draw, _ = sample_poisson_draws(
-                interval=source.interval,
-                n=source.n,
-                start=source.start,
-                noise=source.noise,
-                off=source.off,
-                generator=samplers[entry.stream],
-                dtype=self.draw_dtype,
-            )
-            draws[entry.key] = draw.detach().clone()
+            draw = self._sample_entry(entry, samplers[entry.stream])
+            self._assign_draw(draws, entry, positions[entry.key], draw)
+            positions[entry.key] += 1
         return StimulationDraw(
             draws,
             {
@@ -380,12 +505,14 @@ class PoissonStimulationPlan:
         )
 
     def initialization_mapping(self, packet):
-        return self._schedule_mapping(self.schedules(packet), self._initialization_keys)
+        return self._schedule_mapping(
+            self.schedules(packet, initialization=True), self._initialization_keys
+        )
 
     def _placeholder_draws(self):
         return {
             entry.key: torch.full(
-                (entry.source.n,),
+                self._draw_shape(entry),
                 0.5,
                 dtype=self.draw_dtype,
                 device=self.streams[entry.stream].device,
@@ -408,7 +535,7 @@ class PoissonStimulationPlan:
             return StimulationDraw(
                 {
                     entry.key: torch.empty(
-                        (0, entry.source.n),
+                        (0, *self._draw_shape(entry)),
                         dtype=self.draw_dtype,
                         device=self.streams[entry.stream].device,
                     )
@@ -421,18 +548,11 @@ class PoissonStimulationPlan:
             )
         samplers = self._samplers(state, samplers)
         draws = self._placeholder_draws()
+        positions = Counter()
         for entry in self._runtime_entries:
-            source = entry.source
-            draw, _count = sample_poisson_draws(
-                interval=source.interval,
-                n=source.n,
-                start=source.start,
-                noise=source.noise,
-                off=source.off,
-                generator=samplers[entry.stream],
-                dtype=self.draw_dtype,
-            )
-            draws[entry.key] = draw.detach().clone()
+            draw = self._sample_entry(entry, samplers[entry.stream])
+            self._assign_draw(draws, entry, positions[entry.key], draw)
+            positions[entry.key] += 1
         return StimulationDraw(
             draws,
             {key: generator.get_state().clone() for key, generator in samplers.items()},
@@ -476,7 +596,9 @@ class PoissonStimulationPlan:
             )
         for entry in self.entries:
             value = packet.draws[entry.key]
-            shape = (entry.source.n,) if steps is None else (steps, entry.source.n)
+            shape = self._draw_shape(entry)
+            if steps is not None:
+                shape = (steps, *shape)
             if (
                 not torch.is_tensor(value)
                 or tuple(value.shape) != shape
@@ -527,29 +649,79 @@ class PoissonStimulationPlan:
                         "Shared Poisson waveform aliases have different latest schedules."
                     )
 
-    def schedules(self, packet):
+    def schedules(self, packet, *, initialization=False):
         result = {}
+        counts = self._initialization_counts if initialization else self._runtime_counts
         for entry in self.entries:
             source = entry.source
-            result[entry.key] = poisson_schedule_from_draws(
-                packet.draws[entry.key].detach(),
-                interval=source.interval,
-                start=source.start,
-                noise=source.noise,
-                off=source.off,
-                dtype=entry.dtype,
-                device=entry.device,
+            draws = packet.draws[entry.key].detach()
+            if self._capacities[entry.key] == 1:
+                draws = draws.unsqueeze(0)
+            if entry.key in self._event_slots and counts[entry.key]:
+                self._check_event_slots(entry, draws[: counts[entry.key]])
+            result[entry.key] = torch.stack(
+                [
+                    poisson_schedule_from_draws(
+                        draw,
+                        interval=source.interval,
+                        start=source.start,
+                        noise=source.noise,
+                        off=source.off,
+                        dtype=entry.dtype,
+                        device=entry.device,
+                    )
+                    for draw in draws.unbind(0)
+                ]
             )
         return result
+
+    def _check_event_slots(self, entry, draws):
+        from dendra.models.stim.waveform._poisson import poisson_invocation_event_count
+
+        source = entry.source
+        valid = torch.stack(
+            [
+                poisson_invocation_event_count(
+                    draw,
+                    interval=source.interval,
+                    start=source.start,
+                    noise=source.noise,
+                    off=source.off,
+                )
+                == self._event_slots[entry.key]
+                for draw in draws.unbind(0)
+            ]
+        ).all()
+        message = (
+            "Poisson draws change the fixed nested invocation count; "
+            "draw-dependent invocation counts are currently unsupported."
+        )
+        if torch.compiler.is_compiling():
+            torch._assert_async(valid, message)
+        elif torch._C._are_functorch_transforms_active():
+            functorch = torch._C._functorch
+            while functorch.is_functorch_wrapped_tensor(valid):
+                valid = functorch.get_unwrapped(valid)
+            torch._assert_async(valid.all(), message)
+        elif not _cold_validation():
+            # Scan and while bodies use make_fx before Dynamo compilation.
+            # Keep the predicate in that graph rather than reading a scalar.
+            torch._assert_async(valid, message)
+        elif not bool(valid):
+            raise FunctionalizationError(message)
 
     def parameters(self, parameters, packet):
         result = dict(parameters)
         schedules = self.schedules(packet)
         for entry in self.entries:
             if entry.kind != "mechanism":
-                value = schedules[entry.key]
+                stack = schedules[entry.key]
+                value = stack[0]
                 result[entry.parameter] = value.reshape(
                     value.shape + (1,) * entry.source._spike_time_trailing_dims
+                )
+                result[entry.parameter + ".__invocations"] = stack.reshape(
+                    stack.shape + (1,) * entry.source._spike_time_trailing_dims
                 )
         return result
 
@@ -557,14 +729,26 @@ class PoissonStimulationPlan:
         return self._schedule_mapping(self.schedules(packet), self._runtime_keys)
 
     def _schedule_mapping(self, schedules, active):
-        return {
-            entry.mapping: schedules[entry.key].reshape(
-                schedules[entry.key].shape
-                + (1,) * entry.source._spike_time_trailing_dims
+        from dendra.models.stim.waveform._poisson import (
+            POISSON_INVOCATION_POSITION,
+            POISSON_INVOCATION_STACK,
+        )
+
+        result = {}
+        for entry in self.entries:
+            if entry.mapping is None or entry.key not in active:
+                continue
+            stack = schedules[entry.key]
+            stack = stack.reshape(
+                stack.shape + (1,) * entry.source._spike_time_trailing_dims
             )
-            for entry in self.entries
-            if entry.mapping is not None and entry.key in active
-        }
+            owner = entry.mapping.rsplit(".", 1)[0]
+            result[entry.mapping] = stack[0]
+            result[f"{owner}.{POISSON_INVOCATION_STACK}"] = stack
+            result[f"{owner}.{POISSON_INVOCATION_POSITION}"] = torch.zeros(
+                (1,), dtype=torch.int64, device=stack.device
+            )
+        return result
 
     def state_mapping(self, state):
         """Bind snapshot or carried mechanism schedules without drawing randomness."""
@@ -580,12 +764,14 @@ class PoissonStimulationPlan:
     def advance(self, state, packet, *, tape=False, initialization=False):
         if tape:
             packet = _pytree.tree_map(lambda value: value[-1], packet)
-        schedules = self.schedules(packet)
+        schedules = self.schedules(packet, initialization=initialization)
         latest = {}
-        active = self._initialization_keys if initialization else self._runtime_keys
-        for entry in self.entries:
-            if entry.key in active:
-                latest[id(entry.source)] = schedules[entry.key]
+        positions = Counter()
+        for entry in (
+            self._initialization_entries if initialization else self._runtime_entries
+        ):
+            latest[id(entry.source)] = schedules[entry.key][positions[entry.key]]
+            positions[entry.key] += 1
         return {
             "rng": {name: value.detach().clone() for name, value in packet.rng.items()},
             "schedules": {
@@ -864,18 +1050,11 @@ class NetworkStimulationPlan:
         packets = {name: [] for name in self.plans if name not in provided}
         for index in range(steps):
             draws = {
-                name: {
-                    entry.key: torch.full(
-                        (entry.source.n,),
-                        0.5,
-                        dtype=plan.draw_dtype,
-                        device=self.streams[self.local[name][entry.stream]].device,
-                    )
-                    for entry in plan.entries
-                }
+                name: plan._placeholder_draws()
                 for name, plan in self.plans.items()
                 if name in packets
             }
+            positions = {name: Counter() for name in packets}
             for kind in ("extra", "intra", "mechanism"):
                 for name in self._ordered_names(kind):
                     plan = self.plans[name]
@@ -883,17 +1062,11 @@ class NetworkStimulationPlan:
                         continue
                     for entry in plan._entries_for_phase(kind):
                         canonical = self.local[name][entry.stream]
-                        source = entry.source
-                        value, _count = sample_poisson_draws(
-                            interval=source.interval,
-                            n=source.n,
-                            start=source.start,
-                            noise=source.noise,
-                            off=source.off,
-                            generator=samplers[canonical],
-                            dtype=plan.draw_dtype,
+                        value = plan._sample_entry(entry, samplers[canonical])
+                        plan._assign_draw(
+                            draws[name], entry, positions[name][entry.key], value
                         )
-                        draws[name][entry.key] = value.detach().clone()
+                        positions[name][entry.key] += 1
             for name in packets:
                 packets[name].append(
                     StimulationDraw(

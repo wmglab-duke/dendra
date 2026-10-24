@@ -150,8 +150,16 @@ def mechanism_injection_constant_slots(owner):
     if waveforms is not None:
         for name, value in waveforms.named_buffers(remove_duplicate=False):
             parent, _separator, field = name.rpartition(".")
+            from dendra.models.stim.waveform._poisson import (
+                POISSON_INVOCATION_POSITION,
+                POISSON_INVOCATION_STACK,
+            )
             from dendra.models.stim.waveform.core import _randomized_poisson
 
+            if getattr(
+                waveforms.get_submodule(parent), "_functional_poisson_recipe", False
+            ) and field in (POISSON_INVOCATION_STACK, POISSON_INVOCATION_POSITION):
+                continue  # Per-call operands are not authored model constants.
             if field == "_spike_times" and (
                 type(waveforms.get_submodule(parent)) is _randomized_poisson
                 or getattr(

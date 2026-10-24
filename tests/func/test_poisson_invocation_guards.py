@@ -6,11 +6,19 @@ import torch
 import dendra as dn
 from dendra.models.mechanisms import Mechanism
 from dendra.models.stim.waveform.core import Waveform
+from dendra.units import nA
 from tests.func.test_mechanism_injection_execution import (
     _InjectedLeak,
     _NamedInjectedLeak,
 )
-from tests.func.test_poisson_stimulation import DT, DTYPE, _waveform
+from tests.func.test_poisson_stimulation import (
+    DT,
+    DTYPE,
+    _clone,
+    _close,
+    _population,
+    _waveform,
+)
 
 pytestmark = pytest.mark.cpu
 
@@ -99,27 +107,154 @@ def _case(mechanism, *, waveform=None):
     "mechanism", (_RepeatedAssigned, _NamedInjectedLeak, _RepeatedInitializer)
 )
 @pytest.mark.parametrize("diagnostic", (False, True))
-def test_repeated_poisson_evaluation_rejects_without_mutating_source(
+def test_repeated_poisson_evaluation_matches_native_without_mutating_source(
     mechanism, diagnostic
 ):
     population, waveform = _case(mechanism)
+    native, _ = _case(mechanism)
     generator = waveform.generator.get_state().clone()
     global_rng = torch.get_rng_state().clone()
     voltage = population.v.detach().clone()
     schedule = waveform._spike_times.detach().clone()
-    with (
-        dn.ctx(CHECK_PURITY=diagnostic),
-        pytest.raises(
-            dn.func.FunctionalizationError, match="Multiple evaluations.*Poisson"
-        ),
-    ):
-        dn.func.make_functional(population, dt=DT)
+    with dn.ctx(CHECK_PURITY=diagnostic):
+        functional, tensors = dn.func.make_functional(population, dt=DT)
+        frozen = _clone(tensors)
+        parameters, constants, state = tensors[:3]
+        if mechanism is not _RepeatedInitializer:
+            initialization = tensors.initialization._replace(
+                stimulation=functional.sample_stimulation_initialization_draw(state)
+            )
+            initialized = functional.initialize(
+                parameters, constants, initialization, state=state
+            )
+            native.initialize()
+            _close(initialized.state, functional.extract(native).state)
+            parameters, constants, state = initialized[:3]
+        # Native initial_values builders reject implicit RNG consumption. The
+        # initializer-only case starts from its valid fixed-schedule snapshot;
+        # its accepted steps can evaluate the randomized current normally.
+        prepared = functional.prepare(parameters, constants)
+        for _ in range(3):
+            packet = functional.sample_stimulation_draw(state)
+            state, _ = functional.step(
+                parameters,
+                prepared,
+                state,
+                dn.func.StepInput(stimulation=packet),
+            )
+            native.step(dt=DT)
+            _close(state, functional.extract(native).state)
+        _close(tensors, frozen)
     torch.testing.assert_close(population.v, voltage, rtol=0, atol=0)
     torch.testing.assert_close(waveform._spike_times, schedule, rtol=0, atol=0)
     torch.testing.assert_close(
         waveform.generator.get_state(), generator, rtol=0, atol=0
     )
     torch.testing.assert_close(torch.get_rng_state(), global_rng, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("diagnostic", (False, True))
+def test_shared_poisson_children_intra_and_extra_keep_native_invocations_and_aliases(
+    diagnostic,
+):
+    def case():
+        generator = torch.Generator().manual_seed(105)
+        pulse = _waveform(generator=generator, amp=0.2 * nA)
+        expression = pulse + pulse
+        population, _, _ = _population("intra", waveform=expression)
+        field = torch.linspace(
+            -1.0e6, 1.5e6, population.v.numel(), dtype=DTYPE
+        ).reshape(population.shape)
+        # Distinct outer expressions retain separate stimulus namespaces while
+        # their randomized children share parameters, the stream, and carry.
+        return population, (field, 0.7 * expression), generator
+
+    source, extra, generator = case()
+    native, native_extra, native_generator = case()
+    before = generator.get_state().clone()
+    global_rng = torch.get_rng_state().clone()
+    with dn.ctx(CHECK_PURITY=diagnostic):
+        functional, tensors = dn.func.make_functional(source, dt=DT, extra=extra)
+        frozen = _clone(tensors)
+        amplitudes = [
+            value
+            for name, value in tensors.parameters.items()
+            if name.endswith("waveform.amp")
+        ]
+        assert len(amplitudes) >= 2
+        assert all(value is amplitudes[0] for value in amplitudes)
+        prepared = functional.prepare(tensors.parameters, tensors.constants)
+        state = tensors.state
+        for _ in range(3):
+            packet = functional.sample_stimulation_draw(state)
+            state, _ = functional.step(
+                tensors.parameters,
+                prepared,
+                state,
+                dn.func.StepInput(stimulation=packet),
+            )
+            native.step(DT, extra=native_extra)
+            expected = dn.func.make_functional(native, dt=DT, extra=native_extra)[
+                1
+            ].state
+            _close(state, expected)
+            assert len(state["stimulation"]["rng"]) == 1
+            _close(
+                next(iter(state["stimulation"]["rng"].values())),
+                native_generator.get_state(),
+            )
+            schedules = tuple(state["stimulation"]["schedules"].values())
+            for schedule in schedules[1:]:
+                _close(schedule, schedules[0])
+        _close(tensors, frozen)
+    _close(generator.get_state(), before)
+    _close(torch.get_rng_state(), global_rng)
+
+
+def test_batched_mechanism_invocations_keep_schedule_axes_and_native_gradients():
+    def case():
+        population, waveform = _case(_RepeatedAssigned)
+        population.batch(2)
+        population.train()
+        population.initialize()
+        population.integrator._initialize(
+            population, population.t.new_tensor(DT), force=True
+        )
+        population.detach()
+        return population, waveform
+
+    source, waveform = case()
+    native, native_waveform = case()
+    before = waveform.generator.get_state().clone()
+    global_rng = torch.get_rng_state().clone()
+    functional, tensors = dn.func.make_functional(source, dt=DT)
+    frozen = _clone(tensors)
+    tape = functional.sample_stimulation_draw_tape(tensors.state, 3)
+    final, _ = functional.prepare_and_rollout(
+        tensors.parameters,
+        tensors.constants,
+        tensors.state,
+        dn.func.RolloutInput(stimulation=tape),
+        steps=3,
+    )
+    for _ in range(3):
+        native.step(dt=DT)
+    assert tuple(final["integrator"]["v"].shape) == (2, 1, 2)
+    _close(final, functional.extract(native).state)
+    amplitude = next(
+        value
+        for name, value in tensors.parameters.items()
+        if name.endswith("waveform.amp")
+    )
+    actual = torch.autograd.grad(final["integrator"]["v"].square().mean(), amplitude)[0]
+    expected = torch.autograd.grad(
+        native.v.square().mean(), native_waveform.waveform.amp
+    )[0]
+    assert expected.abs().sum() > 0
+    _close(actual, expected)
+    _close(tensors, frozen)
+    _close(waveform.generator.get_state(), before)
+    _close(torch.get_rng_state(), global_rng)
 
 
 def test_distinct_poisson_nodes_in_one_expression_remain_supported():

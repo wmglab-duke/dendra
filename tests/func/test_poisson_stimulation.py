@@ -492,7 +492,7 @@ def test_randomized_runtime_extra_requires_bound_stimulation_and_preserves_rng(
     _close(torch.get_rng_state(), global_rng)
 
 
-@pytest.mark.parametrize("kind", ("unbounded", "nested", "repeated"))
+@pytest.mark.parametrize("kind", ("unbounded", "draw_dependent_nested"))
 def test_poisson_unsupported_dynamic_invocations_fail_before_consuming_rng(kind):
     generator = torch.Generator().manual_seed(73)
     if kind == "unbounded":
@@ -505,16 +505,17 @@ def test_poisson_unsupported_dynamic_invocations_fail_before_consuming_rng(kind)
         )
     else:
         waveform = _waveform(generator=generator, amp=0.2 * nA)
-        if kind == "nested":
-            waveform = waveform.poisson(interval=0.2, n=2, generator=generator)
-        else:
-            waveform = waveform + waveform
+        waveform = waveform.poisson(
+            interval=0.2,
+            n=2,
+            off=0.3,
+            randomize_every_call=True,
+            generator=generator,
+        )
     population, _, _ = _population("intra", waveform=waveform)
     before = generator.get_state().clone()
     global_rng = torch.get_rng_state().clone()
-    with pytest.raises(
-        dn.func.FunctionalizationError, match="finite n|Nested|repeated"
-    ):
+    with pytest.raises(dn.func.FunctionalizationError, match="finite n|Nested"):
         dn.func.make_functional(population, dt=DT)
     _close(generator.get_state(), before)
     _close(torch.get_rng_state(), global_rng)

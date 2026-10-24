@@ -33,14 +33,6 @@ def _instrument(module, entries):
 
 
 def _check(counts, names, order, phase):
-    repeated = [names[identity] for identity, count in counts.items() if count > 1]
-    if repeated:
-        raise FunctionalizationError(
-            "Multiple evaluations of the same randomized Poisson mechanism "
-            f"waveform during {phase} are currently unsupported; "
-            f"registrations={repeated}. Each physical Poisson waveform needs "
-            "at most one invocation in each execution phase."
-        )
     ambiguous = [
         aliases
         for identity, aliases in names.items()
@@ -62,7 +54,7 @@ def _check(counts, names, order, phase):
 
 
 def validate_poisson_invocations(functional, tensors):
-    """Reject invocation counts which one explicit schedule cannot represent.
+    """Capture a fixed, ordered invocation recipe on disposable operands.
 
     This is a capability check, independent of optional authored-purity
     diagnostics. Disposable fixed-schedule programs preserve their normal
