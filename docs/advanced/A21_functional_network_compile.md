@@ -213,6 +213,9 @@ Scalar `Unmyelinated` and `Myelinated` Populations can use
 same Network; see {doc}`A51_functional_euler` and
 {doc}`A52_functional_runge_kutta` for the native stencil, voltage-stage
 semantics, explicit timestep restriction, and trainable parameters.
+The `df` and `dfh` integrators also support these scalar cable Populations,
+using explicit previous-voltage and history metadata carry. See
+{doc}`A53_functional_dufort_frankel` for startup, smoothing, and continuation.
 
 Shared runtime parameters and parameter/configuration aliases follow authored
 Population initialization order. Earlier Populations retain their prepared

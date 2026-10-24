@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from dendra.func._scan_inductor import (
+    _as_strided_copy,
     _compile_scan,
     _ScanInductorBackend,
     _select_copy,
@@ -144,6 +145,8 @@ def test_scan_inductor_owns_decompositions_and_forwards_overrides(monkeypatch):
     from torch._inductor import compile_fx as compile_module
     from torch._inductor.decomposition import select_decomp_table
 
+    from dendra.func._dufort_autograd import _inductor_decompositions
+
     shared = select_decomp_table()
     before = dict(shared)
     captured = {}
@@ -164,6 +167,9 @@ def test_scan_inductor_owns_decompositions_and_forwards_overrides(monkeypatch):
     assert selected is not shared
     assert selected[torch.ops.aten.select_copy.int] is _select_copy
     assert selected[torch.ops.aten.slice_copy.Tensor] is _slice_copy
+    assert selected[torch.ops.aten.as_strided_copy.default] is _as_strided_copy
+    for operator, decomposition in _inductor_decompositions().items():
+        assert selected[operator] is decomposition
     assert shared == before
     selected.clear()
     assert shared == before
@@ -197,3 +203,43 @@ def test_scan_inductor_real_compiled_copy_gradients():
     torch.testing.assert_close(
         actual_gradient, expected_gradient, rtol=1e-12, atol=1e-12
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float64, torch.int64, torch.bool])
+@pytest.mark.parametrize(
+    "size,stride,offset",
+    [
+        ((3, 2), (1, 3), None),
+        ((2, 3), (4, 1), 6),
+        ((2, 3), (0, 1), 6),
+        ((0, 3), (3, 1), None),
+    ],
+)
+def test_scan_storage_view_copy_preserves_offsets_layouts_and_independent_storage(
+    dtype, size, stride, offset
+):
+    value = torch.arange(32).to(dtype)[4:28].reshape(4, 6)
+    before = value.clone()
+    actual = _as_strided_copy(value, size, stride, offset)
+    expected = torch.ops.aten.as_strided_copy.default(value, size, stride, offset)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert actual.stride() == expected.stride()
+    assert actual.dtype == expected.dtype
+    assert actual.device == expected.device
+    assert not torch._C._is_alias_of(actual, value)
+    torch.testing.assert_close(value, before, rtol=0, atol=0)
+
+
+def test_scan_storage_view_copy_preserves_repeated_element_gradients():
+    raw = torch.linspace(-1, 1, 32, dtype=torch.float64, requires_grad=True)
+    value = raw[4:28].reshape(4, 6)
+    actual = _as_strided_copy(value, (2, 3), (0, 1), 6)
+    expected = torch.ops.aten.as_strided_copy.default(value, (2, 3), (0, 1), 6)
+    weights = torch.arange(1, 7, dtype=torch.float64).reshape(2, 3)
+    actual_gradient = torch.autograd.grad((actual * weights).sum(), raw)[0]
+    expected_gradient = torch.autograd.grad((expected * weights).sum(), raw)[0]
+    torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+    torch.testing.assert_close(
+        actual_gradient[6:9], torch.tensor([5.0, 7.0, 9.0], dtype=raw.dtype)
+    )
+    assert torch.count_nonzero(actual_gradient) == 3

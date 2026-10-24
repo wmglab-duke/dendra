@@ -42,6 +42,8 @@ from dendra.models.integrators.cable import (
 from dendra.models.integrators.core import _FunctionalIntegratorSpec
 from dendra.models.integrators.explicit import (
     SymmetricConv1D,
+    _dufort_frankel,
+    _dufort_frankel_homogeneous,
     _euler,
     _eulerv1,
     _rk2,
@@ -192,9 +194,14 @@ _FUNCTIONAL_HANDLER_HOOKS = (
     "_gather_assigned_current_fields",
 )
 _FUNCTIONAL_EXPLICIT_HANDLER_HOOKS = ("_evaluate_explicit_current_frame", "iexp")
+_FUNCTIONAL_DUFORT_HANDLER_HOOKS = ("_evaluate_dufort_current_frame", "idf")
 _STANDARD_FUNCTIONAL_HANDLER_HOOKS = {
     name: inspect.getattr_static(MechanismHandler, name)
-    for name in (*_FUNCTIONAL_HANDLER_HOOKS, *_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS)
+    for name in (
+        *_FUNCTIONAL_HANDLER_HOOKS,
+        *_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS,
+        *_FUNCTIONAL_DUFORT_HANDLER_HOOKS,
+    )
 }
 _MATERIAL_FUNCTIONAL_COMMON_HOOKS = (
     "material_fields",
@@ -455,6 +462,7 @@ _STANDARD_OWNED_CACHE_METHODS = {
 }
 _INTEGRATOR_FRESH_INITIALIZATION_HOOKS = ("init_v",)
 _SCALAR_EXPLICIT_INTEGRATORS = (_euler, _eulerv1, _rk2, _rk4)
+_SCALAR_DUFORT_INTEGRATORS = (_dufort_frankel, _dufort_frankel_homogeneous)
 _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
     implementation: {
         name: inspect.getattr_static(implementation, name)
@@ -462,6 +470,7 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
     }
     for implementation in (
         *_SCALAR_EXPLICIT_INTEGRATORS,
+        *_SCALAR_DUFORT_INTEGRATORS,
         _bwd_euler_sc,
         _bwd_euler_sc_skip,
         _bwd_euler_ub,
@@ -475,7 +484,13 @@ _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
 }
 
 
-_STANDARD_FUNCTIONAL_INTEGRATOR_STATE_NAMES = {_bwd_euler_sc_skip: ("v",)}
+_STANDARD_FUNCTIONAL_INTEGRATOR_STATE_NAMES = {
+    _bwd_euler_sc_skip: ("v",),
+    **{
+        implementation: ("v", "v_prev", "_df_history_valid", "_df_history_dt")
+        for implementation in _SCALAR_DUFORT_INTEGRATORS
+    },
+}
 _STANDARD_EXPLICIT_INTEGRATOR_HOOKS = {
     implementation: {
         name: inspect.getattr_static(implementation, name)
@@ -486,15 +501,25 @@ _STANDARD_EXPLICIT_INTEGRATOR_HOOKS = {
                 "_FUNCTIONAL_OPERATOR_KIND",
                 "_PREPARED_WORKSPACE_SCHEMA",
                 "_FUNCTIONAL_CRITICAL_METHODS",
+                "_FUNCTIONAL_STATE_NAMES",
             )
         )
         if hasattr(implementation, name)
     }
-    for implementation in _SCALAR_EXPLICIT_INTEGRATORS
+    for implementation in (*_SCALAR_EXPLICIT_INTEGRATORS, *_SCALAR_DUFORT_INTEGRATORS)
 }
 
 
 def _functional_handler_hooks(population):
+    if (
+        getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None)
+        == "scalar_dufort_path"
+    ):
+        return (
+            *_FUNCTIONAL_HANDLER_HOOKS,
+            *_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS,
+            *_FUNCTIONAL_DUFORT_HANDLER_HOOKS,
+        )
     if (
         getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None)
         == "scalar_explicit_path"
@@ -505,6 +530,9 @@ def _functional_handler_hooks(population):
 
 def _scalar_path_integrator_profile(integrator):
     """Select the admitted numerical family independently of path geometry."""
+    spec = _resolve_functional_integrator_spec(integrator, "scalar_dufort_path")
+    if spec is not None and spec.implementation in _SCALAR_DUFORT_INTEGRATORS:
+        return "scalar_dufort_path", spec.implementation
     spec = _resolve_functional_integrator_spec(integrator, "scalar_explicit_path")
     if spec is not None and spec.implementation in _SCALAR_EXPLICIT_INTEGRATORS:
         return "scalar_explicit_path", spec.implementation
@@ -6815,6 +6843,9 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             if path in {
                 ("integrator", "v"),
                 ("integrator", "vc"),
+                ("integrator", "v_prev"),
+                ("integrator", "_df_history_valid"),
+                ("integrator", "_df_history_dt"),
                 ("integrator", "i_membrane"),
                 ("clock", "t"),
                 ("control", "duration_remainder"),
@@ -7059,6 +7090,14 @@ def _fresh_initialization_pre_state(template, v_init):
 
     state = torch.utils._pytree.tree_map(lambda value: value, template)
     state["integrator"]["v"] = v_init
+    if "v_prev" in state["integrator"]:
+        state["integrator"]["v_prev"] = v_init
+        state["integrator"]["_df_history_valid"] = torch.zeros_like(
+            state["integrator"]["_df_history_valid"]
+        )
+        state["integrator"]["_df_history_dt"] = torch.full_like(
+            state["integrator"]["_df_history_dt"], torch.nan
+        )
     if "vc" in state["integrator"]:
         zero = torch.zeros_like(v_init)
         state["integrator"]["vc"] = torch.stack((v_init, zero, zero), dim=-1)
@@ -7068,7 +7107,16 @@ def _fresh_initialization_pre_state(template, v_init):
 def _initialization_voltage_kwargs(state):
     """Keep the scalar call signature unchanged while passing block init_v."""
 
-    return {"vc_init": state["integrator"]["vc"]} if "vc" in state["integrator"] else {}
+    if "vc" in state["integrator"]:
+        return {"vc_init": state["integrator"]["vc"]}
+    if "v_prev" in state["integrator"]:
+        return {
+            "dufort_init": tuple(
+                state["integrator"][name]
+                for name in ("v_prev", "_df_history_valid", "_df_history_dt")
+            )
+        }
+    return {}
 
 
 def _pad_to_visible_rank(value, reference):
@@ -7106,7 +7154,7 @@ class _PopulationInitialization(torch.nn.Module):
             if mechanism.DE
         )
 
-    def forward(self, v_init, *explicit_values, vc_init=None):
+    def forward(self, v_init, *explicit_values, vc_init=None, dufort_init=None):
         if len(explicit_values) != len(self.explicit_layout):
             raise FunctionalizationError(
                 "functional initialization received the wrong number of explicit "
@@ -7165,6 +7213,19 @@ class _PopulationInitialization(torch.nn.Module):
                 value = initial_voltage
             elif leaf.public_path == ("integrator", "vc"):
                 value = initial_circuit_voltage
+            elif (
+                dufort_init is not None
+                and leaf.public_path[0] == "integrator"
+                and (
+                    leaf.public_path[1]
+                    in ("v_prev", "_df_history_valid", "_df_history_dt")
+                )
+            ):
+                value = dufort_init[
+                    ("v_prev", "_df_history_valid", "_df_history_dt").index(
+                        leaf.public_path[1]
+                    )
+                ].clone(memory_format=torch.contiguous_format)
             elif leaf.public_path == ("integrator", "i_membrane"):
                 # Integrator.init_v resets this diagnostic before the first
                 # accepted step; it is not an initialized ionic-current sum.
@@ -7242,6 +7303,9 @@ class _PopulationTransition(torch.nn.Module):
         self.explicit_voltage_step = (
             population.integrator._FUNCTIONAL_OPERATOR_KIND == "scalar_explicit_path"
         )
+        self.dufort_voltage_step = (
+            population.integrator._FUNCTIONAL_OPERATOR_KIND == "scalar_dufort_path"
+        )
         object.__setattr__(
             self,
             "_state_owners",
@@ -7301,7 +7365,36 @@ class _PopulationTransition(torch.nn.Module):
                 if getattr(self, "_audit_noise_workspaces", False)
                 else nullcontext()
             ):
-                if self.block_voltage_state:
+                if self.dufort_voltage_step:
+                    history = tuple(
+                        self.population._buffers[name]
+                        for name in ("v_prev", "_df_history_valid", "_df_history_dt")
+                    )
+                    v, previous, valid, history_dt, i_membrane = (
+                        integrator._functional_step(
+                            v,
+                            dt,
+                            shared_celsius,
+                            ve_step,
+                            intra_step,
+                            history=history,
+                            use_history=torch.all(
+                                integrator._prepare_history(history[1], history[2], dt)[
+                                    0
+                                ]
+                            ),
+                            current_dispatch=(
+                                self._dufort_current_programs.diagnostic
+                                if getattr(self, "_audit_dufort_currents", False)
+                                else self._dufort_current_programs
+                            ),
+                            call_local_currents=True,
+                        )
+                    )
+                    self.population._buffers["v_prev"] = previous
+                    self.population._buffers["_df_history_valid"] = valid
+                    self.population._buffers["_df_history_dt"] = history_dt
+                elif self.block_voltage_state:
                     vc, v, i_membrane = integrator._step(
                         vc.reshape(integrator.B, integrator.K, integrator.M),
                         v,
@@ -8843,6 +8936,94 @@ def _explicit_stencil_failures(integrator):
     return []
 
 
+_STANDARD_DUFORT_FILTER_HOOKS = {
+    name: inspect.getattr_static(torch.nn.Conv1d, name)
+    for name in ("forward", "_conv_forward")
+}
+
+
+def _dufort_configuration_signature(integrator):
+    if getattr(integrator, "_FUNCTIONAL_OPERATOR_KIND", None) != "scalar_dufort_path":
+        return None
+    convolutions = []
+    for name in ("ssd", "filter"):
+        module = getattr(integrator, name, None)
+        if module is None:
+            convolutions.append((name, None))
+            continue
+        convolutions.append(
+            (
+                name,
+                _canonical_type(module),
+                tuple(
+                    (
+                        field,
+                        tuple(value) if isinstance(value, (tuple, list)) else value,
+                    )
+                    for field in _EXPLICIT_STENCIL_CONFIGURATION
+                    for value in (getattr(module, field, None),)
+                ),
+                tuple(
+                    (hook, _effective_hook_identity(module, hook))
+                    for hook in ("forward", "_conv_forward")
+                    if hasattr(module, hook)
+                ),
+                getattr(module, "bias", False) is None,
+            )
+        )
+    return (
+        (type(integrator.beta), integrator.beta),
+        (type(integrator.smoothing), integrator.smoothing),
+        (type(integrator.smooth_every), integrator.smooth_every),
+        (type(getattr(integrator, "conv", False)), getattr(integrator, "conv", False)),
+        tuple(convolutions),
+    )
+
+
+def _dufort_configuration_failures(integrator):
+    if (
+        type(integrator.beta) not in (int, float)
+        or not math.isfinite(integrator.beta)
+        or type(integrator.smoothing) is not bool
+        or integrator.smoothing != bool(1 - integrator.beta)
+        or type(integrator.smooth_every) is not int
+        or type(getattr(integrator, "conv", False)) is not bool
+    ):
+        return ["functional Dufort requires canonical fixed smoothing configuration"]
+    convolutions = []
+    if isinstance(integrator, _dufort_frankel_homogeneous):
+        convolutions.append(
+            ("ssd", SymmetricConv1D, 3, 3, "same", _STANDARD_EXPLICIT_STENCIL_HOOKS)
+        )
+    if integrator.smoothing:
+        convolutions.append(
+            ("filter", torch.nn.Conv1d, 1, 5, (2,), _STANDARD_DUFORT_FILTER_HOOKS)
+        )
+    for name, canonical, inputs, width, padding, standards in convolutions:
+        module = getattr(integrator, name, None)
+        if (
+            _canonical_type(module) is not canonical
+            or any(hook in vars(module) for hook in standards)
+            or any(
+                inspect.getattr_static(type(module), hook) is not standard
+                for hook, standard in standards.items()
+            )
+            or module.in_channels != inputs
+            or module.out_channels != 1
+            or module.groups != 1
+            or module.kernel_size != (width,)
+            or module.stride != (1,)
+            or module.dilation != (1,)
+            or module.padding != padding
+            or module.padding_mode != "reflect"
+            or module.bias is not None
+            or tuple(module._reversed_padding_repeated_twice) != (width // 2,) * 2
+            or _shape_tuple(module.weight) != (1, inputs, width)
+        ):
+            return [f"functional Dufort requires its canonical {name} convolution"]
+    return []
+
+
 def _functional_device_failures(device, dtype):
     """Keep device admission separate from the topology/solver capability.
 
@@ -9193,13 +9374,15 @@ def _functionalization_failures(
             failures.append(
                 f"{topology} functionalization requires bwd_euler_ub"
                 + (
-                    " or canonical Euler/rk1/eulerv1/rk2/rk4"
+                    " or canonical Euler/rk1/eulerv1/rk2/rk4/df/dfh"
                     if not is_native_cable
                     else ""
                 )
             )
         elif implementation in _SCALAR_EXPLICIT_INTEGRATORS:
             failures.extend(_explicit_stencil_failures(population.integrator))
+        elif implementation in _SCALAR_DUFORT_INTEGRATORS:
+            failures.extend(_dufort_configuration_failures(population.integrator))
         elif population.integrator.use_gc_variant:
             failures.append("the gradient-clipped Thomas variant is not supported yet")
     elif is_scalar_tree:
@@ -9595,6 +9778,16 @@ def _functionalization_failures(
             f"{sorted(missing_population_parameters)}"
         )
     allowed_shapes = {}
+    profile, _implementation = _scalar_path_integrator_profile(population.integrator)
+    if profile == "scalar_dufort_path" and not _dufort_configuration_failures(
+        population.integrator
+    ):
+        for name in ("ssd", "filter"):
+            module = getattr(population.integrator, name, None)
+            if module is not None:
+                allowed_shapes[f"integrator.{name}.weight"] = _shape_tuple(
+                    module.weight
+                )
     if _scalar_path_integrator_profile(population.integrator)[
         0
     ] == "scalar_explicit_path" and not _explicit_stencil_failures(
@@ -10537,6 +10730,7 @@ def _structure_signature(population) -> tuple:
             tuple(population.integrator._PREPARED_WORKSPACE_SCHEMA),
             getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None),
             _explicit_stencil_signature(population.integrator),
+            _dufort_configuration_signature(population.integrator),
             tuple(
                 getattr(
                     population.integrator,
@@ -11085,7 +11279,7 @@ class FunctionalPopulation:
             "block_matrix": self._solve_shape + (block_size, block_size),
             "shell_node": self._solve_shape + (block_size - 1,),
         }
-        if operator_kind == "scalar_explicit_path":
+        if operator_kind in {"scalar_explicit_path", "scalar_dufort_path"}:
             workspace_shapes["node"] = self.shape
         if self._topology_kind == "multi_point":
             workspace_shapes["parameter"] = self.shape
@@ -11658,6 +11852,18 @@ class FunctionalPopulation:
             # their temporary bindings after capturing the persistent tensor
             # contract and creating the separate initialization program.
             self._noise_plan.install(self._transition.population)
+        if self._transition.dufort_voltage_step:
+            from ._dufort import DufortCurrentPrograms
+
+            object.__setattr__(
+                self._transition,
+                "_dufort_current_programs",
+                DufortCurrentPrograms(
+                    self._transition.population.mech,
+                    self._transition.population.v,
+                    clock_owner=self._transition.population,
+                ),
+            )
 
     def _build_multi_component_plans(
         self,
@@ -13889,6 +14095,24 @@ class FunctionalPopulation:
             initialization=inputs,
         )
 
+    def _configure_integrator_state(self, state, dt):
+        """Apply native solver-configuration changes to explicit carry."""
+        integrator = self._transition.population.integrator
+        if integrator._FUNCTIONAL_OPERATOR_KIND != "scalar_dufort_path":
+            return state
+        previous = state["integrator"]
+        valid, history_dt = integrator._prepare_history(
+            previous["_df_history_valid"], previous["_df_history_dt"], dt
+        )
+        return {
+            **state,
+            "integrator": {
+                **previous,
+                "_df_history_valid": valid,
+                "_df_history_dt": history_dt,
+            },
+        }
+
     def _preparation_constants(self, constants):
         return {
             **{
@@ -14188,7 +14412,10 @@ class FunctionalPopulation:
         area_scale = population_values["area_scale"]
 
         integrator = self._transition.population.integrator
-        if integrator._FUNCTIONAL_OPERATOR_KIND == "scalar_explicit_path":
+        if integrator._FUNCTIONAL_OPERATOR_KIND in {
+            "scalar_explicit_path",
+            "scalar_dufort_path",
+        }:
             # Native explicit integration uses cylindrical node geometry and
             # raw effective cm/rhoa, including Myelinated's node transforms.
             # These coefficients do not apply the implicit family's independent
@@ -15447,6 +15674,7 @@ class FunctionalPopulation:
                     component_preparation.audit_builder_inputs = True
                 audit_transition = copy.deepcopy(self._transition)
                 audit_transition._audit_noise_workspaces = True
+                audit_transition._audit_dufort_currents = True
                 _rebind_population_time_references(audit_transition.population)
                 _install_voltage_process_audits(audit_transition.population)
                 _install_state_input_audits(audit_transition.population)

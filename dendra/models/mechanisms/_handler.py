@@ -2706,16 +2706,35 @@ class MechanismHandler(torch.nn.Module):
         return torch.stack(buf_i).sum(dim=0), current_frame
 
     def idf(self, v, v_prev):
-        local_voltages = self._gather_support_fields(
-            v,
-            self._current_support_entries,
+        current, conductance, _current_frame, _conductance_frame = (
+            self._evaluate_dufort_current_frame(
+                v,
+                v_prev,
+                scratch=(self._buf_i, self._buf_g) if self.currents else None,
+            )
         )
-        for mech, support_index in self._current_assigned_plan:
-            mech._evaluate_assigned(local_voltages[support_index])
+        return current, conductance
+
+    def _evaluate_dufort_current_frame(self, v, v_prev, *, scratch=None):
+        """Return Dufort currents, conductances, and aligned ionic frames.
+
+        Affine currents are evaluated at half the stored previous voltage;
+        other currents are evaluated explicitly at the current voltage with
+        zero conductance. ASSIGNED products retain the current-voltage phase.
+        ``scratch=None`` uses out-of-place reductions for functional transforms;
+        the native :meth:`idf` supplies its current and conductance buffers.
+        Registered ASSIGNED and SAVE_CURRENT rebindings must be isolated by a
+        functional caller, as for the other call-local current evaluators.
+        """
+        local_voltages = self._gather_assigned_current_fields(v)
 
         if not self.currents:
             z = torch.zeros_like(v)
-            return z, z
+            empty_frame = tuple(
+                torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+                for ion in self._ion_current_frame_ions
+            )
+            return z, z, empty_frame, empty_frame
 
         v_half = 0.5 * v_prev
         local_half_voltages = self._gather_support_fields(
@@ -2723,11 +2742,27 @@ class MechanismHandler(torch.nn.Module):
             self._current_support_entries,
         )
 
-        # reset buffers
-        for i, buf in enumerate(self._buf_i):
-            self._buf_i[i] = torch.zeros_like(buf)
-        for i, buf in enumerate(self._buf_g):
-            self._buf_g[i] = torch.zeros_like(buf)
+        call_local = scratch is None
+        if call_local:
+            buf_i = [None for _ in self._buf_i]
+            buf_g = [None for _ in self._buf_g]
+            zero_field = v.new_zeros(()).expand(v.shape)
+        else:
+            try:
+                buf_i, buf_g = scratch
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    "Dufort current scratch must be a (current_buffers, "
+                    "conductance_buffers) pair"
+                ) from error
+            if len(buf_i) != len(self._buf_i) or len(buf_g) != len(self._buf_g):
+                raise ValueError(
+                    "Dufort current scratch does not match the handler current layout"
+                )
+            for index, value in enumerate(buf_i):
+                buf_i[index] = torch.zeros_like(value)
+            for index, value in enumerate(buf_g):
+                buf_g[index] = torch.zeros_like(value)
 
         for c_idx, support_index, support_entry, entries in self._map_grouped:
             local_i = None
@@ -2744,18 +2779,59 @@ class MechanismHandler(torch.nn.Module):
                         setattr(mech, f"{current_fn}_", raw_i)
                     i = scale_f(raw_i)
                     g = torch.zeros_like(i) if torch.is_tensor(i) else 0.0
-                i = _current_value_for_buffer(i, self._buf_i[c_idx])
-                g = _current_value_for_buffer(g, self._buf_g[c_idx])
+                i = _current_value_for_buffer(i, v if call_local else buf_i[c_idx])
+                g = _current_value_for_buffer(g, v if call_local else buf_g[c_idx])
+                if call_local:
+                    local_shape = local_voltages[support_index].shape
+                    i = torch.broadcast_to(i, local_shape)
+                    g = torch.broadcast_to(g, local_shape)
                 local_i = i if local_i is None else local_i + i
                 local_g = g if local_g is None else local_g + g
-            support_entry.scatter_add_(self._buf_i[c_idx], local_i)
-            support_entry.scatter_add_(self._buf_g[c_idx], local_g)
+            if call_local:
+                if support_entry.spec.kind is SupportKind.DENSE:
+                    buf_i[c_idx] = (
+                        local_i if buf_i[c_idx] is None else buf_i[c_idx] + local_i
+                    )
+                    buf_g[c_idx] = (
+                        local_g if buf_g[c_idx] is None else buf_g[c_idx] + local_g
+                    )
+                else:
+                    destination_i = zero_field if buf_i[c_idx] is None else buf_i[c_idx]
+                    destination_g = zero_field if buf_g[c_idx] is None else buf_g[c_idx]
+                    buf_i[c_idx] = support_entry.scatter_add(destination_i, local_i)
+                    buf_g[c_idx] = support_entry.scatter_add(destination_g, local_g)
+            else:
+                support_entry.scatter_add_(buf_i[c_idx], local_i)
+                support_entry.scatter_add_(buf_g[c_idx], local_g)
 
-        # sum up currents and conductances
-        tot_i = torch.stack(self._buf_i).sum(dim=0)
-        tot_g = torch.stack(self._buf_g).sum(dim=0)
+        if call_local:
+            buf_i = [torch.zeros_like(v) if value is None else value for value in buf_i]
+            buf_g = [torch.zeros_like(v) if value is None else value for value in buf_g]
 
-        return tot_i, tot_g
+        current_frame = tuple(
+            buf_i[current_index]
+            if current_index >= 0
+            else torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+            for ion, current_index in zip(
+                self._ion_current_frame_ions,
+                self._ion_current_frame_indices,
+            )
+        )
+        conductance_frame = tuple(
+            buf_g[current_index]
+            if current_index >= 0
+            else torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+            for ion, current_index in zip(
+                self._ion_current_frame_ions,
+                self._ion_current_frame_indices,
+            )
+        )
+        return (
+            torch.stack(buf_i).sum(dim=0),
+            torch.stack(buf_g).sum(dim=0),
+            current_frame,
+            conductance_frame,
+        )
 
     def itot(self, v):
         if not self.currents:

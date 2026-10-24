@@ -143,5 +143,5 @@ unsupported. Generic morphology-backed `Cable` and `Tree` models require
 their supported geometry-aware integrators; the RK2/RK4 convolution path does
 not implement their canonical edge-conductance equations. Multilayer
 extracellular and concatenated `MultiPopulation` models do not use this scalar
-path. Dufort–Frankel voltage integration is currently unsupported by
-functional lowering.
+path. For two-level Dufort–Frankel integration, see
+{doc}`A53_functional_dufort_frankel`.

@@ -4,7 +4,9 @@ The scan partitioner functionalizes views into copy operators. Inductor does
 not decompose select_copy/slice_copy in the verified Torch releases, leaving
 opaque copy/dispatch boundaries between otherwise fusible numerical kernels.
 An owned decomposition table preserves their copy semantics while allowing
-normal Inductor fusion. Nothing is registered or patched globally.
+normal Inductor fusion. Explicit storage views also retain conditional operand
+layout constraints after scan functionalization. Nothing is registered or
+patched globally.
 """
 
 from __future__ import annotations
@@ -22,6 +24,15 @@ def _select_copy(value, dim, index):
 
 def _slice_copy(value, dim=0, start=None, end=None, step=1):
     return torch.ops.aten.slice.Tensor(value, dim, start, end, step).clone(
+        memory_format=torch.contiguous_format
+    )
+
+
+def _as_strided_copy(value, size, stride, storage_offset=None):
+    # The FX-visible storage view constrains its producer's exact strides.
+    # Inductor's direct copy-view lowering otherwise hides that requirement
+    # from outer conditional graphs after scan's view functionalization.
+    return torch.ops.aten.as_strided.default(value, size, stride, storage_offset).clone(
         memory_format=torch.contiguous_format
     )
 
@@ -53,6 +64,10 @@ class _ScanInductorBackend(torch._TorchCompileInductorWrapper):
             )
         decompositions[torch.ops.aten.select_copy.int] = _select_copy
         decompositions[torch.ops.aten.slice_copy.Tensor] = _slice_copy
+        decompositions[torch.ops.aten.as_strided_copy.default] = _as_strided_copy
+        from ._dufort_autograd import _inductor_decompositions
+
+        decompositions.update(_inductor_decompositions())
         return compile_fx(
             graph,
             inputs,

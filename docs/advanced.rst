@@ -60,3 +60,4 @@ Advanced
    advanced/A50_functional_poisson_stimulation.md
    advanced/A51_functional_euler.md
    advanced/A52_functional_runge_kutta.md
+   advanced/A53_functional_dufort_frankel.md

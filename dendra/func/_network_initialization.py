@@ -883,6 +883,9 @@ def _initialize_components(
                 effective_constants = _replace_at(
                     effective_constants, ("populations", name), population_constants
                 )
+                populations[name] = plan._configure_integrator_state(
+                    populations[name], population_constants["dt"]
+                )
         if inputs.cache is not None:
             effective, effective_constants, populations = _restore_cache_aliases(
                 functional,
@@ -921,6 +924,9 @@ def _initialize_components(
                 )
                 effective_constants = _replace_at(
                     effective_constants, ("populations", name), population_constants
+                )
+                populations[name] = plan._configure_integrator_state(
+                    populations[name], population_constants["dt"]
                 )
         time = inputs.t.detach().clone()
         populations = functional._stimulation_plan.canonicalize(

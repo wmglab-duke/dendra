@@ -113,7 +113,7 @@ def _conv_last(conv: torch.nn.Conv1d, *xs: torch.Tensor) -> torch.Tensor:
 
 def _filter_last(filter_: torch.nn.Conv1d, x: torch.Tensor) -> torch.Tensor:
     """Apply a single-channel Conv1d filter along the final axis."""
-    xf = _flatten_to_solve(x).unsqueeze(1)
+    xf = _flatten_to_solve(x, target_shape=tuple(x.shape)).unsqueeze(1)
     return _conv1d_forward(filter_, xf, filter_.weight).squeeze(1).reshape_as(x)
 
 
@@ -469,8 +469,8 @@ class _rk4(_euler):
 
 def ssd_df(v_c, v_p, v_e):
     K = v_c.shape[-1]
-    vc = _flatten_to_solve(v_c, K)
-    vp = _flatten_to_solve(v_p, K)
+    vc = _flatten_to_solve(v_c, K, tuple(v_c.shape))
+    vp = _flatten_to_solve(v_p, K, tuple(v_c.shape))
     ve = _flatten_to_solve(v_e, K, tuple(v_c.shape))
     vc_p = _reflect_pad_last(vc, (1, 1))
     ve_p = _reflect_pad_last(ve, (1, 1))
@@ -480,8 +480,8 @@ def ssd_df(v_c, v_p, v_e):
 
 def ssd_df_no_ve(v_c, v_p):
     K = v_c.shape[-1]
-    vc = _flatten_to_solve(v_c, K)
-    vp = _flatten_to_solve(v_p, K)
+    vc = _flatten_to_solve(v_c, K, tuple(v_c.shape))
+    vp = _flatten_to_solve(v_p, K, tuple(v_c.shape))
     vc_p = _reflect_pad_last(vc, (1, 1))
     return (vc_p[:, :-2] + vc_p[:, 2:] - vp).reshape_as(v_c)
 
@@ -495,8 +495,8 @@ class _dufort_frankel_homogeneous(Integrator):
     affine in voltage are centered exactly between the stored time levels;
     other currents are evaluated explicitly with zero Dufort conductance. A
     one-``dt`` forward-Euler step constructs the missing history level after
-    initialization or a timestep change. Optionally applies periodic spatial
-    smoothing. Can compute with either convolution-based or direct
+    initialization or a timestep change. Optionally applies spatial smoothing
+    after each voltage update. Can compute with either convolution-based or direct
     finite-difference stencils.
 
     Parameters
@@ -504,8 +504,8 @@ class _dufort_frankel_homogeneous(Integrator):
     beta : float, optional
         Exponential smoothing factor (1.0 disables smoothing). Default 1.0.
     smooth_every : int, optional
-        Apply smoothing every ``smooth_every`` steps when ``beta < 1``.
-        Default 100.
+        Retained configuration metadata. Spatial smoothing is applied each
+        timestep when ``beta < 1``. Default 100.
     conv : bool, optional
         If True, use a fixed convolution kernel for the spatial stencil;
         otherwise use direct finite differences. Default False.
@@ -515,6 +515,29 @@ class _dufort_frankel_homogeneous(Integrator):
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]
     v_vars = ["v", "v_prev", "_df_history_valid", "_df_history_dt"]
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_dufort_path"
+    _FUNCTIONAL_STATE_NAMES = tuple(v_vars)
+    _FUNCTIONAL_CRITICAL_METHODS = (
+        "_functional_step",
+        "_functional_tensor_step",
+        "_prepare_history",
+        "_step_initial",
+        "_step_conv",
+        "_initial_current_frame",
+        "_dufort_current_frame",
+        "_initial_spatial",
+        "_initial_voltage",
+        "_history_spatial",
+        "_history_voltage",
+    )
+    _PREPARED_WORKSPACE_SCHEMA = (
+        ("area", "node"),
+        ("s1", "node"),
+        ("s2", "node"),
+        ("s3", "node"),
+        ("s4", "node"),
+        ("ve_zero", "node"),
+    )
 
     def __init__(self, model, mech, beta=1.0, smooth_every=100, conv=False, imem=None):
         super().__init__(model, mech, imem)
@@ -534,6 +557,7 @@ class _dufort_frankel_homogeneous(Integrator):
         self.register_buffer("s2", torch.tensor(0.0))
         self.register_buffer("s3", torch.tensor(0.0))
         self.register_buffer("s4", torch.tensor(0.0))
+        self.register_buffer("ve_zero", torch.tensor(0.0), persistent=False)
 
         self.smooth_every = smooth_every
         self.beta = beta
@@ -565,38 +589,63 @@ class _dufort_frankel_homogeneous(Integrator):
         for p in self.ssd.parameters():
             p.requires_grad = False
 
-    def initialize(self, model, dt) -> None:
-        diam = _broadcast_to_shape(model.diam, model.shape)
-        dx_raw = _broadcast_to_shape(model.dx, model.shape)
-        rhoa = _broadcast_to_shape(model.rhoa, model.shape)
-        cm_param = _broadcast_to_shape(model.cm, model.shape)
-        self.area = torch.pi * (diam / 10000) * (dx_raw / 10000)
-        cm = (cm_param / 1e3) * self.area
-        dx = dx_raw / 10000
+    @staticmethod
+    def _prepare_workspace(dt, *, dx, diam, cm, rhoa):
+        """Derive the native homogeneous two-level cable coefficients."""
+        area = torch.pi * (diam / 10000) * (dx / 10000)
+        cm = (cm / 1e3) * area
+        dx = dx / 10000
         radii = diam / 20000
         ra = (rhoa * dx) / (torch.pi * radii**2)
-        self.s1 = 2 * dt / cm
-        self.s2 = self.s1 / ra
-        if model.shape[-1] == 1:
+        s1 = 2 * dt / cm
+        s2 = s1 / ra
+        if cm.shape[-1] == 1:
             # A sealed one-compartment cable has no axial edge. Reflection is
             # useful for boundary stencils on longer cables, but treating the
             # lone compartment as its own neighbour creates spurious temporal
             # coupling in the two-level Dufort update.
-            self.s2 = torch.zeros_like(self.s2)
-        self.s3 = self.area * self.s1
-        self.s4 = 1 + self.s2
+            s2 = torch.zeros_like(s2)
+        return {
+            "area": area,
+            "s1": s1,
+            "s2": s2,
+            "s3": area * s1,
+            "s4": 1 + s2,
+            "ve_zero": torch.zeros_like(cm),
+        }
+
+    def initialize(self, model, dt) -> None:
+        workspace = self._derive_prepared_workspace(
+            dt,
+            dx=_broadcast_to_shape(model.dx, model.shape),
+            diam=_broadcast_to_shape(model.diam, model.shape),
+            cm=_broadcast_to_shape(model.cm, model.shape),
+            rhoa=_broadcast_to_shape(model.rhoa, model.shape),
+        )
+        self._install_prepared_workspace(workspace)
         self.f64 = model.dtype() == torch.float64
-        self.ve_zero = torch.zeros_like(model.v)
 
         # Forced coefficient rebuilds in training do not invalidate a same-dt
         # history. A genuine timestep change does, including after restoring a
         # checkpoint into a fresh integrator instance.
-        dt_value = torch.as_tensor(
-            dt, dtype=model._df_history_dt.dtype, device=model._df_history_dt.device
+        model._df_history_valid, model._df_history_dt = self._prepare_history(
+            model._df_history_valid, model._df_history_dt, dt
         )
-        if not bool(torch.all(model._df_history_dt == dt_value).item()):
-            model._df_history_valid = torch.zeros_like(model._df_history_valid)
-        model._df_history_dt = torch.full_like(model._df_history_dt, float(dt_value))
+
+    @staticmethod
+    def _prepare_history(valid, history_dt, dt):
+        """Preserve same-timestep history and invalidate a changed timestep."""
+        dt_value = torch.as_tensor(dt, dtype=history_dt.dtype, device=history_dt.device)
+        # Give scalar metadata a visible axis for empty hidden vmap lanes.
+        same_dt = torch.all(
+            history_dt.reshape(history_dt.numel()) == dt_value.reshape(1)
+        )
+        valid = (valid.reshape(valid.numel()) & same_dt.reshape(1)).reshape(valid.shape)
+        history_dt = (
+            torch.zeros_like(history_dt).reshape(history_dt.numel())
+            + dt_value.reshape(1)
+        ).reshape(history_dt.shape)
+        return valid, history_dt
 
     def step(self, model, dt, ve=None, intra=None):
         if ve is None:
@@ -635,71 +684,237 @@ class _dufort_frankel_homogeneous(Integrator):
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _step_initial(self, v, ve, s1, s2, area, dt, temp, intra=None):
-        """Construct the missing previous time level with one Euler step."""
-        if ve is None:
-            laplacian = ssd_df_no_ve(v, v) - v
+    def _initial_current_frame(self, v, *, call_local_currents):
+        if call_local_currents:
+            return self.mech._evaluate_explicit_current_frame(v)
+        current = self.mech.iexp(v)
+        return current, self._capture_ion_current_frame()
+
+    def _dufort_current_frame(self, v, v_prev, *, call_local_currents):
+        if call_local_currents:
+            return self.mech._evaluate_dufort_current_frame(v, v_prev)
+        current, conductance = self.mech.idf(v, v_prev)
+        return (
+            current,
+            conductance,
+            self._capture_ion_current_frame(),
+            self._capture_ion_conductance_frame(),
+        )
+
+    def _functional_step(
+        self,
+        v,
+        dt,
+        temp,
+        ve=None,
+        intra=None,
+        *,
+        history,
+        use_history,
+        solver=None,
+        call_local_currents=True,
+        current_dispatch=None,
+    ):
+        """Evaluate one selected history phase with the native numerical kernel.
+
+        ``current_dispatch`` selects the current phase with an isolated pure
+        tensor packet. Mechanism advances and smoothing execute once around
+        that packet. The static phase adapter remains available when no packet
+        dispatcher is needed. History never requires a host tensor read.
+        """
+        del solver
+        v_prev, valid, history_dt = history
+        if current_dispatch is not None:
+            v_new, v_prev_new, i_membrane = self._functional_tensor_step(
+                v, v_prev, dt, temp, ve, intra, use_history, current_dispatch
+            )
+        elif use_history:
+            if self.conv and ve is None:
+                ve = self.ve_zero
+            step = self._step_conv if self.conv else self._step
+            v_new, v_prev_new, i_membrane = step(
+                v,
+                v_prev,
+                ve,
+                self.s1,
+                self.s2,
+                self.s3,
+                self.s4,
+                self.area,
+                dt,
+                temp,
+                intra,
+                call_local_currents=call_local_currents,
+            )
         else:
-            laplacian = ssd_df(v, v, ve) - v
+            v_new, v_prev_new, i_membrane = self._step_initial(
+                v,
+                ve,
+                self.s1,
+                self.s2,
+                self.area,
+                dt,
+                temp,
+                intra,
+                call_local_currents=call_local_currents,
+            )
+        return (
+            v_new,
+            v_prev_new,
+            torch.ones_like(valid),
+            torch.zeros_like(history_dt)
+            + torch.as_tensor(dt, dtype=history_dt.dtype, device=history_dt.device),
+            i_membrane,
+        )
 
+    def _functional_tensor_step(
+        self, v, v_prev, dt, temp, ve, intra, use_history, current_dispatch
+    ):
+        # Invalid checkpoints may contain an arbitrary unused history level.
+        # Keep its NaNs out of the inactive numerical branch and its backward.
+        v_prev = torch.where(use_history, v_prev, v)
+        initial_spatial = self._initial_spatial(v, ve)
+        history_spatial = self._history_spatial(v, v_prev, ve)
         self._advance_pre_current(v, dt, temp)
-        i_mem = self.mech.iexp(v)
-        accepted_frame = self._capture_ion_current_frame()
-        i_ion = i_mem * area
-        i_drive = i_ion
-        if intra is not None:
-            i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
-
-        # s1 and s2 contain 2*dt.  The starter advances exactly one dt.
-        v_new = v + 0.5 * s2 * laplacian - 0.5 * s1 * i_drive
-
+        current, conductance, i_frame, g_frame = current_dispatch(
+            v, v_prev, use_history
+        )
+        initial_voltage = self._initial_voltage(v, initial_spatial, current, intra)
+        history_voltage = self._history_voltage(
+            v, v_prev, history_spatial, current, conductance, intra
+        )
+        unsmoothed = torch.where(use_history, history_voltage, initial_voltage)
+        accepted_frame = self._linearize_ion_current_frame(
+            i_frame, g_frame, unsmoothed, conductance_scale=0.5
+        )
+        i_mem = torch.where(
+            use_history, current + 0.5 * conductance * unsmoothed, current
+        )
+        v_new = unsmoothed
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
+        self._advance_post_current(v, dt, temp, accepted_frame)
+        i_membrane = None
+        if self.imem:
+            i_cap = torch.where(
+                use_history,
+                (v_new - v_prev) / self.s1,
+                2.0 * (v_new - v) / self.s1,
+            )
+            i_membrane = i_cap + i_mem * self.area
+        return v_new, v, i_membrane
 
+    def _initial_spatial(self, v, ve, *, s2=None):
+        del s2
+        if ve is None:
+            return ssd_df_no_ve(v, v) - v
+        return ssd_df(v, v, ve) - v
+
+    def _initial_voltage(
+        self, v, spatial, current, intra, *, s1=None, s2=None, area=None
+    ):
+        s1 = self.s1 if s1 is None else s1
+        s2 = self.s2 if s2 is None else s2
+        area = self.area if area is None else area
+        i_drive = current * area
+        if intra is not None:
+            i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
+        # The prepared coefficients contain 2*dt; the starter spans one dt.
+        return v + 0.5 * s2 * spatial - 0.5 * s1 * i_drive
+
+    def _history_spatial(self, v, v_prev, ve, *, s2=None, conv=None):
+        s2 = self.s2 if s2 is None else s2
+        conv = self.conv if conv is None else conv
+        if conv:
+            ve = self.ve_zero if ve is None else ve
+            return s2 * _conv_last(self.ssd, v, v_prev, ve)
+        if ve is None:
+            return s2 * ssd_df_no_ve(v, v_prev)
+        return s2 * ssd_df(v, v_prev, ve)
+
+    def _history_voltage(
+        self,
+        v,
+        v_prev,
+        spatial,
+        current,
+        conductance,
+        intra,
+        *,
+        s1=None,
+        s3=None,
+        s4=None,
+        area=None,
+    ):
+        s1 = self.s1 if s1 is None else s1
+        s3 = self.s3 if s3 is None else s3
+        s4 = self.s4 if s4 is None else s4
+        area = self.area if area is None else area
+        i_drive = current * area
+        if intra is not None:
+            i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
+        return (v_prev + spatial - s1 * i_drive) / (s4 + 0.5 * conductance * s3)
+
+    def _step_initial(
+        self, v, ve, s1, s2, area, dt, temp, intra=None, *, call_local_currents=False
+    ):
+        """Construct the missing previous time level with one Euler step."""
+        spatial = self._initial_spatial(v, ve, s2=s2)
+        self._advance_pre_current(v, dt, temp)
+        i_mem, accepted_frame = self._initial_current_frame(
+            v, call_local_currents=call_local_currents
+        )
+        v_new = self._initial_voltage(v, spatial, i_mem, intra, s1=s1, s2=s2, area=area)
+        if self.smoothing:
+            v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
+                self.filter, v_new
+            )
         self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = 2.0 * (v_new - v) / s1
             i_membrane = i_cap + i_mem * area
-
         return v_new, v, i_membrane
 
     def _step(
-        self, v, v_prev, ve, s1, s2, s3, s4, area, dt, temp, intra=None
+        self,
+        v,
+        v_prev,
+        ve,
+        s1,
+        s2,
+        s3,
+        s4,
+        area,
+        dt,
+        temp,
+        intra=None,
+        *,
+        call_local_currents=False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        if ve is None:
-            d2v = s2 * ssd_df_no_ve(v, v_prev)
-        else:
-            d2v = s2 * ssd_df(v, v_prev, ve)
-
+        spatial = self._history_spatial(v, v_prev, ve, s2=s2, conv=False)
         self._advance_pre_current(v, dt, temp)
-        i_ion, gtot = self.mech.idf(v, v_prev)
-        i_frame = self._capture_ion_current_frame()
-        g_frame = self._capture_ion_conductance_frame()
-
-        i_drive = i_ion * area
-        if intra is not None:
-            i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
-
-        v_new = (v_prev + d2v - s1 * i_drive) / (s4 + 0.5 * gtot * s3)
+        i_ion, gtot, i_frame, g_frame = self._dufort_current_frame(
+            v, v_prev, call_local_currents=call_local_currents
+        )
+        v_new = self._history_voltage(
+            v, v_prev, spatial, i_ion, gtot, intra, s1=s1, s3=s3, s4=s4, area=area
+        )
         accepted_frame = self._linearize_ion_current_frame(
             i_frame, g_frame, v_new, conductance_scale=0.5
         )
         i_mem = i_ion + 0.5 * gtot * v_new
-
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
-
         self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / s1
             i_membrane = i_cap + i_mem * area
-
         return v_new, v, i_membrane
 
     def _step_conv(
@@ -715,35 +930,30 @@ class _dufort_frankel_homogeneous(Integrator):
         dt,
         temp,
         intra=None,
+        *,
+        call_local_currents=False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        d2v = s2 * _conv_last(self.ssd, v, v_prev, ve)
-
+        spatial = self._history_spatial(v, v_prev, ve, s2=s2, conv=True)
         self._advance_pre_current(v, dt, temp)
-        i_ion, gtot = self.mech.idf(v, v_prev)
-        i_frame = self._capture_ion_current_frame()
-        g_frame = self._capture_ion_conductance_frame()
-
-        i_drive = i_ion * area
-        if intra is not None:
-            i_drive = i_drive - _broadcast_to_shape(intra, tuple(v.shape))
-
-        v_new = (v_prev + d2v - s1 * i_drive) / (s4 + 0.5 * gtot * s3)
+        i_ion, gtot, i_frame, g_frame = self._dufort_current_frame(
+            v, v_prev, call_local_currents=call_local_currents
+        )
+        v_new = self._history_voltage(
+            v, v_prev, spatial, i_ion, gtot, intra, s1=s1, s3=s3, s4=s4, area=area
+        )
         accepted_frame = self._linearize_ion_current_frame(
             i_frame, g_frame, v_new, conductance_scale=0.5
         )
         i_mem = i_ion + 0.5 * gtot * v_new
-
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
-
         self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
             i_cap = (v_new - v_prev) / s1
             i_membrane = i_cap + i_mem * area
-
         return v_new, v, i_membrane
 
     def init_v(self, model):
@@ -774,14 +984,41 @@ class _dufort_frankel(Integrator):
     beta : float, optional
         Exponential smoothing factor (1.0 disables smoothing). Default 1.0.
     smooth_every : int, optional
-        Apply smoothing every ``smooth_every`` steps when ``beta < 1``.
-        Default 100.
+        Retained configuration metadata. Spatial smoothing is applied each
+        timestep when ``beta < 1``. Default 100.
     imem : bool or None, optional
         If truthy, accumulate membrane currents each step. Default None.
     """
 
     __constants__ = ["beta", "smoothing", "smooth_every", "imem"]
     v_vars = ["v", "v_prev", "_df_history_valid", "_df_history_dt"]
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_dufort_path"
+    _FUNCTIONAL_STATE_NAMES = tuple(v_vars)
+    _FUNCTIONAL_CRITICAL_METHODS = (
+        "_functional_step",
+        "_functional_tensor_step",
+        "_prepare_history",
+        "_step_initial",
+        "_initial_current_frame",
+        "_dufort_current_frame",
+        "_initial_spatial",
+        "_initial_voltage",
+        "_history_spatial",
+        "_history_voltage",
+    )
+    _initial_current_frame = _dufort_frankel_homogeneous._initial_current_frame
+    _dufort_current_frame = _dufort_frankel_homogeneous._dufort_current_frame
+    _prepare_history = staticmethod(_dufort_frankel_homogeneous._prepare_history)
+    _functional_tensor_step = _dufort_frankel_homogeneous._functional_tensor_step
+    _PREPARED_WORKSPACE_SCHEMA = (
+        ("area", "node"),
+        ("s1", "node"),
+        ("s3", "node"),
+        ("c_axial", "node"),
+        ("c_left", "node"),
+        ("c_right", "node"),
+        ("ve_zero", "node"),
+    )
 
     def __init__(self, model, mech, beta=1.0, smooth_every=100, imem=None):
         super().__init__(model, mech, imem)
@@ -804,6 +1041,7 @@ class _dufort_frankel(Integrator):
         self.register_buffer("c_axial", torch.tensor(0.0))
         self.register_buffer("c_left", torch.tensor(0.0))
         self.register_buffer("c_right", torch.tensor(0.0))
+        self.register_buffer("ve_zero", torch.tensor(0.0), persistent=False)
 
         self.smooth_every = smooth_every
         self.beta = beta
@@ -820,46 +1058,55 @@ class _dufort_frankel(Integrator):
             for p in self.filter.parameters():
                 p.requires_grad = False
 
-    def initialize(self, model, dt) -> None:
+    @staticmethod
+    def _prepare_workspace(dt, *, dx, diam, cm, rhoa):
+        """Derive the native heterogeneous two-level cable coefficients."""
         # Units are critical here. We'll work in [V, A, s, F, Ohm, cm].
-        diam = _broadcast_to_shape(model.diam, model.shape)
-        dx = _broadcast_to_shape(model.dx, model.shape)
-        cm_param = _broadcast_to_shape(model.cm, model.shape)
-        rhoa = _broadcast_to_shape(model.rhoa, model.shape)
-
-        self.area = torch.pi * (diam / 10000.0) * (dx / 10000.0)
-        cm_total = (cm_param / 1000.0) * self.area
+        area = torch.pi * (diam / 10000.0) * (dx / 10000.0)
+        cm_total = (cm / 1000.0) * area
 
         dx_cm = dx / 10000.0
         radii_cm = diam / 20000.0
         ra_comp = (rhoa * dx_cm) / (torch.pi * radii_cm**2)
-        ra_flat = _flatten_to_solve(ra_comp)
+        ra_flat = _flatten_to_solve(ra_comp, target_shape=tuple(ra_comp.shape))
         ra_padded = _reflect_pad_last(ra_flat, (1, 1))
         r_left = 0.5 * (ra_padded[:, :-2] + ra_padded[:, 1:-1])
         r_right = 0.5 * (ra_padded[:, 1:-1] + ra_padded[:, 2:])
 
-        g_left = (1.0 / r_left).reshape(model.shape)
-        g_right = (1.0 / r_right).reshape(model.shape)
-        if model.shape[-1] == 1:
+        g_left = (1.0 / r_left).reshape(cm.shape)
+        g_right = (1.0 / r_right).reshape(cm.shape)
+        if cm.shape[-1] == 1:
             g_left = torch.zeros_like(g_left)
             g_right = torch.zeros_like(g_right)
 
-        self.s1 = (2 * dt) / cm_total
-        self.s3 = self.area * self.s1
-        self.c_left = self.s1 * g_left
-        self.c_right = self.s1 * g_right
-        self.c_axial = 0.5 * (self.c_left + self.c_right)
+        s1 = (2 * dt) / cm_total
+        c_left = s1 * g_left
+        c_right = s1 * g_right
+        return {
+            "area": area,
+            "s1": s1,
+            "s3": area * s1,
+            "c_left": c_left,
+            "c_right": c_right,
+            "c_axial": 0.5 * (c_left + c_right),
+            "ve_zero": torch.zeros_like(cm),
+        }
 
+    def initialize(self, model, dt) -> None:
+        workspace = self._derive_prepared_workspace(
+            dt,
+            dx=_broadcast_to_shape(model.dx, model.shape),
+            diam=_broadcast_to_shape(model.diam, model.shape),
+            cm=_broadcast_to_shape(model.cm, model.shape),
+            rhoa=_broadcast_to_shape(model.rhoa, model.shape),
+        )
+        self._install_prepared_workspace(workspace)
         self.f64 = model.dtype() == torch.float64
-        self.ve_zero = torch.zeros_like(model.v)
 
         self.initialized = True
-        dt_value = torch.as_tensor(
-            dt, dtype=model._df_history_dt.dtype, device=model._df_history_dt.device
+        model._df_history_valid, model._df_history_dt = self._prepare_history(
+            model._df_history_valid, model._df_history_dt, dt
         )
-        if not bool(torch.all(model._df_history_dt == dt_value).item()):
-            model._df_history_valid = torch.zeros_like(model._df_history_valid)
-        model._df_history_dt = torch.full_like(model._df_history_dt, float(dt_value))
 
     def step(self, model, dt, ve=None, intra=None):
         if bool(torch.all(model._df_history_valid).item()):
@@ -887,14 +1134,61 @@ class _dufort_frankel(Integrator):
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _step_initial(self, v, ve, dt, temp, intra=None):
-        """Construct the missing previous time level with one Euler step."""
-        K = v.shape[-1]
-        v_flat = _flatten_to_solve(v, K)
-        c_left = _flatten_to_solve(self.c_left, K)
-        c_right = _flatten_to_solve(self.c_right, K)
-        v_padded = _reflect_pad_last(v_flat, (1, 1))
+    def _functional_step(
+        self,
+        v,
+        dt,
+        temp,
+        ve=None,
+        intra=None,
+        *,
+        history,
+        use_history,
+        solver=None,
+        call_local_currents=True,
+        current_dispatch=None,
+    ):
+        """Adapt an isolated pure history phase to the native shared kernel."""
+        del solver
+        v_prev, valid, history_dt = history
+        if current_dispatch is not None:
+            v_new, v_prev_new, i_membrane = self._functional_tensor_step(
+                v, v_prev, dt, temp, ve, intra, use_history, current_dispatch
+            )
+        elif use_history:
+            v_new, v_prev_new, i_membrane = self._step(
+                v,
+                v_prev,
+                ve,
+                dt,
+                temp,
+                intra,
+                call_local_currents=call_local_currents,
+            )
+        else:
+            v_new, v_prev_new, i_membrane = self._step_initial(
+                v,
+                ve,
+                dt,
+                temp,
+                intra,
+                call_local_currents=call_local_currents,
+            )
+        return (
+            v_new,
+            v_prev_new,
+            torch.ones_like(valid),
+            torch.zeros_like(history_dt)
+            + torch.as_tensor(dt, dtype=history_dt.dtype, device=history_dt.device),
+            i_membrane,
+        )
 
+    def _initial_spatial(self, v, ve):
+        K = v.shape[-1]
+        v_flat = _flatten_to_solve(v, K, tuple(v.shape))
+        c_left = _flatten_to_solve(self.c_left, K, tuple(v.shape))
+        c_right = _flatten_to_solve(self.c_right, K, tuple(v.shape))
+        v_padded = _reflect_pad_last(v_flat, (1, 1))
         delta_axial = 0.5 * c_left * (v_padded[:, :-2] - v_flat)
         delta_axial = delta_axial + 0.5 * c_right * (v_padded[:, 2:] - v_flat)
         if ve is not None:
@@ -902,32 +1196,71 @@ class _dufort_frankel(Integrator):
             ve_padded = _reflect_pad_last(ve_flat, (1, 1))
             delta_axial = delta_axial + 0.5 * c_left * (ve_padded[:, :-2] - ve_flat)
             delta_axial = delta_axial + 0.5 * c_right * (ve_padded[:, 2:] - ve_flat)
+        return delta_axial
 
-        self._advance_pre_current(v, dt, temp)
-        area = _flatten_to_solve(self.area, K)
-        s1 = _flatten_to_solve(self.s1, K)
-        i_mem = self.mech.iexp(v)
-        accepted_frame = self._capture_ion_current_frame()
-        i_ion_stim = _flatten_to_solve(i_mem, K) * area
+    def _initial_voltage(self, v, spatial, current, intra):
+        K = v.shape[-1]
+        v_flat = _flatten_to_solve(v, K, tuple(v.shape))
+        area = _flatten_to_solve(self.area, K, tuple(v.shape))
+        s1 = _flatten_to_solve(self.s1, K, tuple(v.shape))
+        i_ion_stim = _flatten_to_solve(current, K, tuple(v.shape)) * area
         if intra is not None:
             i_ion_stim = i_ion_stim - _flatten_to_solve(intra, K, tuple(v.shape))
+        return (v_flat + spatial - 0.5 * s1 * i_ion_stim).reshape_as(v)
 
-        v_new_flat = v_flat + delta_axial - 0.5 * s1 * i_ion_stim
-        v_new = v_new_flat.reshape_as(v)
+    def _history_spatial(self, v, v_prev, ve):
+        K = v.shape[-1]
+        v_flat = _flatten_to_solve(v, K, tuple(v.shape))
+        v_prev_flat = _flatten_to_solve(v_prev, K, tuple(v.shape))
+        c_left = _flatten_to_solve(self.c_left, K, tuple(v.shape))
+        c_right = _flatten_to_solve(self.c_right, K, tuple(v.shape))
+        c_axial = _flatten_to_solve(self.c_axial, K, tuple(v.shape))
+        v_padded = _reflect_pad_last(v_flat, (1, 1))
+        num_v_prev = v_prev_flat * (1 - c_axial)
+        num_axial_v = c_left * v_padded[:, :-2] + c_right * v_padded[:, 2:]
+        if ve is not None:
+            ve_flat = _flatten_to_solve(ve, K, tuple(v.shape))
+            ve_padded = _reflect_pad_last(ve_flat, (1, 1))
+            num_axial_ve = c_left * (ve_padded[:, :-2] - ve_flat) + c_right * (
+                ve_padded[:, 2:] - ve_flat
+            )
+            return num_v_prev + num_axial_v + num_axial_ve
+        return num_v_prev + num_axial_v
 
+    def _history_voltage(self, v, v_prev, spatial, current, conductance, intra):
+        del v_prev
+        K = v.shape[-1]
+        area = _flatten_to_solve(self.area, K, tuple(v.shape))
+        s1 = _flatten_to_solve(self.s1, K, tuple(v.shape))
+        s3 = _flatten_to_solve(self.s3, K, tuple(v.shape))
+        c_axial = _flatten_to_solve(self.c_axial, K, tuple(v.shape))
+        i_ion_stim = _flatten_to_solve(current, K, tuple(v.shape)) * area
+        if intra is not None:
+            i_ion_stim = i_ion_stim - _flatten_to_solve(intra, K, tuple(v.shape))
+        num_ion = -s1 * i_ion_stim
+        numerator = spatial + num_ion
+        denominator = (
+            1 + c_axial + (0.5 * s3 * _flatten_to_solve(conductance, K, tuple(v.shape)))
+        )
+        return (numerator / denominator).reshape_as(v)
+
+    def _step_initial(self, v, ve, dt, temp, intra=None, *, call_local_currents=False):
+        """Construct the missing previous time level with one Euler step."""
+        spatial = self._initial_spatial(v, ve)
+        self._advance_pre_current(v, dt, temp)
+        i_mem, accepted_frame = self._initial_current_frame(
+            v, call_local_currents=call_local_currents
+        )
+        v_new = self._initial_voltage(v, spatial, i_mem, intra)
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
-            v_new_flat = _flatten_to_solve(v_new, K)
-
         self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
-            i_cap = 2.0 * (v_new_flat - v_flat) / s1
-            i_membrane = i_cap + _flatten_to_solve(i_mem, K) * area
-            i_membrane = i_membrane.reshape_as(v)
-
+            i_cap = 2.0 * (v_new - v) / self.s1
+            i_membrane = i_cap + i_mem * self.area
         return v_new, v, i_membrane
 
     def _step(
@@ -938,61 +1271,28 @@ class _dufort_frankel(Integrator):
         dt,
         temp,
         intra=None,
+        *,
+        call_local_currents=False,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        # The stimulus current `intra` is added to the numerator.
-        K = v.shape[-1]
-        v_flat = _flatten_to_solve(v, K)
-        v_prev_flat = _flatten_to_solve(v_prev, K)
-        c_left = _flatten_to_solve(self.c_left, K)
-        c_right = _flatten_to_solve(self.c_right, K)
-        c_axial = _flatten_to_solve(self.c_axial, K)
-
-        v_padded = _reflect_pad_last(v_flat, (1, 1))
-        num_v_prev = v_prev_flat * (1 - c_axial)
-        num_axial_v = c_left * v_padded[:, :-2] + c_right * v_padded[:, 2:]
-
-        if ve is not None:
-            ve_flat = _flatten_to_solve(ve, K, tuple(v.shape))
-            ve_padded = _reflect_pad_last(ve_flat, (1, 1))
-            num_axial_ve = c_left * (ve_padded[:, :-2] - ve_flat) + c_right * (
-                ve_padded[:, 2:] - ve_flat
-            )
-            num = num_v_prev + num_axial_v + num_axial_ve
-        else:
-            num = num_v_prev + num_axial_v
-
+        spatial = self._history_spatial(v, v_prev, ve)
         self._advance_pre_current(v, dt, temp)
-        i_ion, gtot = self.mech.idf(v, v_prev)
-        i_frame = self._capture_ion_current_frame()
-        g_frame = self._capture_ion_conductance_frame()
-        area = _flatten_to_solve(self.area, K)
-        s1 = _flatten_to_solve(self.s1, K)
-        s3 = _flatten_to_solve(self.s3, K)
-        i_ion_stim = _flatten_to_solve(i_ion, K) * area
-        if intra is not None:
-            i_ion_stim = i_ion_stim - _flatten_to_solve(intra, K, tuple(v.shape))
-        num_ion = -s1 * i_ion_stim
-
-        numerator = num + num_ion
-        denominator = 1 + c_axial + (0.5 * s3 * _flatten_to_solve(gtot, K))
-        v_new = (numerator / denominator).reshape_as(v)
+        i_ion, gtot, i_frame, g_frame = self._dufort_current_frame(
+            v, v_prev, call_local_currents=call_local_currents
+        )
+        v_new = self._history_voltage(v, v_prev, spatial, i_ion, gtot, intra)
         accepted_frame = self._linearize_ion_current_frame(
             i_frame, g_frame, v_new, conductance_scale=0.5
         )
         i_mem = i_ion + 0.5 * gtot * v_new
-
         if self.smoothing:
             v_new = self.beta * v_new + (1 - self.beta) * _filter_last(
                 self.filter, v_new
             )
-
         self._advance_post_current(v, dt, temp, accepted_frame)
         i_membrane = None
         if self.imem:
-            i_cap = (_flatten_to_solve(v_new, K) - v_prev_flat) / s1
-            i_membrane = i_cap + _flatten_to_solve(i_mem, K) * area
-            i_membrane = i_membrane.reshape_as(v)
-
+            i_cap = (v_new - v_prev) / self.s1
+            i_membrane = i_cap + i_mem * self.area
         return v_new, v, i_membrane
 
     # The rest of the class methods (init_v, detach) do not need changes.
