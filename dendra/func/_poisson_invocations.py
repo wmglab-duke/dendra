@@ -1,4 +1,4 @@
-"""Cold capability checks for fixed Poisson mechanism invocation profiles."""
+"""Cold capability checks for fixed Poisson waveform invocation profiles."""
 
 from __future__ import annotations
 
@@ -8,25 +8,27 @@ import torch
 from torch.func import functional_call
 from torch.utils import _pytree
 
+from dendra.helpers import current_check_purity
+
 from ._types import FunctionalizationError
 
 
-def _instrument(module, entries):
+def _instrument(module, bindings):
     counts, names, order = {}, {}, []
-    for entry in entries:
-        node = module.get_submodule(entry.mapping.rsplit(".", 1)[0])
+    for name, path in bindings:
+        node = module.get_submodule(path) if path else module
         identity = id(node)
-        names.setdefault(identity, []).append(entry.key)
+        names.setdefault(identity, []).append(name)
         if identity in counts:
             continue
         counts[identity] = 0
         original = node.fn
 
-        def counted(self, times, *, _original=original, _identity=identity):
+        def counted(self, *args, _original=original, _identity=identity, **kwargs):
             del self
             counts[_identity] += 1
             order.append(_identity)
-            return _original(times)
+            return _original(*args, **kwargs)
 
         node.fn = MethodType(counted, node)
     return counts, names, order
@@ -53,6 +55,68 @@ def _check(counts, names, order, phase):
     )
 
 
+def profile_waveform_invocations(waveform, node_paths, times, *, check_purity=None):
+    """Observe registered child calls on a disposable fixed-schedule recipe.
+
+    ``waveform`` is an isolated execution root whose randomized Poisson nodes
+    already consume explicit schedules. The returned paths retain the authored
+    call order and repetitions, rather than the module registration order.
+    Registered operands, including shared tensors, are owned by this probe.
+    Class-state and global-RNG diagnostics follow the frozen purity policy;
+    the trusted path does not inventory authored Python state.
+    """
+    from ._population import (
+        _authored_workspace_classes,
+        _class_state_snapshot,
+        _deepcopy_execution_module,
+        _global_rng_snapshot,
+        _restore_class_state,
+        _restore_global_rng,
+    )
+
+    device = times.device
+    if check_purity is None:
+        check_purity = current_check_purity()
+    snapshot = _global_rng_snapshot(device) if check_purity else None
+    classes = (
+        _class_state_snapshot(_authored_workspace_classes(waveform))
+        if check_purity
+        else None
+    )
+    try:
+        with torch.inference_mode(False), torch.no_grad():
+            execution = _deepcopy_execution_module(waveform)
+            aliases, operands = {}, {}
+            for name, value in (
+                *execution.named_parameters(remove_duplicate=False),
+                *execution.named_buffers(remove_duplicate=False),
+            ):
+                if id(value) not in aliases:
+                    aliases[id(value)] = value.detach().clone(
+                        memory_format=torch.preserve_format
+                    )
+                operands[name] = aliases[id(value)]
+            counts, names, order = _instrument(
+                execution, ((path, path) for path in node_paths)
+            )
+            functional_call(
+                execution,
+                operands,
+                (times.detach().clone(),),
+                tie_weights=False,
+                strict=True,
+            )
+            _counts, paths = _check(counts, names, order, "waveform evaluation")
+            return paths
+    finally:
+        try:
+            if classes is not None:
+                _restore_class_state(classes)
+        finally:
+            if snapshot is not None:
+                _restore_global_rng(snapshot, device)
+
+
 def validate_poisson_invocations(functional, tensors):
     """Capture a fixed, ordered invocation recipe on disposable operands.
 
@@ -67,6 +131,7 @@ def validate_poisson_invocations(functional, tensors):
     entries = tuple(entry for entry in plan.entries if entry.kind == "mechanism")
     if not entries:
         return
+    bindings = tuple((entry.key, entry.mapping.rsplit(".", 1)[0]) for entry in entries)
     from ._population import (
         _authored_workspace_classes,
         _class_state_snapshot,
@@ -78,8 +143,14 @@ def validate_poisson_invocations(functional, tensors):
         _restore_global_rng,
     )
 
-    snapshot = _global_rng_snapshot(functional.device)
-    classes = _class_state_snapshot(_authored_workspace_classes(functional._transition))
+    snapshot = (
+        _global_rng_snapshot(functional.device) if functional._check_purity else None
+    )
+    classes = (
+        _class_state_snapshot(_authored_workspace_classes(functional._transition))
+        if functional._check_purity
+        else None
+    )
     try:
         with torch.inference_mode(False), torch.no_grad():
             parameters, constants, state = _pytree.tree_map_only(
@@ -93,7 +164,7 @@ def validate_poisson_invocations(functional, tensors):
             )
             transition = _deepcopy_execution_module(functional._transition)
             _rebind_population_time_references(transition.population)
-            counts, names, order = _instrument(transition, entries)
+            counts, names, order = _instrument(transition, bindings)
             functional_call(
                 transition,
                 mapping,
@@ -117,7 +188,7 @@ def validate_poisson_invocations(functional, tensors):
             if functional._initialization is not None:
                 initialization = _deepcopy_execution_module(functional._initialization)
                 _rebind_population_time_references(initialization.population)
-                counts, names, order = _instrument(initialization, entries)
+                counts, names, order = _instrument(initialization, bindings)
                 # Rebuild every mapping tensor after the step so even a trusted
                 # authored in-place write cannot become initializer input.
                 parameters, constants, state = _pytree.tree_map_only(
@@ -157,6 +228,8 @@ def validate_poisson_invocations(functional, tensors):
             )
     finally:
         try:
-            _restore_class_state(classes)
+            if classes is not None:
+                _restore_class_state(classes)
         finally:
-            _restore_global_rng(snapshot, functional.device)
+            if snapshot is not None:
+                _restore_global_rng(snapshot, functional.device)

@@ -370,11 +370,70 @@ class _CustomLeaf(Waveform):
         return torch.exp(-times.square())
 
 
-def test_custom_outer_poisson_composition_rejects_an_unknown_invocation_topology():
-    waveform = _CustomOuter(_waveform(seed=3), _waveform(seed=5))
-    population, _ = _case(_InjectedLeak, waveform=waveform)
-    with pytest.raises(dn.func.FunctionalizationError, match="[Cc]ustom"):
-        dn.func.make_functional(population, dt=DT)
+@pytest.mark.parametrize("diagnostic", (False, True))
+def test_custom_outer_preserves_authored_poisson_order(diagnostic):
+    def case():
+        waveform = _CustomOuter(_waveform(seed=3), _waveform(seed=5))
+        return _case(_InjectedLeak, waveform=waveform)
+
+    population, _ = case()
+    native, _ = case()
+    with dn.ctx(CHECK_PURITY=diagnostic):
+        functional, tensors = dn.func.make_functional(population, dt=DT)
+        frozen = _clone(tensors)
+        prepared = functional.prepare(tensors.parameters, tensors.constants)
+        state = tensors.state
+        for _ in range(3):
+            packet = functional.sample_stimulation_draw(state)
+            state, _ = functional.step(
+                tensors.parameters,
+                prepared,
+                state,
+                dn.func.StepInput(stimulation=packet),
+            )
+            native.step(DT)
+            _close(state, functional.extract(native).state)
+        _close(tensors, frozen)
+
+
+class _UnusedPoissonChild(Waveform):
+    FUNCTIONAL_PURE = True
+
+    def __init__(self, child):
+        super().__init__()
+        self.child = child
+
+    def fn(self, times):
+        return torch.ones_like(times) * self.child.waveform.amp
+
+
+@pytest.mark.parametrize("diagnostic", (False, True))
+def test_custom_container_without_random_calls_keeps_rng_and_schedule(diagnostic):
+    def case():
+        pulse = _waveform(amp=0.2 * nA)
+        return _population("intra", waveform=_UnusedPoissonChild(pulse))[0], pulse
+
+    source, pulse = case()
+    native, _ = case()
+    before_rng = pulse.generator.get_state().clone()
+    with dn.ctx(CHECK_PURITY=diagnostic):
+        functional, tensors = dn.func.make_functional(source, dt=DT)
+        frozen = _clone(tensors)
+        prepared = functional.prepare(tensors.parameters, tensors.constants)
+        state = tensors.state
+        for _ in range(3):
+            packet = functional.sample_stimulation_draw(state)
+            state, _ = functional.step(
+                tensors.parameters,
+                prepared,
+                state,
+                dn.func.StepInput(stimulation=packet),
+            )
+            native.step(DT)
+            _close(state, functional.extract(native).state)
+            _close(state["stimulation"], tensors.state["stimulation"])
+        _close(tensors, frozen)
+    _close(pulse.generator.get_state(), before_rng)
 
 
 def test_custom_leaf_inside_a_poisson_envelope_remains_supported():

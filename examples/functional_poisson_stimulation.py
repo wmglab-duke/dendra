@@ -8,11 +8,31 @@ import torch
 import dendra as dn
 from dendra.models.mechanisms import Mechanism
 from dendra.models.mod import pas
+from dendra.models.stim.waveform import Waveform
 from dendra.units import nA
 
 DT = 0.025
 STEPS = 8
 DTYPE = torch.float64
+
+
+# region custom-waveform
+class OrderedPoissonWaveform(Waveform):
+    FUNCTIONAL_PURE = True
+    Waveform.PARAMETER(gain=0.7)
+
+    def __init__(self, first, second, **kwargs):
+        super().__init__(**kwargs)
+        self.first, self.second = first, second
+
+    def fn(self, times):
+        second = self.second.fn(times)
+        first = self.first.fn(times)
+        repeated = self.first.fn(times)
+        return self.gain * (second + first + 0.25 * repeated)
+
+
+# endregion custom-waveform
 
 
 # region repeated-mechanism
@@ -54,27 +74,37 @@ def make_population(*, mechanism=False):
         )
         population.insert(TwiceDrivenLeak if mechanism else pas, g=0.001, e=-65.0)
         # region waveform
-        pulse = dn.mono_rect(amp=0.2 if mechanism else 0.2 * nA, pw=0.045).poisson(
+        generator = torch.Generator().manual_seed(17)
+        pulse = dn.mono_rect(amp=0.2 if mechanism else 0.2 * nA, pw=0.045)
+        first = pulse.poisson(
             interval=0.055,
             n=5,
             start=-0.035,
             noise=0.7,
             randomize_every_call=True,
-            generator=torch.Generator().manual_seed(17),
+            generator=generator,
         )
-        waveform = pulse + pulse
+        second = pulse.poisson(
+            interval=0.08,
+            n=5,
+            start=-0.02,
+            noise=0.7,
+            randomize_every_call=True,
+            generator=generator,
+        )
+        waveform = OrderedPoissonWaveform(first, second)
         population[:, 1].inject(waveform)
         # endregion waveform
         population.train()
         population.initialize()
         population.detach()
-    return population, pulse
+    return population, waveform
 
 
 def run_demo(*, mechanism=False):
     population, waveform = make_population(mechanism=mechanism)
     native, native_waveform = make_population(mechanism=mechanism)
-    source_rng = waveform.generator.get_state().clone()
+    source_rng = waveform.first.generator.get_state().clone()
     global_rng = torch.get_rng_state().clone()
     # region explicit-draws
     functional, tensors = dn.func.make_functional(population, dt=DT)
@@ -106,12 +136,18 @@ def run_demo(*, mechanism=False):
         for name, value in tensors.parameters.items()
         if name.endswith("waveform.amp")
     )
-    actual = torch.autograd.grad(final["integrator"]["v"].square().mean(), amplitude)[0]
+    gain = next(
+        value for name, value in tensors.parameters.items() if name.endswith(".gain")
+    )
+    actual = torch.autograd.grad(
+        final["integrator"]["v"].square().mean(), (amplitude, gain)
+    )
     expected = torch.autograd.grad(
-        native.v.square().mean(), native_waveform.waveform.amp
-    )[0]
+        native.v.square().mean(),
+        (native_waveform.first.waveform.amp, native_waveform.gain),
+    )
     torch.testing.assert_close(actual, expected)
-    assert actual.abs().sum() > 0
+    assert all(gradient.abs().sum() > 0 for gradient in actual)
     # endregion gradients
 
     # region compiled
@@ -120,7 +156,7 @@ def run_demo(*, mechanism=False):
         dt=DT,
         steps=STEPS,
         inference=False,
-        trainable=("*waveform.amp",),
+        trainable=("*waveform.amp", "*gain"),
         checkpoint_every=4,
         callbacks={"trace": dn.func.Recorder(("v", "t"))},
         backend="aot_eager",
@@ -131,7 +167,7 @@ def run_demo(*, mechanism=False):
     continued, second = runner(prefix, callback_state=first["callbacks"].state)
     assert second["callbacks"]["trace"]["t"][-1] > first["callbacks"]["trace"]["t"][-1]
     # endregion compiled
-    torch.testing.assert_close(waveform.generator.get_state(), source_rng)
+    torch.testing.assert_close(waveform.first.generator.get_state(), source_rng)
     torch.testing.assert_close(torch.get_rng_state(), global_rng)
     torch.testing.assert_close(prefix["integrator"]["v"], final["integrator"]["v"])
     assert torch.isfinite(continued["integrator"]["v"]).all()

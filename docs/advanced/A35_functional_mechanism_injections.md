@@ -178,9 +178,12 @@ functional plan. Runtime injection registration inside captured execution is
 currently unsupported.
 
 Custom waveform hooks call registered children directly, for example
-`self.child(t)` or `self.child.recipe(t)`. Calling through a local module alias
-or dispatching a helper through an indexed `ModuleList` is currently
-unsupported. Built-in waveform compositions support their ordinary APIs.
+`self.child(t)` or `self.child.recipe(t)`. Constant indices and keys in
+`torch.nn.ModuleList`, `torch.nn.ModuleDict`, and `torch.nn.Sequential` are
+also supported, including helper calls such as `self.helpers[0].recipe(t)`.
+Optional purity diagnostics currently cannot qualify calls through a local
+module alias or a runtime-selected child index. Built-in waveform compositions
+support their ordinary APIs.
 
 ```{code-cell} python
 :load: ../../examples/functional_mechanism_injections.py

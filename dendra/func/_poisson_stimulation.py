@@ -14,12 +14,8 @@ from dendra.models.stim.waveform._poisson import (
     sample_poisson_draws,
 )
 from dendra.models.stim.waveform.core import (
-    Product,
-    Reciprocal,
-    Sum,
     _poisson,
     _randomized_poisson,
-    _repeat,
 )
 
 from ._types import FunctionalizationError, StimulationDraw
@@ -45,25 +41,6 @@ def randomized_nodes(waveform):
     """Visit authored registration paths, including shared physical nodes."""
 
     def visit(module, path):
-        canonical = (
-            _randomized_poisson,
-            _poisson,
-            _repeat,
-            Sum,
-            Product,
-            Reciprocal,
-            torch.nn.ModuleList,
-            torch.nn.ModuleDict,
-        )
-        if type(module) not in canonical and any(
-            type(child) is _randomized_poisson
-            for child in module.modules()
-            if child is not module
-        ):
-            raise FunctionalizationError(
-                "Custom waveform containers with randomized Poisson children are currently unsupported; "
-                "compose Poisson waveforms with Waveform arithmetic or repeat()."
-            )
         if type(module) is _randomized_poisson:
             if module.n is None:
                 raise FunctionalizationError(
@@ -112,32 +89,6 @@ def poisson_event_slots(module):
             "are currently unsupported; use a fixed outer count or noise=0."
         )
     return int(module._spike_times.shape[0])
-
-
-def randomized_invocations(waveform):
-    """Unfold canonical waveform calls in their native evaluation order."""
-    result = []
-
-    def visit(module, path):
-        if type(module) is _randomized_poisson:
-            result.append(path)
-        if isinstance(module, _poisson):
-            if any(
-                type(child) is _randomized_poisson
-                for child in module.waveform.modules()
-            ):
-                for _ in range(poisson_event_slots(module)):
-                    visit(module.waveform, f"{path}.waveform" if path else "waveform")
-        elif type(module) in (Sum, Product):
-            for index, child in enumerate(module.waveforms):
-                visit(child, f"{path + '.' if path else ''}waveforms.{index}")
-        elif type(module) is Reciprocal:
-            visit(module.wf, f"{path}.wf" if path else "wf")
-        elif type(module) is _repeat:
-            visit(module.waveform, f"{path}.waveform" if path else "waveform")
-
-    visit(waveform, "")
-    return tuple(result)
 
 
 def configure_execution(module):
@@ -260,9 +211,21 @@ class PoissonStimulationPlan:
                         )
                     )
                     local_entries[path] = entries[-1]
-                bank_calls.extend(
-                    local_entries[path] for path in randomized_invocations(waveform)
-                )
+                if local_entries:
+                    from ._poisson_invocations import profile_waveform_invocations
+
+                    times = (
+                        self.population.t.detach()
+                        .to(dtype=functional.dtype, device=functional.device)
+                        .reshape(-1)
+                    )
+                    order = profile_waveform_invocations(
+                        bank._bank.waveforms[index],
+                        tuple(local_entries),
+                        times,
+                        check_purity=functional._check_purity,
+                    )
+                    bank_calls.extend(local_entries[path] for path in order)
         from ._mechanism_injections import mechanism_injection_owners
 
         for owner_path, owner in mechanism_injection_owners(self.population):
@@ -298,7 +261,10 @@ class PoissonStimulationPlan:
         }
         self.enabled = bool(entries)
         self.has_initialization = any(entry.kind == "mechanism" for entry in entries)
-        self._runtime_keys = frozenset(entry.key for entry in self.entries)
+        self._runtime_keys = frozenset(
+            {entry.key for entry in bank_calls}
+            | {entry.key for entry in entries if entry.kind == "mechanism"}
+        )
         self._initialization_keys = frozenset(
             entry.key for entry in self.entries if entry.kind == "mechanism"
         )
@@ -332,7 +298,7 @@ class PoissonStimulationPlan:
                     "Poisson invocation counts must be non-negative integers."
                 )
         self._runtime_keys = frozenset(
-            {entry.key for entry in self.entries if entry.kind != "mechanism"}
+            {entry.key for entry in self._bank_entries}
             | {key for key, count in runtime.items() if count}
         )
         self._initialization_keys = frozenset(

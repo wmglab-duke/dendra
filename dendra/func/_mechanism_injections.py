@@ -516,62 +516,134 @@ def _validate_waveform_dependencies(waveform):
             if instruction.opname != "LOAD_FAST" or instruction.argval != receiver_name:
                 continue
             current = module
-            chain = []
-            for following in instructions[position + 1 :]:
-                if following.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
-                    break
-                chain.append(following)
-            for index, following in enumerate(chain):
-                name = following.argval
-                if name in current._modules:
-                    current = current._modules[name]
-                    if current is None:
-                        break
-                    if index == len(chain) - 1:
-                        direct_call = following.opname == "LOAD_METHOD" or (
-                            sys.version_info >= (3, 12)
-                            and following.opname == "LOAD_ATTR"
-                            and bool(following.arg & 1)
+            cursor = position + 1
+            path = []
+            while cursor < len(instructions):
+                following = instructions[cursor]
+                indexed = (
+                    type(current)
+                    in (
+                        torch.nn.ModuleList,
+                        torch.nn.ModuleDict,
+                        torch.nn.Sequential,
+                    )
+                    and following.opname == "LOAD_CONST"
+                    and cursor + 1 < len(instructions)
+                    and instructions[cursor + 1].opname == "BINARY_SUBSCR"
+                )
+                if indexed:
+                    index = following.argval
+                    if type(current) is torch.nn.ModuleDict and type(index) is str:
+                        child = current._modules.get(index, missing)
+                    elif (
+                        type(current)
+                        in (
+                            torch.nn.ModuleList,
+                            torch.nn.Sequential,
                         )
-                        if not direct_call and not function.__module__.startswith(
-                            "dendra."
+                        and type(index) is int
+                    ):
+                        children = tuple(current._modules.values())
+                        child = (
+                            children[index]
+                            if -len(children) <= index < len(children)
+                            else missing
+                        )
+                    else:
+                        child = missing
+                    if child is missing:
+                        raise FunctionalizationError(
+                            f"Waveform helper {label!r} purity cannot be proven for registered child index {index!r}"
+                        )
+                    current = child
+                    name = repr(index)
+                    path.append(f"[{name}]")
+                    cursor += 2
+                elif following.opname in {"LOAD_ATTR", "LOAD_METHOD"}:
+                    name = following.argval
+                    path.append(f".{name}")
+                    cursor += 1
+                    if name not in current._modules:
+                        if name in current._parameters or name in current._buffers:
+                            break
+                        from ._torch_parametrizations import property_signature
+
+                        if (
+                            property_signature(current, name, label=label, strict=True)
+                            is not None
                         ):
-                            raise FunctionalizationError(
-                                f"Waveform helper {label!r} purity cannot be proven when registered child module {name!r} escapes a direct call; call its helper directly"
-                            )
-                        if type(current) in (
+                            # Canonical getters dispatch registered pure transforms.
+                            break
+                        target = inspect.getattr_static(current, name, missing)
+                        if target is not missing:
+                            visit(current, target, label + "".join(path))
+                        break
+                    current = current._modules[name]
+                else:
+                    break
+                if current is None:
+                    break
+                if cursor < len(instructions) and (
+                    instructions[cursor].opname in {"LOAD_ATTR", "LOAD_METHOD"}
+                    or (
+                        type(current)
+                        in (
                             torch.nn.ModuleList,
                             torch.nn.ModuleDict,
                             torch.nn.Sequential,
-                        ):
-                            for child_name, child in current.named_children():
-                                visit(
-                                    child,
-                                    inspect.getattr_static(child, "forward", missing),
-                                    f"{label}.{name}.{child_name}.forward",
-                                )
-                        else:
-                            visit(
-                                current,
-                                inspect.getattr_static(current, "forward", missing),
-                                f"{label}.{name}.forward",
-                            )
-                    continue
-                if name in current._parameters or name in current._buffers:
-                    break
-                from ._torch_parametrizations import property_signature
-
-                if (
-                    property_signature(current, name, label=label, strict=True)
-                    is not None
+                        )
+                        and instructions[cursor].opname == "LOAD_CONST"
+                        and cursor + 1 < len(instructions)
+                        and instructions[cursor + 1].opname == "BINARY_SUBSCR"
+                    )
                 ):
-                    # The canonical getter dispatches the registered pure
-                    # transforms; its optional global cache is not authored
-                    # numerical state and is bypassed on execution copies.
-                    break
-                target = inspect.getattr_static(current, name, missing)
-                if target is not missing:
-                    visit(current, target, f"{label}.{name}")
+                    continue
+                direct_call = following.opname == "LOAD_METHOD" or (
+                    sys.version_info >= (3, 12)
+                    and following.opname == "LOAD_ATTR"
+                    and bool(following.arg & 1)
+                )
+                if indexed:
+                    # An indexed module call has a null call sentinel before
+                    # its receiver. A module passed to another helper or stored
+                    # in a local has no such sentinel and remains opaque.
+                    direct_call = (
+                        position > 0
+                        and instructions[position - 1].opname == "PUSH_NULL"
+                        and cursor < len(instructions)
+                        and instructions[cursor].opname
+                        in {
+                            "LOAD_FAST",
+                            "LOAD_CONST",
+                            "LOAD_DEREF",
+                            "LOAD_GLOBAL",
+                            "PUSH_NULL",
+                            "KW_NAMES",
+                            "PRECALL",
+                            "CALL",
+                        }
+                    )
+                if not direct_call and not function.__module__.startswith("dendra."):
+                    raise FunctionalizationError(
+                        f"Waveform helper {label!r} purity cannot be proven when registered child module {name!r} escapes a direct call; call its helper directly"
+                    )
+                if type(current) in (
+                    torch.nn.ModuleList,
+                    torch.nn.ModuleDict,
+                    torch.nn.Sequential,
+                ):
+                    for child_name, child in current.named_children():
+                        visit(
+                            child,
+                            inspect.getattr_static(child, "forward", missing),
+                            f"{label}{''.join(path)}.{child_name}.forward",
+                        )
+                else:
+                    visit(
+                        current,
+                        inspect.getattr_static(current, "forward", missing),
+                        f"{label}{''.join(path)}.forward",
+                    )
                 break
 
     visit(

@@ -524,6 +524,13 @@ class Product(Waveform):
         return super().__truediv__(other)
 
 
+def _poisson_randomization_policy(waveform):
+    """Return the authored policy across native and pure execution adapters."""
+    return isinstance(waveform, _randomized_poisson) or getattr(
+        waveform, "_functional_poisson_recipe", False
+    )
+
+
 class _poisson(Waveform):
     """
     Wrap a single-waveform generator so that it is emitted at
@@ -561,7 +568,9 @@ class _poisson(Waveform):
     def randomize_every_call(self) -> bool:
         """Whether evaluation regenerates the schedule before every call."""
 
-        return isinstance(self, _randomized_poisson)
+        # Pure execution selects a fresh explicit schedule on each call while
+        # keeping generator dispatch outside the numerical waveform recipe.
+        return _poisson_randomization_policy(self)
 
     @randomize_every_call.setter
     def randomize_every_call(self, enabled: bool) -> None:

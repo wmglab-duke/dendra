@@ -979,6 +979,113 @@ def test_plan_rejects_opaque_child_module_helper_dispatch(kind):
         waveform.child = Child()
     else:
         waveform.layers = torch.nn.ModuleList([Child()])
+    with pytest.raises(
+        dn.func.FunctionalizationError,
+        match=(
+            "purity cannot be proven" if kind == "alias" else "hidden mutable numerical"
+        ),
+    ):
+        MechanismInjectionPlan(_population(waveform))
+
+
+class _IndexedPureChild(torch.nn.Module):
+    FUNCTIONAL_PURE = True
+
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("factor", torch.tensor(0.2))
+
+    def forward(self, t):
+        return self.recipe(t)
+
+    def recipe(self, t):
+        return torch.ones_like(t) * self.factor
+
+
+@pytest.mark.parametrize("container", ("list", "dict", "sequential", "nested"))
+@pytest.mark.parametrize("dispatch", ("call", "helper"))
+def test_plan_audits_static_indexed_child_calls_and_helpers(container, dispatch):
+    if container == "dict":
+
+        def call(self, t):
+            return self.layers["leaf"](t=t)
+
+        def helper(self, t):
+            return self.layers["leaf"].recipe(t=t)
+
+        layers = torch.nn.ModuleDict({"leaf": _IndexedPureChild()})
+    elif container == "nested":
+
+        def call(self, t):
+            return self.layers["group"][0](t=t)
+
+        def helper(self, t):
+            return self.layers["group"][0].recipe(t=t)
+
+        layers = torch.nn.ModuleDict(
+            {
+                "group": torch.nn.ModuleList([_IndexedPureChild()]),
+            }
+        )
+    else:
+
+        def call(self, t):
+            return self.layers[-1](t=t)
+
+        def helper(self, t):
+            return self.layers[-1].recipe(t=t)
+
+        container_type = (
+            torch.nn.ModuleList if container == "list" else torch.nn.Sequential
+        )
+        layers = (
+            container_type([_IndexedPureChild()])
+            if container == "list"
+            else container_type(_IndexedPureChild())
+        )
+    waveform_type = type(
+        f"Indexed_{container}_{dispatch}",
+        (Waveform,),
+        {"FUNCTIONAL_PURE": True, "fn": call if dispatch == "call" else helper},
+    )
+    waveform = waveform_type()
+    waveform.layers = layers
+    plan = MechanismInjectionPlan(_population(waveform))
+    plan.validate_source()
+
+
+def _indirect_indexed_recipe(module, t):
+    return module.recipe(t)
+
+
+@pytest.mark.parametrize("kind", ("alias", "dynamic", "external"))
+def test_indexed_children_cannot_escape_into_unproven_dispatch(kind):
+    class Child(_IndexedPureChild):
+        def forward(self, t):
+            return torch.ones_like(t) * self.factor
+
+        def recipe(self, t):
+            return torch.ones_like(t) * _HIDDEN_TENSOR
+
+    def alias(self, t):
+        child = self.layers[0]
+        return child.recipe(t)
+
+    def dynamic(self, t):
+        return self.layers[self.position].recipe(t)
+
+    def external(self, t):
+        return _indirect_indexed_recipe(self.layers[0], t)
+
+    functions = {"alias": alias, "dynamic": dynamic, "external": external}
+    waveform_type = type(
+        f"Escaping_indexed_{kind}",
+        (Waveform,),
+        {"FUNCTIONAL_PURE": True, "fn": functions[kind]},
+    )
+    waveform = waveform_type()
+    waveform.layers = torch.nn.ModuleList([Child()])
+    waveform.position = 0
     with pytest.raises(dn.func.FunctionalizationError, match="purity cannot be proven"):
         MechanismInjectionPlan(_population(waveform))
 
