@@ -30,6 +30,7 @@ from dendra.models.stim.intra import (
 from dendra.models.stim.waveform import Waveform
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
+from ._module_traversal import _raw_module_namespace, _registered_modules
 from ._rng_diagnostics import _numpy_rng_state_equal
 from ._types import FunctionalizationError
 
@@ -181,21 +182,15 @@ def _validate_waveform_dispatch(module: torch.nn.Module, label: str) -> None:
 
 def _waveform_registered_modules(waveform: Waveform):
     """Visit raw registered children, qualifying dispatch before reading state."""
-    seen = set()
 
-    def visit(path, module):
-        if id(module) in seen:
-            return
-        seen.add(id(module))
-        _validate_waveform_dispatch(module, path or "waveform")
-        yield path, module
-        for name, child in object.__getattribute__(module, "__dict__")[
-            "_modules"
-        ].items():
-            if child is not None:
-                yield from visit(f"{path}.{name}" if path else name, child)
+    def qualified():
+        for path, module in _registered_modules(
+            waveform, namespace=_raw_module_namespace
+        ):
+            _validate_waveform_dispatch(module, path or "waveform")
+            yield path, module
 
-    return visit("", waveform)
+    return qualified()
 
 
 def _is_internal_module_state(module: torch.nn.Module, name: str) -> bool:

@@ -28,6 +28,7 @@ from ._continuous_transform import (
     _tensor_layout,
 )
 from ._mechanism_injections import _binding, _literal
+from ._module_traversal import _registered_modules as _walk_registered_modules
 from ._stimuli import _is_internal_module_state
 from ._types import FunctionalizationError
 
@@ -73,23 +74,7 @@ def _helpers():
 
 def _registered_modules(module, *, duplicates=False):
     """Traverse framework registration dictionaries without authored methods."""
-    seen = set()
-
-    def visit(path, child, ancestors):
-        identity = id(child)
-        if identity in ancestors or (not duplicates and identity in seen):
-            return
-        seen.add(identity)
-        yield path, child
-        for name, nested in vars(child)["_modules"].items():
-            if nested is not None:
-                yield from visit(
-                    f"{path}.{name}" if path else name,
-                    nested,
-                    ancestors | {identity},
-                )
-
-    return visit("", module, set())
+    return _walk_registered_modules(module, duplicates=duplicates)
 
 
 def _registered_tensor_slots(module, *, duplicates=False):

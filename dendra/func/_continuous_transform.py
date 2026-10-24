@@ -18,6 +18,7 @@ from torch.func import functional_call
 
 from dendra.helpers import current_check_purity
 
+from ._module_traversal import _registered_modules
 from ._netcon import _snapshot
 from ._types import FunctionalizationError
 
@@ -60,12 +61,8 @@ _RNG_READ_NAMES = frozenset(
 
 def _safe_modules(module):
     """Traverse raw registrations only after qualifying attribute dispatch."""
-    seen = set()
-
-    def walk(path, child):
-        if id(child) in seen:
-            return
-        seen.add(id(child))
+    modules = []
+    for path, child in _registered_modules(module):
         kind = type(child)
         for cls in kind.__mro__:
             if cls in (torch.nn.Module, object):
@@ -93,12 +90,8 @@ def _safe_modules(module):
                 raise FunctionalizationError(
                     "Continuous transform overrides canonical module metadata traversal."
                 )
-        yield path, child
-        for name, nested in vars(child)["_modules"].items():
-            if nested is not None:
-                yield from walk(f"{path}.{name}" if path else name, nested)
-
-    return tuple(walk("", module))
+        modules.append((path, child))
+    return tuple(modules)
 
 
 def _helpers():
