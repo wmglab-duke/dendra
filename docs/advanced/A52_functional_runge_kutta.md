@@ -7,10 +7,13 @@ kernelspec:
 ---
 
 (functional-runge-kutta)=
-# Runge–Kutta cable models
+# Runge–Kutta models
 
-`dn.func` and `dn.compile(...)` support `dn.rk2` and `dn.rk4` for scalar
-`Unmyelinated` and `Myelinated` Populations with standard geometry. A compatible
+`dn.func` and `dn.compile(...)` support `dn.rk2` and `dn.rk4` for canonical
+`Population` and `SingleCompartment` containers and scalar `Unmyelinated` and
+`Myelinated` Populations with standard geometry. See
+{doc}`A55_functional_point_integrators` for point containers and their native
+spatial semantics when `C>1`. A compatible
 Population can be lowered directly or used in a Network with other supported
 integrators. Both execution styles use the native voltage-stage kernels and
 the shared initialization, stimulation, recording, and checkpoint machinery.

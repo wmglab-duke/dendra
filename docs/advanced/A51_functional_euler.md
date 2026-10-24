@@ -7,11 +7,14 @@ kernelspec:
 ---
 
 (functional-euler)=
-# Forward Euler cable models
+# Forward Euler models
 
 `dn.func` and `dn.compile(...)` support `dn.euler`, its `dn.rk1` alias, and
-`dn.eulerv1` for scalar `Unmyelinated` and `Myelinated` Populations with standard
-geometry. A Network can combine these Populations with Populations using other
+`dn.eulerv1` for canonical `Population` and `SingleCompartment` containers and
+scalar `Unmyelinated` and `Myelinated` Populations with standard geometry.
+See {doc}`A55_functional_point_integrators` for point containers and their
+native spatial semantics when `C>1`.
+A Network can combine these Populations with Populations using other
 supported integrators. Initialization, stimulation, connections, recording,
 random draw tapes, and checkpoint continuation use the same functional APIs.
 For multistage voltage integration, see {doc}`A52_functional_runge_kutta`.

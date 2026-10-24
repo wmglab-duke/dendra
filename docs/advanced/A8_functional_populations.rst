@@ -347,15 +347,20 @@ following properties:
 * ``bwd_euler_sc`` or ``scnv`` for exact standalone ``Population`` and
   ``SingleCompartment``,
   ``bwd_euler_ub`` for ``Unmyelinated``, ``Myelinated``, and native ``Cable``,
-  ``euler``/``rk1``/``eulerv1``/``rk2``/``rk4`` for standard ``Unmyelinated`` and
-  ``Myelinated`` models, or ``df``/``dfh`` for those scalar cable families,
-  ``bwd_euler_bt(method="thomas")`` for ``ExtCellAxon``, ``dhs`` for scalar
+  ``euler``/``rk1``/``eulerv1``/``rk2``/``rk4`` or ``df``/``dfh`` for canonical
+  ``Population``/``SingleCompartment`` containers and standard ``Unmyelinated``
+  and ``Myelinated`` models,
+  ``bwd_euler_bt(method="thomas")`` or ``bwd_euler_bt(method="spd")`` for ``ExtCellAxon``, ``dhs`` for scalar
   ``Tree``, ``dhs_bt`` for ``ExtCellTree``, or the automatically selected
   ``bwd_euler_sc_multi``/``dhs_multi``/``dhs_bt_multi`` integrator for
   ``MultiPopulation``, with optional membrane-current output; and
-* for ``bwd_euler_ub``, a transform-compatible Thomas or PCR solver.
+* for ``bwd_euler_ub``, a transform-compatible Thomas, PCR, or SPD solver.
 
-The Euler and Runge--Kutta cable integrators retain their native convolution stencil,
+Point containers with these explicit or Dufort--Frankel integrators retain
+native spatial coupling when ``C>1``. Use ``N=count, C=1`` for independent
+single-compartment cells; see :doc:`A55_functional_point_integrators`.
+
+The Euler and Runge--Kutta integrators retain their native convolution stencil,
 training-mode symmetry, cylindrical workspace, and explicit timestep stability
 restriction. Networks can mix these Populations with other admitted
 integrators. See :doc:`A51_functional_euler` and
@@ -989,8 +994,8 @@ timestep:
 
 Exact plain ``Population`` and ``SingleCompartment`` models use the same
 functional calls with ``dn.bwd_euler_sc(imem=False)``, their default solver.
-Every ``(N, C)`` slot is an independent membrane compartment, including when
-``C > 1``: for example, ``dn.Population(N=2, C=3)`` contains six independent
+With this solver, every ``(N, C)`` slot is an independent membrane compartment,
+including when ``C > 1``: for example, ``dn.Population(N=2, C=3)`` contains six independent
 compartments, not two three-compartment cables. Intracellular current affects
 each compartment's voltage, while an extracellular ``ve`` input has no effect
 because there are no axial connections. Use an admitted cable or Tree model
@@ -1001,6 +1006,9 @@ same concrete model class rather than treating ``Population`` and
 ``SingleCompartment`` as interchangeable plans.
 These standalone topologies also admit ``dn.scnv()`` for mechanism-owned
 voltage; see :ref:`functional-scnv` for its skipped-solve semantics.
+Euler, Runge--Kutta, and Dufort--Frankel integrators retain native spatial
+coupling when ``C > 1``; see :doc:`A55_functional_point_integrators` for these
+methods and their point-container semantics.
 
 ``Myelinated`` and compatible subclasses use the same calls as
 ``Unmyelinated``. Their canonical fiber diameters and node spacing remain
@@ -1071,6 +1079,8 @@ functional API. A scalar pack contains independently admitted exact
 their admitted subclasses, exact native ``Cable``, or canonical scalar ``Tree``
 components.
 Point components using ``scnv`` are excluded from functional packs.
+Packed point execution uses the selected packed implicit solver; it does not
+retain the components' standalone explicit or Dufort--Frankel integration.
 A finite-extracellular pack instead contains only admitted ``ExtCellAxon``
 and/or canonical ``ExtCellTree`` components, each with two extracellular
 layers. Mixing scalar and finite-extracellular components, and nesting

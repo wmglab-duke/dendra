@@ -62,3 +62,4 @@ Advanced
    advanced/A52_functional_runge_kutta.md
    advanced/A53_functional_dufort_frankel.md
    advanced/A54_functional_spd_solvers.md
+   advanced/A55_functional_point_integrators.md

@@ -27,7 +27,7 @@ def _reflect_pad_last(x: torch.Tensor, padding: Tuple[int, int]) -> torch.Tensor
     if left == 0 and right == 0:
         return x
     if size == 1:
-        return F.pad(x, (left, right), mode="replicate")
+        return x.expand(*x.shape[:-1], left + 1 + right)
 
     positions = torch.arange(-left, size + right, device=x.device, dtype=torch.long)
     period = 2 * (size - 1)
@@ -49,12 +49,12 @@ def _has_empty_stencil_vmap_axis(value):
     return False
 
 
-def _empty_weight_conv1d(conv, x, weight, padding):
-    """Retain empty hidden weight lanes unsupported by Conv1d's batching rule.
+def _tensor_stencil_conv1d(conv, x, weight, padding):
+    """Evaluate a small stencil without external convolution buffer aliases.
 
-    The ordinary convolution kernel retains ownership of every nonempty
-    evaluation. Only a zero-sized hidden weight batch uses this equivalent
-    tensor expression; no numerical tensor values are inspected or unwrapped.
+    Single-row reflection and zero-sized hidden input or weight batches use
+    this equivalent tensor expression. Other evaluations retain the ordinary
+    convolution kernel. No numerical tensor values are inspected or unwrapped.
     """
     if conv.padding_mode == "reflect":
         x = _reflect_pad_last(x, padding)
@@ -63,8 +63,18 @@ def _empty_weight_conv1d(conv, x, weight, padding):
     else:
         x = F.pad(x, padding, mode=conv.padding_mode)
     dilation = int(conv.dilation[0])
+    stride = int(conv.stride[0])
     width = (int(weight.shape[-1]) - 1) * dilation + 1
-    windows = x.unfold(-1, width, int(conv.stride[0]))[..., ::dilation]
+    count = (x.shape[-1] - width) // stride + 1
+    # Static tap slices keep the empty-lane reverse path in ordinary tensor
+    # operations; unfold_backward has no zero-batch vmap rule.
+    windows = torch.stack(
+        [
+            x[..., offset : offset + count * stride : stride]
+            for offset in range(0, width, dilation)
+        ],
+        dim=-1,
+    )
     result = (windows.unsqueeze(1) * weight.unsqueeze(0).unsqueeze(-2)).sum(
         dim=(-1, -3)
     )
@@ -78,12 +88,18 @@ def _conv1d_forward(
 ) -> torch.Tensor:
     """Run Conv1d with robust reflection padding for short final axes."""
     padding = tuple(int(value) for value in conv._reversed_padding_repeated_twice)
-    if (
-        conv.groups == 1
-        and torch._C._are_functorch_transforms_active()
-        and _has_empty_stencil_vmap_axis(weight)
+    # Single-row channel views can look contiguous to Inductor's reuse
+    # planner while RK stages still need aliases of their stack storage.
+    if conv.groups == 1 and (
+        (conv.padding_mode == "reflect" and x.shape[0] == 1)
+        or (
+            torch._C._are_functorch_transforms_active()
+            and (
+                _has_empty_stencil_vmap_axis(x) or _has_empty_stencil_vmap_axis(weight)
+            )
+        )
     ):
-        return _empty_weight_conv1d(conv, x, weight, padding)
+        return _tensor_stencil_conv1d(conv, x, weight, padding)
     if conv.padding_mode == "reflect" and (
         padding[0] >= x.shape[-1] or padding[1] >= x.shape[-1]
     ):

@@ -539,12 +539,28 @@ def _scalar_path_integrator_profile(integrator):
     return "scalar_path", _bwd_euler_ub
 
 
+def _scalar_point_integrator_profile(integrator):
+    """Resolve point-container numerics without changing their native stencil.
+
+    Explicit point containers use the same final-axis spatial operator as
+    scalar cables. The implicit point integrators retain their independent
+    compartment equations and workspace layouts.
+    """
+    profile = _scalar_path_integrator_profile(integrator)
+    if profile[0] in {"scalar_explicit_path", "scalar_dufort_path"}:
+        return profile
+    if isinstance(integrator, _bwd_euler_sc_skip):
+        return "scalar_point_skip", _bwd_euler_sc_skip
+    return "scalar_point", _bwd_euler_sc
+
+
 def _functional_initialization_profile(population):
     """Return the audited initializer family for ``population``.
 
     Population and SingleCompartment lowering remain exact-type because general
-    subclasses are not admitted by the transition contract. Both use the same
-    independent-compartment equations. Unmyelinated subclasses may add
+    subclasses are not admitted by the transition contract. Their selected
+    integrator determines independent-compartment or spatial explicit
+    equations. Unmyelinated subclasses may add
     mechanisms and construction-time parameterization while retaining the same
     scalar-path voltage and lifecycle semantics; their inherited hooks are
     checked against the canonical base separately. Canonical scalar Trees use
@@ -575,24 +591,13 @@ def _functional_initialization_profile(population):
     if _is_extcell_tree(population):
         return ExtCellTree, "block_tree", _dhs_bt
     if _is_scalar_point(population):
-        if isinstance(population.integrator, _bwd_euler_sc_skip):
-            return (
-                (
-                    SingleCompartment
-                    if isinstance(population, SingleCompartment)
-                    else Population
-                ),
-                "scalar_point_skip",
-                _bwd_euler_sc_skip,
-            )
         return (
             (
                 SingleCompartment
                 if isinstance(population, SingleCompartment)
                 else Population
             ),
-            "scalar_point",
-            _bwd_euler_sc,
+            *_scalar_point_integrator_profile(population.integrator),
         )
     if isinstance(population, Myelinated):
         return Myelinated, *_scalar_path_integrator_profile(population.integrator)
@@ -9333,10 +9338,8 @@ def _functionalization_failures(
                 "integrator state contract"
             )
     elif is_single_compartment:
-        point_kind = (
-            "scalar_point_skip"
-            if isinstance(population.integrator, _bwd_euler_sc_skip)
-            else "scalar_point"
+        point_kind, implementation = _scalar_point_integrator_profile(
+            population.integrator
         )
         if (
             _resolve_functional_integrator_spec(
@@ -9347,8 +9350,12 @@ def _functionalization_failures(
         ):
             failures.append(
                 "Population/SingleCompartment functionalization requires exactly "
-                "bwd_euler_sc or scnv"
+                "bwd_euler_sc, scnv, or canonical Euler/rk1/eulerv1/rk2/rk4/df/dfh"
             )
+        elif implementation in _SCALAR_EXPLICIT_INTEGRATORS:
+            failures.extend(_explicit_stencil_failures(population.integrator))
+        elif implementation in _SCALAR_DUFORT_INTEGRATORS:
+            failures.extend(_dufort_configuration_failures(population.integrator))
     elif is_unmyelinated or is_myelinated or is_native_cable:
         operator_kind, implementation = (
             _scalar_path_integrator_profile(population.integrator)
@@ -11226,10 +11233,8 @@ class FunctionalPopulation:
             # runtime trees would make every functional mapping clone unused
             # voltage, mechanism, ion, and child-integrator tensors.
             _strip_packed_component_runtime_aliases(execution_population)
-        point_kind = (
-            "scalar_point_skip"
-            if isinstance(execution_population.integrator, _bwd_euler_sc_skip)
-            else "scalar_point"
+        point_kind, _point_implementation = _scalar_point_integrator_profile(
+            execution_population.integrator
         )
         operator_kind = {
             "single_compartment": point_kind,

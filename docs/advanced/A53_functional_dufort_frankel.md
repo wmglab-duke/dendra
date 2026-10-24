@@ -7,10 +7,13 @@ kernelspec:
 ---
 
 (functional-dufort-frankel)=
-# Dufort–Frankel cable models
+# Dufort–Frankel models
 
-`dn.func` and `dn.compile(...)` support `dn.df()` and `dn.dfh()` for scalar
-`Unmyelinated` and `Myelinated` Populations with standard geometry. A compatible
+`dn.func` and `dn.compile(...)` support `dn.df()` and `dn.dfh()` for canonical
+`Population` and `SingleCompartment` containers and scalar `Unmyelinated` and
+`Myelinated` Populations with standard geometry. See
+{doc}`A55_functional_point_integrators` for point containers and their native
+spatial semantics when `C>1`. A compatible
 Population can be lowered directly, independently of Networks. Networks can
 combine these Populations with other supported integrators. Native and
 functional execution share the voltage equations, current evaluation,
