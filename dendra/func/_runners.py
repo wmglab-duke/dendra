@@ -508,6 +508,31 @@ def _slice_inputs(inputs: RolloutInput, start: int, stop: int) -> RolloutInput:
     )
 
 
+def _prepare_chunk_inputs(functional, state, inputs, start, stop):
+    """Slice explicit inputs and sample missing packets at one host boundary."""
+    chunk_steps = stop - start
+    chunk_inputs = _slice_inputs(inputs, start, stop)
+    chunk_inputs = functional._sample_missing_runtime_draws(
+        state, chunk_inputs, chunk_steps
+    )
+    if (
+        functional._noise_plan is not None
+        and functional._noise_plan.runtime
+        and chunk_inputs.noise is None
+    ):
+        chunk_inputs = chunk_inputs._replace(
+            noise=functional.sample_noise_draw_tape(state, chunk_steps)
+        )
+    if (
+        getattr(functional, "_poisson_plan", None) is not None
+        and chunk_inputs.stimulation is None
+    ):
+        chunk_inputs = chunk_inputs._replace(
+            stimulation=functional.sample_stimulation_draw_tape(state, chunk_steps)
+        )
+    return chunk_inputs
+
+
 def _prepare_extra(functional, extra, inputs):
     if extra is None:
         return None, None
@@ -847,25 +872,7 @@ def _execute_chunks(
     auxiliary = None
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
-        chunk_inputs = _slice_inputs(inputs, start, stop)
-        chunk_inputs = functional._sample_missing_runtime_draws(
-            state, chunk_inputs, stop - start
-        )
-        if (
-            functional._noise_plan is not None
-            and functional._noise_plan.runtime
-            and chunk_inputs.noise is None
-        ):
-            chunk_inputs = chunk_inputs._replace(
-                noise=functional.sample_noise_draw_tape(state, stop - start)
-            )
-        if (
-            getattr(functional, "_poisson_plan", None) is not None
-            and chunk_inputs.stimulation is None
-        ):
-            chunk_inputs = chunk_inputs._replace(
-                stimulation=functional.sample_stimulation_draw_tape(state, stop - start)
-            )
+        chunk_inputs = _prepare_chunk_inputs(functional, state, inputs, start, stop)
         extra_ve = _assemble_extra_chunk(
             functional,
             extra_plan,
@@ -918,25 +925,7 @@ def _execute_chunks_with_callbacks(
     auxiliary = None
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
-        chunk_inputs = _slice_inputs(inputs, start, stop)
-        chunk_inputs = functional._sample_missing_runtime_draws(
-            state, chunk_inputs, stop - start
-        )
-        if (
-            functional._noise_plan is not None
-            and functional._noise_plan.runtime
-            and chunk_inputs.noise is None
-        ):
-            chunk_inputs = chunk_inputs._replace(
-                noise=functional.sample_noise_draw_tape(state, stop - start)
-            )
-        if (
-            getattr(functional, "_poisson_plan", None) is not None
-            and chunk_inputs.stimulation is None
-        ):
-            chunk_inputs = chunk_inputs._replace(
-                stimulation=functional.sample_stimulation_draw_tape(state, stop - start)
-            )
+        chunk_inputs = _prepare_chunk_inputs(functional, state, inputs, start, stop)
         extra_ve = _assemble_extra_chunk(
             functional,
             extra_plan,
@@ -1010,25 +999,7 @@ def _execute_checkpointed_chunks(
     for start, stop in _execution_spans(steps, chunklength):
         chunk_steps = stop - start
         start_clock = _capture_clock(state)
-        chunk_inputs = _slice_inputs(inputs, start, stop)
-        chunk_inputs = functional._sample_missing_runtime_draws(
-            state, chunk_inputs, stop - start
-        )
-        if (
-            functional._noise_plan is not None
-            and functional._noise_plan.runtime
-            and chunk_inputs.noise is None
-        ):
-            chunk_inputs = chunk_inputs._replace(
-                noise=functional.sample_noise_draw_tape(state, stop - start)
-            )
-        if (
-            getattr(functional, "_poisson_plan", None) is not None
-            and chunk_inputs.stimulation is None
-        ):
-            chunk_inputs = chunk_inputs._replace(
-                stimulation=functional.sample_stimulation_draw_tape(state, stop - start)
-            )
+        chunk_inputs = _prepare_chunk_inputs(functional, state, inputs, start, stop)
         checkpoint_inputs = _materialize_checkpoint_tree(
             (
                 state,
