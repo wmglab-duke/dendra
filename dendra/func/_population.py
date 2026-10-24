@@ -87,8 +87,12 @@ from dendra.models.mechanisms._numerical import (
 from dendra.models.mechanisms._spatial import SpatialOperator1D, SpatialOperatorTree
 from dendra.models.mechanisms._state import State
 from dendra.models.mechanisms._state_slots import (
+    local_field_bindings,
+    local_source_bindings,
     module_carry_slots,
+    read_local_bindings,
     saved_buffer_slots,
+    shared_field_slots,
     state_carry_slots,
     state_value_slots,
 )
@@ -3367,14 +3371,16 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
         )
 
     for ion_name, ion in handler.ions.items():
-        for field in ion.fields:
-            keys[f"{ion_name}_ion.{field}"] = ("ions", ion_name, field)
+        for slot in shared_field_slots(ion, f"{ion_name}_ion", ion.fields):
+            keys[slot.checkpoint_suffix] = ("ions", ion_name, slot.name)
     for material_name, material in handler.materials.items():
-        for field in material.fields:
-            keys[f"{material_name}_material.{field}"] = (
+        for slot in shared_field_slots(
+            material, f"{material_name}_material", material.fields
+        ):
+            keys[slot.checkpoint_suffix] = (
                 "materials",
                 material_name,
-                field,
+                slot.name,
             )
     for checkpoint_key, public_path in _persistent_shared_local_keys(handler).items():
         keys.setdefault(checkpoint_key, public_path)
@@ -3383,47 +3389,24 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
 
 def _local_synchronization_keys(handler) -> set[str]:
     """Return transient local mirrors reconstructed from canonical carry."""
-    keys = set()
-    for ion_map in handler.read_ion.values():
-        for mechanism_name, fields in ion_map.items():
-            keys.update(f"{mechanism_name}.{field}" for field in fields)
-    for material_map in handler.read_material.values():
-        for mechanism_name, fields in material_map.items():
-            keys.update(f"{mechanism_name}.{field}" for field in fields)
-    return keys
+    return {binding.checkpoint_key for binding in read_local_bindings(handler)}
 
 
 def _persistent_shared_local_keys(handler) -> dict[str, tuple[str, ...]]:
     """Classify write/source locals that are not rebound from shared fields."""
     transient = _local_synchronization_keys(handler)
     keys = {}
-    for ion_map in handler.write_ion_c.values():
-        for mechanism_name, fields in ion_map.items():
-            for field in fields:
-                checkpoint_key = f"{mechanism_name}.{field}"
-                if checkpoint_key not in transient:
-                    keys.setdefault(
-                        checkpoint_key,
-                        ("ion_write_buffers", mechanism_name, field),
-                    )
-    for material_map in handler.write_material.values():
-        for mechanism_name, fields in material_map.items():
-            for field in fields:
-                checkpoint_key = f"{mechanism_name}.{field}"
-                if checkpoint_key not in transient:
-                    keys.setdefault(
-                        checkpoint_key,
-                        ("material_write_buffers", mechanism_name, field),
-                    )
-    for material_map in handler.source_material.values():
-        for mechanism_name, field_map in material_map.items():
-            for local_name in field_map.values():
-                checkpoint_key = f"{mechanism_name}.{local_name}"
-                if checkpoint_key not in transient:
-                    keys.setdefault(
-                        checkpoint_key,
-                        ("material_source_buffers", mechanism_name, local_name),
-                    )
+    for mapping_name, group, bindings in (
+        ("write_ion_c", "ion_write_buffers", local_field_bindings),
+        ("write_material", "material_write_buffers", local_field_bindings),
+        ("source_material", "material_source_buffers", local_source_bindings),
+    ):
+        for binding in bindings(getattr(handler, mapping_name).values()):
+            if binding.checkpoint_key not in transient:
+                keys.setdefault(
+                    binding.checkpoint_key,
+                    (group, binding.mechanism_name, binding.name),
+                )
     return keys
 
 
@@ -4182,10 +4165,13 @@ def _local_synchronization_slots(population: Population) -> tuple[str, ...]:
         module_paths.setdefault(id(owner), module_path)
 
     slots = []
-    for checkpoint_key in _local_synchronization_keys(handler):
-        owner_name, separator, buffer_name = checkpoint_key.partition(".")
-        if not separator:
-            continue  # pragma: no cover - handler keys are always qualified
+    keys, bindings = set(), {}
+    for binding in read_local_bindings(handler):
+        keys.add(binding.checkpoint_key)
+        bindings.setdefault(binding.checkpoint_key, binding)
+    for checkpoint_key in keys:
+        binding = bindings[checkpoint_key]
+        owner_name, buffer_name = binding.mechanism_name, binding.name
         owner = (
             handler.mechanisms[owner_name] if owner_name in handler.mechanisms else None
         )

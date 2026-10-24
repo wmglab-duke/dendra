@@ -25,8 +25,11 @@ from ._noise_workspaces import (
 )
 from ._state import _is_unresolved_deferred_buffer
 from ._state_slots import (
+    local_binding_groups,
+    material_local_buffer_names,
     module_carry_slots,
     saved_buffer_slots,
+    shared_field_slots,
     state_carry_slots,
     state_value_slots,
 )
@@ -2943,18 +2946,7 @@ class MechanismHandler(torch.nn.Module):
 
     def _material_local_buffer_names(self):
         """Return mechanism-local material buffers that cross step boundaries."""
-        names = {}
-        for material_map in (self.read_material, self.write_material):
-            for mechanism_map in material_map.values():
-                for mech_name, fields in mechanism_map.items():
-                    names.setdefault(mech_name, set()).update(fields)
-        for mechanism_map in self.source_material.values():
-            for mech_name, field_map in mechanism_map.items():
-                names.setdefault(mech_name, set()).update(field_map.values())
-        return {
-            mech_name: tuple(sorted(buffer_names))
-            for mech_name, buffer_names in names.items()
-        }
+        return material_local_buffer_names(self)
 
     def mutable_state_dict(self):
         """
@@ -3020,32 +3012,36 @@ class MechanismHandler(torch.nn.Module):
             capture_module(mech, mech_name)
         for process_name, process in self.material_processes.items():
             capture_module(process, process_name)
-        for ion, ion_read in self.read_ion.items():
-            for k, conc_list in ion_read.items():
-                mech = self.mechanisms[k]
-                for conc in conc_list:
-                    states[f"{k}.{conc}"] = mech._buffers[conc]
-        for ion, ion_write in self.write_ion_c.items():
-            for k, conc_list in ion_write.items():
-                mech = self.mechanisms[k]
-                for conc in conc_list:
-                    states[f"{k}.{conc}"] = mech._buffers[conc]
+        for mapping_name in ("read_ion", "write_ion_c"):
+            groups = local_binding_groups(
+                mapping for _ion, mapping in getattr(self, mapping_name).items()
+            )
+            for mech_name, concentrations in groups:
+                mech = self.mechanisms[mech_name]
+                for concentration in concentrations:
+                    states[f"{mech_name}.{concentration}"] = mech._buffers[
+                        concentration
+                    ]
         for mech_name, buffer_names in self._material_local_buffer_names().items():
             mech = self.mechanisms[mech_name]
             for buffer_name in buffer_names:
                 states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
         for ion_name, ion in self.ions.items():
-            for buffer_name in getattr(
-                ion, "fields", tuple(dict(ion.named_buffers()).keys())
+            for slot in shared_field_slots(
+                ion,
+                f"{ion_name}_ion",
+                getattr(ion, "fields", tuple(dict(ion.named_buffers()).keys())),
             ):
-                states[f"{ion_name}_ion.{buffer_name}"] = ion._buffers[buffer_name]
+                states[slot.checkpoint_suffix] = slot.owner._buffers[slot.name]
         for material_name, material in self.materials.items():
-            for buffer_name in getattr(
-                material, "fields", tuple(dict(material.named_buffers()).keys())
+            for slot in shared_field_slots(
+                material,
+                f"{material_name}_material",
+                getattr(
+                    material, "fields", tuple(dict(material.named_buffers()).keys())
+                ),
             ):
-                states[f"{material_name}_material.{buffer_name}"] = material._buffers[
-                    buffer_name
-                ]
+                states[slot.checkpoint_suffix] = slot.owner._buffers[slot.name]
         # Capture an actual boundary snapshot: later in-place simulation updates
         # must not mutate the saved tensors. Preserve graph connectivity and
         # aliases by cloning once per distinct tensor object.
@@ -3565,32 +3561,32 @@ class MechanismHandler(torch.nn.Module):
         for process_name, process in self.material_processes.items():
             add_module(process, process_name)
 
-        for ion_read in self.read_ion.values():
-            for mech_name, concentrations in ion_read.items():
-                mech = self.mechanisms[mech_name]
-                for concentration in concentrations:
-                    key = f"{mech_name}.{concentration}"
-                    add_tensor(mech, concentration, key)
-                    for state in mech.DE.values():
-                        add_tensor(state, concentration, key)
-        for ion_write in self.write_ion_c.values():
-            for mech_name, concentrations in ion_write.items():
-                mech = self.mechanisms[mech_name]
-                for concentration in concentrations:
-                    key = f"{mech_name}.{concentration}"
-                    add_tensor(mech, concentration, key)
-                    for state in mech.DE.values():
-                        state_value = getattr(state, concentration, missing)
-                        add_tensor(
-                            state,
-                            concentration,
-                            key,
-                            reference=(
-                                mech._buffers[concentration]
-                                if state_value is missing
-                                else state_value
-                            ),
-                        )
+        for mech_name, concentrations in local_binding_groups(self.read_ion.values()):
+            mech = self.mechanisms[mech_name]
+            for concentration in concentrations:
+                key = f"{mech_name}.{concentration}"
+                add_tensor(mech, concentration, key)
+                for state in mech.DE.values():
+                    add_tensor(state, concentration, key)
+        for mech_name, concentrations in local_binding_groups(
+            self.write_ion_c.values()
+        ):
+            mech = self.mechanisms[mech_name]
+            for concentration in concentrations:
+                key = f"{mech_name}.{concentration}"
+                add_tensor(mech, concentration, key)
+                for state in mech.DE.values():
+                    state_value = getattr(state, concentration, missing)
+                    add_tensor(
+                        state,
+                        concentration,
+                        key,
+                        reference=(
+                            mech._buffers[concentration]
+                            if state_value is missing
+                            else state_value
+                        ),
+                    )
         for mech_name, buffer_names in self._material_local_buffer_names().items():
             mech = self.mechanisms[mech_name]
             for buffer_name in buffer_names:
@@ -3599,19 +3595,21 @@ class MechanismHandler(torch.nn.Module):
                 for state in mech.DE.values():
                     add_tensor(state, buffer_name, key)
         for ion_name, ion in self.ions.items():
-            for buffer_name in getattr(
-                ion, "fields", tuple(dict(ion.named_buffers()).keys())
+            for slot in shared_field_slots(
+                ion,
+                f"{ion_name}_ion",
+                getattr(ion, "fields", tuple(dict(ion.named_buffers()).keys())),
             ):
-                add_tensor(ion, buffer_name, f"{ion_name}_ion.{buffer_name}")
+                add_tensor(slot.owner, slot.name, slot.checkpoint_suffix)
         for material_name, material in self.materials.items():
-            for buffer_name in getattr(
-                material, "fields", tuple(dict(material.named_buffers()).keys())
+            for slot in shared_field_slots(
+                material,
+                f"{material_name}_material",
+                getattr(
+                    material, "fields", tuple(dict(material.named_buffers()).keys())
+                ),
             ):
-                add_tensor(
-                    material,
-                    buffer_name,
-                    f"{material_name}_material.{buffer_name}",
-                )
+                add_tensor(slot.owner, slot.name, slot.checkpoint_suffix)
 
         return {
             "assignments": list(assignment_map.values()),
