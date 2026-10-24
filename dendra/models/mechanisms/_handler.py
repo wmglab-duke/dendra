@@ -24,6 +24,12 @@ from ._noise_workspaces import (
     retain_noise_workspace_once,
 )
 from ._state import _is_unresolved_deferred_buffer
+from ._state_slots import (
+    module_carry_slots,
+    saved_buffer_slots,
+    state_carry_slots,
+    state_value_slots,
+)
 from ._support import SupportKind
 from ._support_registry import SupportRegistry
 
@@ -2972,66 +2978,48 @@ class MechanismHandler(torch.nn.Module):
                 },
             }
         }
-        for mech_name, mech in self.mechanisms.items():
-            _capture_stochastic_state(states, mech_name, mech)
-            for state_key, state in mech.DE.items():
-                for state_name in sorted(state._state):
-                    states[f"{mech_name}.{state_name}"] = getattr(mech, state_name)
-                for buffer_name in sorted(_runtime_state_buffer_names(state)):
-                    states[f"{mech_name}.DE.{state_key}.{buffer_name}"] = (
-                        state._buffers[buffer_name]
+
+        def capture_module(module, prefix):
+            _capture_stochastic_state(states, prefix, module)
+            for state_key, state in module.DE.items():
+                for slot in state_value_slots(module, state):
+                    states[f"{prefix}.{slot.checkpoint_suffix}"] = getattr(
+                        slot.owner, slot.name
                     )
-                _capture_stochastic_state(states, f"{mech_name}.DE.{state_key}", state)
-            for buffer_name in _runtime_mechanism_carry_names(mech):
-                states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
-            for saved_name in sorted(mech._save):
-                buffer_name = f"{saved_name}_"
-                states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
+                for slot in state_carry_slots(
+                    state_key, state, _runtime_state_buffer_names(state)
+                ):
+                    states[f"{prefix}.{slot.checkpoint_suffix}"] = slot.owner._buffers[
+                        slot.name
+                    ]
+                _capture_stochastic_state(states, f"{prefix}.DE.{state_key}", state)
+            for slot in module_carry_slots(
+                module, _runtime_mechanism_carry_names(module)
+            ):
+                states[f"{prefix}.{slot.checkpoint_suffix}"] = slot.owner._buffers[
+                    slot.name
+                ]
+            for slot in saved_buffer_slots(module):
+                states[f"{prefix}.{slot.checkpoint_suffix}"] = slot.owner._buffers[
+                    slot.name
+                ]
             # Delayed-state queues and ring pointers are registered dynamically,
             # so they are not necessarily present in Mechanism._assigned.
-            for name in sorted(mech._delayed_state_specs):
-                spec = mech._delayed_state_specs[name]
+            for name in sorted(module._delayed_state_specs):
+                spec = module._delayed_state_specs[name]
                 for spec_key in ("buffer", "pointer", "steps_buffer"):
                     buffer_name = spec.get(spec_key)
-                    if buffer_name is not None and buffer_name in mech._buffers:
-                        states[f"{mech_name}.{buffer_name}"] = mech._buffers[
-                            buffer_name
-                        ]
-            if mech._delayed_state_specs:
-                states[f"{mech_name}{_DELAY_SPEC_STATE_SUFFIX}"] = copy.deepcopy(
-                    mech._delayed_state_specs
+                    if buffer_name is not None and buffer_name in module._buffers:
+                        states[f"{prefix}.{buffer_name}"] = module._buffers[buffer_name]
+            if module._delayed_state_specs:
+                states[f"{prefix}{_DELAY_SPEC_STATE_SUFFIX}"] = copy.deepcopy(
+                    module._delayed_state_specs
                 )
+
+        for mech_name, mech in self.mechanisms.items():
+            capture_module(mech, mech_name)
         for process_name, process in self.material_processes.items():
-            _capture_stochastic_state(states, process_name, process)
-            for state_key, state in process.DE.items():
-                for state_name in sorted(state._state):
-                    states[f"{process_name}.{state_name}"] = getattr(
-                        process, state_name
-                    )
-                for buffer_name in sorted(_runtime_state_buffer_names(state)):
-                    states[f"{process_name}.DE.{state_key}.{buffer_name}"] = (
-                        state._buffers[buffer_name]
-                    )
-                _capture_stochastic_state(
-                    states, f"{process_name}.DE.{state_key}", state
-                )
-            for buffer_name in _runtime_mechanism_carry_names(process):
-                states[f"{process_name}.{buffer_name}"] = process._buffers[buffer_name]
-            for saved_name in sorted(process._save):
-                buffer_name = f"{saved_name}_"
-                states[f"{process_name}.{buffer_name}"] = process._buffers[buffer_name]
-            for name in sorted(process._delayed_state_specs):
-                spec = process._delayed_state_specs[name]
-                for spec_key in ("buffer", "pointer", "steps_buffer"):
-                    buffer_name = spec.get(spec_key)
-                    if buffer_name is not None and buffer_name in process._buffers:
-                        states[f"{process_name}.{buffer_name}"] = process._buffers[
-                            buffer_name
-                        ]
-            if process._delayed_state_specs:
-                states[f"{process_name}{_DELAY_SPEC_STATE_SUFFIX}"] = copy.deepcopy(
-                    process._delayed_state_specs
-                )
+            capture_module(process, process_name)
         for ion, ion_read in self.read_ion.items():
             for k, conc_list in ion_read.items():
                 mech = self.mechanisms[k]
@@ -3540,31 +3528,36 @@ class MechanismHandler(torch.nn.Module):
         def add_module(module, prefix):
             add_stochastic(module, prefix, (prefix,))
             for state_key, state in module.DE.items():
-                state_names = tuple(sorted(state._state))
-                for state_name in state_names:
-                    add_tensor(module, state_name, f"{prefix}.{state_name}")
-                for buffer_name in sorted(_runtime_state_buffer_names(state)):
+                state_slots = tuple(state_value_slots(module, state))
+                for slot in state_slots:
                     add_tensor(
-                        state,
-                        buffer_name,
-                        f"{prefix}.DE.{state_key}.{buffer_name}",
+                        slot.owner, slot.name, f"{prefix}.{slot.checkpoint_suffix}"
+                    )
+                for slot in state_carry_slots(
+                    state_key, state, _runtime_state_buffer_names(state)
+                ):
+                    add_tensor(
+                        slot.owner,
+                        slot.name,
+                        f"{prefix}.{slot.checkpoint_suffix}",
                         optional=True,
                     )
                 add_stochastic(
                     state,
                     f"{prefix}.DE.{state_key}",
-                    tuple(f"{prefix}.{name}" for name in state_names),
+                    tuple(f"{prefix}.{slot.checkpoint_suffix}" for slot in state_slots),
                 )
-            for buffer_name in _runtime_mechanism_carry_names(module):
+            for slot in module_carry_slots(
+                module, _runtime_mechanism_carry_names(module)
+            ):
                 # Registered histories can have a different saved capacity.
                 # Their metadata below supplies the exact queue shape and
                 # pointer constraints, including when storage is also CARRY.
-                if buffer_name in module._delay_history_buffer_names:
+                if slot.name in module._delay_history_buffer_names:
                     continue
-                add_tensor(module, buffer_name, f"{prefix}.{buffer_name}")
-            for saved_name in sorted(module._save):
-                buffer_name = f"{saved_name}_"
-                add_tensor(module, buffer_name, f"{prefix}.{buffer_name}")
+                add_tensor(slot.owner, slot.name, f"{prefix}.{slot.checkpoint_suffix}")
+            for slot in saved_buffer_slots(module):
+                add_tensor(slot.owner, slot.name, f"{prefix}.{slot.checkpoint_suffix}")
             add_delayed_state(module, prefix)
 
         for mech_name, mech in self.mechanisms.items():

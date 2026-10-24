@@ -86,6 +86,12 @@ from dendra.models.mechanisms._numerical import (
 )
 from dendra.models.mechanisms._spatial import SpatialOperator1D, SpatialOperatorTree
 from dendra.models.mechanisms._state import State
+from dendra.models.mechanisms._state_slots import (
+    module_carry_slots,
+    saved_buffer_slots,
+    state_carry_slots,
+    state_value_slots,
+)
 from dendra.models.mechanisms._support import SupportKind
 from dendra.models.mechanisms._support_registry import SupportEntry, SupportRegistry
 from dendra.models.mechanisms._symbolic import build_numerical_equation
@@ -3308,40 +3314,40 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
                     ] = ("noise_workspaces", path, suffix)
     from ._mechanism_delays import mechanism_delay_state_slots
 
-    for mechanism_name, mechanism in handler.mechanisms.items():
-        for state in mechanism.DE.values():
-            for state_name in sorted(state._state):
-                keys[f"{mechanism_name}.{state_name}"] = (
-                    "mechanisms",
-                    mechanism_name,
-                    state_name,
+    def add_declared_keys(name, module, state_group, buffer_group, state_buffer_group):
+        for state in module.DE.values():
+            for slot in state_value_slots(module, state):
+                keys[f"{name}.{slot.checkpoint_suffix}"] = (
+                    state_group,
+                    name,
+                    slot.name,
                 )
-        for buffer_name in sorted(mechanism._carry):
-            keys[f"{mechanism_name}.{buffer_name}"] = (
-                "mechanism_buffers",
-                mechanism_name,
-                buffer_name,
-            )
-        for buffer_name, _value in mechanism_delay_state_slots(mechanism):
+        for slot in module_carry_slots(module, sorted(module._carry)):
+            keys[f"{name}.{slot.checkpoint_suffix}"] = (buffer_group, name, slot.name)
+        for buffer_name, _value in mechanism_delay_state_slots(module):
             keys.setdefault(
-                f"{mechanism_name}.{buffer_name}",
-                ("mechanism_buffers", mechanism_name, buffer_name),
+                f"{name}.{buffer_name}",
+                (buffer_group, name, buffer_name),
             )
-        for saved_name in sorted(mechanism._save):
-            buffer_name = f"{saved_name}_"
-            keys[f"{mechanism_name}.{buffer_name}"] = (
-                "mechanism_buffers",
-                mechanism_name,
-                buffer_name,
-            )
-        for state_name, state in mechanism.DE.items():
-            for buffer_name in sorted(state._carry):
-                keys[f"{mechanism_name}.DE.{state_name}.{buffer_name}"] = (
-                    "state_buffers",
-                    mechanism_name,
+        for slot in saved_buffer_slots(module):
+            keys[f"{name}.{slot.checkpoint_suffix}"] = (buffer_group, name, slot.name)
+        for state_name, state in module.DE.items():
+            for slot in state_carry_slots(state_name, state, state._carry):
+                keys[f"{name}.{slot.checkpoint_suffix}"] = (
+                    state_buffer_group,
+                    name,
                     state_name,
-                    buffer_name,
+                    slot.name,
                 )
+
+    for mechanism_name, mechanism in handler.mechanisms.items():
+        add_declared_keys(
+            mechanism_name,
+            mechanism,
+            "mechanisms",
+            "mechanism_buffers",
+            "state_buffers",
+        )
 
     for process_name, process in handler.material_processes.items():
         from dendra.models.mechanisms._material_stochasticity import (
@@ -3352,39 +3358,13 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
             keys[
                 f"{process_name}.__dendra_stochastic_state__.material_workspace.{suffix}"
             ] = ("material_preparation", process_name, suffix)
-        for state in process.DE.values():
-            for state_name in sorted(state._state):
-                keys[f"{process_name}.{state_name}"] = (
-                    "material_processes",
-                    process_name,
-                    state_name,
-                )
-        for buffer_name in sorted(process._carry):
-            keys[f"{process_name}.{buffer_name}"] = (
-                "material_process_buffers",
-                process_name,
-                buffer_name,
-            )
-        for buffer_name, _value in mechanism_delay_state_slots(process):
-            keys.setdefault(
-                f"{process_name}.{buffer_name}",
-                ("material_process_buffers", process_name, buffer_name),
-            )
-        for saved_name in sorted(process._save):
-            buffer_name = f"{saved_name}_"
-            keys[f"{process_name}.{buffer_name}"] = (
-                "material_process_buffers",
-                process_name,
-                buffer_name,
-            )
-        for state_name, state in process.DE.items():
-            for buffer_name in sorted(state._carry):
-                keys[f"{process_name}.DE.{state_name}.{buffer_name}"] = (
-                    "material_process_state_buffers",
-                    process_name,
-                    state_name,
-                    buffer_name,
-                )
+        add_declared_keys(
+            process_name,
+            process,
+            "material_processes",
+            "material_process_buffers",
+            "material_process_state_buffers",
+        )
 
     for ion_name, ion in handler.ions.items():
         for field in ion.fields:
