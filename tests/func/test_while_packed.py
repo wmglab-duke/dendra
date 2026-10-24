@@ -119,18 +119,23 @@ def test_nonzero_offset_views_preserve_clone_strides_values_versions_and_ownersh
     assert versions == tuple(value._version for value in _tensor_leaves(tree))
 
 
-def test_generic_pack_and_public_copy_preserve_autograd_identity():
+def test_generic_pack_and_carry_copy_preserve_autograd_identity():
     # The executor is inference-only; its generic storage utility nevertheless
     # must not detach values or add a dependency on format-only templates.
     source = torch.linspace(-0.5, 0.5, 6, dtype=torch.float64, requires_grad=True)
     value = source.reshape(3, 2).T
     tree = {"x": value, "alias": value.view_as(value)}
-    templates = {name: torch.empty_like(leaf) for name, leaf in tree.items()}
+    templates = {
+        name: torch.empty_like(leaf, requires_grad=True) for name, leaf in tree.items()
+    }
     layout = _PackedCarryLayout.from_tree(tree)
     result = _clone_tree_like(layout.unpack(layout.pack(tree)), templates)
     loss = result["x"].square().sum() + result["alias"].square().sum()
-    gradient = torch.autograd.grad(loss, source)[0]
-    torch.testing.assert_close(gradient, 4 * source, rtol=0, atol=0)
+    gradients = torch.autograd.grad(
+        loss, (source, *templates.values()), allow_unused=True
+    )
+    torch.testing.assert_close(gradients[0], 4 * source, rtol=0, atol=0)
+    assert all(gradient is None for gradient in gradients[1:])
 
 
 def test_layout_rejects_non_tensor_leaves_and_changed_structure():

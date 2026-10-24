@@ -6,6 +6,10 @@ from torch.utils import _pytree as pytree
 
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.func._carry_packing import _PackedCarryLayout
+from dendra.func._hop_inputs import (
+    _isolate_dense_lifted_inputs,
+    _LiftedViewIsolation,
+)
 from dendra.func._scan_tree import _CompiledTensorTreeScan
 
 pytestmark = pytest.mark.cpu
@@ -212,8 +216,6 @@ def test_shared_scan_isolates_lifted_aliases_and_accumulates_shared_gradient(
     "kind", ("slice", "transpose", "expanded", "overlap", "empty", "conj", "neg")
 )
 def test_lifted_input_isolation_preserves_view_layout_and_logical_vjp(kind):
-    from dendra.func._hop_inputs import _isolate_lifted_inputs
-
     source = torch.nn.Parameter(torch.arange(12.0, dtype=torch.float64))
     if kind == "transpose":
         value = source.reshape(3, 4).T
@@ -229,7 +231,8 @@ def test_lifted_input_isolation_preserves_view_layout_and_logical_vjp(kind):
         value = torch._neg_view(source[3:9:2])
     else:
         value = source[3:9:2]
-    first, second = _isolate_lifted_inputs((value, value))
+    isolate_views = _LiftedViewIsolation.from_usage((True, True))
+    first, second = isolate_views((value, value))
     for copied in (first, second):
         torch.testing.assert_close(copied, value)
         assert copied.stride() == value.stride()
@@ -252,8 +255,6 @@ def test_lifted_input_isolation_preserves_view_layout_and_logical_vjp(kind):
 @pytest.mark.parametrize("kind", ("expanded", "overlap"))
 @pytest.mark.parametrize("backend", ("aot_eager", "inductor"))
 def test_compiled_lifted_view_consumers_keep_logical_and_raw_vjps(kind, backend):
-    from dendra.func._hop_inputs import _isolate_lifted_inputs
-
     source = torch.nn.Parameter(torch.arange(12.0, dtype=torch.float64))
     value = (
         source[3:4].expand(2, 3)
@@ -261,16 +262,17 @@ def test_compiled_lifted_view_consumers_keep_logical_and_raw_vjps(kind, backend)
         else source.as_strided((2, 3), (1, 1), 2)
     )
     weights = torch.arange(6.0, dtype=value.dtype).reshape(2, 3) + 0.3
+    isolate_views = _LiftedViewIsolation.from_usage((True, True))
 
     @torch.compile(backend=backend, fullgraph=True)
-    def objective(value):
-        first, second = _isolate_lifted_inputs((value, value))
+    def objective(copies):
+        first, second = _isolate_dense_lifted_inputs(copies)
         return (first * weights).sum() + second.sum()
 
-    # Like the loop engines, consume the copies inside the compiled graph.
-    # Each logical coordinate must retain its own cotangent even if the
-    # original view has overlapping storage.
-    result = objective(value)
+    # The engines isolate authored views at invocation, then isolate dense
+    # operands inside compilation. Each logical coordinate retains its own
+    # cotangent even when the original view has overlapping storage.
+    result = objective(isolate_views((value, value)))
     actual = torch.autograd.grad(result, value, retain_graph=True)[0]
     torch.testing.assert_close(actual, weights + 1)
     raw = torch.autograd.grad(result, source)[0]
@@ -279,20 +281,61 @@ def test_compiled_lifted_view_consumers_keep_logical_and_raw_vjps(kind, backend)
 
 
 def test_lifted_input_isolation_keeps_nonuniform_strided_jvp():
-    from dendra.func._hop_inputs import _isolate_lifted_inputs
-
     value = torch.arange(12.0, dtype=torch.float64)[3:9:2]
     tangent = torch.tensor([0.3, 0.7, 1.2], dtype=value.dtype)
+    isolate_views = _LiftedViewIsolation.from_usage(True)
 
     def view(value):
         return value.as_strided((2,), value.stride(), value.storage_offset()).square()
 
     actual = torch.func.jvp(
-        lambda value: view(_isolate_lifted_inputs(value)), (value,), (tangent,)
+        lambda value: view(isolate_views(value)), (value,), (tangent,)
     )
     expected = torch.func.jvp(view, (value,), (tangent,))
     for result, reference in zip(actual, expected, strict=True):
         torch.testing.assert_close(result, reference)
+
+
+def test_lifted_input_usage_keeps_unused_views_and_splits_dense_isolation():
+    source = torch.nn.Parameter(torch.arange(12.0, dtype=torch.float64))
+    dense = torch.nn.Parameter(torch.tensor([0.2, 0.7], dtype=source.dtype))
+    inputs = {
+        "used": source[3:9:2],
+        "unused": source[1:7:2],
+        "dense": dense,
+        "absent": None,
+    }
+    isolate_views = _LiftedViewIsolation.from_usage(
+        {"used": True, "unused": False, "dense": True, "absent": False}
+    )
+    source_before, source_version = source.detach().clone(), source._version
+    boundary = isolate_views(inputs)
+    assert boundary["unused"] is inputs["unused"]
+    assert boundary["dense"] is dense and boundary["absent"] is None
+    assert not torch._C._is_alias_of(boundary["used"], inputs["used"])
+    assert boundary["used"].stride() == inputs["used"].stride()
+    assert boundary["used"].storage_offset() == inputs["used"].storage_offset()
+
+    operands = _isolate_dense_lifted_inputs(boundary)
+    assert operands["used"] is boundary["used"]
+    assert operands["unused"] is inputs["unused"]
+    assert operands["absent"] is None
+    assert not torch._C._is_alias_of(operands["dense"], dense)
+    objective = operands["used"].square().sum() + operands["dense"].sum()
+    actual = torch.autograd.grad(
+        objective,
+        (source, dense, inputs["unused"]),
+        allow_unused=True,
+        retain_graph=True,
+    )
+    expected = torch.autograd.grad(
+        inputs["used"].square().sum() + dense.sum(), (source, dense)
+    )
+    torch.testing.assert_close(actual[0], expected[0])
+    torch.testing.assert_close(actual[1], expected[1])
+    assert actual[2] is None
+    torch.testing.assert_close(source, source_before)
+    assert source._version == source_version
 
 
 @pytest.mark.parametrize("backend", ("aot_eager", "inductor"))

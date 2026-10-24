@@ -1970,41 +1970,6 @@ def _parameter_alias_paths(module: torch.nn.Module) -> dict[str, tuple[str, ...]
     return {name: tuple(paths) for name, paths in aliases.items()}
 
 
-def _initialization_only_parameter_names(population) -> frozenset[str]:
-    """Identify raw leaves used exclusively by declared shared-field sources."""
-    from ._initialization_sources import _initial_source_entries
-
-    source_parameters = set()
-    source_prefixes = []
-
-    def collect(owner, prefix=""):
-        aliases = {}
-        for path, module in owner.named_modules(remove_duplicate=False):
-            aliases.setdefault(id(module), []).append(path)
-        for path, source in _initial_source_entries(owner, include_tensors=True):
-            parent_path, _separator, slot = path.rpartition(".")
-            parent = _module_at(owner, parent_path)
-            for alias in aliases[id(parent)]:
-                allowed = prefix + f"{alias + '.' if alias else ''}{slot}"
-                if isinstance(source, torch.nn.Module):
-                    source_prefixes.append(allowed + ".")
-                else:
-                    source_parameters.add(allowed)
-        if _is_multi(owner):
-            for name, component in owner.populations.items():
-                collect(component, f"{prefix}populations.{name}.")
-
-    collect(population)
-    return frozenset(
-        name
-        for name, paths in _parameter_alias_paths(population).items()
-        if all(
-            path in source_parameters or path.startswith(tuple(source_prefixes))
-            for path in paths
-        )
-    )
-
-
 class _PreparedPopulation:
     """Opaque plan-bound tensor bundle returned by :meth:`prepare`."""
 
@@ -2755,10 +2720,6 @@ def _install_receiver_audit(process, hook_name):
                 )
 
     setattr(process, hook_name, evaluate)
-
-
-def _install_event_receiver_audit(process):
-    _install_receiver_audit(process, "net_receive_values")
 
 
 def _material_process_failures(process, population=None):

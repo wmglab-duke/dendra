@@ -16,7 +16,7 @@ from torch.utils import _pytree as pytree
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._callback_carry import _CallbackCarryPartition
-from ._carry_packing import _PackedCarryLayout
+from ._carry_packing import _clone_tree_like, _PackedCarryLayout
 from ._hop_inputs import (
     _input_usage,
     _isolate_dense_lifted_inputs,
@@ -272,15 +272,7 @@ class _CompiledTensorTreeWhile:
             final, updated = layout.unpack(packed)
             final = clone_state(final)
             updated = partition.merge(updated, partition.split(carries)[1])
-            updated = pytree.tree_map(
-                lambda value, template: (
-                    torch.empty_like(template).copy_(value)
-                    if torch.is_tensor(value)
-                    else value
-                ),
-                updated,
-                carries,
-            )
+            updated = _clone_tree_like(updated, carries)
             return final, updated, emitted
 
         return materialize

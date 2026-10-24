@@ -153,6 +153,56 @@ def test_shared_loop_without_callbacks_emissions_or_tensor_tapes():
     assert carries == emitted == {}
 
 
+@pytest.mark.parametrize("steps", (1, 5))
+def test_shared_loop_materializes_optional_aliased_carries_with_invocation_formats(
+    steps,
+):
+    def body(parameters, prepared, state, carries, sample):
+        return ({"count": state["count"] + 1}, carries), {}
+
+    source = torch.arange(24, dtype=torch.float64)
+    view = source[2:14:2].reshape(2, 3)
+    carries = {
+        "view": view,
+        "alias": view.view_as(view),
+        "dense": source[3:9].reshape(3, 2).T,
+        "empty": source[5:5],
+        "none": None,
+    }
+    before, version = source.clone(), source._version
+    engine = _CompiledTensorTreeWhile(
+        body,
+        steps=steps,
+        compile_options={"backend": "eager", "fullgraph": True},
+        device="cpu",
+    )
+    initial = {"count": torch.tensor(0)}
+    with torch.no_grad():
+        final, first, emitted = engine({}, {}, initial, carries, None)
+        _, second, _ = engine({}, {}, initial, carries, None)
+    assert final["count"].item() == steps
+    assert emitted == {} and first["none"] is second["none"] is None
+    _close(first, carries)
+    _close(second, carries)
+    outputs = [
+        value for value in pytree.tree_leaves((first, second)) if torch.is_tensor(value)
+    ]
+    for index, value in enumerate(outputs):
+        assert not torch._C._is_alias_of(value, source)
+        assert all(
+            not torch._C._is_alias_of(value, other) for other in outputs[index + 1 :]
+        )
+    for result in (first, second):
+        for name, template in carries.items():
+            if torch.is_tensor(template):
+                assert result[name].stride() == template.clone().stride()
+                assert result[name].storage_offset() == 0
+    first["view"].add_(100)
+    _close(second, carries)
+    torch.testing.assert_close(source, before, rtol=0, atol=0)
+    assert source._version == version
+
+
 @pytest.mark.parametrize("view", (False, True))
 def test_shared_loop_isolates_shared_lifted_fields_and_tape_views(view):
     def body(parameters, prepared, state, carries, sample):

@@ -103,9 +103,12 @@ def _clone_tree_like(values, templates):
     makes non-dense views contiguous. The copy is outside compilation so each
     leaf has genuinely independent storage, even for duplicate logical values.
     It depends only on ``values`` under autograd; templates supply metadata.
+    Non-Tensor leaves pass through unchanged.
     """
     return pytree.tree_map(
-        lambda value, template: torch.empty_like(template).copy_(value),
+        lambda value, template: (
+            torch.empty_like(template).copy_(value) if torch.is_tensor(value) else value
+        ),
         values,
         templates,
     )

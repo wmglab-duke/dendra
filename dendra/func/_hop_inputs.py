@@ -73,10 +73,6 @@ def _isolate_lifted_tensor(value):
     return _IndependentView.apply(value)
 
 
-def _isolate_lifted_inputs(tree):
-    return pytree.tree_map_only(torch.Tensor, _isolate_lifted_tensor, tree)
-
-
 def _input_usage(graph, arguments):
     """Retain only static placeholder-use metadata from an authored step."""
     values, spec = pytree.tree_flatten(arguments)
