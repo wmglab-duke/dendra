@@ -21,8 +21,14 @@ connections in constructors while inheriting their supported execution hooks.
 See {doc}`A56_functional_population_subclasses` for subclass contracts and a
 complete example.
 
-Networks can combine supported scalar and 3×3 block SPD Populations while
-retaining native initialization and checkpoint behavior. See
+Networks can combine supported point, Cable/Tree, extracellular, and packed
+Populations with different admitted integrators. Each solver retains its
+Population's `float32` or `float64` precision; connections apply the native
+source-to-target dtype conversions. Shared parameters retain their aliases
+when their bindings have compatible shapes, dtypes, and devices.
+
+Supported scalar and 3×3 block SPD Populations use the same native
+initialization and checkpoint behavior. See
 {doc}`A54_functional_spd_solvers` for solver selection, matrix requirements,
 and gradient conventions.
 

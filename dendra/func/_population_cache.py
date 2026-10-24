@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 import torch
 
+from dendra.models.mechanisms import ContinuousSynapse
 from dendra.models.networks._population_cache import (
     replay_population_cache_storage,
     restore_population_cache_values,
@@ -432,6 +433,15 @@ class PopulationCachePlan:
                 *(source for _path, source in self.states),
             )
         }
+        # Native continuous resets increment this diagnostic counter. It is
+        # absent from the pure receive frame and numerical carry, so a warmed
+        # cache may differ after the source advances. Its saved schema still
+        # needs validation, but its value does not define frozen topology.
+        continuous_reset_counts = {
+            f"{path + '.' if path else ''}_continuous_reset_count"
+            for path, owner in population.named_modules(remove_duplicate=False)
+            if isinstance(owner, ContinuousSynapse)
+        }
         # Index maps and spatial coordinates participate in the frozen graph,
         # rather than the numerical restoration packet. A same-shaped edit
         # must not silently change a native topology absent from the pure plan.
@@ -440,6 +450,7 @@ class PopulationCachePlan:
             for name, value in slots.items()
             if name in reference
             and name not in preserved
+            and name not in continuous_reset_counts
             and id(value) not in represented
             and (not value.is_floating_point() or name in {"x", "y", "z"})
         )
