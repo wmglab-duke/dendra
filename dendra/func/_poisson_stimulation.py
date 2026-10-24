@@ -159,20 +159,23 @@ def _cold_validation():
 
 def _validate_generator_domains(owner, generators):
     """Reject aliases across adapters with independently owned RNG carries."""
-    from dendra.models.rng import RNGMixin
+    from dendra.models.rng import RNGMixin, RNGModule
 
     identities = {id(generator) for generator in generators}
     if not identities:
         return
     for module in owner.modules():
+        if isinstance(module, RNGModule):
+            # Shared model streams are qualified by the combined RNG plan.
+            continue
         if isinstance(module, RNGMixin) and any(
             id(generator) in identities
             for generator in (module._cpu_gen, *module._device_gens.values())
         ):
             raise FunctionalizationError(
-                "Sharing a Poisson generator with a registered RNGModule or "
-                "model-owned private RNG is currently unsupported. Supply a "
-                "separate torch.Generator for the Poisson waveform."
+                "Sharing a Poisson generator with a model-owned private RNG "
+                "is currently unsupported. Supply a declared RNGModule stream "
+                "or a separate torch.Generator for the Poisson waveform."
             )
 
 
@@ -251,6 +254,7 @@ class PoissonStimulationPlan:
                         )
                     )
         self.entries, self.streams = tuple(entries), streams
+        self.externally_owned_streams = frozenset()
         self._event_slots = {
             entry.key: poisson_event_slots(entry.source)
             for entry in entries
@@ -773,7 +777,13 @@ class PoissonStimulationPlan:
         for source, value in prepared:
             source._spike_times = value
         for stream, sources in groups.items():
-            defer_poisson_generator_restore(sources, state["rng"][stream])
+            if stream in self.externally_owned_streams:
+                # The RNGModule has already published the authoritative frame.
+                # Deferring a second reset could rewind earlier native draws.
+                for source in sources:
+                    source.__dict__.pop("_functional_poisson_rng", None)
+            else:
+                defer_poisson_generator_restore(sources, state["rng"][stream])
 
 
 class NetworkStimulationPlan:

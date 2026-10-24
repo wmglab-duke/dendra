@@ -135,6 +135,10 @@ def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
         }
         if normalized_values:
             normalized[name] = normalized_values
+    functional._stimulation_rng_plan.validate_packets(
+        {name: selected.get("noise") for name, selected in normalized.items()},
+        {name: selected.get("stimulation") for name, selected in normalized.items()},
+    )
     draws = inputs.netstim
     if functional.netstim is not None:
         if draws is None:
@@ -731,24 +735,36 @@ def run(
         for start, stop in _execution_spans(steps, horizon):
             selected = _slice(tape, start, stop)
             populations = dict(selected["populations"])
-            noise_tapes = functional._rng_plan.sample_noise_tapes(
-                state,
-                stop - start,
-                provided={
-                    name: values["noise"]
-                    for name, values in populations.items()
-                    if values.get("noise") is not None
-                },
-            )
-            stimulation_tapes = functional.sample_population_stimulation_tapes(
-                state,
-                stop - start,
-                provided={
-                    name: values["stimulation"]
-                    for name, values in populations.items()
-                    if values.get("stimulation") is not None
-                },
-            )
+            provided_noise = {
+                name: values["noise"]
+                for name, values in populations.items()
+                if values.get("noise") is not None
+            }
+            provided_stimulation = {
+                name: values["stimulation"]
+                for name, values in populations.items()
+                if values.get("stimulation") is not None
+            }
+            if functional._stimulation_rng_plan.enabled:
+                noise_tapes, stimulation_tapes = (
+                    functional._stimulation_rng_plan.sample_tapes(
+                        state,
+                        stop - start,
+                        noise=provided_noise,
+                        stimulation=provided_stimulation,
+                    )
+                )
+            else:
+                noise_tapes = functional._rng_plan.sample_noise_tapes(
+                    state,
+                    stop - start,
+                    provided=provided_noise,
+                )
+                stimulation_tapes = functional.sample_population_stimulation_tapes(
+                    state,
+                    stop - start,
+                    provided=provided_stimulation,
+                )
             for name, plan in functional.populations.items():
                 values = populations.get(name, {})
                 if values.get("stimulation") is None:

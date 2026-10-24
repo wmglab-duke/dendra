@@ -51,6 +51,12 @@ RAND/NOISE, inserted Mechanisms, nested States, and MaterialProcesses.
 A State's Wiener stream can share an owner with its NOISE or other
 Populations' streams.
 
+Randomized Poisson waveforms can also borrow that owner's public `.rng`
+generator. The waveform can belong to another Population that has no local
+RAND, NOISE, or State SDE declaration. Model sampling and stimulation retain
+one shared carry, including across Population boundaries. See
+{doc}`A50_functional_poisson_stimulation` for a complete example.
+
 ## Compile and sample
 
 Compile the ordinary Network:
@@ -88,6 +94,15 @@ timestep. The returned per-Population packets contain their local draws and
 matching post-request RNG states. Keep those packets together; independently
 sampling each Population from the same starting stream would repeat draws
 and lose the shared ordering.
+
+For a stream also consumed by randomized Poisson stimulation, obtain
+`sample_population_stimulation_tapes(state, steps)` from that same incoming
+state and supply both families of packets together. They contain the common
+physical stream end frame at each step. Joint sampling follows the native
+extra/intra preparation order, then each Population's NOISE, mechanism, and
+State SDE requests. The host runner samples both families in one operation
+when neither is supplied. Streams shared only by ordinary model sampling
+retain their per-Population post-request frames.
 
 ```{literalinclude} ../../examples/functional_network_rng_sharing.py
 :language: python

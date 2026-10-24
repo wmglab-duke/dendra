@@ -496,6 +496,10 @@ class CompiledRunner:
                 inputs = RolloutInput()
             if not isinstance(inputs, RolloutInput):
                 raise TypeError("inputs must be a RolloutInput or None")
+            if self._execution == "while":
+                inputs = self._functional._sample_missing_runtime_draws(
+                    selected_state, inputs, self._steps
+                )
             if self._execution == "while" and inputs.noise is None:
                 sample_noise = (
                     self._functional._sample_noise_draw_tape_source_validated

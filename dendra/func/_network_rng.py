@@ -222,6 +222,10 @@ class NetworkRNGPlan:
         boundary as native cache restoration, before later Populations draw.
         Every sampler is isolated from source modules and incoming carry.
         """
+        if self.functional._stimulation_rng_plan.enabled:
+            return self.functional._stimulation_rng_plan.sample_initialization_packets(
+                state
+            )[0]
         if not self.enabled:
             return {
                 name: None
@@ -329,3 +333,498 @@ class NetworkRNGPlan:
                 ),
             )
         return result
+
+
+class NetworkStimulationRNGPlan:
+    """Share physical model generators with Network Poisson consumers.
+
+    The existing Population and stimulation plans retain their local packet
+    schemas. Only the Network carry owns generator bytes; adapter-only aliases
+    are reconstructed at each Population boundary.
+    """
+
+    def __init__(self, functional):
+        self.functional = functional
+        self.random = functional._rng_plan
+        self.stimulation = functional._stimulation_plan
+        self.borrowed = self._current_borrowed(functional._source)
+        self.enabled = bool(self.borrowed)
+        if not self.enabled:
+            return
+        self.random.enabled = True
+        for name, plan in functional.populations.items():
+            sharing = plan._stimulation_rng_plan
+            sharing.configure(plan.extract())
+            if plan._poisson_plan is not None:
+                plan._poisson_plan.externally_owned_streams = frozenset(
+                    local
+                    for local, canonical in self.stimulation.local[name].items()
+                    if canonical in self.borrowed
+                )
+
+    def _current_borrowed(self, network):
+        generators = {}
+        declared = set()
+        for canonical, (name, path, attribute) in self.random.streams.items():
+            source = getattr(
+                self.random._owners(network.populations[name])[path], attribute
+            )
+            declared.add(id(source))
+            generators[id(source._cpu_gen)] = (canonical, "cpu")
+            for device, generator in source._device_gens.items():
+                generators[id(generator)] = (canonical, str(device))
+        result = {}
+        requested = set()
+        for name, plan in self.stimulation.plans.items():
+            sources = plan._resolved_sources(network.populations[name])
+            for entry in plan.entries:
+                generator = sources[entry.key].generator
+                requested.add(id(generator))
+                if id(generator) in generators:
+                    canonical = self.stimulation.local[name][entry.stream]
+                    result[canonical] = generators[id(generator)]
+        for owner in network.modules():
+            if (
+                isinstance(owner, RNGModule)
+                and id(owner) not in declared
+                and any(
+                    id(generator) in requested
+                    for generator in (owner._cpu_gen, *owner._device_gens.values())
+                )
+            ):
+                raise FunctionalizationError(
+                    "Poisson generator aliases an untracked registered RNGModule; "
+                    "use a declared RAND/NOISE/SDE stream or a separate generator"
+                )
+        return result
+
+    def validate_compatible_network(self, network):
+        if self._current_borrowed(network) != self.borrowed:
+            raise FunctionalizationError(
+                "Network stimulation and model RNG sharing differs from this plan; lower again"
+            )
+
+    def validate_source(self):
+        self.validate_compatible_network(self.functional._source)
+
+    def expand_pool(self, random, stimulation):
+        if not self.enabled:
+            return stimulation
+        return {
+            **stimulation,
+            **{
+                stream: random[owner][device].to("cpu")
+                for stream, (owner, device) in self.borrowed.items()
+            },
+        }
+
+    def strip_pool(self, stimulation):
+        if not self.enabled:
+            return stimulation
+        return {
+            stream: value
+            for stream, value in stimulation.items()
+            if stream not in self.borrowed
+        }
+
+    def expand_population(self, name, state, random, stimulation):
+        result = self.stimulation.expand(
+            name,
+            self.random.expand_population(name, state, random),
+            self.expand_pool(random, stimulation),
+        )
+        return self.functional.populations[name]._stimulation_rng_plan.strip_state(
+            result
+        )
+
+    def full_population(self, name, state):
+        return self.functional.populations[name]._stimulation_rng_plan.expand_state(
+            state
+        )
+
+    def refresh_borrowed(self, name, state, random):
+        """Publish model-owned cache restoration without replacing other RNGs."""
+        state = self.random.expand_population(name, state, random)
+        result = self.full_population(name, state)
+        if name in self.stimulation.local and self.enabled:
+            result = {
+                **result,
+                "stimulation": {
+                    **result["stimulation"],
+                    "rng": {
+                        **result["stimulation"]["rng"],
+                        **{
+                            local: random[owner][device].to("cpu")
+                            for local, canonical in self.stimulation.local[name].items()
+                            if canonical in self.borrowed
+                            for owner, device in (self.borrowed[canonical],)
+                        },
+                    },
+                },
+            }
+        return self.functional.populations[name]._stimulation_rng_plan.strip_state(
+            result
+        )
+
+    def sample_population_initialization(self, name, state, random, stimulation):
+        """Sample one Population's two initialization families in one stream."""
+        samplers = self.random._samplers(random)
+        pool = self.expand_pool(random, stimulation)
+        poisson_samplers = {}
+        for stream, source in self.stimulation.streams.items():
+            if stream in self.borrowed:
+                owner, device = self.borrowed[stream]
+                poisson_samplers[stream] = samplers[owner]._generator_for(device)
+            else:
+                generator = torch.Generator(device=source.device)
+                generator.set_state(pool[stream].detach().cpu())
+                poisson_samplers[stream] = generator
+        local = self.expand_population(name, state, random, stimulation)
+        return self.functional.populations[
+            name
+        ]._stimulation_rng_plan.sample_initialization(
+            local,
+            samplers=self.random._local_samplers(name, samplers),
+            poisson_samplers={
+                local: poisson_samplers[canonical]
+                for local, canonical in self.stimulation.local.get(name, {}).items()
+            },
+        )
+
+    def sample_initialization_packets(self, state):
+        """Return replayable paired inputs in native Population order."""
+        packets = dict.fromkeys(self.functional.populations)
+        stimulation_packets = dict(packets)
+        if self.functional._cache_enabled:
+            return packets, stimulation_packets
+        random = state["rng"]
+        stimulation = self.expand_pool(random, state.get("stimulation_rng", {}))
+        for name, plan in self.functional.populations.items():
+            if plan._owned_cache_bound:
+                if plan._owned_cache_error is not None:
+                    raise FunctionalizationError(
+                        f"Population steady-state cache cannot be restored: {plan._owned_cache_error}"
+                    )
+                random = self.random.cache_pool(
+                    name, plan._owned_cache_plan.default, random
+                )
+                stimulation = self.expand_pool(random, stimulation)
+                continue
+            local = self.expand_population(
+                name, state["populations"][name], random, stimulation
+            )
+            packet, stim = self.sample_population_initialization(
+                name, local, random, stimulation
+            )
+            packets[name], stimulation_packets[name] = packet, stim
+            if packet is not None:
+                random = self.random.update_pool(name, packet.rng, random)
+            if stim is not None:
+                for stream, canonical in self.stimulation.local[name].items():
+                    frame = stim.rng[stream]
+                    stimulation[canonical] = frame
+                    if canonical in self.borrowed:
+                        owner, device = self.borrowed[canonical]
+                        random = {
+                            **random,
+                            owner: {
+                                **random[owner],
+                                device: frame.to(random[owner][device]).clone(),
+                            },
+                        }
+            stimulation = self.expand_pool(random, stimulation)
+        return packets, stimulation_packets
+
+    def publish(self, name, state, random, stimulation):
+        """Publish one complete local suffix without duplicate byte ownership."""
+        if self.random.enabled and self.random.local_streams[name]:
+            random = self.random.update_pool(name, state["random"]["rng"], random)
+        local = self.full_population(name, state)
+        if self.enabled and name in self.stimulation.local:
+            for stream, canonical in self.stimulation.local[name].items():
+                if canonical in self.borrowed:
+                    owner, device = self.borrowed[canonical]
+                    random = {
+                        **random,
+                        owner: {
+                            **random[owner],
+                            device: local["stimulation"]["rng"][stream]
+                            .to(random[owner][device])
+                            .clone(),
+                        },
+                    }
+        stimulation = self.stimulation.update(name, local, stimulation)
+        return random, self.expand_pool(random, stimulation)
+
+    def validate_packets(self, noise, stimulation):
+        """Require every alias of a shared physical stream to agree."""
+        if not self.enabled:
+            return
+        from ._stimulation_rng import _assert_shared_frame
+
+        frames = {}
+        for name, packet in noise.items():
+            if packet is None:
+                continue
+            for local, canonical in self.random.local_streams[name].items():
+                for device in {
+                    device
+                    for owner, device in self.borrowed.values()
+                    if owner == canonical
+                }:
+                    frame = packet.rng[local][device]
+                    previous = frames.setdefault((canonical, device), frame)
+                    _assert_shared_frame(frame, previous)
+        for name, packet in stimulation.items():
+            if packet is None:
+                continue
+            for local, canonical in self.stimulation.local[name].items():
+                if canonical in self.borrowed:
+                    owner = self.borrowed[canonical]
+                    frame = packet.rng[local]
+                    previous = frames.setdefault(owner, frame)
+                    _assert_shared_frame(frame, previous)
+
+    def _provided(self, noise, stimulation, steps):
+        noise = {} if noise is None else dict(noise)
+        stimulation = {} if stimulation is None else dict(stimulation)
+        populations = self.functional.populations
+        if (set(noise) | set(stimulation)) - set(populations):
+            raise ValueError("Stochastic tapes name an unknown Population")
+        noise = {name: value for name, value in noise.items() if value is not None}
+        stimulation = {
+            name: value for name, value in stimulation.items() if value is not None
+        }
+        for name, packet in noise.items():
+            populations[name]._validate_noise_draw(packet, steps=steps)
+        for name, packet in stimulation.items():
+            populations[name]._validate_stimulation_draw(packet, steps=steps)
+        from ._stimulation_rng import _assert_shared_frame
+
+        for canonical in self.stimulation.streams:
+            consumers = {
+                name
+                for name, local in self.stimulation.local.items()
+                if canonical in local.values()
+            }
+            selected = consumers.intersection(stimulation)
+            if selected and selected != consumers:
+                raise ValueError(
+                    "Shared Poisson generators require explicit tapes for every "
+                    "consuming Population, or automatic sampling for all of them"
+                )
+            frames = [
+                stimulation[name].rng[local]
+                for name in selected
+                for local, stream in self.stimulation.local[name].items()
+                if stream == canonical
+            ]
+            for frame in frames[1:]:
+                _assert_shared_frame(frame, frames[0])
+        supplied = {("noise", name) for name in noise} | {
+            ("stimulation", name) for name in stimulation
+        }
+        for canonical, device in set(self.borrowed.values()):
+            consumers = {
+                ("noise", name)
+                for name, plan in populations.items()
+                if plan._noise_plan is not None
+                and plan._noise_plan.runtime
+                and canonical in self.random.local_streams[name].values()
+            } | {
+                ("stimulation", name)
+                for name, local in self.stimulation.local.items()
+                if any(
+                    self.borrowed.get(stream) == (canonical, device)
+                    for stream in local.values()
+                )
+            }
+            if supplied.intersection(consumers) not in (set(), consumers):
+                raise ValueError(
+                    "Shared stimulation and model RNG streams require explicit "
+                    "tapes for every consuming Population and draw family, or "
+                    "automatic sampling for all of them"
+                )
+        self.validate_packets(noise, stimulation)
+        return noise, stimulation
+
+    def _contexts(self, state, samplers, poisson_samplers):
+        result = {}
+        for name, plan in self.functional.populations.items():
+            local = self.expand_population(
+                name,
+                state["populations"][name],
+                state["rng"],
+                state.get("stimulation_rng", {}),
+            )
+            result[name] = plan._stimulation_rng_plan.begin_packets(
+                local,
+                samplers=self.random._local_samplers(name, samplers),
+                poisson_samplers={
+                    local: poisson_samplers[canonical]
+                    for local, canonical in self.stimulation.local.get(name, {}).items()
+                },
+            )
+        return result
+
+    def sample_tapes(self, state, steps, *, noise=None, stimulation=None):
+        """Sample one global ordered program, returning both packet families."""
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("steps must be a non-negative integer")
+        supplied_noise, supplied_stimulation = self._provided(noise, stimulation, steps)
+        samplers = self.random._samplers(state["rng"])
+        pool = self.expand_pool(state["rng"], state.get("stimulation_rng", {}))
+        poisson_samplers = {}
+        for stream, source in self.stimulation.streams.items():
+            if stream in self.borrowed:
+                owner, device = self.borrowed[stream]
+                poisson_samplers[stream] = samplers[owner]._generator_for(device)
+            else:
+                generator = torch.Generator(device=source.device)
+                generator.set_state(pool[stream].detach().cpu())
+                poisson_samplers[stream] = generator
+        boundaries = {name: [] for name in self.functional.populations}
+        for index in range(steps):
+            contexts = self._contexts(state, samplers, poisson_samplers)
+            local_noise = {}
+            for phase in ("extra", "intra", "mechanism"):
+                names = (
+                    self.stimulation._ordered_names(phase)
+                    if phase != "mechanism"
+                    else self.functional.populations
+                )
+                for name in names:
+                    adapter = self.functional.populations[name]._stimulation_rng_plan
+                    for kind, entry in adapter.runtime_requests(phase):
+                        if (
+                            name in supplied_stimulation
+                            if kind == "poisson"
+                            else name in supplied_noise
+                        ):
+                            continue
+                        adapter.sample_request(kind, entry, contexts[name])
+                    if phase == "mechanism":
+                        if name in supplied_noise:
+                            packet = _pytree.tree_map(
+                                lambda value: value[index], supplied_noise[name]
+                            )
+                            # Unrelated streams retain their Population-boundary
+                            # restoration semantics. Borrowed devices are owned
+                            # by the common global suffix below.
+                            for local, canonical in self.random.local_streams[
+                                name
+                            ].items():
+                                sampler = samplers[canonical]
+                                current = _rng_values(
+                                    sampler, self.functional.populations[name].device
+                                )
+                                borrowed = {
+                                    device
+                                    for owner, device in self.borrowed.values()
+                                    if owner == canonical
+                                }
+                                frame = {
+                                    key: current[key] if key in borrowed else value
+                                    for key, value in packet.rng[local].items()
+                                }
+                                sampler.restore_rng_checkpoint(
+                                    _rng_extra(frame), policy="checkpoint"
+                                )
+                            local_noise[name] = packet
+                        else:
+                            local_noise[name] = adapter.finish_packets(contexts[name])[
+                                0
+                            ]
+            # Explicit coupled packets own their common post-step frame.
+            for name, tape in supplied_noise.items():
+                frame = _pytree.tree_map(lambda value: value[index], tape.rng)
+                for local, canonical in self.random.local_streams[name].items():
+                    sampler = samplers[canonical]
+                    borrowed = {
+                        device
+                        for owner, device in self.borrowed.values()
+                        if owner == canonical
+                    }
+                    if borrowed:
+                        current = _rng_values(
+                            sampler, self.functional.populations[name].device
+                        )
+                        suffix = {
+                            key: value if key in borrowed else current[key]
+                            for key, value in frame[local].items()
+                        }
+                        sampler.restore_rng_checkpoint(
+                            _rng_extra(suffix), policy="checkpoint"
+                        )
+            for name, tape in supplied_stimulation.items():
+                for local, canonical in self.stimulation.local[name].items():
+                    poisson_samplers[canonical].set_state(
+                        tape.rng[local][index].detach().cpu()
+                    )
+            # Refresh borrowed handles after an RNGModule checkpoint adapter.
+            for stream, (owner, device) in self.borrowed.items():
+                poisson_samplers[stream] = samplers[owner]._generator_for(device)
+            for name, plan in self.functional.populations.items():
+                context = contexts[name]
+                context["random_samplers"] = self.random._local_samplers(name, samplers)
+                context["poisson_samplers"] = {
+                    local: poisson_samplers[canonical]
+                    for local, canonical in self.stimulation.local.get(name, {}).items()
+                }
+                pair = plan._stimulation_rng_plan.finish_packets(context)
+                local_packet = local_noise[name]
+                if local_packet is not None and name not in supplied_noise:
+                    # Independent streams expose their historical per-Population
+                    # boundary; borrowed bytes describe the complete timestep.
+                    local_packet = RuntimeNoiseDraw(
+                        local_packet.draws,
+                        {
+                            local: {
+                                key: pair[0].rng[local][key]
+                                if (canonical, key) in self.borrowed.values()
+                                else value
+                                for key, value in frame.items()
+                            }
+                            for local, frame in local_packet.rng.items()
+                            for canonical in (self.random.local_streams[name][local],)
+                        },
+                    )
+                pair = (
+                    local_packet,
+                    _pytree.tree_map(
+                        lambda value: value[index], supplied_stimulation[name]
+                    )
+                    if name in supplied_stimulation
+                    else pair[1],
+                )
+                boundaries[name].append(pair)
+        noise_result, stimulation_result = {}, {}
+        for name, pairs in boundaries.items():
+            if pairs:
+                packet = _pytree.tree_map(
+                    lambda *values: None if values[0] is None else torch.stack(values),
+                    *pairs,
+                )
+            else:
+                local = self.expand_population(
+                    name,
+                    state["populations"][name],
+                    state["rng"],
+                    state.get("stimulation_rng", {}),
+                )
+                packet = self.functional.populations[
+                    name
+                ]._stimulation_rng_plan.sample_runtime(
+                    local,
+                    steps=0,
+                    samplers=self.random._local_samplers(name, samplers),
+                    poisson_samplers={
+                        local: poisson_samplers[canonical]
+                        for local, canonical in self.stimulation.local.get(
+                            name, {}
+                        ).items()
+                    },
+                )
+            noise_result[name], stimulation_result[name] = packet
+        self.validate_packets(noise_result, stimulation_result)
+        return noise_result, stimulation_result

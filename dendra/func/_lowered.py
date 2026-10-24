@@ -93,6 +93,10 @@ class _LoweredPopulationChunk:
         functional._validate_stimulation_draw(
             None if inputs is None else inputs.stimulation, steps=self._steps
         )
+        functional._stimulation_rng_plan.validate_packets(
+            None if inputs is None else inputs.noise,
+            None if inputs is None else inputs.stimulation,
+        )
         return _PopulationChunkOperands(
             parameters,
             prepared_values,

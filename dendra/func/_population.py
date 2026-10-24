@@ -11274,7 +11274,9 @@ class FunctionalPopulation:
         _multi_component_candidates: Mapping[str, Population] | None = None,
         _bind_owned_cache=True,
         _retain_initialization_materializations=False,
+        _network_stimulation_rng_scope=False,
     ):
+        self._network_stimulation_rng_scope = _network_stimulation_rng_scope
         subclass_failures = _population_subclass_failures(population)
         if subclass_failures:
             raise FunctionalizationError("; ".join(subclass_failures))
@@ -12074,6 +12076,13 @@ class FunctionalPopulation:
         if random_declarations(population) or self._noise_plan is not None:
             self._random_plan = RandomParameterPlan(population)
             self._random_plan.noise = self._noise_plan
+        from ._stimulation_rng import StimulationRNGPlan
+
+        self._stimulation_rng_plan = StimulationRNGPlan(self)
+        if self._stimulation_state_template is not None:
+            self._stimulation_state_template = self._stimulation_rng_plan.strip_state(
+                {"stimulation": self._stimulation_state_template}
+            )["stimulation"]
         self._state_schema = self._make_state_schema(self._state_layout)
         if self._poisson_plan is not None:
             self._state_schema["stimulation"] = {}
@@ -12631,6 +12640,7 @@ class FunctionalPopulation:
                 )
         if self._poisson_plan is not None:
             self._poisson_plan.validate_source()
+        self._stimulation_rng_plan.validate_source()
         self._validate_rng_load_policies()
         if self._torch_source_bindings:
             from ._torch_parametrizations import source_binding_signature
@@ -12979,6 +12989,7 @@ class FunctionalPopulation:
             )
         if self._random_plan is not None:
             self._random_plan.validate_compatible_population(population)
+        self._stimulation_rng_plan.validate_compatible_population(population)
 
     def _validate_parameters(self, parameters) -> None:
         if not isinstance(parameters, Mapping):
@@ -13591,6 +13602,7 @@ class FunctionalPopulation:
         state = self._extract_native_state(population)
         if self._random_plan is not None:
             _random_constants, state["random"] = self._random_plan.extract(population)
+        state = self._stimulation_rng_plan.strip_state(state)
         self._validate_state(state)
         all_parameters = dict(population.named_parameters())
         parameters = (
@@ -14045,6 +14057,9 @@ class FunctionalPopulation:
             constants = self._random_plan.initialize_constants(
                 constants, selected_random_draw
             )
+        self._stimulation_rng_plan.validate_packets(
+            selected_random_draw, stimulation_draw, initialization=True
+        )
         current_failures = (
             _compiled_initialization_failures(self)
             if torch.compiler.is_compiling()
@@ -14230,6 +14245,9 @@ class FunctionalPopulation:
                     stimulation_state, stimulation_draw, initialization=True
                 )
             )
+        state = self._stimulation_rng_plan.publish(
+            state, noise=selected_random_draw, stimulation=stimulation_draw
+        )
         state = {name: state[name] for name in self._state_schema}
         state = self._initialize_material_workspace(
             initialized_parameters, constants, state
@@ -14267,6 +14285,8 @@ class FunctionalPopulation:
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_state(state)
+        if self._stimulation_rng_plan.enabled and not self._owned_cache_bound:
+            return self._stimulation_rng_plan.sample_initialization(state)[0]
         return (
             None
             if self._random_plan is None or self._owned_cache_bound
@@ -14277,6 +14297,12 @@ class FunctionalPopulation:
         """Sample Poisson draws for native fresh-initialization current evaluation."""
         self._validate_source()
         self._validate_state(state)
+        if self._stimulation_rng_plan.enabled:
+            return (
+                None
+                if self._owned_cache_bound
+                else self._stimulation_rng_plan.sample_initialization(state)[1]
+            )
         return (
             None
             if self._poisson_plan is None or not self._poisson_plan.has_initialization
@@ -14287,6 +14313,8 @@ class FunctionalPopulation:
         """Sample one Poisson invocation packet from explicit generator carry."""
         self._validate_source()
         self._validate_state(state)
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_runtime(state)[1]
         return None if self._poisson_plan is None else self._poisson_plan.sample(state)
 
     def sample_stimulation_draw_tape(self, state, steps):
@@ -14299,6 +14327,8 @@ class FunctionalPopulation:
         self._validate_state(state)
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
             raise ValueError("steps must be a non-negative integer")
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_runtime(state, steps=steps)[1]
         return (
             None
             if self._poisson_plan is None
@@ -14320,6 +14350,8 @@ class FunctionalPopulation:
         """Sample NOISE/SDE draws without changing the source or carry."""
         self._validate_source()
         self._validate_state(state)
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_runtime(state)[0]
         return (
             None
             if self._noise_plan is None or not self._noise_plan.runtime
@@ -14336,6 +14368,8 @@ class FunctionalPopulation:
         self._validate_state(state)
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
             raise ValueError("steps must be a non-negative integer")
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_runtime(state, steps=steps)[0]
         return (
             None
             if self._noise_plan is None or not self._noise_plan.runtime
@@ -14369,8 +14403,51 @@ class FunctionalPopulation:
                 ):
                     raise ValueError("NOISE RNG state has incompatible Tensor schema")
 
+    def _sample_missing_runtime_draws(self, state, inputs, steps):
+        """Sample coupled families together at an existing host boundary."""
+        sharing = self._stimulation_rng_plan
+        if not sharing.enabled:
+            return inputs
+        if inputs.noise is not None:
+            self._validate_noise_draw(inputs.noise, steps=steps)
+        if inputs.stimulation is not None:
+            self._validate_stimulation_draw(inputs.stimulation, steps=steps)
+        sharing.validate_packets(inputs.noise, inputs.stimulation)
+        if inputs.stimulation is not None:
+            return inputs
+        if any(
+            getattr(method, "__func__", None) is not original
+            for method, original in (
+                (self.sample_noise_draw_tape, _OWNED_POPULATION_NOISE_TAPE),
+                (self.sample_stimulation_draw_tape, _OWNED_POPULATION_STIMULATION_TAPE),
+            )
+        ):
+            return inputs
+        noise, stimulation = sharing.sample_runtime(state, steps=steps)
+        return inputs._replace(noise=noise, stimulation=stimulation)
+
     def initialize_host(self, parameters, constants, inputs, *, state=None):
         """Sample missing RAND draws at a cold boundary, then initialize purely."""
+        if self._stimulation_rng_plan.enabled and not self._owned_cache_bound:
+            needs_random = self._random_plan is not None
+            needs_stimulation = self._poisson_plan.has_initialization
+            supplied = (inputs.random_draw is not None, inputs.stimulation is not None)
+            if needs_stimulation and supplied[0] != supplied[1]:
+                raise ValueError(
+                    "Shared initialization RNG requires both random and stimulation packets, or automatic sampling for both"
+                )
+            if needs_random and not supplied[0]:
+                self._validate_source()
+                self._validate_parameters(parameters)
+                if state is None:
+                    state = self.extract().state
+                self._validate_state(state)
+                random_draw, stimulation = (
+                    self._stimulation_rng_plan.sample_initialization(state)
+                )
+                inputs = inputs._replace(
+                    random_draw=random_draw, stimulation=stimulation
+                )
         if (
             self._random_plan is not None
             and not self._owned_cache_bound
@@ -14433,6 +14510,7 @@ class FunctionalPopulation:
             parameters, constants, incoming, inputs.cache
         )
         state = _reset_functional_initialization_clock(packet.state)
+        state = self._stimulation_rng_plan.strip_state(state)
         from ._noise_workspaces import noise_workspace_constants_from_state
 
         constants = noise_workspace_constants_from_state(
@@ -17080,6 +17158,10 @@ class FunctionalPopulation:
                     state["stimulation"], stimulation, tape=True
                 )
             )
+        if steps:
+            next_state = self._stimulation_rng_plan.publish(
+                next_state, noise=noise, stimulation=stimulation, tape=True
+            )
         next_state = {name: next_state[name] for name in self._state_schema}
         return next_state, {"v": next_state["integrator"]["v"]}
 
@@ -17730,6 +17812,7 @@ class FunctionalPopulation:
         stimulation = None if inputs is None else inputs.stimulation
         self._validate_noise_draw(noise, steps=resolved_steps)
         self._validate_stimulation_draw(stimulation, steps=resolved_steps)
+        self._stimulation_rng_plan.validate_packets(noise, stimulation)
         if extra is not None:
             if self._extra.enabled:
                 raise ValueError(
@@ -18069,8 +18152,11 @@ class FunctionalPopulation:
         """Explicitly commit validated functional carry into a compatible model."""
         self._validate_compatible_population(population)
         self._validate_state(state)
+        poisson_state = self._stimulation_rng_plan.expand_state(state).get(
+            "stimulation"
+        )
         if self._poisson_plan is not None:
-            self._poisson_plan.validate_state(state["stimulation"])
+            self._poisson_plan.validate_state(poisson_state)
         remainder = state["control"]["duration_remainder"]
         remainder_value = remainder.item()
         if not math.isfinite(remainder_value) or remainder_value < 0.0:
@@ -18165,7 +18251,7 @@ class FunctionalPopulation:
                 # succeeds; the remaining assignment cannot invoke authored code.
                 population._buffers["v"] = staged_population._buffers["v"]
             if self._poisson_plan is not None:
-                self._poisson_plan.commit(population, state["stimulation"])
+                self._poisson_plan.commit(population, poisson_state)
             return population
 
         write_back = bool(population.integrator.write_back)
@@ -18264,8 +18350,12 @@ class FunctionalPopulation:
                 ) from rollback_error
             raise
         if self._poisson_plan is not None:
-            self._poisson_plan.commit(population, state["stimulation"])
+            self._poisson_plan.commit(population, poisson_state)
         return population
+
+
+_OWNED_POPULATION_NOISE_TAPE = FunctionalPopulation.sample_noise_draw_tape
+_OWNED_POPULATION_STIMULATION_TAPE = FunctionalPopulation.sample_stimulation_draw_tape
 
 
 def make_functional(
@@ -18275,6 +18365,7 @@ def make_functional(
     extra=None,
     _bind_owned_cache=True,
     _retain_initialization_materializations=False,
+    _network_stimulation_rng_scope=False,
 ) -> tuple[FunctionalPopulation, PopulationTensors]:
     """Lower an initialized Population into a pure transition."""
     if isinstance(dt, bool):
@@ -18331,6 +18422,7 @@ def make_functional(
                 _retain_initialization_materializations=(
                     _retain_initialization_materializations
                 ),
+                _network_stimulation_rng_scope=_network_stimulation_rng_scope,
             )
             construction_rng = (
                 _global_rng_changes(rng_state, device) if check_purity else ()
@@ -18355,6 +18447,7 @@ def make_functional(
             from ._poisson_invocations import validate_poisson_invocations
 
             validate_poisson_invocations(functional, tensors)
+            functional._stimulation_rng_plan.configure(tensors)
         if check_purity:
             functional._audit_read_only_workspaces(tensors)
             functional._audit_event_receivers(tensors)

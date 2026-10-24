@@ -130,6 +130,66 @@ initialization follows native restoration and draw rules.
 Native `initial_values` and `derive_buffers` hooks require pure builders;
 randomized waveform evaluation belongs in current hooks such as `assigned_values`.
 
+## Share a model's random stream
+
+A randomized Poisson waveform can borrow the public `.rng` generator of an
+`RNGModule` used by declared `RAND`, `NOISE`, or State SDE sampling. Initialize
+the Population to create the declared owner, then pass its generator to the
+waveform:
+
+```{literalinclude} ../../examples/functional_stimulation_rng_sharing.py
+:language: python
+:start-after: "# region borrowed-generator"
+:end-before: "# endregion borrowed-generator"
+:dedent: 4
+```
+
+The complete
+{download}`functional_stimulation_rng_sharing.py <../../examples/functional_stimulation_rng_sharing.py>`
+example declares the `stream` owner with `RANGENOISE(..., rng_name="stream")`.
+It compares native values, gradients, replay, and compiled continuation.
+Run it with `python examples/functional_stimulation_rng_sharing.py`.
+
+Model sampling and stimulation advance the same stream in native call order.
+Each step prepares extra and intra stimulation, samples runtime `NOISE`, and
+evaluates the mechanism and State hooks. SDE draws retain their positions
+between those hooks, including repeated Poisson evaluations. Initialization
+also preserves declaration sampling, per-Population reseeding, and any
+mechanism-owned stimulation evaluations. A shared generator has one
+authoritative carry; Poisson schedules remain in the stimulation state:
+
+```{literalinclude} ../../examples/functional_stimulation_rng_sharing.py
+:language: python
+:start-after: "# region authoritative-carry"
+:end-before: "# endregion authoritative-carry"
+:dedent: 8
+```
+
+When supplying explicit inputs, obtain **both** packets from the same incoming
+state:
+
+```{literalinclude} ../../examples/functional_stimulation_rng_sharing.py
+:language: python
+:start-after: "# region paired-tapes"
+:end-before: "# endregion paired-tapes"
+:dedent: 8
+```
+
+These separate sampling helpers reproduce the same joint sampling operation.
+Their packets contain the common generator end frame at each step; they do
+not independently advance the source generator. Supply both packets together.
+Supplying only one packet for coupled consumers, or combining packets with
+different end frames, raises an error. For Networks, obtain both
+`sample_population_noise_tapes(state, steps)` and
+`sample_population_stimulation_tapes(state, steps)` from the same state and
+place the matching packets in each Population's `RolloutInput`. The Network
+owns one carry per shared generator across Populations.
+
+`dn.compile(...)` samples the joint packets automatically when neither is
+supplied. Fresh initialization likewise supplies the matching initialization
+packets together. Native and functional checkpoints preserve the shared model
+stream and its reseeding and cache RNG-load policies.
+
 ## Gradients and compiled execution
 
 Uniform draws, Poisson event times, and generator bytes are detached, matching
@@ -173,9 +233,11 @@ of invocation draws.
 `commit_state_` restores model-owned intracellular and mechanism stimulation
 when publishing functional state to a native model. Bound `extra` waveforms
 remain external objects, so native commit and the model's native checkpoint
-do not restore their schedules or RNG. Functional checkpoint continuation
-retains that external stimulation carry. To continue natively with bound
-`extra`, restore the external waveforms' state separately as well.
+do not restore their schedules or separately owned RNG. A borrowed model
+generator follows the model's shared RNG carry. Functional checkpoint
+continuation retains the complete external stimulation carry. To continue
+natively with bound `extra`, restore the external waveforms' state separately
+as well.
 
 ## Evaluation boundaries and current limits
 
@@ -220,9 +282,11 @@ explicit waveform data and do not require a stimulation draw tape.
 
 A Poisson generator can be shared with other Poisson waveforms across
 Populations. Sharing the default Torch generator with connection sampling is
-also supported. Sharing an internal model-owned RAND, NOISE, or NetStim
-generator with Poisson stimulation is currently unsupported; supply a separate
-`torch.Generator` for that stimulation.
+also supported. Borrowing a generator from an `RNGModule` requires that owner
+to participate in the lowered model's declared `RAND`, `NOISE`, or State SDE
+sampling. Borrowing an unrelated registered `RNGModule` or a private NetStim
+generator is currently unsupported; use a declared stream's public `.rng` or
+a separate `torch.Generator`.
 
 ```{code-cell} python
 :load: ../../examples/functional_poisson_stimulation.py

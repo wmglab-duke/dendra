@@ -737,13 +737,10 @@ def _initialize_components(
     rng_plan = functional._rng_plan
     rng_pool = state.get("rng", {})
     stimulation_plan = functional._stimulation_plan
-    stimulation_pool = state.get("stimulation_rng", {})
+    sharing = functional._stimulation_rng_plan
+    stimulation_pool = sharing.expand_pool(rng_pool, state.get("stimulation_rng", {}))
     populations = {
-        name: functional._stimulation_plan.expand(
-            name,
-            rng_plan.expand_population(name, value, rng_pool),
-            stimulation_pool,
-        )
+        name: sharing.expand_population(name, value, rng_pool, stimulation_pool)
         for name, value in state["populations"].items()
     }
     effective = parameters
@@ -754,16 +751,56 @@ def _initialize_components(
         # alias before the next Population observes its input frame.
         for name, plan in functional.populations.items():
             incoming_parameters = effective
-            populations[name] = rng_plan.expand_population(
-                name, populations[name], rng_pool
-            )
-            populations[name] = stimulation_plan.expand(
-                name, populations[name], stimulation_pool
+            populations[name] = sharing.expand_population(
+                name, populations[name], rng_pool, stimulation_pool
             )
             if inputs.cache is None:
                 population_inputs = inputs.populations[name]
+                if sample_random and sharing.enabled and not plan._owned_cache_bound:
+                    needs_random = plan._random_plan is not None
+                    needs_stimulation = (
+                        plan._poisson_plan is not None
+                        and plan._poisson_plan.has_initialization
+                    )
+                    coupled = needs_random and any(
+                        sharing.borrowed.get(
+                            stimulation_plan.local[name][entry.stream], (None,)
+                        )[0]
+                        in rng_plan.local_streams[name].values()
+                        for entry in (
+                            ()
+                            if plan._poisson_plan is None
+                            else plan._poisson_plan._initialization_entries
+                        )
+                    )
+                    missing_random = (
+                        needs_random and population_inputs.random_draw is None
+                    )
+                    missing_stimulation = (
+                        needs_stimulation and population_inputs.stimulation is None
+                    )
+                    if coupled and missing_random != missing_stimulation:
+                        raise ValueError(
+                            "Shared initialization RNG streams require both RAND/NOISE "
+                            "and stimulation packets, or automatic sampling for both"
+                        )
+                    if missing_random or missing_stimulation:
+                        random_draw, stimulation_draw = (
+                            sharing.sample_population_initialization(
+                                name, populations[name], rng_pool, stimulation_pool
+                            )
+                        )
+                        population_inputs = population_inputs._replace(
+                            random_draw=random_draw
+                            if missing_random
+                            else population_inputs.random_draw,
+                            stimulation=stimulation_draw
+                            if missing_stimulation
+                            else population_inputs.stimulation,
+                        )
                 if (
                     sample_random
+                    and not sharing.enabled
                     and rng_plan.enabled
                     and population_inputs.random_draw is None
                 ):
@@ -777,6 +814,7 @@ def _initialize_components(
                     )
                 if (
                     sample_random
+                    and not sharing.enabled
                     and plan._poisson_plan is not None
                     and plan._poisson_plan.has_initialization
                     and not plan._owned_cache_bound
@@ -805,9 +843,6 @@ def _initialize_components(
                     populations[name],
                     inputs.cache.populations[name],
                 )
-            stimulation_pool = stimulation_plan.update(
-                name, initialized.state, stimulation_pool
-            )
             if rng_plan.enabled:
                 cache = (
                     inputs.cache.populations[name]
@@ -818,6 +853,11 @@ def _initialize_components(
                 )
                 if cache is not None:
                     rng_pool = rng_plan.cache_pool(name, cache, rng_pool)
+                    initialized = initialized._replace(
+                        state=sharing.refresh_borrowed(
+                            name, initialized.state, rng_pool
+                        )
+                    )
                 elif rng_plan.local_streams[name]:
                     rng_pool = rng_plan.update_pool(
                         name, initialized.state["random"]["rng"], rng_pool
@@ -825,6 +865,9 @@ def _initialize_components(
                 initialized = initialized._replace(
                     state=rng_plan.expand_population(name, initialized.state, rng_pool)
                 )
+            rng_pool, stimulation_pool = sharing.publish(
+                name, initialized.state, rng_pool, stimulation_pool
+            )
             population_constants = initialized.constants
             if inputs.cache is None and plan._owned_cache_bound:
                 # An owned cache prepares its solver at this Population's
@@ -1025,7 +1068,7 @@ def _initialize_components(
                 )
         initialized_state = {
             **(
-                {"stimulation_rng": stimulation_pool}
+                {"stimulation_rng": sharing.strip_pool(stimulation_pool)}
                 if functional._stimulation_plan.enabled
                 else {}
             ),

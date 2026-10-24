@@ -499,19 +499,21 @@ class FunctionalNetwork:
                 extra=extra.get(name),
                 _bind_owned_cache=not bool(network._state_cache),
                 _retain_initialization_materializations=True,
+                _network_stimulation_rng_scope=True,
             )
             if network._state_cache:
                 plan._enable_cache_materializations()
             plan._enable_retained_materializations()
             self.populations[name] = plan
             initialization[name] = packet.initialization
-        from ._network_rng import NetworkRNGPlan
+        from ._network_rng import NetworkRNGPlan, NetworkStimulationRNGPlan
 
         self._rng_plan = NetworkRNGPlan(self, network)
         from ._poisson_stimulation import NetworkStimulationPlan
 
         self._extra_order = tuple(extra)
         self._stimulation_plan = NetworkStimulationPlan(self)
+        self._stimulation_rng_plan = NetworkStimulationRNGPlan(self)
         self._source_table_aliases = network_table_alias_signature(network)
         self._source_mechanism_delay_aliases = network_mechanism_delay_alias_signature(
             network
@@ -806,6 +808,31 @@ class FunctionalNetwork:
         self._validate_state(state)
         return self._rng_plan.sample_init_packets(parameters, state)
 
+    def sample_population_stimulation_initialization_draws(self, parameters, state):
+        """Draw replayable Population waveform-initialization packets.
+
+        Assign each packet to ``InitializationInput.stimulation``. When model
+        randomness shares a generator with a waveform, obtain the matching
+        ``random_draw`` packets with :meth:`sample_population_initialization_draws`
+        from the same incoming state.
+        """
+        from ._network_bindings import _canonicalize_mapping_tree
+
+        (parameters, state), _ = _canonicalize_mapping_tree((parameters, state))
+        self._validate_initialization_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_initialization_packets(state)[1]
+        return {
+            name: None
+            if self._cache_enabled or plan._owned_cache_bound
+            else plan.sample_stimulation_initialization_draw(
+                self._expand_population_state(name, state["populations"][name], state)
+            )
+            for name, plan in self.populations.items()
+        }
+
     def _initialize_host(self, parameters, constants, state, inputs):
         from ._network_initialization import initialize_host
 
@@ -894,6 +921,7 @@ class FunctionalNetwork:
                 "Network timestep phases changed; lower again."
             )
         self._rng_plan.validate_source()
+        self._stimulation_rng_plan.validate_source()
         for plan in (
             *self.populations.values(),
             *self.synapses.values(),
@@ -1070,7 +1098,9 @@ class FunctionalNetwork:
         if self._rng_plan.enabled:
             state["rng"] = self._rng_plan.extract(network)
         if self._stimulation_plan.enabled:
-            state["stimulation_rng"] = self._stimulation_plan.extract(network)
+            state["stimulation_rng"] = self._stimulation_rng_plan.strip_pool(
+                self._stimulation_plan.extract(network)
+            )
             state = self._connection_rng_from_stimulation(state)
         return NetworkTensors(parameters, constants, state)
 
@@ -1093,6 +1123,7 @@ class FunctionalNetwork:
         _eligible(network)
         self._stimulation_plan.validate_compatible_network(network)
         self._rng_plan.validate_compatible_network(network)
+        self._stimulation_rng_plan.validate_compatible_network(network)
         if (
             network_initialization_source_alias_signature(network)
             != self._source_initialization_source_aliases
@@ -1559,6 +1590,8 @@ class FunctionalNetwork:
         (state,), _ = _canonicalize_mapping_tree((state,))
         self._validate_source()
         self._validate_state(state)
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_tapes(state, steps)[0]
         return self._rng_plan.sample_noise_tapes(state, steps)
 
     def sample_population_stimulation_tapes(self, state, steps, provided=None):
@@ -1569,14 +1602,17 @@ class FunctionalNetwork:
         self._validate_state(state)
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
             raise ValueError("steps must be a non-negative integer")
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_tapes(
+                state, steps, stimulation=provided
+            )[1]
         return self._stimulation_plan.sample_tapes(state, steps, provided)
 
     def _expand_population_state(self, name, population_state, state):
-        return self._stimulation_plan.expand(
+        return self._stimulation_rng_plan.expand_population(
             name,
-            self._rng_plan.expand_population(
-                name, population_state, state.get("rng", {})
-            ),
+            population_state,
+            state.get("rng", {}),
             state.get("stimulation_rng", {}),
         )
 
@@ -1736,18 +1772,30 @@ class FunctionalNetwork:
                     f"{label} must map known Population names to explicit inputs"
                 )
         inputs, extra, intra = inputs or {}, extra or {}, intra or {}
+        self._stimulation_rng_plan.validate_packets(
+            {
+                name: packet.noise
+                for name, packet in inputs.items()
+                if isinstance(packet, StepInput)
+            },
+            {
+                name: packet.stimulation
+                for name, packet in inputs.items()
+                if isinstance(packet, StepInput)
+            },
+        )
         clock = state["clock"]
         rng_pool = state.get("rng", {})
-        stimulation_pool = state.get("stimulation_rng", {})
+        stimulation_pool = self._stimulation_rng_plan.expand_pool(
+            rng_pool, state.get("stimulation_rng", {})
+        )
         time = (
             clock["origin"] + clock["step"].to(clock["origin"].dtype) * self.dt
         ).detach()
         states = {
             name: self._snap_population_clock(
-                self._stimulation_plan.expand(
-                    name,
-                    self._rng_plan.expand_population(name, value, rng_pool),
-                    stimulation_pool,
+                self._stimulation_rng_plan.expand_population(
+                    name, value, rng_pool, stimulation_pool
                 ),
                 time,
             )
@@ -1874,17 +1922,15 @@ class FunctionalNetwork:
             states[name], aux[name] = plan._rollout_values(
                 parameters["populations"][name],
                 prepared["populations"][name],
-                self._rng_plan.expand_population(name, states[name], rng_pool),
+                self._stimulation_rng_plan.expand_population(
+                    name, states[name], rng_pool, stimulation_pool
+                ),
                 rollout,
                 steps=1,
                 extra=extra.get(name),
             )
-            if self._rng_plan.enabled and self._rng_plan.local_streams[name]:
-                rng_pool = self._rng_plan.update_pool(
-                    name, states[name]["random"]["rng"], rng_pool
-                )
-            stimulation_pool = self._stimulation_plan.update(
-                name, states[name], stimulation_pool
+            rng_pool, stimulation_pool = self._stimulation_rng_plan.publish(
+                name, states[name], rng_pool, stimulation_pool
             )
         step = clock["step"] + 1
         next_time = (
@@ -1917,7 +1963,11 @@ class FunctionalNetwork:
             ),
             **({"rng": rng_pool} if self._rng_plan.enabled else {}),
             **(
-                {"stimulation_rng": stimulation_pool}
+                {
+                    "stimulation_rng": self._stimulation_rng_plan.strip_pool(
+                        stimulation_pool
+                    )
+                }
                 if self._stimulation_plan.enabled
                 else {}
             ),
@@ -2016,7 +2066,14 @@ class FunctionalNetwork:
         self._validate_source()
         self._validate_compatible(network)
         self._validate_state(state)
-        self._stimulation_plan.validate_state(state)
+        self._stimulation_plan.validate_state(
+            {
+                **state,
+                "stimulation_rng": self._stimulation_rng_plan.expand_pool(
+                    state.get("rng", {}), state.get("stimulation_rng", {})
+                ),
+            }
+        )
         self.check_overflow(state)
         sampling_rng = (
             self._connection_sampling_plan.validate_rng(

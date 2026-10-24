@@ -141,6 +141,17 @@ owners between Network Populations retains one authoritative carry per
 stream and preserves native Population sampling order; see
 {doc}`A47_functional_network_rng_sharing`.
 
+A randomized Poisson waveform can consume a declared stream through its
+public `.rng` generator. Explicit initialization then uses matching RAND/NOISE
+and stimulation packets sampled from the same incoming state. For a
+Population, use `sample_initialization_draw(parameters, state)` together with
+`sample_stimulation_initialization_draw(state)`. For a Network, use
+`sample_population_initialization_draws(parameters, state)` together with
+`sample_population_stimulation_initialization_draws(parameters, state)`.
+Host runners supply both packets automatically when omitted. See
+{doc}`A50_functional_poisson_stimulation` for sharing, runtime tapes, and a
+complete example.
+
 `stream.ignore_rng_on_load(True)` retains the incoming RNG seed and position
 when a valid steady-state cache restores sampled values. Runtime checkpoint
 restoration remains exact; see {doc}`A48_functional_rng_load_policies`.

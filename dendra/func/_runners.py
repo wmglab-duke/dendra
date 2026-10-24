@@ -848,6 +848,9 @@ def _execute_chunks(
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
+        chunk_inputs = functional._sample_missing_runtime_draws(
+            state, chunk_inputs, stop - start
+        )
         if (
             functional._noise_plan is not None
             and functional._noise_plan.runtime
@@ -916,6 +919,9 @@ def _execute_chunks_with_callbacks(
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
+        chunk_inputs = functional._sample_missing_runtime_draws(
+            state, chunk_inputs, stop - start
+        )
         if (
             functional._noise_plan is not None
             and functional._noise_plan.runtime
@@ -1005,6 +1011,9 @@ def _execute_checkpointed_chunks(
         chunk_steps = stop - start
         start_clock = _capture_clock(state)
         chunk_inputs = _slice_inputs(inputs, start, stop)
+        chunk_inputs = functional._sample_missing_runtime_draws(
+            state, chunk_inputs, stop - start
+        )
         if (
             functional._noise_plan is not None
             and functional._noise_plan.runtime
@@ -1253,6 +1262,7 @@ def _run_validated_schedule(
         functional._validate_noise_draw(inputs.noise, steps=steps)
     if inputs.stimulation is not None or steps == 0:
         functional._validate_stimulation_draw(inputs.stimulation, steps=steps)
+    functional._stimulation_rng_plan.validate_packets(inputs.noise, inputs.stimulation)
     chunklength = max(steps, 1) if span is None else span
     use_checkpoint = checkpointed and torch.is_grad_enabled() and steps > 0
     if use_checkpoint:

@@ -686,7 +686,7 @@ class PopulationCachePlan:
                 for entry in plan._poisson_plan.entries
             }
             restored_state["stimulation"] = {
-                "rng": state["stimulation"]["rng"],
+                **state["stimulation"],
                 "schedules": schedules,
             }
         plan._validate_state(restored_state)
