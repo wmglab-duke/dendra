@@ -867,57 +867,7 @@ def _execute_chunks(
     chunklength: int,
     expected_remainder: float,
     dt: float,
-    extra_plan: FunctionalExtra | None = None,
-    extra_tensors: StimulusTensors | None = None,
-):
-    auxiliary = None
-    for start, stop in _execution_spans(steps, chunklength):
-        start_clock = _capture_clock(state)
-        chunk_inputs = _prepare_chunk_inputs(functional, state, inputs, start, stop)
-        extra_ve = _assemble_extra_chunk(
-            functional,
-            extra_plan,
-            extra_tensors,
-            state,
-            start,
-            stop - start,
-            steps,
-            dt,
-        )
-        if extra_ve is not None:
-            chunk_inputs = RolloutInput(
-                ve=extra_ve,
-                intra=chunk_inputs.intra,
-                noise=chunk_inputs.noise,
-                stimulation=chunk_inputs.stimulation,
-            )
-        state, auxiliary = _execute_steps(
-            step,
-            state,
-            chunk_inputs,
-            stop - start,
-        )
-        _validate_returned_state(
-            functional,
-            state,
-            expected_remainder,
-            start_clock=start_clock,
-            steps=stop - start,
-            dt=dt,
-        )
-    return state, auxiliary
-
-
-def _execute_chunks_with_callbacks(
-    functional,
-    step,
-    state,
-    inputs: RolloutInput,
-    steps: int,
-    chunklength: int,
-    expected_remainder: float,
-    dt: float,
-    callbacks: FunctionalCallbacks,
+    callbacks: FunctionalCallbacks | None,
     callback_state,
     callback_parts,
     extra_plan: FunctionalExtra | None = None,
@@ -944,16 +894,24 @@ def _execute_chunks_with_callbacks(
                 noise=chunk_inputs.noise,
                 stimulation=chunk_inputs.stimulation,
             )
-        state, auxiliary, callback_state, emitted = _execute_steps_with_callbacks(
-            step,
-            state,
-            chunk_inputs,
-            stop - start,
-            callbacks,
-            callback_state,
-        )
-        if callbacks._has_emissions(emitted):
-            callback_parts.append(emitted)
+        if callbacks is None:
+            state, auxiliary = _execute_steps(
+                step,
+                state,
+                chunk_inputs,
+                stop - start,
+            )
+        else:
+            state, auxiliary, callback_state, emitted = _execute_steps_with_callbacks(
+                step,
+                state,
+                chunk_inputs,
+                stop - start,
+                callbacks,
+                callback_state,
+            )
+            if callbacks._has_emissions(emitted):
+                callback_parts.append(emitted)
         _validate_returned_state(
             functional,
             state,
@@ -962,12 +920,13 @@ def _execute_chunks_with_callbacks(
             steps=stop - start,
             dt=dt,
         )
-    auxiliary = _attach_callback_results(
-        auxiliary,
-        callbacks,
-        callback_state,
-        callback_parts,
-    )
+    if callbacks is not None:
+        auxiliary = _attach_callback_results(
+            auxiliary,
+            callbacks,
+            callback_state,
+            callback_parts,
+        )
     return state, auxiliary
 
 
@@ -1269,22 +1228,6 @@ def _run_validated_schedule(
             extra_plan,
             extra_tensors,
         )
-    if callbacks is not None:
-        return _execute_chunks_with_callbacks(
-            functional,
-            execution,
-            state,
-            inputs,
-            steps,
-            chunklength,
-            expected_remainder,
-            dt,
-            callbacks,
-            callback_state,
-            callback_parts,
-            extra_plan,
-            extra_tensors,
-        )
     return _execute_chunks(
         functional,
         execution,
@@ -1294,6 +1237,9 @@ def _run_validated_schedule(
         chunklength,
         expected_remainder,
         dt,
+        callbacks,
+        callback_state,
+        callback_parts,
         extra_plan,
         extra_tensors,
     )
