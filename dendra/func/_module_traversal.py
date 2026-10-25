@@ -25,7 +25,7 @@ def _registered_modules(module, *, duplicates=False, namespace=vars):
                 yield from visit(
                     f"{path}.{name}" if path else name,
                     nested,
-                    ancestors | {identity},
+                    ancestors | {identity} if duplicates else ancestors,
                 )
 
     return visit("", module, set())

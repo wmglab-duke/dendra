@@ -11,9 +11,10 @@ ephemeral, read-only entry in a nested State's ``values`` frame; use
 ``Population.bind_input`` to supply such an entry from a declared field in the
 same Population. Declaring a State input does not create a network connection.
 
-This example uses ordinary Network execution. Connected continuous delivery is
-not lowered by ``dn.func``; pure current/state hooks alone do not make the
-Network or its delivery buffers a functional connected-network simulation.
+This example checks ordinary Network execution. The same continuous delivery
+and receive contracts support functional lowering through ``dn.compile(network)``.
+``functional_continuous_connectivity.py`` demonstrates explicit projection and
+receiver composition with gradients and checkpoint continuation.
 """
 
 from __future__ import annotations
