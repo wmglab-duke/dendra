@@ -374,19 +374,9 @@ class NetworkStimulationRNGPlan:
                 if id(generator) in generators:
                     canonical = self.stimulation.local[name][entry.stream]
                     result[canonical] = generators[id(generator)]
-        for owner in network.modules():
-            if (
-                isinstance(owner, RNGModule)
-                and id(owner) not in declared
-                and any(
-                    id(generator) in requested
-                    for generator in (owner._cpu_gen, *owner._device_gens.values())
-                )
-            ):
-                raise FunctionalizationError(
-                    "Poisson generator aliases an untracked registered RNGModule; "
-                    "use a declared RAND/NOISE/SDE stream or a separate generator"
-                )
+        from ._stimulation_rng import _validate_registered_rng_owners
+
+        _validate_registered_rng_owners(network, declared, requested)
         return result
 
     def validate_compatible_network(self, network):

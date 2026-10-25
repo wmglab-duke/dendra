@@ -25,10 +25,9 @@ def _generator_bindings(bindings):
     return result
 
 
-def _validate_tracked_generators(population, bindings, generators):
-    declared = {id(owner) for owner in bindings.values()}
-    requested = {id(generator) for generator in generators}
-    for owner in population.modules():
+def _validate_registered_rng_owners(root, declared, requested):
+    """Reject requested generators with undeclared registered RNG owners."""
+    for owner in root.modules():
         if (
             isinstance(owner, RNGModule)
             and id(owner) not in declared
@@ -41,6 +40,12 @@ def _validate_tracked_generators(population, bindings, generators):
                 "Poisson generator aliases an untracked registered RNGModule; "
                 "use a declared RAND/NOISE/SDE stream or a separate generator"
             )
+
+
+def _validate_tracked_generators(population, bindings, generators):
+    declared = {id(owner) for owner in bindings.values()}
+    requested = {id(generator) for generator in generators}
+    _validate_registered_rng_owners(population, declared, requested)
 
 
 def _assert_shared_frame(actual, expected):
