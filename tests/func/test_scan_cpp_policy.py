@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from dendra.func import _scan
+from dendra.func import _scan, _scan_tree
 from dendra.func._scan_inductor import _compile_scan, _ScanInductorBackend
 
 pytestmark = pytest.mark.cpu
@@ -135,9 +135,8 @@ def test_private_cpp_preference_preserves_mode_options_conflict():
 
 
 @pytest.mark.parametrize("device", ["cpu", "cuda", "mps"])
-@pytest.mark.parametrize("original_grad_enabled", [False, True])
-def test_scan_capture_selects_cpp_from_original_mode_and_immutable_device(
-    monkeypatch, device, original_grad_enabled
+def test_population_inference_capture_selects_cpp_from_immutable_device(
+    monkeypatch, device
 ):
     captured, marker = {}, object()
     functional = SimpleNamespace(
@@ -168,37 +167,82 @@ def test_scan_capture_selects_cpp_from_original_mode_and_immutable_device(
             {},
             {},
             {},
-            [object()],
+            torch.zeros(1),
             None,
             {},
             None,
-            grad_enabled=original_grad_enabled,
         )
     assert result.__wrapped__ is marker
+    assert captured["prefer"] is (device == "cpu")
+    assert captured["pre_dispatch"] is False
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda", "mps"])
+@pytest.mark.parametrize("original_grad_enabled", [False, True])
+def test_shared_scan_capture_selects_cpp_from_original_mode_and_immutable_device(
+    monkeypatch, device, original_grad_enabled
+):
+    captured, marker = {}, object()
+
+    def body(parameters, prepared, state, carries, sample):
+        return (state, carries), {}
+
+    def make_fx_stub(function, *, pre_dispatch):
+        captured["pre_dispatch"] = pre_dispatch
+        return lambda *examples: function
+
+    def compile_stub(function, options, *, prefer_cpp_wrapper=False):
+        captured["prefer"] = prefer_cpp_wrapper
+        return marker
+
+    monkeypatch.setattr(_scan_tree, "make_fx", make_fx_stub)
+    monkeypatch.setattr(_scan_tree, "_compile_scan", compile_stub)
+    engine = _scan_tree._CompiledTensorTreeScan(
+        body, steps=1, compile_options={}, device=device
+    )
+    # CPU examples keep this compiler-policy probe independent of accelerator
+    # availability. Only the immutable device hint chooses the wrapper policy.
+    samples, sample_layout = engine._samples({"drive": torch.zeros(1)})
+    with torch.no_grad():
+        compiled, _layout, _isolate_views = engine._capture(
+            {"scale": torch.tensor(0.7, requires_grad=True)},
+            {},
+            {"v": torch.zeros(1)},
+            {},
+            samples,
+            sample_layout,
+            grad_enabled=original_grad_enabled,
+        )
+    assert compiled is marker
     assert captured["prefer"] is (device == "cpu" and not original_grad_enabled)
     assert captured["pre_dispatch"] is original_grad_enabled
 
 
 @pytest.mark.parametrize("device,forward_block", [("cpu", 4), ("cuda", 1), ("mps", 1)])
-def test_scan_passes_original_gradient_mode_through_forced_no_grad_capture(
+def test_population_scan_routes_training_and_forward_to_separate_engines(
     monkeypatch, device, forward_block
 ):
-    chunk = object.__new__(_scan._CompiledScanPopulationChunk)
-    chunk._functional = SimpleNamespace(device=torch.device(device))
-    chunk._steps, chunk._kernels = 8, {}
+    chunk = _scan._CompiledScanPopulationChunk(
+        SimpleNamespace(device=torch.device(device)), steps=8, compile_options={}
+    )
     records = []
 
     def capture_stub(*operands, **options):
-        records.append(
-            (torch.is_grad_enabled(), options["grad_enabled"], options["block"])
-        )
+        records.append(("inference", torch.is_grad_enabled(), options["block"]))
         return lambda *operands: ({}, {})
 
+    def training_stub(*operands):
+        records.append(("training", torch.is_grad_enabled()))
+        return {}, {}
+
     monkeypatch.setattr(chunk, "_capture", capture_stub)
+    monkeypatch.setattr(chunk, "_training_values", training_stub)
     monkeypatch.setattr(_scan, "_FORWARD_SCAN_BLOCK", 4)
     with torch.no_grad():
         chunk({}, {}, {}, None, None)
     with torch.enable_grad():
         chunk({}, {}, {}, None, None)
-    assert records == [(False, False, forward_block), (False, True, 1)]
-    assert len(chunk._kernels) == 2
+    with torch.no_grad():
+        chunk({}, {}, {}, None, None)
+    assert records == [("inference", False, forward_block), ("training", True)]
+    assert len(chunk._kernels) == 1

@@ -141,26 +141,14 @@ def _case(*, callbacks=True, steps=4):
     )
 
 
-def _capture(case, options):
-    chunk = _CompiledScanPopulationChunk(
+def _chunk(case, options):
+    return _CompiledScanPopulationChunk(
         case.functional,
         steps=case.steps,
         compile_options=options,
         stepwise_stimulation=True,
         plans=case.plans,
     )
-    with torch.no_grad():
-        return chunk._capture(
-            case.parameters,
-            case.prepared,
-            case.state,
-            case.ve,
-            case.intra,
-            case.carries,
-            None,
-            block=1,
-            grad_enabled=True,
-        )
 
 
 def _eager(case):
@@ -222,7 +210,7 @@ def test_training_pack_hop_uses_dtype_groups_and_preserves_gradients(callbacks):
         graphs.append(graph)
         return graph.forward
 
-    kernel = _capture(case, {"backend": backend, "fullgraph": True})
+    kernel = _chunk(case, {"backend": backend, "fullgraph": True})
     actual = kernel(
         case.parameters,
         case.prepared,
@@ -280,10 +268,7 @@ def _check_cpp_pack(callbacks):
         "dynamic": False,
         "options": {"cpp_wrapper": True, "compile_threads": 1, "fx_graph_cache": False},
     }
-    kernel = _capture(case, options)
-    assert callable(kernel.get_compiler_config)
-    assert callable(kernel._dendra_scan_donation_diagnostics)
-    assert callable(kernel.__wrapped__)
+    kernel = _chunk(case, options)
     with torch_compiler_warning_context():
         actual = kernel(
             case.parameters,
@@ -294,6 +279,10 @@ def _check_cpp_pack(callbacks):
             case.carries,
             None,
         )
+        ((compiled, _layout, _isolate_views),) = kernel._training._kernels.values()
+        assert callable(compiled.get_compiler_config)
+        assert callable(compiled._dendra_scan_donation_diagnostics)
+        assert callable(compiled.__wrapped__)
         expected = _eager(case)
         _close(actual, expected)
         _close(_gradients(actual, case), _gradients(expected, case))
@@ -342,7 +331,7 @@ def test_cuda_training_pack_preserves_mixed_host_scheduling_and_gradients():
         "dynamic": False,
         "options": {"compile_threads": 1},
     }
-    kernel = _capture(case, options)
+    kernel = _chunk(case, options)
     with torch_compiler_warning_context():
         actual = kernel(
             case.parameters,

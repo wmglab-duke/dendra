@@ -119,6 +119,8 @@ class _CompiledTensorTreeScan:
         plans=None,
         static_state_paths=(),
         detached_state_paths=(),
+        clone_state=None,
+        capture_examples=None,
     ):
         install_scan_compatibility()
         if type(steps) is not int or steps < 1:
@@ -130,6 +132,8 @@ class _CompiledTensorTreeScan:
         self._callback_carry = _CallbackCarryPartition.from_plans(plans)
         self._static_state_paths = tuple(tuple(path) for path in static_state_paths)
         self._detached_state_paths = tuple(tuple(path) for path in detached_state_paths)
+        self._clone_state = _clone_tree if clone_state is None else clone_state
+        self._capture_examples = capture_examples
         self._kernels = {}
 
     def _samples(self, tapes):
@@ -167,10 +171,17 @@ class _CompiledTensorTreeScan:
     ):
         body = self._body
         partition = self._callback_carry
+        clone_state = self._clone_state
         # Explicit invariant operands are read-only. Retain their visible
         # metadata during capture, including requires_grad and leaf status.
         # The no-grad capture boundary owns recurrent storage separately.
-        state = _clone_tree(state)
+        state = clone_state(state)
+        if self._capture_examples is not None:
+            # Adapter policy applies only to disposable tracing examples.
+            # Live runtime operands keep their gradients and view metadata.
+            parameters, prepared, state, carries, samples = self._capture_examples(
+                (parameters, prepared, state, carries, samples)
+            )
         mutable, invariant = partition.split(carries)
         layout = _PackedCarryLayout.from_tree((state, mutable))
         # Use the exact logical views that the scan body receives. Authored
@@ -218,7 +229,7 @@ class _CompiledTensorTreeScan:
                 layout,
                 parameters,
                 prepared,
-                (_clone_tree(state), mutable),
+                (clone_state(state), mutable),
                 invariant,
                 samples,
             )
@@ -265,7 +276,7 @@ class _CompiledTensorTreeScan:
         final, updated = layout.unpack(packed)
         # Equivalent logical leaves must never escape as duplicate moved C++
         # HOP output handles. Keep these ownership clones outside compilation.
-        final, updated = _clone_tree((final, updated))
+        final = self._clone_state(final)
         updated = _clone_tree(_partition_merge(self._callback_carry, updated, carries))
         for path in self._static_state_paths:
             final = _replace_path(final, path, _get_path(state, path).clone())

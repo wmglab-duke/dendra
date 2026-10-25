@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from dendra.func import _scan as scan_module
-from dendra.func import _scan_compat
+from dendra.func import _scan_compat, _scan_tree
 
 pytestmark = pytest.mark.cpu
 
@@ -36,7 +36,7 @@ def test_training_body_capture_preserves_authored_stop_gradients(monkeypatch):
             }, {}
 
     captured = []
-    make_fx = scan_module.make_fx
+    make_fx = _scan_tree.make_fx
 
     def record_graph(function, **options):
         def capture(*examples):
@@ -46,29 +46,23 @@ def test_training_body_capture_preserves_authored_stop_gradients(monkeypatch):
 
         return capture
 
-    monkeypatch.setattr(scan_module, "make_fx", record_graph)
+    monkeypatch.setattr(_scan_tree, "make_fx", record_graph)
     monkeypatch.setattr(
-        scan_module, "_compile_scan", lambda function, *a, **kw: function
+        _scan_tree, "_compile_scan", lambda function, *a, **kw: function
     )
-    chunk = object.__new__(scan_module._CompiledScanPopulationChunk)
-    chunk._functional = Functional()
-    chunk._steps = 2
-    chunk._options = {}
-    chunk._stepwise = False
-    chunk._plans = None
+    chunk = scan_module._CompiledScanPopulationChunk(
+        Functional(), steps=2, compile_options={}
+    )
     state = {
         "integrator": {"v": torch.tensor([-0.3, 0.2], dtype=torch.float64)},
         "control": {"duration_remainder": torch.tensor(0.0, dtype=torch.float64)},
     }
-    chunk._capture(
+    chunk(
         {"scale": torch.tensor(0.75, dtype=torch.float64)},
         {},
         state,
         None,
         None,
-        {},
-        None,
-        grad_enabled=True,
     )
     ((graph, examples, options),) = captured
     assert options["pre_dispatch"] is True

@@ -93,6 +93,8 @@ def test_phase_recording_and_packed_training_reuse_independent_specializations(m
             case.carries,
         )
         _close(forward, _eager(case))
+    assert chunk._training is None
+    (inference_kernel,) = chunk._kernels.values()
     with torch.enable_grad():
         actual = chunk(
             case.parameters,
@@ -105,6 +107,7 @@ def test_phase_recording_and_packed_training_reuse_independent_specializations(m
         expected = _eager(case)
         _close(actual, expected)
         _close(_gradients(actual, case), _gradients(expected, case))
+    (training_kernel,) = chunk._training._kernels.values()
     context = torch.inference_mode() if mode == "inference" else torch.no_grad()
     with context:
         repeated = chunk(
@@ -115,5 +118,6 @@ def test_phase_recording_and_packed_training_reuse_independent_specializations(m
             case.intra,
             case.carries,
         )
-    assert len(chunk._kernels) == 2
+    assert tuple(chunk._kernels.values()) == (inference_kernel,)
+    assert next(iter(chunk._training._kernels.values())) is training_kernel
     _close(repeated, forward, exact=True)

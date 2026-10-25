@@ -313,6 +313,9 @@ def test_cached_population_scan_accepts_reordered_parameter_keys(grad_enabled):
             )[0]
             torch.testing.assert_close(actual_gradient, expected_gradient)
             assert actual_gradient.abs().sum() > 0
-    assert len(chunk._compiled._kernels) == 1
+    kernels = (
+        chunk._compiled._training._kernels if grad_enabled else chunk._compiled._kernels
+    )
+    assert len(kernels) == 1
     assert reordered[name] is parameters[name]
     assert parameters[name].storage_offset() == 1

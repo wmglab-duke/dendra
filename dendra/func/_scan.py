@@ -16,16 +16,14 @@ from torch.utils import _pytree as pytree
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._callbacks import _update_callback_values
-from ._carry_packing import _PackedCarryLayout
 from ._hop_inputs import (
     _input_usage,
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
 )
-from ._scan_autograd import guard_scan_outputs
 from ._scan_compat import install_scan_compatibility
 from ._scan_inductor import _compile_scan
-from ._scan_tree import _capture_tensor_step, _packed_tensor_scan
+from ._scan_tree import _capture_tensor_step, _CompiledTensorTreeScan
 from ._types import StepInput
 
 # Bound the inference graph independently of the horizon, while amortizing the
@@ -71,6 +69,115 @@ class _CompiledScanPopulationChunk:
         self._plans = plans
         # Only static graphs/callables belong here, never example operands.
         self._kernels = {}
+        self._training = None
+        self._assemblies = {}
+
+    def _training_values(
+        self, parameters, prepared, state, ve, intra, carries, noise, stimulation
+    ):
+        functional = self._functional
+        plans = self._plans
+        # Population parameters are named operands. Stable key order keeps
+        # the shared engine's PyTree schema independent of caller dict order.
+        parameters = {name: parameters[name] for name in sorted(parameters)}
+        stepwise = self._stepwise or stimulation is not None
+        if not stepwise and (functional.intra.enabled or functional.extra.enabled):
+            signature = (ve is not None, intra is not None, MEMBRANE_ASSEMBLY.value)
+            if signature not in self._assemblies:
+                steps = self._steps
+
+                def assemble(parameters, prepared, state, ve, intra):
+                    return functional._assemble_bound_inputs(
+                        parameters,
+                        state,
+                        ve,
+                        intra,
+                        steps,
+                        prepared["integrator"]["dt"],
+                    )
+
+                with torch.inference_mode(False), torch.no_grad():
+                    examples = _detach(
+                        (
+                            parameters,
+                            prepared,
+                            functional._clone_state_tree(state),
+                            ve,
+                            intra,
+                        )
+                    )
+                    self._assemblies[signature] = make_fx(assemble, pre_dispatch=True)(
+                        *examples
+                    )
+            ve, intra = self._assemblies[signature](
+                parameters, prepared, state, ve, intra
+            )
+
+        if self._training is None:
+            stepwise_stimulation = self._stepwise
+
+            def body(parameters, prepared, state, carries, sample):
+                if stepwise_stimulation or sample["stimulation"] is not None:
+                    next_state, auxiliary = functional._step_values(
+                        parameters,
+                        prepared,
+                        state,
+                        StepInput(
+                            sample["ve"],
+                            sample["intra"],
+                            sample["noise"],
+                            sample["stimulation"],
+                        ),
+                    )
+                else:
+                    next_state, auxiliary = functional._transition_rollout_values(
+                        parameters,
+                        prepared,
+                        state,
+                        None if sample["ve"] is None else sample["ve"].unsqueeze(0),
+                        None
+                        if sample["intra"] is None
+                        else sample["intra"].unsqueeze(0),
+                        1,
+                        None
+                        if sample["noise"] is None
+                        else pytree.tree_map(
+                            lambda value: value.unsqueeze(0), sample["noise"]
+                        ),
+                    )
+                emitted = None
+                if plans is not None:
+                    carries, emitted = _update_callback_values(
+                        plans, carries, next_state, auxiliary
+                    )
+                return (next_state, carries), emitted or {}
+
+            self._training = _CompiledTensorTreeScan(
+                body,
+                steps=self._steps,
+                compile_options=self._options,
+                device=functional.device,
+                plans=plans,
+                static_state_paths=(("control", "duration_remainder"),),
+                clone_state=functional._clone_state_tree,
+                capture_examples=_detach,
+            )
+        final, updated, emitted = self._training(
+            parameters,
+            prepared,
+            state,
+            carries,
+            {"ve": ve, "intra": intra, "noise": noise, "stimulation": stimulation},
+        )
+        auxiliary = {"v": final["integrator"]["v"]}
+        if plans is None:
+            return final, auxiliary
+        return (
+            final,
+            auxiliary,
+            updated,
+            {plan.name: emitted.get(plan.name) for plan in plans},
+        )
 
     def _capture(
         self,
@@ -84,8 +191,8 @@ class _CompiledScanPopulationChunk:
         stimulation=None,
         *,
         block=1,
-        grad_enabled=True,
     ):
+        """Capture the specialized inference scan and its blocked emissions."""
         from torch._higher_order_ops.scan import scan
 
         functional = self._functional
@@ -93,10 +200,7 @@ class _CompiledScanPopulationChunk:
         steps = self._steps
         stepwise = self._stepwise or stimulation is not None
         phase_emissions = (
-            not grad_enabled
-            and block > 1
-            and plans is not None
-            and functional.device.type == "cpu"
+            block > 1 and plans is not None and functional.device.type == "cpu"
         )
         state = functional._clone_state_tree(state)
         parameters, prepared, state, ve, intra, carries, noise, stimulation = _detach(
@@ -104,14 +208,6 @@ class _CompiledScanPopulationChunk:
         )
         callback_carry = _CallbackCarryPartition.from_plans(plans)
         carries, invariant_carries = callback_carry.split(carries)
-        packed_training = block == 1 and grad_enabled
-        layout = (
-            _PackedCarryLayout.from_tree((state, carries)) if packed_training else None
-        )
-        if packed_training:
-            # Capture the same private contiguous views used inside the HOP,
-            # including when a caller supplies strided callback carry leaves.
-            state, carries = layout.unpack(layout.pack((state, carries)))
 
         # Atomic rollout samples a bound waveform on start + arange * dt;
         # host runners sample it at each accepted, repeatedly added clock.
@@ -129,7 +225,7 @@ class _CompiledScanPopulationChunk:
                     prepared["integrator"]["dt"],
                 )
 
-            assembly = make_fx(assemble, pre_dispatch=grad_enabled)(
+            assembly = make_fx(assemble, pre_dispatch=False)(
                 parameters, prepared, state, ve, intra
             )
             ve, intra = assembly(parameters, prepared, state, ve, intra)
@@ -185,11 +281,6 @@ class _CompiledScanPopulationChunk:
                     auxiliary,
                 )
                 carries, _ = callback_carry.split(updated)
-            if packed_training:
-                # The terminal pack in combine owns carry storage separately
-                # from AD's saved state intermediates. Keep emission ownership
-                # identical to the established single-step training path.
-                return (next_state, carries), _clone(emitted or {})
             if block == 1:
                 # Keep the established single-step body/partition boundaries.
                 # Unchanged clocks, reducers and Recorder views must not alias
@@ -199,14 +290,12 @@ class _CompiledScanPopulationChunk:
             # scan's non-aliasing contract applies at the block boundary.
             return (next_state, carries), emitted or {}
 
-        # Preserve authored autograd boundaries before the scan body is
-        # differentiated. Post-dispatch capture may represent detach as alias,
-        # which is forward-equivalent but silently erases stop-gradient/STE
-        # semantics. Inference does not differentiate this captured graph.
+        # Inference does not differentiate this captured graph. Training's
+        # authored AD boundaries belong to the shared tensor-tree engine.
         graph = _capture_tensor_step(
             authored,
             (parameters, prepared, state, carries, invariant_carries, sample),
-            grad_enabled=grad_enabled,
+            grad_enabled=False,
             tracer=make_fx,
         )
         parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
@@ -256,19 +345,6 @@ class _CompiledScanPopulationChunk:
                     steps, dtype=torch.int64, device=functional.device
                 )
 
-            if packed_training:
-                packed, emitted = _packed_tensor_scan(
-                    graph,
-                    layout,
-                    parameters,
-                    prepared,
-                    (functional._clone_state_tree(state), carries),
-                    invariant_carries,
-                    samples,
-                )
-                if plans is None:
-                    return packed
-                return packed, {plan.name: emitted.get(plan.name) for plan in plans}
             if block == 1:
 
                 def combine(carry, sample):
@@ -367,7 +443,7 @@ class _CompiledScanPopulationChunk:
         compiled = _compile_scan(
             execute,
             self._options,
-            prefer_cpp_wrapper=not grad_enabled and functional.device.type == "cpu",
+            prefer_cpp_wrapper=functional.device.type == "cpu",
         )
 
         @wraps(compiled)
@@ -392,11 +468,7 @@ class _CompiledScanPopulationChunk:
                 noise,
                 stimulation,
             )
-            if (
-                not packed_training
-                and not phase_emissions
-                and not callback_carry.invariant_names
-            ):
+            if not phase_emissions and not callback_carry.invariant_names:
                 return result
             if phase_emissions:
                 final, updated, phases, tail = result
@@ -421,30 +493,10 @@ class _CompiledScanPopulationChunk:
                     updated,
                     {plan.name: emitted.get(plan.name) for plan in plans},
                 )
-            if not packed_training:
-                final, auxiliary, updated, emitted = result
-                updated = _clone(
-                    callback_carry.merge(updated, callback_carry.split(carries)[1])
-                )
-                return final, auxiliary, updated, emitted
-            if plans is None:
-                packed, emitted = result, None
-            else:
-                packed, emitted = result
-            final, updated = layout.unpack(packed)
-            # Private views must not escape as public sibling aliases. Keep
-            # these clones outside compilation so equivalent logical leaves
-            # cannot become duplicate moved C++ HOP output handles.
-            final = functional._clone_state_tree(final)
+            final, auxiliary, updated, emitted = result
             updated = _clone(
                 callback_carry.merge(updated, callback_carry.split(carries)[1])
             )
-            final["control"]["duration_remainder"] = state["control"][
-                "duration_remainder"
-            ].clone()
-            auxiliary = {"v": final["integrator"]["v"]}
-            if plans is None:
-                return final, auxiliary
             return final, auxiliary, updated, emitted
 
         return materialize
@@ -460,55 +512,41 @@ class _CompiledScanPopulationChunk:
         noise=None,
         stimulation=None,
     ):
-        grad_enabled = torch.is_grad_enabled()
-        # Apply the measured block policy to CPU forward execution. Accelerator
-        # scan and training retain their established one-step body.
-        block = (
-            _FORWARD_SCAN_BLOCK
-            if not grad_enabled and self._functional.device.type == "cpu"
-            else 1
-        )
-        if type(block) is not int or block not in (1, 2, 4):
-            raise ValueError("the private forward scan block must be 1, 2, or 4")
-        block = min(block, self._steps)
-        signature = (
-            ve is not None,
-            intra is not None,
-            noise is not None,
-            stimulation is not None,
-            MEMBRANE_ASSEMBLY.value,
-            grad_enabled,
-            block,
-        )
-        if signature not in self._kernels:
-            # Capture a differentiable tensor program using disposable detached
-            # examples, even when first called under inference_mode/no_grad.
-            with torch.inference_mode(False), torch.no_grad():
-                self._kernels[signature] = self._capture(
-                    parameters,
-                    prepared,
-                    state,
-                    ve,
-                    intra,
-                    {} if carries is None else carries,
-                    noise,
-                    stimulation,
-                    block=block,
-                    # Capture runs under no_grad even for a training kernel.
-                    # Preserve the caller's mode when choosing its compiler.
-                    grad_enabled=grad_enabled,
-                )
-        result = self._kernels[signature](
-            parameters,
-            prepared,
-            state,
-            ve,
-            intra,
-            {} if carries is None else carries,
-            noise,
-            stimulation,
-        )
-        result = guard_scan_outputs(result)
+        carries = {} if carries is None else carries
+        if torch.is_grad_enabled():
+            result = self._training_values(
+                parameters, prepared, state, ve, intra, carries, noise, stimulation
+            )
+        else:
+            # Preserve the measured CPU inference block/phase-recording path.
+            block = _FORWARD_SCAN_BLOCK if self._functional.device.type == "cpu" else 1
+            if type(block) is not int or block not in (1, 2, 4):
+                raise ValueError("the private forward scan block must be 1, 2, or 4")
+            block = min(block, self._steps)
+            signature = (
+                ve is not None,
+                intra is not None,
+                noise is not None,
+                stimulation is not None,
+                MEMBRANE_ASSEMBLY.value,
+                block,
+            )
+            if signature not in self._kernels:
+                with torch.inference_mode(False), torch.no_grad():
+                    self._kernels[signature] = self._capture(
+                        parameters,
+                        prepared,
+                        state,
+                        ve,
+                        intra,
+                        carries,
+                        noise,
+                        stimulation,
+                        block=block,
+                    )
+            result = self._kernels[signature](
+                parameters, prepared, state, ve, intra, carries, noise, stimulation
+            )
         # Scan's AD wrapper marks floating carry outputs differentiable even
         # when their authored update is detached. Runtime NOISE retains its
         # native stop-gradient boundary when exposed as public carry. Poisson
