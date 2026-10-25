@@ -559,6 +559,22 @@ class ContinuousTransformPlan:
             if not p._is_internal_module_state(child, name) and name != "training":
                 self._guard_attributes.append((child, name, value, "config"))
 
+    def _collect_required_class_guards(self, child, cls):
+        """Capture required raw class members without resolving descriptors."""
+        for name in (
+            *_CALL_METHODS,
+            *_METADATA_METHODS,
+            *_COPY_METHODS,
+            "forward",
+            *child._parameters,
+            *child._buffers,
+            *child._modules,
+            *_INTERNAL_FIELDS,
+        ):
+            self._guard_classes.append(
+                (cls, name, name in vars(cls), vars(cls).get(name))
+            )
+
     def _collect_binding_guards(self, transform):
         """Freeze explicit registrations and dispatch without dependency audits."""
         p = _helpers()
@@ -579,19 +595,7 @@ class ContinuousTransformPlan:
             for cls in type(child).__mro__:
                 if cls in (torch.nn.Module, object):
                     continue
-                for name in (
-                    *_CALL_METHODS,
-                    *_METADATA_METHODS,
-                    *_COPY_METHODS,
-                    "forward",
-                    *child._parameters,
-                    *child._buffers,
-                    *child._modules,
-                    *_INTERNAL_FIELDS,
-                ):
-                    self._guard_classes.append(
-                        (cls, name, name in vars(cls), vars(cls).get(name))
-                    )
+                self._collect_required_class_guards(child, cls)
             target = _routine(child.forward)
             if inspect.isfunction(target):
                 self._guard_functions.append(
@@ -649,19 +653,7 @@ class ContinuousTransformPlan:
                     for name, descriptor in vars(cls).items():
                         if name not in p._CLASS_STATE_METADATA_NAMES:
                             self._guard_classes.append((cls, name, True, descriptor))
-                    for name in (
-                        *_CALL_METHODS,
-                        *_METADATA_METHODS,
-                        *_COPY_METHODS,
-                        "forward",
-                        *child._parameters,
-                        *child._buffers,
-                        *child._modules,
-                        *_INTERNAL_FIELDS,
-                    ):
-                        self._guard_classes.append(
-                            (cls, name, name in vars(cls), vars(cls).get(name))
-                        )
+                    self._collect_required_class_guards(child, cls)
                 self._collect_function_guards(child.forward, child)
         elif transform is not None:
             self._collect_function_guards(transform, None)
