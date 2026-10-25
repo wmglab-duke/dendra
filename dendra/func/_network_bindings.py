@@ -151,6 +151,14 @@ class SourceBinding:
         return value if tuple(value.shape) == self.shape else value.expand(self.shape)
 
 
+def _bind_materializer_aliases(mapping, canonical, aliases, values):
+    """Clone each canonical source once and rebind its relative paths."""
+    for relative, key in aliases.items():
+        if key not in canonical:
+            canonical[key] = values[key].clone()
+        mapping[f"source.{relative}"] = canonical[key]
+
+
 class AliasSnapshots:
     """Detached independent snapshots retaining genuine native Tensor ties.
 

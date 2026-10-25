@@ -21,7 +21,7 @@ from ._connection_parameters import (
     _helpers,
     _registered,
 )
-from ._network_bindings import AliasSnapshots
+from ._network_bindings import AliasSnapshots, _bind_materializer_aliases
 from ._prepared_values import (
     _capture_prepared_values,
     _validate_prepared_freshness,
@@ -435,10 +435,7 @@ class NetStimParameterPlan:
             (self._parameter_aliases, parameters),
             (self._constant_aliases, constants),
         ):
-            for path, key in aliases.items():
-                if key not in canonical:
-                    canonical[key] = values[key].clone()
-                mapping[f"source.{path}"] = canonical[key]
+            _bind_materializer_aliases(mapping, canonical, aliases, values)
         result = functional_call(self._execution, mapping, (), tie_weights=False)
         if set(result) != {"interval", *_FIELDS} or any(
             not torch.is_tensor(value)

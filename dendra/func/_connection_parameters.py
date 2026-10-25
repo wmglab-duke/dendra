@@ -20,7 +20,7 @@ from dendra.models.networks.net import (
 )
 from dendra.models.parametric import Bounded, NegativeParam, is_parametric
 
-from ._network_bindings import AliasSnapshots
+from ._network_bindings import AliasSnapshots, _bind_materializer_aliases
 from ._prepared_values import (
     _capture_prepared_values,
     _validate_prepared_freshness,
@@ -736,14 +736,12 @@ class ConnectionParameterPlan:
             name: value.clone() for name, value in p._module_tensor_slots(execution)
         }
         canonical = {}
-        for relative, key in self._role_parameter_aliases[role].items():
-            if key not in canonical:
-                canonical[key] = parameters[key].clone()
-            mapping[f"source.{relative}"] = canonical[key]
-        for relative, key in self._role_constant_aliases[role].items():
-            if key not in canonical:
-                canonical[key] = constants[key].clone()
-            mapping[f"source.{relative}"] = canonical[key]
+        _bind_materializer_aliases(
+            mapping, canonical, self._role_parameter_aliases[role], parameters
+        )
+        _bind_materializer_aliases(
+            mapping, canonical, self._role_constant_aliases[role], constants
+        )
         return mapping
 
     def _derive(self, role, parameters, constants):
