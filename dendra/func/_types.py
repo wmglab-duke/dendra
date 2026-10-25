@@ -236,6 +236,20 @@ class RolloutInput(NamedTuple):
     stimulation: StimulationDraw | None = None
 
 
+def _index_step_input(ve, intra, noise, stimulation, index) -> StepInput:
+    """Select one timestep, retaining packet structure and tensor views."""
+    return StepInput(
+        ve=None if ve is None else ve[index],
+        intra=None if intra is None else intra[index],
+        noise=None
+        if noise is None
+        else torch.utils._pytree.tree_map(lambda value: value[index], noise),
+        stimulation=None
+        if stimulation is None
+        else torch.utils._pytree.tree_map(lambda value: value[index], stimulation),
+    )
+
+
 class FunctionalizationError(RuntimeError):
     """Raised when a Population cannot yet be lowered without semantic loss."""
 

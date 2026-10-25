@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from ._callbacks import _stack_callback_emissions, _update_callback_values
-from ._types import RolloutInput, StepInput
+from ._types import RolloutInput, _index_step_input
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -120,20 +120,7 @@ class _LoweredPopulationChunk:
                     parameters,
                     prepared,
                     state,
-                    StepInput(
-                        ve=None if ve is None else ve[index],
-                        intra=None if intra is None else intra[index],
-                        noise=None
-                        if noise is None
-                        else torch.utils._pytree.tree_map(
-                            lambda value: value[index], noise
-                        ),
-                        stimulation=None
-                        if stimulation is None
-                        else torch.utils._pytree.tree_map(
-                            lambda value: value[index], stimulation
-                        ),
-                    ),
+                    _index_step_input(ve, intra, noise, stimulation, index),
                 )
             return state, auxiliary
         if self._force_unrolled:
@@ -199,20 +186,7 @@ class _LoweredCallbackPopulationChunk:
                 parameters,
                 prepared,
                 state,
-                StepInput(
-                    ve=None if ve is None else ve[index],
-                    intra=None if intra is None else intra[index],
-                    noise=None
-                    if noise is None
-                    else torch.utils._pytree.tree_map(
-                        lambda value: value[index], noise
-                    ),
-                    stimulation=None
-                    if stimulation is None
-                    else torch.utils._pytree.tree_map(
-                        lambda value: value[index], stimulation
-                    ),
-                ),
+                _index_step_input(ve, intra, noise, stimulation, index),
             )
             carries, emitted = _update_callback_values(
                 self._plans, carries, state, auxiliary

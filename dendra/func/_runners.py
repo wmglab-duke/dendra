@@ -19,7 +19,7 @@ from ._callbacks import FunctionalCallbackResults, FunctionalCallbacks
 from ._population import FunctionalPopulation
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._tensor_contracts import _tensor_binding
-from ._types import FunctionalizationError, RolloutInput, StepInput
+from ._types import FunctionalizationError, RolloutInput, StepInput, _index_step_input
 
 _StepCallable = Callable[[Mapping[str, object], StepInput], tuple[object, object]]
 _MISSING = object()
@@ -621,19 +621,8 @@ def _execute_steps(step, state, inputs: RolloutInput, steps: int):
     for index in range(steps):
         result = step(
             state,
-            StepInput(
-                ve=None if inputs.ve is None else inputs.ve[index],
-                intra=None if inputs.intra is None else inputs.intra[index],
-                noise=None
-                if inputs.noise is None
-                else torch.utils._pytree.tree_map(
-                    lambda value: value[index], inputs.noise
-                ),
-                stimulation=None
-                if inputs.stimulation is None
-                else torch.utils._pytree.tree_map(
-                    lambda value: value[index], inputs.stimulation
-                ),
+            _index_step_input(
+                inputs.ve, inputs.intra, inputs.noise, inputs.stimulation, index
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -686,19 +675,8 @@ def _execute_steps_with_callbacks(
     for index in range(steps):
         result = step(
             state,
-            StepInput(
-                ve=None if inputs.ve is None else inputs.ve[index],
-                intra=None if inputs.intra is None else inputs.intra[index],
-                noise=None
-                if inputs.noise is None
-                else torch.utils._pytree.tree_map(
-                    lambda value: value[index], inputs.noise
-                ),
-                stimulation=None
-                if inputs.stimulation is None
-                else torch.utils._pytree.tree_map(
-                    lambda value: value[index], inputs.stimulation
-                ),
+            _index_step_input(
+                inputs.ve, inputs.intra, inputs.noise, inputs.stimulation, index
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
