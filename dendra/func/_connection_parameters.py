@@ -62,6 +62,20 @@ def _callable_binding(value):
     return id(target), id(getattr(target, "__code__", None))
 
 
+def _append_materializer_class_guards(guards, child, seen, helpers):
+    for cls in type(child).__mro__:
+        if (
+            cls in seen
+            or cls in (torch.nn.Module, object)
+            or cls.__module__.startswith("torch.")
+        ):
+            continue
+        seen.add(cls)
+        for name, value in vars(cls).items():
+            if name not in helpers._CLASS_STATE_METADATA_NAMES:
+                guards.append((cls, name, value, _callable_binding(value)))
+
+
 def _binding(module, *, identities=True):
     from ._stimuli import _is_internal_module_state, _trusted_state_signature
     from ._torch_parametrizations import (
@@ -328,19 +342,9 @@ class ConnectionParameterPlan:
         seen_classes = set()
         for module in modules.values():
             for child in module.modules():
-                for cls in type(child).__mro__:
-                    if (
-                        cls in seen_classes
-                        or cls in (torch.nn.Module, object)
-                        or cls.__module__.startswith("torch.")
-                    ):
-                        continue
-                    seen_classes.add(cls)
-                    for name, value in vars(cls).items():
-                        if name not in p._CLASS_STATE_METADATA_NAMES:
-                            self._class_guards.append(
-                                (cls, name, value, _callable_binding(value))
-                            )
+                _append_materializer_class_guards(
+                    self._class_guards, child, seen_classes, p
+                )
         self._parameter_schema = {
             key: (tuple(value.shape), value.dtype, value.device)
             for key, value in self.parameter_sources().items()

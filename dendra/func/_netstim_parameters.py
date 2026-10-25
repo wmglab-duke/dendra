@@ -15,6 +15,7 @@ from dendra.models.networks._netstim_parameters import (
 from dendra.models.networks.netstim import NetStim
 
 from ._connection_parameters import (
+    _append_materializer_class_guards,
     _binding,
     _callable_binding,
     _clone,
@@ -173,19 +174,7 @@ class NetStimParameterPlan:
         seen = set()
         p = _helpers()
         for child in view.modules():
-            for cls in type(child).__mro__:
-                if (
-                    cls in seen
-                    or cls in (torch.nn.Module, object)
-                    or cls.__module__.startswith("torch.")
-                ):
-                    continue
-                seen.add(cls)
-                for name, value in vars(cls).items():
-                    if name not in p._CLASS_STATE_METADATA_NAMES:
-                        self._class_guards.append(
-                            (cls, name, value, _callable_binding(value))
-                        )
+            _append_materializer_class_guards(self._class_guards, child, seen, p)
         self._source_bindings = self._binding(source)
         self._compatible_bindings = self._binding(source, identities=False)
         self._parameter_schema = {
