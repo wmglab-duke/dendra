@@ -3866,40 +3866,27 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     "constant",
                 )
             )
-        for relative_path, buffer in mechanism_injection_constant_slots(owner):
-            if id(buffer) in seen or id(buffer) in parameter_ids:
-                continue
-            seen.add(id(buffer))
-            prefix, _separator, buffer_name = relative_path.rpartition(".")
-            path = f"{module_path}.{prefix}" if prefix else module_path
-            tables.append(
-                _PreparedBuffer(
-                    f"{module_path}.{relative_path}",
-                    path,
-                    buffer_name,
-                    _shape_tuple(buffer),
-                    buffer.dtype,
-                    buffer.device,
-                    "constant",
+        for constant_slots in (
+            mechanism_injection_constant_slots,
+            custom_material_constant_slots,
+        ):
+            for relative_path, buffer in constant_slots(owner):
+                if id(buffer) in seen or id(buffer) in parameter_ids:
+                    continue
+                seen.add(id(buffer))
+                prefix, _separator, buffer_name = relative_path.rpartition(".")
+                path = f"{module_path}.{prefix}" if prefix else module_path
+                tables.append(
+                    _PreparedBuffer(
+                        f"{module_path}.{relative_path}",
+                        path,
+                        buffer_name,
+                        _shape_tuple(buffer),
+                        buffer.dtype,
+                        buffer.device,
+                        "constant",
+                    )
                 )
-            )
-        for relative_path, buffer in custom_material_constant_slots(owner):
-            if id(buffer) in seen or id(buffer) in parameter_ids:
-                continue
-            seen.add(id(buffer))
-            prefix, _separator, buffer_name = relative_path.rpartition(".")
-            path = f"{module_path}.{prefix}" if prefix else module_path
-            tables.append(
-                _PreparedBuffer(
-                    f"{module_path}.{relative_path}",
-                    path,
-                    buffer_name,
-                    _shape_tuple(buffer),
-                    buffer.dtype,
-                    buffer.device,
-                    "constant",
-                )
-            )
     from ._initialization_sources import (
         initialization_source_constant_slots,
         initialization_source_roots,
