@@ -3733,6 +3733,32 @@ def _declared_parameter_names(module) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _append_registered_prepared_constants(
+    population, eligible_ids, seen, parameter_ids, destination
+):
+    for module_path, module in population.named_modules():
+        for name, buffer in module._buffers.items():
+            if (
+                buffer is None
+                or id(buffer) not in eligible_ids
+                or id(buffer) in seen
+                or id(buffer) in parameter_ids
+            ):
+                continue
+            seen.add(id(buffer))
+            destination.append(
+                _PreparedBuffer(
+                    f"{module_path}.{name}",
+                    module_path,
+                    name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "constant",
+                )
+            )
+
+
 def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ...]:
     effective = []
     derived = []
@@ -3903,51 +3929,15 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
         for _name, value in initialization_source_constant_slots(source)
         if id(value) not in runtime_buffer_ids
     }
-    for module_path, module in population.named_modules():
-        for name, buffer in module._buffers.items():
-            if (
-                buffer is None
-                or id(buffer) not in initial_buffer_ids
-                or id(buffer) in seen
-                or id(buffer) in parameter_ids
-            ):
-                continue
-            seen.add(id(buffer))
-            tables.append(
-                _PreparedBuffer(
-                    f"{module_path}.{name}",
-                    module_path,
-                    name,
-                    _shape_tuple(buffer),
-                    buffer.dtype,
-                    buffer.device,
-                    "constant",
-                )
-            )
+    _append_registered_prepared_constants(
+        population, initial_buffer_ids, seen, parameter_ids, tables
+    )
     from ._torch_parametrizations import buffer_slots as torch_buffer_slots
 
     torch_buffers = {id(value) for _name, value in torch_buffer_slots(population)}
-    for module_path, module in population.named_modules():
-        for name, buffer in module._buffers.items():
-            if (
-                buffer is None
-                or id(buffer) not in torch_buffers
-                or id(buffer) in seen
-                or id(buffer) in parameter_ids
-            ):
-                continue
-            seen.add(id(buffer))
-            tables.append(
-                _PreparedBuffer(
-                    f"{module_path}.{name}",
-                    module_path,
-                    name,
-                    _shape_tuple(buffer),
-                    buffer.dtype,
-                    buffer.device,
-                    "constant",
-                )
-            )
+    _append_registered_prepared_constants(
+        population, torch_buffers, seen, parameter_ids, tables
+    )
     return tuple((*effective, *derived, *timestep, *material, *tables))
 
 
