@@ -17527,7 +17527,7 @@ class FunctionalPopulation:
     ):
         """Execute a fixed-step rollout while threading pure callback carry."""
 
-        from ._callbacks import FunctionalCallbackResults
+        from ._callbacks import _complete_callback_results
 
         callbacks._validate_owner(self)
         callbacks._validate_runtime_dt_tensor(prepared["integrator"]["dt"])
@@ -17610,16 +17610,8 @@ class FunctionalPopulation:
             raise FunctionalizationError(
                 "rollout auxiliary output uses the reserved 'callbacks' key"
             )
-        stacked = callbacks._concatenate(parts)
-        callback_state = callbacks._capture_emission_schemas(
-            callback_state,
-            stacked,
-        )
-        outputs = callbacks._finalize(callback_state, stacked)
-        callback_state = callbacks._materialize_state(callback_state)
-        result["callbacks"] = FunctionalCallbackResults(
-            state=callback_state,
-            outputs=outputs,
+        result["callbacks"] = _complete_callback_results(
+            callbacks, callback_state, parts
         )
         return state, result
 

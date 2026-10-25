@@ -15,7 +15,7 @@ from torch.utils.checkpoint import checkpoint
 from dendra.models.core import _duration_step_budget, _validate_time_scalar
 
 from ._binding import BoundPopulation
-from ._callbacks import FunctionalCallbackResults, FunctionalCallbacks
+from ._callbacks import FunctionalCallbacks, _complete_callback_results
 from ._population import FunctionalPopulation
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._tensor_contracts import _tensor_binding
@@ -746,16 +746,8 @@ def _attach_callback_results(
         raise FunctionalizationError(
             "step auxiliary output uses the reserved 'callbacks' key"
         )
-    stacked = callbacks._concatenate(callback_parts)
-    callback_state = callbacks._capture_emission_schemas(
-        callback_state,
-        stacked,
-    )
-    outputs = callbacks._finalize(callback_state, stacked)
-    callback_state = callbacks._materialize_state(callback_state)
-    result["callbacks"] = FunctionalCallbackResults(
-        state=callback_state,
-        outputs=outputs,
+    result["callbacks"] = _complete_callback_results(
+        callbacks, callback_state, callback_parts
     )
     return result
 

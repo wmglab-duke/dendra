@@ -1363,6 +1363,23 @@ def _stack_callback_emissions(plans, emissions):
     }
 
 
+def _complete_callback_results(
+    callbacks, callback_state, parts
+) -> FunctionalCallbackResults:
+    """Finalize one segment before materializing its continuation carry."""
+    stacked = callbacks._concatenate(parts)
+    callback_state = callbacks._capture_emission_schemas(
+        callback_state,
+        stacked,
+    )
+    outputs = callbacks._finalize(callback_state, stacked)
+    callback_state = callbacks._materialize_state(callback_state)
+    return FunctionalCallbackResults(
+        state=callback_state,
+        outputs=outputs,
+    )
+
+
 @dataclass(frozen=True)
 class _ImperativeCallbackBinding:
     callbacks: FunctionalCallbacks
