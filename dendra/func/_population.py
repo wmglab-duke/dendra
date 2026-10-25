@@ -13809,6 +13809,58 @@ class FunctionalPopulation:
             values,
         )
 
+    def _execute_initialization(
+        self,
+        initialization,
+        parameters,
+        pre_state,
+        transform_inputs,
+        initialization_template,
+        prepare,
+        initialize,
+    ):
+        """Execute the common tensor phases within a caller-owned transaction.
+
+        Runtime and diagnostics supply preparation and invocation boundaries.
+        They retain stochastic binding, output checks and audit observations;
+        neither admission nor completion policies belong to this executor.
+        """
+        initialized_parameters, pre_state = _apply_initialization_transforms(
+            initialization, "pre", parameters, pre_state, transform_inputs
+        )
+        prepared = prepare(initialized_parameters)
+        # Native initialization and its final current frame precede integrator
+        # timestep configuration, including when preparation owns runtime dt.
+        initialization_dt = torch.zeros_like(prepared["integrator"]["dt"])
+        mapping, _dt, _celsius, _v, _t, _remainder = self._mapping(
+            initialized_parameters,
+            prepared,
+            initialization_template,
+            isolate_read_only=True,
+            mechanism_dt=initialization_dt,
+        )
+        state = initialize(mapping, pre_state, initialization_dt)
+        initialized_parameters, state = _apply_initialization_transforms(
+            initialization, "post", initialized_parameters, state, transform_inputs
+        )
+        return initialized_parameters, state, prepared
+
+    def _initialization_outputs(self, initialization, mapping, pre_state):
+        """Invoke the initializer with the explicit voltage and State frame."""
+        return functional_call(
+            initialization,
+            mapping,
+            (
+                _get_path(pre_state, ("integrator", "v")),
+                *(
+                    _get_path(pre_state, entry.public_path)
+                    for entry in self._initialization_state_layout
+                ),
+            ),
+            _initialization_voltage_kwargs(pre_state),
+            tie_weights=False,
+        )
+
     def initialize(
         self,
         parameters,
@@ -13955,82 +14007,68 @@ class FunctionalPopulation:
                     initialization=True,
                     owner_paths=("",),
                 )
-        initialized_parameters, pre_state = _apply_initialization_transforms(
+
+        def prepare_initialization(initialized_parameters):
+            return self._prepare_values(
+                initialized_parameters,
+                constants,
+                for_initialization=True,
+                root_random_values=root_random_values,
+            )
+
+        def initialize_state(mapping, pre_state, initialization_dt):
+            if self._noise_plan is not None:
+                self._noise_plan.validate(selected_random_draw, initialization=True)
+                noise_values = self._noise_plan.values(
+                    mapping,
+                    selected_random_draw,
+                    torch.ones_like(initialization_dt),
+                    initialization=True,
+                    owner_paths=(
+                        tuple(
+                            entry.path
+                            for entry in self._noise_plan.entries
+                            if entry.path
+                        )
+                        if self._split_stochastic_initialization
+                        else None
+                    ),
+                )
+                for path, value in {**root_noise_values, **noise_values}.items():
+                    module_path, _separator, _name = path.rpartition(".")
+                    owner = _module_at(self._initialization.population, module_path)
+                    mapping[f"population.{path}"] = value.reshape(
+                        (1,)
+                        * max(
+                            0, len(getattr(owner, "shape_f", value.shape)) - value.ndim
+                        )
+                        + tuple(value.shape)
+                    )
+            if stimulation_draw is not None:
+                mapping.update(
+                    self._poisson_plan.initialization_mapping(stimulation_draw)
+                )
+            outputs = self._initialization_outputs(
+                self._initialization, mapping, pre_state
+            )
+            state = {}
+            for leaf, value in zip(self._state_layout, outputs, strict=True):
+                if not torch.is_tensor(value):
+                    raise FunctionalizationError(
+                        "functional initialization returned non-Tensor state leaf "
+                        f"{'.'.join(leaf.public_path)!r}"
+                    )
+                _put_path(state, leaf.public_path, value)
+            return state
+
+        initialized_parameters, state, prepared = self._execute_initialization(
             self._initialization,
-            "pre",
             parameters,
             pre_state,
             initialization_transform_values,
-        )
-        prepared = self._prepare_values(
-            initialized_parameters,
-            constants,
-            for_initialization=True,
-            root_random_values=root_random_values,
-        )
-        # Imperative Mechanism/State initialization and its final current frame
-        # run before the integrator configures a timestep. Preserve that exact
-        # zero-dt view even though transition preparation already owns runtime dt.
-        initialization_dt = torch.zeros_like(prepared["integrator"]["dt"])
-        mapping, _dt, _celsius, _v, _t, _duration_remainder = self._mapping(
-            initialized_parameters,
-            prepared,
             initialization_template,
-            isolate_read_only=True,
-            mechanism_dt=initialization_dt,
-        )
-        if self._noise_plan is not None:
-            self._noise_plan.validate(selected_random_draw, initialization=True)
-            noise_values = self._noise_plan.values(
-                mapping,
-                selected_random_draw,
-                torch.ones_like(initialization_dt),
-                initialization=True,
-                owner_paths=(
-                    tuple(
-                        entry.path for entry in self._noise_plan.entries if entry.path
-                    )
-                    if self._split_stochastic_initialization
-                    else None
-                ),
-            )
-            for path, value in {**root_noise_values, **noise_values}.items():
-                module_path, _separator, _name = path.rpartition(".")
-                owner = _module_at(self._initialization.population, module_path)
-                mapping[f"population.{path}"] = value.reshape(
-                    (1,)
-                    * max(0, len(getattr(owner, "shape_f", value.shape)) - value.ndim)
-                    + tuple(value.shape)
-                )
-        if stimulation_draw is not None:
-            mapping.update(self._poisson_plan.initialization_mapping(stimulation_draw))
-        outputs = functional_call(
-            self._initialization,
-            mapping,
-            (
-                _get_path(pre_state, ("integrator", "v")),
-                *(
-                    _get_path(pre_state, entry.public_path)
-                    for entry in self._initialization_state_layout
-                ),
-            ),
-            _initialization_voltage_kwargs(pre_state),
-            tie_weights=False,
-        )
-        state = {}
-        for leaf, value in zip(self._state_layout, outputs, strict=True):
-            if not torch.is_tensor(value):
-                raise FunctionalizationError(
-                    "functional initialization returned non-Tensor state leaf "
-                    f"{'.'.join(leaf.public_path)!r}"
-                )
-            _put_path(state, leaf.public_path, value)
-        initialized_parameters, state = _apply_initialization_transforms(
-            self._initialization,
-            "post",
-            initialized_parameters,
-            state,
-            initialization_transform_values,
+            prepare_initialization,
+            initialize_state,
         )
         from ._noise_workspaces import noise_workspace_constants_from_state
 
@@ -16346,79 +16384,68 @@ class FunctionalPopulation:
                         strict=True,
                     ):
                         _put_path(pre_state, entry.public_path, value)
-                    initialized_parameters, pre_state = (
-                        _apply_initialization_transforms(
+
+                    def prepare_initialization(initialized_parameters):
+                        preparation_modules = (
+                            audit_preparation,
+                            *getattr(
+                                audit_preparation, "component_physical_preparations", ()
+                            ),
+                        )
+                        # Storage/version fingerprints are meaningful for the
+                        # ordinary probes, not hidden vmap/JVP tensor wrappers.
+                        for module in preparation_modules:
+                            module.audit_builder_inputs = track_read_only
+                        try:
+                            return self._prepare_values(
+                                initialized_parameters,
+                                constants,
+                                preparation=audit_preparation,
+                                preparation_base_mapping=preparation_base_mapping,
+                                for_initialization=True,
+                            )
+                        finally:
+                            for module in preparation_modules:
+                                module.audit_builder_inputs = True
+
+                    def initialize_state(bound_mapping, pre_state, initialization_dt):
+                        nonlocal mapping, read_only_bindings
+                        nonlocal state_outputs, initialized_v
+                        mapping = bound_mapping
+                        initialized_v = _get_path(pre_state, ("integrator", "v"))
+                        if track_read_only:
+                            read_only_bindings = {
+                                slot: _audit_tensor_binding(value)
+                                for slot, value in mapping.items()
+                                if slot not in self._mutable_mapping_slots
+                            }
+                        audit_initialization._audit_noise_workspaces = track_read_only
+                        try:
+                            state_outputs = self._initialization_outputs(
+                                audit_initialization, mapping, pre_state
+                            )
+                        finally:
+                            audit_initialization._audit_noise_workspaces = True
+                        state = {}
+                        for leaf, value in zip(
+                            self._state_layout,
+                            state_outputs,
+                            strict=True,
+                        ):
+                            _put_path(state, leaf.public_path, value)
+                        return state
+
+                    mapping = read_only_bindings = state_outputs = initialized_v = None
+                    initialized_parameters, state, _prepared = (
+                        self._execute_initialization(
                             audit_initialization,
-                            "pre",
                             parameters,
                             pre_state,
                             transform_inputs,
+                            self._initialization_state_template,
+                            prepare_initialization,
+                            initialize_state,
                         )
-                    )
-                    initialized_v = _get_path(pre_state, ("integrator", "v"))
-                    initialized_explicit = tuple(
-                        _get_path(pre_state, entry.public_path)
-                        for entry in self._initialization_state_layout
-                    )
-                    preparation_modules = (
-                        audit_preparation,
-                        *getattr(
-                            audit_preparation, "component_physical_preparations", ()
-                        ),
-                    )
-                    # Storage/version fingerprints are meaningful for the
-                    # ordinary probes, not for hidden vmap/JVP tensor wrappers.
-                    for module in preparation_modules:
-                        module.audit_builder_inputs = track_read_only
-                    try:
-                        prepared = self._prepare_values(
-                            initialized_parameters,
-                            constants,
-                            preparation=audit_preparation,
-                            preparation_base_mapping=preparation_base_mapping,
-                            for_initialization=True,
-                        )
-                    finally:
-                        for module in preparation_modules:
-                            module.audit_builder_inputs = True
-                    initialization_dt = torch.zeros_like(prepared["integrator"]["dt"])
-                    mapping, _dt, _celsius, _v, _t, _remainder = self._mapping(
-                        initialized_parameters,
-                        prepared,
-                        self._initialization_state_template,
-                        isolate_read_only=True,
-                        mechanism_dt=initialization_dt,
-                    )
-                    if track_read_only:
-                        read_only_bindings = {
-                            slot: _audit_tensor_binding(value)
-                            for slot, value in mapping.items()
-                            if slot not in self._mutable_mapping_slots
-                        }
-                    audit_initialization._audit_noise_workspaces = track_read_only
-                    try:
-                        state_outputs = functional_call(
-                            audit_initialization,
-                            mapping,
-                            (initialized_v, *initialized_explicit),
-                            _initialization_voltage_kwargs(pre_state),
-                            tie_weights=False,
-                        )
-                    finally:
-                        audit_initialization._audit_noise_workspaces = True
-                    state = {}
-                    for leaf, value in zip(
-                        self._state_layout,
-                        state_outputs,
-                        strict=True,
-                    ):
-                        _put_path(state, leaf.public_path, value)
-                    initialized_parameters, state = _apply_initialization_transforms(
-                        audit_initialization,
-                        "post",
-                        initialized_parameters,
-                        state,
-                        transform_inputs,
                     )
                     state = _reset_functional_initialization_clock(state)
                     outputs = (
