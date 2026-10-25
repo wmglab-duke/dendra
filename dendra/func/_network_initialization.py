@@ -515,7 +515,7 @@ def _population_materialization_alias_bindings(functional):
     }
     result = {}
     for name, plan in functional.populations.items():
-        if plan._owned_cache_bound or not plan._materialization_value_specs:
+        if plan._owned_cache_bound or not plan._retained_materializations.slots:
             continue
         population = plan._population
         paths = {
@@ -540,7 +540,8 @@ def _population_materialization_alias_bindings(functional):
                 if field in component._buffers
             )
         sources = {}
-        for _public, path, *_schema in plan._materialization_value_specs:
+        for slot in plan._retained_materializations.slots:
+            path = slot.path
             if path not in paths:
                 continue
             module_path, _separator, field = path.rpartition(".")
@@ -577,10 +578,8 @@ def _publish_materialization_aliases(
     if not bindings:
         return parameters, constants, populations
     values = {
-        path: constants["populations"][name][public]
-        for public, path, *_schema in functional.populations[
-            name
-        ]._materialization_value_specs
+        slot.path: constants["populations"][name][slot.value_key]
+        for slot in functional.populations[name]._retained_materializations.slots
     }
     return _restore_cache_aliases(
         functional,

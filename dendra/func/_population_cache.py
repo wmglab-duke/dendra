@@ -411,9 +411,12 @@ class PopulationCachePlan:
                 )
                 if source is not None:
                     self.constants[public] = source
-        for public, source, _shape, _dtype, _device in (
-            *plan._cache_value_specs,
-            *plan._materialization_value_specs,
+        for public, source in (
+            *((public, source) for public, source, *_schema in plan._cache_value_specs),
+            *(
+                (slot.value_key, slot.path)
+                for slot in plan._retained_materializations.slots
+            ),
         ):
             value = slots[source]
             module_path, _, buffer_name = source.rpartition(".")

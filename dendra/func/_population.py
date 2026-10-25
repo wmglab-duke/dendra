@@ -115,6 +115,7 @@ from dendra.models.stim.waveform.core import Waveform
 from dendra.models.tree import Tree
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
+from ._retained_materializations import _RetainedMaterializationInventory
 from ._rng_diagnostics import (
     _global_rng_changes,
     _global_rng_snapshot,
@@ -11312,8 +11313,7 @@ class FunctionalPopulation:
 
         self._multi_component_plans = ()
         self._cache_value_specs = ()
-        self._materialization_value_specs = ()
-        self._materialization_prepared_paths = {}
+        self._retained_materializations = _RetainedMaterializationInventory()
         self._has_snapshot_materialization_offsets = None
         self._retain_initialization_materializations = (
             _retain_initialization_materializations
@@ -12902,7 +12902,7 @@ class FunctionalPopulation:
         can write shared sources. Effective buffers and solver workspaces have
         separate slots: a later in-place buffer write need not rebuild a solver.
         """
-        if self._materialization_value_specs:
+        if self._retained_materializations.slots:
             return
         paths = list(self._materialization_source_paths())
         paths.extend(
@@ -12911,7 +12911,7 @@ class FunctionalPopulation:
             if entry.kind == "timestep"
         )
         paths.extend(f"integrator.{name}" for name in self._integrator_workspace_names)
-        self._materialization_value_specs = self._materialization_specs(
+        specs = self._materialization_specs(
             tuple(dict.fromkeys(paths)), "materializations"
         )
         prepared_paths = {}
@@ -12925,38 +12925,30 @@ class FunctionalPopulation:
                 )
         for name in self._integrator_workspace_names:
             prepared_paths[f"integrator.{name}"] = ("integrator", name)
-        self._materialization_prepared_paths = prepared_paths
-
-    @staticmethod
-    def _materialization_active_name(path):
-        return f"materializations.active.{path}"
-
-    @staticmethod
-    def _materialization_baseline_name(path):
-        return f"materializations.baseline.{path}"
+        self._retained_materializations = _RetainedMaterializationInventory.from_specs(
+            specs, prepared_paths
+        )
 
     def _clear_retained_materializations(self, constants):
-        if not self._materialization_value_specs:
+        if not self._retained_materializations.slots:
             return constants
         # Fresh preparation discards these values. Cut their old graph before
         # inactive torch.where routes can revisit a completed backward pass.
         return {
             **constants,
             **{
-                name: constants[name].detach()
-                for name, _path, *_schema in self._materialization_value_specs
+                slot.value_key: constants[slot.value_key].detach()
+                for slot in self._retained_materializations.slots
             },
             **{
-                self._materialization_active_name(path): torch.zeros_like(
-                    constants[self._materialization_active_name(path)]
-                )
-                for _name, path, *_schema in self._materialization_value_specs
+                slot.active_key: torch.zeros_like(constants[slot.active_key])
+                for slot in self._retained_materializations.slots
             },
         }
 
     def _retain_materializations(self, parameters, constants, *, prepared=None):
         """Capture native preparation without detaching fresh initialization graphs."""
-        if not self._materialization_value_specs:
+        if not self._retained_materializations.slots:
             return constants
         if prepared is None:
             prepared = self._prepare_values(
@@ -12966,20 +12958,18 @@ class FunctionalPopulation:
         return {
             **constants,
             **{
-                name: values[path].clone(memory_format=torch.preserve_format)
-                for name, path, *_schema in self._materialization_value_specs
+                slot.value_key: values[slot.path].clone(
+                    memory_format=torch.preserve_format
+                )
+                for slot in self._retained_materializations.slots
             },
             **{
-                self._materialization_active_name(path): torch.ones_like(
-                    constants[self._materialization_active_name(path)]
-                )
-                for _name, path, *_schema in self._materialization_value_specs
+                slot.active_key: torch.ones_like(constants[slot.active_key])
+                for slot in self._retained_materializations.slots
             },
             **{
-                self._materialization_baseline_name(path): torch.zeros_like(
-                    constants[self._materialization_baseline_name(path)]
-                )
-                for _name, path, *_schema in self._materialization_value_specs
+                slot.baseline_key: torch.zeros_like(constants[slot.baseline_key])
+                for slot in self._retained_materializations.slots
             },
         }
 
@@ -12991,28 +12981,26 @@ class FunctionalPopulation:
         use_snapshot_offsets=True,
         snapshot_baseline_capture=None,
     ):
-        if not self._cache_value_specs and not self._materialization_value_specs:
+        if not self._cache_value_specs and not self._retained_materializations.slots:
             return None, None
         values = {
             path.removeprefix(prefix): constants[name]
             for name, path, _shape, _dtype, _device in self._cache_value_specs
             if path.startswith(prefix)
         }
-        for name, path, *_schema in self._materialization_value_specs:
-            if path.startswith(prefix):
-                relative = path.removeprefix(prefix)
+        for slot in self._retained_materializations.slots:
+            if slot.path.startswith(prefix):
+                relative = slot.path.removeprefix(prefix)
                 values[relative] = (
                     _SnapshotMaterialization(
-                        constants[name], path, snapshot_baseline_capture
+                        constants[slot.value_key], slot.path, snapshot_baseline_capture
                     )
                     if snapshot_baseline_capture is not None
                     else _RetainedMaterialization(
                         values.get(relative),
-                        constants[name],
-                        constants[self._materialization_active_name(path)],
-                        constants[self._materialization_baseline_name(path)]
-                        if use_snapshot_offsets
-                        else None,
+                        constants[slot.value_key],
+                        constants[slot.active_key],
+                        constants[slot.baseline_key] if use_snapshot_offsets else None,
                     )
                 )
         return values, constants.get("cache.active")
@@ -13039,12 +13027,12 @@ class FunctionalPopulation:
         if self._cache_value_specs:
             expected_names.update(name for name, *_ in self._cache_value_specs)
             expected_names.add("cache.active")
-        for name, path, *_schema in self._materialization_value_specs:
+        for slot in self._retained_materializations.slots:
             expected_names.update(
                 (
-                    name,
-                    self._materialization_active_name(path),
-                    self._materialization_baseline_name(path),
+                    slot.value_key,
+                    slot.active_key,
+                    slot.baseline_key,
                 )
             )
         if set(constants) != expected_names:
@@ -13128,19 +13116,19 @@ class FunctionalPopulation:
                 raise ValueError(
                     f"constant 'cache.active' must be a scalar bool on {self.device}"
                 )
-        for name, path, shape, dtype, device in self._materialization_value_specs:
-            for value_name in (name, self._materialization_baseline_name(path)):
+        for slot in self._retained_materializations.slots:
+            for value_name in (slot.value_key, slot.baseline_key):
                 value = constants[value_name]
                 if (
                     not torch.is_tensor(value)
-                    or _shape_tuple(value) != shape
-                    or value.dtype != dtype
-                    or value.device != device
+                    or _shape_tuple(value) != slot.shape
+                    or value.dtype != slot.dtype
+                    or value.device != slot.device
                 ):
                     raise ValueError(
                         f"constant {value_name!r} has incompatible retained schema"
                     )
-            active_name = self._materialization_active_name(path)
+            active_name = slot.active_key
             active = constants[active_name]
             if (
                 not torch.is_tensor(active)
@@ -13551,32 +13539,30 @@ class FunctionalPopulation:
             constants["cache.active"] = torch.zeros(
                 (), device=self.device, dtype=torch.bool
             )
-        if self._materialization_value_specs:
+        if self._retained_materializations.slots:
             constants.update(
                 {
-                    name: _clone_tensor(population.get_buffer(path))
-                    for name, path, *_schema in self._materialization_value_specs
+                    slot.value_key: _clone_tensor(population.get_buffer(slot.path))
+                    for slot in self._retained_materializations.slots
                 }
             )
             constants.update(
                 {
-                    self._materialization_active_name(path): torch.zeros(
+                    slot.active_key: torch.zeros(
                         (), device=self.device, dtype=torch.bool
                     )
-                    for _name, path, *_schema in self._materialization_value_specs
+                    for slot in self._retained_materializations.slots
                 }
             )
             constants.update(
                 {
-                    self._materialization_baseline_name(path): torch.zeros_like(
-                        constants[name]
-                    )
-                    for name, path, *_schema in self._materialization_value_specs
+                    slot.baseline_key: torch.zeros_like(constants[slot.value_key])
+                    for slot in self._retained_materializations.slots
                 }
             )
         if self._random_plan is not None:
             constants.update(_random_constants)
-        if self._materialization_value_specs:
+        if self._retained_materializations.slots:
             baselines = {}
             with torch.no_grad():
                 self._prepare_values(
@@ -13585,9 +13571,9 @@ class FunctionalPopulation:
                     _snapshot_baseline_capture=baselines,
                 )
             expected_baselines = {
-                path
-                for _name, path, *_schema in self._materialization_value_specs
-                if path != "integrator.dt"
+                slot.path
+                for slot in self._retained_materializations.slots
+                if slot.path != "integrator.dt"
             }
             if set(baselines) != expected_baselines:
                 raise FunctionalizationError(
@@ -13597,14 +13583,17 @@ class FunctionalPopulation:
                 )
             constants.update(
                 {
-                    self._materialization_baseline_name(path): baseline
+                    self._retained_materializations.by_path[path].baseline_key: baseline
                     for path, baseline in baselines.items()
                 }
             )
             if self._has_snapshot_materialization_offsets is None:
                 self._has_snapshot_materialization_offsets = any(
                     not torch.equal(
-                        constants[f"materializations.values.{path}"], baseline
+                        constants[
+                            self._retained_materializations.by_path[path].value_key
+                        ],
+                        baseline,
                     )
                     for path, baseline in baselines.items()
                 )
@@ -14491,14 +14480,12 @@ class FunctionalPopulation:
             if not leaf.public_path[2].startswith("timestep.buffer."):
                 continue
             path = f"{leaf.module_path}.{leaf.buffer_name}"
-            name = f"materializations.values.{path}"
-            if name in constants:
-                constants[name] = _get_path(state, leaf.public_path)
-                constants[self._materialization_active_name(path)] = torch.ones_like(
-                    constants[self._materialization_active_name(path)]
-                )
-                constants[self._materialization_baseline_name(path)] = torch.zeros_like(
-                    constants[self._materialization_baseline_name(path)]
+            slot = self._retained_materializations.by_path.get(path)
+            if slot is not None and slot.value_key in constants:
+                constants[slot.value_key] = _get_path(state, leaf.public_path)
+                constants[slot.active_key] = torch.ones_like(constants[slot.active_key])
+                constants[slot.baseline_key] = torch.zeros_like(
+                    constants[slot.baseline_key]
                 )
         return constants, state
 
@@ -14577,11 +14564,11 @@ class FunctionalPopulation:
     ):
         if for_initialization:
             use_snapshot_offsets = False
-        if self._materialization_value_specs:
+        if self._retained_materializations.slots:
             retained_active = torch.stack(
                 tuple(
-                    constants[self._materialization_active_name(path)]
-                    for _name, path, *_schema in self._materialization_value_specs
+                    constants[slot.active_key]
+                    for slot in self._retained_materializations.slots
                 )
             ).any()
             # An inactive rematerialization may have a nonfinite derivative
@@ -14701,7 +14688,8 @@ class FunctionalPopulation:
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
                 use_snapshot_offsets=(
-                    use_snapshot_offsets and not self._materialization_value_specs
+                    use_snapshot_offsets
+                    and len(self._retained_materializations.slots) == 0
                 ),
                 material_area=constants.get("canonical_area_cm2"),
                 cache_values=cache_values,
@@ -15120,7 +15108,7 @@ class FunctionalPopulation:
                     strict=True,
                 )
             )
-            if self._materialization_value_specs:
+            if self._retained_materializations.slots:
                 component_materializations.update(
                     {
                         f"populations.{component_record.name}.{name}": value
@@ -15331,7 +15319,8 @@ class FunctionalPopulation:
                 base_mapping=preparation_base_mapping,
                 for_initialization=for_initialization,
                 use_snapshot_offsets=(
-                    use_snapshot_offsets and not self._materialization_value_specs
+                    use_snapshot_offsets
+                    and len(self._retained_materializations.slots) == 0
                 ),
                 material_area=parent_fields["point_area"],
                 cache_values=cache_values,
@@ -15447,7 +15436,7 @@ class FunctionalPopulation:
             values["noise_workspaces"] = noise_workspace_preparation_frames(
                 self._population, constants, constants["dt"]
             )
-        if not self._materialization_value_specs:
+        if not self._retained_materializations.slots:
             return values
         overrides, active = self._cache_preparation_inputs(
             constants,
@@ -15469,15 +15458,15 @@ class FunctionalPopulation:
         }
         extras = {} if extras is None else extras
         retained = {}
-        for _name, path, *_schema in self._materialization_value_specs:
-            if path in self._materialization_prepared_paths:
-                section, key = self._materialization_prepared_paths[path]
+        for slot in self._retained_materializations.slots:
+            if slot.prepared_path is not None:
+                section, key = slot.prepared_path
                 value = values[section][key]
-            elif path in extras and extras[path] is not None:
-                value = extras[path]
+            elif slot.path in extras and extras[slot.path] is not None:
+                value = extras[slot.path]
             else:
-                value = values["geometry"][path]
-            retained[path] = value
+                value = values["geometry"][slot.path]
+            retained[slot.path] = value
         values["materializations"] = retained
         return values
 
@@ -15551,7 +15540,7 @@ class FunctionalPopulation:
             expected_sections.add("local_geometry")
         if self._random_plan is not None:
             expected_sections.add("random")
-        if self._materialization_value_specs:
+        if self._retained_materializations.slots:
             expected_sections.add("materializations")
         if self._noise_workspace_constants:
             expected_sections.add("noise_workspaces")
@@ -15654,24 +15643,24 @@ class FunctionalPopulation:
                     f"prepared PointProcess area factor {entry.key} must use "
                     f"{self.device}/{self.dtype}"
                 )
-        if self._materialization_value_specs:
+        if self._retained_materializations.slots:
             retained = values["materializations"]
             if not isinstance(retained, Mapping) or set(retained) != {
-                path for _name, path, *_schema in self._materialization_value_specs
+                slot.path for slot in self._retained_materializations.slots
             }:
                 raise FunctionalizationError(
                     "prepared materialization schema is invalid"
                 )
-            for _name, path, shape, dtype, device in self._materialization_value_specs:
-                value = retained[path]
+            for slot in self._retained_materializations.slots:
+                value = retained[slot.path]
                 if (
                     not torch.is_tensor(value)
-                    or _shape_tuple(value) != shape
-                    or value.dtype != dtype
-                    or value.device != device
+                    or _shape_tuple(value) != slot.shape
+                    or value.dtype != slot.dtype
+                    or value.device != slot.device
                 ):
                     raise FunctionalizationError(
-                        f"prepared retained materialization {path!r} has invalid schema"
+                        f"prepared retained materialization {slot.path!r} has invalid schema"
                     )
         return values
 
