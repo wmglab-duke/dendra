@@ -493,13 +493,7 @@ class StimulationRNGPlan:
             noise, stimulation = self.finish_packets(context)
             if self.noise is not None and self.noise.runtime:
                 noise = RuntimeNoiseDraw(
-                    {
-                        key: leaf.new_empty((0, *leaf.shape))
-                        for entry in self.noise.runtime
-                        for key, leaf in zip(
-                            entry.draw_names, entry.leaves, strict=True
-                        )
-                    },
+                    self.noise._empty_tape_draws(),
                     _pytree.tree_map(
                         lambda value: value.new_empty((0, *value.shape)), noise.rng
                     ),

@@ -520,6 +520,14 @@ class RuntimeNoisePlan:
         }
         return RuntimeNoiseDraw(result, rng)
 
+    def _empty_tape_draws(self):
+        """Allocate fresh zero-step leaves from the captured NOISE/SDE schema."""
+        return {
+            name: leaf.new_empty((0, *leaf.shape))
+            for entry in self.runtime
+            for name, leaf in zip(entry.draw_names, entry.leaves, strict=True)
+        }
+
     def _sample_tape_boundaries(self, state, steps, *, samplers=None):
         draws, rngs = [], []
         carry = state
@@ -544,11 +552,7 @@ class RuntimeNoisePlan:
             }
         )
         return RuntimeNoiseDraw(
-            {
-                name: leaf.new_empty((0, *leaf.shape))
-                for entry in self.runtime
-                for name, leaf in zip(entry.draw_names, entry.leaves, strict=True)
-            },
+            self._empty_tape_draws(),
             _pytree.tree_map(
                 lambda value: value.new_empty((0, *value.shape)), initial_rng
             ),

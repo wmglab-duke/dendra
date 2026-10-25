@@ -317,11 +317,7 @@ class NetworkRNGPlan:
                 name, state["populations"][name], state["rng"]
             )
             result[name] = RuntimeNoiseDraw(
-                {
-                    key: leaf.new_empty((0, *leaf.shape))
-                    for entry in noise.runtime
-                    for key, leaf in zip(entry.draw_names, entry.leaves, strict=True)
-                },
+                noise._empty_tape_draws(),
                 _pytree.tree_map(
                     lambda value: value.new_empty((0, *value.shape)),
                     local["random"]["rng"],
