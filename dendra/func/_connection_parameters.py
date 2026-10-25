@@ -26,6 +26,7 @@ from ._prepared_values import (
     _validate_prepared_freshness,
     _validate_prepared_owner,
 )
+from ._raw_sources import _RawSourceInventory
 from ._types import FunctionalizationError
 
 _ROLES = (("weights", "weight"), ("delays", "delay_ms"))
@@ -208,10 +209,10 @@ class ConnectionParameterPlan:
         self._alternate_draws = {}
         self._schemas = {}
         self._execution = {}
-        self._parameter_paths = {}
-        self._constant_paths = {}
-        self._role_parameter_aliases = {}
-        self._role_constant_aliases = {}
+        parameter_paths = {}
+        constant_paths = {}
+        role_parameter_aliases = {}
+        role_constant_aliases = {}
         self._metadata = {}
         self._class_guards = []
         parameter_identity, constant_identity = {}, {}
@@ -279,7 +280,7 @@ class ConnectionParameterPlan:
             )
             if not self._raw[role]:
                 key = f"{native}.w"
-                self._parameter_paths[key] = (native, "w")
+                parameter_paths[key] = (native, "w")
                 continue
             parameter_aliases, constant_aliases = {}, {}
             registered = tuple(_registered(module))
@@ -294,14 +295,14 @@ class ConnectionParameterPlan:
                 path = f"{native}.{relative}"
                 if id(tensor) in raw_parameter_ids:
                     key = parameter_identity.setdefault(id(tensor), path)
-                    self._parameter_paths.setdefault(key, (native, relative))
+                    parameter_paths.setdefault(key, (native, relative))
                     parameter_aliases[relative] = key
                 else:
                     key = constant_identity.setdefault(id(tensor), path)
-                    self._constant_paths.setdefault(key, (native, relative))
+                    constant_paths.setdefault(key, (native, relative))
                     constant_aliases[relative] = key
-            self._role_parameter_aliases[role] = parameter_aliases
-            self._role_constant_aliases[role] = constant_aliases
+            role_parameter_aliases[role] = parameter_aliases
+            role_constant_aliases[role] = constant_aliases
             execution = p._deepcopy_execution_module(module)
             from ._torch_parametrizations import install_output_schemas
 
@@ -309,29 +310,39 @@ class ConnectionParameterPlan:
             self._execution[role] = _DeriveValues(execution)
         # A Parameter may also have a buffer registration in the other role.
         # Promote that route to the same public raw leaf rather than copying it.
+        self._raw_sources = _RawSourceInventory.from_paths(
+            parameter_paths,
+            constant_paths,
+            routes={
+                role: (aliases, role_constant_aliases[role])
+                for role, aliases in role_parameter_aliases.items()
+            },
+        )
         all_parameters = {
             id(value): key for key, value in self.parameter_sources().items()
         }
         for role, native in _ROLES:
-            for relative, key in tuple(
-                self._role_constant_aliases.get(role, {}).items()
-            ):
-                value = self._resolve(connection, self._constant_paths[key])
+            for relative, key in tuple(role_constant_aliases.get(role, {}).items()):
+                value = self._resolve(connection, constant_paths[key])
                 if id(value) in all_parameters:
-                    self._role_parameter_aliases[role][relative] = all_parameters[
-                        id(value)
-                    ]
-                    del self._role_constant_aliases[role][relative]
+                    role_parameter_aliases[role][relative] = all_parameters[id(value)]
+                    del role_constant_aliases[role][relative]
         used_constants = {
             key
-            for aliases in self._role_constant_aliases.values()
+            for aliases in role_constant_aliases.values()
             for key in aliases.values()
         }
-        self._constant_paths = {
-            key: path
-            for key, path in self._constant_paths.items()
-            if key in used_constants
+        constant_paths = {
+            key: path for key, path in constant_paths.items() if key in used_constants
         }
+        self._raw_sources = _RawSourceInventory.from_paths(
+            parameter_paths,
+            constant_paths,
+            routes={
+                role: (aliases, role_constant_aliases[role])
+                for role, aliases in role_parameter_aliases.items()
+            },
+        )
         self._source_bindings = tuple(
             (native, _binding(module)) for native, module in modules.items()
         )
@@ -345,14 +356,12 @@ class ConnectionParameterPlan:
                 _append_materializer_class_guards(
                     self._class_guards, child, seen_classes, p
                 )
-        self._parameter_schema = {
-            key: (tuple(value.shape), value.dtype, value.device)
-            for key, value in self.parameter_sources().items()
-        }
-        self._constant_schema = {
-            key: (tuple(value.shape), value.dtype, value.device)
-            for key, value in self.constant_sources().items()
-        }
+        self._raw_sources = self._raw_sources.with_schema(
+            "parameter", self.parameter_sources()
+        )
+        self._raw_sources = self._raw_sources.with_schema(
+            "constant", self.constant_sources()
+        )
         self._validate_runtime_ownership(connection)
         if self._check_purity:
             self._audit_sources()
@@ -367,11 +376,11 @@ class ConnectionParameterPlan:
             self._metadata[f"use_offset.{role}"] = torch.ones(
                 (), dtype=torch.bool, device=value.device
             )
-            for key in set(self._role_parameter_aliases.get(role, {}).values()):
+            for key in set(self._raw_sources.aliases("parameter", role).values()):
                 self._metadata[f"baseline.{role}.parameters.{key}"] = _clone(
                     parameters[key]
                 )
-            for key in set(self._role_constant_aliases.get(role, {}).values()):
+            for key in set(self._raw_sources.aliases("constant", role).values()):
                 self._metadata[f"baseline.{role}.constants.{key}"] = _clone(
                     constants[key]
                 )
@@ -443,15 +452,15 @@ class ConnectionParameterPlan:
     def parameter_sources(self, connection=None):
         connection = self._source if connection is None else connection
         return {
-            key: self._resolve(connection, path)
-            for key, path in self._parameter_paths.items()
+            key: self._resolve(connection, binding.path)
+            for key, binding in self._raw_sources.parameters.items()
         }
 
     def constant_sources(self, connection=None):
         connection = self._source if connection is None else connection
         return {
-            key: self._resolve(connection, path)
-            for key, path in self._constant_paths.items()
+            key: self._resolve(connection, binding.path)
+            for key, binding in self._raw_sources.constants.items()
         }
 
     def cache_constant_sources(self, connection=None):
@@ -482,9 +491,9 @@ class ConnectionParameterPlan:
             metadata[f"use_offset.{role}"] = torch.ones(
                 (), dtype=torch.bool, device=value.device
             )
-            for key in set(self._role_parameter_aliases.get(role, {}).values()):
+            for key in set(self._raw_sources.aliases("parameter", role).values()):
                 metadata[f"baseline.{role}.parameters.{key}"] = _clone(parameters[key])
-            for key in set(self._role_constant_aliases.get(role, {}).values()):
+            for key in set(self._raw_sources.aliases("constant", role).values()):
                 metadata[f"baseline.{role}.constants.{key}"] = _clone(constants[key])
             derived = (
                 self._derive(role, parameters, {**constants, **metadata})
@@ -636,11 +645,11 @@ class ConnectionParameterPlan:
             for role, native in _ROLES:
                 for aliases, sources in (
                     (
-                        self._role_parameter_aliases.get(role, {}),
+                        self._raw_sources.aliases("parameter", role),
                         self.parameter_sources(connection),
                     ),
                     (
-                        self._role_constant_aliases.get(role, {}),
+                        self._raw_sources.aliases("constant", role),
                         self.constant_sources(connection),
                     ),
                 ):
@@ -720,11 +729,11 @@ class ConnectionParameterPlan:
 
     def _validate_packet(self, parameters, constants):
         for values, schema, label in (
-            (parameters, self._parameter_schema, "parameter"),
-            (constants, self._constant_schema, "constant"),
-            (constants, self._metadata_schema, "metadata"),
+            (parameters, self._raw_sources.schema_items("parameter"), "parameter"),
+            (constants, self._raw_sources.schema_items("constant"), "constant"),
+            (constants, self._metadata_schema.items(), "metadata"),
         ):
-            for name, expected in schema.items():
+            for name, expected in schema:
                 value = values.get(name)
                 if (
                     not torch.is_tensor(value)
@@ -741,10 +750,10 @@ class ConnectionParameterPlan:
         }
         canonical = {}
         _bind_materializer_aliases(
-            mapping, canonical, self._role_parameter_aliases[role], parameters
+            mapping, canonical, self._raw_sources.aliases("parameter", role), parameters
         )
         _bind_materializer_aliases(
-            mapping, canonical, self._role_constant_aliases[role], constants
+            mapping, canonical, self._raw_sources.aliases("constant", role), constants
         )
         return mapping
 
@@ -794,7 +803,7 @@ class ConnectionParameterPlan:
                 continue
             baseline = {
                 key: constants[f"baseline.{role}.parameters.{key}"]
-                for key in set(self._role_parameter_aliases[role].values())
+                for key in set(self._raw_sources.aliases("parameter", role).values())
             }
             restored = restore_population_cache_values(
                 parameters, baseline, parameter_names=baseline
@@ -809,7 +818,7 @@ class ConnectionParameterPlan:
             }
             constant_baseline = {
                 key: constants[f"baseline.{role}.constants.{key}"]
-                for key in set(self._role_constant_aliases[role].values())
+                for key in set(self._raw_sources.aliases("constant", role).values())
             }
             # A local config buffer can be a selectable raw source elsewhere
             # in a Network. Retention evaluates its stored source value while
@@ -919,9 +928,9 @@ class ConnectionParameterPlan:
                     constants[f"draw_valid.{role}"]
                 )
             value = self._derive(role, parameters, result)
-            for key in set(self._role_parameter_aliases[role].values()):
+            for key in set(self._raw_sources.aliases("parameter", role).values()):
                 result[f"baseline.{role}.parameters.{key}"] = _clone(parameters[key])
-            for key in set(self._role_constant_aliases[role].values()):
+            for key in set(self._raw_sources.aliases("constant", role).values()):
                 result[f"baseline.{role}.constants.{key}"] = _clone(constants[key])
             result[f"stored.{role}"] = _clone(value)
             result[f"baseline_effective.{role}"] = _clone(value)
@@ -1058,7 +1067,7 @@ class ConnectionParameterPlan:
             parameters,
             constants,
             values,
-            parameter_names=self._parameter_paths,
+            parameter_names=self._raw_sources.parameters,
         )
 
     def validate_prepared(self, prepared, parameters):
@@ -1070,7 +1079,7 @@ class ConnectionParameterPlan:
         )
         _validate_prepared_freshness(
             prepared,
-            {key: parameters[key] for key in self._parameter_paths},
+            {key: parameters[key] for key in self._raw_sources.parameters},
             message="Connection parameters, constants, or prepared values changed; prepare again.",
         )
         return self.materialize(parameters, prepared.constants)

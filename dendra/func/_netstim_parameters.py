@@ -28,6 +28,7 @@ from ._prepared_values import (
     _validate_prepared_freshness,
     _validate_prepared_owner,
 )
+from ._raw_sources import _RawSourceInventory
 from ._torch_parametrizations import (
     canonical_type,
     failures,
@@ -122,8 +123,8 @@ class NetStimParameterPlan:
         if errors:
             raise FunctionalizationError("; ".join(errors))
         view = _source_view(source)
-        self._parameter_paths, self._constant_paths = {}, {}
-        self._parameter_aliases, self._constant_aliases = {}, {}
+        parameter_paths, constant_paths = {}, {}
+        parameter_aliases, constant_aliases = {}, {}
         parameter_ids, constant_ids = {}, {}
         registered = tuple(_registered(view))
         primary = {
@@ -143,12 +144,12 @@ class NetStimParameterPlan:
         for name, value, _kind in registered:
             if id(value) in trainable_ids:
                 key = parameter_ids.setdefault(id(value), name)
-                self._parameter_paths[name] = name
-                self._parameter_aliases[name] = key
+                parameter_paths[name] = name
+                parameter_aliases[name] = key
             else:
                 key = constant_ids.setdefault(id(value), name)
-                self._constant_paths[name] = name
-                self._constant_aliases[name] = key
+                constant_paths[name] = name
+                constant_aliases[name] = key
         self._synthetic = {}
         if "tau" in vars(source) and not torch.is_tensor(source.tau):
             self._synthetic["tau"] = torch.as_tensor(
@@ -159,16 +160,14 @@ class NetStimParameterPlan:
             # The execution slot is explicit even though native tau is a float.
             delattr(view, "tau")
             view.register_buffer("tau", self._synthetic["tau"], persistent=False)
-            self._parameter_paths["tau"] = None
-            self._parameter_aliases["tau"] = "tau"
-        self._packet_aliases = tuple(
-            (kind, path, key)
-            for kind, aliases in (
-                ("parameter", self._parameter_aliases),
-                ("constant", self._constant_aliases),
-            )
-            for path, key in aliases.items()
-            if path != key
+            parameter_paths["tau"] = None
+            parameter_aliases["tau"] = "tau"
+        self._raw_sources = _RawSourceInventory.from_paths(
+            parameter_paths,
+            constant_paths,
+            routes={None: (parameter_aliases, constant_aliases)},
+            parameter_canonical=parameter_aliases,
+            constant_canonical=constant_aliases,
         )
         self._class_guards = []
         seen = set()
@@ -177,14 +176,12 @@ class NetStimParameterPlan:
             _append_materializer_class_guards(self._class_guards, child, seen, p)
         self._source_bindings = self._binding(source)
         self._compatible_bindings = self._binding(source, identities=False)
-        self._parameter_schema = {
-            name: (tuple(value.shape), value.dtype, value.device)
-            for name, value in self.parameter_sources().items()
-        }
-        self._constant_schema = {
-            name: (tuple(value.shape), value.dtype, value.device)
-            for name, value in self.constant_sources().items()
-        }
+        self._raw_sources = self._raw_sources.with_schema(
+            "parameter", self.parameter_sources()
+        )
+        self._raw_sources = self._raw_sources.with_schema(
+            "constant", self.constant_sources()
+        )
         self._schema = (
             tuple(source.shape),
             source.next_stoch_time.dtype,
@@ -222,22 +219,22 @@ class NetStimParameterPlan:
         source = self._source if source is None else source
         return {
             key: (
-                self._resolve(source, path)
-                if path is not None
+                self._resolve(source, binding.path)
+                if binding.path is not None
                 else torch.as_tensor(
                     source.tau,
                     dtype=self._synthetic[key].dtype,
                     device=self._synthetic[key].device,
                 )
             )
-            for key, path in self._parameter_paths.items()
+            for key, binding in self._raw_sources.parameters.items()
         }
 
     def constant_sources(self, source=None):
         source = self._source if source is None else source
         return {
-            key: self._resolve(source, path)
-            for key, path in self._constant_paths.items()
+            key: self._resolve(source, binding.path)
+            for key, binding in self._raw_sources.constants.items()
         }
 
     def cache_constant_sources(self, source=None):
@@ -276,7 +273,8 @@ class NetStimParameterPlan:
                     *self.parameter_sources(source).items(),
                     *self.constant_sources(source).items(),
                 )
-                if self._parameter_paths.get(name, "present") is not None
+                if name not in self._raw_sources.parameters
+                or self._raw_sources.parameters[name].path is not None
             ),
             tuple(
                 (name, type(vars(source)[name]))
@@ -319,14 +317,20 @@ class NetStimParameterPlan:
         if source is not self._source:
             self._validate_runtime_ownership(source, owners=self._owners)
             for aliases, sources in (
-                (self._parameter_aliases, self.parameter_sources(source)),
-                (self._constant_aliases, self.constant_sources(source)),
+                (
+                    self._raw_sources.aliases("parameter"),
+                    self.parameter_sources(source),
+                ),
+                (
+                    self._raw_sources.aliases("constant"),
+                    self.constant_sources(source),
+                ),
             ):
                 for path, key in aliases.items():
                     if (
-                        self._parameter_paths.get(key, "present") is not None
-                        and self._resolve(source, path) is not sources[key]
-                    ):
+                        key not in self._raw_sources.parameters
+                        or self._raw_sources.parameters[key].path is not None
+                    ) and self._resolve(source, path) is not sources[key]:
                         raise FunctionalizationError(
                             "Compatible NetStim parameter aliases changed; lower again."
                         )
@@ -393,22 +397,22 @@ class NetStimParameterPlan:
 
     def materialize(self, parameters, constants):
         self.validate_source()
-        for values, schema, label in (
-            (parameters, self._parameter_schema, "parameter"),
-            (constants, self._constant_schema, "constant"),
+        for values, bindings, label in (
+            (parameters, self._raw_sources.parameters, "parameter"),
+            (constants, self._raw_sources.constants, "constant"),
         ):
-            if set(values) != set(schema):
+            if set(values) != set(bindings):
                 raise FunctionalizationError(f"NetStim raw {label} keys changed.")
-            for key, expected in schema.items():
+            for key, binding in bindings.items():
                 value = values[key]
                 if (
                     not torch.is_tensor(value)
-                    or (tuple(value.shape), value.dtype, value.device) != expected
+                    or (tuple(value.shape), value.dtype, value.device) != binding.schema
                 ):
                     raise FunctionalizationError(
                         f"NetStim raw {label} {key!r} changed tensor schema."
                     )
-        for kind, path, canonical in self._packet_aliases:
+        for kind, path, canonical in self._raw_sources.packet_aliases():
             values = parameters if kind == "parameter" else constants
             if values[path] is not values[canonical]:
                 raise FunctionalizationError(
@@ -421,8 +425,8 @@ class NetStimParameterPlan:
         }
         canonical = {}
         for aliases, values in (
-            (self._parameter_aliases, parameters),
-            (self._constant_aliases, constants),
+            (self._raw_sources.aliases("parameter"), parameters),
+            (self._raw_sources.aliases("constant"), constants),
         ):
             _bind_materializer_aliases(mapping, canonical, aliases, values)
         result = functional_call(self._execution, mapping, (), tie_weights=False)

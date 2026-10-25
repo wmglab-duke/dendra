@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from dendra.func import _connection_parameters, _netstim_parameters
+from dendra.func._raw_sources import _RawSourceInventory
 
 pytestmark = pytest.mark.cpu
 
@@ -125,23 +126,30 @@ def _case(kind, monkeypatch, failures=()):
         if kind == "connection"
         else _netstim_parameters.NetStimParameterPlan
     )
-    group_names = {
-        "_role_parameter_aliases": "parameter",
-        "_parameter_aliases": "parameter",
-        "_role_constant_aliases": "constant",
-        "_constant_aliases": "constant",
-    }
+    inventory = _RawSourceInventory.from_paths(
+        {key: key for key in parameters},
+        {key: key for key in constants},
+        routes={
+            "weights" if kind == "connection" else None: (
+                parameter_aliases,
+                constant_aliases,
+            )
+        },
+    )
+    inventory = inventory.with_schema("parameter", parameters)
+    inventory = inventory.with_schema("constant", constants)
 
-    class ObservedPlan(base):
-        def __getattribute__(self, name):
-            if name in group_names:
-                observe(f"group:{group_names[name]}")
-            return super().__getattribute__(name)
+    class ObservedInventory:
+        def __getattr__(self, name):
+            return getattr(inventory, name)
 
-    plan = object.__new__(ObservedPlan)
+        def aliases(self, category, scope=None):
+            observe(f"group:{category}")
+            return Aliases(category, inventory.aliases(category, scope))
+
+    plan = object.__new__(base)
+    plan._raw_sources = ObservedInventory()
     if kind == "connection":
-        plan._role_parameter_aliases = {"weights": parameter_aliases}
-        plan._role_constant_aliases = {"weights": constant_aliases}
         monkeypatch.setattr(_connection_parameters, "_helpers", helpers)
 
         def invoke():
@@ -149,19 +157,6 @@ def _case(kind, monkeypatch, failures=()):
 
     else:
         plan.validate_source = lambda: None
-        plan._parameter_aliases, plan._constant_aliases = (
-            parameter_aliases,
-            constant_aliases,
-        )
-        plan._parameter_schema = {
-            key: (tuple(value.shape), value.dtype, value.device)
-            for key, value in parameters.items()
-        }
-        plan._constant_schema = {
-            key: (tuple(value.shape), value.dtype, value.device)
-            for key, value in constants.items()
-        }
-        plan._packet_aliases = ()
         plan._execution = execution
         plan._schema = (tuple(raw.shape), raw.dtype, raw.device)
         monkeypatch.setattr(_netstim_parameters, "_helpers", helpers)
