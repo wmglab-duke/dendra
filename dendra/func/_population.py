@@ -86,15 +86,15 @@ from dendra.models.mechanisms._numerical import (
 )
 from dendra.models.mechanisms._spatial import SpatialOperator1D, SpatialOperatorTree
 from dendra.models.mechanisms._state import State
+from dendra.models.mechanisms._state_inventory import (
+    _DelayedStateBoundary,
+    functional_module_blocks,
+)
 from dendra.models.mechanisms._state_slots import (
     local_field_bindings,
     local_source_bindings,
-    module_carry_slots,
     read_local_bindings,
-    saved_buffer_slots,
     shared_field_slots,
-    state_carry_slots,
-    state_value_slots,
 )
 from dendra.models.mechanisms._support import SupportKind
 from dendra.models.mechanisms._support_registry import SupportEntry, SupportRegistry
@@ -3291,30 +3291,22 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
     from ._mechanism_delays import mechanism_delay_state_slots
 
     def add_declared_keys(name, module, state_group, buffer_group, state_buffer_group):
-        for state in module.DE.values():
-            for slot in state_value_slots(module, state):
-                keys[f"{name}.{slot.checkpoint_suffix}"] = (
-                    state_group,
-                    name,
-                    slot.name,
-                )
-        for slot in module_carry_slots(module, sorted(module._carry)):
-            keys[f"{name}.{slot.checkpoint_suffix}"] = (buffer_group, name, slot.name)
-        for buffer_name, _value in mechanism_delay_state_slots(module):
-            keys.setdefault(
-                f"{name}.{buffer_name}",
-                (buffer_group, name, buffer_name),
-            )
-        for slot in saved_buffer_slots(module):
-            keys[f"{name}.{slot.checkpoint_suffix}"] = (buffer_group, name, slot.name)
-        for state_name, state in module.DE.items():
-            for slot in state_carry_slots(state_name, state, state._carry):
-                keys[f"{name}.{slot.checkpoint_suffix}"] = (
-                    state_buffer_group,
-                    name,
-                    state_name,
-                    slot.name,
-                )
+        for block in functional_module_blocks(module, name):
+            if isinstance(block, _DelayedStateBoundary):
+                for buffer_name, _value in mechanism_delay_state_slots(module):
+                    keys.setdefault(
+                        f"{name}.{buffer_name}",
+                        (buffer_group, name, buffer_name),
+                    )
+                continue
+            for slot in block.slots:
+                if block.role == "state":
+                    path = (state_group, name, slot.name)
+                elif block.role == "state_carry":
+                    path = (state_buffer_group, name, block.state_key, slot.name)
+                else:
+                    path = (buffer_group, name, slot.name)
+                keys[f"{name}.{slot.checkpoint_suffix}"] = path
 
     for mechanism_name, mechanism in handler.mechanisms.items():
         add_declared_keys(

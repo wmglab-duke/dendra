@@ -24,16 +24,18 @@ from ._noise_workspaces import (
     retain_noise_workspace_once,
 )
 from ._state import _is_unresolved_deferred_buffer
+from ._state_inventory import (
+    _DelayedStateBoundary,
+    _MutableTensorPlan,
+    _StochasticStateBoundary,
+    checkpoint_module_blocks,
+)
 from ._state_slots import (
     local_binding_groups,
     material_local_buffer_names,
-    module_carry_slots,
-    saved_buffer_slots,
     shared_field_slots,
-    state_carry_slots,
-    state_value_slots,
 )
-from ._support import SupportKind
+from ._support import SupportKind, SupportMap, SupportSpec
 from ._support_registry import SupportRegistry
 
 _MATERIAL_PHASE_ALIASES = {
@@ -97,14 +99,88 @@ _SUPPORT_ENTRY_PLAN_ATTRS = (
 )
 
 
-def _runtime_state_buffer_names(state):
-    """Return State buffers that are true mutable runtime carry."""
-    return tuple(getattr(state, "_carry", ()))
+def _prepare_mutable_tensor(candidate, live):
+    return candidate.to(device=live.device, dtype=live.dtype).clone()
 
 
-def _runtime_mechanism_carry_names(module):
-    """Return declared persistent Mechanism carry names."""
-    return tuple(getattr(module, "_carry", ()))
+def _prepare_binding_token(candidate, live):
+    # Cross-device/dtype aliases still exercise native conversion admission.
+    # Ordinary matching fields need only a memo identity, not tensor storage.
+    if candidate.device != live.device or candidate.dtype != live.dtype:
+        return _prepare_mutable_tensor(candidate, live)
+    return object()
+
+
+def _has_direct_state_inventory(handler):
+    """Admit canonical deterministic registrations without probing state hooks.
+
+    Specialized histories and stochastic workspaces retain the complete
+    checkpoint validation route until their inventory phases are migrated.
+    """
+    pending = [
+        *handler.mechanisms.values(),
+        *handler.material_processes.values(),
+        *handler.ions.values(),
+        *handler.materials.values(),
+    ]
+    seen = set()
+    while pending:
+        owner = pending.pop()
+        if id(owner) in seen:
+            continue
+        seen.add(id(owner))
+        namespace = vars(owner)
+        for name in ("_modules", "_buffers"):
+            if type(namespace.get(name)) is not dict:
+                return False
+        for name in (
+            "_rng",
+            "random_parameters",
+            "runtime_noises",
+            "_delayed_state_specs",
+        ):
+            value = inspect.getattr_static(owner, name, {})
+            if type(value) is not dict or value:
+                return False
+        for name in ("_sde_rng_names", "_delay_history_buffer_names"):
+            value = inspect.getattr_static(owner, name, ())
+            if type(value) is not tuple or value:
+                return False
+        for name, admitted in (("_state", tuple), ("_carry", tuple), ("_save", set)):
+            value = inspect.getattr_static(owner, name, None)
+            if value is not None and type(value) is not admitted:
+                return False
+        if (
+            "_cpu_gen" in namespace
+            or "_functional_material_workspace_slots" in namespace
+        ):
+            return False
+        support_map = inspect.getattr_static(owner, "support_map", None)
+        if support_map is not None and type(support_map) is not SupportMap:
+            return False
+        spec = (
+            support_map.spec
+            if support_map is not None
+            else inspect.getattr_static(owner, "support_spec", None)
+        )
+        if spec is not None and (
+            type(spec) is not SupportSpec or not spec.has_compact_identity
+        ):
+            return False
+        for name, value in namespace["_buffers"].items():
+            if name.startswith(("_noise_workspace_", "_material_held_noise_")):
+                return False
+            if value is not None and (
+                type(value) not in (torch.Tensor, torch.nn.Parameter)
+                or value.layout != torch.strided
+                or value.device.type == "meta"
+                or value.is_quantized
+            ):
+                return False
+        pending.extend(
+            value for value in namespace["_modules"].values() if value is not None
+        )
+    return True
 
 
 def _support_spec(module):
@@ -2948,15 +3024,8 @@ class MechanismHandler(torch.nn.Module):
         """Return mechanism-local material buffers that cross step boundaries."""
         return material_local_buffer_names(self)
 
-    def mutable_state_dict(self):
-        """
-        Return a dictionary of all mutable / rebound states in the MechanismHandler.
-
-        Structural support is configuration rather than mutable state. It is
-        nevertheless recorded so restore can reject a same-shaped checkpoint
-        whose local slots refer to different physical compartments. Checkpoints
-        created before support identity was added remain loadable.
-        """
+    def _mutable_state_values(self):
+        """Read checkpoint values before choosing snapshot storage ownership."""
         states = {
             _SUPPORT_IDENTITY_STATE_KEY: {
                 "version": _SUPPORT_IDENTITY_VERSION,
@@ -2972,41 +3041,34 @@ class MechanismHandler(torch.nn.Module):
         }
 
         def capture_module(module, prefix):
-            _capture_stochastic_state(states, prefix, module)
-            for state_key, state in module.DE.items():
-                for slot in state_value_slots(module, state):
-                    states[f"{prefix}.{slot.checkpoint_suffix}"] = getattr(
-                        slot.owner, slot.name
-                    )
-                for slot in state_carry_slots(
-                    state_key, state, _runtime_state_buffer_names(state)
-                ):
-                    states[f"{prefix}.{slot.checkpoint_suffix}"] = slot.owner._buffers[
-                        slot.name
-                    ]
-                _capture_stochastic_state(states, f"{prefix}.DE.{state_key}", state)
-            for slot in module_carry_slots(
-                module, _runtime_mechanism_carry_names(module)
-            ):
-                states[f"{prefix}.{slot.checkpoint_suffix}"] = slot.owner._buffers[
-                    slot.name
-                ]
-            for slot in saved_buffer_slots(module):
-                states[f"{prefix}.{slot.checkpoint_suffix}"] = slot.owner._buffers[
-                    slot.name
-                ]
-            # Delayed-state queues and ring pointers are registered dynamically,
-            # so they are not necessarily present in Mechanism._assigned.
-            for name in sorted(module._delayed_state_specs):
-                spec = module._delayed_state_specs[name]
-                for spec_key in ("buffer", "pointer", "steps_buffer"):
-                    buffer_name = spec.get(spec_key)
-                    if buffer_name is not None and buffer_name in module._buffers:
-                        states[f"{prefix}.{buffer_name}"] = module._buffers[buffer_name]
-            if module._delayed_state_specs:
-                states[f"{prefix}{_DELAY_SPEC_STATE_SUFFIX}"] = copy.deepcopy(
-                    module._delayed_state_specs
-                )
+            for block in checkpoint_module_blocks(module, prefix):
+                if isinstance(block, _StochasticStateBoundary):
+                    _capture_stochastic_state(states, block.prefix, block.owner)
+                elif isinstance(block, _DelayedStateBoundary):
+                    # Histories are registered dynamically, independently of
+                    # ordinary declared carry. Their metadata remains native.
+                    for name in sorted(module._delayed_state_specs):
+                        spec = module._delayed_state_specs[name]
+                        for spec_key in ("buffer", "pointer", "steps_buffer"):
+                            buffer_name = spec.get(spec_key)
+                            if (
+                                buffer_name is not None
+                                and buffer_name in module._buffers
+                            ):
+                                states[f"{prefix}.{buffer_name}"] = module._buffers[
+                                    buffer_name
+                                ]
+                    if module._delayed_state_specs:
+                        states[f"{prefix}{_DELAY_SPEC_STATE_SUFFIX}"] = copy.deepcopy(
+                            module._delayed_state_specs
+                        )
+                else:
+                    for slot in block.slots:
+                        states[f"{prefix}.{slot.checkpoint_suffix}"] = (
+                            getattr(slot.owner, slot.name)
+                            if block.role == "state"
+                            else slot.owner._buffers[slot.name]
+                        )
 
         for mech_name, mech in self.mechanisms.items():
             capture_module(mech, mech_name)
@@ -3042,6 +3104,16 @@ class MechanismHandler(torch.nn.Module):
                 ),
             ):
                 states[slot.checkpoint_suffix] = slot.owner._buffers[slot.name]
+        return states
+
+    def mutable_state_dict(self):
+        """Return a snapshot of the Handler's mutable and rebound state.
+
+        Structural support identifies the physical compartments addressed by
+        local slots. Checkpoints predating support identity retain their legacy
+        shape-based restoration behavior.
+        """
+        states = self._mutable_state_values()
         # Capture an actual boundary snapshot: later in-place simulation updates
         # must not mutate the saved tensors. Preserve graph connectivity and
         # aliases by cloning once per distinct tensor object.
@@ -3225,69 +3297,16 @@ class MechanismHandler(torch.nn.Module):
 
         self._validate_support_identity_payload(state_dict)
 
-        assignment_map = {}
-        assignment_keys = {}
-        tensor_memo = {}
+        tensor_plan = _MutableTensorPlan(state_dict, _prepare_mutable_tensor)
+        assignment_map = tensor_plan.assignment_map
+        assignment_keys = tensor_plan.assignment_keys
+        add_tensor = tensor_plan.add
         rng_assignments = []
         delay_assignments = []
         random_parameter_assignments = []
         material_assignments = []
         noise_workspace_assignments = []
         noise_workspace_resolutions = []
-        missing = object()
-
-        def add_tensor(
-            owner,
-            name,
-            key,
-            *,
-            expected_shape=None,
-            optional=False,
-            reference=None,
-        ):
-            if key not in state_dict:
-                if optional:
-                    return
-                raise KeyError(f"MechanismHandler mutable state is missing {key!r}.")
-            candidate = state_dict[key]
-            if not torch.is_tensor(candidate):
-                raise TypeError(
-                    f"MechanismHandler mutable state {key!r} must be a tensor."
-                )
-
-            live = getattr(owner, name, missing) if reference is None else reference
-            if live is missing or not torch.is_tensor(live):
-                raise TypeError(
-                    f"Live mutable field {key!r} must be a tensor before restore."
-                )
-            shape = (
-                tuple(live.shape) if expected_shape is None else tuple(expected_shape)
-            )
-            if tuple(candidate.shape) != shape:
-                raise ValueError(
-                    f"MechanismHandler mutable state {key!r} has shape "
-                    f"{tuple(candidate.shape)}, expected {shape}."
-                )
-            if candidate.layout != live.layout:
-                raise ValueError(
-                    f"MechanismHandler mutable state {key!r} has layout "
-                    f"{candidate.layout}, expected {live.layout}."
-                )
-
-            memo_key = (id(candidate), live.device, live.dtype, live.layout)
-            if memo_key not in tensor_memo:
-                tensor_memo[memo_key] = candidate.to(
-                    device=live.device, dtype=live.dtype
-                ).clone()
-            prepared = tensor_memo[memo_key]
-            target = (id(owner), name)
-            existing = assignment_map.get(target)
-            if existing is not None and existing[2] is not prepared:
-                raise ValueError(
-                    f"Mutable field {name!r} received conflicting snapshot entries."
-                )
-            assignment_map[target] = (owner, name, prepared)
-            assignment_keys.setdefault(target, key)
 
         def add_stochastic(module, prefix, legacy_prefixes):
             if getattr(module, "random_parameters", {}):
@@ -3522,45 +3541,48 @@ class MechanismHandler(torch.nn.Module):
                     )
 
         def add_module(module, prefix):
-            add_stochastic(module, prefix, (prefix,))
-            for state_key, state in module.DE.items():
-                state_slots = tuple(state_value_slots(module, state))
-                for slot in state_slots:
-                    add_tensor(
-                        slot.owner, slot.name, f"{prefix}.{slot.checkpoint_suffix}"
-                    )
-                for slot in state_carry_slots(
-                    state_key, state, _runtime_state_buffer_names(state)
-                ):
-                    add_tensor(
-                        slot.owner,
-                        slot.name,
-                        f"{prefix}.{slot.checkpoint_suffix}",
-                        optional=True,
-                    )
-                add_stochastic(
-                    state,
-                    f"{prefix}.DE.{state_key}",
-                    tuple(f"{prefix}.{slot.checkpoint_suffix}" for slot in state_slots),
-                )
-            for slot in module_carry_slots(
-                module, _runtime_mechanism_carry_names(module)
-            ):
-                # Registered histories can have a different saved capacity.
-                # Their metadata below supplies the exact queue shape and
-                # pointer constraints, including when storage is also CARRY.
-                if slot.name in module._delay_history_buffer_names:
-                    continue
-                add_tensor(slot.owner, slot.name, f"{prefix}.{slot.checkpoint_suffix}")
-            for slot in saved_buffer_slots(module):
-                add_tensor(slot.owner, slot.name, f"{prefix}.{slot.checkpoint_suffix}")
-            add_delayed_state(module, prefix)
+            for block in checkpoint_module_blocks(module, prefix):
+                if isinstance(block, _StochasticStateBoundary):
+                    add_stochastic(block.owner, block.prefix, block.legacy_prefixes)
+                elif isinstance(block, _DelayedStateBoundary):
+                    add_delayed_state(block.owner, block.prefix)
+                else:
+                    for slot in block.slots:
+                        # Saved history metadata owns queue capacity even when
+                        # the storage is also declared ordinary CARRY.
+                        if (
+                            block.role == "carry"
+                            and slot.name in module._delay_history_buffer_names
+                        ):
+                            continue
+                        add_tensor(
+                            slot.owner,
+                            slot.name,
+                            f"{prefix}.{slot.checkpoint_suffix}",
+                            optional=block.role == "state_carry",
+                        )
 
         for mech_name, mech in self.mechanisms.items():
             add_module(mech, mech_name)
         for process_name, process in self.material_processes.items():
             add_module(process, process_name)
 
+        self._add_mutable_local_tensors(add_tensor)
+
+        return {
+            "assignments": list(assignment_map.values()),
+            "assignment_keys": assignment_keys,
+            "rng_assignments": rng_assignments,
+            "delay_assignments": delay_assignments,
+            "random_parameter_assignments": random_parameter_assignments,
+            "material_assignments": material_assignments,
+            "noise_workspace_assignments": noise_workspace_assignments,
+            "noise_workspace_resolutions": noise_workspace_resolutions,
+        }
+
+    def _add_mutable_local_tensors(self, add_tensor):
+        """Project shared/local checkpoint aliases onto live targets."""
+        missing = object()
         for mech_name, concentrations in local_binding_groups(self.read_ion.values()):
             mech = self.mechanisms[mech_name]
             for concentration in concentrations:
@@ -3611,30 +3633,43 @@ class MechanismHandler(torch.nn.Module):
             ):
                 add_tensor(slot.owner, slot.name, slot.checkpoint_suffix)
 
-        return {
-            "assignments": list(assignment_map.values()),
-            "assignment_keys": assignment_keys,
-            "rng_assignments": rng_assignments,
-            "delay_assignments": delay_assignments,
-            "random_parameter_assignments": random_parameter_assignments,
-            "material_assignments": material_assignments,
-            "noise_workspace_assignments": noise_workspace_assignments,
-            "noise_workspace_resolutions": noise_workspace_resolutions,
-        }
-
     def _mutable_state_bindings(self):
-        """Return checkpoint-key bindings from the canonical state inventory.
+        """Project validated checkpoint aliases without owning tensor snapshots.
 
-        This private manifest is shared by checkpoint restoration and the
-        experimental functional Population lowering.  Building it through the
-        normal snapshot preflight keeps one authority for aliases, shapes, and
-        dynamically registered boundary state.
+        Deterministic declarations share the checkpoint walk and admission
+        rules. Dynamic histories and stochastic workspaces retain their full
+        restoration preflight while their specialized phases are migrated.
         """
-        plan = self._preflight_mutable_state_dict(self.mutable_state_dict())
-        keys = plan["assignment_keys"]
+        if not _has_direct_state_inventory(self):
+            plan = self._preflight_mutable_state_dict(self.mutable_state_dict())
+            keys = plan["assignment_keys"]
+            assignments = plan["assignments"]
+        else:
+            values = self._mutable_state_values()
+            self._validate_support_identity_payload(values)
+            # Matching candidate frames need only a memo identity. Aliases
+            # requiring a conversion retain native conversion admission.
+            plan = _MutableTensorPlan(values, _prepare_binding_token)
+            for collection in (self.mechanisms, self.material_processes):
+                for prefix, module in collection.items():
+                    for block in checkpoint_module_blocks(module, prefix):
+                        if isinstance(
+                            block, (_StochasticStateBoundary, _DelayedStateBoundary)
+                        ):
+                            continue
+                        for slot in block.slots:
+                            plan.add(
+                                slot.owner,
+                                slot.name,
+                                f"{prefix}.{slot.checkpoint_suffix}",
+                                optional=block.role == "state_carry",
+                            )
+            self._add_mutable_local_tensors(plan.add)
+            keys = plan.assignment_keys
+            assignments = plan.assignment_map.values()
         return tuple(
             (keys[(id(owner), name)], owner, name)
-            for owner, name, _value in plan["assignments"]
+            for owner, name, _value in assignments
         )
 
     def _validate_support_identity_payload(self, state_dict):
