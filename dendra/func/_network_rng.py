@@ -457,10 +457,8 @@ class NetworkStimulationRNGPlan:
             result
         )
 
-    def sample_population_initialization(self, name, state, random, stimulation):
-        """Sample one Population's two initialization families in one stream."""
-        samplers = self.random._samplers(random)
-        pool = self.expand_pool(random, stimulation)
+    def _poisson_samplers(self, samplers, pool):
+        """Restore Poisson streams while retaining borrowed generator identity."""
         poisson_samplers = {}
         for stream, source in self.stimulation.streams.items():
             if stream in self.borrowed:
@@ -470,6 +468,13 @@ class NetworkStimulationRNGPlan:
                 generator = torch.Generator(device=source.device)
                 generator.set_state(pool[stream].detach().cpu())
                 poisson_samplers[stream] = generator
+        return poisson_samplers
+
+    def sample_population_initialization(self, name, state, random, stimulation):
+        """Sample one Population's two initialization families in one stream."""
+        samplers = self.random._samplers(random)
+        pool = self.expand_pool(random, stimulation)
+        poisson_samplers = self._poisson_samplers(samplers, pool)
         local = self.expand_population(name, state, random, stimulation)
         return self.functional.populations[
             name
@@ -665,15 +670,7 @@ class NetworkStimulationRNGPlan:
         supplied_noise, supplied_stimulation = self._provided(noise, stimulation, steps)
         samplers = self.random._samplers(state["rng"])
         pool = self.expand_pool(state["rng"], state.get("stimulation_rng", {}))
-        poisson_samplers = {}
-        for stream, source in self.stimulation.streams.items():
-            if stream in self.borrowed:
-                owner, device = self.borrowed[stream]
-                poisson_samplers[stream] = samplers[owner]._generator_for(device)
-            else:
-                generator = torch.Generator(device=source.device)
-                generator.set_state(pool[stream].detach().cpu())
-                poisson_samplers[stream] = generator
+        poisson_samplers = self._poisson_samplers(samplers, pool)
         boundaries = {name: [] for name in self.functional.populations}
         for index in range(steps):
             contexts = self._contexts(state, samplers, poisson_samplers)
