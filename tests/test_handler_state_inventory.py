@@ -185,7 +185,7 @@ def test_live_admission_keeps_legacy_state_local_errors_without_mutating_owners(
         ),
     ),
 )
-def test_special_tensor_locals_keep_whole_legacy_conversion_errors(kind, monkeypatch):
+def test_special_tensor_locals_keep_native_conversion_errors(kind, monkeypatch):
     handler = shared_handler()
     owner = handler.mechanisms["zeta"]
     owner.read = (
@@ -221,7 +221,7 @@ def test_special_tensor_locals_keep_whole_legacy_conversion_errors(kind, monkeyp
     with pytest.raises(type(legacy.value)) as actual:
         handler._mutable_state_bindings()
     assert str(actual.value) == str(legacy.value)
-    assert calls and calls[0] == "snapshot" and "preflight" in calls
+    assert calls == []
     _assert_unchanged(before)
 
 
@@ -258,7 +258,7 @@ class _ClassRNG(Mechanism):
 
 
 @pytest.mark.parametrize("kind", ("noise", "rng", "delay", "metadata"))
-def test_dynamic_metadata_keeps_whole_handler_legacy_bindings_without_sampling(
+def test_dynamic_metadata_keeps_bindings_without_snapshot_or_sampling(
     kind, monkeypatch
 ):
     handler, mechanism = declared_handler(process=False)
@@ -303,7 +303,7 @@ def test_dynamic_metadata_keeps_whole_handler_legacy_bindings_without_sampling(
     monkeypatch.setattr(RNGModule, "randn", _forbidden)
     actual = handler._mutable_state_bindings()
     _assert_bindings(actual, expected)
-    assert calls and calls[0] == "snapshot" and "preflight" in calls
+    assert calls == []
     _assert_unchanged(before)
     assert torch.equal(torch.get_rng_state(), global_rng)
     for stream, generator, frame in rng_frames:
@@ -312,7 +312,7 @@ def test_dynamic_metadata_keeps_whole_handler_legacy_bindings_without_sampling(
 
 
 @pytest.mark.parametrize("field", ("support_map", "support_spec"))
-def test_support_descriptors_wait_for_legacy_snapshot_before_authored_access(
+def test_support_descriptors_wait_for_capture_before_authored_access(
     field, monkeypatch
 ):
     handler, mechanism = declared_handler()
@@ -322,25 +322,26 @@ def test_support_descriptors_wait_for_legacy_snapshot_before_authored_access(
     events = []
     error = RuntimeError("authored support descriptor")
     snapshot = handler.mutable_state_dict
+    capture_values = handler._mutable_state_values
 
     def support(owner):
         events.append("support")
         raise error
 
     def capture():
-        events.append("snapshot")
-        return snapshot()
+        events.append("capture")
+        return capture_values()
 
     monkeypatch.setattr(type(mechanism), field, property(support), raising=False)
     with pytest.raises(RuntimeError) as legacy:
         snapshot()
     assert legacy.value is error
     events.clear()
-    monkeypatch.setattr(handler, "mutable_state_dict", capture)
+    monkeypatch.setattr(handler, "_mutable_state_values", capture)
     with pytest.raises(RuntimeError) as actual:
         handler._mutable_state_bindings()
     assert actual.value is legacy.value
-    assert events == ["snapshot", "support"]
+    assert events == ["capture", "support"]
     _assert_unchanged(before)
 
 

@@ -82,6 +82,21 @@ def functional_module_blocks(module, prefix):
         )
 
 
+def _capture_tensor_values(values, prepare):
+    """Choose frame ownership once per tensor while retaining key aliases."""
+    memo = {}
+    captured = {}
+    for name, value in values.items():
+        if not torch.is_tensor(value):
+            captured[name] = value
+            continue
+        value_id = id(value)
+        if value_id not in memo:
+            memo[value_id] = prepare(value)
+        captured[name] = memo[value_id]
+    return captured
+
+
 class _MutableTensorPlan:
     """Validate targets and prepare each distinct candidate frame once."""
 
