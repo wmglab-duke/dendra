@@ -7240,16 +7240,21 @@ def _reset_functional_initialization_clock(state):
     return state
 
 
-def _fresh_initialization_pre_state(template, v_init):
+def _fresh_initialization_pre_state(template, v_init, *, mechanism_state=None):
     """Reconstruct init_v's voltage frame before authored pre transforms.
 
     Extracellular initialization sets intracellular absolute potential to the
     requested membrane voltage and both shell potentials to zero. Do this
     before transforms: a pre hook may intentionally replace v and vc
-    independently, just as it can after imperative init_v.
+    independently, just as it can after imperative init_v. Mechanism State
+    retains the previous live values until INITIAL applies defaults and ic.
     """
 
     state = torch.utils._pytree.tree_map(lambda value: value, template)
+    if mechanism_state is not None:
+        state["mechanisms"] = torch.utils._pytree.tree_map(
+            lambda value: value, mechanism_state
+        )
     state["integrator"]["v"] = v_init
     if "v_prev" in state["integrator"]:
         state["integrator"]["v_prev"] = v_init
@@ -13814,6 +13819,7 @@ class FunctionalPopulation:
         initialization,
         parameters,
         pre_state,
+        initialization_states,
         transform_inputs,
         initialization_template,
         prepare,
@@ -13839,6 +13845,11 @@ class FunctionalPopulation:
             isolate_read_only=True,
             mechanism_dt=initialization_dt,
         )
+        # Pre hooks act on live State, not insertion configuration. Their
+        # writes remain visible to later hooks, but INITIAL consumes the
+        # original explicit ic frame after the complete pre phase.
+        for entry in self._initialization_state_layout:
+            _put_path(pre_state, entry.public_path, initialization_states[entry.name])
         state = initialize(mapping, pre_state, initialization_dt)
         initialized_parameters, state = _apply_initialization_transforms(
             initialization, "post", initialized_parameters, state, transform_inputs
@@ -13881,7 +13892,10 @@ class FunctionalPopulation:
         Population clock and duration remainder. RAND declarations consume an
         explicit ``random_draw`` or ``inputs.random_draw`` packet. Their retained
         samples and provenance accompany the returned constants; ``state``
-        supplies previous samples for declarations which do not resample.
+        supplies previous samples for declarations which do not resample and
+        previous mechanism State for pre-transform reads. Without ``state``,
+        those reads use the State captured at lowering. ``inputs.states``
+        supplies insertion-time values applied after the complete pre phase.
         """
 
         self._validate_source()
@@ -13973,9 +13987,22 @@ class FunctionalPopulation:
         initialization_transform_values = (
             {} if inputs.transforms is None else inputs.transforms
         )
+        previous_mechanism_state = None
+        if (
+            self._initialization_state_layout
+            and state is not None
+            and "mechanisms" in state
+        ):
+            previous_mechanism_state = state["mechanisms"]
+            self._validate_state_node(
+                previous_mechanism_state,
+                self._state_schema["mechanisms"],
+                ("mechanisms",),
+            )
         pre_state = _fresh_initialization_pre_state(
             self._initialization_state_template,
             inputs.v_init,
+            mechanism_state=previous_mechanism_state,
         )
         initialization_template = self._initialization_state_template
         if state is not None and "noise_workspaces" in state:
@@ -13983,12 +14010,6 @@ class FunctionalPopulation:
                 **initialization_template,
                 "noise_workspaces": state["noise_workspaces"],
             }
-        for entry in self._initialization_state_layout:
-            _put_path(
-                pre_state,
-                entry.public_path,
-                initialization_states[entry.name],
-            )
         root_random_values = None
         root_noise_values = {}
         if self._split_stochastic_initialization:
@@ -14065,6 +14086,7 @@ class FunctionalPopulation:
             self._initialization,
             parameters,
             pre_state,
+            initialization_states,
             initialization_transform_values,
             initialization_template,
             prepare_initialization,
@@ -16328,6 +16350,7 @@ class FunctionalPopulation:
                     constants,
                     v_init,
                     explicit_values,
+                    previous_values,
                     transform_values,
                     *,
                     track_read_only: bool,
@@ -16347,6 +16370,14 @@ class FunctionalPopulation:
                             for name, value in zip(
                                 explicit_names,
                                 explicit_values,
+                                strict=True,
+                            )
+                        },
+                        **{
+                            f"previous_state:{name}": value
+                            for name, value in zip(
+                                explicit_names,
+                                previous_values,
                                 strict=True,
                             )
                         },
@@ -16379,11 +16410,12 @@ class FunctionalPopulation:
                         v_init,
                     )
                     for entry, value in zip(
-                        self._initialization_state_layout,
-                        explicit_values,
-                        strict=True,
+                        self._initialization_state_layout, previous_values, strict=True
                     ):
                         _put_path(pre_state, entry.public_path, value)
+                    initialization_states = dict(
+                        zip(explicit_names, explicit_values, strict=True)
+                    )
 
                     def prepare_initialization(initialized_parameters):
                         preparation_modules = (
@@ -16441,6 +16473,7 @@ class FunctionalPopulation:
                             audit_initialization,
                             parameters,
                             pre_state,
+                            initialization_states,
                             transform_inputs,
                             self._initialization_state_template,
                             prepare_initialization,
@@ -16496,6 +16529,18 @@ class FunctionalPopulation:
                         )
                         for name in explicit_names
                     }
+                    # Previous State and insertion configuration are distinct
+                    # inputs. Probe both frames under autograd/vmap/JVP so pre
+                    # hooks retain the same diagnostic coverage as INITIAL.
+                    previous = tuple(
+                        audit_input(
+                            _get_path(
+                                self._initialization_state_template, entry.public_path
+                            ),
+                            requires_grad=requires_grad,
+                        )
+                        for entry in self._initialization_state_layout
+                    )
                     v_init = audit_input(
                         tensors.initialization.v_init,
                         requires_grad=requires_grad,
@@ -16512,6 +16557,7 @@ class FunctionalPopulation:
                         constants,
                         v_init,
                         tuple(explicit.values()),
+                        previous,
                         tuple(transforms.values()),
                     )
 
@@ -16526,6 +16572,7 @@ class FunctionalPopulation:
                             constants,
                             v_init,
                             explicit_values,
+                            previous_values,
                             transform_values,
                         ) = make_inputs(requires_grad=grad_enabled)
                         outputs = evaluate(
@@ -16533,6 +16580,7 @@ class FunctionalPopulation:
                             constants,
                             v_init,
                             explicit_values,
+                            previous_values,
                             transform_values,
                             track_read_only=True,
                         )
@@ -16554,6 +16602,7 @@ class FunctionalPopulation:
                     constants,
                     v_init,
                     explicit_values,
+                    previous_values,
                     transform_values,
                 ) = make_inputs(requires_grad=False)
                 flat_inputs = (
@@ -16561,6 +16610,7 @@ class FunctionalPopulation:
                     *(constants[name] for name in constant_names),
                     v_init,
                     *explicit_values,
+                    *previous_values,
                     *transform_values,
                 )
                 parameter_count = len(parameter_names)
@@ -16574,12 +16624,15 @@ class FunctionalPopulation:
                     local_v_init = values[constant_stop]
                     explicit_stop = constant_stop + 1 + explicit_count
                     local_explicit = values[constant_stop + 1 : explicit_stop]
-                    local_transforms = values[explicit_stop:]
+                    previous_stop = explicit_stop + explicit_count
+                    local_previous = values[explicit_stop:previous_stop]
+                    local_transforms = values[previous_stop:]
                     outputs = evaluate(
                         dict(zip(parameter_names, parameter_values, strict=True)),
                         dict(zip(constant_names, constant_values, strict=True)),
                         local_v_init,
                         local_explicit,
+                        local_previous,
                         local_transforms,
                         track_read_only=False,
                     )

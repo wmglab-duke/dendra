@@ -95,6 +95,14 @@ Post transforms can observe temporary clock/control writes from earlier post
 transforms, but the normal final initialization reset still returns simulation
 time and the duration remainder to zero.
 
+A pre transform's State writes are visible to later pre transforms. Mechanism
+initialization then establishes the State using its defaults, insertion-time
+``ic``, and authored ``initial_values``. Use a post transform to adjust the final
+initialized State. In functional initialization, ``initialize(..., state=...)``
+supplies previous mechanism state for pre-transform reads; omitting it uses the
+state captured when the Population was lowered. The requested initial voltage
+and fresh clock still define the pre-transform voltage and time frame.
+
 Ordinary pre/post hooks remain the permissive imperative extension point and
 still receive the Population object. Dendra deliberately does not infer a pure
 functional program from those arbitrary callbacks. Use ``set_v_init(...)`` for

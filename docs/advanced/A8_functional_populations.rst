@@ -2782,8 +2782,18 @@ Transforms compose in registration order and must return one tuple entry for
 each declared write. Supported paths are exact ``parameters.<canonical name>``
 leaves and phase-available ``state.*`` leaves. A pre transform runs before
 State inference; a post transform runs after the accepted initial state is
-constructed. As in imperative initialization, simulation time and the duration
-remainder are reset to zero after the complete post-transform sequence.
+constructed. Pre-transform mechanism State paths must have an insertion-time
+``ic``. Pre-transform State writes are visible to subsequent pre
+transforms, then the initialization transaction applies State defaults,
+insertion-time ``ic``, and authored ``initial_values``. A post transform adjusts
+the final initialized State. Pass ``state=previous_state`` to ``initialize``
+when pre transforms need to read previous mechanism state; otherwise they read
+the mechanism state captured at lowering. Explicit ``initialization.states``
+values supply the later insertion-time overrides. The requested ``v_init`` and
+fresh clock define the
+pre-transform voltage and time frame. As in imperative initialization,
+simulation time and the duration remainder are reset to zero after the complete
+post-transform sequence.
 Population-owned RAND and NOISE sample before pre transforms; inserted
 Mechanisms, nested States, and MaterialProcesses sample afterward. Samples
 retain their selected distribution-parameter frames across later shared raw
