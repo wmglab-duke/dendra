@@ -15,7 +15,11 @@ from torch.utils.checkpoint import checkpoint
 from dendra.models.core import _duration_step_budget, _validate_time_scalar
 
 from ._binding import BoundPopulation
-from ._callbacks import FunctionalCallbacks, _complete_callback_results
+from ._callbacks import (
+    FunctionalCallbacks,
+    _complete_callback_results,
+    _setup_callback_state,
+)
 from ._population import FunctionalPopulation
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._tensor_contracts import _tensor_binding
@@ -716,13 +720,7 @@ def _prepare_callback_collection(
         )
     callbacks._validate_owner(functional)
     callbacks._validate_runtime_dt(dt)
-    if callback_state is None:
-        callback_state, initial_emission = callbacks._initialize(state)
-        initial_part = callbacks._stack([initial_emission])
-        parts = [initial_part] if callbacks._has_emissions(initial_part) else []
-    else:
-        callback_state = callbacks._validate_state(callback_state)
-        parts = []
+    callback_state, parts = _setup_callback_state(callbacks, callback_state, state)
     return callbacks, callback_state, parts
 
 

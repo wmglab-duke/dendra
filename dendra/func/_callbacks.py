@@ -1363,6 +1363,18 @@ def _stack_callback_emissions(plans, emissions):
     }
 
 
+def _setup_callback_state(callbacks, callback_state, state):
+    """Initialize or validate carry and collect a segment's initial part."""
+    if callback_state is None:
+        callback_state, initial_emission = callbacks._initialize(state)
+        initial_part = callbacks._stack([initial_emission])
+        parts = [initial_part] if callbacks._has_emissions(initial_part) else []
+    else:
+        callback_state = callbacks._validate_state(callback_state)
+        parts = []
+    return callback_state, parts
+
+
 def _complete_callback_results(
     callbacks, callback_state, parts
 ) -> FunctionalCallbackResults:

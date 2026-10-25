@@ -17527,18 +17527,11 @@ class FunctionalPopulation:
     ):
         """Execute a fixed-step rollout while threading pure callback carry."""
 
-        from ._callbacks import _complete_callback_results
+        from ._callbacks import _complete_callback_results, _setup_callback_state
 
         callbacks._validate_owner(self)
         callbacks._validate_runtime_dt_tensor(prepared["integrator"]["dt"])
-        parts = []
-        if callback_state is None:
-            callback_state, initial_emission = callbacks._initialize(state)
-            initial_part = callbacks._stack([initial_emission])
-            if callbacks._has_emissions(initial_part):
-                parts.append(initial_part)
-        else:
-            callback_state = callbacks._validate_state(callback_state)
+        callback_state, parts = _setup_callback_state(callbacks, callback_state, state)
 
         # Deterministic bound stimulation is evaluated for the complete horizon.
         # Explicit Poisson packets preserve native invocation ordering per step.
