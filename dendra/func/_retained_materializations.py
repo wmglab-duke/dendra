@@ -1,8 +1,10 @@
-"""Cold coordinates for initialization-retained effective operands."""
+"""Retained-materialization coordinates and call-local packet operations."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+
+import torch
 
 
 @dataclass(frozen=True)
@@ -44,3 +46,39 @@ class _RetainedMaterializationInventory:
                 for name, path, shape, dtype, device in specs
             )
         )
+
+
+def _clear_retained_frame(inventory, constants):
+    """Discard value graphs and active flags for a nonempty retained frame."""
+    # Cut old graphs before inactive torch.where routes can revisit a
+    # completed backward pass. Detached views retain their existing storage.
+    return {
+        **constants,
+        **{
+            slot.value_key: constants[slot.value_key].detach()
+            for slot in inventory.slots
+        },
+        **{
+            slot.active_key: torch.zeros_like(constants[slot.active_key])
+            for slot in inventory.slots
+        },
+    }
+
+
+def _capture_retained_frame(inventory, constants, values):
+    """Capture a nonempty prepared frame, retaining its differentiable graphs."""
+    return {
+        **constants,
+        **{
+            slot.value_key: values[slot.path].clone(memory_format=torch.preserve_format)
+            for slot in inventory.slots
+        },
+        **{
+            slot.active_key: torch.ones_like(constants[slot.active_key])
+            for slot in inventory.slots
+        },
+        **{
+            slot.baseline_key: torch.zeros_like(constants[slot.baseline_key])
+            for slot in inventory.slots
+        },
+    }

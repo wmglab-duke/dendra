@@ -115,7 +115,11 @@ from dendra.models.stim.waveform.core import Waveform
 from dendra.models.tree import Tree
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
-from ._retained_materializations import _RetainedMaterializationInventory
+from ._retained_materializations import (
+    _capture_retained_frame,
+    _clear_retained_frame,
+    _RetainedMaterializationInventory,
+)
 from ._rng_diagnostics import (
     _global_rng_changes,
     _global_rng_snapshot,
@@ -12932,19 +12936,7 @@ class FunctionalPopulation:
     def _clear_retained_materializations(self, constants):
         if not self._retained_materializations.slots:
             return constants
-        # Fresh preparation discards these values. Cut their old graph before
-        # inactive torch.where routes can revisit a completed backward pass.
-        return {
-            **constants,
-            **{
-                slot.value_key: constants[slot.value_key].detach()
-                for slot in self._retained_materializations.slots
-            },
-            **{
-                slot.active_key: torch.zeros_like(constants[slot.active_key])
-                for slot in self._retained_materializations.slots
-            },
-        }
+        return _clear_retained_frame(self._retained_materializations, constants)
 
     def _retain_materializations(self, parameters, constants, *, prepared=None):
         """Capture native preparation without detaching fresh initialization graphs."""
@@ -12955,23 +12947,9 @@ class FunctionalPopulation:
                 parameters, constants, use_snapshot_offsets=False
             )
         values = prepared.get("materializations", {})
-        return {
-            **constants,
-            **{
-                slot.value_key: values[slot.path].clone(
-                    memory_format=torch.preserve_format
-                )
-                for slot in self._retained_materializations.slots
-            },
-            **{
-                slot.active_key: torch.ones_like(constants[slot.active_key])
-                for slot in self._retained_materializations.slots
-            },
-            **{
-                slot.baseline_key: torch.zeros_like(constants[slot.baseline_key])
-                for slot in self._retained_materializations.slots
-            },
-        }
+        return _capture_retained_frame(
+            self._retained_materializations, constants, values
+        )
 
     def _cache_preparation_inputs(
         self,
