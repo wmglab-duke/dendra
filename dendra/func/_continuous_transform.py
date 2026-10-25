@@ -526,6 +526,39 @@ class ContinuousTransformPlan:
             return _function_signature(transform, None, strict=strict)
         return _callable_binding(transform)
 
+    def _collect_module_binding_guards(self, child, p):
+        """Capture explicit module bindings before class and function guards."""
+        self._guard_instances.append((vars(child), tuple(vars(child))))
+        self._guard_modules.append(
+            (
+                child,
+                tuple(child._parameters),
+                tuple(child._buffers),
+                tuple(child._modules.items()),
+            )
+        )
+        for collection in ("_parameters", "_buffers"):
+            for name, value in vars(child)[collection].items():
+                schema = (
+                    None
+                    if value is None
+                    else (tuple(value.shape), value.dtype, value.device)
+                )
+                alias = (
+                    None
+                    if value is None
+                    else self._guard_aliases.setdefault(
+                        id(value), len(self._guard_aliases)
+                    )
+                )
+                self._guard_tensor_slots.append(
+                    (child, collection, name, schema, alias)
+                )
+        self._guard_attributes.append((child, "training", child.training, "config"))
+        for name, value in vars(child).items():
+            if not p._is_internal_module_state(child, name) and name != "training":
+                self._guard_attributes.append((child, name, value, "config"))
+
     def _collect_binding_guards(self, transform):
         """Freeze explicit registrations and dispatch without dependency audits."""
         p = _helpers()
@@ -542,36 +575,7 @@ class ContinuousTransformPlan:
                 )
             return
         for _path, child in _safe_modules(transform):
-            self._guard_instances.append((vars(child), tuple(vars(child))))
-            self._guard_modules.append(
-                (
-                    child,
-                    tuple(child._parameters),
-                    tuple(child._buffers),
-                    tuple(child._modules.items()),
-                )
-            )
-            for collection in ("_parameters", "_buffers"):
-                for name, value in vars(child)[collection].items():
-                    schema = (
-                        None
-                        if value is None
-                        else (tuple(value.shape), value.dtype, value.device)
-                    )
-                    alias = (
-                        None
-                        if value is None
-                        else self._guard_aliases.setdefault(
-                            id(value), len(self._guard_aliases)
-                        )
-                    )
-                    self._guard_tensor_slots.append(
-                        (child, collection, name, schema, alias)
-                    )
-            self._guard_attributes.append((child, "training", child.training, "config"))
-            for name, value in vars(child).items():
-                if not p._is_internal_module_state(child, name) and name != "training":
-                    self._guard_attributes.append((child, name, value, "config"))
+            self._collect_module_binding_guards(child, p)
             for cls in type(child).__mro__:
                 if cls in (torch.nn.Module, object):
                     continue
@@ -638,41 +642,7 @@ class ContinuousTransformPlan:
         if self.is_module:
             p = _helpers()
             for path, child in _safe_modules(transform):
-                self._guard_instances.append((vars(child), tuple(vars(child))))
-                self._guard_modules.append(
-                    (
-                        child,
-                        tuple(child._parameters),
-                        tuple(child._buffers),
-                        tuple(child._modules.items()),
-                    )
-                )
-                for collection in ("_parameters", "_buffers"):
-                    for name, value in vars(child)[collection].items():
-                        schema = (
-                            None
-                            if value is None
-                            else (tuple(value.shape), value.dtype, value.device)
-                        )
-                        alias = (
-                            None
-                            if value is None
-                            else self._guard_aliases.setdefault(
-                                id(value), len(self._guard_aliases)
-                            )
-                        )
-                        self._guard_tensor_slots.append(
-                            (child, collection, name, schema, alias)
-                        )
-                self._guard_attributes.append(
-                    (child, "training", child.training, "config")
-                )
-                for name, value in vars(child).items():
-                    if (
-                        not p._is_internal_module_state(child, name)
-                        and name != "training"
-                    ):
-                        self._guard_attributes.append((child, name, value, "config"))
+                self._collect_module_binding_guards(child, p)
                 for cls in type(child).__mro__:
                     if cls in (torch.nn.Module, object):
                         continue
