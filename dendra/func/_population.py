@@ -118,6 +118,7 @@ from dendra.utils.tensor_ops import _logical_tensor_bytes
 from ._retained_materializations import (
     _capture_retained_frame,
     _clear_retained_frame,
+    _project_retained_frame,
     _RetainedMaterializationInventory,
 )
 from ._rng_diagnostics import (
@@ -15434,18 +15435,9 @@ class FunctionalPopulation:
             )
             for name, value in values["integrator"].items()
         }
-        extras = {} if extras is None else extras
-        retained = {}
-        for slot in self._retained_materializations.slots:
-            if slot.prepared_path is not None:
-                section, key = slot.prepared_path
-                value = values[section][key]
-            elif slot.path in extras and extras[slot.path] is not None:
-                value = extras[slot.path]
-            else:
-                value = values["geometry"][slot.path]
-            retained[slot.path] = value
-        values["materializations"] = retained
+        values["materializations"] = _project_retained_frame(
+            self._retained_materializations, values, extras
+        )
         return values
 
     def _validate_prepared_freshness(self, prepared, parameters) -> Mapping:

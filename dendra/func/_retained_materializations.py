@@ -82,3 +82,19 @@ def _capture_retained_frame(inventory, constants, values):
             for slot in inventory.slots
         },
     }
+
+
+def _project_retained_frame(inventory, values, extras):
+    """Select prepared operands without copying tensors or changing their graphs."""
+    extras = {} if extras is None else extras
+    retained = {}
+    for slot in inventory.slots:
+        if slot.prepared_path is not None:
+            section, key = slot.prepared_path
+            value = values[section][key]
+        elif slot.path in extras and extras[slot.path] is not None:
+            value = extras[slot.path]
+        else:
+            value = values["geometry"][slot.path]
+        retained[slot.path] = value
+    return retained
