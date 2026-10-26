@@ -60,6 +60,13 @@ def _cache_storage_frame(value, *, buffer=False, owner=None):
     )
 
 
+def _cache_storage_last_element(offset, shape, strides):
+    """Return the inclusive last element of a nonempty cache storage frame."""
+    return offset + sum(
+        (length - 1) * stride for length, stride in zip(shape, strides, strict=True)
+    )
+
+
 class CacheStorageReplay(NamedTuple):
     size: int
     write_paths: tuple
@@ -115,10 +122,7 @@ def cache_storage_replays(writes, outputs):
 
         def bounds(frame):
             offset, shape, strides = frame[4:]
-            return offset, offset + sum(
-                (length - 1) * stride
-                for length, stride in zip(shape, strides, strict=True)
-            )
+            return offset, _cache_storage_last_element(offset, shape, strides)
 
         components = []
         for frame in sorted(frames, key=bounds):
@@ -322,10 +326,7 @@ class PopulationCachePlan:
 
                     def byte_bounds(tensor, layout):
                         offset, shape, strides = layout[4:]
-                        last = offset + sum(
-                            (size - 1) * stride
-                            for size, stride in zip(shape, strides, strict=True)
-                        )
+                        last = _cache_storage_last_element(offset, shape, strides)
                         return offset * tensor.element_size(), (
                             last + 1
                         ) * tensor.element_size()

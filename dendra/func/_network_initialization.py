@@ -62,7 +62,7 @@ class NetworkInitializationInput(NamedTuple):
 def nonpersistent_material_cache_failures(functional):
     """Reject cache writes omitted from another Population's config reader."""
     from ._custom_material_processes import custom_material_constant_slots
-    from ._population_cache import _cache_storage_frame
+    from ._population_cache import _cache_storage_frame, _cache_storage_last_element
     from ._torch_parametrizations import buffer_slots as torch_buffer_slots
 
     plans = (
@@ -100,9 +100,7 @@ def nonpersistent_material_cache_failures(functional):
 
         def bounds(frame):
             offset, shape, strides = frame[4:]
-            last = offset + sum(
-                (size - 1) * stride for size, stride in zip(shape, strides, strict=True)
-            )
+            last = _cache_storage_last_element(offset, shape, strides)
             return offset * frame[2].itemsize, (last + 1) * frame[2].itemsize
 
         start, end = bounds(left)
@@ -231,7 +229,11 @@ def _propagate_population_parameters(functional, parameters, name, replacement):
 
 def _cache_alias_plan(functional, writers, readers):
     """Freeze one native cache-copy transaction and all of its readers."""
-    from ._population_cache import _cache_storage_frame, cache_storage_replays
+    from ._population_cache import (
+        _cache_storage_frame,
+        _cache_storage_last_element,
+        cache_storage_replays,
+    )
 
     groups = {}
     constant_frames = {}
@@ -257,10 +259,7 @@ def _cache_alias_plan(functional, writers, readers):
         def bounds(value):
             offset, shape, strides = value[4:]
             size = value[2].itemsize
-            end = offset + sum(
-                (length - 1) * stride
-                for length, stride in zip(shape, strides, strict=True)
-            )
+            end = _cache_storage_last_element(offset, shape, strides)
             return offset * size, (end + 1) * size - 1
 
         start, end = bounds(frame)
