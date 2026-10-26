@@ -119,6 +119,7 @@ from ._retained_materializations import (
     _cache_materialization,
     _capture_retained_frame,
     _clear_retained_frame,
+    _complete_snapshot_baselines,
     _materialization_overrides,
     _project_retained_frame,
     _retained_workspace_builder,
@@ -128,6 +129,7 @@ from ._retained_materializations import (
 )
 from ._retained_materializations import (
     _RetainedMaterializationInventory,
+    _seed_snapshot_frame,
 )
 from ._retained_materializations import (
     _SnapshotMaterialization as _SnapshotMaterialization,
@@ -13428,26 +13430,7 @@ class FunctionalPopulation:
                 (), device=self.device, dtype=torch.bool
             )
         if self._retained_materializations.slots:
-            constants.update(
-                {
-                    slot.value_key: _clone_tensor(population.get_buffer(slot.path))
-                    for slot in self._retained_materializations.slots
-                }
-            )
-            constants.update(
-                {
-                    slot.active_key: torch.zeros(
-                        (), device=self.device, dtype=torch.bool
-                    )
-                    for slot in self._retained_materializations.slots
-                }
-            )
-            constants.update(
-                {
-                    slot.baseline_key: torch.zeros_like(constants[slot.value_key])
-                    for slot in self._retained_materializations.slots
-                }
-            )
+            _seed_snapshot_frame(self, population, constants)
         if self._random_plan is not None:
             constants.update(_random_constants)
         if self._retained_materializations.slots:
@@ -13458,23 +13441,7 @@ class FunctionalPopulation:
                     constants,
                     _snapshot_baseline_capture=baselines,
                 )
-            expected_baselines = {
-                slot.path
-                for slot in self._retained_materializations.slots
-                if slot.path != "integrator.dt"
-            }
-            if set(baselines) != expected_baselines:
-                raise FunctionalizationError(
-                    "Snapshot preparation did not visit every retained operand: "
-                    f"missing={sorted(expected_baselines - set(baselines))}, "
-                    f"unexpected={sorted(set(baselines) - expected_baselines)}"
-                )
-            constants.update(
-                {
-                    self._retained_materializations.by_path[path].baseline_key: baseline
-                    for path, baseline in baselines.items()
-                }
-            )
+            _complete_snapshot_baselines(self, constants, baselines)
             if self._has_snapshot_materialization_offsets is None:
                 self._has_snapshot_materialization_offsets = any(
                     not torch.equal(

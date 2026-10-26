@@ -148,6 +148,49 @@ def _retained_workspace_builder(module_path, owner, phase, cache_values, cache_a
     return torch.stack(active).all() if active else None
 
 
+def _seed_snapshot_frame(owner, population, constants):
+    """Seed a retained snapshot in separate value, active and baseline phases."""
+    constants.update(
+        {
+            slot.value_key: _clone_tensor(population.get_buffer(slot.path))
+            for slot in owner._retained_materializations.slots
+        }
+    )
+    constants.update(
+        {
+            slot.active_key: torch.zeros((), device=owner.device, dtype=torch.bool)
+            for slot in owner._retained_materializations.slots
+        }
+    )
+    constants.update(
+        {
+            slot.baseline_key: torch.zeros_like(constants[slot.value_key])
+            for slot in owner._retained_materializations.slots
+        }
+    )
+
+
+def _complete_snapshot_baselines(owner, constants, baselines):
+    """Validate captured snapshot coverage before publishing its baselines."""
+    expected_baselines = {
+        slot.path
+        for slot in owner._retained_materializations.slots
+        if slot.path != "integrator.dt"
+    }
+    if set(baselines) != expected_baselines:
+        raise FunctionalizationError(
+            "Snapshot preparation did not visit every retained operand: "
+            f"missing={sorted(expected_baselines - set(baselines))}, "
+            f"unexpected={sorted(set(baselines) - expected_baselines)}"
+        )
+    constants.update(
+        {
+            owner._retained_materializations.by_path[path].baseline_key: baseline
+            for path, baseline in baselines.items()
+        }
+    )
+
+
 def _clear_retained_frame(inventory, constants):
     """Discard value graphs and active flags for a nonempty retained frame."""
     # Cut old graphs before inactive torch.where routes can revisit a
