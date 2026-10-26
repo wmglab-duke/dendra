@@ -1019,12 +1019,7 @@ class FunctionalNetwork:
             parameters["populations"][name] = snapshots.tree(
                 plan._parameter_sources(population), packet.parameters
             )
-            native_constants = {
-                entry.key: population.get_submodule(entry.module_path)._buffers[
-                    entry.buffer_name
-                ]
-                for entry in plan._parametrization_constants
-            }
+            native_constants = plan._parametrization_constant_sources(population)
             constants["populations"][name] = snapshots.tree(
                 native_constants, packet.constants
             )
@@ -1208,12 +1203,9 @@ class FunctionalNetwork:
         for name, plan in self.populations.items():
             population = network.populations[name]
             parameters["populations", name] = plan._parameter_sources(population)
-            constants["populations", name] = {
-                entry.key: population.get_submodule(entry.module_path)._buffers[
-                    entry.buffer_name
-                ]
-                for entry in plan._parametrization_constants
-            }
+            constants["populations", name] = plan._parametrization_constant_sources(
+                population
+            )
         for (collection, name), plan in self._connection_parameter_plans.items():
             connection = getattr(network, collection)[name]
             sources = plan.parameter_sources(connection)

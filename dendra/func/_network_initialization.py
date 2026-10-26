@@ -307,12 +307,7 @@ def _cache_alias_plan(functional, writers, readers):
     native_constants = {"populations": {}, "synapses": {}, "continuous_synapses": {}}
     for name, plan in functional.populations.items():
         native["populations"][name] = plan._parameter_sources()
-        native_constants["populations"][name] = {
-            entry.key: plan._population.get_submodule(entry.module_path)._buffers[
-                entry.buffer_name
-            ]
-            for entry in plan._parametrization_constants
-        }
+        native_constants["populations"][name] = plan._parametrization_constant_sources()
     for name, plan in functional.synapses.items():
         connection = plan._source
         sources = functional._connection_parameter_plans["synapses", name]

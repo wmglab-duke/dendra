@@ -128,6 +128,10 @@ def _alias_case(writer, reader):
         _parameter_sources=lambda: {"value": reader},
         _parametrization_constants=(),
     )
+    for plan in (writer_plan, reader_plan):
+        plan._parametrization_constant_sources = (
+            dn.func.FunctionalPopulation._parametrization_constant_sources.__get__(plan)
+        )
     functional = SimpleNamespace(
         populations={"writer": writer_plan, "reader": reader_plan},
         synapses={},

@@ -13229,6 +13229,15 @@ class FunctionalPopulation:
         sources.update(self._extra._tensor_sources())
         return sources
 
+    def _parametrization_constant_sources(self, population: Population | None = None):
+        """Project represented configuration keys to original registered buffers."""
+        return {
+            entry.key: (self._population if population is None else population)
+            .get_submodule(entry.module_path)
+            ._buffers[entry.buffer_name]
+            for entry in self._parametrization_constants
+        }
+
     def _native_state_layout(self, population):
         """Match configured native workspaces and cold solver templates."""
         layout = {leaf.public_path: leaf for leaf in _state_layout(population)}
