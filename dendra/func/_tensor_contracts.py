@@ -13,6 +13,10 @@ import torch
 from torch.utils import _pytree as pytree
 
 
+def _shape_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
+    return tuple(int(value) for value in tensor.shape)
+
+
 def validate_tensor(value, *, shape, dtype, device, label):
     if not torch.is_tensor(value):
         raise TypeError(f"{label} must be a Tensor")

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import torch
+
+from ._tensor_contracts import _shape_tuple
+from ._types import FunctionalizationError
 
 
 @dataclass(frozen=True)
@@ -98,3 +102,53 @@ def _project_retained_frame(inventory, values, extras):
             value = values["geometry"][slot.path]
         retained[slot.path] = value
     return retained
+
+
+def _validate_retained_constants(owner, constants):
+    """Validate retained constant fields in their original slot/field order."""
+    # Keep owner metadata reads in the original checks and diagnostic
+    # branches rather than prefetching device ahead of the fields.
+    for slot in owner._retained_materializations.slots:
+        for value_name in (slot.value_key, slot.baseline_key):
+            value = constants[value_name]
+            if (
+                not torch.is_tensor(value)
+                or _shape_tuple(value) != slot.shape
+                or value.dtype != slot.dtype
+                or value.device != slot.device
+            ):
+                raise ValueError(
+                    f"constant {value_name!r} has incompatible retained schema"
+                )
+        active_name = slot.active_key
+        active = constants[active_name]
+        if (
+            not torch.is_tensor(active)
+            or _shape_tuple(active) != ()
+            or active.dtype != torch.bool
+            or active.device != owner.device
+        ):
+            raise ValueError(
+                f"constant {active_name!r} must be a scalar bool on {owner.device}"
+            )
+
+
+def _validate_retained_prepared(owner, values):
+    """Validate prepared retained keys before visiting their Tensor schemas."""
+    retained = values["materializations"]
+    # A non-Mapping frame fails before reading the owner's slot inventory.
+    if not isinstance(retained, Mapping) or set(retained) != {
+        slot.path for slot in owner._retained_materializations.slots
+    }:
+        raise FunctionalizationError("prepared materialization schema is invalid")
+    for slot in owner._retained_materializations.slots:
+        value = retained[slot.path]
+        if (
+            not torch.is_tensor(value)
+            or _shape_tuple(value) != slot.shape
+            or value.dtype != slot.dtype
+            or value.device != slot.device
+        ):
+            raise FunctionalizationError(
+                f"prepared retained materialization {slot.path!r} has invalid schema"
+            )

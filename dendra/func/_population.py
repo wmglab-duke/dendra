@@ -120,6 +120,8 @@ from ._retained_materializations import (
     _clear_retained_frame,
     _project_retained_frame,
     _RetainedMaterializationInventory,
+    _validate_retained_constants,
+    _validate_retained_prepared,
 )
 from ._rng_diagnostics import (
     _global_rng_changes,
@@ -134,6 +136,7 @@ from ._stimuli import (
 )
 from ._tensor_contracts import (
     _has_inference_tensor_component,
+    _shape_tuple,
     _tensor_binding,
     _tensor_tree_binding,
 )
@@ -2017,10 +2020,6 @@ class _PreparedPopulation:
         self.grad_enabled_at_prepare = grad_enabled_at_prepare
         self.value_binding = _tensor_tree_binding(values)
         self.values = values
-
-
-def _shape_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
-    return tuple(int(value) for value in tensor.shape)
 
 
 def _module_at(population: Population, path: str) -> torch.nn.Module:
@@ -13095,29 +13094,7 @@ class FunctionalPopulation:
                 raise ValueError(
                     f"constant 'cache.active' must be a scalar bool on {self.device}"
                 )
-        for slot in self._retained_materializations.slots:
-            for value_name in (slot.value_key, slot.baseline_key):
-                value = constants[value_name]
-                if (
-                    not torch.is_tensor(value)
-                    or _shape_tuple(value) != slot.shape
-                    or value.dtype != slot.dtype
-                    or value.device != slot.device
-                ):
-                    raise ValueError(
-                        f"constant {value_name!r} has incompatible retained schema"
-                    )
-            active_name = slot.active_key
-            active = constants[active_name]
-            if (
-                not torch.is_tensor(active)
-                or _shape_tuple(active) != ()
-                or active.dtype != torch.bool
-                or active.device != self.device
-            ):
-                raise ValueError(
-                    f"constant {active_name!r} must be a scalar bool on {self.device}"
-                )
+        _validate_retained_constants(self, constants)
         if self._random_plan is not None:
             for name, (shape, dtype, device) in self._random_plan.schema.items():
                 value = constants[name]
@@ -15614,24 +15591,7 @@ class FunctionalPopulation:
                     f"{self.device}/{self.dtype}"
                 )
         if self._retained_materializations.slots:
-            retained = values["materializations"]
-            if not isinstance(retained, Mapping) or set(retained) != {
-                slot.path for slot in self._retained_materializations.slots
-            }:
-                raise FunctionalizationError(
-                    "prepared materialization schema is invalid"
-                )
-            for slot in self._retained_materializations.slots:
-                value = retained[slot.path]
-                if (
-                    not torch.is_tensor(value)
-                    or _shape_tuple(value) != slot.shape
-                    or value.dtype != slot.dtype
-                    or value.device != slot.device
-                ):
-                    raise FunctionalizationError(
-                        f"prepared retained materialization {slot.path!r} has invalid schema"
-                    )
+            _validate_retained_prepared(self, values)
         return values
 
     def _mapping(
