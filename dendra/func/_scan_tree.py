@@ -27,6 +27,7 @@ from ._scan_compat import (
 from ._scan_inductor import _compile_scan
 from ._tensor_contracts import _clone_contiguous_tree as _clone_tree
 from ._tensor_contracts import capture_schema as _schema
+from ._tree_paths import _get_path
 
 
 def _capture_tensor_step(body, arguments, *, grad_enabled, tracer=None):
@@ -67,12 +68,6 @@ def _packed_tensor_scan(
         return layout.pack(updated), emitted
 
     return scan(combine, layout.pack(initial), samples)
-
-
-def _get_path(tree, path):
-    for name in path:
-        tree = tree[name]
-    return tree
 
 
 def _replace_path(tree, path, value):

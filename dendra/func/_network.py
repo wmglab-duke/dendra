@@ -50,6 +50,7 @@ from ._population import (
 )
 from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
 from ._tables import network_table_alias_signature
+from ._tree_paths import _get_path as _at
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
 
@@ -155,12 +156,6 @@ def _tensor_paths(value, path=()):
     elif isinstance(value, tuple):
         for index, child in enumerate(value):
             yield from _tensor_paths(child, (*path, index))
-
-
-def _at(value, path):
-    for key in path:
-        value = value[key]
-    return value
 
 
 _NETWORK_METHODS = {

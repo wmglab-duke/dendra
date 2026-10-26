@@ -13,6 +13,7 @@ import torch
 
 from dendra.models.mechanisms._handler import MechanismHandler
 
+from ._tree_paths import _get_path as _tree_value
 from ._types import FunctionalizationError
 
 
@@ -73,13 +74,6 @@ def _registered_source(population, reference):
         module_paths.setdefault(id(module), path)
     path = module_paths[id(owner)]
     return f"population.{path + '.' if path else ''}{field}", value
-
-
-def _tree_value(tree, path):
-    value = tree
-    for part in path:
-        value = value[part]
-    return value
 
 
 class SourceBinding:

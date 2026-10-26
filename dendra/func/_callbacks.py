@@ -13,28 +13,15 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from numbers import Integral
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import torch
 
+from ._tree_paths import _get_path, _put_path
 from ._types import FunctionalizationError
 
 if TYPE_CHECKING:
     from ._population import FunctionalPopulation
-
-
-def _get_path(tree: Mapping[str, object], path: tuple[str, ...]):
-    value: Any = tree
-    for part in path:
-        value = value[part]
-    return value
-
-
-def _put_path(tree: dict[str, object], path: tuple[str, ...], value) -> None:
-    cursor = tree
-    for part in path[:-1]:
-        cursor = cursor.setdefault(part, {})
-    cursor[path[-1]] = value
 
 
 class FunctionalCallback(ABC):

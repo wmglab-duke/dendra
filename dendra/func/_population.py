@@ -159,6 +159,7 @@ from ._tensor_contracts import (
     _tensor_tree_binding,
 )
 from ._torch_parametrizations import canonical_type as _canonical_type
+from ._tree_paths import _get_path, _put_path
 from ._types import (
     FunctionalizationError,
     InitializationInput,
@@ -2243,20 +2244,6 @@ def _set_buffer(
         owner._buffers[name] = value
     else:
         setattr(owner, name, value)
-
-
-def _put_path(tree: dict, path: tuple[str, ...], value) -> None:
-    cursor = tree
-    for part in path[:-1]:
-        cursor = cursor.setdefault(part, {})
-    cursor[path[-1]] = value
-
-
-def _get_path(tree: Mapping, path: tuple[str, ...]):
-    value = tree
-    for part in path:
-        value = value[part]
-    return value
 
 
 @dataclass(frozen=True)
