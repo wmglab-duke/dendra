@@ -1783,6 +1783,20 @@ def _class_state_diagnostic_scope(classes: tuple[type, ...]):
         changed.update(_restore_class_state(snapshot))
 
 
+@contextmanager
+def _functional_probe_restore_scope(functional, classes, snapshot):
+    """Restore captured probe state, including RNG when class rollback fails."""
+    try:
+        yield
+    finally:
+        try:
+            if classes is not None:
+                _restore_class_state(classes)
+        finally:
+            if snapshot is not None:
+                _restore_global_rng(snapshot, functional.device)
+
+
 def _deepcopy_execution_module(module: torch.nn.Module) -> torch.nn.Module:
     """Deep-copy a module while detaching authored non-leaf tensor caches."""
     memo = {}

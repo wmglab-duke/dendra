@@ -136,11 +136,10 @@ def validate_poisson_invocations(functional, tensors):
         _authored_workspace_classes,
         _class_state_snapshot,
         _deepcopy_execution_module,
+        _functional_probe_restore_scope,
         _global_rng_snapshot,
         _initialization_voltage_kwargs,
         _rebind_population_time_references,
-        _restore_class_state,
-        _restore_global_rng,
     )
 
     snapshot = (
@@ -151,7 +150,7 @@ def validate_poisson_invocations(functional, tensors):
         if functional._check_purity
         else None
     )
-    try:
+    with _functional_probe_restore_scope(functional, classes, snapshot):
         with torch.inference_mode(False), torch.no_grad():
             parameters, constants, state = _pytree.tree_map_only(
                 torch.Tensor,
@@ -226,10 +225,3 @@ def validate_poisson_invocations(functional, tensors):
                 runtime_order=runtime_order,
                 initialization_order=initialization_order,
             )
-    finally:
-        try:
-            if classes is not None:
-                _restore_class_state(classes)
-        finally:
-            if snapshot is not None:
-                _restore_global_rng(snapshot, functional.device)

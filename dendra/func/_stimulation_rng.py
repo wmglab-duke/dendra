@@ -90,10 +90,9 @@ def _kernel_requests(functional, tensors):
         _authored_workspace_classes,
         _class_state_snapshot,
         _deepcopy_execution_module,
+        _functional_probe_restore_scope,
         _global_rng_snapshot,
         _rebind_population_time_references,
-        _restore_class_state,
-        _restore_global_rng,
     )
 
     snapshot = (
@@ -105,7 +104,7 @@ def _kernel_requests(functional, tensors):
         else None
     )
     observed = []
-    try:
+    with _functional_probe_restore_scope(functional, classes, snapshot):
         with torch.inference_mode(False), torch.no_grad():
             parameters, constants, state = _pytree.tree_map_only(
                 torch.Tensor,
@@ -165,13 +164,6 @@ def _kernel_requests(functional, tensors):
                 ),
                 tie_weights=False,
             )
-    finally:
-        try:
-            if classes is not None:
-                _restore_class_state(classes)
-        finally:
-            if snapshot is not None:
-                _restore_global_rng(snapshot, functional.device)
     expected = Counter(("poisson", entry.key) for entry in mechanism)
     expected.update(("sde", entry.key) for entry in sde)
     if Counter((kind, entry.key) for kind, entry in observed) != expected:
