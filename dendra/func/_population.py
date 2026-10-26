@@ -20,6 +20,8 @@ import numpy as np
 import torch
 from torch.func import functional_call
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.overrides import TorchFunctionMode
+from torch.utils._device import DeviceContext
 
 from dendra.helpers import MEMBRANE_ASSEMBLY, ctx, current_check_purity
 from dendra.models.core import (
@@ -1191,16 +1193,187 @@ def _audit_tensor_numerical_value(value: torch.Tensor) -> tuple:
     )
 
 
+_BINDING_MRO = type.__dict__["__mro__"].__get__
+_BINDING_CLASS_DICT = type.__dict__["__dict__"].__get__
+_BINDING_MODULE_DICT = vars(torch.nn.Module)["__dict__"].__get__
+_BINDING_TENSOR_DICT = vars(torch.Tensor)["__dict__"].__get__
+_BINDING_MODE_DICT = vars(TorchFunctionMode)["__dict__"].__get__
+_BINDING_NAMED_MODULES = torch.nn.Module.named_modules
+_BINDING_NAMED_MODULES_CODE = _BINDING_NAMED_MODULES.__code__
+_BINDING_NAMED_MODULES_DEFAULTS = _BINDING_NAMED_MODULES.__defaults__
+_BINDING_DEVICE_HANDLER = DeviceContext.__torch_function__
+_BINDING_DEVICE_CODE = _BINDING_DEVICE_HANDLER.__code__
+_BINDING_DEVICE_DEFAULTS = _BINDING_DEVICE_HANDLER.__defaults__
+_BINDING_DEVICE_MRO = _BINDING_MRO(DeviceContext)
+_BINDING_DEVICE_CONSTRUCTORS = _BINDING_DEVICE_HANDLER.__globals__.get(
+    "_device_constructors"
+)
+_BINDING_MISSING = object()
+
+
+def _binding_capture_modes():
+    """Recognize no modes or Torch's unmodified default-device context."""
+    try:
+        if (
+            torch._C._len_torch_dispatch_stack()
+            or torch._ops._len_torch_dispatch_stack_pre_dispatch()
+            or torch._C._are_functorch_transforms_active()
+            or torch.autograd.forward_ad._current_level >= 0
+            or torch.compiler.is_compiling()
+            or torch.jit.is_tracing()
+        ):
+            return None
+        modes = torch.overrides._get_current_function_mode_stack()
+    except AttributeError:
+        return None
+    if not modes:
+        return ()
+    if len(modes) != 1 or type(modes[0]) is not DeviceContext:
+        return None
+    mode = modes[0]
+    namespace = _BINDING_MODE_DICT(mode)
+    if any(type(key) is not str for key in namespace) or set(namespace) - {
+        "device",
+        "prev_mode",
+        "old_device",
+    }:
+        return None
+    if type(namespace.get("device")) is not torch.device:
+        return None
+    if _BINDING_MRO(DeviceContext) is not _BINDING_DEVICE_MRO:
+        return None
+    for cls in _BINDING_DEVICE_MRO[:-1]:
+        members = _BINDING_CLASS_DICT(cls)
+        if any(type(key) is not str for key in members):
+            return None
+        if "__getattribute__" in members or "device" in members:
+            return None
+    if (
+        _BINDING_CLASS_DICT(DeviceContext).get("__torch_function__")
+        is not _BINDING_DEVICE_HANDLER
+        or _BINDING_DEVICE_HANDLER.__code__ is not _BINDING_DEVICE_CODE
+        or _BINDING_DEVICE_HANDLER.__defaults__ is not _BINDING_DEVICE_DEFAULTS
+        or _BINDING_DEVICE_CONSTRUCTORS is None
+        or _BINDING_DEVICE_HANDLER.__globals__.get("_device_constructors")
+        is not _BINDING_DEVICE_CONSTRUCTORS
+    ):
+        return None
+    return (id(mode), namespace["device"])
+
+
+def _binding_capture_plain_graph(module):
+    """Qualify inert registration reads without invoking authored traversal."""
+    if (
+        _BINDING_NAMED_MODULES.__code__ is not _BINDING_NAMED_MODULES_CODE
+        or _BINDING_NAMED_MODULES.__defaults__ is not _BINDING_NAMED_MODULES_DEFAULTS
+    ):
+        return False
+    is_wrapped = getattr(
+        getattr(torch._C, "_functorch", None), "is_functorch_wrapped_tensor", None
+    )
+    is_functional = getattr(torch, "_is_functional_tensor", None)
+    if is_wrapped is None or is_functional is None:
+        return False
+    policy = {
+        "__getattribute__": object.__getattribute__,
+        "__hash__": object.__hash__,
+        "__eq__": object.__eq__,
+        "named_modules": _BINDING_NAMED_MODULES,
+        "__dict__": vars(torch.nn.Module)["__dict__"],
+        "_parameters": _BINDING_MISSING,
+        "_buffers": _BINDING_MISSING,
+        "_modules": _BINDING_MISSING,
+    }
+    qualified_types, visited, active = set(), set(), set()
+    pending = [(module, False)]
+    while pending:
+        owner, leaving = pending.pop()
+        identity = id(owner)
+        if leaving:
+            active.remove(identity)
+            visited.add(identity)
+            continue
+        if identity in active:
+            return False
+        if identity in visited:
+            continue
+        cls = type(owner)
+        if id(cls) not in qualified_types:
+            mro = _BINDING_MRO(cls)
+            if not any(base is torch.nn.Module for base in mro):
+                return False
+            members = {}
+            for base in mro:
+                namespace = _BINDING_CLASS_DICT(base)
+                if any(type(key) is not str for key in namespace):
+                    return False
+                for name in policy:
+                    if name not in members and name in namespace:
+                        members[name] = namespace[name]
+            if any(
+                members.get(name, _BINDING_MISSING) is not expected
+                for name, expected in policy.items()
+            ):
+                return False
+            qualified_types.add(id(cls))
+        namespace = _BINDING_MODULE_DICT(owner)
+        if (
+            any(type(key) is not str for key in namespace)
+            or "named_modules" in namespace
+        ):
+            return False
+        for name in ("_parameters", "_buffers", "_modules"):
+            registry = namespace.get(name)
+            if type(registry) is not dict or any(
+                type(key) is not str for key in registry
+            ):
+                return False
+        for name in ("_parameters", "_buffers"):
+            for value in namespace[name].values():
+                if value is None:
+                    continue
+                if (
+                    type(value) is not torch.Tensor
+                    and type(value) is not torch.nn.Parameter
+                ):
+                    return False
+                if (
+                    _BINDING_TENSOR_DICT(value)
+                    or is_wrapped(value)
+                    or is_functional(value)
+                ):
+                    return False
+        active.add(identity)
+        pending.append((owner, True))
+        pending.extend(
+            (child, False)
+            for child in namespace["_modules"].values()
+            if child is not None
+        )
+    return True
+
+
 def _registered_tensor_bindings(module: torch.nn.Module) -> dict[tuple, tuple]:
     """Snapshot every registered parameter/buffer slot, including aliases."""
-    bindings = {}
+    mode = _binding_capture_modes()
+    reuse = mode is not None and _binding_capture_plain_graph(module)
+    bindings, memo = {}, {}
     for module_path, owner in module.named_modules(remove_duplicate=False):
         for collection_name in ("_parameters", "_buffers"):
             for name, value in getattr(owner, collection_name).items():
                 if value is None:
                     continue
                 key = (module_path, collection_name, name)
-                bindings[key] = _audit_tensor_binding(value)
+                if reuse and _binding_capture_modes() != mode:
+                    reuse = False
+                    memo.clear()
+                if reuse:
+                    identity = id(value)
+                    if identity not in memo:
+                        memo[identity] = (value, _audit_tensor_binding(value))
+                    bindings[key] = memo[identity][1]
+                else:
+                    bindings[key] = _audit_tensor_binding(value)
     return bindings
 
 
