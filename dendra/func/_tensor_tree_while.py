@@ -22,16 +22,9 @@ from ._hop_inputs import (
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
 )
+from ._tensor_contracts import _clone_contiguous_tree as _clone_tree
 from ._tensor_contracts import capture_schema as _schema
 from ._while_inductor import _compile_while
-
-
-def _clone_tree(tree):
-    return pytree.tree_map_only(
-        torch.Tensor,
-        lambda value: value.clone(memory_format=torch.contiguous_format),
-        tree,
-    )
 
 
 class _CompiledTensorTreeWhile:

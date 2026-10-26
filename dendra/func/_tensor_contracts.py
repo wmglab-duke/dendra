@@ -17,6 +17,15 @@ def _clone_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().clone(memory_format=torch.preserve_format)
 
 
+def _clone_contiguous_tree(tree):
+    """Own each Tensor occurrence independently, retaining its autograd history."""
+    return pytree.tree_map_only(
+        torch.Tensor,
+        lambda value: value.clone(memory_format=torch.contiguous_format),
+        tree,
+    )
+
+
 def _shape_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(value) for value in tensor.shape)
 

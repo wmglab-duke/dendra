@@ -25,15 +25,8 @@ from ._scan_compat import (
     install_scan_compatibility,
 )
 from ._scan_inductor import _compile_scan
+from ._tensor_contracts import _clone_contiguous_tree as _clone_tree
 from ._tensor_contracts import capture_schema as _schema
-
-
-def _clone_tree(tree):
-    return pytree.tree_map_only(
-        torch.Tensor,
-        lambda value: value.clone(memory_format=torch.contiguous_format),
-        tree,
-    )
 
 
 def _capture_tensor_step(body, arguments, *, grad_enabled, tracer=None):

@@ -24,6 +24,7 @@ from ._hop_inputs import (
 from ._scan_compat import install_scan_compatibility
 from ._scan_inductor import _compile_scan
 from ._scan_tree import _capture_tensor_step, _CompiledTensorTreeScan
+from ._tensor_contracts import _clone_contiguous_tree as _clone
 from ._types import StepInput
 
 # Bound the inference graph independently of the horizon, while amortizing the
@@ -31,14 +32,6 @@ from ._types import StepInput
 # one-step partition/save policy. This is private so experiments can compare
 # the small supported widths without adding an execution-policy public API.
 _FORWARD_SCAN_BLOCK = 4
-
-
-def _clone(tree):
-    return pytree.tree_map_only(
-        torch.Tensor,
-        lambda value: value.clone(memory_format=torch.contiguous_format),
-        tree,
-    )
 
 
 def _detach(tree):
