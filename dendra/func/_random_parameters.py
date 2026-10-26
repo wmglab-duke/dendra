@@ -9,7 +9,10 @@ import torch
 from torch.utils import _pytree
 
 from dendra.helpers import current_check_purity
-from dendra.models.networks._population_cache import restore_population_cache_values
+from dendra.models.networks._population_cache import (
+    _restore_parameter,
+    restore_population_cache_values,
+)
 from dendra.models.parametric import Parameterized
 from dendra.models.random_parameters import (
     get_random_distribution,
@@ -806,11 +809,9 @@ class RandomParameterPlan:
             evaluated = evaluate_random_parameter(entry.spec, anchored, draw).to(
                 constants[f"random.values.{entry.key}"]
             )
-            sample = restore_population_cache_values(
-                {"value": evaluated},
-                {"value": constants[f"random.values.{entry.key}"]},
-                parameter_names=("value",),
-            )["value"]
+            sample = _restore_parameter(
+                evaluated, constants[f"random.values.{entry.key}"]
+            )
             samples[entry.key] = (
                 sample if entry.spec.reparameterized else sample.detach()
             )
@@ -918,9 +919,7 @@ def materialize_random_parameters(
         # Native sampling normalizes the transform's result to the declared
         # buffer even when a custom distribution returns another dtype/device.
         evaluated = evaluated.to(sample)
-        exact = restore_population_cache_values(
-            {"value": evaluated}, {"value": sample}, parameter_names=("value",)
-        )["value"]
+        exact = _restore_parameter(evaluated, sample)
         value = torch.where(fresh, evaluated, exact)
         if not spec.reparameterized:
             value = value.detach()

@@ -9,6 +9,7 @@ import torch
 
 from dendra.models.mechanisms import ContinuousSynapse
 from dendra.models.networks._population_cache import (
+    _restore_parameter,
     replay_population_cache_storage,
     restore_population_cache_values,
 )
@@ -528,11 +529,7 @@ class PopulationCachePlan:
             else:
                 continue
             reference = parameters[names[0]]
-            value = restore_population_cache_values(
-                {"value": reference},
-                {"value": saved.expand_as(reference)},
-                parameter_names=("value",),
-            )["value"]
+            value = _restore_parameter(reference, saved.expand_as(reference))
             for name in names:
                 effective[name] = value
         return packet._replace(parameters=effective)

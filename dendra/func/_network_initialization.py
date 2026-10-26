@@ -600,8 +600,8 @@ def _restore_cache_aliases(
 ):
     """Publish final native cache writes before rebuilding runtime workspaces."""
     from dendra.models.networks._population_cache import (
+        _restore_parameter,
         replay_population_cache_storage,
-        restore_population_cache_values,
     )
 
     from ._network import _at
@@ -625,11 +625,7 @@ def _restore_cache_aliases(
             # NetStim and stimulation fields may expose a broadcasted view of
             # their authored Tensor. Keep that existing explicit packet shape.
             parameter_saved = saved.expand_as(reference)
-            value = restore_population_cache_values(
-                {"value": reference},
-                {"value": parameter_saved},
-                parameter_names=("value",),
-            )["value"]
+            value = _restore_parameter(reference, parameter_saved)
             for path in parameter_paths:
                 effective = _replace_at(effective, path, value)
         for constant_paths in constant_groups:
@@ -653,11 +649,7 @@ def _restore_cache_aliases(
                 # Retained preparation has an independent graph from another
                 # reader of the same native storage. A copy updates its value
                 # without transferring the writer's graph to that reader.
-                value = restore_population_cache_values(
-                    {"value": reference},
-                    {"value": saved},
-                    parameter_names=("value",),
-                )["value"]
+                value = _restore_parameter(reference, saved)
                 constants = _replace_at(constants, path, value)
         for path in state_paths:
             reference = _at(populations, path)

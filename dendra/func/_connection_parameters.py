@@ -11,7 +11,10 @@ from torch.func import functional_call
 
 from dendra.helpers import current_check_purity
 from dendra.models.distributions import connection_distribution_placeholder
-from dendra.models.networks._population_cache import restore_population_cache_values
+from dendra.models.networks._population_cache import (
+    _restore_parameter,
+    restore_population_cache_values,
+)
 from dendra.models.networks.net import (
     ParameterOrDistributionWrapper,
     WeightExpander,
@@ -862,16 +865,10 @@ class ConnectionParameterPlan:
             )
             # Preserve the exact snapshot value even for equal nonfinite
             # sources while retaining the current raw source's Jacobian.
-            current = restore_population_cache_values(
-                {"effective": derived},
-                {"effective": torch.where(use_anchor, anchored, derived)},
-                parameter_names=("effective",),
-            )["effective"]
-            retained = restore_population_cache_values(
-                {"effective": derived},
-                {"effective": constants[f"stored.{role}"]},
-                parameter_names=("effective",),
-            )["effective"]
+            current = _restore_parameter(
+                derived, torch.where(use_anchor, anchored, derived)
+            )
+            retained = _restore_parameter(derived, constants[f"stored.{role}"])
             values[role] = torch.where(retain, retained, current)
             if self._draw_schemas[role]:
                 # Old native checkpoints contain initialized values without
