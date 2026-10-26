@@ -13,6 +13,10 @@ import torch
 from torch.utils import _pytree as pytree
 
 
+def _clone_tensor(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor.detach().clone(memory_format=torch.preserve_format)
+
+
 def _shape_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
     return tuple(int(value) for value in tensor.shape)
 

@@ -116,10 +116,23 @@ from dendra.models.tree import Tree
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
 from ._retained_materializations import (
+    _cache_materialization,
     _capture_retained_frame,
     _clear_retained_frame,
+    _materialization_overrides,
     _project_retained_frame,
+    _retained_workspace_builder,
+)
+from ._retained_materializations import (
+    _RetainedMaterialization as _RetainedMaterialization,
+)
+from ._retained_materializations import (
     _RetainedMaterializationInventory,
+)
+from ._retained_materializations import (
+    _SnapshotMaterialization as _SnapshotMaterialization,
+)
+from ._retained_materializations import (
     _validate_retained_constants,
     _validate_retained_prepared,
 )
@@ -135,6 +148,7 @@ from ._stimuli import (
     _is_internal_module_state,
 )
 from ._tensor_contracts import (
+    _clone_tensor,
     _has_inference_tensor_component,
     _shape_tuple,
     _tensor_binding,
@@ -1117,10 +1131,6 @@ _STANDARD_ION_MATERIAL_BASE_INITIALIZATION = {
     name: inspect.getattr_static(Material, name)
     for name in _ION_MATERIAL_BASE_INITIALIZATION_HOOKS
 }
-
-
-def _clone_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.detach().clone(memory_format=torch.preserve_format)
 
 
 def _audit_tensor_digest(value: torch.Tensor) -> str:
@@ -4246,68 +4256,6 @@ def _evaluate_timestep_buffers(module, dt) -> Mapping[str, torch.Tensor]:
                 "must be a Tensor"
             )
     return values
-
-
-@dataclass(frozen=True)
-class _RetainedMaterialization:
-    cached: torch.Tensor | None
-    value: torch.Tensor
-    active: torch.Tensor
-    baseline: torch.Tensor | None
-
-
-@dataclass(frozen=True)
-class _SnapshotMaterialization:
-    value: torch.Tensor
-    path: str
-    baselines: dict[str, torch.Tensor]
-
-
-def _cache_materialization(value, name, cache_values, cache_active):
-    """Select an explicit native materialization before its numerical consumers."""
-    if cache_values is None or name not in cache_values:
-        return value
-    selected = cache_values[name]
-    if isinstance(selected, _SnapshotMaterialization):
-        # Extraction records each operation's baseline before supplying the
-        # native result to downstream preparation. Integrator baselines must
-        # be measured after native physical buffers are selected.
-        selected.baselines[selected.path] = _clone_tensor(value)
-        return selected.value
-    if isinstance(selected, _RetainedMaterialization):
-        if selected.baseline is not None:
-            # Subtract the computed baseline before adding the native value:
-            # a large raw write must not cancel a small retained native operand.
-            value = (
-                selected.value ^ (value ^ selected.baseline)
-                if value.dtype == torch.bool
-                else selected.value + (value - selected.baseline)
-            )
-        if selected.cached is not None:
-            value = torch.where(cache_active, selected.cached.detach(), value)
-        return torch.where(selected.active, selected.value, value)
-    return torch.where(cache_active, selected.detach(), value)
-
-
-def _retained_workspace_builder(module_path, owner, phase, cache_values, cache_active):
-    """Identify wholly discarded preparation before authored getter arithmetic."""
-    from dendra.models.mechanisms._noise_workspaces import noise_workspace_phases
-
-    if cache_values is None or phase not in noise_workspace_phases(owner):
-        return None
-    active = []
-    for name in getattr(owner, f"_{phase}_buffers"):
-        retained = cache_values.get(f"{module_path}.{name}")
-        if isinstance(retained, _RetainedMaterialization):
-            selected = retained.active
-            if retained.cached is not None and cache_active is not None:
-                selected = torch.logical_or(selected, cache_active)
-        elif torch.is_tensor(retained) and cache_active is not None:
-            selected = cache_active
-        else:
-            return None
-        active.append(selected)
-    return torch.stack(active).all() if active else None
 
 
 class _PopulationPreparation(torch.nn.Module):
@@ -12959,29 +12907,13 @@ class FunctionalPopulation:
         use_snapshot_offsets=True,
         snapshot_baseline_capture=None,
     ):
-        if not self._cache_value_specs and not self._retained_materializations.slots:
-            return None, None
-        values = {
-            path.removeprefix(prefix): constants[name]
-            for name, path, _shape, _dtype, _device in self._cache_value_specs
-            if path.startswith(prefix)
-        }
-        for slot in self._retained_materializations.slots:
-            if slot.path.startswith(prefix):
-                relative = slot.path.removeprefix(prefix)
-                values[relative] = (
-                    _SnapshotMaterialization(
-                        constants[slot.value_key], slot.path, snapshot_baseline_capture
-                    )
-                    if snapshot_baseline_capture is not None
-                    else _RetainedMaterialization(
-                        values.get(relative),
-                        constants[slot.value_key],
-                        constants[slot.active_key],
-                        constants[slot.baseline_key] if use_snapshot_offsets else None,
-                    )
-                )
-        return values, constants.get("cache.active")
+        return _materialization_overrides(
+            self,
+            constants,
+            prefix=prefix,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=snapshot_baseline_capture,
+        )
 
     def _validate_constants(self, constants) -> None:
         if not isinstance(constants, Mapping):
