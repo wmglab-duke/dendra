@@ -16,7 +16,6 @@ from ._state_slots import (
 @dataclass(frozen=True)
 class _TensorStateBlock:
     role: str
-    prefix: str
     slots: tuple[_StateSlot, ...]
     state_key: str | None = None
 
@@ -39,10 +38,9 @@ def checkpoint_module_blocks(module, prefix):
     yield _StochasticStateBoundary(module, prefix, (prefix,))
     for state_key, state in module.DE.items():
         values = tuple(state_value_slots(module, state))
-        yield _TensorStateBlock("state", prefix, values)
+        yield _TensorStateBlock("state", values)
         yield _TensorStateBlock(
             "state_carry",
-            prefix,
             tuple(
                 state_carry_slots(state_key, state, tuple(getattr(state, "_carry", ())))
             ),
@@ -55,28 +53,24 @@ def checkpoint_module_blocks(module, prefix):
         )
     yield _TensorStateBlock(
         "carry",
-        prefix,
         tuple(module_carry_slots(module, tuple(getattr(module, "_carry", ())))),
     )
-    yield _TensorStateBlock("saved", prefix, tuple(saved_buffer_slots(module)))
+    yield _TensorStateBlock("saved", tuple(saved_buffer_slots(module)))
     yield _DelayedStateBoundary(module, prefix)
 
 
 def functional_module_blocks(module, prefix):
     """Yield declared functional roles in their existing projection order."""
     for state in module.DE.values():
-        yield _TensorStateBlock(
-            "state", prefix, tuple(state_value_slots(module, state))
-        )
+        yield _TensorStateBlock("state", tuple(state_value_slots(module, state)))
     yield _TensorStateBlock(
-        "carry", prefix, tuple(module_carry_slots(module, sorted(module._carry)))
+        "carry", tuple(module_carry_slots(module, sorted(module._carry)))
     )
     yield _DelayedStateBoundary(module, prefix)
-    yield _TensorStateBlock("saved", prefix, tuple(saved_buffer_slots(module)))
+    yield _TensorStateBlock("saved", tuple(saved_buffer_slots(module)))
     for state_key, state in module.DE.items():
         yield _TensorStateBlock(
             "state_carry",
-            prefix,
             tuple(state_carry_slots(state_key, state, state._carry)),
             state_key,
         )

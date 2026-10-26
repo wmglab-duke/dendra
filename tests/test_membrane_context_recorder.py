@@ -63,10 +63,13 @@ def test_scan_graph_cache_is_partitioned_by_policy_without_executing_scan(monkey
     # Real scan execution has an exact supported-Torch gate. This unit test
     # tests only dispatch/cache ownership using a fake capture, not an
     # unsupported scan implementation or an altered numerical compatibility gate.
+    from types import SimpleNamespace
+
     import dendra.func._scan as scan_module
+    import dendra.func._scan_tree as scan_tree_module
 
     monkeypatch.setattr(scan_module, "install_scan_compatibility", lambda: None)
-    monkeypatch.setattr(scan_module, "guard_scan_outputs", lambda result: result)
+    monkeypatch.setattr(scan_tree_module, "install_scan_compatibility", lambda: None)
     captured = []
 
     def capture(
@@ -74,23 +77,52 @@ def test_scan_graph_cache_is_partitioned_by_policy_without_executing_scan(monkey
         parameters,
         prepared,
         state,
-        ve,
-        intra,
         carries,
-        noise,
-        stimulation,
+        samples,
+        sample_layout,
         *,
-        block,
         grad_enabled,
     ):
-        assert noise is None and stimulation is None
+        assert grad_enabled
         policy = dn.current_membrane_assembly()
         captured.append(policy)
-        return lambda *operands: policy
 
-    monkeypatch.setattr(scan_module._CompiledScanPopulationChunk, "_capture", capture)
-    kernel = scan_module._CompiledScanPopulationChunk(None, steps=4, compile_options={})
+        def execute(parameters, prepared, current, carries, samples):
+            final = {
+                "integrator": {
+                    "v": current["integrator"]["v"].new_tensor(
+                        ("auto", "off", "validate").index(policy)
+                    )
+                },
+                "control": current["control"],
+            }
+            return (final, carries), {}
+
+        layout = SimpleNamespace(unpack=lambda packed: packed)
+        return execute, layout, lambda operands: operands
+
+    monkeypatch.setattr(scan_tree_module._CompiledTensorTreeScan, "_capture", capture)
+    functional = SimpleNamespace(
+        device=torch.device("cpu"),
+        intra=SimpleNamespace(enabled=False),
+        extra=SimpleNamespace(enabled=False),
+        _clone_state_tree=lambda value: value,
+    )
+    state = {
+        "integrator": {"v": torch.tensor(0.0)},
+        "control": {"duration_remainder": torch.tensor(0.0)},
+    }
+    kernel = scan_module._CompiledScanPopulationChunk(
+        functional, steps=4, compile_options={}
+    )
     for policy in ("auto", "off", "validate", "auto", "off", "validate"):
-        with dn.ctx(MEMBRANE_ASSEMBLY=policy):
-            assert kernel({}, {}, {}, None, None) == policy
+        with dn.ctx(MEMBRANE_ASSEMBLY=policy), torch.enable_grad():
+            final, auxiliary = kernel({}, {}, state, None, None)
+            assert final["integrator"]["v"].item() == (
+                "auto",
+                "off",
+                "validate",
+            ).index(policy)
+            assert auxiliary["v"] is final["integrator"]["v"]
     assert captured == ["auto", "off", "validate"]
+    assert len(kernel._training._kernels) == 3

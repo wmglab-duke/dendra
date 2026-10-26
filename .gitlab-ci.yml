@@ -146,7 +146,7 @@ test_base_install:
 test_shards:
   extends: .full_test_rules
   stage: test
-  parallel: 4
+  parallel: 10
   variables:
     OMP_NUM_THREADS: "1"
     MKL_NUM_THREADS: "1"
@@ -164,6 +164,7 @@ test_shards:
       -m "cpu or (neuron and not cuda)"
       --ci-shard-index="$CI_NODE_INDEX" --ci-shard-total="$CI_NODE_TOTAL"
       --ci-shard-output="ci-results/$CI_NODE_INDEX"
+      --ci-shard-durations=scripts/ci_durations.json
       --junitxml="ci-results/$CI_NODE_INDEX/junit.xml" --durations=25
       --cov=dendra --cov-branch --cov-config=.coveragerc.cpu --cov-report=
   artifacts:
@@ -187,7 +188,7 @@ test_coverage:
     - python -m pip install --upgrade pip
     - python -m pip install coverage
   script:
-    - python scripts/combine_ci_coverage.py --shards 4 --input-dir ci-results --fail-under=84
+    - python scripts/combine_ci_coverage.py --shards 10 --input-dir ci-results --fail-under=84
   coverage: '/TOTAL.*\s+(\d+%)$/'
   artifacts:
     when: always

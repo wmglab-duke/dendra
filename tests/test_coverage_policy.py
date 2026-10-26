@@ -109,7 +109,11 @@ def test_required_coverage_commands_use_cpu_scope():
     assert "--cov-config=.coveragerc.cpu" in ci
     assert "--cov-config=.coveragerc.cpu" in testing_guide
     assert "--fail-under=84" in ci
-    assert "python scripts/combine_ci_coverage.py --shards 4" in ci
+    assert "python scripts/combine_ci_coverage.py --shards 10" in ci
+    assert "python scripts/combine_ci_coverage.py --shards 10" in testing_guide
+    assert "--ci-shard-total=10" in testing_guide
+    assert "--ci-shard-durations=scripts/ci_durations.json" in ci
+    assert "--ci-shard-durations=scripts/ci_durations.json" in testing_guide
 
 
 def test_shard_coverage_uses_checkout_relative_source_paths():
@@ -129,11 +133,12 @@ def test_gitlab_full_suite_and_aggregate_are_required_gates():
     release = ci.split("\nrelease_bump:\n", 1)[1]
     docs = ci.split("\nbuild_docs:\n", 1)[1].split("\nrelease_bump:\n", 1)[0]
 
-    assert "parallel: 4" in shards
+    assert "parallel: 10" in shards
     assert '-m "cpu or (neuron and not cuda)"' in shards
     assert "--cov-report=" in shards
     assert "--cov-fail-under" not in shards
     assert "--ci-shard-index=" in shards and "--ci-shard-total=" in shards
+    assert "--ci-shard-durations=scripts/ci_durations.json" in shards
     assert "job: test_shards\n      artifacts: true" in aggregate
     assert "job: test_coverage\n      artifacts: false" in release
     # Jobs without rules default to except:merge_requests in GitLab. Feature
