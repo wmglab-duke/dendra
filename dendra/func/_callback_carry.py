@@ -50,5 +50,9 @@ class _CallbackCarryPartition:
             for name in self.names
         }
 
+    def restore_invariants(self, updated, original):
+        """Restore invariants from this invocation's original callback carry."""
+        return self.merge(updated, self.split(original)[1])
+
 
 __all__ = []

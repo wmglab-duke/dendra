@@ -264,7 +264,7 @@ class _CompiledTensorTreeWhile:
             )
             final, updated = layout.unpack(packed)
             final = clone_state(final)
-            updated = partition.merge(updated, partition.split(carries)[1])
+            updated = partition.restore_invariants(updated, carries)
             updated = _clone_tree_like(updated, carries)
             return final, updated, emitted
 

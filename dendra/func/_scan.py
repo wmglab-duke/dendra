@@ -467,7 +467,7 @@ class _CompiledScanPopulationChunk:
                 final, updated, phases, tail = result
                 if callback_carry.invariant_names:
                     updated = _clone(
-                        callback_carry.merge(updated, callback_carry.split(carries)[1])
+                        callback_carry.restore_invariants(updated, carries)
                     )
                 # Each phase history is (blocks, 1, *sample_shape). Interleave
                 # once outside the hot compiled loop, in accepted-clock order.
@@ -487,9 +487,7 @@ class _CompiledScanPopulationChunk:
                     {plan.name: emitted.get(plan.name) for plan in plans},
                 )
             final, auxiliary, updated, emitted = result
-            updated = _clone(
-                callback_carry.merge(updated, callback_carry.split(carries)[1])
-            )
+            updated = _clone(callback_carry.restore_invariants(updated, carries))
             return final, auxiliary, updated, emitted
 
         return materialize

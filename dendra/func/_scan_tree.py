@@ -265,17 +265,12 @@ class _CompiledTensorTreeScan:
         # Equivalent logical leaves must never escape as duplicate moved C++
         # HOP output handles. Keep these ownership clones outside compilation.
         final = self._clone_state(final)
-        updated = _clone_tree(_partition_merge(self._callback_carry, updated, carries))
+        updated = _clone_tree(self._callback_carry.restore_invariants(updated, carries))
         for path in self._static_state_paths:
             final = _replace_path(final, path, _get_path(state, path).clone())
         for path in self._detached_state_paths:
             final = _replace_path(final, path, _get_path(final, path).detach())
         return guard_scan_outputs((final, updated, emitted))
-
-
-def _partition_merge(partition, updated, original):
-    """Restore callback invariants from this invocation's explicit operands."""
-    return partition.merge(updated, partition.split(original)[1])
 
 
 __all__ = []
