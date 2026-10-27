@@ -227,8 +227,8 @@ def gather_morphology(graph):
 
     Notes
     -----
-    In addition to Dendra's historical ``dx``, ``diam``, and coordinate buffers,
-    this now registers material-geometry buffers:
+    The CPU staging tensors include ``dx``, ``diam``, coordinate buffers, and
+    material-geometry buffers:
 
     ``volume`` / ``volume_um3``
         Total compartment volume in µm³.
@@ -260,24 +260,30 @@ def gather_morphology(graph):
     # those values until Tree.from_graph deliberately converts the gathered
     # buffers to the requested model dtype.  Constructing these tensors with
     # PyTorch's default float32 would irreversibly quantize a float64 Tree.
-    volume_t = torch.tensor(volume, dtype=torch.float64).unsqueeze(0)
+    # Stage on CPU independently of the ambient device: MPS cannot represent
+    # float64, and the model owns the final device/dtype conversion below.
+    volume_t = torch.tensor(volume, dtype=torch.float64, device="cpu").unsqueeze(0)
     return {
-        "dx": torch.tensor(L, dtype=torch.float64).unsqueeze(0),
-        "diam": torch.tensor(diam, dtype=torch.float64).unsqueeze(0),
-        "x": torch.tensor(x, dtype=torch.float64).unsqueeze(0),
-        "y": torch.tensor(y, dtype=torch.float64).unsqueeze(0),
-        "z": torch.tensor(z, dtype=torch.float64).unsqueeze(0),
+        "dx": torch.tensor(L, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "diam": torch.tensor(diam, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "x": torch.tensor(x, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "y": torch.tensor(y, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "z": torch.tensor(z, dtype=torch.float64, device="cpu").unsqueeze(0),
         "volume": volume_t,
         "volume_um3": volume_t.clone(),
-        "volume_i": torch.tensor(volume_i, dtype=torch.float64).unsqueeze(0),
-        "volume_o": torch.tensor(volume_o, dtype=torch.float64).unsqueeze(0),
+        "volume_i": torch.tensor(volume_i, dtype=torch.float64, device="cpu").unsqueeze(
+            0
+        ),
+        "volume_o": torch.tensor(volume_o, dtype=torch.float64, device="cpu").unsqueeze(
+            0
+        ),
     }
 
 
 def gather_diffusion_edges(graph):
     """Extract child-indexed diffusion-edge metadata from a tree graph.
 
-    Returns tensors suitable for registering on :class:`Tree`. The
+    Returns CPU staging tensors suitable for registering on :class:`Tree`. The
     ``diff_parent_index`` and ``diff_geom_um`` buffers have length ``n_comp`` and
     are child-indexed: root entries have parent ``-1`` and zero geometry.
     Compact edge-list buffers are also returned for scatter/gather backends.
@@ -308,12 +314,14 @@ def gather_diffusion_edges(graph):
         edge_diff_geom.append(geom)
 
     return {
-        "diff_parent_index": torch.tensor(parent_index, dtype=torch.long),
-        "diff_geom_um": torch.tensor(diff_geom, dtype=torch.float64).unsqueeze(0),
-        "diff_edge_parent": torch.tensor(edge_parent, dtype=torch.long),
-        "diff_edge_child": torch.tensor(edge_child, dtype=torch.long),
+        "diff_parent_index": torch.tensor(parent_index, dtype=torch.long, device="cpu"),
+        "diff_geom_um": torch.tensor(
+            diff_geom, dtype=torch.float64, device="cpu"
+        ).unsqueeze(0),
+        "diff_edge_parent": torch.tensor(edge_parent, dtype=torch.long, device="cpu"),
+        "diff_edge_child": torch.tensor(edge_child, dtype=torch.long, device="cpu"),
         "diff_edge_geom_um": torch.tensor(
-            edge_diff_geom, dtype=torch.float64
+            edge_diff_geom, dtype=torch.float64, device="cpu"
         ).unsqueeze(0),
     }
 
@@ -338,9 +346,9 @@ def gather_membrane(graph):
         cm.append(attrs.get("cm"))
         area.append(attrs.get("area"))
     return {
-        "rhoa": torch.tensor(rhoa, dtype=torch.float64).unsqueeze(0),
-        "cm": torch.tensor(cm, dtype=torch.float64).unsqueeze(0),
-        "area": torch.tensor(area, dtype=torch.float64).unsqueeze(0),
+        "rhoa": torch.tensor(rhoa, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "cm": torch.tensor(cm, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "area": torch.tensor(area, dtype=torch.float64, device="cpu").unsqueeze(0),
     }
 
 

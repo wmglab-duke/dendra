@@ -144,9 +144,11 @@ def gather_extcell(graph, n_layers=2):
         # precision here so a float64 ExtCellTree does not widen values that
         # were already rounded through PyTorch's default float32 dtype.
         # ``from_graph`` performs the intentional final cast to model dtype.
-        "xraxial": torch.tensor(xraxial, dtype=torch.float64).unsqueeze(0),
-        "xc": torch.tensor(xc, dtype=torch.float64).unsqueeze(0),
-        "xg": torch.tensor(xg, dtype=torch.float64).unsqueeze(0),
+        "xraxial": torch.tensor(xraxial, dtype=torch.float64, device="cpu").unsqueeze(
+            0
+        ),
+        "xc": torch.tensor(xc, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "xg": torch.tensor(xg, dtype=torch.float64, device="cpu").unsqueeze(0),
     }
 
 
