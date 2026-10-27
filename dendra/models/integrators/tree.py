@@ -1,6 +1,7 @@
 from collections import deque
 from dataclasses import dataclass
 from functools import partial
+from types import GetSetDescriptorType
 from typing import List, Tuple
 
 import networkx as nx
@@ -16,6 +17,7 @@ from .core import (
     _as_solve_matrix,
     _broadcast_to_shape,
     _flatten_to_solve,
+    _population_runtime_modes_plain,
 )
 from .triton import dhs_solve_cuda, dhs_solve_multi_cuda
 
@@ -63,6 +65,76 @@ except ImportError:
 
 
 THREADS_PER_WARP = 32
+
+_TYPE_MRO = type.__dict__["__mro__"]
+_TYPE_NAMESPACE = type.__dict__["__dict__"]
+_PLAN_TENSOR_TYPE = torch.Tensor
+_PLAN_TENSOR_MRO = _TYPE_MRO.__get__(_PLAN_TENSOR_TYPE)
+_PLAN_TENSOR_NAMESPACES = tuple(
+    _TYPE_NAMESPACE.__get__(base) for base in _PLAN_TENSOR_MRO
+)
+_PLAN_METADATA_NAMES = (
+    "device",
+    "_version",
+    "__dict__",
+    "__getattribute__",
+    "__torch_function__",
+)
+_PLAN_METADATA_GETTERS = tuple(
+    next(
+        (namespace[name] for namespace in _PLAN_TENSOR_NAMESPACES if name in namespace),
+        None,
+    )
+    for name in _PLAN_METADATA_NAMES
+)
+_PLAN_DISABLE_TORCH_FUNCTION = getattr(torch._C, "DisableTorchFunction", None)
+
+
+def _plain_plan_metadata(sources):
+    """Prove ordered topology metadata reads cannot invoke authored code."""
+    if (
+        type(sources) is not tuple
+        or _TYPE_MRO.__get__(_PLAN_TENSOR_TYPE) is not _PLAN_TENSOR_MRO
+        or any(type(value) is not _PLAN_TENSOR_TYPE for value in sources)
+        or not all(
+            next(
+                (
+                    namespace[name]
+                    for namespace in _PLAN_TENSOR_NAMESPACES
+                    if name in namespace
+                ),
+                None,
+            )
+            is getter
+            for name, getter in zip(_PLAN_METADATA_NAMES, _PLAN_METADATA_GETTERS)
+        )
+        or any(
+            type(getter) is not GetSetDescriptorType
+            for getter in _PLAN_METADATA_GETTERS[:3]
+        )
+        or not callable(_PLAN_DISABLE_TORCH_FUNCTION)
+        or getattr(torch._C, "DisableTorchFunction", None)
+        is not _PLAN_DISABLE_TORCH_FUNCTION
+        or not _population_runtime_modes_plain()
+    ):
+        return False
+    for value in sources:
+        namespace = _PLAN_METADATA_GETTERS[2].__get__(value)
+        if type(namespace) is not dict or any(
+            name in namespace for name in _PLAN_METADATA_NAMES
+        ):
+            return False
+    return True
+
+
+def _owned_plan_source_versions(sources):
+    """Keep device short-circuiting before the ordered version-counter reads."""
+    if all(value.device.type in {"cpu", "mps"} for value in sources):
+        try:
+            return tuple(value._version for value in sources)
+        except RuntimeError:
+            pass
+    return None
 
 
 def _topology_initialization_contract(integrator, model):
@@ -125,15 +197,14 @@ def _refresh_owned_cpu_plan(integrator, sources, constructor, eligible, *, kwarg
     """
     old_plan = integrator._cpu_topology_plan
     versions = None
-    if (
-        callable(constructor)
-        and eligible
-        and all(t.device.type in {"cpu", "mps"} for t in sources)
-    ):
-        try:
-            versions = tuple(t._version for t in sources)
-        except RuntimeError:
-            pass
+    if callable(constructor) and eligible:
+        if _plain_plan_metadata(sources):
+            # Stock DeviceContext only changes tensor factories. Keep every
+            # native device/version read, without forwarding these getters.
+            with _PLAN_DISABLE_TORCH_FUNCTION():
+                versions = _owned_plan_source_versions(sources)
+        else:
+            versions = _owned_plan_source_versions(sources)
     if versions is not None and old_plan is not None:
         if versions == integrator._cpu_plan_versions and all(
             current is previous
