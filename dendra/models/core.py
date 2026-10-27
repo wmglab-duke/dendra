@@ -1022,7 +1022,7 @@ def _runtime_step_eligibility(
     fuse_intra = with_intra and model._can_fuse_intra_step(intra)
     stable = (
         model.jit
-        and model.device().type == "cpu"
+        and model.device().type in ("cpu", "mps")
         and _population_runtime_modes_plain()
         and not progressbar
         and pre_step_hook is _STANDARD_PRE_STEP_HOOK
@@ -1040,7 +1040,10 @@ def _runtime_step_eligibility(
         and _runtime_execution_stable(model.integrator.mech, model)
     )
     skip_empty_noise = (
-        not with_intra and stable and model._can_skip_runtime_noise_sampling()
+        not with_intra
+        and stable
+        and model.device().type == "cpu"
+        and model._can_skip_runtime_noise_sampling()
     )
     return _RuntimeStepEligibility(fuse_intra, stable, skip_empty_noise)
 
@@ -1538,11 +1541,22 @@ class Population(P, Sliceable):
         return self
 
     def _call_make_intra(self, intra, stims, indices):
+        if (
+            type(intra) is Intra
+            and type(stims) in (list, tuple)
+            and len(stims) > 1
+            and _runtime_method_is(intra, "__call__", _STANDARD_INTRA_CALL)
+            and getattr(self.make_intra, "_torchdynamo_orig_callable", self.make_intra)
+            is make_intra
+        ):
+            indices = intra._prepare_assembly(
+                stims, indices, backend=self.backend if self.jit else None
+            )
         with torch_compiler_warning_context():
             return self.make_intra(intra, stims, indices)
 
     def _can_fuse_intra_step(self, intra):
-        """Eligibility for CPU stimulus/transition fusion in run/longrun.
+        """Eligibility for CPU/MPS stimulus/transition fusion in run/longrun.
 
         Custom injection/stepping hooks, runtime NOISE, and unsupported devices
         retain the original scatter -> pre-step -> noise -> transition order.
@@ -1552,7 +1566,7 @@ class Population(P, Sliceable):
         """
         if (
             not self.jit
-            or self.device().type != "cpu"
+            or self.device().type not in ("cpu", "mps")
             or type(intra) is not Intra
             or not _runtime_plain_intra_metadata(intra)
             or not _runtime_method_is(intra, "__call__", _STANDARD_INTRA_CALL)
@@ -1568,7 +1582,11 @@ class Population(P, Sliceable):
 
     def _can_skip_runtime_noise_sampling(self):
         """Prove the current canonical dispatch has no runtime NOISE to sample."""
-        if not self.jit or self.device().type != "cpu" or self._step is not step:
+        if (
+            not self.jit
+            or self.device().type not in ("cpu", "mps")
+            or self._step is not step
+        ):
             return False
         supports = getattr(self.integrator, "_supports_fused_intra_step", None)
         if (
@@ -4068,7 +4086,9 @@ class Population(P, Sliceable):
                 )
             )
             with (
-                self.integrator._population_step_scope(stable=stable_intra_callbacks)
+                self.integrator._population_step_scope(
+                    stable=stable_intra_callbacks and self.device().type == "cpu"
+                )
                 if isinstance(self.integrator, Integrator)
                 else nullcontext()
             ):
@@ -4092,7 +4112,13 @@ class Population(P, Sliceable):
                                 and self._can_fuse_intra_step(intra)
                             )
                         ):
-                            intra_c = _DeferredIntra(intra, s, indices)
+                            intra_c = _DeferredIntra(
+                                intra,
+                                s,
+                                intra._prepare_assembly(
+                                    s, indices, backend=self.backend
+                                ),
+                            )
                         else:
                             intra_c = self._call_make_intra(intra, s, indices)
                     else:
@@ -4313,6 +4339,7 @@ class Population(P, Sliceable):
                     with (
                         self.integrator._population_step_scope(
                             stable=stable_intra_callbacks
+                            and self.device().type == "cpu"
                         )
                         if isinstance(self.integrator, Integrator)
                         else nullcontext()
@@ -4330,7 +4357,13 @@ class Population(P, Sliceable):
                                         and self._can_fuse_intra_step(intra)
                                     )
                                 ):
-                                    intra_c = _DeferredIntra(intra, s, indices)
+                                    intra_c = _DeferredIntra(
+                                        intra,
+                                        s,
+                                        intra._prepare_assembly(
+                                            s, indices, backend=self.backend
+                                        ),
+                                    )
                                 else:
                                     intra_c = self._call_make_intra(intra, s, indices)
                             else:

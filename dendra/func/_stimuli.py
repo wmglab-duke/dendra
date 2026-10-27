@@ -23,6 +23,7 @@ from torch.func import functional_call
 from dendra.helpers import current_check_purity, op_mc, op_sc
 from dendra.models.core import Population
 from dendra.models.parametric import SimpleParameterized, cacheable
+from dendra.models.stim._assembly import _assemble_currents, _current_groups
 from dendra.models.stim.intra import (
     _canonicalize_index_for_index_put,
     _retained_leading_batch_shape,
@@ -1273,6 +1274,7 @@ class FunctionalIntra(_FunctionalStimulus):
                 _retained_leading_batch_shape(canonical, batch_shape)
             )
         self._indices = tuple(indices)
+        self._current_groups = _current_groups(self._indices, shape)
         self._selected_batch_shapes = tuple(selected_batch_shapes)
         self._waveforms = _FunctionalWaveformBank(
             waveforms,
@@ -1397,54 +1399,43 @@ class FunctionalIntra(_FunctionalStimulus):
             return None
         n_steps = int(times.shape[0])
         evaluated = self._waveforms.evaluate(parameters, constants, times)
-        result = torch.zeros(
-            (n_steps, *self.shape), device=self.device, dtype=self.dtype
-        )
 
-        for waveform_index, (value, indices, selected_batch_shape) in enumerate(
-            zip(
-                evaluated,
-                self._indices,
-                self._selected_batch_shapes,
-                strict=True,
-            )
-        ):
-            value = value.to(device=self.device, dtype=self.dtype)
-            value = _normalize_time_last_output(
-                value,
-                n_steps=n_steps,
-                name=f"intracellular waveform {waveform_index}",
-            )
-            samples = value.movedim(-1, 0)
-            selection_shape = tuple(
-                int(size)
-                for size in torch.broadcast_shapes(
-                    *(tuple(item.shape) for item in indices)
+        def samples():
+            for waveform_index, (value, indices, selected_batch_shape) in enumerate(
+                zip(
+                    evaluated,
+                    self._indices,
+                    self._selected_batch_shapes,
+                    strict=True,
                 )
-            )
-            samples = _expand_time_first_to_selection(
-                samples,
-                selection_shape,
-                selected_batch_shape,
-                name=f"intracellular waveform {waveform_index}",
-            )
+            ):
+                value = value.to(device=self.device, dtype=self.dtype)
+                value = _normalize_time_last_output(
+                    value,
+                    n_steps=n_steps,
+                    name=f"intracellular waveform {waveform_index}",
+                )
+                selection_shape = tuple(
+                    int(size)
+                    for size in torch.broadcast_shapes(
+                        *(tuple(item.shape) for item in indices)
+                    )
+                )
+                yield _expand_time_first_to_selection(
+                    value.movedim(-1, 0),
+                    selection_shape,
+                    selected_batch_shape,
+                    name=f"intracellular waveform {waveform_index}",
+                )
 
-            time_shape = (n_steps, *(1,) * len(selection_shape))
-            time_index = (
-                torch.arange(n_steps, device=self.device, dtype=torch.long)
-                .reshape(time_shape)
-                .expand(n_steps, *selection_shape)
-            )
-            assembled_indices = [time_index]
-            assembled_indices.extend(
-                index.unsqueeze(0).expand(n_steps, *selection_shape)
-                for index in indices
-            )
-            # Out-of-place index_put is essential here: its transform rule is
-            # vmap-safe, and accumulate=True preserves duplicate/overlap sums.
-            result = result.index_put(
-                tuple(assembled_indices), samples, accumulate=True
-            )
+        result = _assemble_currents(
+            self.shape,
+            self.dtype,
+            self.device,
+            samples(),
+            self._current_groups,
+            n_steps=n_steps,
+        )
         return result.contiguous()
 
 
