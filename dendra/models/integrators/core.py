@@ -276,7 +276,7 @@ class _DeferredIntra:
     """
 
     source: object
-    stimuli: list
+    stimuli: object
     indices: object
 
 

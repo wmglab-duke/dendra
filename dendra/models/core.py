@@ -14,7 +14,7 @@ from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from fractions import Fraction
-from types import CodeType, FunctionType, MethodType
+from types import BuiltinMethodType, CodeType, FunctionType, MethodType
 from typing import (
     Any,
     Callable,
@@ -117,6 +117,11 @@ from dendra.models.rng import (
     _restore_rng_lifecycle,
     _snapshot_rng_lifecycle,
     _validate_rng_checkpoint_payload,
+)
+from dendra.models.stim._assembly import (
+    _aligned_current_indices,
+    _indexed_current_tapes,
+    _IndexedCurrentSamples,
 )
 from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
@@ -624,6 +629,58 @@ def make_intra(intra, stims, indices):
         Instantiated stimulation payload compatible with the integrator.
     """
     return intra(stims, indices)
+
+
+_STANDARD_TENSOR_UNBIND = torch.Tensor.unbind
+
+
+def _can_index_intra_tapes(model, intra):
+    return (
+        model.jit
+        and type(model.backend) is str
+        and model.backend == "inductor"
+        and not torch.is_grad_enabled()
+        and type(intra) is Intra
+        and _runtime_plain_intra_metadata(intra)
+        and intra.device.type == "mps"
+        and _runtime_method_is(intra, "__call__", _STANDARD_INTRA_CALL)
+        and _population_runtime_modes_plain()
+    )
+
+
+def _unbind_intra_tapes(tapes, intra, n_steps, *, indexed=False):
+    """Retain the public slice preparation and optionally capture its tapes."""
+    if (
+        not indexed
+        or type(tapes) not in (list, tuple)
+        or not _population_runtime_modes_plain()
+    ):
+        return [tape.unbind(-1) for tape in tapes], None
+    stims = []
+    canonical = torch.Tensor.unbind is _STANDARD_TENSOR_UNBIND
+    for tape in tapes:
+        unbind = tape.unbind
+        stims.append(unbind(-1))
+        canonical = canonical and (
+            type(unbind) is BuiltinMethodType
+            and unbind.__self__ is tape
+            and unbind.__name__ == "unbind"
+        )
+    captured = None
+    if canonical and _population_runtime_modes_plain():
+        captured = _indexed_current_tapes(
+            tapes, n_steps, device=intra.device, dtype=intra.dtype
+        )
+    return stims, captured
+
+
+def _prepare_intra_run(model, intra, n, dt, *, indexed=False):
+    times = _time_grid_from_step_count(model.t, n, dt, device=model.device()).to(
+        model.dtype()
+    )
+    tapes, indices = intra.init(times)
+    stims, captured = _unbind_intra_tapes(tapes, intra, n, indexed=indexed)
+    return stims, indices, captured
 
 
 def _intra_fusion_callbacks_safe(callbacks):
@@ -3327,11 +3384,7 @@ class Population(P, Sliceable):
             Pair ``(stims, indices)`` where ``stims`` is a list of sequences
             of stimuli and ``indices`` encodes electrode mapping metadata.
         """
-        t_ = _time_grid_from_step_count(self.t, n, dt, device=self.device()).to(
-            self.dtype()
-        )
-        stims, indices = intra.init(t_)
-        stims = [s.unbind(-1) for s in stims]
+        stims, indices, _ = _prepare_intra_run(self, intra, n, dt)
         return stims, indices
 
     # extracellular helpers
@@ -4018,9 +4071,18 @@ class Population(P, Sliceable):
             # --------------------------------------------------------------
             # Prepare intra
             # --------------------------------------------------------------
+            indexed_tapes = None
             if with_intra:
-                # Preserve existing intra preparation semantics
-                stims, indices = self.prep_intra(intra, n, dt_f)
+                if (
+                    n > 0
+                    and _can_index_intra_tapes(self, intra)
+                    and _runtime_method_is(self, "prep_intra", _STANDARD_PREP_INTRA)
+                ):
+                    stims, indices, indexed_tapes = _prepare_intra_run(
+                        self, intra, n, dt_f, indexed=True
+                    )
+                else:
+                    stims, indices = self.prep_intra(intra, n, dt_f)
 
             # --------------------------------------------------------------
             # Callbacks and integrator
@@ -4085,6 +4147,14 @@ class Population(P, Sliceable):
                     post_step=psh,
                 )
             )
+            indexed_steps = (
+                _aligned_current_indices(n, device=intra.device)
+                if indexed_tapes is not None
+                and fuse_intra
+                and not torch.is_grad_enabled()
+                and _population_runtime_modes_plain()
+                else None
+            )
             with (
                 self.integrator._population_step_scope(
                     stable=stable_intra_callbacks and self.device().type == "cpu"
@@ -4114,7 +4184,18 @@ class Population(P, Sliceable):
                         ):
                             intra_c = _DeferredIntra(
                                 intra,
-                                s,
+                                (
+                                    _IndexedCurrentSamples(
+                                        indexed_tapes, indexed_steps[local_ind]
+                                    )
+                                    if indexed_steps is not None
+                                    and not torch.is_grad_enabled()
+                                    and (
+                                        stable_intra_callbacks
+                                        or _population_runtime_modes_plain()
+                                    )
+                                    else s
+                                ),
                                 intra._prepare_assembly(
                                     s, indices, backend=self.backend
                                 ),
@@ -4305,11 +4386,17 @@ class Population(P, Sliceable):
                 # Main chunk loop
                 # --------------------------------------------------------------
                 for i, t_chunk in enumerate(t_chunks):
+                    indexed_tapes = None
                     if with_intra:
-                        stims, indices = intra.init(t_chunk)
+                        tapes, indices = intra.init(t_chunk)
                         # Waveform output always carries time on its last axis;
                         # leading axes are population batch/sweep axes.
-                        stims = [s.unbind(-1) for s in stims]
+                        stims, indexed_tapes = _unbind_intra_tapes(
+                            tapes,
+                            intra,
+                            len(t_chunk),
+                            indexed=_can_index_intra_tapes(self, intra),
+                        )
 
                     if with_extra:
                         ve_list = self._compute_extra_chunk(extra_cfg, i, t_chunk)
@@ -4336,6 +4423,14 @@ class Population(P, Sliceable):
                             post_step=psh,
                         )
                     )
+                    indexed_steps = (
+                        _aligned_current_indices(len(t_chunk), device=intra.device)
+                        if indexed_tapes is not None
+                        and fuse_intra
+                        and not torch.is_grad_enabled()
+                        and _population_runtime_modes_plain()
+                        else None
+                    )
                     with (
                         self.integrator._population_step_scope(
                             stable=stable_intra_callbacks
@@ -4359,7 +4454,18 @@ class Population(P, Sliceable):
                                 ):
                                     intra_c = _DeferredIntra(
                                         intra,
-                                        s,
+                                        (
+                                            _IndexedCurrentSamples(
+                                                indexed_tapes, indexed_steps[j]
+                                            )
+                                            if indexed_steps is not None
+                                            and not torch.is_grad_enabled()
+                                            and (
+                                                stable_intra_callbacks
+                                                or _population_runtime_modes_plain()
+                                            )
+                                            else s
+                                        ),
                                         intra._prepare_assembly(
                                             s, indices, backend=self.backend
                                         ),
@@ -11185,6 +11291,7 @@ def passive_end_nodes_(
 # Capture once after definitions, rather than comparing with mutable class or
 # module attributes at eligibility time (which would authorize monkeypatches).
 _STANDARD_CALL_MAKE_INTRA = Population._call_make_intra
+_STANDARD_PREP_INTRA = Population.prep_intra
 _STANDARD_CAN_FUSE_INTRA_STEP = Population._can_fuse_intra_step
 _STANDARD_CAN_SKIP_RUNTIME_NOISE = Population._can_skip_runtime_noise_sampling
 _STANDARD_PRE_STEP_HOOK = pre_step_hook

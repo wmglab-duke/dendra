@@ -3,6 +3,7 @@ import torch
 from ._assembly import (
     _assemble_currents,
     _current_groups,
+    _IndexedCurrentSamples,
     _PreparedCurrentIndices,
 )
 from .waveform import Waveform
@@ -308,6 +309,10 @@ class Intra(torch.nn.Module):
             axes (``[B]`` to ``[B, 1, 1]``).  Use explicit singleton axes when
             equal-sized batch and spatial axes would otherwise be ambiguous.
         """
+        if isinstance(stims, _IndexedCurrentSamples):
+            stims = [
+                tape.index_select(-1, stims.index).squeeze(-1) for tape in stims.tapes
+            ]
         if not torch.compiler.is_compiling() and type(self) is Intra:
             inds = self._prepare_assembly(stims, inds)
         if isinstance(inds, _PreparedCurrentIndices):

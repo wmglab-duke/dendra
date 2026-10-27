@@ -10,6 +10,11 @@ from math import prod
 
 import torch
 
+_TAPE_METHODS = tuple(
+    (name, getattr(torch.Tensor, name))
+    for name in ("data_ptr", "stride", "storage_offset", "as_strided", "detach")
+)
+
 
 def _current_groups(indices, shape):
     """Prepare immutable scatter coordinates outside numerical execution.
@@ -136,3 +141,81 @@ class _PreparedCurrentIndices:
     indices: tuple
     groups: tuple
     selection_shapes: tuple
+
+
+@dataclass(frozen=True)
+class _IndexedCurrentSamples:
+    """Read one sample from captured time-last tapes inside a compiled step."""
+
+    tapes: tuple
+    index: torch.Tensor
+
+
+def _indexed_current_tapes(tapes, n_steps, *, device, dtype):
+    """Capture live storage with the metadata of the original unbind views.
+
+    Only inference uses whole-tape gathers: their per-step backward would
+    otherwise allocate a full tape gradient for every accepted sample. The
+    caller has already performed canonical unbinds before authored hooks.
+    """
+    if torch.is_grad_enabled() or n_steps <= 0:
+        return None
+    try:
+        if (
+            type(tapes) not in (list, tuple)
+            or not tapes
+            or any(
+                type(tape) not in (torch.Tensor, torch.nn.Parameter)
+                or type(object.__getattribute__(tape, "__dict__")) is not dict
+                or any(
+                    name in object.__getattribute__(tape, "__dict__")
+                    or getattr(type(tape), name) is not method
+                    for name, method in _TAPE_METHODS
+                )
+                or tape.is_nested
+                or tape.layout != torch.strided
+                or tape.device != device
+                or tape.dtype != dtype
+                or tape.ndim == 0
+                or tape.shape[-1] < n_steps
+                or tape.data_ptr() % 16
+                for tape in tapes
+            )
+        ):
+            return None
+        if not any(tape.requires_grad for tape in tapes) and (
+            n_steps <= 1
+            or not any(tape.stride(-1) * dtype.itemsize % 16 for tape in tapes)
+        ):
+            # These slices already meet the compiler's alignment contract.
+            # Grad-requiring aliases retain detached capture: rebinding their
+            # storage can otherwise invalidate FakeTensor's no-grad views.
+            return None
+        # no_grad does not disable forward AD. Such tapes must retain the
+        # original route, including tangents hidden by ambient inference mode.
+        with torch.inference_mode(False), torch.no_grad():
+            if any(
+                torch.autograd.forward_ad.unpack_dual(tape).tangent is not None
+                for tape in tapes
+            ):
+                return None
+        views = tuple(
+            tape.detach().as_strided(tape.shape, tape.stride(), tape.storage_offset())
+            for tape in tapes
+        )
+    except RuntimeError:
+        # Unsupported metadata/view access keeps the original sample path and
+        # its per-step diagnostics, rather than adding a preparation failure.
+        return None
+    for view in views:
+        if view.shape[-1] > 1:
+            # Time extent is private input bookkeeping, independent of the
+            # fixed neuron shape. Varying run/chunk lengths can reuse a graph.
+            torch._dynamo.mark_dynamic(view, view.ndim - 1)
+    return views
+
+
+def _aligned_current_indices(n_steps, *, device):
+    """Framework-owned int64 index views with 16-byte-spaced sample starts."""
+    values = torch.arange(n_steps, dtype=torch.int64, device=device)
+    return values[:, None].expand(-1, 2).contiguous()[:, :1].unbind(0)
