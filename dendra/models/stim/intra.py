@@ -231,6 +231,10 @@ class Intra(torch.nn.Module):
             for position in range(count):
                 index = inds[position]
                 previous = cached[2].indices[position]
+                # Cached exact tuples cannot replace their members. Tensor
+                # mutations still pass through every version check below.
+                if index is previous:
+                    continue
                 if (
                     type(index) is not tuple
                     or len(index) != len(previous)
