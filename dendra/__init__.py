@@ -32,7 +32,7 @@ import dendra.models.mod as mod
 
 from .const import FARADAY, PI, TAU, E, R
 from .diagnostics import doctor
-from .func import compile
+from .func import VarInput, compile
 from .helpers import (
     CHECK_PURITY,
     COMPILE_OPTIONS,
@@ -163,6 +163,7 @@ __all__ = [
     "callbacks",
     "func",
     "compile",
+    "VarInput",
     "mod",
     "Recorder",
     "load_mechanisms",

@@ -25,6 +25,8 @@ the live ``requires_grad`` subset. See
 .. autoclass:: dendra.func.PopulationTensors
    :members: parameters, trainable_parameters, model_parameters, intra_parameters, extra_parameters, find_parameters, parameter_name, get_parameter, independent_parameters
 
+.. autoclass:: dendra.func.VarInput
+
 
 Intrinsic activity
 ------------------

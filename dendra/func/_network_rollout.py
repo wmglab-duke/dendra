@@ -22,12 +22,16 @@ from ._netstim import NetStimDraw, NetStimOutputs
 from ._network import _schema, _tensor_paths, _validate_tree
 from ._network_bindings import _canonicalize_mapping_tree
 from ._runners import (
+    _assemble_extra_chunk,
     _attach_callback_results,
     _checkpoint_tensor_tree,
     _execution_spans,
     _prepare_callback_collection,
+    _prepare_extra,
+    _runtime_extra_checkpoint_binding,
     _validate_chunklength,
 )
+from ._stimuli import StimulusTensors
 from ._tensor_contracts import _tensor_tree_binding
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
@@ -647,13 +651,16 @@ def run(
     callbacks=None,
     callback_state=None,
     compiled_chunk=None,
+    _runtime_extra=None,
 ):
     """Host scheduling with shared exact spans and non-reentrant checkpoints.
 
     Explicit tapes are sliced without detaching. Missing NOISE or NetStim
     tapes are sampled for each bounded host span sequentially from explicit
     RNG carry before entering checkpoint/compiled execution. Backward reuses
-    those same packets.
+    those same packets. Call-local extracellular recipes are assembled inside
+    each checkpoint closure, one bounded kernel at a time, from explicit
+    stimulus leaves and the Network's canonical pre-step clock.
     """
     public_parameters, public_constants, public_inputs = parameters, constants, inputs
     (parameters, constants, state, inputs), _ = _canonicalize_mapping_tree(
@@ -664,6 +671,24 @@ def run(
     )
     _validate_tree(constants, functional._constant_schema, "constants")
     tape, steps = _resolve_inputs(functional, inputs, steps, allow_missing_draws=True)
+    extra_plans, extra_tensors, extra_values = {}, {}, {}
+    if _runtime_extra is not None:
+        for name, extra in _runtime_extra.items():
+            selected = tape["populations"].get(name, {})
+            if selected.get("ve") is not None:
+                raise ValueError(
+                    f"explicit ve for Population {name!r} cannot be combined "
+                    "with a declared runtime extra slot"
+                )
+            plan, tensors = _prepare_extra(
+                functional.populations[name], extra, RolloutInput()
+            )
+            extra_plans[name], extra_tensors[name] = plan, tensors
+            extra_values[name] = (
+                None
+                if tensors is None
+                else {"parameters": tensors.parameters, "constants": tensors.constants}
+            )
     chunklength = _validate_chunklength(chunklength)
     if checkpoint_every is not None:
         checkpoint_every = _validate_chunklength(checkpoint_every)
@@ -688,15 +713,39 @@ def run(
         _binding((public_parameters, public_constants)) if checkpoint_active else None
     )
     tape_binding = _binding((public_inputs, tape)) if checkpoint_active else None
+
+    def runtime_extra_binding():
+        return tuple(
+            (name, _runtime_extra_checkpoint_binding(plan, extra_tensors[name]))
+            for name, plan in extra_plans.items()
+            if plan is not None
+        )
+
+    extra_binding = (
+        runtime_extra_binding() if checkpoint_active and extra_plans else None
+    )
     auxiliary = _auxiliary(functional, state)
 
-    def span(parameters_in, constants_in, state_in, tape_in, callback_in, span_steps):
+    def span(
+        parameters_in,
+        constants_in,
+        state_in,
+        tape_in,
+        callback_in,
+        extra_in,
+        span_steps,
+        span_start,
+    ):
         if binding is not None and (
             _binding((public_parameters, public_constants)) != binding
             or _binding((public_inputs, tape)) != tape_binding
         ):
             raise FunctionalizationError(
                 "Network parameters, constants, or input tapes changed after checkpoint forward"
+            )
+        if extra_binding is not None and runtime_extra_binding() != extra_binding:
+            raise FunctionalizationError(
+                "Network runtime extra tensors changed after checkpoint forward"
             )
         functional._validate_source()
         functional._validate_parameters(parameters_in)
@@ -706,6 +755,43 @@ def run(
         auxiliary_in = _auxiliary(functional, state_in)
         for start, stop in _execution_spans(span_steps, kernel_width):
             selected = _slice(tape_in, start, stop)
+            if extra_plans:
+                populations = dict(selected["populations"])
+                clock = state_in["clock"]
+                indices = clock["step"] + torch.arange(
+                    stop - start,
+                    device=clock["step"].device,
+                    dtype=clock["step"].dtype,
+                )
+                times = (
+                    clock["origin"] + indices.to(clock["origin"].dtype) * functional.dt
+                ).detach()
+                for name, extra_plan in extra_plans.items():
+                    plan = functional.populations[name]
+                    packet = extra_in[name]
+                    tensors = (
+                        None
+                        if packet is None
+                        else StimulusTensors(
+                            packet["parameters"],
+                            packet["constants"],
+                            extra_tensors[name].plan_token,
+                        )
+                    )
+                    ve = _assemble_extra_chunk(
+                        plan,
+                        extra_plan,
+                        tensors,
+                        state_in["populations"][name],
+                        span_start + start,
+                        stop - start,
+                        steps,
+                        functional.dt,
+                        runtime_extra_slot=True,
+                        times=times.to(device=plan.device, dtype=plan.dtype),
+                    )
+                    populations[name] = {**populations.get(name, {}), "ve": ve}
+                selected = {**selected, "populations": populations}
             if compiled_chunk is None:
                 state_in, auxiliary_in, callback_in, emitted = _eager_values(
                     functional,
@@ -790,7 +876,9 @@ def run(
                 state_in,
                 tape_in,
                 callback_in,
+                extra_in,
                 span_steps=span_steps,
+                span_start=start,
             ):
                 return span(
                     parameters_in,
@@ -798,10 +886,19 @@ def run(
                     state_in,
                     tape_in,
                     callback_in,
+                    extra_in,
                     span_steps,
+                    span_start,
                 )
 
-            operands = (parameters, constants, state, selected, callback_state)
+            operands = (
+                parameters,
+                constants,
+                state,
+                selected,
+                callback_state,
+                extra_values,
+            )
             if not checkpoint_active:
                 state, auxiliary, callback_state, emitted = execute(*operands)
             else:

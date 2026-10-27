@@ -25,6 +25,11 @@ from ._runner_policy import (
     _validate_host_call,
     _validate_host_construction,
 )
+from ._runtime_extra import (
+    _MISSING_RUNTIME_EXTRA,
+    VarInput,
+    _runtime_extra_chunk_steps,
+)
 from ._types import FunctionalizationError
 
 
@@ -89,7 +94,14 @@ class CompiledNetworkRunner:
     stimulation machinery. Its fields and waveform leaves are independent
     parameters selected through ``trainable``, with shared aliases preserved.
     Binding stimulation and supplying explicit ``ve`` inputs to the same
-    Population cannot be combined.
+    Population cannot be combined. ``extra=VarInput()`` instead declares
+    call-time slots for every Population. A mapping can declare selected slots
+    with ``VarInput()`` alongside static bindings. Every call then requires
+    an ``extra`` mapping (or ``None``); omitted declared names receive zero
+    stimulation. Recipe types and contact counts may vary between calls.
+    ``chunk_steps`` bounds call-local assembly and compiled kernel width,
+    defaulting to 64 for runtime slots. Runtime stimulation is deterministic;
+    bind randomized Poisson waveforms when compiling.
 
     ``pending_capacity`` sets the entry count for packed scheduled traffic and
     sparse inference calendars. It accepts one positive integer or a mapping
@@ -105,6 +117,7 @@ class CompiledNetworkRunner:
         dt,
         steps,
         extra=None,
+        chunk_steps=None,
         execution="scan",
         callbacks=None,
         inference=True,
@@ -145,9 +158,33 @@ class CompiledNetworkRunner:
                 )
         configured = _configured_callbacks(callbacks)
         dt_value = _validate_time_scalar(dt, name="dt", positive=True)
+        if isinstance(extra, VarInput):
+            runtime_extra_names = tuple(network.populations)
+            bound_extra = None
+        elif isinstance(extra, Mapping):
+            extra = dict(extra)
+            unknown = extra.keys() - network.populations.keys()
+            if unknown:
+                raise ValueError(
+                    f"extra names unknown Populations: {sorted(unknown, key=str)!r}"
+                )
+            runtime_extra_names = tuple(
+                name for name, value in extra.items() if isinstance(value, VarInput)
+            )
+            bound_extra = {
+                name: value
+                for name, value in extra.items()
+                if not isinstance(value, VarInput)
+            }
+        else:
+            runtime_extra_names, bound_extra = (), extra
+        self._runtime_extra_names = runtime_extra_names
+        self._chunk_steps = _runtime_extra_chunk_steps(
+            chunk_steps, steps=steps, enabled=bool(runtime_extra_names)
+        )
         with torch.inference_mode(False), torch.no_grad():
             self._functional, tensors = make_functional_network(
-                network, extra=extra, pending_capacity=pending_capacity
+                network, extra=bound_extra, pending_capacity=pending_capacity
             )
             if dt_value != self._functional.dt:
                 raise ValueError(
@@ -204,12 +241,16 @@ class CompiledNetworkRunner:
         self._execution = execution
         self._initialization = initialization
         self._steps = steps
-        self._checkpoint_every = checkpoint_every
+        self._checkpoint_every = (
+            min(checkpoint_every, self._chunk_steps)
+            if checkpoint_every is not None and runtime_extra_names
+            else checkpoint_every
+        )
         keywords = _inference_compile_options(
             self._functional, inference, backend, options, compile_options
         )
         self._kernel = self._functional.compile_rollout_chunk(
-            steps, execution=execution, **keywords
+            self._chunk_steps, execution=execution, **keywords
         )
         self._kernel._validate_while_callbacks(self._callbacks)
 
@@ -295,8 +336,33 @@ class CompiledNetworkRunner:
         inputs=None,
         callback_state=None,
         initialization=None,
+        extra=_MISSING_RUNTIME_EXTRA,
     ):
         _validate_host_call()
+        if self._runtime_extra_names:
+            if extra is _MISSING_RUNTIME_EXTRA:
+                raise TypeError(
+                    "extra is required for runtime extra slots declared with VarInput()"
+                )
+            if extra is not None and not isinstance(extra, Mapping):
+                raise TypeError("extra must map declared Population names to bindings")
+            selected_extra = {} if extra is None else dict(extra)
+            unknown = selected_extra.keys() - set(self._runtime_extra_names)
+            if unknown:
+                raise ValueError(
+                    "extra names Populations without runtime slots: "
+                    f"{sorted(unknown, key=str)!r}"
+                )
+            selected_extra = {
+                name: _map_containers(selected_extra.get(name), dict)
+                for name in self._runtime_extra_names
+            }
+        else:
+            if extra is not _MISSING_RUNTIME_EXTRA:
+                raise TypeError(
+                    "call-time extra requires slots declared with extra=VarInput()"
+                )
+            selected_extra = None
         fresh_policy = self._initialization == "fresh"
         if initialization is not None:
             if not fresh_policy:
@@ -384,17 +450,30 @@ class CompiledNetworkRunner:
                 selected_parameters, selected_constants
             )
             with torch.inference_mode() if self._inference else nullcontext():
-                final, auxiliary = self._functional.run(
+                schedule_args = (
                     selected_parameters,
                     selected_constants,
                     selected_state,
                     selected_inputs,
+                )
+                if selected_extra is None:
+                    schedule = self._functional.run
+                    schedule_options = {}
+                else:
+                    from ._network_rollout import run
+
+                    schedule = run
+                    schedule_args = (self._functional, *schedule_args)
+                    schedule_options = {"_runtime_extra": selected_extra}
+                final, auxiliary = schedule(
+                    *schedule_args,
                     steps=self._steps,
                     callbacks=self._callbacks,
                     callback_state=callback_state,
                     checkpoint_every=self._checkpoint_every,
                     compiled_chunk=self._kernel,
-                    chunklength=self._steps,
+                    chunklength=self._chunk_steps,
+                    **schedule_options,
                 )
                 if fresh_policy:
                     auxiliary = dict(auxiliary)

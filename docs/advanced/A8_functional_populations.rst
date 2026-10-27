@@ -1525,7 +1525,8 @@ multicontact list used by ``Population.step``, ``run``, and ``longrun``:
        extra=extra,
    )
 
-The compiled convenience entry point accepts this specification directly:
+The compiled convenience entry point can bind this specification when the
+runner is constructed:
 
 .. code-block:: python
 
@@ -1569,7 +1570,9 @@ tensors. Alternatively, pass a complete replacement mapping through
 ``runner(parameters=parameters)``. Non-leaf replacements retain their autograd
 history, so a field computed from trainable electrode coordinates can propagate
 gradients to those coordinates. Updating numerical values preserves the bound
-contact structure; changing that structure requires a new runner.
+contact structure; changing a constructor binding's structure requires a new
+runner. To choose contacts separately for each call, declare a runtime slot as
+described below.
 Omitting ``trainable`` selects no differentiable leaves, and ``inference=True``
 suppresses gradients regardless of that selection. Field values multiplied by
 waveform values must produce mV; analytic unit-current fields in mV/mA pair
@@ -1586,11 +1589,109 @@ time-first mV tensor and pass ``runner(inputs=dn.func.RolloutInput(ve=ve))``
 instead. Both routes preserve the model's ordinary scalar-cable or
 finite-extracellular interpretation of the supplied potential.
 
+.. _functional-runtime-extra:
+
+Choose extracellular contacts per compiled call
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Declare ``extra=dn.VarInput()`` to compile a Population before choosing its
+extracellular specification. Supply the ordinary ``(field, waveform)`` pair
+or a list of contact pairs through ``runner(extra=...)``:
+
+.. code-block:: python
+
+   runner = dn.compile(
+       model,
+       dt=0.025,
+       steps=800,
+       extra=dn.VarInput(),
+       chunk_steps=64,
+       execution="scan",
+       inference=False,
+       callbacks={"trace": dn.func.Recorder(("v",))},
+   )
+   first_state, first_aux = runner(extra=(field_a, dn.sin(amp=0.2, freq=0.5)))
+   second_state, second_aux = runner(
+       extra=[
+           (field_a, dn.mono_rect(amp=0.3, delay=2.0, pw=0.2)),
+           (field_b, dn.cos(amp=0.1, freq=0.7)),
+       ],
+   )
+   zero_state, zero_aux = runner(extra=None)
+
+The complete
+:download:`functional_runtime_extra.py <../../examples/functional_runtime_extra.py>`
+example builds a passive cable, changes contact types and counts on one runner,
+and compares continued checkpointed training with an uninterrupted run and its
+field and Waveform gradients. Run it from the repository root with
+``python examples/functional_runtime_extra.py``; ``--backend`` selects
+``eager`` (the default), ``aot_eager``, or ``inductor``.
+
+Each call can choose different deterministic Waveform types, compositions,
+and contact counts. Fields follow the Population's ordinary spatial and batch
+broadcasting rules. Tensor temporal specifications are also accepted: their
+trailing axis contains exactly ``steps`` samples for that call, with the same
+leading batch and Population broadcasting rules as ordinary runtime
+``extra``. All contacts in one specification must use Waveforms or all must
+use tensor temporal specifications. Temporal tensors are sliced across chunks
+by their global sample index for the call.
+
+``VarInput`` declares a required call argument. Omitting ``extra`` raises
+``TypeError``; explicitly passing ``None`` supplies zero extracellular
+potential. The same compiled model accepts zero stimulation and every valid
+contact recipe. A runner constructed without ``VarInput`` rejects call-local
+``extra`` overrides, including ``None``. Runtime ``extra`` cannot be combined
+with an explicit ``RolloutInput.ve`` source.
+
+The host evaluates the selected contacts and passes assembled extracellular
+voltage to the compiled model in bounded chunks. Changing a Waveform type,
+contact count, or field value reuses that model kernel and the Population's
+valid inference preparation. ``chunk_steps`` is a positive integer accepted
+only with ``VarInput``. Its default is 64; the kernel width is capped at the
+runner's ``steps``. This bounds the temporary assembled voltage tape by the
+chunk width. Requested recordings still retain their selected trajectory,
+and training retains the activations needed for gradients. In training scan,
+``checkpoint_every=H`` uses checkpoint spans of at most
+``min(H, chunk_steps)`` steps.
+
+Runtime contacts work with training scan, inference scan, and inference-only
+while execution. While execution requires at least four steps in both the
+runner horizon and its chunk width, and retains its bounded tail behavior.
+Waveforms sample the accepted state clock, including after explicit
+continuation and during checkpoint replay. Continue with both
+simulation and callback state to avoid a duplicate boundary recording:
+
+.. code-block:: python
+
+   continued_state, continued_aux = runner(
+       first_state,
+       extra=(field_a, waveform_a),
+       callback_state=first_aux["callbacks"].state,
+   )
+
+With ``inference=False``, gradients flow to the supplied field and Waveform
+tensors, including fields computed from other differentiable tensors. Runtime
+contacts keep their caller-owned autograd history; they do not create
+``stimulation.extra.*`` leaves in ``runner.parameters`` and do not use the
+runner's ``trainable`` selector. The source Population, fields, and Waveform
+objects remain unchanged. Per-call contact plans and autograd graphs are not
+retained between calls. Use a constructor binding when stimulation should be
+managed as independent optimizer leaves in ``runner.parameters``.
+
+Runtime Waveform evaluation must be deterministic and side-effect-free.
+Fixed-schedule Poisson Waveforms with ``randomize_every_call=False`` are
+accepted. Randomized Poisson Waveforms are unsupported in call-local
+``extra``; bind them at construction to use the explicit stimulation RNG
+contract described in :doc:`A50_functional_poisson_stimulation`.
+
 For Networks, bind the same specifications by top-level Population name with
 ``extra={population_name: specification}`` in ``dn.compile`` or
 ``make_functional_network``. Stimulation leaves are nested under their
 Population's parameter namespace. See :doc:`A28_functional_network_extra`
 for trainable sharing, continuation, and per-population explicit-input rules.
+
+Lower-level runtime extracellular inputs
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 The same ``extra=extra`` keyword is accepted by ``fmodel.step`` and by
 ``dn.func.run``, ``longrun``, and ``longrun_checkpointed``. Dendra evaluates

@@ -24,7 +24,12 @@ from ._runner_policy import (
     _validate_host_call,
     _validate_host_construction,
 )
-from ._runners import _run_source_validated, run
+from ._runners import _run_source_validated, _slice_inputs, run
+from ._runtime_extra import (
+    _MISSING_RUNTIME_EXTRA,
+    VarInput,
+    _runtime_extra_chunk_steps,
+)
 from ._types import FunctionalizationError, InitializationInput, RolloutInput
 
 _OWNED_PREPARE = FunctionalPopulation.prepare
@@ -108,6 +113,16 @@ class CompiledRunner:
     checkpoint replay. Explicit ``RolloutInput.ve`` cannot be combined with
     bound ``extra``; use it instead for already assembled time-first voltages.
 
+    ``extra=VarInput()`` declares a required call-local stimulation input.
+    Supply ``extra=(field, waveform)`` or a contact sequence to each invocation;
+    deterministic waveform recipes and contact counts may differ between calls.
+    Explicit ``extra=None`` supplies zero drive. ``chunk_steps`` bounds the
+    assembled voltage block independently of the complete ``steps`` horizon
+    and defaults to 64 (capped to that horizon). Checkpoint spans are bounded
+    by both ``checkpoint_every`` and ``chunk_steps``. Runtime waveforms are not
+    retained by the runner or included in its default parameter mappings.
+    Runtime randomized Poisson stimulation is currently unsupported.
+
     Fresh calls accept an ``initialization=InitializationInput(...)`` override;
     it cannot be combined with explicit state. Fresh-policy outputs include
     ``aux['parameters']`` and ``aux['constants']``, the effective mappings after
@@ -124,6 +139,7 @@ class CompiledRunner:
         dt,
         steps,
         extra=None,
+        chunk_steps=None,
         execution="scan",
         callbacks=None,
         inference=True,
@@ -173,10 +189,20 @@ class CompiledRunner:
         self._execution = execution
         self._steps = steps
         self._checkpoint_every = checkpoint_every
+        self._runtime_extra = isinstance(extra, VarInput)
+        self._chunk_steps = _runtime_extra_chunk_steps(
+            chunk_steps, steps=steps, enabled=self._runtime_extra
+        )
+        if self._runtime_extra and execution == "while" and self._chunk_steps < 4:
+            raise ValueError(
+                "execution='while' requires runtime extra chunk_steps of at least four"
+            )
         # Versioned snapshots must remain ordinary tensors even when the
         # convenience constructor is called inside inference_mode().
         with torch.inference_mode(False), torch.no_grad():
-            self._functional, tensors = make_functional(population, dt=dt, extra=extra)
+            self._functional, tensors = make_functional(
+                population, dt=dt, extra=None if self._runtime_extra else extra
+            )
             self._parameters = tensors.independent_parameters(trainable=trainable)
             self._constants = dict(tensors.constants)
             self._initial_state = pytree.tree_map_only(
@@ -207,7 +233,7 @@ class CompiledRunner:
             self._functional, inference, backend, options, compile_options
         )
         self._kernel = self._functional.compile_rollout_chunk(
-            steps,
+            self._chunk_steps,
             execution="default" if execution == "while" else "scan",
             **keywords,
         )
@@ -335,14 +361,38 @@ class CompiledRunner:
         functional = self._functional
         functional._validate_state(state)
         values = functional._validate_prepared(prepared, parameters)
-        ve, intra, _ = functional._resolve_rollout_inputs(inputs, self._steps)
+        steps = self._kernel.steps if self._runtime_extra else self._steps
+        if self._runtime_extra:
+            # Only inspect one bounded loop signature. The actual schedule
+            # samples draw packets and assembles stimulation span by span.
+            inputs = _slice_inputs(inputs, 0, steps)
+            inputs = inputs._replace(
+                ve=torch.zeros(
+                    (steps, *functional.shape),
+                    device=functional.device,
+                    dtype=functional.dtype,
+                )
+            )
+            inputs = functional._sample_missing_runtime_draws(state, inputs, steps)
+            if inputs.noise is None:
+                inputs = inputs._replace(
+                    noise=functional.sample_noise_draw_tape(state, steps)
+                )
+            if inputs.stimulation is None and functional._poisson_plan is not None:
+                inputs = inputs._replace(
+                    stimulation=functional.sample_stimulation_draw_tape(state, steps)
+                )
+            # Public sampler replacements can execute authored code. Qualify
+            # the source after their calls and before capturing a loop body.
+            functional._validate_source()
+        ve, intra, _ = functional._resolve_rollout_inputs(inputs, steps)
         callbacks = self._callbacks
         carry = (
             callbacks._initialize(state)[0]
             if callback_state is None
             else callbacks._validate_state(callback_state)
         )
-        chunk = self._kernel._runner_callback_chunk(callbacks, self._steps)
+        chunk = self._kernel._runner_callback_chunk(callbacks, steps)
         executor = chunk._recorder_while
         if executor is None:
             raise FunctionalizationError(
@@ -370,8 +420,14 @@ class CompiledRunner:
         inputs=None,
         callback_state=None,
         initialization=None,
+        extra=_MISSING_RUNTIME_EXTRA,
     ):
         _validate_host_call()
+        if self._runtime_extra:
+            if extra is _MISSING_RUNTIME_EXTRA:
+                raise TypeError("extra must be supplied for extra=VarInput()")
+        elif extra is not _MISSING_RUNTIME_EXTRA:
+            raise TypeError("runtime extra requires compile(..., extra=VarInput())")
         fresh_policy = self._initialization == "fresh"
         if initialization is not None:
             if not fresh_policy:
@@ -496,11 +552,17 @@ class CompiledRunner:
                 inputs = RolloutInput()
             if not isinstance(inputs, RolloutInput):
                 raise TypeError("inputs must be a RolloutInput or None")
-            if self._execution == "while":
+            if self._runtime_extra and inputs.ve is not None:
+                raise ValueError("explicit ve cannot be combined with runtime extra")
+            if self._execution == "while" and not self._runtime_extra:
                 inputs = self._functional._sample_missing_runtime_draws(
                     selected_state, inputs, self._steps
                 )
-            if self._execution == "while" and inputs.noise is None:
+            if (
+                self._execution == "while"
+                and not self._runtime_extra
+                and inputs.noise is None
+            ):
                 sample_noise = (
                     self._functional._sample_noise_draw_tape_source_validated
                     if owned_boundaries
@@ -511,6 +573,7 @@ class CompiledRunner:
                 )
             if (
                 self._execution == "while"
+                and not self._runtime_extra
                 and inputs.stimulation is None
                 and getattr(self._functional, "_poisson_plan", None) is not None
             ):
@@ -536,6 +599,14 @@ class CompiledRunner:
                 if self._checkpoint_every is None
                 else {"checkpoint_every": self._checkpoint_every}
             )
+            if self._runtime_extra:
+                schedule_options.update(extra=extra, _runtime_extra_slot=True)
+                if self._checkpoint_every is None:
+                    schedule_options["host_span_steps"] = self._chunk_steps
+                else:
+                    schedule_options["checkpoint_every"] = min(
+                        self._checkpoint_every, self._chunk_steps
+                    )
             final, auxiliary = schedule(
                 bound,
                 selected_state,
@@ -558,6 +629,7 @@ def compile(
     dt,
     steps,
     extra=None,
+    chunk_steps=None,
     execution="scan",
     callbacks=None,
     inference=True,
@@ -613,6 +685,14 @@ def compile(
     binds extracellular stimulation. For Networks, ``extra`` maps Population
     names to those same bindings. Select independent fields and waveform leaves
     through ``trainable``; inspect ``runner.parameters`` for canonical names.
+    ``extra=VarInput()`` declares call-local deterministic stimulation instead
+    of binding a concrete recipe. Calls require an ``extra=`` specification;
+    use ``None`` for zero drive. Waveform types and contact counts may differ
+    between calls. ``chunk_steps`` bounds its assembly and kernel width and
+    defaults to 64, capped to ``steps``. It requires a runtime-extra declaration.
+    Networks also accept ``extra={name: VarInput(), ...}`` to declare selected
+    Population inputs alongside other bound stimulation. Runtime overrides map
+    only those declared names to specs; omitted names receive zero drive.
     See :class:`CompiledRunner` and :class:`CompiledNetworkRunner` for all
     constructor options.
     """
@@ -632,6 +712,7 @@ def compile(
         dt=dt,
         steps=steps,
         extra=extra,
+        chunk_steps=chunk_steps,
         execution=execution,
         callbacks=callbacks,
         inference=inference,

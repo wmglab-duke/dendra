@@ -178,6 +178,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "StepInput",
         "StimulusTensors",
         "TensorScheduleTensors",
+        "VarInput",
         "compile",
         "longrun",
         "longrun_checkpointed",

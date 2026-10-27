@@ -306,9 +306,9 @@ def _validate_visible_step_dt(
         prepared_values["integrator"]["dt"]
     )
     prepared_value = float(
-        prepared_dt.detach().to(device="cpu", dtype=torch.float64).item()
+        prepared_dt.detach().to(device="cpu").to(torch.float64).item()
     )
-    runner_value = float(torch.tensor(dt, dtype=prepared_dt.dtype).item())
+    runner_value = float(torch.tensor(dt, dtype=prepared_dt.dtype, device="cpu").item())
     if prepared_value != runner_value:
         raise FunctionalizationError(
             "step clock advance does not match runner dt: bound prepared dt is "
@@ -421,10 +421,10 @@ def _validate_clock_advance(
     # detached primals so this correctness guard does not alter reverse- or
     # forward-mode differentiation through the transition itself.  Moving to
     # CPU before float64 conversion also keeps this valid on MPS.
-    clocks = torch.stack((start, end.detach())).to(device="cpu", dtype=torch.float64)
+    clocks = torch.stack((start, end.detach())).to(device="cpu").to(torch.float64)
     start_value, end_value = clocks.tolist()
     observed_advance = end_value - start_value
-    runner_dt = float(torch.tensor(dt, dtype=start.dtype).item())
+    runner_dt = float(torch.tensor(dt, dtype=start.dtype, device="cpu").item())
     expected_advance = steps * runner_dt
 
     # A correct transition repeatedly evaluates fl(t + dt).  Each addition
@@ -439,10 +439,12 @@ def _validate_clock_advance(
         abs(end_value),
         abs(start_value + expected_advance),
     )
-    magnitude = torch.tensor(largest_clock, dtype=start.dtype)
+    magnitude = torch.tensor(largest_clock, dtype=start.dtype, device="cpu")
     spacing = float(
         (
-            torch.nextafter(magnitude, torch.full_like(magnitude, float("inf")))
+            torch.nextafter(
+                magnitude, torch.full_like(magnitude, float("inf"), device="cpu")
+            )
             - magnitude
         )
         .to(torch.float64)
@@ -569,20 +571,55 @@ def _assemble_extra_chunk(
     steps: int,
     total_steps: int,
     dt: float,
+    *,
+    runtime_extra_slot: bool = False,
+    times: torch.Tensor | None = None,
+    clock_dt: torch.Tensor | None = None,
 ):
     if plan is None:
+        if runtime_extra_slot:
+            return torch.zeros(
+                (steps, *functional.shape),
+                device=functional.device,
+                dtype=functional.dtype,
+            )
         return None
-    dt_tensor = torch.tensor(dt, device=functional.device, dtype=functional.dtype)
-    times = functional._stimulation_times(state, steps, dt_tensor)
+    if times is None:
+        dt_tensor = (
+            torch.tensor(dt, device=functional.device, dtype=functional.dtype)
+            if clock_dt is None
+            else clock_dt
+        )
+        # Host schedules sample waveforms at the clock accepted by each
+        # transition. Reproduce that bounded recurrence using tensor additions:
+        # start + arange * dt changes float32 pulse-edge ordering. Neither the
+        # clock nor the waveform needs a per-step host read here. Network
+        # schedules can supply their canonical origin/step clock explicitly.
+        # Owned bindings supply prepared dt to retain timing derivatives;
+        # generic callables retain the host scheduler's scalar fallback.
+        clock = state["clock"]["t"]
+        clocks = []
+        for _ in range(steps):
+            clocks.append(clock)
+            clock = (clock.reshape(1) + dt_tensor.reshape(1)).squeeze(0)
+        times = torch.stack(clocks) if clocks else clock.new_empty((0,))
     if plan.uses_waveforms:
-        return plan.assemble_tensors(tensors, times)
-    return plan.assemble(
-        tensors.parameters,
-        tensors.constants,
-        times,
-        temporal_slice=slice(start, start + steps),
-        total_steps=total_steps,
-    )
+        ve = plan.assemble_tensors(tensors, times)
+    else:
+        ve = plan.assemble(
+            tensors.parameters,
+            tensors.constants,
+            times,
+            temporal_slice=slice(start, start + steps),
+            total_steps=total_steps,
+        )
+    if ve is None and runtime_extra_slot:
+        return torch.zeros(
+            (steps, *functional.shape),
+            device=functional.device,
+            dtype=functional.dtype,
+        )
+    return ve
 
 
 def _validate_zero_step_extra(functional, plan, tensors, state, dt: float) -> None:
@@ -604,6 +641,48 @@ def _validate_zero_step_extra(functional, plan, tensors, state, dt: float) -> No
         ),
         temporal_slice=slice(0, 0),
         total_steps=0,
+    )
+
+
+def _runtime_extra_checkpoint_binding(plan, tensors):
+    """Bind declared runtime leaves and their authored owners for replay."""
+    values = {
+        f"{namespace}.{name}": value
+        for namespace, leaves in (
+            ("parameters", tensors.parameters),
+            ("constants", tensors.constants),
+            ("sources", plan._tensor_sources()),
+        )
+        for name, value in leaves.items()
+    }
+    # Checkpoint materializes inference operands into independent snapshots.
+    # Their source owners have no version counter, so retain identity/schema
+    # guards without requiring versioned source tensors for this public input.
+    inference = tuple(
+        (
+            name,
+            id(value),
+            tuple(value.shape),
+            value.dtype,
+            value.device,
+            value.requires_grad,
+        )
+        for name, value in sorted(values.items())
+        if torch.is_inference(value)
+    )
+    return (
+        tuple(
+            (name, tuple(value.shape), value.dtype, value.device)
+            for name, value in sorted(values.items())
+        ),
+        _tensor_binding(
+            {
+                name: value
+                for name, value in values.items()
+                if not torch.is_inference(value)
+            }
+        ),
+        inference,
     )
 
 
@@ -840,6 +919,7 @@ def _execute_chunks(
     callback_parts,
     extra_plan: FunctionalExtra | None = None,
     extra_tensors: StimulusTensors | None = None,
+    runtime_extra_slot: bool = False,
 ):
     auxiliary = None
     for start, stop in _execution_spans(steps, chunklength):
@@ -854,6 +934,12 @@ def _execute_chunks(
             stop - start,
             steps,
             dt,
+            runtime_extra_slot=runtime_extra_slot,
+            clock_dt=(
+                step.prepared_values["integrator"]["dt"]
+                if isinstance(step, _StepExecution) and step.prepared_values is not None
+                else None
+            ),
         )
         if extra_ve is not None:
             chunk_inputs = RolloutInput(
@@ -912,6 +998,7 @@ def _execute_checkpointed_chunks(
     callback_parts,
     extra_plan,
     extra_tensors,
+    runtime_extra_slot=False,
 ):
     """Execute a resolved host schedule with replay-time binding validation."""
     if execution.binding is not None:
@@ -923,6 +1010,11 @@ def _execute_checkpointed_chunks(
             execution,
             checkpoint_parameter_binding=_tensor_binding(execution.binding.parameters),
         )
+    extra_binding = (
+        _runtime_extra_checkpoint_binding(extra_plan, extra_tensors)
+        if runtime_extra_slot and extra_plan is not None
+        else None
+    )
     auxiliary: Any = None
     for start, stop in _execution_spans(steps, chunklength):
         chunk_steps = stop - start
@@ -952,34 +1044,41 @@ def _execute_checkpointed_chunks(
             extra_constants,
             chunk_steps=chunk_steps,
             chunk_start=start,
-            chunk_stop=stop,
             total_steps=steps,
         ):
-            if extra_plan is not None:
-                times = functional._stimulation_times(
+            if extra_binding is not None and (
+                _runtime_extra_checkpoint_binding(extra_plan, extra_tensors)
+                != extra_binding
+            ):
+                raise FunctionalizationError(
+                    "runtime extra tensors changed after checkpoint forward; "
+                    "run a new forward before backward"
+                )
+            chunk_execution = _refresh_checkpoint_execution(execution, state_in)
+            if extra_plan is not None or runtime_extra_slot:
+                chunk_tensors = (
+                    None
+                    if extra_tensors is None
+                    else StimulusTensors(
+                        extra_parameters, extra_constants, extra_tensors.plan_token
+                    )
+                )
+                ve = _assemble_extra_chunk(
+                    functional,
+                    extra_plan,
+                    chunk_tensors,
                     state_in,
+                    chunk_start,
                     chunk_steps,
-                    torch.tensor(
-                        dt,
-                        device=functional.device,
-                        dtype=functional.dtype,
+                    total_steps,
+                    dt,
+                    runtime_extra_slot=runtime_extra_slot,
+                    clock_dt=(
+                        chunk_execution.prepared_values["integrator"]["dt"]
+                        if chunk_execution.prepared_values is not None
+                        else None
                     ),
                 )
-                if extra_plan.uses_waveforms:
-                    ve = extra_plan.assemble(
-                        extra_parameters,
-                        extra_constants,
-                        times,
-                    )
-                else:
-                    ve = extra_plan.assemble(
-                        extra_parameters,
-                        extra_constants,
-                        times,
-                        temporal_slice=slice(chunk_start, chunk_stop),
-                        total_steps=total_steps,
-                    )
-            chunk_execution = _refresh_checkpoint_execution(execution, state_in)
             if callbacks is None:
                 return _execute_steps(
                     chunk_execution,
@@ -1027,11 +1126,11 @@ def _bound_runner_dt(functional, prepared_values):
     primal, _tangent = torch.autograd.forward_ad.unpack_dual(
         prepared_values["integrator"]["dt"]
     )
-    value = float(primal.detach().to(device="cpu", dtype=torch.float64).item())
+    value = float(primal.detach().to(device="cpu").to(torch.float64).item())
     nominal = functional.dt
     # Callback sample windows and physical durations use the authored Python
     # value. Retain it when it represents exactly the same prepared timestep.
-    if float(torch.tensor(nominal, dtype=primal.dtype).item()) == value:
+    if float(torch.tensor(nominal, dtype=primal.dtype, device="cpu").item()) == value:
         return nominal
     return value
 
@@ -1051,6 +1150,7 @@ def _run_schedule(
     legacy_input_horizon=False,
     duration_name="duration",
     extra=None,
+    _runtime_extra_slot=False,
     callbacks=None,
     callback_state=None,
 ):
@@ -1071,6 +1171,7 @@ def _run_schedule(
         legacy_input_horizon=legacy_input_horizon,
         duration_name=duration_name,
         extra=extra,
+        _runtime_extra_slot=_runtime_extra_slot,
         callbacks=callbacks,
         callback_state=callback_state,
     )
@@ -1085,6 +1186,9 @@ def _run_source_validated(
     callbacks,
     callback_state,
     checkpoint_every=None,
+    host_span_steps=None,
+    extra=None,
+    _runtime_extra_slot=False,
 ):
     """Schedule one fixed-horizon convenience invocation after its source check.
 
@@ -1103,9 +1207,11 @@ def _run_source_validated(
         inputs,
         expected_remainder=expected_remainder,
         steps=steps,
-        span=checkpoint_every,
+        span=checkpoint_every if checkpoint_every is not None else host_span_steps,
         checkpointed=checkpoint_every is not None,
         infer_bound_dt=True,
+        extra=extra,
+        _runtime_extra_slot=_runtime_extra_slot,
         callbacks=callbacks,
         callback_state=callback_state,
     )
@@ -1127,6 +1233,7 @@ def _run_validated_schedule(
     legacy_input_horizon=False,
     duration_name="duration",
     extra=None,
+    _runtime_extra_slot=False,
     callbacks=None,
     callback_state=None,
 ):
@@ -1141,7 +1248,14 @@ def _run_validated_schedule(
     if span is not None:
         span = _validate_chunklength(span)
     inputs = _validate_rollout_input_container(inputs)
+    if _runtime_extra_slot and inputs.ve is not None:
+        raise ValueError("explicit ve cannot be combined with a runtime extra slot")
     extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
+    if _runtime_extra_slot:
+        # Raw containers and stimulus providers can execute authored Python
+        # while binding. Requalify the source and preparation before capture.
+        functional._validate_source()
+        execution = _prepare_step_execution(functional, step)
     has_drives = (
         inputs.ve is not None
         or inputs.intra is not None
@@ -1195,6 +1309,7 @@ def _run_validated_schedule(
             callback_parts,
             extra_plan,
             extra_tensors,
+            _runtime_extra_slot,
         )
     return _execute_chunks(
         functional,
@@ -1210,6 +1325,7 @@ def _run_validated_schedule(
         callback_parts,
         extra_plan,
         extra_tensors,
+        _runtime_extra_slot,
     )
 
 
@@ -1226,6 +1342,7 @@ def run(
     tstop: float | None = None,
     dt: float | None = None,
     extra=None,
+    _runtime_extra_slot=False,
     callbacks: FunctionalCallbacks | None = None,
     callback_state=None,
 ):
@@ -1297,6 +1414,7 @@ def run(
             dt=dt,
             infer_bound_dt=True,
             extra=extra,
+            _runtime_extra_slot=_runtime_extra_slot,
             callbacks=callbacks,
             callback_state=callback_state,
         )
@@ -1319,6 +1437,7 @@ def run(
         legacy_input_horizon=True,
         duration_name="tstop",
         extra=extra,
+        _runtime_extra_slot=_runtime_extra_slot,
         callbacks=callbacks,
         callback_state=callback_state,
     )

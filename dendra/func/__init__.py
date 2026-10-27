@@ -42,6 +42,7 @@ from ._network_initialization import (
 from ._network_rollout import CompiledNetworkChunk, NetworkRolloutInput
 from ._population import FunctionalPopulation, make_functional
 from ._runners import longrun, longrun_checkpointed, run
+from ._runtime_extra import VarInput
 from ._schedules import TensorScheduleTensors
 from ._stimuli import FunctionalExtra, FunctionalIntra, StimulusTensors
 from ._types import (
@@ -103,6 +104,7 @@ __all__ = [
     "StepInput",
     "StimulusTensors",
     "TensorScheduleTensors",
+    "VarInput",
     "compile",
     "longrun",
     "longrun_checkpointed",

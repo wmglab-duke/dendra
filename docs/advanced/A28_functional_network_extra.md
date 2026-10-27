@@ -78,8 +78,9 @@ binding. A concatenated MultiPopulation is one top-level owner. For example,
 after `network = network.concat(packed=["exc", "inh"])`, bind under `"packed"`
 and supply a field in that packed Population's coordinates. `"exc"` and
 `"packed.exc"` are not separate binding keys. Pad or mask the packed spatial
-field to stimulate only a component. Changing the contact structure requires
-a new functional plan or runner.
+field to stimulate only a component. Changing a constructor binding's contact
+structure requires a new functional plan or runner. A runtime slot, described
+below, lets each call choose its contact structure.
 
 Constructor binding requires a `Waveform` temporal specification for every
 contact. Tensor temporal specifications are currently unsupported in these
@@ -182,6 +183,91 @@ Inference-only while execution uses the same contacts and accepted clock.
 Use `execution="while", inference=True`; a full loop block reports
 `compiled_while_loop`, and a shorter remainder uses the bounded tail described
 in {doc}`A25_functional_network_while`.
+
+## Choose Network contacts at call time
+
+Compile with `extra=dn.VarInput()` to declare a runtime extracellular slot for
+every top-level Population. Supply a mapping of ordinary Population contact
+specifications on each call:
+
+```python
+runtime = dn.compile(
+    network,
+    dt=0.05,
+    steps=100,
+    extra=dn.VarInput(),
+    chunk_steps=32,
+    inference=False,
+    callbacks={"trace": dn.func.Recorder(("left.v", "right.v"))},
+)
+state, auxiliary = runtime(extra={"left": (field_a, waveform_a)})
+other_state, other_auxiliary = runtime(
+    extra={
+        "left": [(field_a, waveform_b), (field_b, waveform_a)],
+        "right": (field_b, waveform_b),
+    },
+)
+```
+
+An explicitly supplied mapping can omit declared slots; omitted slots receive
+zero extracellular potential. Mapping a slot to `None` has the same effect.
+Pass `extra=None` to supply zero potential to all runtime slots. The whole
+`extra` call argument is required whenever the runner declares any slots;
+omitting it raises `TypeError`.
+
+To restrict runtime input to selected Populations, put `VarInput()` values in
+the constructor mapping. Other entries can bind fixed contacts:
+
+```python
+selective = dn.compile(
+    network,
+    dt=0.05,
+    steps=100,
+    extra={"left": dn.VarInput(), "right": (field_a, waveform_a)},
+    chunk_steps=32,
+)
+state, auxiliary = selective(extra={"left": (field_b, waveform_b)})
+```
+
+Only declared runtime names are accepted in a call mapping. Unknown names,
+statically bound names, and unbound names without a slot are rejected. A
+runner with no runtime slots rejects call-local `extra` overrides, including
+`None`. Exact top-level names and packed Population coordinates follow the
+same rules as constructor bindings.
+
+Each slot accepts different deterministic Waveform types, compositions, and
+contact counts on subsequent calls. Tensor temporal specifications are also
+accepted, with a trailing time axis containing exactly `steps` samples for
+that call and the ordinary Population broadcasting rules. Within one
+Population's specification, all contacts must use Waveforms or all must use
+temporal tensors. Dendra slices temporal tensors across chunks using their
+global sample index for the call. Runtime specifications use caller-owned
+tensor values and preserve their autograd history with `inference=False`,
+including fields computed from upstream differentiable tensors. They create
+no `stimulation.extra.*` runner parameter leaves and do not use `trainable`.
+
+The compiled Network consumes assembled extracellular voltage in bounded
+chunks. Changes to runtime contact recipes reuse its model kernel;
+call-local contact plans and autograd graphs are not retained between calls.
+`chunk_steps` is a positive integer accepted only when runtime slots are
+declared. It defaults to 64, with the kernel width capped at `steps`.
+In training scan, `checkpoint_every=H` uses spans of at most
+`min(H, chunk_steps)` steps. Recordings retain their requested trajectory.
+Inference-only while execution keeps the usual bounded tail behavior;
+chunks shorter than four steps use the bounded unrolled tail.
+
+Runtime Waveforms follow the accepted simulation clock across continuation
+and checkpoint replay. Continue with both returned simulation state and
+callback state as in the bound example above. Runtime slots conflict with
+explicit `ve` on the same Population, including when a slot receives zero
+potential; other unbound Populations can receive explicit voltage tapes.
+The source Network, fields, and Waveforms remain unchanged.
+
+Runtime Waveform evaluation must be deterministic and side-effect-free.
+Fixed Poisson schedules with `randomize_every_call=False` are supported.
+Randomized Poisson Waveforms are unsupported in call-local `extra`; bind them
+at construction to use the explicit stimulation RNG contract in
+{doc}`A50_functional_poisson_stimulation`.
 
 ## Combine bindings and explicit voltage tapes
 
