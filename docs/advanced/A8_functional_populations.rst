@@ -1764,9 +1764,11 @@ their explicit parameter namespaces cannot silently diverge.
 Host-side simulation
 --------------------
 
-Use ``dn.func.run`` to advance an explicit state through a binding. Bindings
-carry the functional model, parameters, preparation, and number of timesteps
-per call. Prepare once for a forward/backward graph and bind an eager step:
+Use ``dn.func.run`` to advance an explicit state through a binding. It is the
+common host scheduling interface for Populations and Networks. Population
+bindings carry the functional model, parameters, preparation, and number of
+timesteps per call. Prepare once for a forward/backward graph and bind an eager
+step:
 
 .. code-block:: python
 
@@ -1815,12 +1817,11 @@ not retain bindings or differentiable preparation. A direct
 ``bound_chunk(state, RolloutInput(...))`` call consumes exactly
 ``bound_chunk.steps`` timesteps.
 
-The existing ``run(fmodel, step, state, ...)``, ``longrun`` and
-``longrun_checkpointed`` forms remain supported, including their original
-``tstop`` and ``chunklength`` conventions. They accept explicit bindings and
-existing ``functools.partial`` forms. A general callable in those legacy forms
-must accept ``(state, StepInput)`` and return exactly
-``(next_state, auxiliary)`` for one transition from the same model.
+An explicit binding identifies its model and operands directly. Canonical
+scheduling does not infer that ownership from ``functools.partial`` or wrapper
+metadata. Network bindings use the same scheduling keywords and callback
+continuation contract; see :doc:`A20_functional_network_rollout` for their raw
+constant and materialization lifetime rules.
 
 With PyTorch 2.14 or newer, ``execution="scan"`` offers an
 experimental alternative for first-order training over longer horizons:
@@ -1862,12 +1863,27 @@ direct forward AD use the existing eager recurrence, so those compositions
 remain available but do not gain scan compilation. Integer callback counters
 can keep their integer dtype.
 
-For explicit bindings and the supported exact ``functools.partial`` forms,
-Dendra verifies ownership, source structure, state, parameters, and
-prepared-workspace freshness at runner/chunk boundaries, then calls the owned
-tensor kernel. Custom wrappers remain fully checked on every public call and
-must still advance exactly one timestep. Wrapping a multi-step compiled chunk
-in another callable does not opt it into chunk scheduling.
+For explicit bindings, Dendra verifies ownership, source structure, state,
+parameters, and prepared-workspace freshness at runner/chunk boundaries, then
+calls the owned tensor kernel. The compiled kernel remains reusable across
+bindings without retaining their preparation graphs.
+
+Compatibility scheduling forms
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The existing ``run(fmodel, step, state, ...)``, ``longrun`` and
+``longrun_checkpointed`` forms remain supported through compatibility adapters,
+including their original ``tstop`` and ``chunklength`` conventions. They accept
+explicit bindings and existing ``functools.partial`` forms. A general callable
+in these forms must accept ``(state, StepInput)`` and return exactly
+``(next_state, auxiliary)`` for one transition from the same model.
+
+Supported exact partial bindings retain the owned tensor-kernel path. Custom
+wrappers retain their public invocation semantics and must still advance
+exactly one timestep. Wrapping a multi-step compiled chunk in another callable
+does not opt it into chunk scheduling. These adapters do not issue deprecation
+warnings. Use explicit bindings with ``dn.func.run`` to select a step count,
+duration, and host/checkpoint spans through the common interface.
 
 Functional callbacks
 ~~~~~~~~~~~~~~~~~~~~
@@ -1921,8 +1937,9 @@ after every step. This includes one initial sample for a zero-step run. Its
 recording remains connected to autograd. ``AnomalyDetector`` instead emits no
 trajectory: it keeps and returns a cumulative Boolean mask using constant
 callback memory. Callback objects are immutable configuration. Functional
-callbacks work with eager callables, bound compiled chunks, and
-``longrun_checkpointed``. With a bound compiled chunk, the runner compiles
+callbacks work with eager bindings, bound compiled chunks, and the compatibility
+runners. Use ``checkpoint_every`` on ``dn.func.run`` for activation checkpointing.
+With a bound compiled chunk, the runner compiles
 the simulation steps and callback updates together. Callbacks still observe
 every timestep: increasing the compiled chunk size does not subsample a
 recording or skip reducer updates. Checkpoint replay recomputes each pure host

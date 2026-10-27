@@ -34,6 +34,7 @@ from ._netstim import (
     make_functional_netstim,
 )
 from ._network import FunctionalNetwork, NetworkTensors, make_functional_network
+from ._network_binding import BoundNetwork
 from ._network_compile import CompiledNetworkRunner
 from ._network_initialization import (
     NetworkInitializationCache,
@@ -63,6 +64,7 @@ __all__ = [
     "APCount",
     "AnomalyDetector",
     "BoundPopulation",
+    "BoundNetwork",
     "CompiledNetworkChunk",
     "CompiledNetworkRunner",
     "CompiledPopulationChunk",

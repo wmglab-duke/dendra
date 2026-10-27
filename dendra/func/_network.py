@@ -1684,6 +1684,18 @@ class FunctionalNetwork:
             self, steps=steps, execution=execution, **compile_options
         )
 
+    def bind(self, parameters, constants, *, compiled_chunk=None):
+        """Bind raw inputs for eager steps or canonical host scheduling.
+
+        Tensor leaves stay live and differentiable. Network bindings retain raw
+        constants, deriving fresh coefficients for every invocation instead of
+        retaining graph-bearing materializations. Use ``chunk.bind`` for a
+        compiled transition; both bindings work with ``dn.func.run``.
+        """
+        from ._network_binding import BoundNetwork
+
+        return BoundNetwork(self, parameters, constants, compiled_chunk=compiled_chunk)
+
     def run(
         self,
         parameters,
@@ -1698,8 +1710,11 @@ class FunctionalNetwork:
         callback_state=None,
         compiled_chunk=None,
     ):
-        """Schedule exact chunks, optional checkpoints and bounded RNG sampling.
+        """Compatibility form of explicit bound Network host scheduling.
 
+        Use ``run(functional.bind(parameters, constants), state, ...)`` for the
+        common scheduling contract. This adapter retains ``chunklength`` and
+        its existing interaction with ``checkpoint_every``.
         Returned state and ``aux['callbacks'].state`` can be passed directly to
         another call. Checkpoint replay retains gradients through all chunks.
         """

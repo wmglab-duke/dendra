@@ -17,6 +17,18 @@ from ._tree_paths import _get_path as _tree_value
 from ._types import FunctionalizationError
 
 
+def _map_containers(tree, mapping):
+    """Snapshot public container structure without copying differentiable leaves."""
+    if isinstance(tree, Mapping):
+        return mapping(
+            {key: _map_containers(value, mapping) for key, value in tree.items()}
+        )
+    if isinstance(tree, tuple):
+        values = tuple(_map_containers(value, mapping) for value in tree)
+        return type(tree)(*values) if hasattr(tree, "_fields") else values
+    return tree
+
+
 def _canonicalize_mapping_tree(tree):
     """Normalize public Mappings to compiler PyTrees without copying tensors.
 

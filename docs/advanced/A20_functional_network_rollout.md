@@ -78,8 +78,8 @@ Without a NetStim it returns `None`.
 
 Pure `rollout`, `prepare_and_rollout`, and direct compiled chunks require an
 explicit draw tape when a NetStim is present and the horizon is nonempty.
-`plan.run` can instead omit that tape: the host samples bounded packets before
-each execution span and supplies the same packets again during checkpoint
+`dn.func.run(bound, state, ...)` can omit that tape: the host samples bounded
+packets before each execution span and supplies the same packets again during checkpoint
 backward. Its returned state contains the exact next RNG position. Sampling
 does not belong inside a compiled timestep. See
 {doc}`A14_functional_netstim_renewal` for draw semantics.
@@ -174,14 +174,36 @@ For a long horizon, use the host runner with optional checkpointing:
 ```
 
 Here `chunk` is `None` in the default eager example, or a compiled chunk when
-`run_demo(compiled=True)` is selected. `chunklength` bounds execution chunks.
-`checkpoint_every` independently chooses host checkpoint spans, including the
-automatic NetStim draw-tape spans; neither option truncates gradients. The runner
-executes exact shorter tails when execution, checkpoint, and compiled widths do
-not divide the horizon.
+`run_demo(compiled=True)` is selected. Both create an explicit `BoundNetwork`
+for the same `dn.func.run` scheduling contract used by Populations. Its parameter
+and constant mappings snapshot the container structure while retaining the
+original tensor leaves and their gradients. Replacing a mapping entry requires
+a new binding. The binding holds raw constants; the host derives prepared
+materializations at their execution boundaries instead of retaining a prepared
+autograd graph across calls.
+
+`checkpoint_every` chooses host checkpoint spans, including automatic NetStim
+draw-tape spans. Use `host_span_steps` to bound ordinary execution spans without
+checkpointing. These options are mutually exclusive and independent of the
+compiled kernel width; neither truncates gradients. The runner executes exact
+shorter tails when the spans and compiled width do not divide the horizon.
 Checkpoint backward replays the same explicit inputs and NetStim packets.
 Keep parameter, constant, input-tape, and source configuration values unchanged
 until backward completes.
+
+With no explicit `steps` or `duration`, supplied tapes determine the horizon.
+`steps=N` executes an exact count, including with no tapes. `duration=...`
+advances a physical duration from the current state and retains incomplete
+timesteps in `state["clock"]["duration_remainder"]`. Steps and duration are
+mutually exclusive, and supplied tapes must match the resolved count exactly.
+The binding uses the Network's fixed timestep. A host span defaults to 64 steps
+for Network execution; a binding does not change that timestep or its compiled
+kernel width.
+
+The existing `plan.run(parameters, constants, state, ..., chunklength=...)`
+entry point remains a compatibility adapter with its original arguments and
+defaults. It schedules the same execution machinery. Explicit bindings and
+`dn.func.run` provide the common scheduling interface for new code.
 
 Scan supports ordinary first-order `backward()` and `autograd.grad` on the
 supported PyTorch compiler interfaces; `create_graph=True` raises explicitly.

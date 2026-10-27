@@ -28,6 +28,27 @@ the live ``requires_grad`` subset. See
 .. autoclass:: dendra.func.VarInput
 
 
+Functional host scheduling
+--------------------------
+
+``dn.func.run`` schedules Population and Network bindings with explicit steps
+or duration, host spans, activation checkpointing, and callback continuation.
+Bindings retain tensor aliases and gradients; they do not own simulation state.
+See :doc:`../advanced/A8_functional_populations` and
+:doc:`../advanced/A20_functional_network_rollout` for the execution and
+preparation lifetime contracts.
+
+.. autoclass:: dendra.func.BoundPopulation
+   :members: functional, parameters, prepared, compiled_chunk, steps
+   :special-members: __call__
+
+.. autoclass:: dendra.func.BoundNetwork
+   :members: functional, parameters, constants, compiled_chunk, steps
+   :special-members: __call__
+
+.. autofunction:: dendra.func.run
+
+
 Intrinsic activity
 ------------------
 

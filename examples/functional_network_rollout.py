@@ -169,15 +169,17 @@ def run_demo(*, compiled=False):
     )
     # endregion chunk
     # region run
-    final, auxiliary = plan.run(
-        parameters,
-        constants,
+    bound = (
+        plan.bind(parameters, constants)
+        if chunk is None
+        else chunk.bind(parameters, constants)
+    )
+    final, auxiliary = dn.func.run(
+        bound,
         initial,
-        inputs,
-        chunklength=5,
+        inputs=inputs,
         checkpoint_every=4,
         callbacks=callbacks,
-        compiled_chunk=chunk,
     )
     trace = auxiliary["callbacks"]["trace"]
     assert trace["right.v"].shape[0] == STEPS + 1
@@ -186,27 +188,23 @@ def run_demo(*, compiled=False):
     assert_tree(trace, expected_aux["callbacks"]["trace"])
 
     # region continuation
-    prefix, prefix_aux = plan.run(
-        parameters,
-        constants,
+    prefix, prefix_aux = dn.func.run(
+        bound,
         initial,
-        slice_inputs(inputs, 0, SPLIT),
+        inputs=slice_inputs(inputs, 0, SPLIT),
         callbacks=callbacks,
-        compiled_chunk=chunk,
     )
     saved = {
         "state": clone_tree(prefix),
         "callbacks": clone_tree(prefix_aux["callbacks"].state),
         "step": SPLIT,
     }
-    resumed, resumed_aux = plan.run(
-        parameters,
-        constants,
+    resumed, resumed_aux = dn.func.run(
+        bound,
         saved["state"],
-        slice_inputs(inputs, saved["step"], STEPS),
+        inputs=slice_inputs(inputs, saved["step"], STEPS),
         callbacks=callbacks,
         callback_state=saved["callbacks"],
-        compiled_chunk=chunk,
     )
     joined = {
         name: torch.cat((prefix_aux["callbacks"]["trace"][name], values))

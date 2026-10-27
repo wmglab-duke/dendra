@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from functools import partial
 from typing import Any
 
 import torch
@@ -20,6 +19,7 @@ from ._callbacks import (
     _complete_callback_results,
     _setup_callback_state,
 )
+from ._network_binding import BoundNetwork
 from ._population import FunctionalPopulation
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._tensor_contracts import _tensor_binding
@@ -71,51 +71,16 @@ class _StepExecution:
 
 
 def _owned_step_binding(functional, step) -> _OwnedStepBinding | None:
-    """Recognize only the ordinary, semantics-preserving public partial form.
-
-    Wrapped callables and partial subclasses remain generic: bypassing an
-    adapter whose invocation semantics we do not own would be unsafe. Exact
-    :class:`CompiledPopulationChunk` instances are also owned and
-    expose the same private tensor-only boundary. An explicit ``extra=None``
-    is equivalent to the functional-step default; non-empty functional
-    ``extra`` remains on the public path so its validation is unchanged.
-    """
+    """Read explicit ownership; infer legacy partials only in their adapter."""
     if type(step) is BoundPopulation:
         if step.functional is not functional:
             return None
         return _OwnedStepBinding(
             functional, step._parameters, step.prepared, step.compiled_chunk
         )
-    if type(step) is not partial:
-        return None
-    candidate = step.func
-    is_functional_step = (
-        getattr(candidate, "__self__", None) is functional
-        and getattr(candidate, "__func__", None) is FunctionalPopulation.step
-    )
-    if len(step.args) != 2:
-        return None
-    keywords = step.keywords or {}
-    if is_functional_step:
-        if set(keywords) - {"extra"} or keywords.get("extra") is not None:
-            return None
-        return _OwnedStepBinding(functional, step.args[0], step.args[1])
+    from ._runner_compat import legacy_owned_step_binding
 
-    # Import lazily to preserve the existing population/compiled module split.
-    from ._compiled import CompiledPopulationChunk
-
-    if (
-        not keywords
-        and type(candidate) is CompiledPopulationChunk
-        and candidate._functional is functional
-    ):
-        return _OwnedStepBinding(
-            functional,
-            step.args[0],
-            step.args[1],
-            compiled_chunk=candidate,
-        )
-    return None
+    return legacy_owned_step_binding(functional, step)
 
 
 def _prepare_step_execution(functional, step) -> _StepExecution:
@@ -195,78 +160,16 @@ def _refresh_checkpoint_execution(execution: _StepExecution, state) -> _StepExec
     return replace(execution, prepared_values=prepared_values)
 
 
-def _inspect_step_callable(step):
-    """Unwrap public callable adapters while retaining bound positional args."""
-    from ._compiled import CompiledPopulationChunk
-
-    candidate = step
-    bound_args = ()
-    seen = set()
-    while id(candidate) not in seen:
-        seen.add(id(candidate))
-        if isinstance(candidate, partial):
-            # Inner partial arguments precede outer partial arguments in the
-            # eventual invocation.
-            bound_args = (*candidate.args, *bound_args)
-            candidate = candidate.func
-            continue
-        original = getattr(candidate, "_torchdynamo_orig_callable", None)
-        if original is None:
-            original = getattr(candidate, "__wrapped__", None)
-        if original is not None:
-            candidate = original
-            continue
-        owner = getattr(candidate, "__self__", None)
-        if (
-            isinstance(owner, BoundPopulation)
-            and getattr(candidate, "__func__", None) is BoundPopulation.__call__
-        ):
-            candidate = owner
-            continue
-        if (
-            isinstance(owner, CompiledPopulationChunk)
-            and getattr(candidate, "__func__", None) is CompiledPopulationChunk.__call__
-        ):
-            candidate = owner
-            continue
-        break
-    return candidate, bound_args
-
-
 def _validate_step_plan(functional, step) -> None:
-    """Reject plan mismatches that are visible through public callables."""
-    candidate, _bound_args = _inspect_step_callable(step)
-
-    owner = getattr(candidate, "__self__", None)
-    if isinstance(owner, FunctionalPopulation) and owner is not functional:
-        raise FunctionalizationError(
-            "step belongs to a different FunctionalPopulation plan"
-        )
-
-    # Import lazily to preserve the existing population/compiled module split.
-    from ._compiled import CompiledPopulationChunk
-
-    if isinstance(candidate, BoundPopulation):
-        if candidate.functional is not functional:
+    if type(step) is BoundPopulation:
+        if step.functional is not functional:
             raise FunctionalizationError(
                 "step belongs to a different FunctionalPopulation plan"
             )
-        if candidate.steps != 1 and _owned_step_binding(functional, step) is None:
-            raise FunctionalizationError(
-                "multi-step compiled chunks require the exact binding returned "
-                "by chunk.bind(); other adapters must expose a one-step callable"
-            )
-    if isinstance(candidate, CompiledPopulationChunk):
-        if candidate._functional is not functional:
-            raise FunctionalizationError(
-                "step belongs to a different FunctionalPopulation plan"
-            )
-        if candidate.steps != 1 and _owned_step_binding(functional, step) is None:
-            raise FunctionalizationError(
-                "multi-step compiled chunks require the exact binding "
-                "functools.partial(chunk, parameters, prepared); other adapters "
-                "must expose a one-step callable"
-            )
+        return
+    from ._runner_compat import _validate_step_plan as validate_legacy_step
+
+    validate_legacy_step(functional, step)
 
 
 def _validate_visible_step_dt(
@@ -276,30 +179,12 @@ def _validate_visible_step_dt(
     *,
     prepared_values: Mapping[str, object] | None = None,
 ) -> None:
-    """Compare runner dt exactly when a public prepared binding is visible."""
-    candidate, bound_args = _inspect_step_callable(step)
-    owner = getattr(candidate, "__self__", None)
+    """Check explicit preparation without inspecting callable metadata."""
+    if type(step) is not BoundPopulation:
+        from ._runner_compat import _validate_visible_step_dt as validate_legacy_dt
 
-    # Import lazily to preserve the existing population/compiled module split.
-    from ._compiled import CompiledPopulationChunk
-
-    if isinstance(candidate, BoundPopulation) and candidate.functional is functional:
-        parameters, prepared = candidate._parameters, candidate.prepared
-    elif (
-        owner is functional
-        and getattr(candidate, "__func__", None) is FunctionalPopulation.step
-        and len(bound_args) >= 2
-    ):
-        parameters, prepared = bound_args[:2]
-    elif (
-        isinstance(candidate, CompiledPopulationChunk)
-        and candidate._functional is functional
-        and len(bound_args) >= 2
-    ):
-        parameters, prepared = bound_args[:2]
-    else:
-        return
-
+        return validate_legacy_dt(functional, step, dt, prepared_values=prepared_values)
+    parameters, prepared = step._parameters, step.prepared
     if prepared_values is None:
         prepared_values = functional._validate_prepared(prepared, parameters)
     prepared_dt, _tangent = torch.autograd.forward_ad.unpack_dual(
@@ -1146,15 +1031,12 @@ def _run_schedule(
     span=None,
     checkpointed=False,
     dt=None,
-    infer_bound_dt=False,
-    legacy_input_horizon=False,
-    duration_name="duration",
     extra=None,
     _runtime_extra_slot=False,
     callbacks=None,
     callback_state=None,
 ):
-    """Resolve one horizon and use the shared eager/checkpoint execution engine."""
+    """Validate an explicit binding and execute its canonical host schedule."""
     expected_remainder = _validate_execution(functional, step, state)
     return _run_validated_schedule(
         functional,
@@ -1167,9 +1049,6 @@ def _run_schedule(
         span=span,
         checkpointed=checkpointed,
         dt=dt,
-        infer_bound_dt=infer_bound_dt,
-        legacy_input_horizon=legacy_input_horizon,
-        duration_name=duration_name,
         extra=extra,
         _runtime_extra_slot=_runtime_extra_slot,
         callbacks=callbacks,
@@ -1209,12 +1088,29 @@ def _run_source_validated(
         steps=steps,
         span=checkpoint_every if checkpoint_every is not None else host_span_steps,
         checkpointed=checkpoint_every is not None,
-        infer_bound_dt=True,
         extra=extra,
         _runtime_extra_slot=_runtime_extra_slot,
         callbacks=callbacks,
         callback_state=callback_state,
     )
+
+
+def _prepare_schedule_inputs(
+    functional, step, execution, inputs, *, span, extra, _runtime_extra_slot
+):
+    """Prepare inputs once before either horizon spelling is normalized."""
+    if span is not None:
+        span = _validate_chunklength(span)
+    inputs = _validate_rollout_input_container(inputs)
+    if _runtime_extra_slot and inputs.ve is not None:
+        raise ValueError("explicit ve cannot be combined with a runtime extra slot")
+    extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
+    if _runtime_extra_slot:
+        # Raw containers and stimulus providers can execute authored Python
+        # while binding. Requalify the source and preparation before capture.
+        functional._validate_source()
+        execution = _prepare_step_execution(functional, step)
+    return execution, inputs, span, extra_plan, extra_tensors
 
 
 def _run_validated_schedule(
@@ -1229,47 +1125,67 @@ def _run_validated_schedule(
     span=None,
     checkpointed=False,
     dt=None,
-    infer_bound_dt=False,
-    legacy_input_horizon=False,
-    duration_name="duration",
     extra=None,
     _runtime_extra_slot=False,
     callbacks=None,
     callback_state=None,
 ):
-    """Execute the common schedule after validating its public entry."""
+    """Normalize the explicit binding contract before common execution."""
     execution = _prepare_step_execution(functional, step)
-    if infer_bound_dt and dt is None:
+    if dt is None and type(step) is BoundPopulation:
         dt = _bound_runner_dt(functional, execution.prepared_values)
     dt = _validate_runner_dt(functional, dt)
     _validate_visible_step_dt(
         functional, step, dt, prepared_values=execution.prepared_values
     )
-    if span is not None:
-        span = _validate_chunklength(span)
-    inputs = _validate_rollout_input_container(inputs)
-    if _runtime_extra_slot and inputs.ve is not None:
-        raise ValueError("explicit ve cannot be combined with a runtime extra slot")
-    extra_plan, extra_tensors = _prepare_extra(functional, extra, inputs)
-    if _runtime_extra_slot:
-        # Raw containers and stimulus providers can execute authored Python
-        # while binding. Requalify the source and preparation before capture.
-        functional._validate_source()
-        execution = _prepare_step_execution(functional, step)
-    has_drives = (
-        inputs.ve is not None
-        or inputs.intra is not None
-        or inputs.noise is not None
-        or inputs.stimulation is not None
+    execution, inputs, span, extra_plan, extra_tensors = _prepare_schedule_inputs(
+        functional,
+        step,
+        execution,
+        inputs,
+        span=span,
+        extra=extra,
+        _runtime_extra_slot=_runtime_extra_slot,
     )
-    if legacy_input_horizon:
-        if has_drives:
-            duration = _MISSING
-        elif duration is None:
-            raise ValueError("tstop must be provided when inputs contain no drives")
     if duration is not _MISSING:
-        state, steps = _stage_duration(state, duration, dt, name=duration_name)
+        state, steps = _stage_duration(state, duration, dt, name="duration")
         expected_remainder = _validate_duration_remainder(state)
+    return _execute_schedule(
+        functional,
+        execution,
+        state,
+        inputs,
+        expected_remainder=expected_remainder,
+        steps=steps,
+        span=span,
+        checkpointed=checkpointed,
+        dt=dt,
+        extra_plan=extra_plan,
+        extra_tensors=extra_tensors,
+        _runtime_extra_slot=_runtime_extra_slot,
+        callbacks=callbacks,
+        callback_state=callback_state,
+    )
+
+
+def _execute_schedule(
+    functional,
+    execution,
+    state,
+    inputs,
+    *,
+    expected_remainder,
+    steps=None,
+    span,
+    checkpointed,
+    dt,
+    extra_plan,
+    extra_tensors,
+    _runtime_extra_slot,
+    callbacks,
+    callback_state,
+):
+    """Execute resolved scheduling operands without legacy horizon policies."""
     inputs, steps = _resolve_inputs(functional, inputs, steps)
     if inputs.noise is not None or steps == 0:
         functional._validate_noise_draw(inputs.noise, steps=steps)
@@ -1329,8 +1245,85 @@ def _run_validated_schedule(
     )
 
 
+def _run_bound_network(
+    bound,
+    state,
+    inputs,
+    *,
+    steps,
+    duration,
+    host_span_steps,
+    checkpoint_every,
+    dt,
+    extra,
+    callbacks,
+    callback_state,
+):
+    """Resolve the shared host contract over Network's existing chunk engine."""
+    from ._network_bindings import _canonicalize_mapping_tree, _map_containers
+    from ._network_rollout import run as run_network
+    from ._runner_policy import _validate_host_call
+
+    _validate_host_call()
+    (state, inputs), _ = _canonicalize_mapping_tree((state, inputs))
+    if extra is not None:
+        if not isinstance(extra, Mapping):
+            raise TypeError("Network extra must map Population names to bindings")
+        extra = _map_containers(extra, dict)
+        unknown = extra.keys() - bound.functional.populations.keys()
+        if unknown:
+            raise ValueError(
+                f"extra names unknown Populations: {sorted(unknown, key=str)!r}"
+            )
+    functional = bound.functional
+    functional._validate_source()
+    functional._validate_state(state)
+    runner_dt = _validate_time_scalar(
+        functional.dt if dt is None else dt, name="dt", positive=True
+    )
+    if runner_dt != functional.dt:
+        raise FunctionalizationError("runner dt must match the bound Network timestep")
+    remainder = state["clock"]["duration_remainder"]
+    if remainder.requires_grad:
+        raise FunctionalizationError(
+            "Network duration_remainder must not require gradients"
+        )
+    _, tangent = torch.autograd.forward_ad.unpack_dual(remainder)
+    if tangent is not None:
+        raise FunctionalizationError(
+            "Network duration_remainder must not carry a forward-AD tangent"
+        )
+    pending = float(remainder.detach().cpu().item())
+    if not math.isfinite(pending) or pending < 0:
+        raise ValueError("Network duration_remainder must be finite and non-negative")
+    if duration is not None:
+        duration = _validate_time_scalar(duration, name="duration", positive=False)
+        steps, pending = _duration_step_budget(duration, runner_dt, pending)
+        state = {
+            **state,
+            "clock": {
+                **state["clock"],
+                "duration_remainder": remainder.new_tensor(pending),
+            },
+        }
+    return run_network(
+        functional,
+        bound._parameters,
+        bound._constants,
+        state,
+        inputs,
+        steps=steps,
+        chunklength=(checkpoint_every or host_span_steps or 64),
+        checkpoint_every=checkpoint_every,
+        callbacks=callbacks,
+        callback_state=callback_state,
+        compiled_chunk=bound.compiled_chunk,
+        _runtime_extra=extra,
+    )
+
+
 def run(
-    functional: FunctionalPopulation | BoundPopulation,
+    functional: FunctionalPopulation | BoundPopulation | BoundNetwork,
     step=_MISSING,
     state=_MISSING,
     inputs: RolloutInput | None = None,
@@ -1350,13 +1343,17 @@ def run(
 
     Preferred form: ``run(bound, state, inputs=..., steps=N)`` or
     ``run(bound, state, duration=..., checkpoint_every=H)``. Create ``bound``
-    with ``fmodel.bind(parameters, prepared)`` or ``kernel.bind(...)``. Inputs
+    with ``fmodel.bind(parameters, prepared)`` for Populations or
+    ``fnetwork.bind(parameters, constants)`` for Networks. Compiled kernels
+    expose the corresponding ``bind(...)`` method. Inputs
     alone infer the horizon; an explicit step count or duration must match
     their time axis. ``steps`` and ``duration`` are mutually exclusive.
 
     ``duration`` is an amount to advance, including the state's retained
     fractional remainder. Explicit or input-inferred steps leave that remainder
-    unchanged. The default timestep comes from the validated preparation.
+    unchanged. The default timestep comes from validated Population preparation
+    or the Network's fixed clock. Network bindings retain raw constants and
+    derive fresh materializations during execution.
     ``checkpoint_every`` sets the number of steps between activation checkpoints;
     ``host_span_steps`` instead groups an ordinary run. These mutually exclusive
     options are independent of the compiled kernel width. Shorter kernel tails
@@ -1373,21 +1370,29 @@ def run(
     ``state`` as ``callback_state`` when resuming to avoid duplicate frames.
     This host scheduler stays outside torch.compile and torch.func boundaries.
     """
-    if isinstance(functional, BoundPopulation):
-        if type(functional) is not BoundPopulation:
-            raise TypeError("run requires an exact BoundPopulation binding")
+    from ._network_rollout import NetworkRolloutInput
+
+    if isinstance(functional, (BoundPopulation, BoundNetwork)):
+        if type(functional) not in (BoundPopulation, BoundNetwork):
+            raise TypeError(
+                "run requires an exact BoundPopulation or BoundNetwork binding"
+            )
         bound = functional
         if step is not _MISSING:
             if state is _MISSING:
                 state = step
-            elif inputs is None and (isinstance(state, RolloutInput) or state is None):
+            elif inputs is None and (
+                isinstance(state, (RolloutInput, NetworkRolloutInput)) or state is None
+            ):
                 inputs, state = state, step
             else:
                 raise TypeError("state was supplied more than once")
         if state is _MISSING:
             raise TypeError("run requires state")
         if tstop is not None:
-            raise ValueError("use duration instead of tstop with a BoundPopulation")
+            raise ValueError(
+                f"use duration instead of tstop with a {type(bound).__name__}"
+            )
         if steps is not None and duration is not None:
             raise ValueError("steps and duration are mutually exclusive")
         if checkpoint_every is not None and host_span_steps is not None:
@@ -1402,6 +1407,20 @@ def run(
                 isinstance(value, bool) or not isinstance(value, int) or value < 1
             ):
                 raise ValueError(f"{name} must be a positive integer")
+        if type(bound) is BoundNetwork:
+            return _run_bound_network(
+                bound,
+                state,
+                inputs,
+                steps=steps,
+                duration=duration,
+                host_span_steps=host_span_steps,
+                checkpoint_every=checkpoint_every,
+                dt=dt,
+                extra=extra,
+                callbacks=callbacks,
+                callback_state=callback_state,
+            )
         return _run_schedule(
             bound.functional,
             bound,
@@ -1412,7 +1431,6 @@ def run(
             span=checkpoint_every if checkpoint_every is not None else host_span_steps,
             checkpointed=checkpoint_every is not None,
             dt=dt,
-            infer_bound_dt=True,
             extra=extra,
             _runtime_extra_slot=_runtime_extra_slot,
             callbacks=callbacks,
@@ -1427,7 +1445,9 @@ def run(
         )
     if step is _MISSING or state is _MISSING:
         raise TypeError("legacy run requires functional, step and state")
-    return _run_schedule(
+    from ._runner_compat import run_legacy_schedule
+
+    return run_legacy_schedule(
         functional,
         step,
         state,
@@ -1435,7 +1455,6 @@ def run(
         duration=tstop,
         dt=dt,
         legacy_input_horizon=True,
-        duration_name="tstop",
         extra=extra,
         _runtime_extra_slot=_runtime_extra_slot,
         callbacks=callbacks,
@@ -1464,7 +1483,9 @@ def longrun(
     accepted. The default timestep is the functional plan's nominal timestep.
     New code can use ``run(bound, state, duration=..., host_span_steps=...)``.
     """
-    return _run_schedule(
+    from ._runner_compat import run_legacy_schedule
+
+    return run_legacy_schedule(
         functional,
         step,
         state,
@@ -1472,7 +1493,6 @@ def longrun(
         duration=tstop,
         span=_validate_chunklength(chunklength),
         dt=dt,
-        duration_name="tstop",
         extra=extra,
         callbacks=callbacks,
         callback_state=callback_state,
@@ -1500,7 +1520,9 @@ def longrun_checkpointed(
     span the full simulation; replay reuses and revalidates prepared inputs.
     With gradients disabled, ordinary execution uses the same host spans.
     """
-    return _run_schedule(
+    from ._runner_compat import run_legacy_schedule
+
+    return run_legacy_schedule(
         functional,
         step,
         state,
@@ -1509,7 +1531,6 @@ def longrun_checkpointed(
         span=_validate_chunklength(chunklength),
         checkpointed=True,
         dt=dt,
-        duration_name="tstop",
         extra=extra,
         callbacks=callbacks,
         callback_state=callback_state,

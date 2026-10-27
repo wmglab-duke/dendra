@@ -313,6 +313,14 @@ class CompiledNetworkChunk:
     tensor-only kernel. Kernel caches retain no live input/preparation graphs.
     """
 
+    def bind(self, parameters, constants):
+        """Bind raw inputs for host scheduling and fresh direct preparation."""
+        from ._network_binding import BoundNetwork
+
+        return BoundNetwork(
+            self._functional, parameters, constants, compiled_chunk=self
+        )
+
     def __init__(
         self,
         functional,

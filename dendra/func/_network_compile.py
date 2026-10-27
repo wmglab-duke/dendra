@@ -12,6 +12,7 @@ from torch.utils import _pytree as pytree
 from dendra.models.core import _validate_time_scalar
 
 from ._network import make_functional_network
+from ._network_bindings import _map_containers
 from ._network_initialization import NetworkInitializationInput
 from ._network_parameters import (
     find_parameters,
@@ -31,18 +32,6 @@ from ._runtime_extra import (
     _runtime_extra_chunk_steps,
 )
 from ._types import FunctionalizationError
-
-
-def _map_containers(tree, mapping):
-    """Snapshot public container structure without copying differentiable leaves."""
-    if isinstance(tree, Mapping):
-        return mapping(
-            {key: _map_containers(value, mapping) for key, value in tree.items()}
-        )
-    if isinstance(tree, tuple):
-        values = tuple(_map_containers(value, mapping) for value in tree)
-        return type(tree)(*values) if hasattr(tree, "_fields") else values
-    return tree
 
 
 class CompiledNetworkRunner:

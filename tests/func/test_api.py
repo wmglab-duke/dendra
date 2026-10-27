@@ -136,6 +136,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "ActiveALCount",
         "APCount",
         "BoundPopulation",
+        "BoundNetwork",
         "CompiledNetworkChunk",
         "CompiledNetworkRunner",
         "CompiledPopulationChunk",
