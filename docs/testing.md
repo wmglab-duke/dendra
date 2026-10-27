@@ -35,14 +35,14 @@ python -m pytest tests -W error -m "cpu or (neuron and not cuda)"
 ```
 
 This expression runs each selected test once. The `cpu` marker covers tests
-that require neither CUDA nor the NEURON simulator, while `neuron and not
+that require neither an accelerator nor the NEURON simulator, while `neuron and not
 cuda` adds the required simulator-backed CPU tests without selecting GPU
 comparisons.
 
 Mark tests that inspect device metadata or mock compiler behavior with
-`@pytest.mark.cpu` when they do not allocate or execute on CUDA. This prevents a
-parameter such as `device="cuda"` from assigning them to the CUDA lane.
-Explicit `cuda` markers and CUDA/GPU hardware guards still identify tests that
+`@pytest.mark.cpu` when they do not allocate or execute on an accelerator. This prevents a
+parameter such as `device="cuda"` or `device="mps"` from assigning them to an accelerator lane.
+Explicit accelerator markers and hardware guards still identify tests that
 require an accelerator.
 
 CUDA- and Triton-dependent cases use the `cuda` marker.
@@ -50,6 +50,10 @@ CUDA- and Triton-dependent cases use the `cuda` marker.
 comparisons also carry `slow`, and randomized or property-generated cases
 carry `stochastic`. Marker names are strict, so misspelled or undeclared
 markers fail during test collection.
+
+Apple MPS hardware tests use the separate `mps` marker. MPS guards and explicit
+markers take precedence over inherited CPU metadata markers; an MPS guard that
+mentions an Apple GPU is not classified as CUDA.
 
 ## Shorter development passes
 
@@ -114,6 +118,22 @@ lane, and explains how to restore that coverage.
 On WSL with a WDDM GPU, sanitizer availability can depend on the Windows
 driver and debugging-interface support. See NVIDIA's
 [operating-system-specific Compute Sanitizer documentation](https://docs.nvidia.com/compute-sanitizer/ComputeSanitizer/index.html#operating-system-specific-behavior).
+
+## Run the MPS solver checks
+
+On an Apple MPS host with an MPS-enabled `dendra-solvers` installation, verify
+the backend and run the native solver integration cases with CPU fallback
+disabled:
+
+```sh
+python -c "import dendra_solvers; assert dendra_solvers.is_mps_available()"
+PYTORCH_ENABLE_MPS_FALLBACK=0 python -m pytest tests/test_mps_native_solvers.py -W error -m mps
+```
+
+These cases compare float32 native and functional trajectories and gradients
+against CPU references, check owning topology-plan reuse, and exercise
+full-graph atomic steps with the AOT-eager backend. `-m mps` selects all optional
+MPS cases when running the complete test directory.
 
 ## Measure branch and statement coverage
 

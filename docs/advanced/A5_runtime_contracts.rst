@@ -269,6 +269,22 @@ are transferred to MPS. This includes the compartment coordinates of an
 lengths. This does not make float64 simulation state available on MPS;
 construct the model with ``dtype=torch.float32``.
 
+An MPS-enabled ``dendra-solvers`` installation supplies native Metal Thomas/PCR,
+3-by-3 block Thomas, scalar/block DHS, and packed scalar DHS kernels. Tree
+integrators keep immutable topology in owning CPU plans and upload its device
+representation on demand; unchanged versioned topology is reused between
+steps. Reinitialization and ordinary topology-buffer writes retain the normal
+plan freshness checks. Inference-created topology without version counters uses
+the fully validated raw solve path instead.
+
+Scalar and block cables retain their portable PyTorch PCR fallback when the
+native MPS backend is unavailable. Tree voltage execution requires the native
+MPS backend. Dedicated native SPD kernels are currently unsupported on MPS.
+Scalar cables use Thomas or PCR; block cables requested with ``method="spd"``
+use the portable PyTorch block-PCR solver. Native tree material
+diffusion validates its supplied topology on each solve, while functional
+lowering owns a separate immutable plan.
+
 For JIT execution, Dendra applies MPS compiler compatibility as per-model
 ``torch.compile`` options rather than changing process-global Inductor state.
 It disables the unsupported non-AOT C++ MPS wrapper and limits fusion to 30

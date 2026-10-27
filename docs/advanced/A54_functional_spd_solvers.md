@@ -113,8 +113,11 @@ Scalar CUDA requests retain the native Thomas fallback. Block CUDA uses the
 native SPD kernel and its diagonal-repair policy. Its derivatives treat the
 repair shift as fixed; when a repair is triggered they exclude the shift's
 dependence on the coefficients. Use well-conditioned SPD systems when exact
-coefficient sensitivities are required. MPS functional execution is currently
-unsupported.
+coefficient sensitivities are required. Dedicated native SPD kernels are
+currently unsupported on MPS. Scalar MPS cables use Thomas or PCR. Block MPS
+cables requested with `method="spd"` use the differentiable portable
+PyTorch block-PCR solver, including functional execution; this path uses the
+general block-system derivative rather than the native SPD repair policy.
 
 ## Run the complete example
 

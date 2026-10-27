@@ -9295,14 +9295,16 @@ def _dufort_configuration_failures(integrator):
 def _functional_device_failures(device, dtype):
     """Keep device admission separate from the topology/solver capability.
 
-    CUDA uses the same pure preparation and explicit state contract as CPU;
-    each integrator supplies its own transform-compatible solver facade.
-    Other accelerators must not silently select a CPU or CUDA-only kernel.
+    Each integrator supplies its own transform-compatible solver facade.
+    MPS uses float32; CPU and CUDA also support float64.
     """
     failures = []
-    if torch.device(device).type not in {"cpu", "cuda"}:
-        failures.append("the supported functional devices are CPU and CUDA")
-    if dtype not in (torch.float32, torch.float64):
+    device_type = torch.device(device).type
+    if device_type not in {"cpu", "cuda", "mps"}:
+        failures.append("the supported functional devices are CPU, CUDA, and MPS")
+    if device_type == "mps" and dtype != torch.float32:
+        failures.append("MPS functional execution requires dtype float32")
+    elif device_type != "mps" and dtype not in (torch.float32, torch.float64):
         failures.append("dtype must be float32 or float64")
     return failures
 

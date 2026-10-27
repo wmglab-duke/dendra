@@ -19,6 +19,8 @@ from typing import Literal
 import numpy as np
 import torch
 
+from dendra.models.integrators._native import _cpu_topology, _mps_solver_available
+
 try:  # Registers torch.ops.dendra_solvers when available.
     import dendra_solvers  # noqa: F401
 
@@ -1249,7 +1251,7 @@ def _select_dhs_solver(solver: str | None, device: torch.device | str, *, thread
     mode = str(solver or "auto").lower()
     aliases = {"dhs": "auto", "hines": "auto", "tree": "auto", "custom": "auto"}
     mode = aliases.get(mode, _normalize_solver_name(mode))
-    dev_type = torch.device(device).type if not isinstance(device, str) else device
+    dev_type = torch.device(device).type
 
     if mode in {"dense", "debug", "torch", "linalg"}:
         return None, "dense"
@@ -1284,6 +1286,16 @@ def _select_dhs_solver(solver: str | None, device: torch.device | str, *, thread
             "with `python -m pip install --upgrade "
             '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
         )
+        return None, "dense"
+
+    if dev_type == "mps":
+        if DENDRA_SOLVERS_AVAILABLE and _mps_solver_available(dendra_solvers):
+            return torch.ops.dendra_solvers.dhs_solve, "dhs_mps"
+        if mode == "thomas":
+            raise ImportError(
+                "Tree material diffusion on MPS requires an MPS-enabled "
+                "dendra-solvers installation and an available Apple GPU."
+            )
         return None, "dense"
 
     return None, "dense"
@@ -1971,9 +1983,12 @@ class SpatialOperatorTree(torch.nn.Module):
         if DENDRA_SOLVERS_AVAILABLE and solver is torch.ops.dendra_solvers.dhs_solve:
             if callable(getattr(dendra_solvers, "DHSPlan", None)):
                 plan = dendra_solvers.DHSPlan(
-                    self._buffers["parent_idx"],
-                    self._buffers["order"],
-                    self._buffers["layer_ptr"],
+                    *_cpu_topology(
+                        tuple(
+                            self._buffers[name]
+                            for name in ("parent_idx", "order", "layer_ptr")
+                        )
+                    )
                 )
                 return partial(_functional_dhs_plan_solve, plan=plan)
             facade = getattr(dendra_solvers, "dhs_solve", None)

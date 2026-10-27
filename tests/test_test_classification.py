@@ -11,14 +11,14 @@ from pathlib import Path
 import pytest
 
 _ROOT = Path(__file__).resolve().parents[1]
-_BACKENDS = {"cpu", "neuron", "cuda"}
+_BACKENDS = {"cpu", "neuron", "cuda", "mps"}
 
 
 @pytest.fixture
 def classification_suite(tmp_path: Path) -> Path:
     (tmp_path / "pytest.ini").write_text(
         "[pytest]\naddopts = --strict-markers\nmarkers =\n"
-        "    cpu\n    neuron\n    cuda\n    slow\n    stochastic\n",
+        "    cpu\n    neuron\n    cuda\n    mps\n    slow\n    stochastic\n",
         encoding="utf-8",
     )
     classifier = (_ROOT / "tests" / "conftest.py").read_text(encoding="utf-8")
@@ -27,7 +27,7 @@ def classification_suite(tmp_path: Path) -> Path:
         + "\nimport json\n"
         + "\ndef pytest_collection_finish(session):\n"
         + "    inventory = {item.name: sorted({mark.name for mark in "
-        + "item.iter_markers()} & {'cpu', 'neuron', 'cuda'}) "
+        + "item.iter_markers()} & {'cpu', 'neuron', 'cuda', 'mps'}) "
         + "for item in session.items}\n"
         + "    (session.config.rootpath / 'inventory.json').write_text("
         + "json.dumps(inventory), encoding='utf-8')\n",
@@ -178,3 +178,46 @@ def test_optional_lane_keeps_hardware_parameters_explicit_markers_and_guards(
         "test_local_explicit_accelerator",
         "test_class_accelerator",
     }
+
+
+def test_mps_lane_is_separate_from_cuda_and_required_cpu_cases(classification_suite):
+    (classification_suite / "test_mps_devices.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.mps\ndef test_mps_explicit():\n    pass\n"
+        "@pytest.mark.skipif(False, reason='MPS GPU is required')\n"
+        "def test_mps_guard():\n    pass\n"
+        "@pytest.mark.skipif(False, reason='Metal GPU is required')\n"
+        "def test_metal_guard():\n    pass\n"
+        "@pytest.mark.parametrize('device', ['mps', 'mps:0'])\n"
+        "def test_mps_hardware(device):\n    pass\n"
+        "@pytest.mark.cpu\n@pytest.mark.parametrize('device', ['mps'])\n"
+        "def test_mps_metadata(device):\n    pass\n",
+        encoding="utf-8",
+    )
+    assert set(_collect(classification_suite, "mps")) == {
+        "test_mps_explicit",
+        "test_mps_guard",
+        "test_metal_guard",
+        "test_mps_hardware[mps]",
+        "test_mps_hardware[mps:0]",
+    }
+    assert "test_mps_metadata[mps]" in _collect(classification_suite, "cpu")
+    cuda = _collect(classification_suite, "cuda")
+    assert not any(name.startswith("test_mps_") for name in cuda)
+    assert "test_metal_guard" not in cuda
+
+
+def test_unrelated_reason_substrings_do_not_change_backend_classification(
+    classification_suite,
+):
+    (classification_suite / "test_reason_substrings.py").write_text(
+        "import pytest\n"
+        "@pytest.mark.skipif(False, reason='diagnostic dumps are enabled')\n"
+        "def test_dumps_cpu():\n    pass\n"
+        "@pytest.mark.skipif(False, reason='GPU diagnostic dumps are enabled')\n"
+        "def test_dumps_cuda():\n    pass\n",
+        encoding="utf-8",
+    )
+    inventory = _collect(classification_suite)
+    assert inventory["test_dumps_cpu"] == {"cpu"}
+    assert inventory["test_dumps_cuda"] == {"cuda"}

@@ -437,7 +437,7 @@ and mixtures of scalar and
 finite-extracellular components), Cable/Axon/Tree subclasses with unrecognized
 custom geometry, stateful
 or unregistered parameter transforms, custom integrator subclasses,
-and non-CUDA accelerators (including MPS). Row-regular
+and accelerators other than CPU, CUDA, and MPS. Row-regular
 selectors authored through the normal Population indexing API are already
 represented as packed support and are supported; users do not need to choose a
 different input form.
@@ -2643,7 +2643,17 @@ geometry/integrators are currently unsupported. The block SPD facade retains
 its native diagonal-repair and gradient policy, described in
 :doc:`A54_functional_spd_solvers`. Network event delivery uses the composed Network plan
 described in :doc:`A19_functional_network_lowering`.
-MPS, float16 and bfloat16 are currently unsupported.
+Float16 and bfloat16 are currently unsupported. MPS functional execution uses
+float32 and the same explicit state/preparation interfaces. Scalar cable
+Thomas/PCR, block cable Thomas, scalar and block Tree DHS, and packed scalar
+DHS use the corresponding native Metal kernels from an MPS-enabled
+``dendra-solvers`` installation. Owning topology plans remain CPU control
+metadata; numerical operands and results stay on MPS. The MPS acceptance tests
+compare short native/functional trajectories and parameter/input gradients
+against CPU references, and exercise full-graph ``prepare_and_step`` with
+``backend="aot_eager"``. Dedicated native SPD solvers are currently unsupported
+on MPS. Block cables requested with ``method="spd"`` use the portable PyTorch
+block-PCR solver, including functional execution.
 
 The CUDA acceptance tests compare full trajectories and gradients against
 imperative execution and CPU references, and separately exercise transforms and

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import PurePosixPath
 
 import pytest
@@ -10,6 +11,8 @@ import pytest
 # initialization is deterministic. TorchInductor cache configuration is opt-in.
 import dendra  # noqa: F401
 from dendra._bootstrap import reset_torch_compiler
+
+_MPS_REASON = re.compile(r"\b(?:mps|metal)\b", re.IGNORECASE)
 
 _NEURON_MODULES = {
     "tests/test_io_from_neuron_topology.py",
@@ -83,9 +86,25 @@ def _skipif_requires_cuda(item: pytest.Item) -> bool:
     """Recognize accelerator guards without inferring intent from a test name."""
     for marker in item.iter_markers(name="skipif"):
         reason = str(marker.kwargs.get("reason", "")).casefold()
-        if "cuda" in reason or "gpu" in reason:
+        if "cuda" in reason or ("gpu" in reason and not _MPS_REASON.search(reason)):
             return True
     return False
+
+
+def _requires_mps(item: pytest.Item, authored_cpu: set) -> bool:
+    if item.get_closest_marker("mps") is not None:
+        return True
+    for marker in item.iter_markers(name="skipif"):
+        if _MPS_REASON.search(str(marker.kwargs.get("reason", ""))):
+            return True
+    callspec = getattr(item, "callspec", None)
+    return (
+        item not in authored_cpu
+        and callspec is not None
+        and any(
+            str(value).lower().startswith("mps") for value in callspec.params.values()
+        )
+    )
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -93,10 +112,10 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Assign every collected test to a required or optional backend lane.
 
     Tests may carry more than one backend marker (for example the CUDA NEURON
-    comparison), but only tests requiring neither receive the ``cpu`` marker.
+    comparison), but only tests requiring no accelerator receive ``cpu``.
     Parameterized ``device='cuda'`` cases are classified independently from
     their CPU siblings unless an authored ``cpu`` marker declares that only
-    device metadata is inspected. Explicit CUDA markers and hardware guards
+    device metadata is inspected. Explicit accelerator markers and hardware guards
     still identify accelerator requirements, including within CPU-marked
     modules or classes.
     """
@@ -133,15 +152,22 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
             or _skipif_requires_cuda(item)
             or item.get_closest_marker("cuda") is not None
         )
+        needs_mps = _requires_mps(item, authored_cpu)
 
         if needs_neuron:
             item.add_marker(pytest.mark.neuron)
         if needs_cuda:
             item.add_marker(pytest.mark.cuda)
+        if needs_mps:
+            item.add_marker(pytest.mark.mps)
         if normalized_path.startswith("tests/simtests/"):
             item.add_marker(pytest.mark.slow)
         if any(token in nodeid_lower for token in _STOCHASTIC_TOKENS):
             item.add_marker(pytest.mark.stochastic)
 
-        if not needs_cuda and (item in authored_cpu or not needs_neuron):
+        if (
+            not needs_cuda
+            and not needs_mps
+            and (item in authored_cpu or not needs_neuron)
+        ):
             item.add_marker(pytest.mark.cpu)

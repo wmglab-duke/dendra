@@ -8,6 +8,7 @@ import numpy as np
 import torch
 
 from ..graph import share_topology_labeled
+from ._native import _cpu_topology, _mps_solver_available
 from .cable import unbranched_edge_conductance
 from .core import (
     Integrator,
@@ -127,7 +128,7 @@ def _refresh_owned_cpu_plan(integrator, sources, constructor, eligible, *, kwarg
     if (
         callable(constructor)
         and eligible
-        and all(t.device.type == "cpu" for t in sources)
+        and all(t.device.type in {"cpu", "mps"} for t in sources)
     ):
         try:
             versions = tuple(t._version for t in sources)
@@ -145,7 +146,9 @@ def _refresh_owned_cpu_plan(integrator, sources, constructor, eligible, *, kwarg
     if old_plan is not None:
         integrator.clear_jit_cache()
     if versions is not None:
-        owner = constructor(*sources, **({} if kwargs is None else kwargs))
+        owner = constructor(
+            *_cpu_topology(sources), **({} if kwargs is None else kwargs)
+        )
         integrator._cpu_topology_plan = owner
         integrator._cpu_plan_sources = sources
         integrator._cpu_plan_versions = versions
@@ -288,7 +291,7 @@ def _scalar_dhs_group(model, P: int, device: torch.device) -> _ScalarDHSGroup:
 
 
 def _validate_dhs_threads(threads: int) -> int:
-    """Validate the lane count accepted by the CPU and CUDA DHS kernels."""
+    """Validate the lane count accepted by the DHS topology layout."""
     if isinstance(threads, bool) or not isinstance(threads, int):
         raise TypeError("threads must be a positive integer that divides 32")
     if threads <= 0 or threads > THREADS_PER_WARP:
@@ -612,8 +615,8 @@ class _dhs(Integrator):
     Dendritic Hierarchical Scheduling (DHS) integrator for tree morphologies.
 
     Preprocesses a rooted tree into elimination layers and solves the resulting
-    Hines tridiagonal system with a warp-friendly DHS ordering. Supports CUDA
-    and CPU backends (CPU requires ``dendra_solvers``). Extracellular coupling
+    Hines tridiagonal system with a warp-friendly DHS ordering. CUDA uses
+    Triton; CPU and Apple MPS use ``dendra_solvers``. Extracellular coupling
     is included by accumulating edge currents into the RHS when ``ve`` is
     provided.
 
@@ -715,6 +718,15 @@ class _dhs(Integrator):
                     '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                 )
             self._solve = torch.ops.dendra_solvers.dhs_solve
+        elif device.type == "mps":
+            if not DENDRA_SOLVERS_AVAILABLE or not _mps_solver_available(
+                dendra_solvers
+            ):
+                raise ImportError(
+                    "DHS execution on MPS requires an MPS-enabled dendra-solvers "
+                    "installation and an available Apple GPU."
+                )
+            self._solve = torch.ops.dendra_solvers.dhs_solve
         else:
             raise NotImplementedError(
                 f"DHS integrator is not implemented for device type {device.type}."
@@ -745,7 +757,7 @@ class _dhs(Integrator):
                 # both the source Population and its disposable tensor clones.
                 # Construct outside compilation, including under inference_mode.
                 plan = dendra_solvers.DHSPlan(
-                    self.parent_idx, self.order, self.layer_ptr
+                    *_cpu_topology((self.parent_idx, self.order, self.layer_ptr))
                 )
                 return partial(_functional_dhs_plan_solve, plan=plan)
             facade = (
@@ -763,7 +775,7 @@ class _dhs(Integrator):
             )
         raise RuntimeError(
             "The selected DHS solver is not yet transform-compatible. "
-            "Functional scalar Tree execution currently requires CPU "
+            "Functional scalar Tree execution requires native CPU or MPS "
             "dendra_solvers.dhs_solve."
         )
 
@@ -784,7 +796,7 @@ class _dhs(Integrator):
         if (
             not callable(constructor)
             or self._solve is not torch.ops.dendra_solvers.dhs_solve
-            or any(t.device.type != "cpu" for t in sources)
+            or any(t.device.type not in {"cpu", "mps"} for t in sources)
         ):
             versions = None
         else:
@@ -806,7 +818,7 @@ class _dhs(Integrator):
         if old_plan is not None:
             self.clear_jit_cache()
         if versions is not None:
-            plan = constructor(*sources)
+            plan = constructor(*_cpu_topology(sources))
             self._cpu_topology_plan = plan
             self._cpu_plan_sources = sources
             self._cpu_plan_versions = versions
@@ -1249,6 +1261,15 @@ class _dhs_multi(MultiIntegrator):
                     '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                 )
             self._solve = _dhs_multi_solve_cpu
+        elif device.type == "mps":
+            if not DENDRA_SOLVERS_AVAILABLE or not _mps_solver_available(
+                dendra_solvers
+            ):
+                raise ImportError(
+                    "Packed DHS execution on MPS requires an MPS-enabled "
+                    "dendra-solvers installation and an available Apple GPU."
+                )
+            self._solve = _dhs_multi_solve_cpu
         else:
             raise NotImplementedError(
                 f"DHS multi integrator is not implemented for device type "
@@ -1285,7 +1306,7 @@ class _dhs_multi(MultiIntegrator):
             facade = getattr(dendra_solvers, "dhs_multi_solve_plan", None)
             if callable(constructor) and callable(facade):
                 plan = constructor(
-                    *self._cpu_topology_sources(),
+                    *_cpu_topology(self._cpu_topology_sources()),
                     batch_size=self._tiled_rows_total,
                     stride=self.K_stride,
                 )
@@ -1305,7 +1326,7 @@ class _dhs_multi(MultiIntegrator):
             )
         raise RuntimeError(
             "The selected packed DHS solver is not yet transform-compatible. "
-            "Functional MultiPopulation execution currently requires CPU "
+            "Functional MultiPopulation execution requires native CPU or MPS "
             "dendra_solvers.dhs_multi_solve."
         )
 

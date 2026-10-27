@@ -58,8 +58,9 @@ dendra = "dendra.cli:main"
 testpaths = ["tests"]
 addopts = "--strict-markers"
 markers = [
-    "cpu: tests that require neither CUDA nor the NEURON simulator",
+    "cpu: tests that require neither an accelerator nor the NEURON simulator",
     "cuda: tests that require a CUDA-capable PyTorch runtime",
+    "mps: tests that require an Apple MPS-capable PyTorch runtime",
     "neuron: tests that require NEURON; the non-CUDA subset is required in CI",
     "slow: longer-running integration or simulator-comparison tests",
     "stochastic: tests of stochastic or property-generated behavior",

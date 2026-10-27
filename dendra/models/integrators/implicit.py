@@ -15,6 +15,7 @@ except ImportError:
 
 from ._cuda_functional import pcr_solve as _functional_pcr_solve
 from ._cuda_functional import thomas_solve as _functional_thomas_solve
+from ._native import _mps_solver_available
 from .cable import (
     _layered_edge_conductance,
     unbranched_edge_conductance,
@@ -29,7 +30,7 @@ from .core import (
     _model_solve_shape,
     ensure_model_buffer,
 )
-from .tridiag import pcr_solve_t
+from .tridiag import pcr_solve_parallel_t, pcr_solve_t
 from .tridiag.block import block_pcr_solve_t
 from .triton import (
     pcr_solve_cuda_t,
@@ -59,6 +60,7 @@ _BWD_EULER_INCREMENT_SOLVERS = tuple(
     solve
     for solve in (
         pcr_solve_t,
+        pcr_solve_parallel_t,
         pcr_solve_cuda_t,
         thomas_solve_cuda_t,
         _functional_pcr_solve,
@@ -366,12 +368,24 @@ class _bwd_euler_ub(Integrator):
         if self.method == "pcr":
             if dev == "cuda":
                 self._solve = pcr_solve_cuda_t
+            elif dev == "mps":
+                self._solve = (
+                    torch.ops.dendra_solvers.pcr_solve_t
+                    if DENDRA_SOLVERS_AVAILABLE
+                    and _mps_solver_available(dendra_solvers)
+                    else pcr_solve_parallel_t
+                )
             else:
                 self._solve = pcr_solve_t
             return
 
         # -------- SPD option (CPU only) --------
         if self.method == "spd":
+            if dev == "mps":
+                raise NotImplementedError(
+                    "method='spd' is currently unsupported on MPS; "
+                    "select method='thomas' or method='pcr'."
+                )
             if dev == "cuda":
                 warnings.warn(
                     "method='spd' is not implemented on CUDA; falling back to method='thomas' (CUDA)."
@@ -407,6 +421,12 @@ class _bwd_euler_ub(Integrator):
         if dev == "cuda":
             # CUDA: always use CUDA Thomas implementation
             self._solve = thomas_solve_cuda_t
+        elif dev == "mps":
+            self._solve = (
+                torch.ops.dendra_solvers.thomas_solve_t
+                if DENDRA_SOLVERS_AVAILABLE and _mps_solver_available(dendra_solvers)
+                else pcr_solve_parallel_t
+            )
         elif dev == "cpu":
             if DENDRA_SOLVERS_AVAILABLE:
                 self._solve = torch.ops.dendra_solvers.thomas_solve_t
@@ -450,7 +470,7 @@ class _bwd_euler_ub(Integrator):
                 '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
             )
 
-        if solver_name == "pcr_solve_t" and solver_module == (
+        if solver_name in {"pcr_solve_t", "pcr_solve_parallel_t"} and solver_module == (
             "dendra.models.integrators.tridiag.pcr"
         ):
             return solver
@@ -880,11 +900,15 @@ class _bwd_euler_bt(Integrator):
     def _select_solver(self, device):
         dev = torch.device(device).type
 
-        # Apple MPS cannot load either the CPU extension or CUDA/Triton kernels.
-        # Use a vectorized, differentiable pure-Torch solver for both public
-        # methods. The method still controls CPU/CUDA dispatch exactly as before.
         if dev == "mps":
-            self._solve = block_pcr_solve_t
+            if self.method == "spd":
+                self._solve = block_pcr_solve_t
+                return
+            self._solve = (
+                torch.ops.dendra_solvers.solve_bt
+                if DENDRA_SOLVERS_AVAILABLE and _mps_solver_available(dendra_solvers)
+                else block_pcr_solve_t
+            )
             return
 
         if self.method == "spd":

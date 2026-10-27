@@ -206,7 +206,13 @@ def test_extcell_axon_initializes_and_steps_with_mps_block_solver():
     axon.initialize()
     axon.run(tstop=0.01, dt=0.005)
 
-    assert axon.integrator._solve is block_pcr_solve_t
+    expected_solver = (
+        torch.ops.dendra_solvers.solve_bt
+        if implicit.DENDRA_SOLVERS_AVAILABLE
+        and implicit._mps_solver_available(implicit.dendra_solvers)
+        else block_pcr_solve_t
+    )
+    assert axon.integrator._solve is expected_solver
     assert axon.v.device.type == "mps"
     assert torch.isfinite(axon.v).all()
     torch.testing.assert_close(axon.v, axon.vc[..., 0] - axon.vc[..., 1])

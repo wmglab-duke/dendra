@@ -5,6 +5,7 @@ from typing import List, Tuple
 import networkx as nx
 import torch
 
+from ._native import _cpu_topology, _mps_solver_available
 from .cable import _layered_edge_conductance, unbranched_edge_conductance
 from .core import (
     Integrator,
@@ -125,7 +126,7 @@ class _dhs_bt(Integrator):
 
     Extends DHS to models with intracellular voltage and two extracellular
     shells (vi, ve0, ve1) per node, assembling block diagonals and axial
-    conductances, then solving in DHS order with CUDA or CPU backends.
+    conductances, then solving in DHS order with CUDA, CPU, or Apple MPS backends.
 
     Parameters
     ----------
@@ -211,6 +212,15 @@ class _dhs_bt(Integrator):
                     '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
                 )
             self._solve = torch.ops.dendra_solvers.dhs_bt_solve
+        elif device.type == "mps":
+            if not DENDRA_SOLVERS_AVAILABLE or not _mps_solver_available(
+                dendra_solvers
+            ):
+                raise ImportError(
+                    "Block DHS execution on MPS requires an MPS-enabled "
+                    "dendra-solvers installation and an available Apple GPU."
+                )
+            self._solve = torch.ops.dendra_solvers.dhs_bt_solve
         else:
             raise NotImplementedError(f"Unsupported device type: {device.type}")
 
@@ -241,7 +251,9 @@ class _dhs_bt(Integrator):
             constructor = getattr(dendra_solvers, "DHSPlan", None)
             planned = getattr(dendra_solvers, "dhs_bt_solve_plan", None)
             if callable(constructor) and callable(planned):
-                plan = constructor(self.parent_idx, self.order, self.layer_ptr)
+                plan = constructor(
+                    *_cpu_topology((self.parent_idx, self.order, self.layer_ptr))
+                )
                 return partial(_functional_dhs_bt_plan_solve, plan=plan)
             facade = (
                 None
@@ -258,7 +270,7 @@ class _dhs_bt(Integrator):
             )
         raise RuntimeError(
             "The selected block-DHS solver is not yet transform-compatible. "
-            "Functional ExtCellTree execution currently requires CPU "
+            "Functional ExtCellTree execution requires native CPU or MPS "
             "dendra_solvers.dhs_bt_solve."
         )
 
