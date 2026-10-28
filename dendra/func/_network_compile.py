@@ -307,6 +307,29 @@ class CompiledNetworkRunner:
         """
         return self._callbacks
 
+    def export_continuation(self, continuation):
+        """Export detached owned continuation data, retaining source ties/flags.
+
+        The versioned plain data/Tensor packet supports ``torch.save`` and
+        ``torch.load(..., weights_only=True)``. It excludes upstream graphs,
+        recording history, input/draw tapes and optimizer state.
+        """
+        from ._continuation_checkpoints import export_continuation
+
+        return export_continuation(self, continuation)
+
+    def restore_continuation(self, packet):
+        """Restore a checkpoint into this compatible initialized Network runner.
+
+        Owner/schema, dtype/device, shared source ties and callbacks are
+        validated before returning owned ordinary Tensor leaves in a
+        ``Continuation``. No initialization, preparation, RNG sampling or
+        execution runs, and runner defaults retain their values.
+        """
+        from ._continuation_checkpoints import restore_continuation
+
+        return restore_continuation(self, packet)
+
     @property
     def kernel(self):
         return self._kernel

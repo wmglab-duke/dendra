@@ -13,7 +13,6 @@ The small CPU examples check disk round-trips and continuation, not performance.
 from __future__ import annotations
 
 import argparse
-from collections.abc import Mapping
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -23,29 +22,6 @@ import dendra as dn
 from dendra.models.mod import expsyn, graded_syn, pas
 
 DT, STEPS = 0.025, 4
-
-
-def snapshot(tree):
-    """Own detached tensor storage while retaining shared parameter aliases."""
-    tensors = {}
-
-    def copy(value):
-        if isinstance(value, torch.Tensor):
-            identity = id(value)
-            if identity not in tensors:
-                with torch.inference_mode(False):
-                    tensors[identity] = value.detach().clone()
-            return tensors[identity]
-        if isinstance(value, Mapping):
-            return {name: copy(child) for name, child in value.items()}
-        if isinstance(value, tuple):
-            children = tuple(copy(child) for child in value)
-            return type(value)(*children) if hasattr(value, "_fields") else children
-        if isinstance(value, list):
-            return [copy(child) for child in value]
-        return value
-
-    return copy(tree)
 
 
 # region models
@@ -145,32 +121,17 @@ def compile_runner(model, *, network, backend, execution, steps=STEPS, threshold
 
 
 # region checkpoint
-def save_checkpoint(path, runner, state, auxiliary):
-    continuation = auxiliary["continuation"]
-    # Callback export owns detached carry and metadata, excluding old traces.
-    callback_packet = runner.callbacks.export_state(continuation.callback_state)
-    payload = snapshot(
-        {
-            "state": state,
-            "parameters": continuation.parameters,
-            "constants": continuation.constants,
-            "callbacks": callback_packet,
-        }
-    )
+def save_checkpoint(path, runner, auxiliary):
+    payload = runner.export_continuation(auxiliary["continuation"])
     torch.save(payload, path)
     return payload
 
 
 def resume_checkpoint(path, receiver):
     saved = torch.load(path, weights_only=True)
-    carry = receiver.callbacks.restore_state(saved["callbacks"])
-    # A returned state continues without running initialization again.
-    return receiver(
-        saved["state"],
-        parameters=saved["parameters"],
-        constants=saved["constants"],
-        callback_state=carry,
-    )
+    continuation = receiver.restore_continuation(saved)
+    # A restored continuation resumes without running initialization again.
+    return receiver(continuation)
 
 
 # endregion checkpoint
@@ -211,10 +172,10 @@ def run_demo(*, network, backend, execution, directory):
     runner = compile_runner(
         model, network=network, backend=backend, execution=execution
     )
-    native_start = snapshot(runner.functional.extract().state)
-    prefix, first = runner()
+    native_start = runner.functional.extract().state
+    _, first = runner()
     path = directory / ("network.pt" if network else "population.pt")
-    payload = save_checkpoint(path, runner, prefix, first)
+    payload = save_checkpoint(path, runner, first)
 
     # Rebuild ordinary model, lowering plan, callbacks and compiled runner.
     receiver = compile_runner(
@@ -242,7 +203,7 @@ def run_demo(*, network, backend, execution, directory):
         threshold=-58.0,
     )
     try:
-        incompatible.callbacks.restore_state(payload["callbacks"])
+        incompatible.restore_continuation(payload)
     except dn.func.FunctionalizationError:
         pass
     else:

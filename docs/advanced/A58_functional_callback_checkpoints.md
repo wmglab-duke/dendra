@@ -7,12 +7,25 @@ kernelspec:
 ---
 
 (functional-callback-checkpoints)=
-# Save and restore callback continuation
+# Save and restore functional continuation
 
 Functional simulation state contains clocks, delay histories, event queues and
-RNG carry. Functional callbacks have separate continuation state for reductions,
-threshold crossing latches and sampling phase. Save both to resume a simulation
-and its analysis in a reconstructed runner.
+RNG carry. A complete continuation also includes the effective parameter and
+constant sources and callback state for reductions, threshold crossing latches
+and sampling phase. Both `dn.compile` runners provide the same portable bridge:
+
+```python
+packet = program.export_continuation(auxiliary["continuation"])
+torch.save(packet, path)
+
+restored = receiver.restore_continuation(torch.load(path, weights_only=True))
+state, auxiliary = receiver(restored)
+```
+
+Construct and initialize the receiving model and runner explicitly. The file
+contains versioned data and Tensors, rather than executable model configuration.
+The restored `dn.func.Continuation` supplies all four operands to the existing
+resume call.
 
 Use `runner.callbacks` to access the runner's bound callback collection. It is a
 read-only property and returns `None` when recording and reducers are omitted.
@@ -20,16 +33,12 @@ For an explicitly lowered Population or Network, use the collection returned by
 `functional.make_callbacks(...)` instead. Both expose the same `export_state`
 and `restore_state` methods.
 
-For continuation in the same compiled runner, pass
-`auxiliary["continuation"]` to its next call. That `dn.func.Continuation`
-retains effective parameters/constants, simulation state and callback carry
-with their live Tensor identities and graphs. It is an in-memory packet;
-portable serialization uses detached tensor trees plus the checked callback
-export described here. Export its `callback_state` through
-`runner.callbacks.export_state(...)` when callbacks are configured. Do not
-save the `Continuation` object as a replacement for that portable format.
+For continuation with live graph history, pass `auxiliary["continuation"]`
+directly to the next call. Portable export is a separate operation with an
+explicit autograd boundary. Save the result of `export_continuation`, rather
+than pickling the in-memory `Continuation` object.
 
-The complete
+The complete inference
 {download}`functional_callback_checkpoints.py <../../examples/functional_callback_checkpoints.py>`
 example writes actual temporary checkpoint files and reconstructs both a
 Population runner and a connected Network runner:
@@ -45,12 +54,25 @@ backend exercises compiler capture without native kernel generation. AOT eager
 selects PyTorch's ahead-of-time graph backend. These short inference examples
 verify continuation and do not measure performance.
 
+The complete training
+{download}`functional_continuation_checkpoints.py <../../examples/functional_continuation_checkpoints.py>`
+example retains fresh initialization replacements, a per-call source override
+and shared Network parameters. It checks disk restoration, joined recordings,
+source trainability and suffix gradients after the detached boundary:
+
+```console
+python examples/functional_continuation_checkpoints.py
+python examples/functional_continuation_checkpoints.py --backend aot_eager
+```
+
 ## Configure the receiving analysis explicitly
 
 A checkpoint contains data, rather than constructors for models or callbacks.
 Construct and initialize an equivalent ordinary model, compile it with the
-intended callback configurations, then restore the saved carry against that
-collection. Callback names and their bound configurations must match: this
+intended callback configurations, then restore against that runner. Owner kind,
+timestep, native mode, component layouts and the parameter/constant/state
+schemas must be compatible. Saved parameter and constant values can differ
+from the receiving runner's defaults. Callback names and their bound configurations must match: this
 includes observation paths and indices, physical regions, Population scopes,
 timestep, threshold windows, activity rules and LFP lead fields.
 
@@ -71,21 +93,23 @@ the examples use CPU float64 and a fixed timestep of 0.025 ms.
 
 ## Export and save a checkpoint
 
-`callbacks.export_state(auxiliary["callbacks"].state)` returns a versioned packet
-of ordinary data and Tensors. It contains callback carry and emission-schema
-metadata, including a schema discovered only after the first post-step emission.
-It excludes the already emitted recording history and finalized results.
-Save earlier recordings separately when they are needed.
+`program.export_continuation(auxiliary["continuation"])` returns a versioned
+packet of ordinary data and Tensors. It includes complete simulation state,
+the effective raw parameters/constants and checked callback carry with its
+emission-schema metadata. This includes a callback schema discovered only after
+the first post-step emission. It excludes already emitted recording history and
+finalized results. Save earlier recordings separately when they are needed.
 
-Export owns detached Tensor storage, including when invoked in inference mode.
-It does not mutate the supplied carry or retain its autograd graph. Callback
+Export owns detached ordinary Tensor storage, including when invoked in inference mode.
+It does not mutate the supplied continuation or retain its autograd graph. Callback
 configuration is part of the compatibility metadata; matching shapes alone is
 insufficient to establish that two reducers mean the same thing.
 
-The example stores complete simulation state and effective parameter/constant
-values from `auxiliary["continuation"]` alongside the callback packet. Its
-`snapshot` helper preserves shared parameter aliases while making independent
-detached storage:
+The runner captures the sources in `auxiliary["continuation"]`, including
+explicit overrides and fresh/cache initialization replacements. Repeated raw
+parameter/constant Tensor references retain their aliases, including cross-field
+ties. Export and restoration own storage independently of the input packet and
+runner defaults:
 
 ```{literalinclude} ../../examples/functional_callback_checkpoints.py
 :language: python
@@ -94,24 +118,27 @@ detached storage:
 ```
 
 `torch.load(..., weights_only=True)` reads the data/Tensor packet without
-requiring Python callback objects or PyTree implementation classes in the file.
-The original `FunctionalCallbackState` object is an in-memory carry type;
-export it through the collection before saving a portable checkpoint.
+requiring Python callbacks, schedule classes or PyTree implementation classes
+in the file. Trusted structured schedule values are reconstructed against the
+receiving plan's schema.
 
-`continuation.parameters` and `continuation.constants` capture the effective
-sources for every successful convenience call, including explicit overrides
-and fresh/cache replacements. Fresh-policy calls also expose these mappings
-at `auxiliary["parameters"]` and `auxiliary["constants"]`. Restoring callback
-carry does not restore model parameters, geometry, stimulation configuration,
-optimizer state or prior recording results.
+Model and stimulation declarations, runtime input/draw tapes, optimizer state
+and prior recording results are saved separately by the application. The runner
+checkpoint preserves their effective execution sources, rather than serializing
+the declarations that created them.
 
 ## Restore and continue
 
-`receiver.callbacks.restore_state(packet)` validates the checkpoint against the
-receiving collection and returns ordinary, detached `FunctionalCallbackState`
-with the receiving collection's identity. Pass that state through the existing
-`callback_state=` argument alongside the saved simulation state. Restoration
-does not call callback initialization or advance a model/RNG clock.
+`receiver.restore_continuation(packet)` validates the checkpoint against the
+receiving source plan and callback collection. It returns independently owned,
+detached ordinary Tensor trees in a `Continuation`, with the receiving callback
+collection's identity. Resume with `receiver(restored)`.
+
+Restoration does not initialize, prepare, sample or execute the model, advance
+its clock/RNG, or replace runner defaults. Existing source, schema and required
+alias checks apply. Invalid versions, malformed packets, incompatible schemas
+and mismatched callback configurations reject restoration without changing the
+receiver or supplied packet.
 
 The example compares the reconstructed runner's complete state and joined
 recordings with one uninterrupted run. A resumed Recorder emits only new
@@ -127,10 +154,44 @@ delivery and RNG continuation.
 ```
 
 A different threshold, selection, scope, timestep or lead field rejects
-restoration even if its carry has the same Tensor shapes. Invalid versions,
-malformed packets and incompatible tensor schemas also reject restoration.
-The receiving collection and supplied packet retain their values when
-validation fails.
+restoration even if callback carry has the same Tensor shapes.
+
+## Train after restoring
+
+Raw parameter and constant `requires_grad` flags are retained. Trainable restored
+sources are new leaves: they preserve tied identities but have no upstream
+computation history. Relationships between distinct saved Tensors are not
+reconstructed. If initialization produced a retained value from a raw parameter,
+the restored raw parameter and retained value are independent leaves, even when
+both have trainability enabled.
+
+Fresh or cached executions can use active retained materializations in the
+constant frame. A resumed segment then differentiates with respect to those
+effective values; a corresponding raw source may have zero or unused gradient.
+Choose the effective trainable leaves used by the model from the restored
+parameter and constant frames, deduplicated by Tensor identity, when building
+an optimizer. The receiving runner's default optimization leaves remain
+separate, and optimizer state is an application checkpoint.
+
+```{literalinclude} ../../examples/functional_continuation_checkpoints.py
+:language: python
+:start-after: "# region trainability"
+:end-before: "# endregion trainability"
+:dedent: 4
+```
+
+The Population case differentiates the resumed segment with respect to its raw
+conductance. The fresh Network case selects the retained effective conductance
+in its saved constant frame. That constant path is specific to the example's
+declaration. Inspect your model's restored frames when choosing optimization
+inputs. Both cases
+retain raw trainability and aliases while their earlier gain parameter has no
+gradient connection through the portable boundary.
+
+Use live in-memory continuation when the initialization graph must span the
+segment boundary. To train with a new initialization graph, construct a fresh
+initialized training run explicitly. Restoration does not replay initialization
+or rematerialize relationships among saved values.
 
 ## Ownership and supported configurations
 
@@ -141,7 +202,7 @@ simulation state and callback carry directly without exporting or detaching
 them. `checkpoint_every` is separate: it recomputes activations during backward
 within one graph rather than making a portable detached checkpoint.
 
-Restoration supports the same dtype and device as the receiving callback
+Restoration supports the same dtype and device as the receiving plan and callback
 collection. Cross-device and dtype-changing restoration are currently
 unsupported. Save and load a compatible model configuration rather than
 changing checkpoint metadata to force acceptance.
@@ -163,3 +224,13 @@ Restoration is the explicit checked bridge into an equivalent reconstructed
 collection. The public `(state, auxiliary)` result and `callback_state=`
 execution argument use the same contract for eager bindings, direct chunks,
 host scheduling, scan and supported inference while loops.
+
+## Save callback carry independently
+
+For explicitly lowered execution or independently managed analysis,
+`callbacks.export_state(state)` and `callbacks.restore_state(packet)` provide
+the callback-only bridge. Export owns detached carry and emission metadata;
+restore validates the same qualified configurations and attaches the receiving
+collection's identity. Pass the returned carry through `callback_state=` with
+the saved simulation state and effective sources. These methods do not save
+or restore simulation state, parameters, constants or recording history.

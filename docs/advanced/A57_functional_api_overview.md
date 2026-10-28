@@ -332,7 +332,8 @@ are independent ordinary containers. Editing a packet does not bypass source,
 schema or callback-state validation when it is resumed.
 The runner does not retain the returned packet. Tensor
 leaves remain live: keep their values unchanged until backward completes.
-Prepared coefficients and emitted recording history remain outside the packet.
+Runtime preparation is separate from the packet; emitted recordings are saved
+separately when needed.
 Packet calls prepare from their explicit sources; they do not replace the
 runner's default bindings or populate its default inference cache.
 The `(state, auxiliary)` return value and explicit keyword calls are also
@@ -363,19 +364,41 @@ explicitly:
 :dedent: 4
 ```
 
-`Continuation` is an in-memory execution packet. For an independent portable
-checkpoint, detach and clone the state, effective parameter and constant tensor
-trees. Save complete simulation state,
-including clocks, queues, delay histories and RNG carry. Tensor checkpoints can
-be serialized with PyTorch and restored against a compatible functional plan.
-Callback carry is tagged with the identity of its in-memory callback collection.
-Pass it directly when continuing with that collection. For a reconstructed
-runner, save `runner.callbacks.export_state(auxiliary["callbacks"].state)` and
-restore it through `receiver.callbacks.restore_state(packet)` before continuing.
-The checked checkpoint bridge supports built-ins and retains detached carry,
-phase and discovered emission metadata; see {doc}`A58_functional_callback_checkpoints`
-for a complete disk round-trip example and compatibility rules. Starting a new
-callback collection without restored carry starts new reductions and includes
+`Continuation` retains in-memory graph history. For an independent portable
+checkpoint, use the shared methods on either convenience runner:
+
+```python
+saved = runner.export_continuation(auxiliary["continuation"])
+torch.save(saved, path)
+
+# Construct and initialize a compatible model and runner explicitly.
+restored = receiver.restore_continuation(torch.load(path, weights_only=True))
+state, auxiliary = receiver(restored)
+```
+
+The versioned data/Tensor packet owns detached ordinary storage and preserves
+raw parameter/constant aliases and trainability flags. Restored trainable
+sources are new leaves; upstream computation graphs are not restored.
+Relationships between distinct saved Tensors are also cut. Fresh/cache
+initialization can leave active retained values in the constant frame, so
+suffix gradients may reach those effective leaves while their raw sources
+have zero or unused gradients. Choose the restored parameter/constant leaves
+used by the model for suffix optimization; use live in-memory continuation
+when initialization graphs must remain connected.
+The receiving plan validates source, state and binding schemas, required aliases
+and callback compatibility. Restoration uses the same dtype/device, does not
+initialize or execute a model, and leaves receiver defaults and RNG unchanged.
+Save runtime input/draw tapes, model declarations, optimizer state and earlier
+recordings separately. See {doc}`A58_functional_callback_checkpoints` and the
+complete
+{download}`functional_continuation_checkpoints.py <../../examples/functional_continuation_checkpoints.py>`
+example for fresh replacements, shared sources and suffix gradients.
+
+Callback carry is tagged with its in-memory collection's identity. Portable
+runner restoration uses the checked callback export/restore bridge to attach
+the receiving identity. Independently managed callbacks use
+`callbacks.export_state(...)` and `callbacks.restore_state(...)` directly.
+Starting a collection without restored carry starts new reductions and includes
 its initial boundary sample. Native state is published only through an explicit
 `functional.commit_state_(...)` call.
 

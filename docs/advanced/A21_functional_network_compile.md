@@ -477,6 +477,25 @@ optimization problem. To continue natively, publish state with
 `runner.functional.commit_state_(matching_network, state)` and align its
 parameters separately; runner calls do not commit anything automatically.
 
+Portable runner checkpoints use a versioned plain data/Tensor format:
+
+```python
+saved = runner.export_continuation(aux["continuation"])
+torch.save(saved, path)
+restored = receiver.restore_continuation(torch.load(path, weights_only=True))
+state, aux = receiver(restored)
+```
+
+Construct and initialize the receiving model/runner explicitly with compatible
+source/state schemas, timestep, native mode and callback configurations.
+Exported/restored storage is detached and independently owned; raw source
+aliases and trainability are preserved, including fresh/cache replacements.
+Restored trainable sources are new leaves, without a gradient connection to
+the prefix. Restoration does not initialize, prepare, sample, run or mutate
+receiver defaults. Runtime tapes, optimizer state and prior recordings are
+separate application checkpoints. See {doc}`A58_functional_callback_checkpoints`
+for same-dtype/device compatibility and complete Population/Network examples.
+
 To branch a native Network independently, use `copy.deepcopy(network)`. Its
 event, continuous-connection, and Population clocks refer to the copied owners.
 Stored runtime graphs are detached during copying; use explicit functional

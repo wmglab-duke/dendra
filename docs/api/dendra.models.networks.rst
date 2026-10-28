@@ -95,8 +95,18 @@ and runtime extracellular recipes remain per-call arguments. See
 :doc:`../advanced/A57_functional_api_overview` for the same Population/Network
 contract and the explicit bridge to raw bindings.
 
+``runner.export_continuation(packet)`` exports detached ordinary storage as a
+versioned plain data/Tensor checkpoint. A compatible reconstructed runner uses
+``restore_continuation(saved)`` to restore effective sources, raw
+parameter/constant aliases, trainability and checked callback carry. Restore
+validates source/state schemas, timestep, native mode and callback settings;
+it does not initialize, prepare, sample, run or mutate runner defaults. The
+checkpoint uses the same dtype/device, while model declarations, runtime tapes,
+optimizer state and recording history remain separate. See
+:doc:`../advanced/A58_functional_callback_checkpoints` for complete examples.
+
 .. autoclass:: dendra.func.CompiledNetworkRunner
-   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, callbacks, kernel, find_parameters, parameter_name, get_parameter, execution_report
+   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, callbacks, kernel, find_parameters, parameter_name, get_parameter, export_continuation, restore_continuation, execution_report
    :special-members: __call__
 
 .. autoclass:: dendra.func.PopulationCallback

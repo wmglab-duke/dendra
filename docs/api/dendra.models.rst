@@ -32,7 +32,7 @@ The :doc:`functional API overview <../advanced/A57_functional_api_overview>`
 provides complete Population and connected-Network workflows.
 
 .. autoclass:: dendra.func.CompiledRunner
-   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, callbacks, kernel, find_parameters, parameter_name, get_parameter, execution_report
+   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, callbacks, kernel, find_parameters, parameter_name, get_parameter, export_continuation, restore_continuation, execution_report
    :special-members: __call__
 
 .. autoclass:: dendra.func.PopulationTensors
@@ -72,7 +72,7 @@ The packet captures effective raw parameter/constant bindings, including call
 overrides and fresh/cache replacements, with complete simulation state and
 callback carry. Attributes are fixed; container snapshots are independent
 ordinary dictionaries/lists/tuples, and Tensor identities, aliases and gradient
-history are retained. It stores no prepared coefficients or recording history.
+history are retained. Runtime preparation and recording history are separate.
 Passing a packet cannot be combined with non-``None`` ``parameters=``,
 ``constants=``, ``callback_state=`` or ``initialization=`` overrides. Runtime
 inputs, draws and declared call-local ``extra=`` remain per-call arguments.
@@ -82,12 +82,19 @@ inputs, draws and declared call-local ``extra=`` remain per-call arguments.
 Existing explicit-state/keyword calls retain their contracts. Raw/prepared
 bindings keep explicit ownership: create a binding with ``packet.parameters``
 and ``packet.constants`` and pass ``packet.state`` and ``packet.callback_state``
-through the usual execution arguments. Portable detached checkpoints use the
-callback export/restoration bridge separately; the continuation packet is not a
-portable checkpoint format. See
+through the usual execution arguments. Save portable detached checkpoints with
+``runner.export_continuation(packet)`` and restore them with
+``receiver.restore_continuation(saved)``. The versioned plain data/Tensor format
+preserves effective raw sources, tied Tensor identities and trainability.
+Restored sources are independent leaves; receiver defaults and RNG are
+unchanged, and restoration does not initialize or execute a model. Same
+dtype/device, source/state schemas and callback compatibility are required.
+The methods reuse the callback export/restore bridge; the in-memory
+``Continuation`` object itself is not the portable format. See
 :doc:`../advanced/A57_functional_api_overview` and the complete
 :download:`functional_continuation.py <../../examples/functional_continuation.py>`
-example.
+in-memory example, or :doc:`../advanced/A58_functional_callback_checkpoints`
+for disk checkpoints.
 
 
 Functional host scheduling

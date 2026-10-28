@@ -314,13 +314,18 @@ an opaque carry object bound to the same callback collection. Passing no
 callback state starts a fresh collection at the supplied Network boundary.
 
 The example clones carry without detaching it, preserving gradients across the
-prefix. For durable independent checkpoints, save detached copies together
-with matching parameters, constants, remaining inputs, and Network
-configuration. Export callback carry with `callbacks.export_state(...)`, then
-restore it through the receiving collection's `restore_state(...)` before
-passing `callback_state=`. Convenience runners expose their bound collection
-as `runner.callbacks`. The portable packet validates callback settings and
-schemas against the receiving plan; see
+prefix. A compiled convenience program saves complete detached continuation
+with `program.export_continuation(aux["continuation"])`. Load the plain
+data/Tensor packet and pass `receiver.restore_continuation(saved)` to a
+compatible reconstructed runner. This retains effective sources, raw
+parameter/constant aliases, trainability and callback phase. Runtime tapes,
+model configuration, optimizer state and prior recordings remain separate.
+For explicitly lowered execution, export callback carry with
+`callbacks.export_state(...)` and restore it through the receiving collection's
+`restore_state(...)` before supplying `callback_state=` alongside the saved
+state and sources. Convenience runners expose their collection as
+`runner.callbacks`. The portable bridge validates callback settings and
+source/state schemas; see
 {doc}`A58_functional_callback_checkpoints` for complete Population and Network
 examples. Native continuation uses `plan.commit_state_(matching_network,
 state)` as described in {doc}`A19_functional_network_lowering`; commit transfers

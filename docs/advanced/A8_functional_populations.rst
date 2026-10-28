@@ -123,13 +123,25 @@ See :doc:`A57_functional_api_overview` and the complete
 :download:`functional_continuation.py <../../examples/functional_continuation.py>`
 example for Population and Network training and continuation.
 
-To persist callback carry and restore it with an equivalent reconstructed
-runner, use ``runner.callbacks.export_state(...)`` and
-``runner.callbacks.restore_state(...)``. The exported packet contains detached
-carry and emission metadata. Save simulation state and effective parameter
-mappings alongside it; finalized recordings remain separate. See
-:doc:`A58_functional_callback_checkpoints` for complete disk-checkpoint examples
-and callback-configuration compatibility rules.
+To save a complete portable continuation and restore it into a compatible
+reconstructed runner, use the same methods for Populations and Networks:
+
+.. code-block:: python
+
+   saved = runner.export_continuation(auxiliary["continuation"])
+   torch.save(saved, path)
+   restored = receiver.restore_continuation(torch.load(path, weights_only=True))
+   state, auxiliary = receiver(restored)
+
+Export owns detached ordinary storage while preserving raw parameter/constant
+aliases and trainability. Restore returns new trainable leaves with no prefix
+graph. It validates state/source schemas and callback compatibility without
+initializing, preparing, sampling or executing the model, and does not replace
+runner defaults. The model/runner configuration, runtime tapes, optimizer and
+earlier recordings remain application-owned. Independently managed callbacks
+use ``callbacks.export_state(...)`` / ``callbacks.restore_state(...)``. See
+:doc:`A58_functional_callback_checkpoints` for same-dtype/device compatibility
+rules and complete disk-checkpoint examples.
 
 Registered stimuli are captured with the model. Explicit time-first waveform
 inputs can instead be supplied with ``runner(inputs=dn.func.RolloutInput(...))``.
