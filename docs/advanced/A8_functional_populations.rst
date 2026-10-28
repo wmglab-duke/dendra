@@ -149,6 +149,15 @@ The runner exposes ``parameters`` as a read-only mapping of independent tensor
 copies, as well as ``constants``, ``functional``, and the compiled ``kernel``.
 Use ``runner.execution_report()`` after a call to inspect the selected strategy.
 
+``dn.func.inspect_sources(runner)`` reports the runner's default parameter and
+constant frames. To inspect overrides or fresh/cache replacements from a call,
+pass ``auxiliary["continuation"]`` instead. The read-only report exposes named
+Tensor entries, identity aliases, captured gradient/leaf flags and
+``trainable_leaves`` deduplicated by Tensor identity. Nonleaf sources remain
+visible but are excluded from the optimizer-leaf tuple. Inspection does not
+execute or validate the model, and eligibility does not imply a nonzero
+gradient. See :ref:`functional-source-inspection` for ownership and examples.
+
 For ordinary first-order backpropagation, select scan and disable inference
 explicitly. The default has no trainable parameter leaves; ``trainable`` accepts
 exact names, unambiguous partial names, glob patterns, and explicit regular

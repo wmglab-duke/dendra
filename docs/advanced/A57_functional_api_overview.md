@@ -157,6 +157,74 @@ parameter tensors; Network extraction returns independent detached snapshots.
 `tensors.independent_parameters(...)` constructs independent optimization
 leaves while preserving their aliases in either case.
 
+(functional-source-inspection)=
+## Inspect runner defaults and effective sources
+
+`dn.func.inspect_sources` accepts either `dn.compile(...)` runner type or a
+`dn.func.Continuation`. A runner reports its default parameter and constant
+frames. A continuation reports the effective frames captured for that call,
+including overrides and fresh/cache initialization replacements:
+
+```python
+program = dn.compile(model, dt=DT, steps=STEPS, inference=False)
+defaults = dn.func.inspect_sources(program)
+print(defaults)
+
+state, auxiliary = program()
+current = dn.func.inspect_sources(auxiliary["continuation"])
+print(current)
+```
+
+Both calls return a read-only `SourceReport`. Printing it, or displaying it in
+an interactive session, shows a summary and compact path tree: parameter and
+constant path counts, unique Tensors, alias groups, trainable leaves and
+gradient-enabled nonleaves. Rows show shape, dtype, device and gradient/leaf
+status; alias arrows point to the first path for the same Tensor object.
+The display abbreviates large frames, prioritizes gradient-enabled entries and
+marks omitted paths. It does not print Tensor values or transfer data between
+devices. Use `report.entries` for the full inventory.
+
+Its ordered `entries` retain every
+Tensor path: parameters first, then constants, following their frame order.
+Paths have `parameters.` or `constants.` prefixes. Network paths also include
+their collection and Population names; structured schedule fields retain their
+names. Each `SourceEntry` provides:
+
+| Attribute | Meaning |
+| --- | --- |
+| `path` | Full source path |
+| `domain` | `"parameters"` or `"constants"` |
+| `tensor` | The original live Tensor reference |
+| `aliases` | Other paths referring to that exact Tensor object |
+| `requires_grad`, `is_leaf` | Flags captured during inspection |
+
+`report.trainable_leaves` is a tuple containing each Tensor object once, in
+first-path order, when both captured flags are true. It includes qualifying
+constant leaves as well as parameters and can be supplied explicitly to an
+optimizer. Distinct Tensor views remain distinct objects even when they share
+storage.
+
+Inspection captures names, aliases and flags without copying or detaching
+Tensors. Tensor values remain live. Inspect again after replacing sources or
+changing their flags. Inspection performs no initialization, preparation,
+sampling, execution or execution-validity checks. State, callback carry,
+initialization inputs and call-local input/draw/extra sources are outside its
+scope. Call it on the host, outside `torch.compile`.
+
+Eligibility does not establish that a source affects a particular loss or has a
+nonzero gradient. Nonleaf sources with `requires_grad=True` appear in `entries`
+but are absent from `trainable_leaves`. Their upstream optimizer leaves can be
+caller-owned; inspection does not traverse their computation graphs. Existing
+`runner.trainable_parameters`, `find_parameters` and related selectors retain
+their default-parameter scope.
+
+The complete
+{download}`functional_continuation_checkpoints.py <../../examples/functional_continuation_checkpoints.py>`
+example compares default and effective inspection, lists aliases, restores
+trainable leaves and optimizes a resumed segment without selecting internal
+materialization keys. See {doc}`A58_functional_callback_checkpoints` for the
+detached checkpoint boundary.
+
 ## Deterministic drives and runtime draws are separate inputs
 
 Use one deterministic packet for a Population:
@@ -382,9 +450,11 @@ sources are new leaves; upstream computation graphs are not restored.
 Relationships between distinct saved Tensors are also cut. Fresh/cache
 initialization can leave active retained values in the constant frame, so
 suffix gradients may reach those effective leaves while their raw sources
-have zero or unused gradients. Choose the restored parameter/constant leaves
-used by the model for suffix optimization; use live in-memory continuation
-when initialization graphs must remain connected.
+have zero or unused gradients. `dn.func.inspect_sources(restored)` reports their
+paths and identity-deduplicated `trainable_leaves` for explicit suffix
+optimization. This reports eligibility, rather than discovering loss
+dependencies. Use live in-memory continuation when initialization graphs must
+remain connected.
 The receiving plan validates source, state and binding schemas, required aliases
 and callback compatibility. Restoration uses the same dtype/device, does not
 initialize or execute a model, and leaves receiver defaults and RNG unchanged.

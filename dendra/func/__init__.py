@@ -49,6 +49,7 @@ from ._population import FunctionalPopulation
 from ._runners import longrun, longrun_checkpointed, run
 from ._runtime_extra import VarInput
 from ._schedules import TensorScheduleTensors
+from ._source_inspection import SourceEntry, SourceReport, inspect_sources
 from ._stimuli import FunctionalExtra, FunctionalIntra, StimulusTensors
 from ._types import (
     FunctionalizationError,
@@ -109,12 +110,15 @@ __all__ = [
     "RolloutInput",
     "RuntimeNoiseDraw",
     "RuntimeDraws",
+    "SourceEntry",
+    "SourceReport",
     "StimulationDraw",
     "StepInput",
     "StimulusTensors",
     "TensorScheduleTensors",
     "VarInput",
     "compile",
+    "inspect_sources",
     "longrun",
     "longrun_checkpointed",
     "make_functional",

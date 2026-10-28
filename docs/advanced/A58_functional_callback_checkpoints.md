@@ -25,7 +25,9 @@ state, auxiliary = receiver(restored)
 Construct and initialize the receiving model and runner explicitly. The file
 contains versioned data and Tensors, rather than executable model configuration.
 The restored `dn.func.Continuation` supplies all four operands to the existing
-resume call.
+resume call. Both `program` and `receiver` are constructed with `dn.compile`;
+the receiver can belong to another Python process. The original program can
+also restore a checkpoint.
 
 Use `runner.callbacks` to access the runner's bound callback collection. It is a
 read-only property and returns `None` when recording and reducers are omitted.
@@ -168,10 +170,42 @@ both have trainability enabled.
 Fresh or cached executions can use active retained materializations in the
 constant frame. A resumed segment then differentiates with respect to those
 effective values; a corresponding raw source may have zero or unused gradient.
-Choose the effective trainable leaves used by the model from the restored
-parameter and constant frames, deduplicated by Tensor identity, when building
-an optimizer. The receiving runner's default optimization leaves remain
-separate, and optimizer state is an application checkpoint.
+Inspect the restored continuation to see these effective sources:
+
+```python
+report = dn.func.inspect_sources(restored)
+print(report)
+```
+
+The display summarizes source and alias counts, trainable leaves and nonleaf
+gradient-enabled sources, followed by a compact path tree with Tensor metadata.
+Large frames are abbreviated with explicit omission counts; `report.entries`
+retains the complete inventory. Tensor values are not printed.
+
+The report retains every parameter/constant Tensor path and its live Tensor
+reference. Aliases list other paths to the same object, including ties across
+the parameter and constant frames. `report.trainable_leaves` contains each
+Tensor object once when its captured `requires_grad` and `is_leaf` flags are
+both true. It does not include state or callback carry. The receiving runner's
+default optimization leaves remain separate.
+
+Pass the `dn.compile` runner to inspect its defaults, or its returned
+continuation to inspect a particular call's effective frames:
+
+```{literalinclude} ../../examples/functional_continuation_checkpoints.py
+:language: python
+:start-after: "# region source_inspection"
+:end-before: "# endregion source_inspection"
+:dedent: 4
+```
+
+Nonleaf sources remain visible in `entries` but are excluded from
+`trainable_leaves`. A live continuation can depend on caller-owned upstream
+leaves that the report cannot recover. Reports snapshot names, aliases and
+flags; Tensor values remain live. Inspect again after changing flags or source
+bindings. Source inspection does not validate the model for execution, replay
+initialization or traverse computation graphs. See
+{ref}`functional-source-inspection` for the complete inspection contract.
 
 ```{literalinclude} ../../examples/functional_continuation_checkpoints.py
 :language: python
@@ -180,13 +214,27 @@ separate, and optimizer state is an application checkpoint.
 :dedent: 4
 ```
 
-The Population case differentiates the resumed segment with respect to its raw
-conductance. The fresh Network case selects the retained effective conductance
-in its saved constant frame. That constant path is specific to the example's
-declaration. Inspect your model's restored frames when choosing optimization
-inputs. Both cases
+The example differentiates its loss with respect to the report's eligible
+leaves, rather than selecting an internal retained-value key. Its Population
+case receives a raw-conductance gradient; its fresh Network case receives
+gradients through saved effective constants. Eligibility alone does not prove
+that a leaf affects this loss: some gradients are zero or unused. Both cases
 retain raw trainability and aliases while their earlier gain parameter has no
 gradient connection through the portable boundary.
+
+After verifying continuation, the example supplies the deduplicated leaves to
+an optimizer and performs a suffix update:
+
+```{literalinclude} ../../examples/functional_continuation_checkpoints.py
+:language: python
+:start-after: "# region optimizer"
+:end-before: "# endregion optimizer"
+:dedent: 4
+```
+
+Optimizer state remains an application checkpoint. The report does not select
+trainability, freeze sources or guarantee that an optimization step changes
+every listed leaf.
 
 Use live in-memory continuation when the initialization graph must span the
 segment boundary. To train with a new initialization graph, construct a fresh

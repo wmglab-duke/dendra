@@ -106,17 +106,6 @@ def conductance(continuation, network):
     return values["populations"]["left"][G] if network else values[G]
 
 
-def suffix_conductance(continuation, network):
-    if not network:
-        return conductance(continuation, network)
-    # This fresh Network retains its derived conductance in the explicit
-    # constant frame. That saved Tensor is distinct from raw g_param; export
-    # cuts the computation relating them. This path is specific to this model.
-    return continuation.constants["populations"]["left"][
-        "materializations.values.integrator.mech.mechanisms.leak.g"
-    ]
-
-
 def demo(network, backend, directory):
     model = make_model(network)
     source = program(model, network, backend)
@@ -128,6 +117,20 @@ def demo(network, backend, directory):
     effective = conductance(original, network)
     assert effective.grad_fn is not None
     torch.testing.assert_close(effective, raw * gain * 1.5)
+
+    # region source_inspection
+    defaults = dn.func.inspect_sources(source)  # dn.compile runner defaults
+    current = dn.func.inspect_sources(original)  # Effective sources for this call
+    print(defaults)
+    print(current)
+    assert any(entry.tensor is raw for entry in defaults.entries)
+    assert any(
+        entry.tensor is effective and entry.requires_grad and not entry.is_leaf
+        for entry in current.entries
+    )
+    # The original optimizer leaves raw and gain remain caller-owned. Inspection
+    # reports the nonleaf result; it does not traverse its upstream graph.
+    # endregion source_inspection
 
     # region save
     packet = source.export_continuation(first["continuation"])
@@ -148,8 +151,15 @@ def demo(network, backend, directory):
     torch.testing.assert_close(saved_g, effective)
     if network:
         assert saved_g is restored.parameters["populations"]["right"][G]
-    used_g = suffix_conductance(restored, network)
-    assert used_g.requires_grad and used_g.is_leaf and used_g.grad_fn is None
+    report = dn.func.inspect_sources(restored)
+    leaves = report.trainable_leaves
+    assert len(leaves) == len({id(value) for value in leaves})
+    assert any(value is saved_g for value in leaves)
+    print(report)
+    if network:
+        assert any(
+            entry.tensor is saved_g and entry.aliases for entry in report.entries
+        )
     loss = sum(
         value.square().mean()
         for name, value in last["callbacks"]["trace"].items()
@@ -157,16 +167,32 @@ def demo(network, backend, directory):
     )
     gradients = torch.autograd.grad(
         loss,
-        (used_g, gain, saved_g) if network else (used_g, gain),
+        (*leaves, gain),
         allow_unused=True,
+        retain_graph=True,  # Reuse this loss for the optimizer demonstration below.
     )
-    suffix_gradient, prefix_gradient = gradients[:2]
-    assert torch.isfinite(suffix_gradient).all() and suffix_gradient.abs().sum() > 0
+    suffix_gradients, prefix_gradient = gradients[:-1], gradients[-1]
+    assert all(
+        gradient is None or torch.isfinite(gradient).all()
+        for gradient in suffix_gradients
+    )
+    nonzero = {
+        id(value)
+        for value, gradient in zip(leaves, suffix_gradients, strict=True)
+        if gradient is not None and torch.count_nonzero(gradient)
+    }
+    assert nonzero
     assert prefix_gradient is None  # Portable export cuts the prefix graph.
     if network:
-        # Retaining a trainability flag does not recreate the discarded
-        # initialization graph from raw g_param to the active retained value.
-        assert gradients[2] is None or torch.count_nonzero(gradients[2]) == 0
+        # The suffix uses saved retained constants. Inspection lists eligible
+        # leaves; differentiating this loss establishes which receive gradients.
+        assert any(
+            entry.domain == "constants" and id(entry.tensor) in nonzero
+            for entry in report.entries
+        )
+        assert id(saved_g) not in nonzero
+    else:
+        assert id(saved_g) in nonzero
     # endregion trainability
 
     whole = program(model, network, backend, steps=2 * STEPS)
@@ -178,9 +204,17 @@ def demo(network, backend, directory):
         assert joined.shape[0] == 2 * STEPS + 1
         assert suffix.shape[0] == STEPS
     assert receiver.initial_state["clock"]["t"].item() == 0
+
+    # region optimizer
+    optimizer = torch.optim.Adam(report.trainable_leaves, lr=1e-6)
+    optimizer.zero_grad(set_to_none=True)
+    loss.backward()
+    optimizer.step()
+    # endregion optimizer
+
     print(
         f"{'Network' if network else 'Population'}: portable effective sources, "
-        "trainable aliases, joined recording and detached-prefix gradients passed"
+        "source inspection, joined recording and suffix optimization passed"
     )
 
 

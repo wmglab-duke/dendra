@@ -58,6 +58,27 @@ and supply it through ``draws=``. See
 compatibility packet forms.
 
 
+Source inspection
+-----------------
+
+``dn.func.inspect_sources(runner)`` inspects the defaults of either runner
+returned by ``dn.compile``. Pass a ``Continuation`` to inspect effective
+parameter/constant frames from a call or restored checkpoint instead. Ordered
+entries expose live Tensor references, aliases and captured gradient/leaf flags.
+``report.trainable_leaves`` contains each qualifying leaf once by identity.
+State and callback carry are outside this inventory. Inspection neither executes
+the model nor proves that a source affects a particular output. See
+:ref:`functional-source-inspection` for metadata ownership and runnable examples.
+
+.. autofunction:: dendra.func.inspect_sources
+
+.. autoclass:: dendra.func.SourceReport
+   :members: entries, trainable_leaves
+
+.. autoclass:: dendra.func.SourceEntry
+   :members: path, domain, tensor, aliases, requires_grad, is_leaf
+
+
 Functional continuation
 ------------------------
 
