@@ -43,9 +43,31 @@ are in µS, continuous conductance weights are in S/cm², and time is in ms.
 The same canonical single-device lowering requirements apply to all execution
 modes. Configure training, differentiability, and the timestep before lowering.
 
-## Supply per-population tapes and NetStim packets
+## Supply canonical runtime draws
 
-`NetworkRolloutInput` has two optional fields. `populations` maps the Network's
+`plan.sample_runtime_draws(state, steps=N)` supplies one `RuntimeDraws` packet
+for all runtime stochastic requests in the Network. Pass it through `draws=`
+alongside any per-Population voltage/current tapes:
+
+```python
+draws = plan.sample_runtime_draws(initial, steps=STEPS)
+final, auxiliary = dn.func.run(
+    bound, initial, steps=STEPS, draws=draws, callbacks=callbacks,
+)
+```
+
+The packet contains named draw families and one authoritative RNG timeline
+per physical stream. It includes NetStim, model NOISE/SDE, and randomized
+Poisson stimulation requests while preserving native ordering and shared
+stream boundaries. Host execution with `draws=None` samples bounded packets
+automatically; pure execution consumes explicit stochastic inputs. See
+{ref}`functional-runtime-draws` and the complete
+{download}`functional_runtime_draws.py <../../examples/functional_runtime_draws.py>`
+example for replay, gradients, checkpointing, and continuation.
+
+## Per-population tapes and compatibility NetStim packets
+
+The existing `NetworkRolloutInput` retains two optional fields. `populations` maps the Network's
 Population names to `RolloutInput(ve=..., intra=...)`; `netstim` supplies explicit
 NetStim draws with their matching post-draw RNG bytes. Each supplied tensor has
 one leading time axis:

@@ -11,6 +11,7 @@ from torch.utils import _pytree as pytree
 
 from dendra.models.core import _validate_time_scalar
 
+from ._draws import _normalize_runtime_draws
 from ._network import make_functional_network
 from ._network_bindings import _map_containers
 from ._network_initialization import NetworkInitializationInput
@@ -326,8 +327,11 @@ class CompiledNetworkRunner:
         callback_state=None,
         initialization=None,
         extra=_MISSING_RUNTIME_EXTRA,
+        draws=None,
     ):
         _validate_host_call()
+        if draws is not None:
+            draws = _normalize_runtime_draws(draws)
         if self._runtime_extra_names:
             if extra is _MISSING_RUNTIME_EXTRA:
                 raise TypeError(
@@ -454,6 +458,8 @@ class CompiledNetworkRunner:
                     schedule = run
                     schedule_args = (self._functional, *schedule_args)
                     schedule_options = {"_runtime_extra": selected_extra}
+                if draws is not None:
+                    schedule_options["draws"] = draws
                 final, auxiliary = schedule(
                     *schedule_args,
                     steps=self._steps,

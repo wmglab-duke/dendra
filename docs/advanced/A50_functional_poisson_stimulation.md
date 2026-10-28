@@ -108,6 +108,26 @@ packet in `RolloutInput.stimulation`:
 :dedent: 4
 ```
 
+Use `sample_runtime_draws(state)` for a canonical single-timestep packet or
+`sample_runtime_draws(state, steps=N)` for a time-leading tape. Supply the
+result through `draws=` for Population or Network execution:
+
+```python
+draws = functional.sample_runtime_draws(state, steps=100)
+final, auxiliary = dn.func.run(
+    bound, state, steps=100, draws=draws, checkpoint_every=25,
+)
+```
+
+This packet contains randomized stimulation together with model NOISE, State
+SDE, and Network NetStim requests when present. Sampling follows native order
+and stores each physical stream's authoritative RNG boundary timeline once.
+Voltage/current tapes can accompany `draws=`, but explicit canonical packets
+cannot be mixed with the compatibility stochastic packet fields. Host
+execution samples missing runtime packets automatically. See
+{ref}`functional-runtime-draws` for a complete runnable example.
+
+The separate sampler methods remain supported as compatibility APIs.
 `sample_stimulation_draw(state)` supplies one `StepInput.stimulation` packet.
 `sample_stimulation_draw_tape(state, steps)` supplies a time-first rollout
 packet. Reusing the same state and packet replays the same result. Sampling a
@@ -165,8 +185,14 @@ authoritative carry; Poisson schedules remain in the stimulation state:
 :dedent: 8
 ```
 
-When supplying explicit inputs, obtain **both** packets from the same incoming
-state:
+The canonical `sample_runtime_draws(state, steps=N)` operation samples the
+coupled families together. Pass its result through `draws=`; no paired packet
+assembly is required. The packet retains one authoritative RNG timeline per
+physical generator, including native publication boundaries. Its sampling
+does not advance the source generator.
+
+When using compatibility packet fields, obtain **both** packets from the same
+incoming state:
 
 ```{literalinclude} ../../examples/functional_stimulation_rng_sharing.py
 :language: python

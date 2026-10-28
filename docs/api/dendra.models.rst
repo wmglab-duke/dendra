@@ -27,6 +27,15 @@ the live ``requires_grad`` subset. See
 
 .. autoclass:: dendra.func.VarInput
 
+.. autoclass:: dendra.func.RuntimeDraws
+   :members: draws, rng
+
+``RuntimeDraws`` is the canonical runtime stochastic input packet for both
+Populations and Networks. Obtain it with ``functional.sample_runtime_draws``
+and supply it through ``draws=``. See
+:ref:`functional-runtime-draws` for sampling, slicing, continuation, and the
+compatibility packet forms.
+
 
 Functional host scheduling
 --------------------------

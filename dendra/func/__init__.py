@@ -24,6 +24,7 @@ from ._continuous import (
     make_functional_continuous_con,
 )
 from ._convenience import CompiledRunner, compile
+from ._draws import RuntimeDraws
 from ._execution import ExecutionCapabilities, ExecutionReport
 from ._netcon import FunctionalNetCon, NetConTensors, make_functional_netcon
 from ._netstim import (
@@ -102,6 +103,7 @@ __all__ = [
     "Recorder",
     "RolloutInput",
     "RuntimeNoiseDraw",
+    "RuntimeDraws",
     "StimulationDraw",
     "StepInput",
     "StimulusTensors",

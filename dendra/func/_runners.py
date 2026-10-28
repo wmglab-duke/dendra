@@ -19,6 +19,12 @@ from ._callbacks import (
     _complete_callback_results,
     _setup_callback_state,
 )
+from ._draws import (
+    RuntimeDraws,
+    _normalize_runtime_draws,
+    _runtime_draws_binding,
+    _with_runtime_draws,
+)
 from ._network_binding import BoundNetwork
 from ._population import FunctionalPopulation
 from ._stimuli import FunctionalExtra, StimulusTensors
@@ -27,6 +33,15 @@ from ._types import FunctionalizationError, RolloutInput, StepInput, _index_step
 
 _StepCallable = Callable[[Mapping[str, object], StepInput], tuple[object, object]]
 _MISSING = object()
+_OWNED_RUNTIME_DRAW_SAMPLER = FunctionalPopulation.sample_runtime_draws
+_OWNED_RUNTIME_SAMPLERS = {
+    name: getattr(FunctionalPopulation, name)
+    for name in (
+        "sample_noise_draw_tape",
+        "sample_stimulation_draw_tape",
+        "_sample_missing_runtime_draws",
+    )
+}
 
 
 @dataclass(frozen=True)
@@ -129,19 +144,24 @@ def _prepare_compiled_schedule(execution, steps, chunklength, *, callbacks):
     return replace(execution, compiled_chunks=kernels)
 
 
-def _refresh_checkpoint_execution(execution: _StepExecution, state) -> _StepExecution:
-    """Revalidate captured bindings once for each checkpoint invocation.
+def _refresh_checkpoint_execution(
+    execution: _StepExecution, state, *, source_validated=False
+) -> _StepExecution:
+    """Revalidate bindings after authored sampling and at checkpoint replay.
 
     Non-reentrant checkpointing invokes a chunk again during backward, after
     user code has had an opportunity to mutate captured tensors or the source
     model.  Rechecking at that replay boundary preserves the public freshness
     contract without putting Python validation back inside the timestep loop.
+    An owned sampler boundary can reuse its immediate source validation while
+    still checking independent preparation inputs after authored sampling.
     """
     binding = execution.binding
     if binding is None:
         return execution
     functional = binding.functional
-    functional._validate_source()
+    if not source_validated:
+        functional._validate_source()
     functional._validate_parameters(binding.parameters)
     functional._validate_state(state)
     prepared_values = functional._validate_prepared(
@@ -389,21 +409,58 @@ def _slice_inputs(inputs: RolloutInput, start: int, stop: int) -> RolloutInput:
         intra=None if inputs.intra is None else inputs.intra[start:stop],
         noise=None
         if inputs.noise is None
-        else torch.utils._pytree.tree_map(
-            lambda value: value[start:stop], inputs.noise
+        else torch.utils._pytree.tree_map_only(
+            torch.Tensor, lambda value: value[start:stop], inputs.noise
         ),
         stimulation=None
         if inputs.stimulation is None
-        else torch.utils._pytree.tree_map(
-            lambda value: value[start:stop], inputs.stimulation
+        else torch.utils._pytree.tree_map_only(
+            torch.Tensor, lambda value: value[start:stop], inputs.stimulation
         ),
     )
 
 
-def _prepare_chunk_inputs(functional, state, inputs, start, stop):
+def _canonical_runtime_sampling_available(functional, inputs):
+    """Use the canonical sampler without bypassing legacy public overrides."""
+    if inputs.noise is not None or inputs.stimulation is not None:
+        return False
+    if not (
+        functional._noise_plan is not None
+        and functional._noise_plan.runtime
+        or getattr(functional, "_poisson_plan", None) is not None
+    ):
+        return False
+    return all(
+        getattr(getattr(functional, name), "__self__", None) is functional
+        and getattr(getattr(functional, name), "__func__", None) is original
+        for name, original in _OWNED_RUNTIME_SAMPLERS.items()
+    )
+
+
+def _prepare_chunk_inputs(functional, state, inputs, start, stop, *, canonical=False):
     """Slice explicit inputs and sample missing packets at one host boundary."""
     chunk_steps = stop - start
     chunk_inputs = _slice_inputs(inputs, start, stop)
+    if isinstance(chunk_inputs.noise, RuntimeDraws):
+        return chunk_inputs
+    if canonical and _canonical_runtime_sampling_available(functional, chunk_inputs):
+        public_sampler = functional.sample_runtime_draws
+        owned_sampler = (
+            getattr(public_sampler, "__self__", None) is functional
+            and getattr(public_sampler, "__func__", None) is _OWNED_RUNTIME_DRAW_SAMPLER
+        )
+        sampler = (
+            functional._sample_runtime_draws_source_validated
+            if owned_sampler
+            else public_sampler
+        )
+        packet = sampler(state, steps=chunk_steps)
+        chunk_inputs = _with_runtime_draws(chunk_inputs, packet)
+        # Public samplers and Mapping providers can execute authored Python.
+        if not owned_sampler:
+            functional._validate_source()
+        functional._runtime_draw_plan.validate(chunk_inputs.noise, steps=chunk_steps)
+        return chunk_inputs
     chunk_inputs = functional._sample_missing_runtime_draws(
         state, chunk_inputs, chunk_steps
     )
@@ -809,7 +866,20 @@ def _execute_chunks(
     auxiliary = None
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
-        chunk_inputs = _prepare_chunk_inputs(functional, state, inputs, start, stop)
+        chunk_inputs = _prepare_chunk_inputs(
+            functional,
+            state,
+            inputs,
+            start,
+            stop,
+            **(
+                {"canonical": True} if type(step.public_step) is BoundPopulation else {}
+            ),
+        )
+        if isinstance(chunk_inputs.noise, RuntimeDraws) and not isinstance(
+            inputs.noise, RuntimeDraws
+        ):
+            step = _refresh_checkpoint_execution(step, state, source_validated=True)
         extra_ve = _assemble_extra_chunk(
             functional,
             extra_plan,
@@ -900,11 +970,32 @@ def _execute_checkpointed_chunks(
         if runtime_extra_slot and extra_plan is not None
         else None
     )
+    full_draws = inputs.noise if isinstance(inputs.noise, RuntimeDraws) else None
+    full_draws_binding = (
+        None if full_draws is None else _runtime_draws_binding(full_draws)
+    )
     auxiliary: Any = None
     for start, stop in _execution_spans(steps, chunklength):
         chunk_steps = stop - start
         start_clock = _capture_clock(state)
-        chunk_inputs = _prepare_chunk_inputs(functional, state, inputs, start, stop)
+        chunk_inputs = _prepare_chunk_inputs(
+            functional,
+            state,
+            inputs,
+            start,
+            stop,
+            **(
+                {"canonical": True}
+                if type(execution.public_step) is BoundPopulation
+                else {}
+            ),
+        )
+        source_draws = (
+            chunk_inputs.noise if isinstance(chunk_inputs.noise, RuntimeDraws) else None
+        )
+        source_draws_binding = (
+            None if source_draws is None else _runtime_draws_binding(source_draws)
+        )
         checkpoint_inputs = _materialize_checkpoint_tree(
             (
                 state,
@@ -930,7 +1021,18 @@ def _execute_checkpointed_chunks(
             chunk_steps=chunk_steps,
             chunk_start=start,
             total_steps=steps,
+            source_draws=source_draws,
+            source_draws_binding=source_draws_binding,
         ):
+            if (
+                full_draws_binding is not None
+                and _runtime_draws_binding(full_draws) != full_draws_binding
+                or source_draws_binding is not None
+                and _runtime_draws_binding(source_draws) != source_draws_binding
+            ):
+                raise FunctionalizationError(
+                    "runtime draws changed after checkpoint forward; run a new forward before backward"
+                )
             if extra_binding is not None and (
                 _runtime_extra_checkpoint_binding(extra_plan, extra_tensors)
                 != extra_binding
@@ -1187,11 +1289,18 @@ def _execute_schedule(
 ):
     """Execute resolved scheduling operands without legacy horizon policies."""
     inputs, steps = _resolve_inputs(functional, inputs, steps)
-    if inputs.noise is not None or steps == 0:
-        functional._validate_noise_draw(inputs.noise, steps=steps)
-    if inputs.stimulation is not None or steps == 0:
-        functional._validate_stimulation_draw(inputs.stimulation, steps=steps)
-    functional._stimulation_rng_plan.validate_packets(inputs.noise, inputs.stimulation)
+    if isinstance(inputs.noise, RuntimeDraws):
+        if inputs.stimulation is not None:
+            raise ValueError("draws cannot be combined with legacy stimulation packets")
+        functional._runtime_draw_plan.validate(inputs.noise, steps=steps)
+    else:
+        if inputs.noise is not None or steps == 0:
+            functional._validate_noise_draw(inputs.noise, steps=steps)
+        if inputs.stimulation is not None or steps == 0:
+            functional._validate_stimulation_draw(inputs.stimulation, steps=steps)
+        functional._stimulation_rng_plan.validate_packets(
+            inputs.noise, inputs.stimulation
+        )
     chunklength = max(steps, 1) if span is None else span
     use_checkpoint = checkpointed and torch.is_grad_enabled() and steps > 0
     if use_checkpoint:
@@ -1258,6 +1367,7 @@ def _run_bound_network(
     extra,
     callbacks,
     callback_state,
+    draws=None,
 ):
     """Resolve the shared host contract over Network's existing chunk engine."""
     from ._network_bindings import _canonicalize_mapping_tree, _map_containers
@@ -1265,6 +1375,8 @@ def _run_bound_network(
     from ._runner_policy import _validate_host_call
 
     _validate_host_call()
+    if draws is not None:
+        draws = _normalize_runtime_draws(draws)
     (state, inputs), _ = _canonicalize_mapping_tree((state, inputs))
     if extra is not None:
         if not isinstance(extra, Mapping):
@@ -1306,6 +1418,7 @@ def _run_bound_network(
                 "duration_remainder": remainder.new_tensor(pending),
             },
         }
+    options = {} if draws is None else {"draws": draws}
     return run_network(
         functional,
         bound._parameters,
@@ -1319,6 +1432,7 @@ def _run_bound_network(
         callback_state=callback_state,
         compiled_chunk=bound.compiled_chunk,
         _runtime_extra=extra,
+        **options,
     )
 
 
@@ -1338,6 +1452,7 @@ def run(
     _runtime_extra_slot=False,
     callbacks: FunctionalCallbacks | None = None,
     callback_state=None,
+    draws=None,
 ):
     """Schedule explicit functional execution, optionally with checkpointing.
 
@@ -1420,7 +1535,9 @@ def run(
                 extra=extra,
                 callbacks=callbacks,
                 callback_state=callback_state,
+                draws=draws,
             )
+        inputs = _with_runtime_draws(inputs, draws)
         return _run_schedule(
             bound.functional,
             bound,
@@ -1443,6 +1560,8 @@ def run(
         raise ValueError(
             "steps, duration and span options require run(bound, state, ...)"
         )
+    if draws is not None:
+        raise ValueError("draws requires run(bound, state, ...)")
     if step is _MISSING or state is _MISSING:
         raise TypeError("legacy run requires functional, step and state")
     from ._runner_compat import run_legacy_schedule

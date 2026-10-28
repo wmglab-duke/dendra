@@ -10,6 +10,7 @@ import torch
 from dendra._bootstrap import isolate_compilation_callable
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
+from ._draws import _with_runtime_draws
 from ._execution import (
     ExecutionCapabilities,
     ExecutionReport,
@@ -322,13 +323,13 @@ class CompiledPopulationChunk:
             None,
             None
             if inputs.noise is None
-            else torch.utils._pytree.tree_map(
-                lambda value: value.unsqueeze(0), inputs.noise
+            else torch.utils._pytree.tree_map_only(
+                torch.Tensor, lambda value: value.unsqueeze(0), inputs.noise
             ),
             None
             if inputs.stimulation is None
-            else torch.utils._pytree.tree_map(
-                lambda value: value.unsqueeze(0), inputs.stimulation
+            else torch.utils._pytree.tree_map_only(
+                torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
             ),
         )
         # A one-step kernel has no large rollout graph to bound, so the
@@ -358,6 +359,8 @@ class CompiledPopulationChunk:
         prepared,
         state,
         inputs: RolloutInput | StepInput | None = None,
+        *,
+        draws=None,
     ):
         if torch.compiler.is_compiling():
             raise FunctionalizationError(
@@ -365,6 +368,7 @@ class CompiledPopulationChunk:
                 "around a compiled tensor kernel; call it directly instead of "
                 "passing it through torch.compile"
             )
+        inputs = _with_runtime_draws(inputs, draws, step=isinstance(inputs, StepInput))
         if isinstance(inputs, StepInput):
             if self._steps != 1:
                 raise TypeError(
@@ -378,13 +382,13 @@ class CompiledPopulationChunk:
                 intra=None if inputs.intra is None else inputs.intra.unsqueeze(0),
                 noise=None
                 if inputs.noise is None
-                else torch.utils._pytree.tree_map(
-                    lambda value: value.unsqueeze(0), inputs.noise
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.noise
                 ),
                 stimulation=None
                 if inputs.stimulation is None
-                else torch.utils._pytree.tree_map(
-                    lambda value: value.unsqueeze(0), inputs.stimulation
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
                 ),
             )
         functional = self._functional

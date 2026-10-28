@@ -83,6 +83,26 @@ def _replace_path(tree, path, value):
     return result
 
 
+def _tensor_samples(tapes, steps, device):
+    """Pack Tensor leaves once, retaining static None positions for the body."""
+    values, spec = pytree.tree_flatten(tapes)
+    tensors, positions = [], []
+    for value in values:
+        if value is None:
+            positions.append(None)
+        else:
+            positions.append(len(tensors))
+            tensors.append(value)
+    if any(
+        not torch.is_tensor(value) or value.ndim < 1 or value.shape[0] != steps
+        for value in tensors
+    ):
+        raise ValueError("scan input tapes require a matching leading time axis")
+    if not tensors:
+        tensors.append(torch.arange(steps, dtype=torch.int64, device=device))
+    return tuple(tensors), (spec, tuple(positions))
+
+
 class _CompiledTensorTreeScan:
     """Lazy shared scan capture for an adapter's fixed-horizon tensor step.
 
@@ -125,26 +145,7 @@ class _CompiledTensorTreeScan:
         self._kernels = {}
 
     def _samples(self, tapes):
-        values, spec = pytree.tree_flatten(tapes)
-        tensors, positions = [], []
-        for value in values:
-            if value is None:
-                positions.append(None)
-            else:
-                positions.append(len(tensors))
-                tensors.append(value)
-        if any(
-            not torch.is_tensor(value)
-            or value.ndim < 1
-            or value.shape[0] != self._steps
-            for value in tensors
-        ):
-            raise ValueError("scan input tapes require a matching leading time axis")
-        if not tensors:
-            tensors.append(
-                torch.arange(self._steps, dtype=torch.int64, device=self._device)
-            )
-        return tuple(tensors), (spec, tuple(positions))
+        return _tensor_samples(tapes, self._steps, self._device)
 
     def _capture(
         self,

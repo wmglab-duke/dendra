@@ -1745,8 +1745,10 @@ unsupported. A fixed Poisson schedule is supported as an explicit tensor
 leaf. To choose another fixed schedule, call ``regenerate_schedule_()`` before
 lowering and keep ``randomize_every_call=False``. For a schedule regenerated
 on each functional step, use finite ``n`` and ``randomize_every_call=True``;
-the pure API requires ``StepInput.stimulation`` or
-``RolloutInput.stimulation``, and compiled host runners supply missing packets.
+the pure API accepts explicit runtime packets through ``draws=`` as described
+in :ref:`functional-runtime-draws`. The compatibility fields
+``StepInput.stimulation`` and ``RolloutInput.stimulation`` remain supported,
+and compiled host runners supply missing packets.
 Other explicit setup operations, such as ``expand()`` and
 ``reshape_for_intra()``, are outside the evaluation purity contract and should
 be completed before ``make_functional``.
@@ -1760,6 +1762,66 @@ Python-state mutation and RNG use. The marker and numerical probes are not
 required in the default trust mode. When the same authored Waveform is
 needed for both registered intra and bound extra, use distinct instances so
 their explicit parameter namespaces cannot silently diverge.
+
+.. _functional-runtime-draws:
+
+Canonical runtime draw packets
+------------------------------
+
+``RuntimeDraws`` carries the runtime stochastic inputs for a Population or
+Network. Sample one packet for a pure timestep, or a time-leading tape for a
+rollout, outside compiled or transformed code:
+
+.. code-block:: python
+
+   step_draws = functional.sample_runtime_draws(state)
+   next_state, auxiliary = functional.step(
+       parameters, prepared, state, draws=step_draws,
+   )
+   tape = functional.sample_runtime_draws(state, steps=100)
+   final_state, auxiliary = dn.func.run(
+       bound, state, steps=100, draws=tape, checkpoint_every=25,
+   )
+
+The same ``sample_runtime_draws`` and ``draws=`` contract covers model NOISE,
+State SDEs, randomized Poisson stimulation, and Network NetStim draws. A
+packet contains named draw families in ``draws`` and their authoritative RNG
+boundary timelines in ``rng``. One physical stream is represented once, with
+the boundaries required by native execution. Ordinary shared Network streams
+retain per-Population boundaries; streams shared with Poisson stimulation
+retain the common timestep suffix. Use the sampler's schema rather than
+assembling those mappings manually.
+For Populations without recurrent NOISE or State SDE draws, initialization-only
+model RNG carry remains in checkpoint state and is omitted from runtime tapes
+unless a Poisson consumer borrows the stream.
+
+Sampling leaves the supplied state, source model, and global PyTorch RNG
+unchanged. It follows native request order, including repeated waveform
+invocations. A ``steps=N`` tape adds a leading time axis to its tensor leaves;
+slice all of them together with PyTorch's PyTree operations when selecting a
+prefix or continuation. Explicit ``steps`` also supplies an unambiguous horizon
+for deterministic models whose packets contain no stochastic tensor leaves.
+
+Pure step, rollout, and compiled-chunk calls consume explicit packets. Host
+``run`` and ``dn.compile`` calls with ``draws=None`` sample omitted runtime
+inputs in bounded spans. Checkpoint replay consumes the forward packets and
+does not sample again. With ``inference=False``, model, drift, diffusion,
+waveform, and field gradients retain their native contracts; stochastic base
+draws and generator state remain detached. Keep inputs unchanged until
+backward completes.
+
+Voltage/current input tapes can accompany ``draws=``. Explicit canonical draws
+cannot be mixed with the compatibility ``noise``, ``stimulation``, or Network
+``netstim`` packet fields. Those fields, their existing NamedTuple layouts,
+and the separate sampler methods remain supported through compatibility
+adapters. Initialization draws use their separate initialization input fields.
+
+The complete
+:download:`functional_runtime_draws.py <../../examples/functional_runtime_draws.py>`
+example checks native Population and Network trajectories, explicit versus
+automatic sampling, checkpoint continuation, recording, and gradients. Run
+``python examples/functional_runtime_draws.py`` from the repository root;
+``--backend aot_eager`` selects AOT eager compilation for its Network chunk.
 
 Host-side simulation
 --------------------

@@ -16,6 +16,7 @@ from torch.utils import _pytree as pytree
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._callbacks import _update_callback_values
+from ._draws import RuntimeDraws, _has_runtime_stimulation
 from ._hop_inputs import (
     _input_usage,
     _isolate_dense_lifted_inputs,
@@ -23,7 +24,7 @@ from ._hop_inputs import (
 )
 from ._scan_compat import install_scan_compatibility
 from ._scan_inductor import _compile_scan
-from ._scan_tree import _capture_tensor_step, _CompiledTensorTreeScan
+from ._scan_tree import _capture_tensor_step, _CompiledTensorTreeScan, _tensor_samples
 from ._tensor_contracts import _clone_contiguous_tree as _clone
 from ._types import StepInput
 
@@ -39,7 +40,10 @@ def _detach(tree):
 
 
 def _stack_steps(steps):
-    return pytree.tree_map(lambda *values: torch.stack(values, dim=0), *steps)
+    return pytree.tree_map(
+        lambda *values: None if values[0] is None else torch.stack(values, dim=0),
+        *steps,
+    )
 
 
 class _CompiledScanPopulationChunk:
@@ -73,7 +77,7 @@ class _CompiledScanPopulationChunk:
         # Population parameters are named operands. Stable key order keeps
         # the shared engine's PyTree schema independent of caller dict order.
         parameters = {name: parameters[name] for name in sorted(parameters)}
-        stepwise = self._stepwise or stimulation is not None
+        stepwise = self._stepwise or _has_runtime_stimulation(noise, stimulation)
         if not stepwise and (functional.intra.enabled or functional.extra.enabled):
             signature = (ve is not None, intra is not None, MEMBRANE_ASSEMBLY.value)
             if signature not in self._assemblies:
@@ -110,7 +114,9 @@ class _CompiledScanPopulationChunk:
             stepwise_stimulation = self._stepwise
 
             def body(parameters, prepared, state, carries, sample):
-                if stepwise_stimulation or sample["stimulation"] is not None:
+                if stepwise_stimulation or _has_runtime_stimulation(
+                    sample["noise"], sample["stimulation"]
+                ):
                     next_state, auxiliary = functional._step_values(
                         parameters,
                         prepared,
@@ -134,8 +140,10 @@ class _CompiledScanPopulationChunk:
                         1,
                         None
                         if sample["noise"] is None
-                        else pytree.tree_map(
-                            lambda value: value.unsqueeze(0), sample["noise"]
+                        else pytree.tree_map_only(
+                            torch.Tensor,
+                            lambda value: value.unsqueeze(0),
+                            sample["noise"],
                         ),
                     )
                 emitted = None
@@ -191,7 +199,7 @@ class _CompiledScanPopulationChunk:
         functional = self._functional
         plans = self._plans
         steps = self._steps
-        stepwise = self._stepwise or stimulation is not None
+        stepwise = self._stepwise or _has_runtime_stimulation(noise, stimulation)
         phase_emissions = (
             block > 1 and plans is not None and functional.device.type == "cpu"
         )
@@ -229,10 +237,14 @@ class _CompiledScanPopulationChunk:
         if intra is not None:
             sample["intra"] = intra[0]
         if noise is not None:
-            sample["noise"] = pytree.tree_map(lambda value: value[0], noise)
+            sample["noise"] = pytree.tree_map_only(
+                torch.Tensor, lambda value: value[0], noise
+            )
         if stimulation is not None:
-            sample["stimulation"] = pytree.tree_map(lambda value: value[0], stimulation)
-        if not sample:
+            sample["stimulation"] = pytree.tree_map_only(
+                torch.Tensor, lambda value: value[0], stimulation
+            )
+        if not any(torch.is_tensor(value) for value in pytree.tree_leaves(sample)):
             # Scan requires a leading iteration axis even without input drives.
             sample["index"] = torch.zeros(
                 (), dtype=torch.int64, device=functional.device
@@ -261,8 +273,8 @@ class _CompiledScanPopulationChunk:
                     1,
                     None
                     if "noise" not in sample
-                    else pytree.tree_map(
-                        lambda value: value.unsqueeze(0), sample["noise"]
+                    else pytree.tree_map_only(
+                        torch.Tensor, lambda value: value.unsqueeze(0), sample["noise"]
                     ),
                 )
             emitted = None
@@ -333,14 +345,26 @@ class _CompiledScanPopulationChunk:
                 samples["noise"] = noise
             if stimulation is not None:
                 samples["stimulation"] = stimulation
-            if not samples:
+            if not any(torch.is_tensor(value) for value in pytree.tree_leaves(samples)):
                 samples["index"] = torch.arange(
                     steps, dtype=torch.int64, device=functional.device
+                )
+
+            flat_samples, sample_layout = _tensor_samples(
+                samples, steps, functional.device
+            )
+
+            def unpack_sample(values):
+                spec, positions = sample_layout
+                return pytree.tree_unflatten(
+                    [None if index is None else values[index] for index in positions],
+                    spec,
                 )
 
             if block == 1:
 
                 def combine(carry, sample):
+                    sample = unpack_sample(sample)
                     state, carries = carry
                     return graph(
                         parameters, prepared, state, carries, invariant_carries, sample
@@ -349,7 +373,7 @@ class _CompiledScanPopulationChunk:
                 (final, updated), emitted = scan(
                     combine,
                     (functional._clone_state_tree(state), _clone(carries)),
-                    samples,
+                    flat_samples,
                 )
             else:
                 full_steps = (steps // block) * block
@@ -358,7 +382,11 @@ class _CompiledScanPopulationChunk:
                 def combine(carry, samples):
                     emissions = []
                     for offset in range(block):
-                        sample = pytree.tree_map(lambda value: value[offset], samples)
+                        sample = unpack_sample(
+                            pytree.tree_map_only(
+                                torch.Tensor, lambda value: value[offset], samples
+                            )
+                        )
                         carry, emission = graph(
                             parameters, prepared, *carry, invariant_carries, sample
                         )
@@ -371,7 +399,8 @@ class _CompiledScanPopulationChunk:
                         # output metadata from identical final-carry values.
                         # Copy each accepted frame, not a four-frame block.
                         phases = tuple(
-                            pytree.tree_map(
+                            pytree.tree_map_only(
+                                torch.Tensor,
                                 lambda value: value.unsqueeze(0).clone(
                                     memory_format=torch.contiguous_format
                                 ),
@@ -382,23 +411,28 @@ class _CompiledScanPopulationChunk:
                         return _clone(carry), phases
                     return _clone(carry), _stack_steps(emissions)
 
-                blocked_samples = pytree.tree_map(
+                blocked_samples = pytree.tree_map_only(
+                    torch.Tensor,
                     lambda value: value[:full_steps].reshape(
                         full_steps // block, block, *value.shape[1:]
                     ),
-                    samples,
+                    flat_samples,
                 )
                 carry, emitted = scan(combine, carry, blocked_samples)
                 if not phase_emissions:
-                    emitted = pytree.tree_map(
-                        lambda value: value.flatten(0, 1), emitted
+                    emitted = pytree.tree_map_only(
+                        torch.Tensor, lambda value: value.flatten(0, 1), emitted
                     )
 
                 # At most block-1 authored steps. Short horizons reduce the
                 # effective block width before capture, retaining a real scan.
                 tail = []
                 for index in range(full_steps, steps):
-                    sample = pytree.tree_map(lambda value: value[index], samples)
+                    sample = unpack_sample(
+                        pytree.tree_map_only(
+                            torch.Tensor, lambda value: value[index], flat_samples
+                        )
+                    )
                     carry, emission = graph(
                         parameters, prepared, *carry, invariant_carries, sample
                     )
@@ -407,7 +441,9 @@ class _CompiledScanPopulationChunk:
                     tail = _stack_steps(tail)
                     if not phase_emissions:
                         emitted = pytree.tree_map(
-                            lambda prefix, suffix: torch.cat((prefix, suffix), dim=0),
+                            lambda prefix, suffix: None
+                            if prefix is None
+                            else torch.cat((prefix, suffix), dim=0),
                             emitted,
                             tail,
                         )
@@ -472,11 +508,16 @@ class _CompiledScanPopulationChunk:
                 # Each phase history is (blocks, 1, *sample_shape). Interleave
                 # once outside the hot compiled loop, in accepted-clock order.
                 emitted = pytree.tree_map(
-                    lambda *values: torch.cat(values, dim=1).flatten(0, 1), *phases
+                    lambda *values: None
+                    if values[0] is None
+                    else torch.cat(values, dim=1).flatten(0, 1),
+                    *phases,
                 )
                 if tail is not None:
                     emitted = pytree.tree_map(
-                        lambda prefix, suffix: torch.cat((prefix, suffix), dim=0),
+                        lambda prefix, suffix: None
+                        if prefix is None
+                        else torch.cat((prefix, suffix), dim=0),
                         emitted,
                         tail,
                     )
@@ -519,6 +560,8 @@ class _CompiledScanPopulationChunk:
                 intra is not None,
                 noise is not None,
                 stimulation is not None,
+                isinstance(noise, RuntimeDraws),
+                _has_runtime_stimulation(noise, stimulation),
                 MEMBRANE_ASSEMBLY.value,
                 block,
             )

@@ -11,6 +11,7 @@ from torch.utils import _pytree as pytree
 
 from ._binding import BoundPopulation
 from ._compiled import CompiledPopulationChunk
+from ._draws import RuntimeDraws, _with_runtime_draws
 from ._parameter_queries import matching_names
 from ._parameter_queries import parameter_name as _parameter_name
 from ._population import (
@@ -24,7 +25,13 @@ from ._runner_policy import (
     _validate_host_call,
     _validate_host_construction,
 )
-from ._runners import _run_source_validated, _slice_inputs, run
+from ._runners import (
+    _canonical_runtime_sampling_available,
+    _prepare_chunk_inputs,
+    _run_source_validated,
+    _slice_inputs,
+    run,
+)
 from ._runtime_extra import (
     _MISSING_RUNTIME_EXTRA,
     VarInput,
@@ -37,6 +44,8 @@ _OWNED_BIND = CompiledPopulationChunk.bind
 _OWNED_RUN = run
 _OWNED_NOISE_TAPE = FunctionalPopulation.sample_noise_draw_tape
 _OWNED_STIMULATION_TAPE = FunctionalPopulation.sample_stimulation_draw_tape
+_OWNED_MISSING_DRAWS = FunctionalPopulation._sample_missing_runtime_draws
+_OWNED_RUNTIME_DRAW_SAMPLER = FunctionalPopulation.sample_runtime_draws
 
 
 def _initialization_input_mapping(inputs):
@@ -373,18 +382,27 @@ class CompiledRunner:
                     dtype=functional.dtype,
                 )
             )
-            inputs = functional._sample_missing_runtime_draws(state, inputs, steps)
-            if inputs.noise is None:
-                inputs = inputs._replace(
-                    noise=functional.sample_noise_draw_tape(state, steps)
+            if _canonical_runtime_sampling_available(functional, inputs):
+                inputs = _prepare_chunk_inputs(
+                    functional, state, inputs, 0, steps, canonical=True
                 )
-            if inputs.stimulation is None and functional._poisson_plan is not None:
-                inputs = inputs._replace(
-                    stimulation=functional.sample_stimulation_draw_tape(state, steps)
-                )
+            elif not isinstance(inputs.noise, RuntimeDraws):
+                inputs = functional._sample_missing_runtime_draws(state, inputs, steps)
+                if inputs.noise is None:
+                    inputs = inputs._replace(
+                        noise=functional.sample_noise_draw_tape(state, steps)
+                    )
+                if inputs.stimulation is None and functional._poisson_plan is not None:
+                    inputs = inputs._replace(
+                        stimulation=functional.sample_stimulation_draw_tape(
+                            state, steps
+                        )
+                    )
             # Public sampler replacements can execute authored code. Qualify
             # the source after their calls and before capturing a loop body.
             functional._validate_source()
+            functional._validate_parameters(parameters)
+            values = functional._validate_prepared(prepared, parameters)
         ve, intra, _ = functional._resolve_rollout_inputs(inputs, steps)
         callbacks = self._callbacks
         carry = (
@@ -421,8 +439,10 @@ class CompiledRunner:
         callback_state=None,
         initialization=None,
         extra=_MISSING_RUNTIME_EXTRA,
+        draws=None,
     ):
         _validate_host_call()
+        inputs = _with_runtime_draws(inputs, draws)
         if self._runtime_extra:
             if extra is _MISSING_RUNTIME_EXTRA:
                 raise TypeError("extra must be supplied for extra=VarInput()")
@@ -519,6 +539,14 @@ class CompiledRunner:
                             self._functional.sample_stimulation_draw_tape,
                             _OWNED_STIMULATION_TAPE,
                         ),
+                        (
+                            self._functional._sample_missing_runtime_draws,
+                            _OWNED_MISSING_DRAWS,
+                        ),
+                        (
+                            self._functional.sample_runtime_draws,
+                            _OWNED_RUNTIME_DRAW_SAMPLER,
+                        ),
                     )
                 )
             )
@@ -554,13 +582,35 @@ class CompiledRunner:
                 raise TypeError("inputs must be a RolloutInput or None")
             if self._runtime_extra and inputs.ve is not None:
                 raise ValueError("explicit ve cannot be combined with runtime extra")
-            if self._execution == "while" and not self._runtime_extra:
+            if isinstance(inputs.noise, RuntimeDraws):
+                self._functional._runtime_draw_plan.validate(
+                    inputs.noise, steps=self._steps
+                )
+            if (
+                self._execution == "while"
+                and not self._runtime_extra
+                and _canonical_runtime_sampling_available(self._functional, inputs)
+            ):
+                inputs = _prepare_chunk_inputs(
+                    self._functional,
+                    selected_state,
+                    inputs,
+                    0,
+                    self._steps,
+                    canonical=True,
+                )
+            if (
+                self._execution == "while"
+                and not self._runtime_extra
+                and not isinstance(inputs.noise, RuntimeDraws)
+            ):
                 inputs = self._functional._sample_missing_runtime_draws(
                     selected_state, inputs, self._steps
                 )
             if (
                 self._execution == "while"
                 and not self._runtime_extra
+                and not isinstance(inputs.noise, RuntimeDraws)
                 and inputs.noise is None
             ):
                 sample_noise = (
@@ -574,6 +624,7 @@ class CompiledRunner:
             if (
                 self._execution == "while"
                 and not self._runtime_extra
+                and not isinstance(inputs.noise, RuntimeDraws)
                 and inputs.stimulation is None
                 and getattr(self._functional, "_poisson_plan", None) is not None
             ):

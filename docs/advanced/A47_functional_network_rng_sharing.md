@@ -87,22 +87,29 @@ uses packets from the Network sampler:
 :dedent: 8
 ```
 
-Use `sample_population_noise_tapes(state, steps)` for runtime packets.
-It samples each timestep in native Population order, including each
-Population's NOISE and State Wiener requests, before advancing to the next
-timestep. The returned per-Population packets contain their local draws and
-matching post-request RNG states. Keep those packets together; independently
-sampling each Population from the same starting stream would repeat draws
-and lose the shared ordering.
+Use `sample_runtime_draws(state, steps=N)` for one canonical runtime packet,
+then supply it through `draws=`. The sampler orders all runtime families
+together, including Network NetStim, randomized extra/intra preparation,
+each Population's NOISE, mechanism, and State SDE requests:
 
-For a stream also consumed by randomized Poisson stimulation, obtain
-`sample_population_stimulation_tapes(state, steps)` from that same incoming
-state and supply both families of packets together. They contain the common
-physical stream end frame at each step. Joint sampling follows the native
-extra/intra preparation order, then each Population's NOISE, mechanism, and
-State SDE requests. The host runner samples both families in one operation
-when neither is supplied. Streams shared only by ordinary model sampling
-retain their per-Population post-request frames.
+```python
+draws = functional.sample_runtime_draws(state, steps=100)
+final, auxiliary = dn.func.run(bound, state, steps=100, draws=draws)
+```
+
+`RuntimeDraws.draws` contains named draw families; `RuntimeDraws.rng` is the
+authoritative frame timeline for each physical stream. Ordinary shared model
+streams retain per-Population post-request boundaries. Streams also consumed
+by randomized Poisson stimulation retain their common physical timestep
+suffix. Combining these representations does not discard those intermediate
+boundaries or change when native execution publishes them.
+
+The existing `sample_population_noise_tapes(state, steps)` and
+`sample_population_stimulation_tapes(state, steps)` methods remain compatible.
+Their separate packets must be obtained from the same incoming state and
+supplied together for coupled consumers. Independently sampling each Population
+from the same starting stream would repeat draws and lose the required ordering. Canonical
+`draws=` cannot be combined with those explicit legacy packet fields.
 
 ```{literalinclude} ../../examples/functional_network_rng_sharing.py
 :language: python
@@ -114,7 +121,9 @@ retain their per-Population post-request frames.
 Continue from the returned state and effective parameters/constants. Scan,
 checkpointed scan, and inference-only while execution use the same packet
 sequence. Backward checkpoint replay reuses the forward draws.
-NetStim and sampled connection sources retain their separate RNG APIs.
+NetStim participates in the canonical runtime packet and retains its separate
+sampler APIs for compatibility. Initialization-time sampled connection
+sources retain their existing initialization RNG APIs.
 
 ## Initialization, caches, and gradients
 

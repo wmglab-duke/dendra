@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 
 from ._callbacks import _stack_callback_emissions, _update_callback_values
+from ._draws import _has_runtime_stimulation
 from ._types import RolloutInput, _index_step_input
 
 if TYPE_CHECKING:
@@ -110,7 +111,7 @@ class _LoweredPopulationChunk:
         stimulation=None,
     ):
         """Execute the pure tensor transition for exactly ``steps`` steps."""
-        if self._stepwise_stimulation or stimulation is not None:
+        if self._stepwise_stimulation or _has_runtime_stimulation(noise, stimulation):
             # A host step samples bound Waveforms at its accepted clock. A
             # vector start + arange * dt can round differently from repeated
             # clock additions and miss narrow pulses. Preserve that recurrence

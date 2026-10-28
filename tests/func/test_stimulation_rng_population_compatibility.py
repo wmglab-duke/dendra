@@ -116,16 +116,20 @@ def test_compatible_population_rejects_new_alias_to_an_untracked_registered_rng(
         _close(pulse.generator.get_state(), generator)
 
 
-def test_public_borrowed_step_preserves_fullgraph_and_functional_transforms():
+@pytest.mark.parametrize("canonical", (False, True))
+def test_public_borrowed_step_preserves_fullgraph_and_functional_transforms(canonical):
     source, pulse = _case(True)
     functional, tensors = _lower(source)
-    inputs = _draw_input(functional, tensors.state)
+    inputs = None if canonical else _draw_input(functional, tensors.state)
+    options = (
+        {"draws": functional.sample_runtime_draws(tensors.state)} if canonical else {}
+    )
     before = _clone(tensors)
     generator = pulse.generator.get_state().clone()
 
     def step(parameters):
         return functional.prepare_and_step(
-            parameters, tensors.constants, tensors.state, inputs
+            parameters, tensors.constants, tensors.state, inputs, **options
         )
 
     expected = step(tensors.parameters)

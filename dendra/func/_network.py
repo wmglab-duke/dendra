@@ -32,7 +32,7 @@ from ._initialization_sources import (
 from ._mechanism_delays import network_mechanism_delay_alias_signature
 from ._mechanism_injections import network_mechanism_injection_alias_signature
 from ._netcon import FunctionalNetCon, _snapshot
-from ._netstim import FunctionalNetStim
+from ._netstim import FunctionalNetStim, NetStimDraw
 from ._netstim_parameters import NetStimParameterPlan
 from ._network_bindings import AliasSnapshots, SourceBinding
 from ._network_initialization import (
@@ -697,6 +697,10 @@ class FunctionalNetwork:
                 )
             ),
         )
+
+        from ._network_draws import NetworkRuntimeDrawPlan
+
+        self._runtime_draw_plan = NetworkRuntimeDrawPlan(self)
 
     @property
     def initialization_inputs(self):
@@ -1558,6 +1562,17 @@ class FunctionalNetwork:
         self._validate_source()
         return make_network_callbacks(self, callbacks)
 
+    def sample_runtime_draws(self, state, *, steps=None):
+        """Sample one canonical runtime packet or time-leading draw/RNG tape."""
+        from ._network_bindings import _canonicalize_mapping_tree
+
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError("Sample runtime draws outside torch.compile")
+        (state,), _ = _canonicalize_mapping_tree((state,))
+        self._validate_source()
+        self._validate_state(state)
+        return self._runtime_draw_plan.sample(state, steps=steps)
+
     def sample_draw_tape(self, state, steps):
         """Sample replayable NetStim draw/RNG packets outside compiled code."""
         from ._network_rollout import sample_draw_tape
@@ -1635,6 +1650,7 @@ class FunctionalNetwork:
         steps=None,
         callbacks=None,
         callback_state=None,
+        draws=None,
     ):
         """Execute a pure horizon with per-Population inputs and explicit draws."""
         from ._network_rollout import rollout
@@ -1648,6 +1664,7 @@ class FunctionalNetwork:
             steps=steps,
             callbacks=callbacks,
             callback_state=callback_state,
+            **({"draws": draws} if draws is not None else {}),
         )
 
     def prepare_and_rollout(
@@ -1660,6 +1677,7 @@ class FunctionalNetwork:
         steps=None,
         callbacks=None,
         callback_state=None,
+        draws=None,
     ):
         """Derive coefficients and execute an explicit, differentiable horizon."""
         from ._network_rollout import rollout
@@ -1673,6 +1691,7 @@ class FunctionalNetwork:
             steps=steps,
             callbacks=callbacks,
             callback_state=callback_state,
+            **({"draws": draws} if draws is not None else {}),
             constants=constants,
         )
 
@@ -1708,6 +1727,7 @@ class FunctionalNetwork:
         checkpoint_every=None,
         callbacks=None,
         callback_state=None,
+        draws=None,
         compiled_chunk=None,
     ):
         """Compatibility form of explicit bound Network host scheduling.
@@ -1731,6 +1751,7 @@ class FunctionalNetwork:
             checkpoint_every=checkpoint_every,
             callbacks=callbacks,
             callback_state=callback_state,
+            **({"draws": draws} if draws is not None else {}),
             compiled_chunk=compiled_chunk,
         )
 
@@ -1761,6 +1782,7 @@ class FunctionalNetwork:
         state,
         *,
         netstim_draw=None,
+        draws=None,
         inputs=None,
         extra=None,
         intra=None,
@@ -1774,18 +1796,37 @@ class FunctionalNetwork:
                     f"{label} must map known Population names to explicit inputs"
                 )
         inputs, extra, intra = inputs or {}, extra or {}, intra or {}
-        self._stimulation_rng_plan.validate_packets(
-            {
-                name: packet.noise
-                for name, packet in inputs.items()
-                if isinstance(packet, StepInput)
-            },
-            {
-                name: packet.stimulation
-                for name, packet in inputs.items()
-                if isinstance(packet, StepInput)
-            },
-        )
+        if draws is not None:
+            from ._draws import _normalize_runtime_draws
+
+            draws = _normalize_runtime_draws(draws)
+            if netstim_draw is not None or any(
+                isinstance(packet, StepInput)
+                and (packet.noise is not None or packet.stimulation is not None)
+                for packet in inputs.values()
+            ):
+                raise ValueError(
+                    "draws cannot be combined with legacy runtime draw packets"
+                )
+            self._runtime_draw_plan.validate(draws)
+            netstim_draw = (
+                None
+                if self.netstim is None
+                else NetStimDraw(draws.draws["netstim"], draws.rng["netstim"].clone())
+            )
+        else:
+            self._stimulation_rng_plan.validate_packets(
+                {
+                    name: packet.noise
+                    for name, packet in inputs.items()
+                    if isinstance(packet, StepInput)
+                },
+                {
+                    name: packet.stimulation
+                    for name, packet in inputs.items()
+                    if isinstance(packet, StepInput)
+                },
+            )
         clock = state["clock"]
         rng_pool = state.get("rng", {})
         stimulation_pool = self._stimulation_rng_plan.expand_pool(
@@ -1921,6 +1962,15 @@ class FunctionalNetwork:
                     torch.Tensor, lambda value: value.unsqueeze(0), selected.stimulation
                 ),
             )
+            runtime_draws = (
+                None
+                if draws is None
+                else pytree.tree_map_only(
+                    torch.Tensor,
+                    lambda value: value.unsqueeze(0),
+                    self._runtime_draw_plan.local(name, draws),
+                )
+            )
             states[name], aux[name] = plan._rollout_values(
                 parameters["populations"][name],
                 prepared["populations"][name],
@@ -1930,10 +1980,16 @@ class FunctionalNetwork:
                 rollout,
                 steps=1,
                 extra=extra.get(name),
+                **({"draws": runtime_draws} if runtime_draws is not None else {}),
             )
-            rng_pool, stimulation_pool = self._stimulation_rng_plan.publish(
-                name, states[name], rng_pool, stimulation_pool
-            )
+            if draws is None:
+                rng_pool, stimulation_pool = self._stimulation_rng_plan.publish(
+                    name, states[name], rng_pool, stimulation_pool
+                )
+            else:
+                rng_pool, stimulation_pool = self._runtime_draw_plan.publish_population(
+                    name, states[name], rng_pool, stimulation_pool, draws
+                )
         step = clock["step"] + 1
         next_time = (
             clock["origin"] + step.to(clock["origin"].dtype) * self.dt
@@ -1996,11 +2052,19 @@ class FunctionalNetwork:
         state,
         *,
         netstim_draw=None,
+        draws=None,
         inputs=None,
         extra=None,
         intra=None,
     ):
         """Advance one complete native-ordered timestep with reusable preparation."""
+        if draws is not None:
+            from ._draws import _normalize_runtime_draws
+            from ._network_bindings import _canonicalize_mapping_tree
+
+            (parameters, state, inputs, draws), _ = _canonicalize_mapping_tree(
+                (parameters, state, inputs, _normalize_runtime_draws(draws))
+            )
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_state(state)
@@ -2011,6 +2075,7 @@ class FunctionalNetwork:
                 values,
                 state,
                 netstim_draw=netstim_draw,
+                **({"draws": draws} if draws is not None else {}),
                 inputs=inputs,
                 extra=extra,
                 intra=intra,
@@ -2025,11 +2090,19 @@ class FunctionalNetwork:
         state,
         *,
         netstim_draw=None,
+        draws=None,
         inputs=None,
         extra=None,
         intra=None,
     ):
         """Derive coefficients and execute one pure, fullgraph-compatible timestep."""
+        if draws is not None:
+            from ._draws import _normalize_runtime_draws
+            from ._network_bindings import _canonicalize_mapping_tree
+
+            (parameters, state, inputs, draws), _ = _canonicalize_mapping_tree(
+                (parameters, state, inputs, _normalize_runtime_draws(draws))
+            )
         self._validate_source()
         self._validate_parameters(parameters)
         _validate_tree(constants, self._constant_schema, "constants")
@@ -2041,6 +2114,7 @@ class FunctionalNetwork:
                 values,
                 state,
                 netstim_draw=netstim_draw,
+                **({"draws": draws} if draws is not None else {}),
                 inputs=inputs,
                 extra=extra,
                 intra=intra,
@@ -2180,3 +2254,7 @@ def make_functional_network(network, *, extra=None, pending_capacity=None):
 
 
 __all__ = ["FunctionalNetwork", "NetworkTensors", "make_functional_network"]
+
+_OWNED_NETWORK_NOISE_TAPES = FunctionalNetwork.sample_population_noise_tapes
+_OWNED_NETWORK_STIMULATION_TAPES = FunctionalNetwork.sample_population_stimulation_tapes
+_OWNED_NETWORK_NETSTIM_TAPE = FunctionalNetwork.sample_draw_tape

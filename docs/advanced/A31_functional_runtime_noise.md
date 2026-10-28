@@ -74,7 +74,30 @@ the current step's sample. Spatial diffusion retains the realization used
 when `set_dt` configured its operator, alongside the independently refreshed
 runtime buffer, and preserves that configured realization in checkpoints.
 
-## Supply draw and RNG tapes
+## Supply canonical runtime draws
+
+Use `functional.sample_runtime_draws(state)` for one timestep or
+`functional.sample_runtime_draws(state, steps=N)` for a time-leading tape.
+Pass the returned `RuntimeDraws` through `draws=` to Population or Network
+execution. This samples model NOISE and State SDE requests together with any
+randomized Poisson or NetStim requests, retaining native order and one
+authoritative RNG timeline per physical stream:
+
+```python
+draws = functional.sample_runtime_draws(state, steps=100)
+final, auxiliary = dn.func.run(
+    bound, state, steps=100, draws=draws, checkpoint_every=25,
+)
+```
+
+Canonical draws can accompany voltage/current input tapes, but cannot be
+combined with the compatibility stochastic fields described below. Host
+execution with `draws=None` samples bounded packets automatically. Pure calls
+require their explicit stochastic inputs. See
+{ref}`functional-runtime-draws` for slicing, continuation, and a complete
+Population/Network example. Initialization draws remain separate.
+
+### Compatibility noise packets
 
 A `RuntimeNoiseDraw` contains two mappings: `draws` holds explicit base draws
 for runtime NOISE and State SDEs under canonical names, and `rng` holds the
@@ -88,7 +111,7 @@ it does not advance the source model or mutate the input state. Calls
 without explicit state restart the captured boundary, including its RNG
 carry, so repeated calls reproduce their noisy trajectory.
 
-Pure step and rollout calls require explicit packets. For a Population,
+The compatibility APIs also supply explicit packets. For a Population,
 `sample_noise_draw(state)` produces one step and
 `sample_noise_draw_tape(state, steps)` produces a time-leading tape outside
 compiled or transformed code. Supply them through `StepInput.noise` or

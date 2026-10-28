@@ -114,18 +114,25 @@ class BoundNetwork:
         """Exact timestep count consumed by a direct invocation."""
         return 1 if self._compiled_chunk is None else self._compiled_chunk.steps
 
-    def __call__(self, state, inputs: NetworkRolloutInput | None = None):
+    def __call__(self, state, inputs: NetworkRolloutInput | None = None, *, draws=None):
         if torch.compiler.is_compiling():
             raise FunctionalizationError(
                 "BoundNetwork is an eager binding; use prepare_and_step() "
                 "or prepare_and_rollout() inside torch.compile"
             )
+        if draws is not None:
+            from ._draws import _normalize_runtime_draws
+
+            draws = _normalize_runtime_draws(draws)
+        options = {} if draws is None else {"draws": draws}
         if self._compiled_chunk is None:
             return self._eager_rollout(
-                self._parameters, self._constants, state, inputs, steps=1
+                self._parameters, self._constants, state, inputs, steps=1, **options
             )
         prepared = self._functional.prepare(self._parameters, self._constants)
-        return self._compiled_chunk(self._parameters, prepared, state, inputs)
+        return self._compiled_chunk(
+            self._parameters, prepared, state, inputs, **options
+        )
 
 
 __all__ = ["BoundNetwork"]

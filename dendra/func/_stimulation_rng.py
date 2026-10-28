@@ -414,7 +414,8 @@ class StimulationRNGPlan:
             context["positions"][entry.key] += 1
             return
         with _rng_diagnostic_scope(
-            self.functional.device, enabled=self.functional._check_purity
+            self.functional.device,
+            enabled=context.get("diagnostic_enabled", self.functional._check_purity),
         ) as diagnostic:
             draw = sample_random_parameter_draw(
                 entry.spec,
@@ -466,27 +467,17 @@ class StimulationRNGPlan:
     def sample_runtime(
         self, state, *, steps=None, samplers=None, poisson_samplers=None
     ):
-        if steps is not None:
-            if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
-                raise ValueError("steps must be a non-negative integer")
+        """Compatibility projection from one canonical runtime transaction."""
+        if steps is not None and (
+            isinstance(steps, bool) or not isinstance(steps, int) or steps < 0
+        ):
+            raise ValueError("steps must be a non-negative integer")
+        if steps == 0:
+            # Compatibility packets retain their allocation and frame-lookup
+            # order. No numerical sampling is duplicated by this empty adapter.
             context = self.begin_packets(
                 state, samplers=samplers, poisson_samplers=poisson_samplers
             )
-            packets = []
-            for _ in range(steps):
-                context["noise_draws"] = {}
-                context["stimulation_draws"] = (
-                    {} if self.poisson is None else self.poisson._placeholder_draws()
-                )
-                context["positions"] = Counter()
-                for kind, entry in self.runtime_requests():
-                    self.sample_request(kind, entry, context)
-                packets.append(self.finish_packets(context))
-            if packets:
-                return _pytree.tree_map(
-                    lambda *values: None if values[0] is None else torch.stack(values),
-                    *packets,
-                )
             noise, stimulation = self.finish_packets(context)
             if self.noise is not None and self.noise.runtime:
                 noise = RuntimeNoiseDraw(
@@ -511,12 +502,89 @@ class StimulationRNGPlan:
                     ),
                 )
             return noise, stimulation
+        packet = self.sample_runtime_draws(
+            state, steps=steps, samplers=samplers, poisson_samplers=poisson_samplers
+        )
+        return self.functional._runtime_draw_plan.legacy(packet)
+
+    def sample_runtime_draws(
+        self, state, *, steps=None, samplers=None, poisson_samplers=None
+    ):
+        """Capture each physical generator once after the accepted step."""
+        if steps is not None and (
+            isinstance(steps, bool) or not isinstance(steps, int) or steps < 0
+        ):
+            raise ValueError("steps must be a non-negative integer")
+        plan = self.functional._runtime_draw_plan
+        samplers = (
+            {
+                stream: _sampler_from_frame(state["random"]["rng"][stream])
+                for stream in plan.model_reference
+            }
+            if samplers is None
+            else {stream: samplers[stream] for stream in plan.model_reference}
+        )
         context = self.begin_packets(
             state, samplers=samplers, poisson_samplers=poisson_samplers
         )
-        for kind, entry in self.runtime_requests():
-            self.sample_request(kind, entry, context)
-        return self.finish_packets(context)
+        ordinary_noise = plan.has_noise and not self.enabled
+        if ordinary_noise:
+            context["diagnostic_enabled"] = False
+
+        def sample_step():
+            # Ordinary NOISE historically checks global RNG unconditionally.
+            # Keep that transaction around its native ordered request group;
+            # mixed borrowed streams retain the captured optional policy.
+            with _rng_diagnostic_scope(
+                self.functional.device, enabled=ordinary_noise
+            ) as diagnostic:
+                for kind, entry in self.runtime_requests():
+                    self.sample_request(kind, entry, context)
+            if diagnostic.changes:
+                raise FunctionalizationError(
+                    "NOISE draw sampler consumed global RNG; use explicit RNGModule"
+                )
+            return plan.finish_context(context)
+
+        if steps is None:
+            return sample_step()
+        packets = []
+        for _ in range(steps):
+            context["noise_draws"] = {}
+            context["stimulation_draws"] = (
+                {} if self.poisson is None else self.poisson._placeholder_draws()
+            )
+            context["positions"] = Counter()
+            packets.append(sample_step())
+        if packets:
+            return _pytree.tree_map(
+                lambda *values: None if values[0] is None else torch.stack(values),
+                *packets,
+            )
+        packet = plan.finish_context(context)
+        noise = self.noise._empty_tape_draws() if plan.has_noise else None
+        stimulation = (
+            None
+            if self.poisson is None
+            else {
+                entry.key: torch.empty(
+                    (0, *self.poisson._draw_shape(entry)),
+                    dtype=self.poisson.draw_dtype,
+                    device=self.poisson.streams[entry.stream].device,
+                )
+                for entry in self.poisson.entries
+            }
+        )
+        from ._draws import RuntimeDraws
+
+        return RuntimeDraws(
+            {"noise": noise, "stimulation": stimulation},
+            _pytree.tree_map_only(
+                torch.Tensor,
+                lambda value: value.new_empty((0, *value.shape)),
+                packet.rng,
+            ),
+        )
 
     def sample_initialization(self, state, *, samplers=None, poisson_samplers=None):
         """Sample RAND/initial NOISE before the mechanism's initial currents."""

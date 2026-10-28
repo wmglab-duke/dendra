@@ -243,10 +243,14 @@ def _index_step_input(ve, intra, noise, stimulation, index) -> StepInput:
         intra=None if intra is None else intra[index],
         noise=None
         if noise is None
-        else torch.utils._pytree.tree_map(lambda value: value[index], noise),
+        else torch.utils._pytree.tree_map_only(
+            torch.Tensor, lambda value: value[index], noise
+        ),
         stimulation=None
         if stimulation is None
-        else torch.utils._pytree.tree_map(lambda value: value[index], stimulation),
+        else torch.utils._pytree.tree_map_only(
+            torch.Tensor, lambda value: value[index], stimulation
+        ),
     )
 
 

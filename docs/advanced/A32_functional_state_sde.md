@@ -90,7 +90,29 @@ coefficients should receive pathwise gradients; see
 {doc}`A31_functional_runtime_noise` for detached stochastic drives and
 {doc}`A30_functional_random_parameters` for sampled parameter heterogeneity.
 
-## Supply explicit draws
+## Supply canonical runtime draws
+
+`functional.sample_runtime_draws(state)` supplies a single-timestep
+`RuntimeDraws`; `steps=N` samples a time-leading tape. Pass it through
+`draws=` to pure Population/Network execution or to the host runner:
+
+```python
+draws = functional.sample_runtime_draws(state, steps=100)
+final, auxiliary = dn.func.run(
+    bound, state, steps=100, draws=draws, checkpoint_every=25,
+)
+```
+
+The packet combines the model's runtime NOISE and SDE base draws with any
+randomized stimulation requests. Sampling follows native request order and
+retains the necessary RNG boundaries for shared streams. Drift, diffusion,
+and timestep gradients preserve their existing contracts; the base draws
+remain detached. Host execution can sample automatically when `draws` is
+omitted. Pure execution consumes explicit stochastic inputs. See
+{ref}`functional-runtime-draws` for the complete sampling and continuation
+contract.
+
+### Compatibility noise/SDE packets
 
 Pure Population step and rollout calls require explicit stochastic inputs.
 `sample_noise_draw(state)` produces one `RuntimeNoiseDraw` packet;

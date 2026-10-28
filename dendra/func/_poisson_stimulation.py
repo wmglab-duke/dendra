@@ -553,7 +553,7 @@ class PoissonStimulationPlan:
                             "Poisson stimulation RNG contains an invalid frame."
                         ) from error
 
-    def validate(self, packet, *, steps=None):
+    def validate(self, packet, *, steps=None, validate_rng=True):
         if not isinstance(packet, StimulationDraw):
             raise ValueError(
                 "Randomized Poisson stimulation requires an explicit StimulationDraw packet"
@@ -586,7 +586,8 @@ class PoissonStimulationPlan:
                 raise ValueError(
                     "Poisson stimulation uniforms must be finite in [0, 1)."
                 )
-        self._validate_rng(packet.rng, steps=steps)
+        if validate_rng:
+            self._validate_rng(packet.rng, steps=steps)
 
     def validate_state(self, state):
         """Preflight complete carried state before a native commit transaction."""
@@ -731,7 +732,9 @@ class PoissonStimulationPlan:
             if entry.mapping is not None
         }
 
-    def advance(self, state, packet, *, tape=False, initialization=False):
+    def advance(
+        self, state, packet, *, tape=False, initialization=False, publish_rng=True
+    ):
         if tape:
             packet = _pytree.tree_map(lambda value: value[-1], packet)
         schedules = self.schedules(packet, initialization=initialization)
@@ -743,7 +746,11 @@ class PoissonStimulationPlan:
             latest[id(entry.source)] = schedules[entry.key][positions[entry.key]]
             positions[entry.key] += 1
         return {
-            "rng": {name: value.detach().clone() for name, value in packet.rng.items()},
+            "rng": (
+                {name: value.detach().clone() for name, value in packet.rng.items()}
+                if publish_rng
+                else state.get("rng", {})
+            ),
             "schedules": {
                 entry.key: latest.get(id(entry.source), state["schedules"][entry.key])
                 for entry in self.entries

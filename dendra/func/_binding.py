@@ -118,7 +118,9 @@ class BoundPopulation:
         """Exact timestep count consumed by a direct invocation."""
         return 1 if self._compiled_chunk is None else self._compiled_chunk.steps
 
-    def __call__(self, state, inputs: RolloutInput | StepInput | None = None):
+    def __call__(
+        self, state, inputs: RolloutInput | StepInput | None = None, *, draws=None
+    ):
         if torch.compiler.is_compiling():
             raise FunctionalizationError(
                 "BoundPopulation is an eager binding; use prepare_and_step() "
@@ -126,9 +128,14 @@ class BoundPopulation:
             )
         # MappingProxyType is an opaque leaf to PyTorch's PyTree machinery.
         # Only the owned ordinary dict may cross a tensor execution boundary.
+        options = {} if draws is None else {"draws": draws}
         if self._compiled_chunk is None:
-            return self._eager_step(self._parameters, self._prepared, state, inputs)
-        return self._compiled_chunk(self._parameters, self._prepared, state, inputs)
+            return self._eager_step(
+                self._parameters, self._prepared, state, inputs, **options
+            )
+        return self._compiled_chunk(
+            self._parameters, self._prepared, state, inputs, **options
+        )
 
 
 __all__ = ["BoundPopulation"]

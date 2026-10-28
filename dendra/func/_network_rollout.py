@@ -83,7 +83,12 @@ def _binding(tree):
     )
 
 
-def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
+def _resolve_inputs(
+    functional, inputs, steps, *, allow_missing_draws=False, draws=None
+):
+    from ._network_draws import _with_network_runtime_draws
+
+    inputs, draws = _with_network_runtime_draws(inputs, draws)
     if inputs is None:
         inputs = NetworkRolloutInput()
     if not isinstance(inputs, NetworkRolloutInput):
@@ -112,6 +117,11 @@ def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
             if not torch.is_tensor(value) or value.ndim < 1:
                 raise ValueError("NetStim draw tapes need a leading time axis")
             lengths.append(value.shape[0])
+    if draws is not None:
+        for _path, value in _tensor_paths(draws):
+            if value.ndim < 1:
+                raise ValueError("Runtime draw tapes need a leading time axis")
+            lengths.append(value.shape[0])
     if steps is None:
         if not lengths:
             raise ValueError("steps is required when no input tape supplies a horizon")
@@ -123,9 +133,11 @@ def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
     for name, plan in functional.populations.items():
         selected = populations.get(name, RolloutInput())
         ve, intra, _ = plan._resolve_rollout_inputs(selected, steps)
-        if selected.noise is not None or not allow_missing_draws:
+        if draws is None and (selected.noise is not None or not allow_missing_draws):
             plan._validate_noise_draw(selected.noise, steps=steps)
-        if selected.stimulation is not None or not allow_missing_draws:
+        if draws is None and (
+            selected.stimulation is not None or not allow_missing_draws
+        ):
             plan._validate_stimulation_draw(selected.stimulation, steps=steps)
         normalized_values = {
             key: value
@@ -139,13 +151,17 @@ def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
         }
         if normalized_values:
             normalized[name] = normalized_values
-    functional._stimulation_rng_plan.validate_packets(
-        {name: selected.get("noise") for name, selected in normalized.items()},
-        {name: selected.get("stimulation") for name, selected in normalized.items()},
-    )
-    draws = inputs.netstim
-    if functional.netstim is not None:
-        if draws is None:
+    if draws is None:
+        functional._stimulation_rng_plan.validate_packets(
+            {name: selected.get("noise") for name, selected in normalized.items()},
+            {
+                name: selected.get("stimulation")
+                for name, selected in normalized.items()
+            },
+        )
+    netstim = inputs.netstim
+    if draws is None and functional.netstim is not None:
+        if netstim is None:
             if steps and not allow_missing_draws:
                 raise ValueError(
                     "NetStim requires an explicit draw/RNG tape; use sample_draw_tape"
@@ -154,22 +170,25 @@ def _resolve_inputs(functional, inputs, steps, *, allow_missing_draws=False):
             plan = functional.netstim
             shape, dtype, device = plan._state_schema["rng_state"]
             plan._validate_tensor(
-                draws.exp_rand,
+                netstim.exp_rand,
                 shape=(steps, *plan.shape),
                 dtype=plan.dtype,
                 device=plan.device,
                 label="netstim.exp_rand",
             )
             plan._validate_tensor(
-                draws.rng_state,
+                netstim.rng_state,
                 shape=(steps, *shape),
                 dtype=dtype,
                 device=device,
                 label="netstim.rng_state",
             )
     tape = {"populations": normalized}
+    if netstim is not None:
+        tape["netstim"] = netstim
     if draws is not None:
-        tape["netstim"] = draws
+        functional._runtime_draw_plan.validate(draws, steps=steps)
+        tape["draws"] = draws
     return tape, steps
 
 
@@ -229,7 +248,12 @@ def _step(functional, parameters, prepared, state, sample):
         for name, selected in sample.get("populations", {}).items()
     }
     return functional._step_values(
-        parameters, prepared, state, inputs=inputs, netstim_draw=sample.get("netstim")
+        parameters,
+        prepared,
+        state,
+        inputs=inputs,
+        netstim_draw=sample.get("netstim"),
+        **({"draws": sample["draws"]} if "draws" in sample else {}),
     )
 
 
@@ -272,14 +296,20 @@ def rollout(
     callbacks=None,
     callback_state=None,
     constants=None,
+    draws=None,
 ):
-    (parameters, prepared, state, inputs, constants), _ = _canonicalize_mapping_tree(
-        (parameters, prepared, state, inputs, constants)
+    from ._network_draws import _with_network_runtime_draws
+
+    inputs, draws = _with_network_runtime_draws(inputs, draws)
+    (parameters, prepared, state, inputs, constants, draws), _ = (
+        _canonicalize_mapping_tree(
+            (parameters, prepared, state, inputs, constants, draws)
+        )
     )
     callbacks, callback_state, parts = _validate(
         functional, parameters, state, callbacks, callback_state
     )
-    tape, steps = _resolve_inputs(functional, inputs, steps)
+    tape, steps = _resolve_inputs(functional, inputs, steps, draws=draws)
     if constants is None:
         values = functional._validate_prepared(prepared, parameters)
     else:
@@ -607,19 +637,23 @@ class CompiledNetworkChunk:
         *,
         callbacks=None,
         callback_state=None,
+        draws=None,
     ):
         previous = self._report_state.report
         try:
             # Mapping accessors may execute external Python. Finish all public
             # packet traversal before validating source/preparation freshness.
-            (parameters, prepared, state, inputs), _ = _canonicalize_mapping_tree(
-                (parameters, prepared, state, inputs)
+            from ._network_draws import _with_network_runtime_draws
+
+            inputs, draws = _with_network_runtime_draws(inputs, draws)
+            (parameters, prepared, state, inputs, draws), _ = (
+                _canonicalize_mapping_tree((parameters, prepared, state, inputs, draws))
             )
             functional = self._functional
             callbacks, callback_state, parts = _validate(
                 functional, parameters, state, callbacks, callback_state
             )
-            tape, _ = _resolve_inputs(functional, inputs, self.steps)
+            tape, _ = _resolve_inputs(functional, inputs, self.steps, draws=draws)
             values = functional._validate_prepared(prepared, parameters)
             with nullcontext() if functional.training else torch.no_grad():
                 state, auxiliary, callback_state, emitted = self._values(
@@ -660,6 +694,7 @@ def run(
     callback_state=None,
     compiled_chunk=None,
     _runtime_extra=None,
+    draws=None,
 ):
     """Host scheduling with shared exact spans and non-reentrant checkpoints.
 
@@ -670,15 +705,37 @@ def run(
     each checkpoint closure, one bounded kernel at a time, from explicit
     stimulus leaves and the Network's canonical pre-step clock.
     """
+    from ._draws import _runtime_draws_binding
+    from ._network_draws import _owned_runtime_sampling, _with_network_runtime_draws
+
     public_parameters, public_constants, public_inputs = parameters, constants, inputs
-    (parameters, constants, state, inputs), _ = _canonicalize_mapping_tree(
-        (parameters, constants, state, inputs)
+    public_draws = draws
+    inputs, draws = _with_network_runtime_draws(inputs, draws)
+    (parameters, constants, state, inputs, draws), _ = _canonicalize_mapping_tree(
+        (parameters, constants, state, inputs, draws)
     )
     callbacks, callback_state, parts = _validate(
         functional, parameters, state, callbacks, callback_state
     )
     _validate_tree(constants, functional._constant_schema, "constants")
-    tape, steps = _resolve_inputs(functional, inputs, steps, allow_missing_draws=True)
+    tape, steps = _resolve_inputs(
+        functional, inputs, steps, allow_missing_draws=True, draws=draws
+    )
+    automatic_draws = (
+        draws is None
+        and (
+            functional.netstim is not None
+            or any(
+                plan._runtime_draw_plan.has_noise or plan._poisson_plan is not None
+                for plan in functional.populations.values()
+            )
+        )
+        and tape.get("netstim") is None
+        and not any(
+            values.get("noise") is not None or values.get("stimulation") is not None
+            for values in tape["populations"].values()
+        )
+    )
     extra_plans, extra_tensors, extra_values = {}, {}, {}
     if _runtime_extra is not None:
         for name, extra in _runtime_extra.items():
@@ -721,6 +778,11 @@ def run(
         _binding((public_parameters, public_constants)) if checkpoint_active else None
     )
     tape_binding = _binding((public_inputs, tape)) if checkpoint_active else None
+    draw_binding = (
+        _binding((public_draws, draws))
+        if checkpoint_active and draws is not None
+        else None
+    )
 
     def runtime_extra_binding():
         return tuple(
@@ -750,6 +812,10 @@ def run(
         ):
             raise FunctionalizationError(
                 "Network parameters, constants, or input tapes changed after checkpoint forward"
+            )
+        if draw_binding is not None and _binding((public_draws, draws)) != draw_binding:
+            raise FunctionalizationError(
+                "Network runtime draws changed after checkpoint forward"
             )
         if extra_binding is not None and runtime_extra_binding() != extra_binding:
             raise FunctionalizationError(
@@ -828,55 +894,73 @@ def run(
     ):
         for start, stop in _execution_spans(steps, horizon):
             selected = _slice(tape, start, stop)
-            populations = dict(selected["populations"])
-            provided_noise = {
-                name: values["noise"]
-                for name, values in populations.items()
-                if values.get("noise") is not None
-            }
-            provided_stimulation = {
-                name: values["stimulation"]
-                for name, values in populations.items()
-                if values.get("stimulation") is not None
-            }
-            if functional._stimulation_rng_plan.enabled:
-                noise_tapes, stimulation_tapes = (
-                    functional._stimulation_rng_plan.sample_tapes(
+            if (
+                "draws" not in selected
+                and automatic_draws
+                and _owned_runtime_sampling(functional)
+            ):
+                packet = functional.sample_runtime_draws(state, steps=stop - start)
+                from ._draws import _normalize_runtime_draws
+
+                packet = _normalize_runtime_draws(packet)
+                functional._runtime_draw_plan.validate(packet, steps=stop - start)
+                selected = {**selected, "draws": packet}
+            elif "draws" not in selected:
+                populations = dict(selected["populations"])
+                provided_noise = {
+                    name: values["noise"]
+                    for name, values in populations.items()
+                    if values.get("noise") is not None
+                }
+                provided_stimulation = {
+                    name: values["stimulation"]
+                    for name, values in populations.items()
+                    if values.get("stimulation") is not None
+                }
+                if functional._stimulation_rng_plan.enabled:
+                    noise_tapes, stimulation_tapes = (
+                        functional._stimulation_rng_plan.sample_tapes(
+                            state,
+                            stop - start,
+                            noise=provided_noise,
+                            stimulation=provided_stimulation,
+                        )
+                    )
+                else:
+                    noise_tapes = functional._rng_plan.sample_noise_tapes(
                         state,
                         stop - start,
-                        noise=provided_noise,
-                        stimulation=provided_stimulation,
+                        provided=provided_noise,
                     )
-                )
-            else:
-                noise_tapes = functional._rng_plan.sample_noise_tapes(
-                    state,
-                    stop - start,
-                    provided=provided_noise,
-                )
-                stimulation_tapes = functional.sample_population_stimulation_tapes(
-                    state,
-                    stop - start,
-                    provided=provided_stimulation,
-                )
-            for name, plan in functional.populations.items():
-                values = populations.get(name, {})
-                if values.get("stimulation") is None:
-                    stimulation = stimulation_tapes[name]
-                    if stimulation is not None:
-                        values = {**values, "stimulation": stimulation}
-                        populations[name] = values
-                if values.get("noise") is None:
-                    noise = noise_tapes[name]
-                    if noise is not None:
-                        populations[name] = {**values, "noise": noise}
-            selected = {**selected, "populations": populations}
-            if functional.netstim is not None and selected.get("netstim") is None:
-                selected = {
-                    **selected,
-                    "netstim": sample_draw_tape(functional, state, stop - start),
-                }
+                    stimulation_tapes = functional.sample_population_stimulation_tapes(
+                        state,
+                        stop - start,
+                        provided=provided_stimulation,
+                    )
+                for name, plan in functional.populations.items():
+                    values = populations.get(name, {})
+                    if values.get("stimulation") is None:
+                        stimulation = stimulation_tapes[name]
+                        if stimulation is not None:
+                            values = {**values, "stimulation": stimulation}
+                            populations[name] = values
+                    if values.get("noise") is None:
+                        noise = noise_tapes[name]
+                        if noise is not None:
+                            populations[name] = {**values, "noise": noise}
+                selected = {**selected, "populations": populations}
+                if functional.netstim is not None and selected.get("netstim") is None:
+                    selected = {
+                        **selected,
+                        "netstim": sample_draw_tape(functional, state, stop - start),
+                    }
             span_steps = stop - start
+            packet_source = selected.get("draws")
+            packet_binding = (
+                _runtime_draws_binding(packet_source)
+                if checkpoint_active and packet_source is not None
+                else None
+            )
 
             def execute(
                 parameters_in,
@@ -887,7 +971,15 @@ def run(
                 extra_in,
                 span_steps=span_steps,
                 span_start=start,
+                packet_source=packet_source,
+                packet_binding=packet_binding,
             ):
+                if packet_binding is not None and (
+                    _runtime_draws_binding(packet_source) != packet_binding
+                ):
+                    raise FunctionalizationError(
+                        "Network runtime draws changed after checkpoint forward"
+                    )
                 return span(
                     parameters_in,
                     constants_in,
@@ -921,3 +1013,5 @@ def run(
 
 
 __all__ = ["NetworkRolloutInput", "CompiledNetworkChunk"]
+
+_OWNED_NETSTIM_DRAW_TAPE = sample_draw_tape
