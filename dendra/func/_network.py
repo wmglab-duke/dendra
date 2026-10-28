@@ -1706,6 +1706,8 @@ class FunctionalNetwork:
     def bind(self, parameters, constants, *, compiled_chunk=None):
         """Bind raw inputs for eager steps or canonical host scheduling.
 
+        Use ``bind(parameters, constants=constants)`` for the shared Population
+        and Network binding contract. Positional constants are also supported.
         Tensor leaves stay live and differentiable. Network bindings retain raw
         constants, deriving fresh coefficients for every invocation instead of
         retaining graph-bearing materializations. Use ``chunk.bind`` for a

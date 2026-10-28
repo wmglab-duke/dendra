@@ -1170,12 +1170,14 @@ def _run_source_validated(
     host_span_steps=None,
     extra=None,
     _runtime_extra_slot=False,
+    duration=_MISSING,
+    dt=None,
 ):
-    """Schedule one fixed-horizon convenience invocation after its source check.
+    """Schedule one qualified binding invocation after its source check.
 
-    Only CompiledRunner owns this path. It skips no state, schema, parameter,
-    prepared-plan or callback checks, and carries no exemption into replay or
-    any later invocation of a public boundary.
+    CompiledRunner and raw bindings use this path after qualifying their
+    current invocation. It skips no state, schema, parameter, prepared-plan or
+    callback checks, and carries no exemption into replay or later calls.
     """
     functional = bound.functional
     _validate_execution_context(functional, bound)
@@ -1187,9 +1189,11 @@ def _run_source_validated(
         state,
         inputs,
         expected_remainder=expected_remainder,
+        duration=duration,
         steps=steps,
         span=checkpoint_every if checkpoint_every is not None else host_span_steps,
         checkpointed=checkpoint_every is not None,
+        dt=dt,
         extra=extra,
         _runtime_extra_slot=_runtime_extra_slot,
         callbacks=callbacks,
@@ -1458,8 +1462,9 @@ def run(
 
     Preferred form: ``run(bound, state, inputs=..., steps=N)`` or
     ``run(bound, state, duration=..., checkpoint_every=H)``. Create ``bound``
-    with ``fmodel.bind(parameters, prepared)`` for Populations or
-    ``fnetwork.bind(parameters, constants)`` for Networks. Compiled kernels
+    with ``functional.bind(parameters, constants=constants)`` for either model.
+    Population ``bind(parameters, prepared)`` remains available for explicit
+    preparation ownership. Compiled kernels
     expose the corresponding ``bind(...)`` method. Inputs
     alone infer the horizon; an explicit step count or duration must match
     their time axis. ``steps`` and ``duration`` are mutually exclusive.
@@ -1467,8 +1472,9 @@ def run(
     ``duration`` is an amount to advance, including the state's retained
     fractional remainder. Explicit or input-inferred steps leave that remainder
     unchanged. The default timestep comes from validated Population preparation
-    or the Network's fixed clock. Network bindings retain raw constants and
-    derive fresh materializations during execution.
+    or the Network's fixed clock. Raw Population bindings prepare once for the
+    complete invocation, with safe inference reuse. Networks retain their
+    native inner materialization order.
     ``checkpoint_every`` sets the number of steps between activation checkpoints;
     ``host_span_steps`` instead groups an ordinary run. These mutually exclusive
     options are independent of the compiled kernel width. Shorter kernel tails
@@ -1538,6 +1544,29 @@ def run(
                 draws=draws,
             )
         inputs = _with_runtime_draws(inputs, draws)
+        if bound._is_raw:
+            from ._network_bindings import _canonicalize_mapping_tree
+
+            _validate_execution_context(bound.functional, bound)
+            (state, inputs), _ = _canonicalize_mapping_tree((state, inputs))
+            bound.functional._validate_source()
+            bound.functional._validate_parameters(bound._parameters)
+            bound.functional._validate_state(state)
+            prepared_bound = bound._prepared_binding(source_validated=True)
+            return _run_source_validated(
+                prepared_bound,
+                state,
+                inputs=inputs,
+                steps=steps,
+                duration=_MISSING if duration is None else duration,
+                dt=dt,
+                host_span_steps=host_span_steps,
+                checkpoint_every=checkpoint_every,
+                extra=extra,
+                _runtime_extra_slot=_runtime_extra_slot,
+                callbacks=callbacks,
+                callback_state=callback_state,
+            )
         return _run_schedule(
             bound.functional,
             bound,

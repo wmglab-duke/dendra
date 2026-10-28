@@ -1,4 +1,4 @@
-"""Explicit, graph-local bindings for functional Population execution."""
+"""Explicit raw or prepared bindings for functional Population execution."""
 
 from __future__ import annotations
 
@@ -16,19 +16,26 @@ if TYPE_CHECKING:
     from ._population import FunctionalPopulation
 
 
+_BINDING_UNSET = object()
+
+
 @dataclass(frozen=True, eq=False, init=False)
 class BoundPopulation:
-    """A callable transition with explicit model ownership and prepared inputs.
+    """A transition bound to explicit parameters and preparation inputs.
 
-    Construct with ``fmodel.bind(parameters, prepared)`` for one eager step,
-    or ``kernel.bind(parameters, prepared)`` for a fixed compiled chunk.
-    Parameter keys are snapshotted; tensor leaves remain live and differentiable.
-    Replacing a caller mapping entry requires a new binding. In-place changes
-    to preparation inputs are rejected by the usual freshness checks.
+    ``functional.bind(parameters, constants=constants)`` binds one eager step;
+    the same keyword form on a compiled chunk binds its fixed-length rollout.
+    Raw mapping containers are snapshotted while tensor identities, aliases,
+    and autograd history remain live. Each complete invocation owns its
+    preparation graph. Safe inference preparation can be reused while its
+    parameter and constant bindings remain fresh.
 
-    Reuse a binding throughout one forward/backward graph, then prepare and
-    bind again for the next training iteration. The reusable compiled kernel
-    never owns this binding. Call ``run(bound, state, ...)`` to schedule a run.
+    ``bind(parameters, prepared)`` retains explicit preparation for advanced
+    use. Recreate that prepared binding for each independent backward graph;
+    in-place preparation input changes retain their existing freshness errors.
+    Replacing an entry in a caller mapping requires a new binding in either
+    form. Reusable kernels retain neither bindings nor preparation graphs.
+    Call ``run(bound, state, ...)`` to schedule arbitrary horizons.
     """
 
     _functional: FunctionalPopulation
@@ -36,8 +43,45 @@ class BoundPopulation:
     _prepared: object
     _compiled_chunk: CompiledPopulationChunk | None
     _eager_step: object
+    _constants: object
+    _inference_prepared: object | None
+    _inference_prepared_context: tuple | None
 
-    def __init__(self, functional, parameters, prepared, *, compiled_chunk=None):
+    def __init__(
+        self,
+        functional,
+        parameters,
+        prepared=_BINDING_UNSET,
+        *,
+        constants=_BINDING_UNSET,
+        compiled_chunk=None,
+    ):
+        if prepared is _BINDING_UNSET and constants is _BINDING_UNSET:
+            raise TypeError("bind requires prepared or constants")
+        if prepared is not _BINDING_UNSET and constants is not _BINDING_UNSET:
+            raise TypeError("prepared and constants are mutually exclusive")
+        if constants is not _BINDING_UNSET:
+            from ._network_bindings import _map_containers
+
+            # Public Mapping traversal can execute authored Python. Finish
+            # both snapshots before qualifying source or prepared freshness.
+            parameters = _map_containers(parameters, dict)
+            constants = _map_containers(constants, dict)
+            eager_step = self._validate_owner(functional, compiled_chunk)
+            functional._validate_source()
+            functional._validate_parameters(parameters)
+            functional._validate_constants(constants)
+            object.__setattr__(self, "_functional", functional)
+            object.__setattr__(self, "_parameters", parameters)
+            object.__setattr__(self, "_prepared", None)
+            object.__setattr__(self, "_constants", constants)
+            object.__setattr__(self, "_inference_prepared", None)
+            object.__setattr__(self, "_inference_prepared_context", None)
+            object.__setattr__(self, "_compiled_chunk", compiled_chunk)
+            object.__setattr__(
+                self, "_eager_step", eager_step if compiled_chunk is None else None
+            )
+            return
         eager_step = self._validate_owner(functional, compiled_chunk)
         functional._validate_source()
         self._initialize(functional, parameters, prepared, compiled_chunk, eager_step)
@@ -91,6 +135,9 @@ class BoundPopulation:
         object.__setattr__(self, "_functional", functional)
         object.__setattr__(self, "_parameters", snapshot)
         object.__setattr__(self, "_prepared", prepared)
+        object.__setattr__(self, "_constants", None)
+        object.__setattr__(self, "_inference_prepared", None)
+        object.__setattr__(self, "_inference_prepared_context", None)
         object.__setattr__(self, "_compiled_chunk", compiled_chunk)
         object.__setattr__(
             self, "_eager_step", eager_step if compiled_chunk is None else None
@@ -103,11 +150,92 @@ class BoundPopulation:
     @property
     def parameters(self) -> Mapping[str, torch.Tensor]:
         """Read-only parameter mapping; its tensor leaves are not copied."""
+        if self._is_raw:
+            from ._network_bindings import _map_containers
+
+            return _map_containers(self._parameters, MappingProxyType)
         return MappingProxyType(self._parameters)
 
     @property
+    def constants(self):
+        """Read-only raw constants, or ``None`` for an explicit prepared binding."""
+        if not self._is_raw:
+            return None
+        from ._network_bindings import _map_containers
+
+        return _map_containers(self._constants, MappingProxyType)
+
+    @property
     def prepared(self):
+        """The explicitly supplied preparation, or ``None`` for raw bindings."""
         return self._prepared
+
+    @property
+    def _is_raw(self):
+        return self._constants is not None
+
+    def _prepared_binding(self, *, source_validated=False):
+        """Own a prepared frame only for this complete forward invocation."""
+        if not self._is_raw:
+            return self
+        from ._population import _OWNED_POPULATION_PREPARE, _binding_capture_modes
+        from ._preparation import (
+            _cacheable_preparation_inputs,
+            _cacheable_preparation_values,
+            _select_population_preparation,
+        )
+
+        functional = self._functional
+        public_prepare = functional.prepare
+        owned = (
+            getattr(public_prepare, "__self__", None) is functional
+            and getattr(public_prepare, "__func__", None) is _OWNED_POPULATION_PREPARE
+        )
+        if not source_validated or not owned:
+            functional._validate_source()
+        modes = _binding_capture_modes() if owned else None
+        context = None if modes is None else (modes, torch.get_default_dtype())
+        cache = (
+            owned
+            and modes is not None
+            and _cacheable_preparation_inputs(self._parameters, self._constants)
+        )
+        prepared = _select_population_preparation(
+            functional,
+            self._parameters,
+            self._constants,
+            cached=(
+                self._inference_prepared
+                if context == self._inference_prepared_context
+                else None
+            ),
+            cache=cache,
+            prepare=(functional._prepare_source_validated if owned else public_prepare),
+        )
+        if not owned:
+            functional._validate_source()
+        bound = object.__new__(type(self))
+        bound._initialize(
+            functional,
+            self._parameters,
+            prepared,
+            self._compiled_chunk,
+            self._eager_step,
+        )
+        if cache:
+            retained = (
+                prepared
+                if context == (_binding_capture_modes(), torch.get_default_dtype())
+                and _cacheable_preparation_values(prepared)
+                else None
+            )
+            object.__setattr__(self, "_inference_prepared", retained)
+            object.__setattr__(
+                self,
+                "_inference_prepared_context",
+                context if retained is not None else None,
+            )
+        return bound
 
     @property
     def compiled_chunk(self) -> CompiledPopulationChunk | None:
@@ -126,6 +254,17 @@ class BoundPopulation:
                 "BoundPopulation is an eager binding; use prepare_and_step() "
                 "or prepare_and_rollout() inside torch.compile"
             )
+        if self._is_raw:
+            from ._draws import _with_runtime_draws
+            from ._network_bindings import _canonicalize_mapping_tree
+
+            inputs = _with_runtime_draws(
+                inputs,
+                draws,
+                step=self._compiled_chunk is None or isinstance(inputs, StepInput),
+            )
+            (state, inputs), _ = _canonicalize_mapping_tree((state, inputs))
+            return self._prepared_binding()(state, inputs)
         # MappingProxyType is an opaque leaf to PyTorch's PyTree machinery.
         # Only the owned ordinary dict may cross a tensor execution boundary.
         options = {} if draws is None else {"draws": draws}

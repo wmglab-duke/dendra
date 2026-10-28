@@ -117,6 +117,7 @@ from dendra.models.stim.waveform.core import Waveform
 from dendra.models.tree import Tree
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
+from ._binding import _BINDING_UNSET
 from ._draws import RuntimeDraws, _has_runtime_stimulation, _with_runtime_draws
 from ._retained_materializations import (
     _cache_materialization,
@@ -18068,16 +18069,18 @@ class FunctionalPopulation:
             parameters, prepared, state, scratch, target, payload, input, reduce, mask
         )
 
-    def bind(self, parameters, prepared):
-        """Bind one eager step to explicit parameters and reusable preparation.
+    def bind(self, parameters, prepared=_BINDING_UNSET, *, constants=_BINDING_UNSET):
+        """Bind one eager step to raw constants or explicit preparation.
 
-        The binding snapshots the parameter mapping, retains its tensor leaves,
-        and carries this functional plan into the host runners. Prepare and bind
-        again for each new forward/backward graph when training.
+        ``bind(parameters, constants=constants)`` snapshots raw mapping
+        containers and retains live tensor leaves. Each complete forward or
+        host run owns its preparation graph, with safe inference reuse.
+        ``bind(parameters, prepared)`` retains an explicit prepared value;
+        prepare and bind again for independent backward graphs in that form.
         """
         from ._binding import BoundPopulation
 
-        return BoundPopulation(self, parameters, prepared)
+        return BoundPopulation(self, parameters, prepared, constants=constants)
 
     def compile_rollout_chunk(
         self, steps: int, *, execution: str = "default", **compile_options
@@ -18469,3 +18472,5 @@ def make_functional(
 
 
 __all__ = ["FunctionalPopulation", "make_functional"]
+
+_OWNED_POPULATION_PREPARE = FunctionalPopulation.prepare

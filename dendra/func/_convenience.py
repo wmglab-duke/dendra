@@ -343,23 +343,15 @@ class CompiledRunner:
         )
 
     def _prepare_with(self, parameters, *, cache, prepare, constants=None):
-        if cache and self._prepared is not None:
-            try:
-                self._functional._validate_prepared_freshness(
-                    self._prepared, parameters
-                )
-            except FunctionalizationError as exc:
-                # Refresh normal model/constant edits, but do not hide a
-                # corrupted workspace, invalid schema, or foreign plan.
-                if str(exc) not in (
-                    "parameters changed after prepare(); call prepare() again",
-                    "constants changed after prepare(); call prepare() again",
-                ):
-                    raise
-            else:
-                return self._prepared
-        prepared = prepare(
-            parameters, self._constants if constants is None else constants
+        from ._preparation import _select_population_preparation
+
+        prepared = _select_population_preparation(
+            self._functional,
+            parameters,
+            self._constants if constants is None else constants,
+            cached=self._prepared,
+            cache=cache,
+            prepare=prepare,
         )
         if cache:
             self._prepared = prepared

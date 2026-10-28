@@ -344,7 +344,11 @@ class CompiledNetworkChunk:
     """
 
     def bind(self, parameters, constants):
-        """Bind raw inputs for host scheduling and fresh direct preparation."""
+        """Bind raw inputs with ``bind(parameters, constants=constants)``.
+
+        Positional constants remain supported. Each direct call prepares fresh
+        values; host scheduling retains its per-span preparation boundaries.
+        """
         from ._network_binding import BoundNetwork
 
         return BoundNetwork(

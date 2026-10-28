@@ -20,8 +20,9 @@ if TYPE_CHECKING:
 class BoundNetwork:
     """A Network transition bound to explicit parameters and raw constants.
 
-    Construct with ``functional.bind(parameters, constants)`` for one step,
-    or ``kernel.bind(parameters, constants)`` for a fixed compiled chunk.
+    Construct with ``functional.bind(parameters, constants=constants)`` for one
+    step, or ``kernel.bind(parameters, constants=constants)`` for a fixed chunk.
+    The positional ``bind(parameters, constants)`` form is also supported.
     Mapping containers are snapshotted; tensor leaves retain their identities,
     aliases, and autograd history. Replacing a caller mapping entry requires a
     new binding. In-place parameter changes remain live.

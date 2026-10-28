@@ -161,6 +161,10 @@ def _validate_visible_step_dt(
 
     if isinstance(candidate, BoundPopulation) and candidate.functional is functional:
         parameters, prepared = candidate._parameters, candidate.prepared
+        if candidate._is_raw and prepared_values is None:
+            # A visible adapter retains its own invocation semantics. Prepare
+            # only this clock check rather than replacing the callable.
+            prepared = candidate._prepared_binding().prepared
     elif (
         owner is functional
         and getattr(candidate, "__func__", None) is FunctionalPopulation.step
@@ -245,6 +249,8 @@ def run_legacy_schedule(
     from . import _runners as engine
 
     expected_remainder = validate_legacy_execution(functional, step, state)
+    if type(step) is BoundPopulation and step._is_raw:
+        step = step._prepared_binding()
     execution = engine._prepare_step_execution(functional, step)
     dt = engine._validate_runner_dt(functional, dt)
     _validate_visible_step_dt(

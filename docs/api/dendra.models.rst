@@ -42,13 +42,20 @@ Functional host scheduling
 
 ``dn.func.run`` schedules Population and Network bindings with explicit steps
 or duration, host spans, activation checkpointing, and callback continuation.
-Bindings retain tensor aliases and gradients; they do not own simulation state.
+Both use ``functional.bind(parameters, constants=constants)`` or the same form
+on a compiled chunk. Bindings snapshot mapping containers, retain tensor
+aliases and gradients, and expose read-only ``parameters`` and ``constants``.
+Independent runs derive fresh training preparation; safe Population inference
+preparation is reused until its inputs change. In-place optimizer updates are
+visible on the next run. Replacing a mapping entry requires a new binding.
+Bindings do not own simulation state. Population's explicit
+``bind(parameters, prepared)`` form remains available for graph-local control.
 See :doc:`../advanced/A8_functional_populations` and
 :doc:`../advanced/A20_functional_network_rollout` for the execution and
 preparation lifetime contracts.
 
 .. autoclass:: dendra.func.BoundPopulation
-   :members: functional, parameters, prepared, compiled_chunk, steps
+   :members: functional, parameters, constants, prepared, compiled_chunk, steps
    :special-members: __call__
 
 .. autoclass:: dendra.func.BoundNetwork

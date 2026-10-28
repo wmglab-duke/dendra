@@ -10,6 +10,7 @@ import torch
 from dendra._bootstrap import isolate_compilation_callable
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
+from ._binding import _BINDING_UNSET
 from ._draws import _with_runtime_draws
 from ._execution import (
     ExecutionCapabilities,
@@ -141,12 +142,16 @@ class CompiledPopulationChunk:
         """
         return self._report_state.report
 
-    def bind(self, parameters, prepared):
-        """Bind live parameters and preparation to this reusable kernel."""
+    def bind(self, parameters, prepared=_BINDING_UNSET, *, constants=_BINDING_UNSET):
+        """Bind raw constants per invocation or an explicit prepared frame."""
         from ._binding import BoundPopulation
 
         return BoundPopulation(
-            self._functional, parameters, prepared, compiled_chunk=self
+            self._functional,
+            parameters,
+            prepared,
+            constants=constants,
+            compiled_chunk=self,
         )
 
     def _runner_chunk(self, steps: int) -> CompiledPopulationChunk:

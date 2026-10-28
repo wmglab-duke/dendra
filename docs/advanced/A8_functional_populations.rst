@@ -1828,14 +1828,12 @@ Host-side simulation
 
 Use ``dn.func.run`` to advance an explicit state through a binding. It is the
 common host scheduling interface for Populations and Networks. Population
-bindings carry the functional model, parameters, preparation, and number of
-timesteps per call. Prepare once for a forward/backward graph and bind an eager
-step:
+and Network bindings use the same raw parameter/constant contract. Bind an eager
+step with explicit constants:
 
 .. code-block:: python
 
-   prepared = fmodel.prepare(tensors.parameters, tensors.constants)
-   eager_step = fmodel.bind(tensors.parameters, prepared)
+   eager_step = fmodel.bind(tensors.parameters, constants=tensors.constants)
    drives = dn.func.RolloutInput(
        ve=ve_over_time,
        intra=intra_over_time,
@@ -1845,18 +1843,31 @@ step:
    )
 
 The returned ``BoundPopulation`` is also callable directly as
-``eager_step(state, StepInput(...))``. Its parameter mapping is a read-only
-snapshot of the keys and tensor references: replacing a leaf in the original
-mapping does not change an existing binding. Create a new binding after
-parameter replacement. The tensors themselves remain differentiable, and
-in-place edits to preparation inputs trigger the usual freshness checks.
+``eager_step(state, StepInput(...))``. Its ``parameters`` and ``constants``
+properties expose read-only snapshots of the mapping containers and tensor
+references. Shared tensor aliases and autograd history remain live. Replacing
+a leaf in the caller's mapping requires a new binding; in-place tensor edits,
+including optimizer updates, are visible on the next invocation.
+
+Each direct call or complete ``run`` invocation owns its preparation graph.
+The same raw binding can therefore serve independent forward/backward passes.
+Under ``torch.no_grad()`` or ``torch.inference_mode()``, Population bindings
+reuse safe preparation while parameter and constant bindings remain fresh,
+and refresh it after their in-place edits. Reuse requires ordinary versioned
+tensors and a matching default dtype/device context; autocast and custom
+PyTorch dispatch modes use fresh preparation. Prepared workspaces retain
+their mutation checks. Simulation state and any input autograd graphs
+remain caller-owned: pass the intended initial or continuation state explicitly,
+and rebuild differentiable non-leaf inputs when their graph has been consumed.
 
 For compiled execution, bind a reusable fixed-width kernel:
 
 .. code-block:: python
 
    compiled_chunk = fmodel.compile_rollout_chunk(8)
-   bound_chunk = compiled_chunk.bind(tensors.parameters, prepared)
+   bound_chunk = compiled_chunk.bind(
+       tensors.parameters, constants=tensors.constants,
+   )
    final_state, auxiliary = dn.func.run(
        bound_chunk,
        tensors.state,
@@ -1873,17 +1884,32 @@ a four-step kernel and a ten-step span execute as ``4 + 4 + 2`` steps. A span
 shorter than the kernel uses a shorter specialization. Neither setting
 truncates gradients.
 
-Keep ``compiled_chunk`` across optimization iterations. Prepare and bind again
-for each forward/backward graph; kernels cache shorter specializations but do
-not retain bindings or differentiable preparation. A direct
+Keep ``compiled_chunk`` and its raw binding across optimization iterations.
+Kernels cache shorter specializations and do not retain bindings or
+differentiable preparation. A direct
 ``bound_chunk(state, RolloutInput(...))`` call consumes exactly
 ``bound_chunk.steps`` timesteps.
 
+Explicit preparation remains available for advanced control:
+
+.. code-block:: python
+
+   prepared = fmodel.prepare(tensors.parameters, tensors.constants)
+   prepared_step = fmodel.bind(tensors.parameters, prepared)
+
+This form reuses that exact prepared object. Prepare and bind again for each
+independent forward/backward graph and after parameter or constant edits.
+Its ``prepared`` property holds the object and its ``constants`` property is
+``None``. A raw binding has the inverse ownership: it exposes raw constants and
+its ``prepared`` property is ``None``.
+
 An explicit binding identifies its model and operands directly. Canonical
 scheduling does not infer that ownership from ``functools.partial`` or wrapper
-metadata. Network bindings use the same scheduling keywords and callback
-continuation contract; see :doc:`A20_functional_network_rollout` for their raw
-constant and materialization lifetime rules.
+metadata. Network bindings use ``bind(parameters, constants=constants)``, the
+same scheduling keywords, and the same callback continuation contract; see
+:doc:`A20_functional_network_rollout` for their materialization lifetime rules.
+The executable ``examples/functional_raw_bindings.py`` demonstrates repeated
+training passes and optimizer updates with Population and Network bindings.
 
 With PyTorch 2.14 or newer, ``execution="scan"`` offers an
 experimental alternative for first-order training over longer horizons:
@@ -1893,7 +1919,9 @@ experimental alternative for first-order training over longer horizons:
    compiled_chunk = fmodel.compile_rollout_chunk(
        ve_over_time.shape[0], execution="scan"
    )
-   bound_chunk = compiled_chunk.bind(tensors.parameters, prepared)
+   bound_chunk = compiled_chunk.bind(
+       tensors.parameters, constants=tensors.constants,
+   )
    final_state, auxiliary = dn.func.run(
        bound_chunk, tensors.state, inputs=drives,
    )
@@ -2454,9 +2482,11 @@ checkpoint options for cloning or restoring model state are unnecessary. When
 gradients are disabled, the checkpointed runner uses the ordinary chunk engine
 because there is no autograd graph to reduce.
 
-A differentiable prepared object belongs to one forward/backward graph. Create
-it with gradient recording enabled, reuse it across that graph's complete run,
-and prepare again for the next forward pass or after an optimizer update.
+A differentiable prepared object belongs to one forward/backward graph. Raw
+bindings own this lifetime for each complete run. When using an explicit
+``bind(parameters, prepared)`` binding, create the prepared object with gradient
+recording enabled, reuse it across that graph's complete run, and prepare again
+for the next forward pass or after an optimizer update.
 
 PyTorch transforms
 ------------------
