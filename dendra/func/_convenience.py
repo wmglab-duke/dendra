@@ -11,6 +11,7 @@ from torch.utils import _pytree as pytree
 
 from ._binding import BoundPopulation
 from ._compiled import CompiledPopulationChunk
+from ._continuation import _complete_continuation, _resolve_continuation
 from ._draws import _with_runtime_draws
 from ._inputs import _population_inputs
 from ._parameter_queries import matching_names
@@ -461,6 +462,9 @@ class CompiledRunner:
                 raise TypeError("extra must be supplied for extra=VarInput()")
         elif extra is not _MISSING_RUNTIME_EXTRA:
             raise TypeError("runtime extra requires compile(..., extra=VarInput())")
+        state, parameters, constants, callback_state = _resolve_continuation(
+            state, parameters, constants, callback_state, initialization
+        )
         fresh_policy = self._initialization == "fresh"
         if initialization is not None:
             if not fresh_policy:
@@ -675,6 +679,7 @@ class CompiledRunner:
                     schedule_options["checkpoint_every"] = min(
                         self._checkpoint_every, self._chunk_steps
                     )
+            previous_report = self._kernel.execution_report()
             final, auxiliary = schedule(
                 bound,
                 selected_state,
@@ -688,7 +693,13 @@ class CompiledRunner:
                 auxiliary = dict(auxiliary)
                 auxiliary["parameters"] = dict(selected_parameters)
                 auxiliary["constants"] = dict(selected_constants)
-            return final, auxiliary
+            try:
+                return _complete_continuation(
+                    final, auxiliary, selected_parameters, selected_constants
+                )
+            except Exception:
+                self._kernel._report_state.report = previous_report
+                raise
 
 
 def compile(

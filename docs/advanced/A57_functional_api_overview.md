@@ -16,6 +16,13 @@ returns explicit simulation state. Use `make_functional(model, dt=...)`
 for either kind of model when an application needs to control bindings, chunk
 scheduling, explicit draws, or PyTorch function transforms.
 
+The same `dn.compile` function returns `CompiledRunner` for one Population,
+including a concatenated `MultiPopulation`, or `CompiledNetworkRunner` for a
+Network. The Network runner coordinates its Populations, connections, optional
+NetStim, and shared clock/RNG scheduling. Both use the same calling and
+continuation interface; Network inputs and parameter trees are grouped by
+Population/component, and observation paths use names such as `"left.v"`.
+
 The complete
 {download}`functional_api_overview.py <../../examples/functional_api_overview.py>`
 example contains six independently runnable sections:
@@ -86,8 +93,17 @@ the initialized snapshot; an explicit state continues that simulation. It does
 not advance the native model or overwrite its snapshot.
 
 Recording is an explicit named callback. A fresh Recorder includes the initial
-sample, followed by every accepted step. Supply both simulation state and
-callback state to continue without recording the shared boundary twice:
+sample, followed by every accepted step. `auxiliary["continuation"]` carries
+the returned simulation state, effective bindings and callback state together.
+Pass it to the next call to continue without recording the shared boundary twice:
+
+```python
+state, auxiliary = runner()
+state, auxiliary = runner(auxiliary["continuation"])
+```
+
+Supplying simulation state and `callback_state=` explicitly uses the same
+continuation contract:
 
 ```{literalinclude} ../../examples/functional_api_overview.py
 :language: python
@@ -295,9 +311,10 @@ current parameters, rather than restart a captured state. Edit
 Bound steady-state caches restore their saved state and detached
 materializations according to native cache semantics.
 
-Fresh initialization can return replacement parameter or constant mappings.
-The result exposes these effective mappings explicitly. A continuation carries
-them with the simulation and callback state:
+Every successful convenience-runner call returns a `dn.func.Continuation` at
+`auxiliary["continuation"]`. It captures the actual effective `parameters` and
+`constants` for that call, including per-call overrides and fresh/cache
+initialization replacements, with its simulation state and callback carry:
 
 ```python
 fresh_runner = dn.compile(
@@ -305,17 +322,50 @@ fresh_runner = dn.compile(
     callbacks={"trace": dn.func.Recorder(("v", "t"))},
 )
 state, auxiliary = fresh_runner()
-continued, next_auxiliary = fresh_runner(
-    state,
-    parameters=auxiliary["parameters"],
-    constants=auxiliary["constants"],
-    callback_state=auxiliary["callbacks"].state,
-)
+continued, next_auxiliary = fresh_runner(auxiliary["continuation"])
 ```
 
-For an in-memory training continuation, retain tensors with their existing
-graphs. For an independent checkpoint, detach and clone the tensor trees. Save
-effective parameters/constants as needed and complete simulation state,
+A packet has `state`, `parameters`, `constants` and `callback_state` attributes.
+It snapshots their container structure and retains Tensor identities, aliases
+and gradient history. Its attributes are fixed; nested dictionaries and lists
+are independent ordinary containers. Editing a packet does not bypass source,
+schema or callback-state validation when it is resumed.
+The runner does not retain the returned packet. Tensor
+leaves remain live: keep their values unchanged until backward completes.
+Prepared coefficients and emitted recording history remain outside the packet.
+Packet calls prepare from their explicit sources; they do not replace the
+runner's default bindings or populate its default inference cache.
+The `(state, auxiliary)` return value and explicit keyword calls are also
+supported; fresh-policy calls expose their effective mappings at
+`auxiliary["parameters"]` and `auxiliary["constants"]`.
+
+A packet supplies all four continuation operands. Do not combine it with
+non-`None` `parameters=`, `constants=`, `callback_state=` or `initialization=`
+overrides. `inputs=`, `draws=` and call-local `extra=` remain inputs to each
+invocation; the packet does not save or replay those tapes or waveform recipes.
+No-state calls retain the configured snapshot/fresh restart behavior.
+
+The complete
+{download}`functional_continuation.py <../../examples/functional_continuation.py>`
+example checks Population and connected-Network continuation, per-call
+parameter overrides, aliases, joined recordings, checkpointed gradients and
+fresh effective bindings. Run
+`python examples/functional_continuation.py --backend aot_eager`.
+
+Explicit bindings keep their source ownership. To continue through a raw
+binding, construct it with the packet's sources and pass the state/carry
+explicitly:
+
+```{literalinclude} ../../examples/functional_continuation.py
+:language: python
+:start-after: "# region binding_bridge"
+:end-before: "# endregion binding_bridge"
+:dedent: 4
+```
+
+`Continuation` is an in-memory execution packet. For an independent portable
+checkpoint, detach and clone the state, effective parameter and constant tensor
+trees. Save complete simulation state,
 including clocks, queues, delay histories and RNG carry. Tensor checkpoints can
 be serialized with PyTorch and restored against a compatible functional plan.
 Callback carry is tagged with the identity of its in-memory callback collection.

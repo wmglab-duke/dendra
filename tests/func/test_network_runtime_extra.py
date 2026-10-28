@@ -170,7 +170,9 @@ def test_nonruntime_network_preserves_the_public_run_boundary(monkeypatch, bound
     monkeypatch.setattr(runner.functional, "run", public_run)
     final, auxiliary = runner()
     assert final is runner.initial_state
-    assert auxiliary == {}
+    assert set(auxiliary) == {"continuation"}
+    assert isinstance(auxiliary["continuation"], dn.func.Continuation)
+    _close(auxiliary["continuation"].state, final)
     assert len(calls) == 1
     assert calls[0][1]["steps"] == 2
     assert "_runtime_extra" not in calls[0][1]

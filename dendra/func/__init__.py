@@ -18,6 +18,7 @@ from ._callbacks import (
 )
 from ._compiled import CompiledPopulationChunk
 from ._connection_sampling import ConnectionSamplingDraw
+from ._continuation import Continuation
 from ._continuous import (
     ContinuousConTensors,
     FunctionalContinuousCon,
@@ -73,6 +74,7 @@ __all__ = [
     "CompiledPopulationChunk",
     "CompiledRunner",
     "ContinuousConTensors",
+    "Continuation",
     "ConnectionSamplingDraw",
     "ExecutionCapabilities",
     "ExecutionReport",

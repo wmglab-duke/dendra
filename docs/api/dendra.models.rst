@@ -58,6 +58,38 @@ and supply it through ``draws=``. See
 compatibility packet forms.
 
 
+Functional continuation
+------------------------
+
+``dn.compile(Population)`` returns a ``CompiledRunner``; a concatenated
+``MultiPopulation`` is one Population. ``dn.compile(Network)`` returns a
+``CompiledNetworkRunner`` that coordinates its Populations, connections,
+optional NetStim and shared clock/RNG scheduling. Both return
+``(state, auxiliary)`` and publish ``auxiliary["continuation"]`` for the same
+in-memory resume call: ``state, auxiliary = runner(packet)``.
+
+The packet captures effective raw parameter/constant bindings, including call
+overrides and fresh/cache replacements, with complete simulation state and
+callback carry. Attributes are fixed; container snapshots are independent
+ordinary dictionaries/lists/tuples, and Tensor identities, aliases and gradient
+history are retained. It stores no prepared coefficients or recording history.
+Passing a packet cannot be combined with non-``None`` ``parameters=``,
+``constants=``, ``callback_state=`` or ``initialization=`` overrides. Runtime
+inputs, draws and declared call-local ``extra=`` remain per-call arguments.
+
+.. autoclass:: dendra.func.Continuation
+
+Existing explicit-state/keyword calls retain their contracts. Raw/prepared
+bindings keep explicit ownership: create a binding with ``packet.parameters``
+and ``packet.constants`` and pass ``packet.state`` and ``packet.callback_state``
+through the usual execution arguments. Portable detached checkpoints use the
+callback export/restoration bridge separately; the continuation packet is not a
+portable checkpoint format. See
+:doc:`../advanced/A57_functional_api_overview` and the complete
+:download:`functional_continuation.py <../../examples/functional_continuation.py>`
+example.
+
+
 Functional host scheduling
 --------------------------
 

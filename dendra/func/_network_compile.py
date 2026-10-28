@@ -11,6 +11,7 @@ from torch.utils import _pytree as pytree
 
 from dendra.models.core import _validate_time_scalar
 
+from ._continuation import _complete_continuation, _resolve_continuation
 from ._draws import _normalize_runtime_draws
 from ._lowering import _lower_network
 from ._network_bindings import _map_containers
@@ -365,6 +366,9 @@ class CompiledNetworkRunner:
                     "call-time extra requires slots declared with extra=VarInput()"
                 )
             selected_extra = None
+        state, parameters, constants, callback_state = _resolve_continuation(
+            state, parameters, constants, callback_state, initialization
+        )
         fresh_policy = self._initialization == "fresh"
         if initialization is not None:
             if not fresh_policy:
@@ -483,7 +487,9 @@ class CompiledNetworkRunner:
                     auxiliary = dict(auxiliary)
                     auxiliary["parameters"] = _map_containers(selected_parameters, dict)
                     auxiliary["constants"] = _map_containers(selected_constants, dict)
-                return final, auxiliary
+                return _complete_continuation(
+                    final, auxiliary, selected_parameters, selected_constants
+                )
         except Exception:
             self._kernel._report_state.report = previous
             raise

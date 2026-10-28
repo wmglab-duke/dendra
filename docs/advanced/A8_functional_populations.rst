@@ -102,16 +102,26 @@ different execution strategy.
 
 State stays explicit. By default, every ``runner()`` starts from the captured
 ``runner.initial_state`` snapshot; the runner never advances or commits state
-to the source Population. To
-continue, pass the returned state. Passing the callback state also preserves
-reducer history and its clock without recording a duplicate boundary frame:
+to the source Population. Each successful call returns a
+``dn.func.Continuation`` at ``auxiliary["continuation"]``. It carries the returned
+state, effective raw parameters/constants and callback carry together:
 
 .. code-block:: python
 
-   continued_state, continued_auxiliary = runner(
-       final_state,
-       callback_state=auxiliary["callbacks"].state,
-   )
+   continued_state, continued_auxiliary = runner(auxiliary["continuation"])
+
+This preserves reducer history and sampling phase without repeating the boundary
+frame. The packet snapshots container structure while retaining Tensor identities,
+aliases and gradient history. Its attributes are read-only; Tensor leaves remain
+live, and nested dictionaries/lists are independent ordinary containers.
+Source, tensor-schema and callback-state validation still applies at resume.
+Passing the returned state and ``callback_state=`` explicitly is also
+supported. Packets cannot be combined with non-``None`` ``parameters=``,
+``constants=``, ``callback_state=`` or ``initialization=`` overrides. Supply
+``inputs=``, ``draws=`` and declared runtime ``extra=`` per call.
+See :doc:`A57_functional_api_overview` and the complete
+:download:`functional_continuation.py <../../examples/functional_continuation.py>`
+example for Population and Network training and continuation.
 
 To persist callback carry and restore it with an equivalent reconstructed
 runner, use ``runner.callbacks.export_state(...)`` and
@@ -242,21 +252,17 @@ and waveform parameters retain their shared aliases; see
 Explicit state always means continuation and bypasses initialization, even on
 a fresh-policy runner. Every fresh-policy call returns its effective runtime
 parameters at ``auxiliary["parameters"]``. If a pure initialization transform
-replaces parameters (for example, to balance resting current), continuation
-must carry that mapping explicitly:
+replaces parameters (for example, to balance resting current), the continuation
+packet retains those effective values automatically:
 
 .. code-block:: python
 
-   continued_state, continued_auxiliary = fresh_runner(
-       final_state,
-       parameters=auxiliary["parameters"],
-       constants=auxiliary["constants"],
-       callback_state=auxiliary["callbacks"].state,
-   )
+   continued_state, continued_auxiliary = fresh_runner(auxiliary["continuation"])
 
 Cached starts also return effective constants at ``auxiliary["constants"]``;
-pass both effective parameter and constant mappings when continuing their
-returned state. Without a cache or parameter-writing transforms, state-only
+the packet includes those values as well. For explicit-state calls, pass both
+effective mappings through ``parameters=`` and ``constants=`` when continuing a
+cached or parameter-writing start. Without those features, state-only
 continuation remains valid.
 To replay the originally captured snapshot on a fresh-policy runner, use
 ``fresh_runner(fresh_runner.initial_state, parameters=fresh_runner.parameters,

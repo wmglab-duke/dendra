@@ -85,6 +85,16 @@ and constants, while parameter-invariant connection histories use current
 connection values. Cache packets and explicit continuation are described in
 :doc:`../advanced/A29_functional_network_cache_initialization`.
 
+Each successful convenience-runner call publishes an in-memory
+``dn.func.Continuation`` at ``auxiliary["continuation"]``. Pass that packet as
+the next call's state argument to retain complete Network state, effective
+parameters/constants and callback carry together. Per-call parameter overrides
+and fresh/cache replacements retain their selected Tensor identities, shared
+aliases and gradients; they do not replace runner defaults. Input/draw tapes
+and runtime extracellular recipes remain per-call arguments. See
+:doc:`../advanced/A57_functional_api_overview` for the same Population/Network
+contract and the explicit bridge to raw bindings.
+
 .. autoclass:: dendra.func.CompiledNetworkRunner
    :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, callbacks, kernel, find_parameters, parameter_name, get_parameter, execution_report
    :special-members: __call__

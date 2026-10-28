@@ -20,6 +20,15 @@ For an explicitly lowered Population or Network, use the collection returned by
 `functional.make_callbacks(...)` instead. Both expose the same `export_state`
 and `restore_state` methods.
 
+For continuation in the same compiled runner, pass
+`auxiliary["continuation"]` to its next call. That `dn.func.Continuation`
+retains effective parameters/constants, simulation state and callback carry
+with their live Tensor identities and graphs. It is an in-memory packet;
+portable serialization uses detached tensor trees plus the checked callback
+export described here. Export its `callback_state` through
+`runner.callbacks.export_state(...)` when callbacks are configured. Do not
+save the `Continuation` object as a replacement for that portable format.
+
 The complete
 {download}`functional_callback_checkpoints.py <../../examples/functional_callback_checkpoints.py>`
 example writes actual temporary checkpoint files and reconstructs both a
@@ -74,8 +83,9 @@ configuration is part of the compatibility metadata; matching shapes alone is
 insufficient to establish that two reducers mean the same thing.
 
 The example stores complete simulation state and effective parameter/constant
-values alongside the callback packet. Its `snapshot` helper preserves shared
-parameter aliases while making independent detached storage:
+values from `auxiliary["continuation"]` alongside the callback packet. Its
+`snapshot` helper preserves shared parameter aliases while making independent
+detached storage:
 
 ```{literalinclude} ../../examples/functional_callback_checkpoints.py
 :language: python
@@ -88,10 +98,10 @@ requiring Python callback objects or PyTree implementation classes in the file.
 The original `FunctionalCallbackState` object is an in-memory carry type;
 export it through the collection before saving a portable checkpoint.
 
-When fresh initialization replaces parameters or constants, save
-`auxiliary["parameters"]` and `auxiliary["constants"]`. Otherwise the runner's
-default mappings are sufficient when no per-call override was used. If a call
-supplied explicit overrides, save those effective values. Restoring callback
+`continuation.parameters` and `continuation.constants` capture the effective
+sources for every successful convenience call, including explicit overrides
+and fresh/cache replacements. Fresh-policy calls also expose these mappings
+at `auxiliary["parameters"]` and `auxiliary["constants"]`. Restoring callback
 carry does not restore model parameters, geometry, stimulation configuration,
 optimizer state or prior recording results.
 

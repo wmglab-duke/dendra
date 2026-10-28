@@ -172,8 +172,10 @@ to `True`, refreshing those values from their raw sources. Set either flag to
 `aux["constants"]` to preserve that materialization across fresh initialization
 boundaries. Fresh-policy calls return the resulting
 effective parameter packet in `aux["parameters"]`; initialization does not
-overwrite the runner's independent optimizer leaves. If an initialization
-transform writes parameters, continue with that effective packet explicitly:
+overwrite the runner's independent optimizer leaves. `runner(aux["continuation"])`
+continues with the effective parameters/constants and callback carry together.
+When using explicit-state calls after a parameter-writing initialization, pass
+the effective mappings as in this example:
 
 ```{literalinclude} ../../examples/functional_network_initialization.py
 :language: python
@@ -424,6 +426,24 @@ trainable selection, shared aliases, and the same continuation clock; see
 any Population without bound `extra`.
 
 ## Restart or continue explicitly
+
+Every successful call publishes `aux["continuation"]`, a `dn.func.Continuation`
+containing the returned state, effective raw parameters/constants and callback
+carry. Pass that packet as the next call's state argument:
+
+```python
+state, aux = runner()
+state, aux = runner(aux["continuation"])
+```
+
+The packet captures actual per-call overrides and fresh/cache replacements,
+with independent containers and the same Tensor identities, aliases and
+gradient history. It does not save input/draw tapes or runtime `extra=` recipes;
+supply those per call. Packet calls cannot include non-`None` parameter,
+constant, callback-state or initialization overrides. The same contract applies
+to the Population runner. See {doc}`A57_functional_api_overview` and
+{download}`functional_continuation.py <../../examples/functional_continuation.py>`
+for complete examples and the explicit raw-binding bridge.
 
 Repeated no-state calls with the same parameters and input tapes produce the
 same result, without consuming the native Network's clock or RNG:

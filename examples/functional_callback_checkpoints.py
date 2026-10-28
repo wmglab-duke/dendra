@@ -146,13 +146,14 @@ def compile_runner(model, *, network, backend, execution, steps=STEPS, threshold
 
 # region checkpoint
 def save_checkpoint(path, runner, state, auxiliary):
+    continuation = auxiliary["continuation"]
     # Callback export owns detached carry and metadata, excluding old traces.
-    callback_packet = runner.callbacks.export_state(auxiliary["callbacks"].state)
+    callback_packet = runner.callbacks.export_state(continuation.callback_state)
     payload = snapshot(
         {
             "state": state,
-            "parameters": auxiliary.get("parameters", runner.parameters),
-            "constants": auxiliary.get("constants", runner.constants),
+            "parameters": continuation.parameters,
+            "constants": continuation.constants,
             "callbacks": callback_packet,
         }
     )

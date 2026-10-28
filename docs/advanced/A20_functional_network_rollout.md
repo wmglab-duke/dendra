@@ -269,6 +269,31 @@ checkpointing reduces saved transition activations, not the recording result.
 
 ## Continue both simulation and callback state
 
+For `dn.compile(Network)`, each successful call returns an in-memory
+`dn.func.Continuation` at `aux["continuation"]`:
+
+```python
+state, aux = program()
+state, aux = program(aux["continuation"])
+```
+
+It carries complete simulation state, the effective raw parameters/constants
+selected for that call, and callback carry. This includes per-call overrides
+and fresh/cache initialization replacements. Container structure is snapshotted;
+Tensor identities, shared aliases and gradients remain live. A packet supplies
+all four operands, so do not combine it with non-`None` parameter, constant,
+callback-state or initialization overrides. Supply input/draw tapes and runtime
+extracellular recipes separately on each invocation. See
+{doc}`A57_functional_api_overview` and the complete
+{download}`functional_continuation.py <../../examples/functional_continuation.py>`
+example for Population and Network workflows.
+
+Explicit raw/prepared bindings retain their source ownership. Bind a kernel to
+`continuation.parameters` and `continuation.constants`, then pass
+`continuation.state` and `callback_state=continuation.callback_state` to
+`dn.func.run`. Bindings and pure numerical kernels do not consume the packet
+directly.
+
 A returned Network state includes all Population carry, delivery queues,
 NetStim clock/RNG/calendar state, and the authoritative Network clock. Preserve
 `aux["callbacks"].state` alongside it when continuing the same callback
