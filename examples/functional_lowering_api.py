@@ -6,7 +6,8 @@ Run from the repository root::
     python examples/functional_lowering_api.py
     python examples/functional_lowering_api.py --backend aot_eager
 
-The short CPU examples check ownership, gradients and continuation, not speed.
+The short CPU examples verify source inspection, ownership, gradients and
+continuation.
 """
 
 from __future__ import annotations
@@ -14,7 +15,6 @@ from __future__ import annotations
 import argparse
 
 import torch
-from torch.utils import _pytree as pytree
 
 import dendra as dn
 from dendra.models.mod import graded_syn, pas
@@ -81,29 +81,64 @@ def check_extraction(model, functional, tensors):
         assert tensors.parameters[name] is model.mech.leak.g_param
 
 
+def source_signature(report):
+    """Compare source metadata without comparing Tensor contents."""
+    return tuple(
+        (
+            entry.path,
+            id(entry.tensor),
+            entry.aliases,
+            entry.requires_grad,
+            entry.is_leaf,
+        )
+        for entry in report.entries
+    )
+
+
 def run_model(model, *, paths, backend):
     # region lower_and_bind
     functional, tensors = dn.func.make_functional(model, dt=DT)
+    # The extracted bundle reports exactly its stored parameter/constant frames.
+    extracted = dn.func.inspect_sources(tensors)
+    print(extracted)
     parameters = tensors.independent_parameters(trainable="*.g_param")
     callbacks = functional.make_callbacks({"trace": dn.func.Recorder(paths)})
     kernel = functional.compile_rollout_chunk(WIDTH, backend=backend)
     bound = kernel.bind(parameters, constants=tensors.constants)
+    # A raw binding reports the sources it consumes, including canonical
+    # parameter-owned readers in a Network's constant frame.
+    bound_report = dn.func.inspect_sources(bound)
+    print(bound_report)
     # endregion lower_and_bind
     check_extraction(model, functional, tensors)
+    extracted_signature = source_signature(extracted)
+    bound_signature = source_signature(bound_report)
+    assert all(
+        value.requires_grad and value.is_leaf for value in bound_report.trainable_leaves
+    )
+    assert len(bound_report.trainable_leaves) == len(
+        {id(value) for value in bound_report.trainable_leaves}
+    )
 
     # region run_and_continue
-    prefix, first = dn.func.run(bound, tensors.state, steps=WIDTH, callbacks=callbacks)
+    _, first = dn.func.run(bound, tensors.state, steps=WIDTH, callbacks=callbacks)
     final, second = dn.func.run(
         bound,
-        prefix,
+        first["continuation"],
         steps=STEPS - WIDTH,
         callbacks=callbacks,
-        callback_state=first["callbacks"].state,
     )
     expected, whole = dn.func.run(
         bound, tensors.state, steps=STEPS, callbacks=callbacks
     )
     # endregion run_and_continue
+    # region inspect_continuation
+    current = dn.func.inspect_sources(second["continuation"])
+    print(current)
+    assert source_signature(current) == bound_signature
+    # endregion inspect_continuation
+    assert source_signature(dn.func.inspect_sources(tensors)) == extracted_signature
+    assert source_signature(dn.func.inspect_sources(bound)) == bound_signature
     torch.testing.assert_close(final, expected)
     for name, suffix in second["callbacks"]["trace"].items():
         joined = torch.cat((first["callbacks"]["trace"][name], suffix))
@@ -111,21 +146,28 @@ def run_model(model, *, paths, backend):
         assert joined.shape[0] == STEPS + 1  # One initial boundary frame.
     torch.testing.assert_close(functional.extract().state, tensors.state)
 
-    targets = tuple(
-        {
-            id(value): value
-            for value in pytree.tree_leaves(parameters)
-            if isinstance(value, torch.Tensor) and value.requires_grad
-        }.values()
-    )
+    targets = bound_report.trainable_leaves
     trace = whole["callbacks"]["trace"]
     loss = sum(value.square().mean() for name, value in trace.items() if name != "t")
-    gradients = torch.autograd.grad(loss, targets)
+    gradients = torch.autograd.grad(loss, targets, allow_unused=True)
     assert targets
-    for gradient in gradients:
-        assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
+    assert all(
+        gradient is None or torch.isfinite(gradient).all() for gradient in gradients
+    )
+    by_identity = {
+        id(value): gradient for value, gradient in zip(targets, gradients, strict=True)
+    }
+    conductances = {
+        id(entry.tensor)
+        for entry in bound_report.entries
+        if entry.domain == "parameters" and entry.path.endswith("leak.g_param")
+    }
+    assert conductances
+    for identity in conductances:
+        gradient = by_identity[identity]
+        assert gradient is not None and gradient.abs().sum() > 0
     print(
-        f"{type(functional).__name__}: shared lowering/bind/run, extraction ownership, "
+        f"{type(functional).__name__}: shared lowering/bind/run inspection, extraction ownership, "
         "recording continuation and training gradients passed"
     )
 

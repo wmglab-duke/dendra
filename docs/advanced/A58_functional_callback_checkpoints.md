@@ -166,6 +166,7 @@ construct a new raw binding from those exact sources:
 
 ```python
 bound = receiver.kernel.bind(restored.parameters, constants=restored.constants)
+print(dn.func.inspect_sources(bound))
 state, auxiliary = dn.func.run(
     bound, restored, steps=STEPS, callbacks=receiver.callbacks,
 )
@@ -181,6 +182,13 @@ state, effective sources and callback carry. Supplied callback collections
 still have to match the packet's restored carry. Do not also pass a non-`None`
 `callback_state=`. Input/draw tapes, runtime extracellular recipes and the next
 horizon are supplied separately.
+
+Inspecting that raw binding reports its effective parameter and constant
+readers. Network readers owned by a parameter resolve to the same Tensor
+object, including across the two frames. The authored binding maps remain
+unchanged. Inspecting a `PopulationTensors` or `NetworkTensors` bundle instead
+reports exactly the frames stored in that bundle. The report never performs
+preparation, source validation or checkpoint restoration.
 
 The complete
 {download}`functional_continuation.py <../../examples/functional_continuation.py>`

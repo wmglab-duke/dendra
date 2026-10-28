@@ -158,12 +158,43 @@ parameter tensors; Network extraction returns independent detached snapshots.
 leaves while preserving their aliases in either case.
 
 (functional-source-inspection)=
-## Inspect runner defaults and effective sources
+## Inspect explicit sources and runner defaults
 
-`dn.func.inspect_sources` accepts either `dn.compile(...)` runner type or a
-`dn.func.Continuation`. A runner reports its default parameter and constant
-frames. A continuation reports the effective frames captured for that call,
-including overrides and fresh/cache initialization replacements:
+`dn.func.inspect_sources` uses the same report throughout lowering, binding
+and execution:
+
+| Subject | Parameter and constant frames reported |
+| --- | --- |
+| `PopulationTensors`, `NetworkTensors` | Exactly the frames stored in the bundle |
+| Raw `BoundPopulation`, `BoundNetwork` | The binding's sources, with canonical shared readers for a Network |
+| Either `dn.compile(...)` runner | The runner's defaults |
+| `Continuation` | The effective frames captured for that call or checkpoint |
+
+The complete
+{download}`functional_lowering_api.py <../../examples/functional_lowering_api.py>`
+example inspects extracted bundles, raw bindings and returned continuations
+for both a Population and a connected Network:
+
+```python
+functional, tensors = dn.func.make_functional(model, dt=DT)
+print(dn.func.inspect_sources(tensors))
+parameters = tensors.independent_parameters(trainable="*.g_param")
+kernel = functional.compile_rollout_chunk(2, backend="aot_eager")
+bound = kernel.bind(parameters, constants=tensors.constants)
+print(dn.func.inspect_sources(bound))
+```
+
+A bundle reports its stored Tensor objects, even when independently selected
+parameters have been used for a later binding. Raw Network bindings resolve
+parameter-owned constant readers through the same projection used by
+execution and continuation. This can differ from the authored constant frame;
+inspection leaves that frame and the binding's containers unchanged. Prepared
+Population bindings do not own raw constants and are currently unsupported by
+source inspection. Pass the original tensor bundle or create a raw binding
+with `constants=` when those are the sources you intend to inspect.
+
+For convenience runners, inspect the runner's defaults or a particular call's
+effective frames, including overrides and fresh/cache initialization replacements:
 
 ```python
 program = dn.compile(model, dt=DT, steps=STEPS, inference=False)
@@ -175,7 +206,7 @@ current = dn.func.inspect_sources(auxiliary["continuation"])
 print(current)
 ```
 
-Both calls return a read-only `SourceReport`. Printing it, or displaying it in
+Every supported subject returns a read-only `SourceReport`. Printing it, or displaying it in
 an interactive session, shows a summary and compact path tree: parameter and
 constant path counts, unique Tensors, alias groups, trainable leaves and
 gradient-enabled nonleaves. Rows show shape, dtype, device and gradient/leaf
@@ -224,6 +255,16 @@ example compares default and effective inspection, lists aliases, restores
 trainable leaves and optimizes a resumed segment without selecting internal
 materialization keys. See {doc}`A58_functional_callback_checkpoints` for the
 detached checkpoint boundary.
+
+After a raw-bound run, its returned continuation reports the same effective
+binding sources:
+
+```{literalinclude} ../../examples/functional_lowering_api.py
+:language: python
+:start-after: "# region inspect_continuation"
+:end-before: "# endregion inspect_continuation"
+:dedent: 4
+```
 
 ## Deterministic drives and runtime draws are separate inputs
 

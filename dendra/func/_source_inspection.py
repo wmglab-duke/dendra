@@ -1,4 +1,4 @@
-"""Read-only metadata for runner defaults and effective continuation sources."""
+"""Read-only metadata for explicit parameter and constant source frames."""
 
 from __future__ import annotations
 
@@ -162,13 +162,59 @@ def _format_source_tree(tree, canonical, groups, prefix="  "):
         )
 
 
+def _source_frames(subject):
+    """Select stored or bound reader frames without owning an execution lifecycle."""
+    from ._binding import BoundPopulation
+    from ._continuation import Continuation, _bound_continuation_sources
+    from ._convenience import CompiledRunner
+    from ._network import NetworkTensors
+    from ._network_binding import BoundNetwork
+    from ._network_compile import CompiledNetworkRunner
+    from ._types import PopulationTensors
+
+    if isinstance(subject, (BoundPopulation, BoundNetwork)):
+        if type(subject) not in (BoundPopulation, BoundNetwork):
+            raise TypeError(
+                "inspect_sources requires an exact raw BoundPopulation or "
+                "BoundNetwork binding"
+            )
+        if type(subject) is BoundPopulation and subject._constants is None:
+            raise FunctionalizationError(
+                "inspect_sources requires a raw binding created with constants=; "
+                "prepared Population bindings do not own raw constants"
+            )
+        return _bound_continuation_sources(subject)
+    if isinstance(
+        subject,
+        (
+            CompiledRunner,
+            CompiledNetworkRunner,
+            Continuation,
+            PopulationTensors,
+            NetworkTensors,
+        ),
+    ):
+        return subject.parameters, subject.constants
+    raise TypeError(
+        "inspect_sources requires a compiled Population/Network runner, "
+        "Continuation, PopulationTensors/NetworkTensors bundle, or raw binding"
+    )
+
+
 def inspect_sources(subject) -> SourceReport:
-    """Inspect a compiled runner's defaults or a Continuation's effective frame.
+    """Inspect explicit sources from a runner, tensor bundle, raw binding or packet.
 
     Both Population and Network runners returned by ``dn.compile`` are
     accepted. To inspect overrides or fresh/cache replacements from a particular
     call, pass ``auxiliary['continuation']`` instead of the runner. Existing
     runner parameter selectors continue to describe their defaults only.
+
+    ``PopulationTensors`` and ``NetworkTensors`` expose their stored parameter
+    and constant frames exactly. Raw ``BoundPopulation``/``BoundNetwork``
+    bindings expose their owned sources, with Network shared readers resolved
+    against canonical parameter objects. This does not mutate authored binding
+    maps. Binding types must be exact; prepared Population bindings do not own
+    raw constants and are currently unsupported.
 
     Paths start with ``parameters.`` or ``constants.``. Mapping order and named
     tuple fields are preserved, including all Tensor identity aliases. The
@@ -184,16 +230,8 @@ def inspect_sources(subject) -> SourceReport:
         raise FunctionalizationError(
             "inspect_sources is a host inspection API; call it outside torch.compile"
         )
-    from ._continuation import Continuation
-    from ._convenience import CompiledRunner
-    from ._network_compile import CompiledNetworkRunner
-
-    if not isinstance(subject, (CompiledRunner, CompiledNetworkRunner, Continuation)):
-        raise TypeError(
-            "inspect_sources requires a compiled Population/Network runner "
-            "or Continuation"
-        )
-    frames = (("parameters", subject.parameters), ("constants", subject.constants))
+    parameters, constants = _source_frames(subject)
+    frames = (("parameters", parameters), ("constants", constants))
     # Mapping accessors can execute authored Python. Complete traversal before
     # capturing each unique Tensor's flags, without calling any model hooks.
     rows = [

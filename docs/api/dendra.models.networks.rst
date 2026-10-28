@@ -63,6 +63,10 @@ regex selectors. Preview matches with ``find_parameters`` and inspect the live
 selected leaves through ``trainable_parameters``; shared aliases remain visible.
 ``dn.func.inspect_sources(runner)`` reports default parameter/constant sources;
 pass a returned ``Continuation`` for the effective sources of a particular call.
+Pass ``NetworkTensors`` to inspect its stored frames, or a raw ``BoundNetwork``
+to inspect its canonical parameter-owned readers. The binding's authored
+constant map is unchanged. The same inspection forms apply to Population
+bundles and raw bindings; prepared Population bindings do not own raw constants.
 The shared report includes aliases and identity-deduplicated trainable leaves.
 See :ref:`functional-source-inspection` for the inspection contract.
 Compact source-history training with native ``auto`` selection, delivery-time

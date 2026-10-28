@@ -63,7 +63,12 @@ Source inspection
 
 ``dn.func.inspect_sources(runner)`` inspects the defaults of either runner
 returned by ``dn.compile``. Pass a ``Continuation`` to inspect effective
-parameter/constant frames from a call or restored checkpoint instead. Ordered
+parameter/constant frames from a call or restored checkpoint instead.
+``PopulationTensors`` and ``NetworkTensors`` report exactly their stored
+frames. Exact raw ``BoundPopulation`` and ``BoundNetwork`` bindings report
+their sources, with Network parameter-owned constant readers resolved through
+the execution projection. Authored maps remain unchanged. Prepared Population
+bindings do not own raw constants and are currently unsupported. Ordered
 entries expose live Tensor references, aliases and captured gradient/leaf flags.
 ``report.trainable_leaves`` contains each qualifying leaf once by identity.
 State and callback carry are outside this inventory. Inspection neither executes

@@ -154,7 +154,12 @@ Use ``runner.execution_report()`` after a call to inspect the selected strategy.
 
 ``dn.func.inspect_sources(runner)`` reports the runner's default parameter and
 constant frames. To inspect overrides or fresh/cache replacements from a call,
-pass ``auxiliary["continuation"]`` instead. The read-only report exposes named
+pass ``auxiliary["continuation"]`` instead. The same function accepts
+``PopulationTensors``/``NetworkTensors`` bundles and raw Population/Network
+bindings. Bundles report their stored frames; raw Network bindings report
+canonical parameter-owned constant readers without modifying the authored
+maps. Prepared Population bindings do not own raw constants and are currently
+unsupported by inspection. The read-only report exposes named
 Tensor entries, identity aliases, captured gradient/leaf flags and
 ``trainable_leaves`` deduplicated by Tensor identity. Nonleaf sources remain
 visible but are excluded from the optimizer-leaf tuple. Inspection does not
