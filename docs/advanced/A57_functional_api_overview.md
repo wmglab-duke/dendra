@@ -307,11 +307,15 @@ graphs. For an independent checkpoint, detach and clone the tensor trees. Save
 effective parameters/constants as needed and complete simulation state,
 including clocks, queues, delay histories and RNG carry. Tensor checkpoints can
 be serialized with PyTorch and restored against a compatible functional plan.
-Callback carry is tagged with the identity of its in-memory callback collection;
-continuing it requires that same collection. Serializing callback carry alone
-does not provide portable restoration into a reconstructed collection. Starting
-a new callback collection starts new reductions and includes its initial
-boundary sample. Native state is published only through an explicit
+Callback carry is tagged with the identity of its in-memory callback collection.
+Pass it directly when continuing with that collection. For a reconstructed
+runner, save `runner.callbacks.export_state(auxiliary["callbacks"].state)` and
+restore it through `receiver.callbacks.restore_state(packet)` before continuing.
+The checked checkpoint bridge supports built-ins and retains detached carry,
+phase and discovered emission metadata; see {doc}`A58_functional_callback_checkpoints`
+for a complete disk round-trip example and compatibility rules. Starting a new
+callback collection without restored carry starts new reductions and includes
+its initial boundary sample. Native state is published only through an explicit
 `functional.commit_state_(...)` call.
 
 ## Choose an execution level deliberately

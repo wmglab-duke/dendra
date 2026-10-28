@@ -321,6 +321,15 @@ class CompiledRunner:
         return self._functional
 
     @property
+    def callbacks(self):
+        """Bound callback collection, or ``None`` when callbacks are omitted.
+
+        Use its ``export_state`` and ``restore_state`` methods to save and
+        resume explicit callback carry with an equivalent reconstructed runner.
+        """
+        return self._callbacks
+
+    @property
     def kernel(self):
         return self._kernel
 

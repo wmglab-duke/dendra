@@ -101,6 +101,14 @@ reducer history and its clock without recording a duplicate boundary frame:
        callback_state=auxiliary["callbacks"].state,
    )
 
+To persist callback carry and restore it with an equivalent reconstructed
+runner, use ``runner.callbacks.export_state(...)`` and
+``runner.callbacks.restore_state(...)``. The exported packet contains detached
+carry and emission metadata. Save simulation state and effective parameter
+mappings alongside it; finalized recordings remain separate. See
+:doc:`A58_functional_callback_checkpoints` for complete disk-checkpoint examples
+and callback-configuration compatibility rules.
+
 Registered stimuli are captured with the model. Explicit time-first waveform
 inputs can instead be supplied with ``runner(inputs=dn.func.RolloutInput(...))``.
 The runner exposes ``parameters`` as a read-only mapping of independent tensor

@@ -83,7 +83,7 @@ connection values. Cache packets and explicit continuation are described in
 :doc:`../advanced/A29_functional_network_cache_initialization`.
 
 .. autoclass:: dendra.func.CompiledNetworkRunner
-   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
+   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, callbacks, kernel, find_parameters, parameter_name, get_parameter, execution_report
    :special-members: __call__
 
 .. autoclass:: dendra.func.PopulationCallback

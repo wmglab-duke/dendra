@@ -21,7 +21,7 @@ The :doc:`functional API overview <../advanced/A57_functional_api_overview>`
 provides complete Population and connected-Network workflows.
 
 .. autoclass:: dendra.func.CompiledRunner
-   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
+   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, callbacks, kernel, find_parameters, parameter_name, get_parameter, execution_report
    :special-members: __call__
 
 .. autoclass:: dendra.func.PopulationTensors
@@ -78,6 +78,20 @@ preparation lifetime contracts.
 
 .. autofunction:: dendra.func.run
 
+
+Functional callback checkpoints
+-------------------------------
+
+``runner.callbacks`` exposes the bound collection, or ``None`` when callbacks
+are omitted. Its ``export_state`` and ``restore_state`` methods provide checked
+portable continuation into an equivalent reconstructed collection. Exported
+carry is detached and excludes earlier recording results. Direct in-memory
+continuation retains the existing ``callback_state=`` contract. See
+:doc:`../advanced/A58_functional_callback_checkpoints` for complete Population
+and Network examples, ownership, and compatibility rules.
+
+.. autoclass:: dendra.func.FunctionalCallbacks
+   :members: export_state, restore_state
 
 Intrinsic activity
 ------------------

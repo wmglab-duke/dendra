@@ -289,7 +289,13 @@ callback state starts a fresh collection at the supplied Network boundary.
 The example clones carry without detaching it, preserving gradients across the
 prefix. For durable independent checkpoints, save detached copies together
 with matching parameters, constants, remaining inputs, and Network
-configuration. Native continuation uses `plan.commit_state_(matching_network,
+configuration. Export callback carry with `callbacks.export_state(...)`, then
+restore it through the receiving collection's `restore_state(...)` before
+passing `callback_state=`. Convenience runners expose their bound collection
+as `runner.callbacks`. The portable packet validates callback settings and
+schemas against the receiving plan; see
+{doc}`A58_functional_callback_checkpoints` for complete Population and Network
+examples. Native continuation uses `plan.commit_state_(matching_network,
 state)` as described in {doc}`A19_functional_network_lowering`; commit transfers
 state rather than parameters or constants.
 

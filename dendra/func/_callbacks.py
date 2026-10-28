@@ -1402,6 +1402,31 @@ class FunctionalCallbacks:
     Callback objects supply static configuration only and are never mutated.
     """
 
+    def export_state(self, state: FunctionalCallbackState):
+        """Export owned detached carry for equivalent reconstructed callbacks.
+
+        The versioned plain data/Tensor packet can be saved with ``torch.save``
+        and loaded with ``torch.load(..., weights_only=True)``. It contains
+        callback carry and emission metadata, without recording history. Only
+        qualified built-in callbacks and Population scopes are supported.
+        Export runs outside compilation, function transforms and forward AD.
+        """
+        from ._callback_checkpoints import export_state
+
+        return export_state(self, state)
+
+    def restore_state(self, packet) -> FunctionalCallbackState:
+        """Restore a checkpoint into this compatible callback collection.
+
+        Configuration, tensor structure, dtype and device must match. The
+        returned carry owns detached ordinary tensors and uses this collection's
+        identity; pass it through the existing ``callback_state=`` argument.
+        Restoring does not initialize callbacks or mutate this collection.
+        """
+        from ._callback_checkpoints import restore_state
+
+        return restore_state(self, packet)
+
     def __init__(
         self,
         functional: FunctionalPopulation,
