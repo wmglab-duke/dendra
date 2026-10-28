@@ -44,6 +44,13 @@ class CompiledPopulationChunk:
     Source structure is checked when this immutable lowered-plan wrapper is
     constructed. Later edits to the imperative source Population do not alter
     the compiled kernel; create a new functional plan after structural edits.
+
+    ``inputs`` supplies exactly ``steps`` time-leading samples. Optional
+    ``callbacks`` from ``functional.make_callbacks(...)`` use the same
+    stimulation clock and return results in ``auxiliary['callbacks']``.
+    Continue with the returned simulation state and
+    ``callback_state=auxiliary['callbacks'].state``; resumed recording contains
+    only samples produced by the new call.
     """
 
     def __init__(
@@ -105,6 +112,7 @@ class CompiledPopulationChunk:
                 plans=(),
                 compile_options=options,
                 allow_empty_plans=True,
+                stepwise_stimulation=_stepwise_stimulation,
             )
 
         if execution == "scan":
@@ -309,21 +317,25 @@ class CompiledPopulationChunk:
             reason=reason,
         )
 
-    def _runner_callback_chunk(self, callbacks, steps: int):
-        """Cache a joint transition/reducer kernel for one plan and width."""
+    def _runner_callback_chunk(
+        self, callbacks, steps: int, *, stepwise_stimulation: bool = True
+    ):
+        """Cache one joint recurrence with its caller's stimulation clock."""
         if not 1 <= steps <= self._steps:
             raise ValueError("runner chunk steps must be between 1 and chunk.steps")
         kernels = self._callback_chunks.setdefault(callbacks, {})
-        if steps not in kernels:
-            kernels[steps] = _CompiledCallbackPopulationChunk(
+        key = (steps, stepwise_stimulation)
+        if key not in kernels:
+            kernels[key] = _CompiledCallbackPopulationChunk(
                 self._functional,
                 steps=steps,
                 plans=callbacks._plans,
                 compile_options=self._compile_options,
                 execution=self._execution,
                 report_state=self._report_state,
+                stepwise_stimulation=stepwise_stimulation,
             )
-        return kernels[steps]
+        return kernels[key]
 
     def _step_values(self, parameters, prepared, state, inputs: _RuntimeInputs):
         """Execute one runner-validated frame without public Python checks."""
@@ -385,6 +397,8 @@ class CompiledPopulationChunk:
         state,
         inputs: Inputs | RolloutInput | StepInput | None = None,
         *,
+        callbacks=None,
+        callback_state=None,
         draws=None,
     ):
         if torch.compiler.is_compiling():
@@ -445,6 +459,43 @@ class CompiledPopulationChunk:
             inputs,
             self._steps,
         )
+        if callbacks is not None:
+            from ._callbacks import FunctionalCallbacks, _setup_callback_state
+            from ._runners import _attach_callback_results
+
+            if not isinstance(callbacks, FunctionalCallbacks):
+                raise TypeError(
+                    "callbacks must be a FunctionalCallbacks plan created by "
+                    "functional.make_callbacks(...)"
+                )
+            callbacks._validate_owner(functional)
+            callbacks._validate_runtime_dt_tensor(prepared_values["integrator"]["dt"])
+            previous = self._report_state.report
+            try:
+                callback_state, parts = _setup_callback_state(
+                    callbacks, callback_state, state
+                )
+                kernel = self._runner_callback_chunk(
+                    callbacks,
+                    self._steps,
+                    stepwise_stimulation=self._lowered._stepwise_stimulation,
+                )
+                final, auxiliary, carries, emitted = kernel._rollout_values(
+                    parameters, prepared_values, state, resolved, callback_state.carries
+                )
+                callback_state = callbacks._wrap_compiled_update(
+                    callback_state, carries, emitted
+                )
+                if callbacks._has_emissions(emitted):
+                    parts.append(emitted)
+                return final, _attach_callback_results(
+                    auxiliary, callbacks, callback_state, parts
+                )
+            except BaseException:
+                self._report_state.report = previous
+                raise
+        if callback_state is not None:
+            raise ValueError("callback_state requires callbacks")
         operands = _PopulationChunkOperands(
             parameters,
             prepared_values,
@@ -471,20 +522,28 @@ class _CompiledCallbackPopulationChunk:
         compile_options,
         execution="default",
         report_state,
+        stepwise_stimulation=True,
     ):
         self._execution = execution
         self._steps = steps
         self._compile_options = compile_options
         self._report_state = report_state
         self._lowered = _LoweredCallbackPopulationChunk(
-            functional, steps=steps, plans=plans
+            functional,
+            steps=steps,
+            plans=plans,
+            stepwise_stimulation=stepwise_stimulation,
         )
         self._recorder_while = None
         if execution == "default" and not compile_options.get("disable", False):
             from ._recorder_while import _RecorderWhileExecutor
 
             self._recorder_while = _RecorderWhileExecutor(
-                functional, steps=steps, plans=plans, compile_options=compile_options
+                functional,
+                steps=steps,
+                plans=plans,
+                compile_options=compile_options,
+                stepwise_stimulation=stepwise_stimulation,
             )
         if execution == "scan":
             from ._scan import _CompiledScanPopulationChunk
@@ -494,6 +553,7 @@ class _CompiledCallbackPopulationChunk:
                 steps=steps,
                 plans=plans,
                 compile_options=compile_options,
+                stepwise_stimulation=stepwise_stimulation,
             )
         else:
             self._compiled = torch.compile(

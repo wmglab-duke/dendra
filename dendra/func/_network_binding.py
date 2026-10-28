@@ -42,6 +42,11 @@ class BoundNetwork:
     convention; use ``inputs={}`` for a step with only draws.
     Host ``run(bound, state, ...)``
     schedules arbitrary horizons and samples missing tapes in bounded spans.
+
+    Direct calls accept ``callbacks`` from ``functional.make_callbacks(...)``
+    and return results in ``auxiliary['callbacks']``. Supply its ``state`` as
+    ``callback_state`` alongside the returned Network state to continue
+    reducers and recording without repeating the boundary sample.
     """
 
     _functional: FunctionalNetwork
@@ -127,6 +132,8 @@ class BoundNetwork:
         state,
         inputs: Mapping[str, Inputs] | NetworkRolloutInput | None = None,
         *,
+        callbacks=None,
+        callback_state=None,
         draws=None,
     ):
         if torch.compiler.is_compiling():
@@ -139,6 +146,10 @@ class BoundNetwork:
 
             draws = _normalize_runtime_draws(draws)
         options = {} if draws is None else {"draws": draws}
+        if callbacks is not None:
+            options["callbacks"] = callbacks
+        if callback_state is not None:
+            options["callback_state"] = callback_state
         if self._compiled_chunk is None:
             if isinstance(inputs, Mapping):
                 inputs, _ = _canonicalize_mapping_tree(inputs)
@@ -148,7 +159,8 @@ class BoundNetwork:
                         lambda value: value.unsqueeze(0),
                         (inputs, draws),
                     )
-                    options = {} if draws is None else {"draws": draws}
+                    if draws is not None:
+                        options["draws"] = draws
             return self._eager_rollout(
                 self._parameters, self._constants, state, inputs, steps=1, **options
             )

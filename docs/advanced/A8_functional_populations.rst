@@ -9,6 +9,9 @@ PyTorch function transforms such as ``torch.func.grad``, ``jacrev``, ``vmap``,
 and ``torch.compile`` without changing the normal ``Population.step()``,
 ``run()``, or ``longrun()`` paths.
 
+For complete Population and connected-Network examples and a comparison of the
+execution interfaces, see :doc:`A57_functional_api_overview`.
+
 Quick start: compiled scan or while loop
 ----------------------------------------
 
@@ -63,8 +66,10 @@ The mapping accepts ``dn.func.FunctionalCallback`` configurations, not mutable
 ``"trace"`` are user-defined and have no special meaning. Threshold-only reducers
 need no voltage trajectory, so the example above allocates no full-trace
 storage. Omitting ``callbacks`` or passing ``callbacks={}`` selects no callbacks;
-this is supported by scan, while execution requires a nonempty supported
-callback collection.
+this is supported by scan. The Population convenience runner's while execution
+requires a nonempty supported callback collection. The Network convenience
+runner also supports callback-free while execution; see
+:doc:`A25_functional_network_while`.
 
 Choose ``execution="while"`` for the inference-only ``torch.while_loop``
 path. Both modes default to ``inference=True``: the runner manages
@@ -74,8 +79,9 @@ captures and compiles the loop; retain the runner for subsequent calls.
 Explicit compiler modes and alternate code-generation options take precedence
 over the default C++ wrapper choice.
 Scan and while execution use Dendra's PyTorch 2.14+ baseline; supported features
-are not selected by patch-version number. While execution requires at least four steps, a nonempty
-collection of supported built-in callbacks, and a capturable inference step.
+are not selected by patch-version number. The Population convenience runner's
+while execution requires at least four steps, a nonempty collection of supported
+built-in callbacks, and a capturable inference step.
 Supported built-ins are ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``, ``APCount``,
 ``Active``, ``ActiveAL``, and ``ActiveALCount``; scan also accepts pure custom
 functional callbacks. An unsupported while request raises an error
@@ -1830,7 +1836,7 @@ Deterministic runtime inputs
 
 ``dn.func.Inputs(ve=..., intra=...)`` supplies deterministic voltage/current
 inputs to Population and Network execution. ``ve`` is extracellular voltage
-in mV; ``intra`` is assembled intracellular current density in mA/cm². Each
+in mV; ``intra`` is assembled absolute intracellular current in mA. Each
 field is a Tensor or ``None``, retaining its views, aliases and gradients.
 The normal Population broadcasting and registered-stimulation rules apply.
 
@@ -1947,7 +1953,7 @@ truncates gradients.
 Keep ``compiled_chunk`` and its raw binding across optimization iterations.
 Kernels cache shorter specializations and do not retain bindings or
 differentiable preparation. A direct
-``bound_chunk(state, RolloutInput(...))`` call consumes exactly
+``bound_chunk(state, Inputs(...))`` call consumes exactly
 ``bound_chunk.steps`` timesteps.
 
 Explicit preparation remains available for advanced control:
@@ -2081,6 +2087,27 @@ transformed function and use the fixed-step tensor operation directly:
        callbacks=callbacks,
    )
    voltage = auxiliary["callbacks"]["trace"]["v"]
+
+Direct eager bindings and fixed-width compiled chunks also accept the same
+bound collection:
+
+.. code-block:: python
+
+   final_state, auxiliary = bound_chunk(
+       tensors.state, drives, callbacks=callbacks,
+   )
+   continued_state, continued_auxiliary = bound_chunk(
+       final_state, next_drives, callbacks=callbacks,
+       callback_state=auxiliary["callbacks"].state,
+   )
+
+Here each input tape has ``bound_chunk.steps`` frames. An eager Population
+binding instead consumes one ``Inputs`` frame. A direct Population chunk keeps
+the deterministic bound-waveform grid of the corresponding atomic rollout;
+host ``run`` samples bound waveforms at each accepted clock. Adding callbacks
+preserves the timing of the chosen execution interface. Callback carry continues
+reducers across calls and prevents a duplicate initial recording frame. Each
+returned recording contains only that call's samples.
 
 For a fresh run, ``Recorder`` returns the initial value followed by one value
 after every step. This includes one initial sample for a zero-step run. Its

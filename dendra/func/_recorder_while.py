@@ -14,26 +14,37 @@ from functools import wraps
 
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.utils import _pytree as pytree
 
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
+from ._callback_recurrence import _transition_sample_values
 from ._callbacks import _is_builtin_callback, _update_callback_values
+from ._draws import _has_runtime_stimulation
 from ._inputs import _RuntimeInputs
 from ._tensor_tree_while import _CompiledTensorTreeWhile, _schema
 from ._while_inductor import _compile_while
 
 
 class _RecorderWhileExecutor:
-    """Capture one accepted-clock transition, then reuse a bounded loop body."""
+    """Capture one transition with explicit caller-owned waveform timing."""
 
     def __init__(
-        self, functional, *, steps, plans, compile_options, allow_empty_plans=False
+        self,
+        functional,
+        *,
+        steps,
+        plans,
+        compile_options,
+        allow_empty_plans=False,
+        stepwise_stimulation=True,
     ):
         self._functional = functional
         self._steps = steps
         self._plans = plans
         self._options = compile_options
         self._allow_empty_plans = allow_empty_plans
+        self._stepwise_stimulation = stepwise_stimulation
         self._kernels = {}
         self._capture_errors = {}
 
@@ -119,11 +130,38 @@ class _RecorderWhileExecutor:
         draws=None,
     ):
         functional, plans = self._functional, self._plans
+        stepwise = self._stepwise_stimulation or _has_runtime_stimulation(
+            stimulation, draws
+        )
+        assembly = None
+        if not stepwise and (functional.intra.enabled or functional.extra.enabled):
+
+            def assemble(parameters, prepared, state, ve, intra):
+                return functional._assemble_bound_inputs(
+                    parameters,
+                    state,
+                    ve,
+                    intra,
+                    self._steps,
+                    prepared["integrator"]["dt"],
+                )
+
+            examples = pytree.tree_map_only(
+                torch.Tensor,
+                lambda value: value.detach(),
+                (parameters, prepared, functional._clone_state_tree(state), ve, intra),
+            )
+            assembly = make_fx(assemble, pre_dispatch=False)(*examples)
+            ve, intra = assembly(parameters, prepared, state, ve, intra)
 
         def body(parameters, prepared, current, current_carries, sample):
-            # Accepted-clock sampling retains native waveform boundaries.
-            next_state, auxiliary = functional._step_values(
-                parameters, prepared, current, _RuntimeInputs(*sample)
+            next_state, auxiliary = _transition_sample_values(
+                functional,
+                parameters,
+                prepared,
+                current,
+                _RuntimeInputs(*sample),
+                stepwise_stimulation=stepwise,
             )
             if plans:
                 updated, emitted = _update_callback_values(
@@ -159,6 +197,8 @@ class _RecorderWhileExecutor:
             stimulation=None,
             draws=None,
         ):
+            if assembly is not None:
+                ve, intra = assembly(parameters, prepared, state, ve, intra)
             final, final_carries, observed = kernel(
                 parameters,
                 prepared,

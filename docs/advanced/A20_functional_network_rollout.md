@@ -100,7 +100,7 @@ one leading time axis:
 ```
 
 The remaining dimensions follow each Population's functional input contract.
-`intra` is the assembled intracellular current density in mA/cm²; `ve` is the
+`intra` is the assembled absolute intracellular current in mA; `ve` is the
 external potential in mV for integrators that accept it. Omitted Population
 entries and fields retain their normal registered stimulation or default
 behavior. The two populations can receive different shapes and different
@@ -223,6 +223,16 @@ original tensor leaves and their gradients. Replacing a mapping entry requires
 a new binding. The binding holds raw constants; the host derives prepared
 materializations at their execution boundaries instead of retaining a prepared
 autograd graph across calls.
+
+Direct eager bindings and compiled chunks accept `callbacks=callbacks` and
+`callback_state=previous_aux["callbacks"].state` as well. A direct compiled
+call consumes exactly its fixed width, and all Population input packets are
+time-leading tapes. A direct eager call consumes one frame per Population when
+given a mapping of `dn.func.Inputs`; the legacy `NetworkRolloutInput` form keeps
+its one-step time-leading convention. The result is the same `(state, aux)`
+pair used by host execution. The complete examples in
+{doc}`A57_functional_api_overview` compare these interfaces and their ownership
+rules.
 
 `checkpoint_every` chooses host checkpoint spans, including automatic NetStim
 draw-tape spans. Use `host_span_steps` to bound ordinary execution spans without

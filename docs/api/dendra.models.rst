@@ -17,6 +17,8 @@ exact/unique partial names, glob patterns, or explicit regex selectors. Use
 ``find_parameters`` to preview matches and ``trainable_parameters`` to inspect
 the live ``requires_grad`` subset. See
 :ref:`functional-parameter-selection` for matching rules and runnable examples.
+The :doc:`functional API overview <../advanced/A57_functional_api_overview>`
+provides complete Population and connected-Network workflows.
 
 .. autoclass:: dendra.func.CompiledRunner
    :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, constants, functional, kernel, find_parameters, parameter_name, get_parameter, execution_report
@@ -58,6 +60,10 @@ preparation is reused until its inputs change. In-place optimizer updates are
 visible on the next run. Replacing a mapping entry requires a new binding.
 Bindings do not own simulation state. Population's explicit
 ``bind(parameters, prepared)`` form remains available for graph-local control.
+Direct bindings and compiled chunks accept ``callbacks=`` and
+``callback_state=`` and return ``(state, auxiliary)``. Bind a collection once
+with ``functional.make_callbacks``; its results and continuation carry appear
+under ``auxiliary["callbacks"]``.
 See :doc:`../advanced/A8_functional_populations` and
 :doc:`../advanced/A20_functional_network_rollout` for the execution and
 preparation lifetime contracts.

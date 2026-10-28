@@ -37,6 +37,13 @@ class BoundPopulation:
     Replacing an entry in a caller mapping requires a new binding in either
     form. Reusable kernels retain neither bindings nor preparation graphs.
     Call ``run(bound, state, ...)`` to schedule arbitrary horizons.
+
+    Direct eager calls consume one :class:`Inputs` frame; compiled calls
+    consume exactly ``steps`` time-leading samples. Supply ``callbacks`` from
+    ``functional.make_callbacks(...)`` to return results in
+    ``auxiliary['callbacks']``. Continue their carry with
+    ``callback_state=auxiliary['callbacks'].state`` alongside the returned
+    simulation state; continuation records only new samples.
     """
 
     _functional: FunctionalPopulation
@@ -252,6 +259,8 @@ class BoundPopulation:
         state,
         inputs: Inputs | RolloutInput | StepInput | None = None,
         *,
+        callbacks=None,
+        callback_state=None,
         draws=None,
     ):
         if torch.compiler.is_compiling():
@@ -277,10 +286,19 @@ class BoundPopulation:
                 from ._inputs import _legacy_step_input
 
                 inputs = _legacy_step_input(inputs)
-            return self._prepared_binding()(state, inputs)
+            options = {}
+            if callbacks is not None:
+                options["callbacks"] = callbacks
+            if callback_state is not None:
+                options["callback_state"] = callback_state
+            return self._prepared_binding()(state, inputs, **options)
         # MappingProxyType is an opaque leaf to PyTorch's PyTree machinery.
         # Only the owned ordinary dict may cross a tensor execution boundary.
         options = {} if draws is None else {"draws": draws}
+        if callbacks is not None:
+            options["callbacks"] = callbacks
+        if callback_state is not None:
+            options["callback_state"] = callback_state
         if self._compiled_chunk is None:
             return self._eager_step(
                 self._parameters, self._prepared, state, inputs, **options

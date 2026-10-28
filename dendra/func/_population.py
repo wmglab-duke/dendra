@@ -17658,74 +17658,30 @@ class FunctionalPopulation:
     ):
         """Execute a fixed-step rollout while threading pure callback carry."""
 
+        from ._callback_recurrence import _execute_callback_steps
         from ._callbacks import _complete_callback_results, _setup_callback_state
 
         callbacks._validate_owner(self)
         callbacks._validate_runtime_dt_tensor(prepared["integrator"]["dt"])
         callback_state, parts = _setup_callback_state(callbacks, callback_state, state)
 
-        # Deterministic bound stimulation is evaluated for the complete horizon.
-        # Explicit Poisson packets preserve native invocation ordering per step.
-        if not _has_runtime_stimulation(stimulation, draws):
-            ve, intra = self._assemble_bound_inputs(
-                parameters,
-                state,
-                ve,
-                intra,
-                steps,
-                prepared["integrator"]["dt"],
-            )
-        emissions = []
-        auxiliary = {"v": state["integrator"]["v"]}
-        if steps == 0:
-            state, auxiliary = self._transition_rollout_values(
-                parameters,
-                prepared,
-                state,
-                ve,
-                intra,
-                0,
-            )
-        else:
-            for index in range(steps):
-                execute = (
-                    self._transition_rollout_values
-                    if not _has_runtime_stimulation(stimulation, draws)
-                    else self._execute_rollout_values
-                )
-                state, auxiliary = execute(
-                    parameters,
-                    prepared,
-                    state,
-                    None if ve is None else ve[index : index + 1],
-                    None if intra is None else intra[index : index + 1],
-                    1,
-                    None
-                    if noise is None
-                    else torch.utils._pytree.tree_map_only(
-                        torch.Tensor, lambda value: value[index : index + 1], noise
-                    ),
-                    None
-                    if stimulation is None
-                    else torch.utils._pytree.tree_map_only(
-                        torch.Tensor,
-                        lambda value: value[index : index + 1],
-                        stimulation,
-                    ),
-                    None
-                    if draws is None
-                    else torch.utils._pytree.tree_map_only(
-                        torch.Tensor, lambda value: value[index : index + 1], draws
-                    ),
-                )
-                callback_state, emitted = callbacks._update(
-                    callback_state,
-                    state,
-                    auxiliary,
-                )
-                if emitted is not None:
-                    emissions.append(emitted)
-        emitted_part = callbacks._stack(emissions)
+        state, auxiliary, callback_state, emitted_part = _execute_callback_steps(
+            self,
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            steps,
+            callback_state,
+            lambda carry, current, auxiliary: callbacks._update(
+                carry, current, auxiliary
+            ),
+            lambda emissions: callbacks._stack(emissions),
+            noise,
+            stimulation,
+            draws,
+        )
         if callbacks._has_emissions(emitted_part):
             parts.append(emitted_part)
 
@@ -17932,6 +17888,8 @@ class FunctionalPopulation:
         inputs: Inputs | StepInput | None = None,
         *,
         extra=None,
+        callbacks=None,
+        callback_state=None,
         draws=None,
     ):
         """Advance one functional timestep without mutating the Population."""
@@ -17967,6 +17925,8 @@ class FunctionalPopulation:
             ),
             steps=1,
             extra=extra,
+            callbacks=callbacks,
+            callback_state=callback_state,
         )
 
     def prepare_and_step(
@@ -17977,6 +17937,8 @@ class FunctionalPopulation:
         inputs: Inputs | StepInput | None = None,
         *,
         extra=None,
+        callbacks=None,
+        callback_state=None,
         draws=None,
     ):
         """Derive coefficients and advance one atomic, compile-safe step."""
@@ -18012,6 +17974,8 @@ class FunctionalPopulation:
             ),
             steps=1,
             extra=extra,
+            callbacks=callbacks,
+            callback_state=callback_state,
         )
 
     def receive(self, parameters, prepared, state, *, target: str, payload):

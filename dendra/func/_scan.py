@@ -15,6 +15,7 @@ from torch.utils import _pytree as pytree
 
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
+from ._callback_recurrence import _transition_sample_values
 from ._callbacks import _update_callback_values
 from ._draws import _has_runtime_stimulation
 from ._hop_inputs import (
@@ -62,7 +63,7 @@ class _CompiledScanPopulationChunk:
         self._functional = functional
         self._steps = steps
         self._options = compile_options
-        self._stepwise = stepwise_stimulation or plans is not None
+        self._stepwise = stepwise_stimulation
         self._plans = plans
         # Only static graphs/callables belong here, never example operands.
         self._kernels = {}
@@ -123,46 +124,20 @@ class _CompiledScanPopulationChunk:
             stepwise_stimulation = self._stepwise
 
             def body(parameters, prepared, state, carries, sample):
-                if stepwise_stimulation or _has_runtime_stimulation(
-                    sample["stimulation"], sample["draws"]
-                ):
-                    next_state, auxiliary = functional._step_values(
-                        parameters,
-                        prepared,
-                        state,
-                        _RuntimeInputs(
-                            sample["ve"],
-                            sample["intra"],
-                            sample["noise"],
-                            sample["stimulation"],
-                            sample["draws"],
-                        ),
-                    )
-                else:
-                    next_state, auxiliary = functional._transition_rollout_values(
-                        parameters,
-                        prepared,
-                        state,
-                        None if sample["ve"] is None else sample["ve"].unsqueeze(0),
-                        None
-                        if sample["intra"] is None
-                        else sample["intra"].unsqueeze(0),
-                        1,
-                        None
-                        if sample["noise"] is None
-                        else pytree.tree_map_only(
-                            torch.Tensor,
-                            lambda value: value.unsqueeze(0),
-                            sample["noise"],
-                        ),
-                        draws=None
-                        if sample["draws"] is None
-                        else pytree.tree_map_only(
-                            torch.Tensor,
-                            lambda value: value.unsqueeze(0),
-                            sample["draws"],
-                        ),
-                    )
+                next_state, auxiliary = _transition_sample_values(
+                    functional,
+                    parameters,
+                    prepared,
+                    state,
+                    _RuntimeInputs(
+                        sample["ve"],
+                        sample["intra"],
+                        sample["noise"],
+                        sample["stimulation"],
+                        sample["draws"],
+                    ),
+                    stepwise_stimulation=stepwise_stimulation,
+                )
                 emitted = None
                 if plans is not None:
                     carries, emitted = _update_callback_values(
@@ -291,38 +266,20 @@ class _CompiledScanPopulationChunk:
             )
 
         def authored(parameters, prepared, state, carries, invariant_carries, sample):
-            if stepwise:
-                next_state, auxiliary = functional._step_values(
-                    parameters,
-                    prepared,
-                    state,
-                    _RuntimeInputs(
-                        sample.get("ve"),
-                        sample.get("intra"),
-                        sample.get("noise"),
-                        sample.get("stimulation"),
-                        sample.get("draws"),
-                    ),
-                )
-            else:
-                next_state, auxiliary = functional._transition_rollout_values(
-                    parameters,
-                    prepared,
-                    state,
-                    None if "ve" not in sample else sample["ve"].unsqueeze(0),
-                    None if "intra" not in sample else sample["intra"].unsqueeze(0),
-                    1,
-                    None
-                    if "noise" not in sample
-                    else pytree.tree_map_only(
-                        torch.Tensor, lambda value: value.unsqueeze(0), sample["noise"]
-                    ),
-                    draws=None
-                    if "draws" not in sample
-                    else pytree.tree_map_only(
-                        torch.Tensor, lambda value: value.unsqueeze(0), sample["draws"]
-                    ),
-                )
+            next_state, auxiliary = _transition_sample_values(
+                functional,
+                parameters,
+                prepared,
+                state,
+                _RuntimeInputs(
+                    sample.get("ve"),
+                    sample.get("intra"),
+                    sample.get("noise"),
+                    sample.get("stimulation"),
+                    sample.get("draws"),
+                ),
+                stepwise_stimulation=stepwise,
+            )
             emitted = None
             if plans is not None:
                 updated, emitted = _update_callback_values(

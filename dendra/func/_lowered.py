@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from ._callback_recurrence import _execute_callback_steps
 from ._callbacks import _stack_callback_emissions, _update_callback_values
 from ._draws import _has_runtime_stimulation
 from ._inputs import Inputs, _index_runtime_inputs
@@ -169,12 +170,13 @@ class _LoweredCallbackPopulationChunk:
     differentiable preparation belongs to this static callable.
     """
 
-    __slots__ = ("_functional", "_steps", "_plans")
+    __slots__ = ("_functional", "_steps", "_plans", "_stepwise_stimulation")
 
-    def __init__(self, functional, *, steps, plans):
+    def __init__(self, functional, *, steps, plans, stepwise_stimulation=True):
         self._functional = functional
         self._steps = steps
         self._plans = plans
+        self._stepwise_stimulation = stepwise_stimulation
 
     def __call__(
         self,
@@ -188,26 +190,27 @@ class _LoweredCallbackPopulationChunk:
         stimulation=None,
         draws=None,
     ):
-        emissions = []
-        for index in range(self._steps):
-            # Sample bound waveforms at the accepted clock each time, matching
-            # the host recurrence even at floating-point pulse boundaries.
-            state, auxiliary = self._functional._step_values(
-                parameters,
-                prepared,
-                state,
-                _index_runtime_inputs(ve, intra, noise, stimulation, index, draws),
-            )
-            carries, emitted = _update_callback_values(
-                self._plans, carries, state, auxiliary
-            )
-            if emitted is not None:
-                emissions.append(emitted)
-        return (
+        def update(carries, state, auxiliary):
+            return _update_callback_values(self._plans, carries, state, auxiliary)
+
+        def stack(emissions):
+            return _stack_callback_emissions(self._plans, emissions)
+
+        return _execute_callback_steps(
+            self._functional,
+            parameters,
+            prepared,
             state,
-            auxiliary,
+            ve,
+            intra,
+            self._steps,
             carries,
-            _stack_callback_emissions(self._plans, emissions),
+            update,
+            stack,
+            noise,
+            stimulation,
+            draws,
+            stepwise_stimulation=self._stepwise_stimulation,
         )
 
 
