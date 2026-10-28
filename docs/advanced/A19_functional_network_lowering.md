@@ -10,10 +10,15 @@ kernelspec:
 # Lower a standard Network
 
 Declare and initialize a `Network` using the ordinary Dendra API, then call
-`dn.func.make_functional_network(network)`. The result is a plan for executing
+`dn.func.make_functional(network, dt=DT)`. The result is a plan for executing
 connected timesteps with explicit parameters, constants, and state. Functional
 execution preserves the native Network's phase order and supports gradients,
 replay, and checkpoint continuation without advancing the source Network.
+
+`make_functional` accepts either a Population or a Network. A Network's `dt`
+must match its initialized timestep; supplying a different value does not
+reinitialize it. `make_functional_network(network, ...)` remains available with
+its existing signature and uses the initialized Network timestep.
 
 The complete
 {download}`functional_network_lowering.py <../../examples/functional_network_lowering.py>`
@@ -63,6 +68,9 @@ Network timestep are in milliseconds. See {doc}`../units` and
 `NetworkTensors` has three fields: `parameters`, `constants`, and `state`.
 They are ordinary tensor trees. Component names match those in
 `network.populations`, `network.synapses`, and `network.continuous_synapses`.
+The shared factory returns the existing `FunctionalNetwork` and `NetworkTensors`
+types for a Network, or `FunctionalPopulation` and `PopulationTensors` for a
+Population; their state layouts and extraction ownership remain distinct.
 Lower with `extra={population_name: specification}` to bind extracellular
 contacts and Waveforms. Their explicit leaves live under the selected
 Population's parameter namespace; see {doc}`A28_functional_network_extra`.
@@ -81,6 +89,23 @@ simulation history. Parameter leaves retain their gradient flags.
 Shared registered parameter identities remain shared in the aggregate tree;
 optimize each distinct leaf once. Values computed from another parameterization
 can be supplied explicitly instead of optimizing the extracted leaves.
+Population extraction instead exposes native raw parameter references. Use
+`tensors.independent_parameters(trainable=...)` when independently owned optimizer
+leaves are needed for either kind of model.
+
+Both plans support the same raw binding and host execution spelling:
+
+```python
+bound = plan.bind(tensors.parameters, constants=tensors.constants)
+state, auxiliary = dn.func.run(bound, tensors.state, steps=8)
+```
+
+The complete
+{download}`functional_lowering_api.py <../../examples/functional_lowering_api.py>`
+example applies one compiled-chunk binding, recording, training-gradient and
+continuation workflow to both kinds of model. Run
+`python examples/functional_lowering_api.py --backend aot_eager` to exercise
+ahead-of-time autograd capture.
 
 ```{literalinclude} ../../examples/functional_network_lowering.py
 :language: python

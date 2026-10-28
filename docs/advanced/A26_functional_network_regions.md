@@ -68,7 +68,7 @@ before concatenation, such as `exc[1, :].label("cell_1")`, to select it through
 `network.all_populations.exc.cell_1`.
 
 Create each region from the exact source Network passed to `dn.compile` or
-`make_functional_network`. An equivalent Slice from another Network, or a Slice
+`make_functional(network, dt=...)`. An equivalent Slice from another Network, or a Slice
 retained from before concatenation, does not identify the transformed owner.
 Selection indices are copied when callbacks bind; edit the callback configuration
 and bind again to change a selection.

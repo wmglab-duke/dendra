@@ -10,7 +10,7 @@ kernelspec:
 # Run and record a functional Network
 
 An initialized standard `Network` can execute for a complete horizon through
-`dn.func.make_functional_network`. Rollouts accept per-population input tapes
+`dn.func.make_functional(network, dt=DT)`. Rollouts accept per-population input tapes
 and NetStim draw packets, support recording and reducer callbacks, and return
 state for continuation. Event delivery, continuous source observation, and
 Population updates follow the native ordering described in
@@ -42,6 +42,8 @@ connection parameters. As in the previous tutorial, event weights for `expsyn`
 are in µS, continuous conductance weights are in S/cm², and time is in ms.
 The same canonical single-device lowering requirements apply to all execution
 modes. Configure training, differentiability, and the timestep before lowering.
+The supplied `dt` must match the initialized Network timestep. The compatible
+`make_functional_network(network, ...)` form uses that timestep implicitly.
 
 ## Supply canonical runtime draws
 
@@ -328,7 +330,7 @@ The complete CPU example executes here:
 For `dn.compile(Network)` convenience execution with snapshot or fresh
 initialization, continue with {doc}`A21_functional_network_compile`.
 Bind per-population extracellular contacts and Waveforms with
-`make_functional_network(network, extra={name: specification})`; see
+`make_functional(network, dt=DT, extra={name: specification})`; see
 {doc}`A28_functional_network_extra` for trainable leaves and mixed explicit inputs.
 Inference-only captured while loops, recording, and bounded tails use the same
 pure Network timestep; see {doc}`A25_functional_network_while`.

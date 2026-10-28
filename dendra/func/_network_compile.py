@@ -12,7 +12,7 @@ from torch.utils import _pytree as pytree
 from dendra.models.core import _validate_time_scalar
 
 from ._draws import _normalize_runtime_draws
-from ._network import make_functional_network
+from ._lowering import _lower_network
 from ._network_bindings import _map_containers
 from ._network_initialization import NetworkInitializationInput
 from ._network_parameters import (
@@ -174,13 +174,12 @@ class CompiledNetworkRunner:
             chunk_steps, steps=steps, enabled=bool(runtime_extra_names)
         )
         with torch.inference_mode(False), torch.no_grad():
-            self._functional, tensors = make_functional_network(
-                network, extra=bound_extra, pending_capacity=pending_capacity
+            self._functional, tensors = _lower_network(
+                network,
+                dt=dt_value,
+                extra=bound_extra,
+                pending_capacity=pending_capacity,
             )
-            if dt_value != self._functional.dt:
-                raise ValueError(
-                    "dt must match the initialized Network timestep; initialize and compile again to change it"
-                )
             if not inference and not self._functional.training:
                 raise FunctionalizationError(
                     "inference=False requires a Network initialized in training mode; call train() and initialize() before compiling"

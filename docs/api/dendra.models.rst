@@ -12,6 +12,17 @@ Core
 Functional Population parameters
 --------------------------------
 
+``dn.func.make_functional(model, dt=...)`` lowers either an initialized Population
+or a Network. The concrete plan and tensor-bundle types, state layouts and
+extraction ownership follow the model: Population raw parameters refer to native
+sources, while Network extraction produces independent detached snapshots with
+shared aliases. Use ``independent_parameters`` for independent optimization
+leaves. Network ``dt`` must match its initialized timestep. See
+:doc:`../advanced/A19_functional_network_lowering` for the shared lowering and
+binding flow and the compatible ``make_functional_network`` form.
+
+.. autofunction:: dendra.func.make_functional
+
 ``dn.compile(Population)`` returns independent parameter leaves selectable by
 exact/unique partial names, glob patterns, or explicit regex selectors. Use
 ``find_parameters`` to preview matches and ``trainable_parameters`` to inspect

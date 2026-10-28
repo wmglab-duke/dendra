@@ -12,8 +12,8 @@ kernelspec:
 Use `dn.compile(model, ...)` for an ordinary simulation or training loop built
 from a supported, initialized Population or Network. It owns independent default
 parameter tensors, manages preparation and optional runtime sampling, and
-returns explicit simulation state. Use `make_functional` or
-`make_functional_network` when an application needs to control bindings, chunk
+returns explicit simulation state. Use `make_functional(model, dt=...)`
+for either kind of model when an application needs to control bindings, chunk
 scheduling, explicit draws, or PyTorch function transforms.
 
 The complete
@@ -206,15 +206,26 @@ stochastic subsystem. Do not supply the same stochastic family through both
 
 ## Explicit bindings and direct chunks
 
-`make_functional(population, dt=...)` and `make_functional_network(network)`
-return a plan and explicit tensor bundles. Use the same raw binding spelling
-for eager and compiled execution:
+`make_functional(model, dt=...)` returns a plan and explicit tensor bundle for
+an initialized Population or Network. A Network's supplied `dt` must match its
+initialized timestep. The factory returns the concrete `FunctionalPopulation` /
+`PopulationTensors` or `FunctionalNetwork` / `NetworkTensors` types; it preserves
+their distinct state layouts and extraction ownership. The existing
+`make_functional_network(network, ...)` spelling remains available and uses the
+initialized Network timestep implicitly. Use the same raw binding spelling for
+eager and compiled execution:
 
 ```python
 eager = functional.bind(parameters, constants=constants)
 kernel = functional.compile_rollout_chunk(2, backend="aot_eager")
 bound = kernel.bind(parameters, constants=constants)
 ```
+
+The complete
+{download}`functional_lowering_api.py <../../examples/functional_lowering_api.py>`
+example applies this shared lowering, binding and scheduling flow to both a
+Population and a connected Network, including recording, gradients and resumed
+execution.
 
 An eager binding executes one step; a compiled binding executes its fixed
 width. Direct calls accept the same `callbacks=` and `callback_state=` contract
@@ -361,9 +372,8 @@ This section executes eagerly. Its parity checks establish the transform
 contract for the example; they do not claim compiled acceleration.
 
 The main remaining API asymmetries are visible at the advanced boundary:
-Population and Network have separate lowering functions and state layouts;
-Population extraction exposes native parameters while Network extraction takes
-detached snapshots;
+Population and Network retain different state layouts; Population extraction
+exposes native parameters while Network extraction takes detached snapshots;
 prepared Population bindings and raw Network bindings use different positional
 arguments; eager frames and compiled tapes differ by a leading time dimension;
 and the legacy packet/callable scheduler forms remain available. The raw

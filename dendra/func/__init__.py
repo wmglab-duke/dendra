@@ -27,6 +27,7 @@ from ._convenience import CompiledRunner, compile
 from ._draws import RuntimeDraws
 from ._execution import ExecutionCapabilities, ExecutionReport
 from ._inputs import Inputs
+from ._lowering import make_functional
 from ._netcon import FunctionalNetCon, NetConTensors, make_functional_netcon
 from ._netstim import (
     FunctionalNetStim,
@@ -43,7 +44,7 @@ from ._network_initialization import (
     NetworkInitializationInput,
 )
 from ._network_rollout import CompiledNetworkChunk, NetworkRolloutInput
-from ._population import FunctionalPopulation, make_functional
+from ._population import FunctionalPopulation
 from ._runners import longrun, longrun_checkpointed, run
 from ._runtime_extra import VarInput
 from ._schedules import TensorScheduleTensors

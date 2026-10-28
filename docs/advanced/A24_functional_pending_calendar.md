@@ -86,7 +86,8 @@ modulo behavior.
 `pending_capacity` is the maximum number of entries per connection calendar,
 independent of the number of ring slots. Supply one positive integer or a mapping
 from event-connection names to counts to `dn.compile`,
-`dn.func.make_functional_network`, or `FunctionalNetwork`. Explicit NetCon
+`dn.func.make_functional(network, dt=...)`, or `FunctionalNetwork`. The compatible
+`dn.func.make_functional_network` entry point accepts the same option. Explicit NetCon
 lowering accepts one integer through `dn.func.make_functional_netcon`.
 
 Intrinsic-only packed connections with no NetCon schedules or imported pending

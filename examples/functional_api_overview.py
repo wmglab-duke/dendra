@@ -260,7 +260,7 @@ def explicit_demo(*, backend):
 # region draws
 def draws_demo(*, backend):
     model = make_network()
-    functional, tensors = dn.func.make_functional_network(model)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
     initial = copy_state(tensors.state)
     callbacks = functional.make_callbacks(
         {"trace": dn.func.Recorder(("left.v", "right.v", "t"))}

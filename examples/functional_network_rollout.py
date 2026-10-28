@@ -131,7 +131,7 @@ def objective(state, auxiliary):
 def run_demo(*, compiled=False):
     model = make_network()
     # region inputs
-    plan, tensors = dn.func.make_functional_network(model)
+    plan, tensors = dn.func.make_functional(model, dt=DT)
     parameters, constants, initial = tensors
     left_v = initial["populations"]["left"]["integrator"]["v"]
     right_v = initial["populations"]["right"]["integrator"]["v"]

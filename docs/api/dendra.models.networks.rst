@@ -32,8 +32,11 @@ Functional Network lowering
 ---------------------------
 
 Declare and initialize a canonical single-device Network with the standard
-Network API, then lower it for pure execution with explicit parameters and
-state. Connections read their registered source fields automatically, and
+Network API, then lower it with ``dn.func.make_functional(network, dt=DT)`` for
+pure execution with explicit parameters and state. The supplied timestep must
+match the initialized Network. ``make_functional_network(network, ...)`` remains
+available with its existing implicit-timestep signature. Connections read their
+registered source fields automatically, and
 recurrent delivery follows native execution order. See
 :doc:`../advanced/A19_functional_network_lowering` for a runnable example of
 pure timesteps, parameter gradients, NetStim draw packets, and checkpoint
@@ -70,7 +73,7 @@ checkpoints are described in :doc:`../advanced/A24_functional_pending_calendar`.
 
 Bind extracellular stimulation with
 ``extra={population_name: (field, waveform)}`` in ``dn.compile`` or
-``make_functional_network``. Each selected Population also accepts a sequence
+``make_functional(network, dt=...)``. Each selected Population also accepts a sequence
 of contacts. Bound stimulation exposes trainable field and waveform leaves,
 preserves shared aliases, and follows the accepted simulation clock. An
 explicit ``ve`` input can supply another Population without bound stimulation.

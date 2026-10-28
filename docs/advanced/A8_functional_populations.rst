@@ -12,6 +12,18 @@ and ``torch.compile`` without changing the normal ``Population.step()``,
 For complete Population and connected-Network examples and a comparison of the
 execution interfaces, see :doc:`A57_functional_api_overview`.
 
+``dn.func.make_functional(model, dt=...)`` is the shared lowering entry point for
+initialized Populations and Networks. It returns each model's concrete plan and
+tensor bundle. Population extraction exposes native raw parameter references;
+Network extraction owns detached snapshots while retaining shared parameter
+aliases. Use ``tensors.independent_parameters(trainable=...)`` for independent
+optimizer leaves. A Network's explicit ``dt`` must match its initialized
+timestep. ``make_functional_network(network, ...)`` remains available with its
+existing implicit-timestep signature. See :doc:`A19_functional_network_lowering`
+and the complete
+:download:`functional_lowering_api.py <../../examples/functional_lowering_api.py>`
+example for the common binding, scheduling and continuation flow.
+
 Quick start: compiled scan or while loop
 ----------------------------------------
 
@@ -1700,7 +1712,7 @@ contract described in :doc:`A50_functional_poisson_stimulation`.
 
 For Networks, bind the same specifications by top-level Population name with
 ``extra={population_name: specification}`` in ``dn.compile`` or
-``make_functional_network``. Stimulation leaves are nested under their
+``make_functional(network, dt=...)``. Stimulation leaves are nested under their
 Population's parameter namespace. See :doc:`A28_functional_network_extra`
 for trainable sharing, continuation, and per-population explicit-input rules.
 
@@ -3021,7 +3033,7 @@ insertion, deletion, and rebuilding; directly editing a compiled Mechanism's
 Fresh functional initialization
 -------------------------------
 
-``make_functional`` still uses an initialized Population to discover the exact
+For a Population, ``make_functional`` uses the initialized model to discover the exact
 tensor schema. For an admitted declaration-driven model, a fresh state can then
 be constructed without mutating that Population:
 

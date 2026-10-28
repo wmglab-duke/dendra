@@ -111,7 +111,7 @@ def run_demo(*, compiled=False):
     reference = make_network()
     resumed = make_network()
     # region lower
-    plan, tensors = dn.func.make_functional_network(model)
+    plan, tensors = dn.func.make_functional(model, dt=DT)
     parameters, constants, state = tensors
     execute = (
         torch.compile(plan.prepare_and_step, backend="aot_eager", fullgraph=True)

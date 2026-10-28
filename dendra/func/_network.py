@@ -2038,6 +2038,10 @@ class FunctionalNetwork:
     def _snap_population_clock(state, time):
         result, clock = dict(state), dict(state["clock"])
         value = clock["t"]
+        # Cast before transfer so compiled MPS execution never stages float64
+        # on the device while converting the authoritative CPU clock.
+        if value.device.type == "mps":
+            time = time.to(dtype=value.dtype)
         clock["t"] = time.to(device=value.device, dtype=value.dtype).reshape(
             value.shape
         )
@@ -2266,8 +2270,9 @@ def make_functional_network(network, *, extra=None, pending_capacity=None):
     Overflow raises at host execution boundaries; retry from the input state
     with a larger-capacity plan.
     """
-    plan = FunctionalNetwork(network, extra=extra, pending_capacity=pending_capacity)
-    return plan, plan.extract()
+    from ._lowering import _lower_network
+
+    return _lower_network(network, extra=extra, pending_capacity=pending_capacity)
 
 
 __all__ = ["FunctionalNetwork", "NetworkTensors", "make_functional_network"]
