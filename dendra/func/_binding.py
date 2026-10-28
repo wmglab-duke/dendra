@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ._inputs import Inputs
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
 if TYPE_CHECKING:
@@ -247,7 +248,11 @@ class BoundPopulation:
         return 1 if self._compiled_chunk is None else self._compiled_chunk.steps
 
     def __call__(
-        self, state, inputs: RolloutInput | StepInput | None = None, *, draws=None
+        self,
+        state,
+        inputs: Inputs | RolloutInput | StepInput | None = None,
+        *,
+        draws=None,
     ):
         if torch.compiler.is_compiling():
             raise FunctionalizationError(
@@ -258,12 +263,20 @@ class BoundPopulation:
             from ._draws import _with_runtime_draws
             from ._network_bindings import _canonicalize_mapping_tree
 
-            inputs = _with_runtime_draws(
-                inputs,
-                draws,
-                step=self._compiled_chunk is None or isinstance(inputs, StepInput),
+            legacy_step = self._compiled_chunk is not None and isinstance(
+                inputs, StepInput
             )
+            if draws is not None:
+                inputs = _with_runtime_draws(
+                    inputs,
+                    draws,
+                    step=self._compiled_chunk is None or isinstance(inputs, StepInput),
+                )
             (state, inputs), _ = _canonicalize_mapping_tree((state, inputs))
+            if legacy_step and draws is not None:
+                from ._inputs import _legacy_step_input
+
+                inputs = _legacy_step_input(inputs)
             return self._prepared_binding()(state, inputs)
         # MappingProxyType is an opaque leaf to PyTorch's PyTree machinery.
         # Only the owned ordinary dict may cross a tensor execution boundary.

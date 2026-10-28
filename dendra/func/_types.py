@@ -237,20 +237,11 @@ class RolloutInput(NamedTuple):
 
 
 def _index_step_input(ve, intra, noise, stimulation, index) -> StepInput:
-    """Select one timestep, retaining packet structure and tensor views."""
-    return StepInput(
-        ve=None if ve is None else ve[index],
-        intra=None if intra is None else intra[index],
-        noise=None
-        if noise is None
-        else torch.utils._pytree.tree_map_only(
-            torch.Tensor, lambda value: value[index], noise
-        ),
-        stimulation=None
-        if stimulation is None
-        else torch.utils._pytree.tree_map_only(
-            torch.Tensor, lambda value: value[index], stimulation
-        ),
+    """Compatibility projection of the shared timestep selection contract."""
+    from ._inputs import _index_runtime_inputs, _legacy_step_input
+
+    return _legacy_step_input(
+        _index_runtime_inputs(ve, intra, noise, stimulation, index)
     )
 
 

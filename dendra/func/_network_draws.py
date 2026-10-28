@@ -90,29 +90,44 @@ def _with_network_runtime_draws(inputs, draws):
     """Normalize canonical ingress without changing the public input tuple."""
     if draws is None:
         return inputs, None
-    from ._network_rollout import NetworkRolloutInput
-
     draws = _normalize_runtime_draws(draws)
-    if inputs is None:
-        inputs = NetworkRolloutInput()
-    if not isinstance(inputs, NetworkRolloutInput):
-        raise TypeError("inputs must be a NetworkRolloutInput or None")
-    if inputs.netstim is not None:
+    populations, netstim = _network_inputs(inputs)
+    if netstim is not None:
         raise ValueError("draws cannot be combined with legacy NetStim packets")
-    if inputs.populations is not None:
-        if not isinstance(inputs.populations, Mapping):
+    if populations is not None:
+        if not isinstance(populations, Mapping):
             raise ValueError(
                 "populations must map known Network names to RolloutInput tapes"
             )
-        for selected in inputs.populations.values():
+        for selected in populations.values():
             if (
                 getattr(selected, "noise", None) is not None
                 or getattr(selected, "stimulation", None) is not None
+                or getattr(selected, "draws", None) is not None
             ):
                 raise ValueError(
                     "draws cannot be combined with legacy noise or stimulation packets"
                 )
     return inputs, draws
+
+
+def _network_inputs(inputs):
+    """Read deterministic name bindings or the unchanged legacy envelope."""
+    from ._network_rollout import NetworkRolloutInput
+
+    if inputs is None:
+        return {}, None
+    if isinstance(inputs, Mapping):
+        return inputs, None
+    if not isinstance(inputs, NetworkRolloutInput):
+        raise TypeError("inputs must be a NetworkRolloutInput or None")
+    return ({} if inputs.populations is None else inputs.populations), inputs.netstim
+
+
+def _legacy_population_noise(inputs):
+    """Project the local authority only for legacy RNG validation/sampling."""
+    draws = getattr(inputs, "draws", None)
+    return getattr(inputs, "noise", None) if draws is None else draws
 
 
 class NetworkRuntimeDrawPlan:

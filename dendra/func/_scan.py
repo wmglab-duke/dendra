@@ -16,17 +16,17 @@ from torch.utils import _pytree as pytree
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._callbacks import _update_callback_values
-from ._draws import RuntimeDraws, _has_runtime_stimulation
+from ._draws import _has_runtime_stimulation
 from ._hop_inputs import (
     _input_usage,
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
 )
+from ._inputs import _RuntimeInputs
 from ._scan_compat import install_scan_compatibility
 from ._scan_inductor import _compile_scan
 from ._scan_tree import _capture_tensor_step, _CompiledTensorTreeScan, _tensor_samples
 from ._tensor_contracts import _clone_contiguous_tree as _clone
-from ._types import StepInput
 
 # Bound the inference graph independently of the horizon, while amortizing the
 # scan loop boundary over several accepted timesteps. Keep training's audited
@@ -70,14 +70,23 @@ class _CompiledScanPopulationChunk:
         self._assemblies = {}
 
     def _training_values(
-        self, parameters, prepared, state, ve, intra, carries, noise, stimulation
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries,
+        noise,
+        stimulation,
+        draws=None,
     ):
         functional = self._functional
         plans = self._plans
         # Population parameters are named operands. Stable key order keeps
         # the shared engine's PyTree schema independent of caller dict order.
         parameters = {name: parameters[name] for name in sorted(parameters)}
-        stepwise = self._stepwise or _has_runtime_stimulation(noise, stimulation)
+        stepwise = self._stepwise or _has_runtime_stimulation(stimulation, draws)
         if not stepwise and (functional.intra.enabled or functional.extra.enabled):
             signature = (ve is not None, intra is not None, MEMBRANE_ASSEMBLY.value)
             if signature not in self._assemblies:
@@ -115,17 +124,18 @@ class _CompiledScanPopulationChunk:
 
             def body(parameters, prepared, state, carries, sample):
                 if stepwise_stimulation or _has_runtime_stimulation(
-                    sample["noise"], sample["stimulation"]
+                    sample["stimulation"], sample["draws"]
                 ):
                     next_state, auxiliary = functional._step_values(
                         parameters,
                         prepared,
                         state,
-                        StepInput(
+                        _RuntimeInputs(
                             sample["ve"],
                             sample["intra"],
                             sample["noise"],
                             sample["stimulation"],
+                            sample["draws"],
                         ),
                     )
                 else:
@@ -144,6 +154,13 @@ class _CompiledScanPopulationChunk:
                             torch.Tensor,
                             lambda value: value.unsqueeze(0),
                             sample["noise"],
+                        ),
+                        draws=None
+                        if sample["draws"] is None
+                        else pytree.tree_map_only(
+                            torch.Tensor,
+                            lambda value: value.unsqueeze(0),
+                            sample["draws"],
                         ),
                     )
                 emitted = None
@@ -168,7 +185,13 @@ class _CompiledScanPopulationChunk:
             prepared,
             state,
             carries,
-            {"ve": ve, "intra": intra, "noise": noise, "stimulation": stimulation},
+            {
+                "ve": ve,
+                "intra": intra,
+                "noise": noise,
+                "stimulation": stimulation,
+                "draws": draws,
+            },
         )
         auxiliary = {"v": final["integrator"]["v"]}
         if plans is None:
@@ -190,6 +213,7 @@ class _CompiledScanPopulationChunk:
         carries,
         noise,
         stimulation=None,
+        draws=None,
         *,
         block=1,
     ):
@@ -199,13 +223,25 @@ class _CompiledScanPopulationChunk:
         functional = self._functional
         plans = self._plans
         steps = self._steps
-        stepwise = self._stepwise or _has_runtime_stimulation(noise, stimulation)
+        stepwise = self._stepwise or _has_runtime_stimulation(stimulation, draws)
         phase_emissions = (
             block > 1 and plans is not None and functional.device.type == "cpu"
         )
         state = functional._clone_state_tree(state)
-        parameters, prepared, state, ve, intra, carries, noise, stimulation = _detach(
-            (parameters, prepared, state, ve, intra, carries, noise, stimulation)
+        parameters, prepared, state, ve, intra, carries, noise, stimulation, draws = (
+            _detach(
+                (
+                    parameters,
+                    prepared,
+                    state,
+                    ve,
+                    intra,
+                    carries,
+                    noise,
+                    stimulation,
+                    draws,
+                )
+            )
         )
         callback_carry = _CallbackCarryPartition.from_plans(plans)
         carries, invariant_carries = callback_carry.split(carries)
@@ -244,6 +280,10 @@ class _CompiledScanPopulationChunk:
             sample["stimulation"] = pytree.tree_map_only(
                 torch.Tensor, lambda value: value[0], stimulation
             )
+        if draws is not None:
+            sample["draws"] = pytree.tree_map_only(
+                torch.Tensor, lambda value: value[0], draws
+            )
         if not any(torch.is_tensor(value) for value in pytree.tree_leaves(sample)):
             # Scan requires a leading iteration axis even without input drives.
             sample["index"] = torch.zeros(
@@ -256,11 +296,12 @@ class _CompiledScanPopulationChunk:
                     parameters,
                     prepared,
                     state,
-                    StepInput(
+                    _RuntimeInputs(
                         sample.get("ve"),
                         sample.get("intra"),
                         sample.get("noise"),
                         sample.get("stimulation"),
+                        sample.get("draws"),
                     ),
                 )
             else:
@@ -275,6 +316,11 @@ class _CompiledScanPopulationChunk:
                     if "noise" not in sample
                     else pytree.tree_map_only(
                         torch.Tensor, lambda value: value.unsqueeze(0), sample["noise"]
+                    ),
+                    draws=None
+                    if "draws" not in sample
+                    else pytree.tree_map_only(
+                        torch.Tensor, lambda value: value.unsqueeze(0), sample["draws"]
                     ),
                 )
             emitted = None
@@ -316,24 +362,41 @@ class _CompiledScanPopulationChunk:
                 sample_use.get("intra", False),
                 sample_use.get("noise", False),
                 sample_use.get("stimulation", False),
+                sample_use.get("draws", False),
             )
         )
 
         def execute(
-            parameters, prepared, state, ve, intra, carries, noise, stimulation=None
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            carries,
+            noise,
+            stimulation=None,
+            draws=None,
         ):
             carries, invariant_carries = callback_carry.split(carries)
-            parameters, prepared, invariant_carries, ve, intra, noise, stimulation = (
-                _isolate_dense_lifted_inputs(
-                    (
-                        parameters,
-                        prepared,
-                        invariant_carries,
-                        ve,
-                        intra,
-                        noise,
-                        stimulation,
-                    )
+            (
+                parameters,
+                prepared,
+                invariant_carries,
+                ve,
+                intra,
+                noise,
+                stimulation,
+                draws,
+            ) = _isolate_dense_lifted_inputs(
+                (
+                    parameters,
+                    prepared,
+                    invariant_carries,
+                    ve,
+                    intra,
+                    noise,
+                    stimulation,
+                    draws,
                 )
             )
             samples = {}
@@ -345,6 +408,8 @@ class _CompiledScanPopulationChunk:
                 samples["noise"] = noise
             if stimulation is not None:
                 samples["stimulation"] = stimulation
+            if draws is not None:
+                samples["draws"] = draws
             if not any(torch.is_tensor(value) for value in pytree.tree_leaves(samples)):
                 samples["index"] = torch.arange(
                     steps, dtype=torch.int64, device=functional.device
@@ -477,14 +542,31 @@ class _CompiledScanPopulationChunk:
 
         @wraps(compiled)
         def materialize(
-            parameters, prepared, state, ve, intra, carries, noise, stimulation=None
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            carries,
+            noise,
+            stimulation=None,
+            draws=None,
         ):
             if assembly is not None:
                 ve, intra = assembly(parameters, prepared, state, ve, intra)
             recurrent, invariant = callback_carry.split(carries)
-            parameters, prepared, invariant, ve, intra, noise, stimulation = (
+            parameters, prepared, invariant, ve, intra, noise, stimulation, draws = (
                 isolate_views(
-                    (parameters, prepared, invariant, ve, intra, noise, stimulation)
+                    (
+                        parameters,
+                        prepared,
+                        invariant,
+                        ve,
+                        intra,
+                        noise,
+                        stimulation,
+                        draws,
+                    )
                 )
             )
             result = compiled(
@@ -496,6 +578,7 @@ class _CompiledScanPopulationChunk:
                 callback_carry.merge(recurrent, invariant),
                 noise,
                 stimulation,
+                draws,
             )
             if not phase_emissions and not callback_carry.invariant_names:
                 return result
@@ -543,11 +626,20 @@ class _CompiledScanPopulationChunk:
         carries=None,
         noise=None,
         stimulation=None,
+        draws=None,
     ):
         carries = {} if carries is None else carries
         if torch.is_grad_enabled():
             result = self._training_values(
-                parameters, prepared, state, ve, intra, carries, noise, stimulation
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                carries,
+                noise,
+                stimulation,
+                draws,
             )
         else:
             # Preserve the measured CPU inference block/phase-recording path.
@@ -560,8 +652,8 @@ class _CompiledScanPopulationChunk:
                 intra is not None,
                 noise is not None,
                 stimulation is not None,
-                isinstance(noise, RuntimeDraws),
-                _has_runtime_stimulation(noise, stimulation),
+                draws is not None,
+                _has_runtime_stimulation(stimulation, draws),
                 MEMBRANE_ASSEMBLY.value,
                 block,
             )
@@ -576,10 +668,19 @@ class _CompiledScanPopulationChunk:
                         carries,
                         noise,
                         stimulation,
+                        draws,
                         block=block,
                     )
             result = self._kernels[signature](
-                parameters, prepared, state, ve, intra, carries, noise, stimulation
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                carries,
+                noise,
+                stimulation,
+                draws,
             )
         # Scan's AD wrapper marks floating carry outputs differentiable even
         # when their authored update is detached. Runtime NOISE retains its

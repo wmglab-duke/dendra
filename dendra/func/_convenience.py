@@ -11,7 +11,8 @@ from torch.utils import _pytree as pytree
 
 from ._binding import BoundPopulation
 from ._compiled import CompiledPopulationChunk
-from ._draws import RuntimeDraws, _with_runtime_draws
+from ._draws import _with_runtime_draws
+from ._inputs import _population_inputs
 from ._parameter_queries import matching_names
 from ._parameter_queries import parameter_name as _parameter_name
 from ._population import (
@@ -27,6 +28,7 @@ from ._runner_policy import (
 )
 from ._runners import (
     _canonical_runtime_sampling_available,
+    _normalize_sampled_inputs,
     _prepare_chunk_inputs,
     _run_source_validated,
     _slice_inputs,
@@ -37,7 +39,7 @@ from ._runtime_extra import (
     VarInput,
     _runtime_extra_chunk_steps,
 )
-from ._types import FunctionalizationError, InitializationInput, RolloutInput
+from ._types import FunctionalizationError, InitializationInput
 
 _OWNED_PREPARE = FunctionalPopulation.prepare
 _OWNED_BIND = CompiledPopulationChunk.bind
@@ -378,18 +380,26 @@ class CompiledRunner:
                 inputs = _prepare_chunk_inputs(
                     functional, state, inputs, 0, steps, canonical=True
                 )
-            elif not isinstance(inputs.noise, RuntimeDraws):
+            elif inputs.draws is None:
                 inputs = functional._sample_missing_runtime_draws(state, inputs, steps)
-                if inputs.noise is None:
+                supplied_draws = getattr(inputs, "draws", None)
+                if supplied_draws is None and inputs.noise is None:
                     inputs = inputs._replace(
                         noise=functional.sample_noise_draw_tape(state, steps)
                     )
-                if inputs.stimulation is None and functional._poisson_plan is not None:
+                if (
+                    supplied_draws is None
+                    and inputs.stimulation is None
+                    and functional._poisson_plan is not None
+                ):
                     inputs = inputs._replace(
                         stimulation=functional.sample_stimulation_draw_tape(
                             state, steps
                         )
                     )
+                inputs = _normalize_sampled_inputs(
+                    functional, inputs, steps, qualify_draws=True
+                )
             # Public sampler replacements can execute authored code. Qualify
             # the source after their calls and before capturing a loop body.
             functional._validate_source()
@@ -417,6 +427,7 @@ class CompiledRunner:
             carry.carries,
             None if inputs is None else inputs.noise,
             None if inputs is None else inputs.stimulation,
+            None if inputs is None else inputs.draws,
         )
         if kernel is None:
             raise FunctionalizationError(f"execution='while' is unavailable: {reason}")
@@ -434,7 +445,8 @@ class CompiledRunner:
         draws=None,
     ):
         _validate_host_call()
-        inputs = _with_runtime_draws(inputs, draws)
+        if draws is not None:
+            inputs = _with_runtime_draws(inputs, draws)
         if self._runtime_extra:
             if extra is _MISSING_RUNTIME_EXTRA:
                 raise TypeError("extra must be supplied for extra=VarInput()")
@@ -568,15 +580,12 @@ class CompiledRunner:
                 if owned_boundaries
                 else self._kernel.bind(selected_parameters, prepared)
             )
-            if inputs is None:
-                inputs = RolloutInput()
-            if not isinstance(inputs, RolloutInput):
-                raise TypeError("inputs must be a RolloutInput or None")
+            inputs = _population_inputs(inputs)
             if self._runtime_extra and inputs.ve is not None:
                 raise ValueError("explicit ve cannot be combined with runtime extra")
-            if isinstance(inputs.noise, RuntimeDraws):
+            if inputs.draws is not None:
                 self._functional._runtime_draw_plan.validate(
-                    inputs.noise, steps=self._steps
+                    inputs.draws, steps=self._steps
                 )
             if (
                 self._execution == "while"
@@ -594,7 +603,7 @@ class CompiledRunner:
             if (
                 self._execution == "while"
                 and not self._runtime_extra
-                and not isinstance(inputs.noise, RuntimeDraws)
+                and inputs.draws is None
             ):
                 inputs = self._functional._sample_missing_runtime_draws(
                     selected_state, inputs, self._steps
@@ -602,7 +611,7 @@ class CompiledRunner:
             if (
                 self._execution == "while"
                 and not self._runtime_extra
-                and not isinstance(inputs.noise, RuntimeDraws)
+                and getattr(inputs, "draws", None) is None
                 and inputs.noise is None
             ):
                 sample_noise = (
@@ -616,7 +625,7 @@ class CompiledRunner:
             if (
                 self._execution == "while"
                 and not self._runtime_extra
-                and not isinstance(inputs.noise, RuntimeDraws)
+                and getattr(inputs, "draws", None) is None
                 and inputs.stimulation is None
                 and getattr(self._functional, "_poisson_plan", None) is not None
             ):
@@ -629,6 +638,13 @@ class CompiledRunner:
                     stimulation=sample_stimulation(selected_state, self._steps)
                 )
             if self._execution == "while":
+                if not self._runtime_extra:
+                    inputs = _normalize_sampled_inputs(
+                        self._functional,
+                        inputs,
+                        self._steps,
+                        qualify_draws=not owned_boundaries,
+                    )
                 if not owned_boundaries:
                     # A replaced public sampler can run user code after its
                     # own check. Recheck before preflight captures a step.

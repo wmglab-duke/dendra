@@ -27,6 +27,14 @@ the live ``requires_grad`` subset. See
 
 .. autoclass:: dendra.func.VarInput
 
+.. autoclass:: dendra.func.Inputs
+   :members: ve, intra
+
+``Inputs`` carries deterministic voltage/current frames or time-leading tapes.
+Networks accept mappings from Population names to the same packet. Stochastic
+inputs use ``draws=`` separately. See :ref:`functional-runtime-inputs` for shape,
+ownership, sampling, and compatibility contracts.
+
 .. autoclass:: dendra.func.RuntimeDraws
    :members: draws, rng
 

@@ -119,6 +119,7 @@ from dendra.utils.tensor_ops import _logical_tensor_bytes
 
 from ._binding import _BINDING_UNSET
 from ._draws import RuntimeDraws, _has_runtime_stimulation, _with_runtime_draws
+from ._inputs import Inputs, _population_inputs, _RuntimeInputs
 from ._retained_materializations import (
     _cache_materialization,
     _capture_retained_frame,
@@ -14342,12 +14343,13 @@ class FunctionalPopulation:
     def _sample_missing_runtime_draws(self, state, inputs, steps):
         """Sample coupled families together at an existing host boundary."""
         sharing = self._stimulation_rng_plan
-        if isinstance(inputs.noise, RuntimeDraws):
-            if inputs.stimulation is not None:
+        inputs = _population_inputs(inputs)
+        if inputs.draws is not None:
+            if inputs.noise is not None or inputs.stimulation is not None:
                 raise ValueError(
                     "draws cannot be combined with legacy stochastic packets"
                 )
-            self._runtime_draw_plan.validate(inputs.noise, steps=steps)
+            self._runtime_draw_plan.validate(inputs.draws, steps=steps)
             return inputs
         if not sharing.enabled:
             return inputs
@@ -16988,9 +16990,10 @@ class FunctionalPopulation:
         steps,
         noise=None,
         stimulation=None,
+        draws=None,
     ):
         """Execute the established authored transition with a Python loop."""
-        runtime_draws = noise if isinstance(noise, RuntimeDraws) else None
+        runtime_draws = draws
         if runtime_draws is not None:
             noise, stimulation = self._runtime_draw_plan.arithmetic(runtime_draws)
         mapping, dt, celsius, v, t, duration_remainder = self._mapping(
@@ -17469,10 +17472,7 @@ class FunctionalPopulation:
 
     def _resolve_rollout_inputs(self, inputs, steps):
         """Normalize rollout drives and resolve their common time axis."""
-        if inputs is None:
-            inputs = RolloutInput()
-        if not isinstance(inputs, RolloutInput):
-            raise TypeError("inputs must be a RolloutInput or None")
+        inputs = _population_inputs(inputs)
         if steps is not None:
             if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
                 raise ValueError("steps must be a non-negative integer")
@@ -17493,7 +17493,7 @@ class FunctionalPopulation:
             name="intra",
             steps=resolved_steps,
         )
-        stochastic_inputs = (inputs.noise, inputs.stimulation)
+        stochastic_inputs = (inputs.noise, inputs.stimulation, inputs.draws)
         if any(value is not None for value in stochastic_inputs):
             leaves = [
                 value
@@ -17523,20 +17523,20 @@ class FunctionalPopulation:
         Host schedules use the normalizer separately while stochastic tapes
         may still be omitted for automatic sampling.
         """
+        inputs = _population_inputs(inputs)
         ve, intra, resolved_steps = self._resolve_rollout_inputs(inputs, steps)
-        noise = None if inputs is None else inputs.noise
-        stimulation = None if inputs is None else inputs.stimulation
-        if isinstance(noise, RuntimeDraws):
-            if stimulation is not None:
+        noise, stimulation, draws = inputs.noise, inputs.stimulation, inputs.draws
+        if draws is not None:
+            if noise is not None or stimulation is not None:
                 raise ValueError(
                     "draws cannot be combined with legacy stochastic packets"
                 )
-            self._runtime_draw_plan.validate(noise, steps=resolved_steps)
+            self._runtime_draw_plan.validate(draws, steps=resolved_steps)
         else:
             self._validate_noise_draw(noise, steps=resolved_steps)
             self._validate_stimulation_draw(stimulation, steps=resolved_steps)
             self._stimulation_rng_plan.validate_packets(noise, stimulation)
-        return RolloutInput(ve, intra, noise, stimulation), resolved_steps
+        return _RuntimeInputs(ve, intra, noise, stimulation, draws), resolved_steps
 
     def _execute_rollout_values(
         self,
@@ -17548,18 +17548,19 @@ class FunctionalPopulation:
         steps,
         noise=None,
         stimulation=None,
+        draws=None,
     ):
         """Execute already validated tensor inputs through the selected path."""
-        if _has_runtime_stimulation(noise, stimulation):
+        if _has_runtime_stimulation(stimulation, draws):
             auxiliary = {"v": state["integrator"]["v"]}
             for index in range(steps):
                 packet = (
                     self._runtime_draw_plan.arithmetic(
                         torch.utils._pytree.tree_map_only(
-                            torch.Tensor, lambda value: value[index], noise
+                            torch.Tensor, lambda value: value[index], draws
                         )
                     )[1]
-                    if isinstance(noise, RuntimeDraws)
+                    if draws is not None
                     else torch.utils._pytree.tree_map_only(
                         torch.Tensor, lambda value: value[index], stimulation
                     )
@@ -17592,6 +17593,11 @@ class FunctionalPopulation:
                         lambda value: value[index : index + 1],
                         stimulation,
                     ),
+                    None
+                    if draws is None
+                    else torch.utils._pytree.tree_map_only(
+                        torch.Tensor, lambda value: value[index : index + 1], draws
+                    ),
                 )
             return state, auxiliary
         ve, intra = self._assemble_bound_inputs(
@@ -17609,6 +17615,7 @@ class FunctionalPopulation:
         )
         if (
             noise is None
+            and draws is None
             and torch.compiler.is_compiling()
             and not torch.is_grad_enabled()
             and torch.autograd.forward_ad._current_level < 0
@@ -17631,6 +17638,8 @@ class FunctionalPopulation:
             intra,
             steps,
             noise,
+            stimulation,
+            draws,
         )
 
     def _execute_rollout_values_with_callbacks(
@@ -17645,6 +17654,7 @@ class FunctionalPopulation:
         callback_state,
         noise=None,
         stimulation=None,
+        draws=None,
     ):
         """Execute a fixed-step rollout while threading pure callback carry."""
 
@@ -17656,7 +17666,7 @@ class FunctionalPopulation:
 
         # Deterministic bound stimulation is evaluated for the complete horizon.
         # Explicit Poisson packets preserve native invocation ordering per step.
-        if not _has_runtime_stimulation(noise, stimulation):
+        if not _has_runtime_stimulation(stimulation, draws):
             ve, intra = self._assemble_bound_inputs(
                 parameters,
                 state,
@@ -17680,7 +17690,7 @@ class FunctionalPopulation:
             for index in range(steps):
                 execute = (
                     self._transition_rollout_values
-                    if not _has_runtime_stimulation(noise, stimulation)
+                    if not _has_runtime_stimulation(stimulation, draws)
                     else self._execute_rollout_values
                 )
                 state, auxiliary = execute(
@@ -17701,6 +17711,11 @@ class FunctionalPopulation:
                         torch.Tensor,
                         lambda value: value[index : index + 1],
                         stimulation,
+                    ),
+                    None
+                    if draws is None
+                    else torch.utils._pytree.tree_map_only(
+                        torch.Tensor, lambda value: value[index : index + 1], draws
                     ),
                 )
                 callback_state, emitted = callbacks._update(
@@ -17731,7 +17746,7 @@ class FunctionalPopulation:
         )
         return state, result
 
-    def _step_values(self, parameters, prepared, state, inputs: StepInput):
+    def _step_values(self, parameters, prepared, state, inputs: _RuntimeInputs):
         """Advance one already-validated host step using tensor values only.
 
         Host runners use this private boundary after validating the source,
@@ -17740,6 +17755,7 @@ class FunctionalPopulation:
         repeating those Python freshness/schema walks at every timestep while
         preserving :meth:`step` as the fully checked public entrypoint.
         """
+        inputs = _population_inputs(inputs, step=True)
         ve = None if inputs.ve is None else inputs.ve.unsqueeze(0)
         intra = None if inputs.intra is None else inputs.intra.unsqueeze(0)
         return self._execute_rollout_values(
@@ -17759,6 +17775,11 @@ class FunctionalPopulation:
             else torch.utils._pytree.tree_map_only(
                 torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
             ),
+            None
+            if inputs.draws is None
+            else torch.utils._pytree.tree_map_only(
+                torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
+            ),
         )
 
     def _rollout_values(
@@ -17766,7 +17787,7 @@ class FunctionalPopulation:
         parameters,
         prepared,
         state,
-        inputs: RolloutInput | None = None,
+        inputs: Inputs | RolloutInput | None = None,
         *,
         steps: int | None = None,
         extra=None,
@@ -17776,7 +17797,7 @@ class FunctionalPopulation:
     ):
         inputs = _with_runtime_draws(inputs, draws)
         resolved, resolved_steps = self._resolve_rollout_input_packets(inputs, steps)
-        ve, intra, noise, stimulation = resolved
+        ve, intra, noise, stimulation, draws = resolved
         if extra is not None:
             if self._extra.enabled:
                 raise ValueError(
@@ -17812,6 +17833,7 @@ class FunctionalPopulation:
                 resolved_steps,
                 noise,
                 stimulation,
+                draws,
             )
         from ._callbacks import FunctionalCallbacks
 
@@ -17831,6 +17853,7 @@ class FunctionalPopulation:
             callback_state,
             noise,
             stimulation,
+            draws,
         )
 
     def rollout(
@@ -17838,7 +17861,7 @@ class FunctionalPopulation:
         parameters,
         prepared,
         state,
-        inputs: RolloutInput | None = None,
+        inputs: Inputs | RolloutInput | None = None,
         *,
         steps: int | None = None,
         extra=None,
@@ -17852,7 +17875,8 @@ class FunctionalPopulation:
         under ``auxiliary["callbacks"]``. Its explicit result state may be
         supplied as ``callback_state`` when continuing without reinitializing.
         """
-        inputs = _with_runtime_draws(inputs, draws)
+        if draws is not None:
+            inputs = _with_runtime_draws(inputs, draws)
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_state(state)
@@ -17873,7 +17897,7 @@ class FunctionalPopulation:
         parameters,
         constants,
         state,
-        inputs: RolloutInput | None = None,
+        inputs: Inputs | RolloutInput | None = None,
         *,
         steps: int | None = None,
         extra=None,
@@ -17882,7 +17906,8 @@ class FunctionalPopulation:
         draws=None,
     ):
         """Derive and consume coefficients atomically, including under compile."""
-        inputs = _with_runtime_draws(inputs, draws)
+        if draws is not None:
+            inputs = _with_runtime_draws(inputs, draws)
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_constants(constants)
@@ -17904,17 +17929,14 @@ class FunctionalPopulation:
         parameters,
         prepared,
         state,
-        inputs: StepInput | None = None,
+        inputs: Inputs | StepInput | None = None,
         *,
         extra=None,
         draws=None,
     ):
         """Advance one functional timestep without mutating the Population."""
         inputs = _with_runtime_draws(inputs, draws, step=True)
-        if inputs is None:
-            inputs = StepInput()
-        if not isinstance(inputs, StepInput):
-            raise TypeError("inputs must be a StepInput or None")
+        inputs = _population_inputs(inputs, step=True)
         for name, value in zip(("ve", "intra"), inputs):
             if value is not None and not torch.is_tensor(value):
                 raise TypeError(f"{name} must be a Tensor or None")
@@ -17924,7 +17946,7 @@ class FunctionalPopulation:
             parameters,
             prepared,
             state,
-            RolloutInput(
+            _RuntimeInputs(
                 ve=ve,
                 intra=intra,
                 noise=None
@@ -17936,6 +17958,11 @@ class FunctionalPopulation:
                 if inputs.stimulation is None
                 else torch.utils._pytree.tree_map_only(
                     torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
+                ),
+                draws=None
+                if inputs.draws is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
                 ),
             ),
             steps=1,
@@ -17947,17 +17974,14 @@ class FunctionalPopulation:
         parameters,
         constants,
         state,
-        inputs: StepInput | None = None,
+        inputs: Inputs | StepInput | None = None,
         *,
         extra=None,
         draws=None,
     ):
         """Derive coefficients and advance one atomic, compile-safe step."""
         inputs = _with_runtime_draws(inputs, draws, step=True)
-        if inputs is None:
-            inputs = StepInput()
-        if not isinstance(inputs, StepInput):
-            raise TypeError("inputs must be a StepInput or None")
+        inputs = _population_inputs(inputs, step=True)
         for name, value in zip(("ve", "intra"), inputs):
             if value is not None and not torch.is_tensor(value):
                 raise TypeError(f"{name} must be a Tensor or None")
@@ -17967,7 +17991,7 @@ class FunctionalPopulation:
             parameters,
             constants,
             state,
-            RolloutInput(
+            _RuntimeInputs(
                 ve=ve,
                 intra=intra,
                 noise=None
@@ -17979,6 +18003,11 @@ class FunctionalPopulation:
                 if inputs.stimulation is None
                 else torch.utils._pytree.tree_map_only(
                     torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
+                ),
+                draws=None
+                if inputs.draws is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
                 ),
             ),
             steps=1,

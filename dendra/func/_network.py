@@ -29,6 +29,7 @@ from ._initialization_sources import (
     initialization_source_runtime_buffer_ids,
     network_initialization_source_alias_signature,
 )
+from ._inputs import Inputs, _population_inputs, _RuntimeInputs
 from ._mechanism_delays import network_mechanism_delay_alias_signature
 from ._mechanism_injections import network_mechanism_injection_alias_signature
 from ._netcon import FunctionalNetCon, _snapshot
@@ -51,7 +52,7 @@ from ._population import (
 from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
 from ._tables import network_table_alias_signature
 from ._tree_paths import _get_path as _at
-from ._types import FunctionalizationError, RolloutInput, StepInput
+from ._types import FunctionalizationError, StepInput
 
 
 class NetworkTensors(NamedTuple):
@@ -1803,8 +1804,12 @@ class FunctionalNetwork:
 
             draws = _normalize_runtime_draws(draws)
             if netstim_draw is not None or any(
-                isinstance(packet, StepInput)
-                and (packet.noise is not None or packet.stimulation is not None)
+                isinstance(packet, (Inputs, _RuntimeInputs, StepInput))
+                and (
+                    getattr(packet, "noise", None) is not None
+                    or getattr(packet, "stimulation", None) is not None
+                    or getattr(packet, "draws", None) is not None
+                )
                 for packet in inputs.values()
             ):
                 raise ValueError(
@@ -1817,16 +1822,18 @@ class FunctionalNetwork:
                 else NetStimDraw(draws.draws["netstim"], draws.rng["netstim"].clone())
             )
         else:
+            from ._network_draws import _legacy_population_noise
+
             self._stimulation_rng_plan.validate_packets(
                 {
-                    name: packet.noise
+                    name: _legacy_population_noise(packet)
                     for name, packet in inputs.items()
-                    if isinstance(packet, StepInput)
+                    if isinstance(packet, (Inputs, _RuntimeInputs, StepInput))
                 },
                 {
-                    name: packet.stimulation
+                    name: getattr(packet, "stimulation", None)
                     for name, packet in inputs.items()
-                    if isinstance(packet, StepInput)
+                    if isinstance(packet, (Inputs, _RuntimeInputs, StepInput))
                 },
             )
         clock = state["clock"]
@@ -1943,9 +1950,10 @@ class FunctionalNetwork:
             )
         aux = {}
         for name, plan in self.populations.items():
-            selected = inputs.get(name, StepInput())
-            if not isinstance(selected, StepInput):
+            selected = inputs.get(name, _RuntimeInputs())
+            if not isinstance(selected, (Inputs, _RuntimeInputs, StepInput)):
                 raise TypeError("Network inputs must contain StepInput values")
+            selected = _population_inputs(selected, step=True)
             ve, injection = selected.ve, intra.get(name, selected.intra)
             if any(
                 value is not None and not torch.is_tensor(value)
@@ -1954,24 +1962,14 @@ class FunctionalNetwork:
                 raise TypeError(
                     "Explicit extracellular and intracellular step inputs must be Tensors"
                 )
-            rollout = RolloutInput(
-                ve=None if ve is None else ve.unsqueeze(0),
-                intra=None if injection is None else injection.unsqueeze(0),
-                noise=pytree.tree_map_only(
-                    torch.Tensor, lambda value: value.unsqueeze(0), selected.noise
-                ),
-                stimulation=pytree.tree_map_only(
-                    torch.Tensor, lambda value: value.unsqueeze(0), selected.stimulation
-                ),
-            )
-            runtime_draws = (
-                None
-                if draws is None
-                else pytree.tree_map_only(
-                    torch.Tensor,
-                    lambda value: value.unsqueeze(0),
-                    self._runtime_draw_plan.local(name, draws),
+            if draws is not None:
+                selected = selected._replace(
+                    draws=self._runtime_draw_plan.local(name, draws)
                 )
+            rollout = pytree.tree_map_only(
+                torch.Tensor,
+                lambda value: value.unsqueeze(0),
+                selected._replace(ve=ve, intra=injection),
             )
             states[name], aux[name] = plan._rollout_values(
                 parameters["populations"][name],
@@ -1982,7 +1980,6 @@ class FunctionalNetwork:
                 rollout,
                 steps=1,
                 extra=extra.get(name),
-                **({"draws": runtime_draws} if runtime_draws is not None else {}),
             )
             if draws is None:
                 rng_pool, stimulation_pool = self._stimulation_rng_plan.publish(
@@ -2055,7 +2052,7 @@ class FunctionalNetwork:
         *,
         netstim_draw=None,
         draws=None,
-        inputs=None,
+        inputs: Mapping[str, Inputs | StepInput] | None = None,
         extra=None,
         intra=None,
     ):
@@ -2071,6 +2068,15 @@ class FunctionalNetwork:
         self._validate_parameters(parameters)
         self._validate_state(state)
         values = self._validate_prepared(prepared, parameters)
+        if draws is None:
+            from ._network_bindings import _canonicalize_mapping_tree
+
+            inputs, changed = _canonicalize_mapping_tree(inputs)
+            if changed:
+                self._validate_source()
+                self._validate_parameters(parameters)
+                self._validate_state(state)
+                values = self._validate_prepared(prepared, parameters)
         with nullcontext() if self.training else torch.no_grad():
             result = self._step_values(
                 parameters,
@@ -2093,7 +2099,7 @@ class FunctionalNetwork:
         *,
         netstim_draw=None,
         draws=None,
-        inputs=None,
+        inputs: Mapping[str, Inputs | StepInput] | None = None,
         extra=None,
         intra=None,
     ):
@@ -2110,6 +2116,15 @@ class FunctionalNetwork:
         _validate_tree(constants, self._constant_schema, "constants")
         self._validate_state(state)
         with nullcontext() if self.training else torch.no_grad():
+            if draws is None:
+                from ._network_bindings import _canonicalize_mapping_tree
+
+                inputs, changed = _canonicalize_mapping_tree(inputs)
+                if changed:
+                    self._validate_source()
+                    self._validate_parameters(parameters)
+                    _validate_tree(constants, self._constant_schema, "constants")
+                    self._validate_state(state)
             values = self._prepare_values(parameters, constants)
             result = self._step_values(
                 parameters,

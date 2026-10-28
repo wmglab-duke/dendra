@@ -26,6 +26,7 @@ from ._continuous import (
 from ._convenience import CompiledRunner, compile
 from ._draws import RuntimeDraws
 from ._execution import ExecutionCapabilities, ExecutionReport
+from ._inputs import Inputs
 from ._netcon import FunctionalNetCon, NetConTensors, make_functional_netcon
 from ._netstim import (
     FunctionalNetStim,
@@ -87,6 +88,7 @@ __all__ = [
     "FunctionalNetwork",
     "FunctionalizationError",
     "InitializationInput",
+    "Inputs",
     "LFP",
     "NetConTensors",
     "NetStimDraw",

@@ -1823,6 +1823,66 @@ automatic sampling, checkpoint continuation, recording, and gradients. Run
 ``python examples/functional_runtime_draws.py`` from the repository root;
 ``--backend aot_eager`` selects AOT eager compilation for its Network chunk.
 
+.. _functional-runtime-inputs:
+
+Deterministic runtime inputs
+----------------------------
+
+``dn.func.Inputs(ve=..., intra=...)`` supplies deterministic voltage/current
+inputs to Population and Network execution. ``ve`` is extracellular voltage
+in mV; ``intra`` is assembled intracellular current density in mA/cm². Each
+field is a Tensor or ``None``, retaining its views, aliases and gradients.
+The normal Population broadcasting and registered-stimulation rules apply.
+
+A step or eager binding consumes one frame. Rollouts, compiled chunks and host ``run`` calls
+consume tapes with a leading time axis, including compiled chunks of width one:
+
+.. code-block:: python
+
+   tape = dn.func.Inputs(ve=ve_over_time, intra=intra_over_time)
+   frame = dn.func.Inputs(ve=ve_over_time[0], intra=intra_over_time[0])
+   next_state, auxiliary = fmodel.step(parameters, prepared, state, frame)
+   final_state, auxiliary = dn.func.run(bound, state, inputs=tape, steps=100)
+
+The call boundary determines the time-axis contract; the packet does not infer
+whether its Tensors represent one step or a tape. A host run can infer its
+horizon from supplied tapes. Supply ``steps`` or ``duration`` when neither
+deterministic inputs nor explicit draws supplies a horizon.
+
+Networks accept a mapping from Population names to the same packets:
+
+.. code-block:: python
+
+   final_state, auxiliary = dn.func.run(
+       network_bound, network_state,
+       inputs={"left": dn.func.Inputs(intra=left_current),
+               "right": dn.func.Inputs(intra=right_current)},
+       steps=100, draws=runtime_draws,
+   )
+
+Omitted Population entries and fields retain their registered stimulation or
+default behavior. All supplied tapes share the resolved horizon. Stochastic
+values and their RNG timelines use ``draws=`` separately; host execution samples
+omitted runtime draws in bounded spans. Pure steps and rollouts consume explicit
+stochastic packets. See :ref:`functional-runtime-draws`.
+
+``StepInput`` and ``RolloutInput`` also accept their existing ``ve``, ``intra``,
+``noise`` and ``stimulation`` fields. ``NetworkRolloutInput`` retains its
+``populations`` and ``netstim`` fields. These compatibility packets preserve
+their tuple layouts, partial stochastic tapes, sampler overrides and validation
+rules. Explicit ``draws=`` cannot accompany legacy stochastic fields.
+Direct eager Network bindings retain the time-leading convention for the
+legacy ``NetworkRolloutInput`` envelope and ``inputs=None``; a mapping of
+``Inputs`` consumes one frame per Population. Use ``inputs={}`` for a direct
+eager Network step with only a one-step ``draws=`` packet.
+
+The complete
+:download:`functional_runtime_inputs.py <../../examples/functional_runtime_inputs.py>`
+example compares Population and Network values and gradients with compatibility
+inputs, then resumes recording without duplicate boundary samples. Run
+``python examples/functional_runtime_inputs.py``; ``--backend aot_eager`` selects
+AOT eager compilation of its bounded chunks.
+
 Host-side simulation
 --------------------
 
@@ -1834,7 +1894,7 @@ step with explicit constants:
 .. code-block:: python
 
    eager_step = fmodel.bind(tensors.parameters, constants=tensors.constants)
-   drives = dn.func.RolloutInput(
+   drives = dn.func.Inputs(
        ve=ve_over_time,
        intra=intra_over_time,
    )
@@ -1843,7 +1903,7 @@ step with explicit constants:
    )
 
 The returned ``BoundPopulation`` is also callable directly as
-``eager_step(state, StepInput(...))``. Its ``parameters`` and ``constants``
+``eager_step(state, Inputs(...))``. Its ``parameters`` and ``constants``
 properties expose read-only snapshots of the mapping containers and tensor
 references. Shared tensor aliases and autograd history remain live. Replacing
 a leaf in the caller's mapping requires a new binding; in-place tensor edits,

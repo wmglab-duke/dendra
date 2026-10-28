@@ -270,6 +270,7 @@ def run_legacy_schedule(
     has_drives = (
         inputs.ve is not None
         or inputs.intra is not None
+        or inputs.draws is not None
         or inputs.noise is not None
         or inputs.stimulation is not None
     )

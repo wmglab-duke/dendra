@@ -14,7 +14,8 @@ import torch
 
 from ._callbacks import _stack_callback_emissions, _update_callback_values
 from ._draws import _has_runtime_stimulation
-from ._types import RolloutInput, _index_step_input
+from ._inputs import Inputs, _index_runtime_inputs
+from ._types import RolloutInput
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -33,6 +34,7 @@ class _PopulationChunkOperands(NamedTuple):
     carries: object = None
     noise: object = None
     stimulation: object = None
+    draws: object = None
 
 
 class _LoweredPopulationChunk:
@@ -76,7 +78,7 @@ class _LoweredPopulationChunk:
         parameters,
         prepared: _PreparedPopulation,
         state,
-        inputs: RolloutInput | None = None,
+        inputs: Inputs | RolloutInput | None = None,
     ) -> _PopulationChunkOperands:
         """Validate and unwrap one call without entering the tensor kernel."""
         functional = self._functional
@@ -97,6 +99,7 @@ class _LoweredPopulationChunk:
             None,
             resolved.noise,
             resolved.stimulation,
+            resolved.draws,
         )
 
     def __call__(
@@ -109,9 +112,10 @@ class _LoweredPopulationChunk:
         carries=None,
         noise=None,
         stimulation=None,
+        draws=None,
     ):
         """Execute the pure tensor transition for exactly ``steps`` steps."""
-        if self._stepwise_stimulation or _has_runtime_stimulation(noise, stimulation):
+        if self._stepwise_stimulation or _has_runtime_stimulation(stimulation, draws):
             # A host step samples bound Waveforms at its accepted clock. A
             # vector start + arange * dt can round differently from repeated
             # clock additions and miss narrow pulses. Preserve that recurrence
@@ -121,7 +125,7 @@ class _LoweredPopulationChunk:
                     parameters,
                     prepared,
                     state,
-                    _index_step_input(ve, intra, noise, stimulation, index),
+                    _index_runtime_inputs(ve, intra, noise, stimulation, index, draws),
                 )
             return state, auxiliary
         if self._force_unrolled:
@@ -141,6 +145,8 @@ class _LoweredPopulationChunk:
                 intra,
                 self._steps,
                 noise,
+                stimulation,
+                draws,
             )
         return self._functional._execute_rollout_values(
             parameters,
@@ -150,6 +156,8 @@ class _LoweredPopulationChunk:
             intra,
             self._steps,
             noise,
+            stimulation,
+            draws,
         )
 
 
@@ -178,6 +186,7 @@ class _LoweredCallbackPopulationChunk:
         carries,
         noise=None,
         stimulation=None,
+        draws=None,
     ):
         emissions = []
         for index in range(self._steps):
@@ -187,7 +196,7 @@ class _LoweredCallbackPopulationChunk:
                 parameters,
                 prepared,
                 state,
-                _index_step_input(ve, intra, noise, stimulation, index),
+                _index_runtime_inputs(ve, intra, noise, stimulation, index, draws),
             )
             carries, emitted = _update_callback_values(
                 self._plans, carries, state, auxiliary

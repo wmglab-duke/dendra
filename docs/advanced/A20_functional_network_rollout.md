@@ -65,7 +65,27 @@ automatically; pure execution consumes explicit stochastic inputs. See
 {download}`functional_runtime_draws.py <../../examples/functional_runtime_draws.py>`
 example for replay, gradients, checkpointing, and continuation.
 
-## Per-population tapes and compatibility NetStim packets
+## Per-population tapes
+
+Use the same deterministic `Inputs` packet as Population execution:
+
+```python
+inputs = {
+    "left": dn.func.Inputs(intra=left_current),
+    "right": dn.func.Inputs(intra=right_current),
+}
+final, auxiliary = dn.func.run(
+    bound, initial, inputs=inputs, steps=STEPS, draws=runtime_draws,
+)
+```
+
+Pure Network steps and eager bindings accept the same mapping with one input frame per Population;
+rollouts, chunks and host runs consume time-leading tapes. Stochastic requests
+use `draws=` or host automatic sampling separately from deterministic fields.
+See {ref}`functional-runtime-inputs` for the shared contract and a runnable
+Population/Network example.
+
+## Compatibility NetStim packets
 
 The existing `NetworkRolloutInput` retains two optional fields. `populations` maps the Network's
 Population names to `RolloutInput(ve=..., intra=...)`; `netstim` supplies explicit

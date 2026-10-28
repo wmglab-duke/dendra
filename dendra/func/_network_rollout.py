@@ -18,9 +18,11 @@ from ._execution import (
     _capabilities,
     _ExecutionReportState,
 )
+from ._inputs import Inputs, _population_inputs, _RuntimeInputs
 from ._netstim import NetStimDraw, NetStimOutputs
 from ._network import _schema, _tensor_paths, _validate_tree
 from ._network_bindings import _canonicalize_mapping_tree
+from ._network_draws import _legacy_population_noise
 from ._runners import (
     _assemble_extra_chunk,
     _attach_callback_results,
@@ -33,7 +35,7 @@ from ._runners import (
 )
 from ._stimuli import StimulusTensors
 from ._tensor_contracts import _tensor_tree_binding
-from ._types import FunctionalizationError, RolloutInput, StepInput
+from ._types import FunctionalizationError, RolloutInput
 
 
 class NetworkRolloutInput(NamedTuple):
@@ -86,14 +88,10 @@ def _binding(tree):
 def _resolve_inputs(
     functional, inputs, steps, *, allow_missing_draws=False, draws=None
 ):
-    from ._network_draws import _with_network_runtime_draws
+    from ._network_draws import _network_inputs, _with_network_runtime_draws
 
     inputs, draws = _with_network_runtime_draws(inputs, draws)
-    if inputs is None:
-        inputs = NetworkRolloutInput()
-    if not isinstance(inputs, NetworkRolloutInput):
-        raise TypeError("inputs must be a NetworkRolloutInput or None")
-    populations = {} if inputs.populations is None else inputs.populations
+    populations, netstim = _network_inputs(inputs)
     if not isinstance(populations, Mapping) or not set(populations) <= set(
         functional.populations
     ):
@@ -102,18 +100,18 @@ def _resolve_inputs(
         )
     lengths = []
     for name, selected in populations.items():
-        if not isinstance(selected, RolloutInput):
+        if not isinstance(selected, (Inputs, _RuntimeInputs, RolloutInput)):
             raise TypeError(f"Population {name!r} inputs must be a RolloutInput")
         for _path, value in _tensor_paths(selected):
             if value.ndim < 1:
                 raise ValueError("Population input tapes need a leading time axis")
             lengths.append(value.shape[0])
-    if inputs.netstim is not None:
+    if netstim is not None:
         if functional.netstim is None:
             raise ValueError("A Network without NetStim requires netstim=None")
-        if not isinstance(inputs.netstim, NetStimDraw):
+        if not isinstance(netstim, NetStimDraw):
             raise TypeError("netstim must be a NetStimDraw tape")
-        for value in inputs.netstim:
+        for value in netstim:
             if not torch.is_tensor(value) or value.ndim < 1:
                 raise ValueError("NetStim draw tapes need a leading time axis")
             lengths.append(value.shape[0])
@@ -131,35 +129,27 @@ def _resolve_inputs(
         raise ValueError("All Network input tapes must have exactly steps samples")
     normalized = {}
     for name, plan in functional.populations.items():
-        selected = populations.get(name, RolloutInput())
+        selected = _population_inputs(populations.get(name))
         ve, intra, _ = plan._resolve_rollout_inputs(selected, steps)
-        if draws is None and (selected.noise is not None or not allow_missing_draws):
+        if draws is None and selected.draws is not None:
+            plan._runtime_draw_plan.validate(selected.draws, steps=steps)
+        elif draws is None and (selected.noise is not None or not allow_missing_draws):
             plan._validate_noise_draw(selected.noise, steps=steps)
         if draws is None and (
             selected.stimulation is not None or not allow_missing_draws
         ):
             plan._validate_stimulation_draw(selected.stimulation, steps=steps)
-        normalized_values = {
-            key: value
-            for key, value in (
-                ("ve", ve),
-                ("intra", intra),
-                ("noise", selected.noise),
-                ("stimulation", selected.stimulation),
-            )
-            if value is not None
-        }
-        if normalized_values:
-            normalized[name] = normalized_values
+        frame = selected._replace(ve=ve, intra=intra)
+        if any(value is not None for value in frame):
+            normalized[name] = frame
     if draws is None:
         functional._stimulation_rng_plan.validate_packets(
-            {name: selected.get("noise") for name, selected in normalized.items()},
             {
-                name: selected.get("stimulation")
+                name: _legacy_population_noise(selected)
                 for name, selected in normalized.items()
             },
+            {name: selected.stimulation for name, selected in normalized.items()},
         )
-    netstim = inputs.netstim
     if draws is None and functional.netstim is not None:
         if netstim is None:
             if steps and not allow_missing_draws:
@@ -238,15 +228,7 @@ def _auxiliary(functional, state, *, scan=False):
 
 
 def _step(functional, parameters, prepared, state, sample):
-    inputs = {
-        name: StepInput(
-            selected.get("ve"),
-            selected.get("intra"),
-            selected.get("noise"),
-            selected.get("stimulation"),
-        )
-        for name, selected in sample.get("populations", {}).items()
-    }
+    inputs = sample.get("populations", {})
     return functional._step_values(
         parameters,
         prepared,
@@ -736,15 +718,17 @@ def run(
         )
         and tape.get("netstim") is None
         and not any(
-            values.get("noise") is not None or values.get("stimulation") is not None
+            values.noise is not None
+            or values.stimulation is not None
+            or values.draws is not None
             for values in tape["populations"].values()
         )
     )
     extra_plans, extra_tensors, extra_values = {}, {}, {}
     if _runtime_extra is not None:
         for name, extra in _runtime_extra.items():
-            selected = tape["populations"].get(name, {})
-            if selected.get("ve") is not None:
+            selected = tape["populations"].get(name, _RuntimeInputs())
+            if selected.ve is not None:
                 raise ValueError(
                     f"explicit ve for Population {name!r} cannot be combined "
                     "with a declared runtime extra slot"
@@ -868,7 +852,9 @@ def run(
                         runtime_extra_slot=True,
                         times=times.to(device=plan.device, dtype=plan.dtype),
                     )
-                    populations[name] = {**populations.get(name, {}), "ve": ve}
+                    populations[name] = populations.get(
+                        name, _RuntimeInputs()
+                    )._replace(ve=ve)
                 selected = {**selected, "populations": populations}
             if compiled_chunk is None:
                 state_in, auxiliary_in, callback_in, emitted = _eager_values(
@@ -912,14 +898,14 @@ def run(
             elif "draws" not in selected:
                 populations = dict(selected["populations"])
                 provided_noise = {
-                    name: values["noise"]
+                    name: _legacy_population_noise(values)
                     for name, values in populations.items()
-                    if values.get("noise") is not None
+                    if _legacy_population_noise(values) is not None
                 }
                 provided_stimulation = {
-                    name: values["stimulation"]
+                    name: values.stimulation
                     for name, values in populations.items()
-                    if values.get("stimulation") is not None
+                    if values.stimulation is not None
                 }
                 if functional._stimulation_rng_plan.enabled:
                     noise_tapes, stimulation_tapes = (
@@ -942,16 +928,22 @@ def run(
                         provided=provided_stimulation,
                     )
                 for name, plan in functional.populations.items():
-                    values = populations.get(name, {})
-                    if values.get("stimulation") is None:
+                    values = populations.get(name, _RuntimeInputs())
+                    if values.stimulation is None:
                         stimulation = stimulation_tapes[name]
                         if stimulation is not None:
-                            values = {**values, "stimulation": stimulation}
+                            values = values._replace(stimulation=stimulation)
                             populations[name] = values
-                    if values.get("noise") is None:
+                    if values.noise is None and values.draws is None:
                         noise = noise_tapes[name]
                         if noise is not None:
-                            populations[name] = {**values, "noise": noise}
+                            from ._draws import RuntimeDraws
+
+                            populations[name] = (
+                                values._replace(draws=noise)
+                                if isinstance(noise, RuntimeDraws)
+                                else values._replace(noise=noise)
+                            )
                 selected = {**selected, "populations": populations}
                 if functional.netstim is not None and selected.get("netstim") is None:
                     selected = {

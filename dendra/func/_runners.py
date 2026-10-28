@@ -25,11 +25,19 @@ from ._draws import (
     _runtime_draws_binding,
     _with_runtime_draws,
 )
+from ._inputs import (
+    Inputs,
+    _index_runtime_inputs,
+    _legacy_step_input,
+    _population_inputs,
+    _RuntimeInputs,
+    _slice_runtime_inputs,
+)
 from ._network_binding import BoundNetwork
 from ._population import FunctionalPopulation
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._tensor_contracts import _tensor_binding
-from ._types import FunctionalizationError, RolloutInput, StepInput, _index_step_input
+from ._types import FunctionalizationError, RolloutInput, StepInput
 
 _StepCallable = Callable[[Mapping[str, object], StepInput], tuple[object, object]]
 _MISSING = object()
@@ -66,7 +74,7 @@ class _StepExecution:
 
     def __call__(self, state, inputs: StepInput):
         if self.binding is None:
-            return self.public_step(state, inputs)
+            return self.public_step(state, _legacy_step_input(inputs))
         if self.binding.compiled_chunk is None:
             return self.binding.functional._step_values(
                 self.binding.parameters,
@@ -388,41 +396,26 @@ def _stage_duration(state, tstop, dt: float, *, name="tstop"):
     return _replace_duration_remainder(state, next_remainder), steps
 
 
-def _validate_rollout_input_container(inputs: RolloutInput | None):
-    if inputs is None:
-        return RolloutInput()
-    if not isinstance(inputs, RolloutInput):
-        raise TypeError("inputs must be a RolloutInput or None")
-    return inputs
+def _validate_rollout_input_container(inputs):
+    return _population_inputs(inputs)
 
 
-def _resolve_inputs(functional, inputs: RolloutInput, steps: int | None):
+def _resolve_inputs(functional, inputs, steps: int | None):
     ve, intra, resolved_steps = functional._resolve_rollout_inputs(inputs, steps)
-    return RolloutInput(
-        ve=ve, intra=intra, noise=inputs.noise, stimulation=inputs.stimulation
-    ), resolved_steps
+    return inputs._replace(ve=ve, intra=intra), resolved_steps
 
 
-def _slice_inputs(inputs: RolloutInput, start: int, stop: int) -> RolloutInput:
-    return RolloutInput(
-        ve=None if inputs.ve is None else inputs.ve[start:stop],
-        intra=None if inputs.intra is None else inputs.intra[start:stop],
-        noise=None
-        if inputs.noise is None
-        else torch.utils._pytree.tree_map_only(
-            torch.Tensor, lambda value: value[start:stop], inputs.noise
-        ),
-        stimulation=None
-        if inputs.stimulation is None
-        else torch.utils._pytree.tree_map_only(
-            torch.Tensor, lambda value: value[start:stop], inputs.stimulation
-        ),
-    )
+def _slice_inputs(inputs, start: int, stop: int):
+    return _slice_runtime_inputs(inputs, start, stop)
 
 
 def _canonical_runtime_sampling_available(functional, inputs):
     """Use the canonical sampler without bypassing legacy public overrides."""
-    if inputs.noise is not None or inputs.stimulation is not None:
+    if (
+        inputs.draws is not None
+        or inputs.noise is not None
+        or inputs.stimulation is not None
+    ):
         return False
     if not (
         functional._noise_plan is not None
@@ -437,11 +430,23 @@ def _canonical_runtime_sampling_available(functional, inputs):
     )
 
 
+def _normalize_sampled_inputs(functional, inputs, steps, *, qualify_draws=False):
+    """Qualify canonical packets returned through a legacy sampler boundary."""
+    legacy_canonical = isinstance(getattr(inputs, "noise", None), RuntimeDraws)
+    inputs = _population_inputs(inputs)
+    if inputs.draws is not None and (legacy_canonical or qualify_draws):
+        # A replaced legacy sampler can return the canonical public packet and
+        # execute authored code after sampling. Requalify before unchecked use.
+        functional._validate_source()
+        functional._runtime_draw_plan.validate(inputs.draws, steps=steps)
+    return inputs
+
+
 def _prepare_chunk_inputs(functional, state, inputs, start, stop, *, canonical=False):
     """Slice explicit inputs and sample missing packets at one host boundary."""
     chunk_steps = stop - start
     chunk_inputs = _slice_inputs(inputs, start, stop)
-    if isinstance(chunk_inputs.noise, RuntimeDraws):
+    if chunk_inputs.draws is not None:
         return chunk_inputs
     if canonical and _canonical_runtime_sampling_available(functional, chunk_inputs):
         public_sampler = functional.sample_runtime_draws
@@ -459,11 +464,15 @@ def _prepare_chunk_inputs(functional, state, inputs, start, stop, *, canonical=F
         # Public samplers and Mapping providers can execute authored Python.
         if not owned_sampler:
             functional._validate_source()
-        functional._runtime_draw_plan.validate(chunk_inputs.noise, steps=chunk_steps)
+        functional._runtime_draw_plan.validate(chunk_inputs.draws, steps=chunk_steps)
         return chunk_inputs
     chunk_inputs = functional._sample_missing_runtime_draws(
         state, chunk_inputs, chunk_steps
     )
+    if isinstance(chunk_inputs, _RuntimeInputs) and chunk_inputs.draws is not None:
+        return _normalize_sampled_inputs(
+            functional, chunk_inputs, chunk_steps, qualify_draws=True
+        )
     if (
         functional._noise_plan is not None
         and functional._noise_plan.runtime
@@ -479,7 +488,7 @@ def _prepare_chunk_inputs(functional, state, inputs, start, stop, *, canonical=F
         chunk_inputs = chunk_inputs._replace(
             stimulation=functional.sample_stimulation_draw_tape(state, chunk_steps)
         )
-    return chunk_inputs
+    return _normalize_sampled_inputs(functional, chunk_inputs, chunk_steps)
 
 
 def _prepare_extra(functional, extra, inputs):
@@ -646,8 +655,13 @@ def _execute_steps(step, state, inputs: RolloutInput, steps: int):
     for index in range(steps):
         result = step(
             state,
-            _index_step_input(
-                inputs.ve, inputs.intra, inputs.noise, inputs.stimulation, index
+            _index_runtime_inputs(
+                inputs.ve,
+                inputs.intra,
+                inputs.noise,
+                inputs.stimulation,
+                index,
+                draws=inputs.draws,
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -700,8 +714,13 @@ def _execute_steps_with_callbacks(
     for index in range(steps):
         result = step(
             state,
-            _index_step_input(
-                inputs.ve, inputs.intra, inputs.noise, inputs.stimulation, index
+            _index_runtime_inputs(
+                inputs.ve,
+                inputs.intra,
+                inputs.noise,
+                inputs.stimulation,
+                index,
+                draws=inputs.draws,
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -876,9 +895,7 @@ def _execute_chunks(
                 {"canonical": True} if type(step.public_step) is BoundPopulation else {}
             ),
         )
-        if isinstance(chunk_inputs.noise, RuntimeDraws) and not isinstance(
-            inputs.noise, RuntimeDraws
-        ):
+        if chunk_inputs.draws is not None and inputs.draws is None:
             step = _refresh_checkpoint_execution(step, state, source_validated=True)
         extra_ve = _assemble_extra_chunk(
             functional,
@@ -897,12 +914,7 @@ def _execute_chunks(
             ),
         )
         if extra_ve is not None:
-            chunk_inputs = RolloutInput(
-                ve=extra_ve,
-                intra=chunk_inputs.intra,
-                noise=chunk_inputs.noise,
-                stimulation=chunk_inputs.stimulation,
-            )
+            chunk_inputs = chunk_inputs._replace(ve=extra_ve)
         if callbacks is None:
             state, auxiliary = _execute_steps(
                 step,
@@ -970,7 +982,7 @@ def _execute_checkpointed_chunks(
         if runtime_extra_slot and extra_plan is not None
         else None
     )
-    full_draws = inputs.noise if isinstance(inputs.noise, RuntimeDraws) else None
+    full_draws = inputs.draws
     full_draws_binding = (
         None if full_draws is None else _runtime_draws_binding(full_draws)
     )
@@ -990,9 +1002,7 @@ def _execute_checkpointed_chunks(
                 else {}
             ),
         )
-        source_draws = (
-            chunk_inputs.noise if isinstance(chunk_inputs.noise, RuntimeDraws) else None
-        )
+        source_draws = chunk_inputs.draws
         source_draws_binding = (
             None if source_draws is None else _runtime_draws_binding(source_draws)
         )
@@ -1004,6 +1014,7 @@ def _execute_checkpointed_chunks(
                 chunk_inputs.intra,
                 chunk_inputs.noise,
                 chunk_inputs.stimulation,
+                chunk_inputs.draws,
                 None if extra_tensors is None else extra_tensors.parameters,
                 None if extra_tensors is None else extra_tensors.constants,
             )
@@ -1016,6 +1027,7 @@ def _execute_checkpointed_chunks(
             intra,
             noise,
             stimulation,
+            draws,
             extra_parameters,
             extra_constants,
             chunk_steps=chunk_steps,
@@ -1070,15 +1082,25 @@ def _execute_checkpointed_chunks(
                 return _execute_steps(
                     chunk_execution,
                     state_in,
-                    RolloutInput(
-                        ve=ve, intra=intra, noise=noise, stimulation=stimulation
+                    _RuntimeInputs(
+                        ve=ve,
+                        intra=intra,
+                        noise=noise,
+                        stimulation=stimulation,
+                        draws=draws,
                     ),
                     chunk_steps,
                 )
             return _execute_steps_with_callbacks(
                 chunk_execution,
                 state_in,
-                RolloutInput(ve=ve, intra=intra, noise=noise, stimulation=stimulation),
+                _RuntimeInputs(
+                    ve=ve,
+                    intra=intra,
+                    noise=noise,
+                    stimulation=stimulation,
+                    draws=draws,
+                ),
                 chunk_steps,
                 callbacks,
                 callback_state_in,
@@ -1293,10 +1315,10 @@ def _execute_schedule(
 ):
     """Execute resolved scheduling operands without legacy horizon policies."""
     inputs, steps = _resolve_inputs(functional, inputs, steps)
-    if isinstance(inputs.noise, RuntimeDraws):
+    if inputs.draws is not None:
         if inputs.stimulation is not None:
             raise ValueError("draws cannot be combined with legacy stimulation packets")
-        functional._runtime_draw_plan.validate(inputs.noise, steps=steps)
+        functional._runtime_draw_plan.validate(inputs.draws, steps=steps)
     else:
         if inputs.noise is not None or steps == 0:
             functional._validate_noise_draw(inputs.noise, steps=steps)
@@ -1444,7 +1466,7 @@ def run(
     functional: FunctionalPopulation | BoundPopulation | BoundNetwork,
     step=_MISSING,
     state=_MISSING,
-    inputs: RolloutInput | None = None,
+    inputs: Inputs | RolloutInput | None = None,
     *,
     steps: int | None = None,
     duration: float | None = None,
@@ -1465,7 +1487,9 @@ def run(
     with ``functional.bind(parameters, constants=constants)`` for either model.
     Population ``bind(parameters, prepared)`` remains available for explicit
     preparation ownership. Compiled kernels
-    expose the corresponding ``bind(...)`` method. Inputs
+    expose the corresponding ``bind(...)`` method. ``Inputs(ve=..., intra=...)``
+    supplies Population drive tapes; Networks accept a mapping from Population
+    names to the same packets. Legacy input tuple forms remain supported. Inputs
     alone infer the horizon; an explicit step count or duration must match
     their time axis. ``steps`` and ``duration`` are mutually exclusive.
 
@@ -1503,7 +1527,10 @@ def run(
             if state is _MISSING:
                 state = step
             elif inputs is None and (
-                isinstance(state, (RolloutInput, NetworkRolloutInput)) or state is None
+                isinstance(
+                    state, (Inputs, _RuntimeInputs, RolloutInput, NetworkRolloutInput)
+                )
+                or state is None
             ):
                 inputs, state = state, step
             else:
@@ -1543,7 +1570,8 @@ def run(
                 callback_state=callback_state,
                 draws=draws,
             )
-        inputs = _with_runtime_draws(inputs, draws)
+        if draws is not None:
+            inputs = _with_runtime_draws(inputs, draws)
         if bound._is_raw:
             from ._network_bindings import _canonicalize_mapping_tree
 
@@ -1616,7 +1644,7 @@ def longrun(
     state,
     tstop: float,
     chunklength: int,
-    inputs: RolloutInput | None = None,
+    inputs: Inputs | RolloutInput | None = None,
     *,
     dt: float | None = None,
     extra=None,
@@ -1653,7 +1681,7 @@ def longrun_checkpointed(
     state,
     tstop: float,
     chunklength: int,
-    inputs: RolloutInput | None = None,
+    inputs: Inputs | RolloutInput | None = None,
     *,
     dt: float | None = None,
     extra=None,

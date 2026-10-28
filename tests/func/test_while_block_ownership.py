@@ -7,7 +7,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from dendra._bootstrap import torch_compiler_warning_context
-from dendra.func import _recorder_while
+from dendra.func import StepInput, _recorder_while
 from dendra.func._callbacks import (
     AnomalyDetector,
     _BoundRecorder,
@@ -204,7 +204,7 @@ def _eager(case, steps, *, state=None, carries=None, offset=0):
             case.parameters,
             case.prepared,
             state,
-            _recorder_while.StepInput(case.ve[index], case.intra[index]),
+            StepInput(case.ve[index], case.intra[index]),
         )
         carries, emitted = _update_callback_values(
             case.plans, carries, state, auxiliary

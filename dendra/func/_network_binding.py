@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import TYPE_CHECKING
 
 import torch
+from torch.utils import _pytree as pytree
 
-from ._network_bindings import _map_containers
+from ._inputs import Inputs
+from ._network_bindings import _canonicalize_mapping_tree, _map_containers
 from ._types import FunctionalizationError
 
 if TYPE_CHECKING:
@@ -32,8 +35,12 @@ class BoundNetwork:
     of connection and NetStim parameter materialization. A reusable compiled
     chunk never retains the binding or its preparation graphs.
 
-    Direct calls accept a :class:`NetworkRolloutInput` with exactly ``steps``
-    samples and explicit stochastic tapes. Host ``run(bound, state, ...)``
+    An eager direct call accepts Population-name mappings of one-step
+    :class:`Inputs` and a one-step ``draws=`` packet. Compiled bindings consume
+    mappings with exactly ``steps`` time-leading samples. Legacy
+    :class:`NetworkRolloutInput` packets and ``inputs=None`` retain their tape
+    convention; use ``inputs={}`` for a step with only draws.
+    Host ``run(bound, state, ...)``
     schedules arbitrary horizons and samples missing tapes in bounded spans.
     """
 
@@ -115,7 +122,13 @@ class BoundNetwork:
         """Exact timestep count consumed by a direct invocation."""
         return 1 if self._compiled_chunk is None else self._compiled_chunk.steps
 
-    def __call__(self, state, inputs: NetworkRolloutInput | None = None, *, draws=None):
+    def __call__(
+        self,
+        state,
+        inputs: Mapping[str, Inputs] | NetworkRolloutInput | None = None,
+        *,
+        draws=None,
+    ):
         if torch.compiler.is_compiling():
             raise FunctionalizationError(
                 "BoundNetwork is an eager binding; use prepare_and_step() "
@@ -127,6 +140,15 @@ class BoundNetwork:
             draws = _normalize_runtime_draws(draws)
         options = {} if draws is None else {"draws": draws}
         if self._compiled_chunk is None:
+            if isinstance(inputs, Mapping):
+                inputs, _ = _canonicalize_mapping_tree(inputs)
+                if all(isinstance(value, Inputs) for value in inputs.values()):
+                    inputs, draws = pytree.tree_map_only(
+                        torch.Tensor,
+                        lambda value: value.unsqueeze(0),
+                        (inputs, draws),
+                    )
+                    options = {} if draws is None else {"draws": draws}
             return self._eager_rollout(
                 self._parameters, self._constants, state, inputs, steps=1, **options
             )

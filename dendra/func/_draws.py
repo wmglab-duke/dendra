@@ -38,33 +38,29 @@ def _normalize_runtime_draws(packet):
 
 
 def _with_runtime_draws(inputs, draws, *, step=False):
-    """Keep the canonical packet whole in an existing private loop operand.
+    """Keep deterministic inputs and canonical draw authority separate."""
+    from ._inputs import _population_inputs
 
-    The public input tuple formats are unchanged. Tensor-only loops transport
-    the canonical tree in their existing runtime operand and project family
-    views only at numerical consumption, after checkpoint/view isolation.
-    """
     if draws is None:
-        return inputs
-    from ._types import RolloutInput, StepInput
+        return _population_inputs(inputs, step=step)
 
     packet = _normalize_runtime_draws(draws)
-    input_type = StepInput if step else RolloutInput
-    if inputs is None:
-        inputs = input_type()
-    if not isinstance(inputs, input_type):
-        raise TypeError(f"inputs must be a {input_type.__name__} or None")
-    if inputs.noise is not None or inputs.stimulation is not None:
+    inputs = _population_inputs(inputs, step=step)
+    if (
+        inputs.noise is not None
+        or inputs.stimulation is not None
+        or inputs.draws is not None
+    ):
         raise ValueError(
             "draws cannot be combined with legacy noise or stimulation packets"
         )
-    return inputs._replace(noise=packet)
+    return inputs._replace(draws=packet)
 
 
-def _has_runtime_stimulation(noise, stimulation=None):
+def _has_runtime_stimulation(stimulation=None, draws=None):
     """Retain the existing atomic-versus-accepted-step waveform clocks."""
     return stimulation is not None or (
-        isinstance(noise, RuntimeDraws) and noise.draws.get("stimulation") is not None
+        draws is not None and draws.draws.get("stimulation") is not None
     )
 
 

@@ -57,7 +57,8 @@ class CompiledNetworkRunner:
     Per-call parameter overrides preserve their Tensor objects and autograd
     history, and must retain the Network's parameter ties and component schema.
 
-    Runtime inputs use :class:`NetworkRolloutInput`. Supplied draw/RNG tapes
+    Runtime inputs map Population names to :class:`Inputs`; legacy
+    :class:`NetworkRolloutInput` packets remain supported. Supplied draw/RNG tapes
     are replayed explicitly; omitted NetStim tapes are sampled by the shared
     host scheduler from the supplied state's RNG carry. Qualified Recorders and
     pure callback reducers use the existing Network callback binding.

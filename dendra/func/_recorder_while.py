@@ -18,8 +18,8 @@ from torch.fx.experimental.proxy_tensor import make_fx
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._callbacks import _is_builtin_callback, _update_callback_values
+from ._inputs import _RuntimeInputs
 from ._tensor_tree_while import _CompiledTensorTreeWhile, _schema
-from ._types import StepInput
 from ._while_inductor import _compile_while
 
 
@@ -47,6 +47,7 @@ class _RecorderWhileExecutor:
         carries,
         noise=None,
         stimulation=None,
+        draws=None,
     ):
         from ._population import _STRUCTURED_ROLLOUT_CHUNK
 
@@ -64,7 +65,17 @@ class _RecorderWhileExecutor:
         # from a patch-version label.
         signature = (
             _schema(
-                (parameters, prepared, state, ve, intra, carries, noise, stimulation)
+                (
+                    parameters,
+                    prepared,
+                    state,
+                    ve,
+                    intra,
+                    carries,
+                    noise,
+                    stimulation,
+                    draws,
+                )
             ),
             MEMBRANE_ASSEMBLY.value,
         )
@@ -84,6 +95,7 @@ class _RecorderWhileExecutor:
                         carries,
                         noise,
                         stimulation,
+                        draws,
                     )
             except Exception as error:
                 reason = (
@@ -95,14 +107,23 @@ class _RecorderWhileExecutor:
         return self._kernels[signature], None
 
     def _capture(
-        self, parameters, prepared, state, ve, intra, carries, noise, stimulation
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries,
+        noise,
+        stimulation,
+        draws=None,
     ):
         functional, plans = self._functional, self._plans
 
         def body(parameters, prepared, current, current_carries, sample):
             # Accepted-clock sampling retains native waveform boundaries.
             next_state, auxiliary = functional._step_values(
-                parameters, prepared, current, StepInput(*sample)
+                parameters, prepared, current, _RuntimeInputs(*sample)
             )
             if plans:
                 updated, emitted = _update_callback_values(
@@ -123,7 +144,7 @@ class _RecorderWhileExecutor:
             compiler=_compile_while,
         )
         kernel = engine.kernel_for(
-            parameters, prepared, state, carries, (ve, intra, noise, stimulation)
+            parameters, prepared, state, carries, (ve, intra, noise, stimulation, draws)
         )
 
         @wraps(kernel)
@@ -136,9 +157,14 @@ class _RecorderWhileExecutor:
             carries,
             noise=None,
             stimulation=None,
+            draws=None,
         ):
             final, final_carries, observed = kernel(
-                parameters, prepared, state, carries, (ve, intra, noise, stimulation)
+                parameters,
+                prepared,
+                state,
+                carries,
+                (ve, intra, noise, stimulation, draws),
             )
             emitted = {plan.name: observed.get(plan.name) for plan in plans}
             return final, {"v": final["integrator"]["v"]}, final_carries, emitted

@@ -20,6 +20,7 @@ from ._execution import (
     _ExecutionReportState,
 )
 from ._inference import _canonicalize_inference_tree
+from ._inputs import Inputs, _population_inputs, _RuntimeInputs
 from ._lowered import (
     _LoweredCallbackPopulationChunk,
     _LoweredPopulationChunk,
@@ -202,7 +203,11 @@ class CompiledPopulationChunk:
                 operands = operands._replace(state=state)
         if (
             self._noise_while is not None
-            and (operands.noise is not None or operands.stimulation is not None)
+            and (
+                operands.noise is not None
+                or operands.stimulation is not None
+                or operands.draws is not None
+            )
             and not grad_enabled
         ):
             kernel, reason = self._noise_while.kernel_for(
@@ -214,6 +219,7 @@ class CompiledPopulationChunk:
                 (),
                 operands.noise,
                 operands.stimulation,
+                operands.draws,
             )
             if kernel is not None:
                 final, auxiliary, _carries, _emitted = kernel(
@@ -225,6 +231,7 @@ class CompiledPopulationChunk:
                     (),
                     operands.noise,
                     operands.stimulation,
+                    operands.draws,
                 )
                 self._record_execution("compiled_while_loop", grad_enabled=False)
                 return final, auxiliary
@@ -232,6 +239,7 @@ class CompiledPopulationChunk:
             self._execution == "default"
             and operands.noise is None
             and operands.stimulation is None
+            and operands.draws is None
             and prewarm_structured
             and not torch.is_grad_enabled()
         ):
@@ -272,7 +280,11 @@ class CompiledPopulationChunk:
                 "compiled_unrolled",
                 "The chunk is shorter than one inference loop block.",
             )
-        if operands.noise is not None or operands.stimulation is not None:
+        if (
+            operands.noise is not None
+            or operands.stimulation is not None
+            or operands.draws is not None
+        ):
             return (
                 "compiled_unrolled",
                 "No captured stochastic inference step graph is available.",
@@ -313,12 +325,13 @@ class CompiledPopulationChunk:
             )
         return kernels[steps]
 
-    def _step_values(self, parameters, prepared, state, inputs: StepInput):
+    def _step_values(self, parameters, prepared, state, inputs: _RuntimeInputs):
         """Execute one runner-validated frame without public Python checks."""
         if self._steps != 1:
             raise FunctionalizationError(
                 "one-step execution requires a CompiledPopulationChunk with steps=1"
             )
+        inputs = _population_inputs(inputs, step=True)
         operands = _PopulationChunkOperands(
             parameters,
             prepared,
@@ -336,13 +349,19 @@ class CompiledPopulationChunk:
             else torch.utils._pytree.tree_map_only(
                 torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
             ),
+            None
+            if inputs.draws is None
+            else torch.utils._pytree.tree_map_only(
+                torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
+            ),
         )
         # A one-step kernel has no large rollout graph to bound, so the
         # inference-only structured prewarm is unnecessary in this hot path.
         return self._execute_operands(operands, prewarm_structured=False)
 
-    def _rollout_values(self, parameters, prepared, state, inputs: RolloutInput):
+    def _rollout_values(self, parameters, prepared, state, inputs: _RuntimeInputs):
         """Execute one runner-validated fixed chunk without public tree checks."""
+        inputs = _population_inputs(inputs)
         operands = _PopulationChunkOperands(
             parameters,
             prepared,
@@ -352,6 +371,7 @@ class CompiledPopulationChunk:
             None,
             inputs.noise,
             inputs.stimulation,
+            inputs.draws,
         )
         return self._execute_operands(
             operands,
@@ -363,7 +383,7 @@ class CompiledPopulationChunk:
         parameters,
         prepared,
         state,
-        inputs: RolloutInput | StepInput | None = None,
+        inputs: Inputs | RolloutInput | StepInput | None = None,
         *,
         draws=None,
     ):
@@ -373,8 +393,10 @@ class CompiledPopulationChunk:
                 "around a compiled tensor kernel; call it directly instead of "
                 "passing it through torch.compile"
             )
-        inputs = _with_runtime_draws(inputs, draws, step=isinstance(inputs, StepInput))
-        if isinstance(inputs, StepInput):
+        legacy_step = isinstance(inputs, StepInput)
+        if draws is not None or legacy_step:
+            inputs = _with_runtime_draws(inputs, draws, step=legacy_step)
+        if legacy_step:
             if self._steps != 1:
                 raise TypeError(
                     "StepInput is accepted only by a one-step compiled chunk"
@@ -382,7 +404,7 @@ class CompiledPopulationChunk:
             for name, value in zip(("ve", "intra"), inputs):
                 if value is not None and not torch.is_tensor(value):
                     raise TypeError(f"{name} must be a Tensor or None")
-            inputs = RolloutInput(
+            inputs = _RuntimeInputs(
                 ve=None if inputs.ve is None else inputs.ve.unsqueeze(0),
                 intra=None if inputs.intra is None else inputs.intra.unsqueeze(0),
                 noise=None
@@ -394,6 +416,11 @@ class CompiledPopulationChunk:
                 if inputs.stimulation is None
                 else torch.utils._pytree.tree_map_only(
                     torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
+                ),
+                draws=None
+                if inputs.draws is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
                 ),
             )
         functional = self._functional
@@ -427,6 +454,7 @@ class CompiledPopulationChunk:
             None,
             resolved.noise,
             resolved.stimulation,
+            resolved.draws,
         )
         return self._execute_operands(operands, prewarm_structured=True)
 
@@ -473,6 +501,7 @@ class _CompiledCallbackPopulationChunk:
             )
 
     def _rollout_values(self, parameters, prepared, state, inputs, carries):
+        inputs = _population_inputs(inputs)
         operands = (
             parameters,
             prepared,
@@ -482,6 +511,7 @@ class _CompiledCallbackPopulationChunk:
             carries,
             inputs.noise,
             inputs.stimulation,
+            inputs.draws,
         )
         transform_active = torch._C._are_functorch_transforms_active()
         forward_ad_active = torch.autograd.forward_ad._current_level >= 0
@@ -506,6 +536,7 @@ class _CompiledCallbackPopulationChunk:
                     carries,
                     inputs.noise,
                     inputs.stimulation,
+                    inputs.draws,
                 )
             while_kernel = None
             if self._recorder_while is not None and not grad_enabled:
