@@ -113,19 +113,31 @@ identities, schemas and aliases remain authoritative. A packet with different
 sources requires an explicit new binding, including after portable restoration.
 Prepared Population bindings, direct calls and legacy scheduling keep explicit
 state/callback arguments. See :ref:`functional-bound-continuation`.
-Save portable detached checkpoints with
-``runner.export_continuation(packet)`` and restore them with
+Save portable detached checkpoints against a lowered Population or Network with
+``dn.func.export_continuation(functional, packet, callbacks=callbacks)``. Restore
+against a compatible receiving plan with
+``dn.func.restore_continuation(receiving, saved, callbacks=receiving_callbacks)``.
+Each explicitly supplied callback collection must belong to its respective
+plan; omit it for callback-free continuation. Bind the returned sources with
+``receiving_kernel.bind(restored.parameters, constants=restored.constants)``
+before using ``dn.func.run``. The same format is supported by
+``runner.export_continuation(packet)`` and
 ``receiver.restore_continuation(saved)``. The versioned plain data/Tensor format
 preserves effective raw sources, tied Tensor identities and trainability.
 Restored sources are independent leaves; receiver defaults and RNG are
-unchanged, and restoration does not initialize or execute a model. Same
-dtype/device, source/state schemas and callback compatibility are required.
-The methods reuse the callback export/restore bridge; the in-memory
+unchanged, and restoration does not extract native state, initialize, prepare,
+sample or execute a model. Same dtype/device, source/state schemas and callback
+compatibility are required. The functions and methods reuse the callback
+export/restore bridge; the in-memory
 ``Continuation`` object itself is not the portable format. See
 :doc:`../advanced/A57_functional_api_overview` and the complete
 :download:`functional_continuation.py <../../examples/functional_continuation.py>`
 in-memory example, or :doc:`../advanced/A58_functional_callback_checkpoints`
 for disk checkpoints.
+
+.. autofunction:: dendra.func.export_continuation
+
+.. autofunction:: dendra.func.restore_continuation
 
 
 Functional host scheduling

@@ -338,9 +338,9 @@ class CompiledRunner:
         outside compilation and function transforms; prior graphs and recording
         history are excluded.
         """
-        from ._continuation_checkpoints import export_continuation
+        from ._continuation_checkpoints import _export_runner_continuation
 
-        return export_continuation(self, continuation)
+        return _export_runner_continuation(self, continuation)
 
     def restore_continuation(self, packet):
         """Restore a plain checkpoint against this compatible initialized runner.
@@ -350,9 +350,9 @@ class CompiledRunner:
         ``Continuation`` without initialization, preparation, sampling or
         execution. Runner defaults are unchanged.
         """
-        from ._continuation_checkpoints import restore_continuation
+        from ._continuation_checkpoints import _restore_runner_continuation
 
-        return restore_continuation(self, packet)
+        return _restore_runner_continuation(self, packet)
 
     @property
     def kernel(self):

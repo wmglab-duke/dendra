@@ -8,6 +8,7 @@ no physical-storage alias or upstream computation graph is reconstructed.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import dataclass
 
 import torch
 
@@ -16,6 +17,15 @@ from ._types import FunctionalizationError
 
 _NAMED_TUPLES = (TensorScheduleTensors,)
 _SCALARS = (bool, int, float, str)
+
+
+@dataclass(frozen=True)
+class _TensorDescriptor:
+    """Receiving Tensor metadata supplied by a trusted lowered plan."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+    device: torch.device
 
 
 def _keys(value, expected, *, label):
@@ -117,9 +127,9 @@ def encode_frames(frames):
 def decode_frames(packet, templates):
     """Validate plain data against trusted receiving frames and own fresh leaves.
 
-    Container classes come only from the receiving templates. Raw Tensor values
-    and trainability can differ from those defaults; shape, dtype and device
-    cannot. Shared references yield one owned Tensor per table entry.
+    Container classes and Tensor descriptors come only from receiving templates.
+    Tensor values and trainability can differ from defaults; shape, dtype and
+    device cannot. Shared references yield one owned Tensor per table entry.
     """
     _keys(packet, ("tree", "tensors", "requires_grad"), label="continuation frames")
     tensors, flags = packet["tensors"], packet["requires_grad"]
@@ -149,8 +159,12 @@ def decode_frames(packet, templates):
             kind = node.get("kind")
             if type(kind) is not str:
                 raise ValueError("continuation frame kind must be a plain string")
-            if isinstance(template, torch.Tensor):
-                _ordinary_tensor(template)
+            if (
+                isinstance(template, torch.Tensor)
+                or type(template) is _TensorDescriptor
+            ):
+                if isinstance(template, torch.Tensor):
+                    _ordinary_tensor(template)
                 if kind != "tensor":
                     raise ValueError(f"{path} must contain a Tensor reference")
                 _keys(node, ("kind", "index"), label="continuation Tensor reference")

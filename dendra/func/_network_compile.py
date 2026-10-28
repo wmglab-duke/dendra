@@ -314,9 +314,9 @@ class CompiledNetworkRunner:
         ``torch.load(..., weights_only=True)``. It excludes upstream graphs,
         recording history, input/draw tapes and optimizer state.
         """
-        from ._continuation_checkpoints import export_continuation
+        from ._continuation_checkpoints import _export_runner_continuation
 
-        return export_continuation(self, continuation)
+        return _export_runner_continuation(self, continuation)
 
     def restore_continuation(self, packet):
         """Restore a checkpoint into this compatible initialized Network runner.
@@ -326,9 +326,9 @@ class CompiledNetworkRunner:
         ``Continuation``. No initialization, preparation, RNG sampling or
         execution runs, and runner defaults retain their values.
         """
-        from ._continuation_checkpoints import restore_continuation
+        from ._continuation_checkpoints import _restore_runner_continuation
 
-        return restore_continuation(self, packet)
+        return _restore_runner_continuation(self, packet)
 
     @property
     def kernel(self):

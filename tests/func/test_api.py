@@ -186,6 +186,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "TensorScheduleTensors",
         "VarInput",
         "compile",
+        "export_continuation",
         "inspect_sources",
         "longrun",
         "longrun_checkpointed",
@@ -194,6 +195,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "make_functional_netcon",
         "make_functional_netstim",
         "make_functional_network",
+        "restore_continuation",
         "run",
     }
 

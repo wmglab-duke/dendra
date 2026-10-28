@@ -127,7 +127,29 @@ Raw-bound host scheduling accepts the same packet as
 the binding; see :ref:`functional-bound-continuation`.
 
 To save a complete portable continuation and restore it into a compatible
-reconstructed runner, use the same methods for Populations and Networks:
+lowered Population or Network, use the shared functions:
+
+.. code-block:: python
+
+   saved = dn.func.export_continuation(
+       functional, auxiliary["continuation"], callbacks=callbacks,
+   )
+   torch.save(saved, path)
+   restored = dn.func.restore_continuation(
+       receiving, torch.load(path, weights_only=True),
+       callbacks=receiving_callbacks,
+   )
+   bound = receiving_kernel.bind(
+       restored.parameters, constants=restored.constants,
+   )
+   state, auxiliary = dn.func.run(
+       bound, restored, steps=100, callbacks=receiving_callbacks,
+   )
+
+The receiving functional plan is constructed explicitly. Each callback
+collection belongs to its corresponding plan; omit it for callback-free
+continuation. Restored sources require a new raw binding. The same portable
+format is supported by the convenience-runner methods:
 
 .. code-block:: python
 
@@ -139,10 +161,11 @@ reconstructed runner, use the same methods for Populations and Networks:
 Export owns detached ordinary storage while preserving raw parameter/constant
 aliases and trainability. Restore returns new trainable leaves with no prefix
 graph. It validates state/source schemas and callback compatibility without
-initializing, preparing, sampling or executing the model, and does not replace
-runner defaults. The model/runner configuration, runtime tapes, optimizer and
-earlier recordings remain application-owned. Independently managed callbacks
-use ``callbacks.export_state(...)`` / ``callbacks.restore_state(...)``. See
+extracting native state, initializing, preparing, sampling or executing the
+model, and does not replace runner defaults. The model/runner configuration,
+runtime tapes, optimizer and earlier recordings remain application-owned.
+Independently managed callbacks use ``callbacks.export_state(...)`` /
+``callbacks.restore_state(...)``. See
 :doc:`A58_functional_callback_checkpoints` for same-dtype/device compatibility
 rules and complete disk-checkpoint examples.
 

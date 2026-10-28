@@ -109,10 +109,15 @@ explicit rebinding. Callback collections still have to match the carry, and
 direct binding/chunk calls retain their explicit state/callback arguments. See
 :ref:`functional-bound-continuation`.
 
-``runner.export_continuation(packet)`` exports detached ordinary storage as a
-versioned plain data/Tensor checkpoint. A compatible reconstructed runner uses
-``restore_continuation(saved)`` to restore effective sources, raw
-parameter/constant aliases, trainability and checked callback carry. Restore
+``dn.func.export_continuation(functional, packet, callbacks=callbacks)`` exports
+detached ordinary storage for a lowered Population or Network. Restore with
+``dn.func.restore_continuation(receiving, saved, callbacks=receiving_callbacks)``
+against a compatible receiving plan, then bind the restored source leaves
+explicitly before calling ``dn.func.run``. Supplied callback collections belong
+to their respective plans. The same versioned plain data/Tensor format is
+supported by ``runner.export_continuation(packet)`` and a compatible
+reconstructed runner's ``restore_continuation(saved)``. These restore effective
+sources, raw parameter/constant aliases, trainability and checked callback carry. Restore
 validates source/state schemas, timestep, native mode and callback settings;
 it does not initialize, prepare, sample, run or mutate runner defaults. The
 checkpoint uses the same dtype/device, while model declarations, runtime tapes,

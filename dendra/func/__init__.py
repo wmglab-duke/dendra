@@ -19,6 +19,7 @@ from ._callbacks import (
 from ._compiled import CompiledPopulationChunk
 from ._connection_sampling import ConnectionSamplingDraw
 from ._continuation import Continuation
+from ._continuation_checkpoints import export_continuation, restore_continuation
 from ._continuous import (
     ContinuousConTensors,
     FunctionalContinuousCon,
@@ -118,6 +119,7 @@ __all__ = [
     "TensorScheduleTensors",
     "VarInput",
     "compile",
+    "export_continuation",
     "inspect_sources",
     "longrun",
     "longrun_checkpointed",
@@ -126,5 +128,6 @@ __all__ = [
     "make_functional_netcon",
     "make_functional_netstim",
     "make_functional_network",
+    "restore_continuation",
     "run",
 ]

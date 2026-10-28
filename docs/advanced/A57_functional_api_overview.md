@@ -523,7 +523,32 @@ callback collection can still be used:
 ### Save and restore a detached continuation
 
 `Continuation` retains in-memory graph history. For an independent portable
-checkpoint, use the shared methods on either convenience runner:
+checkpoint, export against its lowered Population or Network plan:
+
+```python
+saved = dn.func.export_continuation(
+    functional, auxiliary["continuation"], callbacks=callbacks,
+)
+torch.save(saved, path)
+
+# Construct and lower a compatible initialized model explicitly.
+restored = dn.func.restore_continuation(
+    receiving, torch.load(path, weights_only=True), callbacks=receiving_callbacks,
+)
+bound = receiving_kernel.bind(restored.parameters, constants=restored.constants)
+state, auxiliary = dn.func.run(
+    bound, restored, steps=100, callbacks=receiving_callbacks,
+)
+```
+
+Each supplied callback collection must belong to its corresponding functional
+plan. Omit it for callback-free continuation. Restoration creates new owned
+source leaves; bind those exact restored objects before resuming. The complete
+{download}`functional_explicit_continuation_checkpoints.py <../../examples/functional_explicit_continuation_checkpoints.py>`
+example checks both model kinds, disk restoration, aliases, recording and
+suffix gradients.
+
+Both convenience runners provide the same operations as methods:
 
 ```python
 saved = runner.export_continuation(auxiliary["continuation"])
@@ -533,6 +558,9 @@ torch.save(saved, path)
 restored = receiver.restore_continuation(torch.load(path, weights_only=True))
 state, auxiliary = receiver(restored)
 ```
+
+The functions and methods use the same versioned packet format and accept
+compatible checkpoints from one another.
 
 The versioned data/Tensor packet owns detached ordinary storage and preserves
 raw parameter/constant aliases and trainability flags. Restored trainable
@@ -547,7 +575,8 @@ dependencies. Use live in-memory continuation when initialization graphs must
 remain connected.
 The receiving plan validates source, state and binding schemas, required aliases
 and callback compatibility. Restoration uses the same dtype/device, does not
-initialize or execute a model, and leaves receiver defaults and RNG unchanged.
+extract native state, initialize, prepare, sample or execute a model, and leaves
+receiver defaults and RNG unchanged.
 Save runtime input/draw tapes, model declarations, optimizer state and earlier
 recordings separately. See {doc}`A58_functional_callback_checkpoints` and the
 complete
@@ -555,7 +584,7 @@ complete
 example for fresh replacements, shared sources and suffix gradients.
 
 Callback carry is tagged with its in-memory collection's identity. Portable
-runner restoration uses the checked callback export/restore bridge to attach
+restoration uses the checked callback export/restore bridge to attach
 the receiving identity. Independently managed callbacks use
 `callbacks.export_state(...)` and `callbacks.restore_state(...)` directly.
 Starting a collection without restored carry starts new reductions and includes
