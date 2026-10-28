@@ -354,7 +354,12 @@ def test_packet_has_an_explicit_raw_binding_bridge_without_rebinding_existing_so
     )
     _close(actual, expected)
     _close(auxiliary["callbacks"].outputs, last["callbacks"].outputs)
-    assert "continuation" not in auxiliary
+    returned = auxiliary["continuation"]
+    _close(returned.state, actual)
+    assert _target(returned.parameters, network) is _target(
+        continuation.parameters, network
+    )
+    assert returned.callback_state.plan_token is continuation.callback_state.plan_token
 
 
 def test_population_packet_resume_retains_existing_inference_cache_admission():

@@ -97,7 +97,13 @@ and fresh/cache replacements retain their selected Tensor identities, shared
 aliases and gradients; they do not replace runner defaults. Input/draw tapes
 and runtime extracellular recipes remain per-call arguments. See
 :doc:`../advanced/A57_functional_api_overview` for the same Population/Network
-contract and the explicit bridge to raw bindings.
+contract. Raw-bound host runs also consume and publish that packet through
+``dn.func.run(bound, packet, ...)``. The binding owns its sources: schemas,
+Tensor identities and aliases must match, with Network shared constant readers
+resolved against their parameter owners. Different or restored sources require
+explicit rebinding. Callback collections still have to match the carry, and
+direct binding/chunk calls retain their explicit state/callback arguments. See
+:ref:`functional-bound-continuation`.
 
 ``runner.export_continuation(packet)`` exports detached ordinary storage as a
 versioned plain data/Tensor checkpoint. A compatible reconstructed runner uses

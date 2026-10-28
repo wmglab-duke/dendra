@@ -122,6 +122,9 @@ supported. Packets cannot be combined with non-``None`` ``parameters=``,
 See :doc:`A57_functional_api_overview` and the complete
 :download:`functional_continuation.py <../../examples/functional_continuation.py>`
 example for Population and Network training and continuation.
+Raw-bound host scheduling accepts the same packet as
+``dn.func.run(bound, auxiliary["continuation"], ...)`` when its sources match
+the binding; see :ref:`functional-bound-continuation`.
 
 To save a complete portable continuation and restore it into a compatible
 reconstructed runner, use the same methods for Populations and Networks:
@@ -1962,6 +1965,27 @@ references. Shared tensor aliases and autograd history remain live. Replacing
 a leaf in the caller's mapping requires a new binding; in-place tensor edits,
 including optimizer updates, are visible on the next invocation.
 
+Successful ``dn.func.run`` calls with a raw binding return a
+``dn.func.Continuation`` at ``auxiliary["continuation"]``. Continue through the
+same binding with the returned packet:
+
+.. code-block:: python
+
+   continued_state, continued_auxiliary = dn.func.run(
+       eager_step, auxiliary["continuation"], inputs=next_drives,
+   )
+
+The packet keeps state, effective raw sources and callback carry together.
+The binding remains authoritative: source schemas, Tensor identities and aliases
+must match, and equal-valued replacement tensors require a new binding. A
+non-``None`` ``callback_state=`` cannot be supplied with a packet. When it carries
+callback state, also supply its matching collection through ``callbacks=``.
+Inputs, draws, runtime extracellular inputs and the horizon remain per-call
+arguments. These packet calls retain live gradients and recording phase without
+duplicating the boundary frame. See :ref:`functional-bound-continuation` and
+the complete ``examples/functional_continuation.py`` example for both model kinds,
+checkpointed gradients and explicit binding of restored source leaves.
+
 Each direct call or complete ``run`` invocation owns its preparation graph.
 The same raw binding can therefore serve independent forward/backward passes.
 Under ``torch.no_grad()`` or ``torch.inference_mode()``, Population bindings
@@ -2015,6 +2039,9 @@ independent forward/backward graph and after parameter or constant edits.
 Its ``prepared`` property holds the object and its ``constants`` property is
 ``None``. A raw binding has the inverse ownership: it exposes raw constants and
 its ``prepared`` property is ``None``.
+Prepared bindings use explicit state and ``callback_state=`` rather than a full
+continuation packet. Direct binding/chunk calls and the legacy scheduling forms
+keep their explicit argument contracts.
 
 An explicit binding identifies its model and operands directly. Canonical
 scheduling does not infer that ownership from ``functools.partial`` or wrapper

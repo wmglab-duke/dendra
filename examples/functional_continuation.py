@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Continue compiled Populations and Networks with their effective bindings.
+"""Continue Population/Network runners and explicit raw bindings.
 
 Run from the repository root::
 
@@ -129,15 +129,37 @@ def run_model(model, *, network, backend):
     bound = program.kernel.bind(
         continuation.parameters, constants=continuation.constants
     )
-    explicit, _ = dn.func.run(
+    explicit, bound_aux = dn.func.run(
         bound,
-        continuation.state,
+        continuation,
         steps=STEPS,
         callbacks=program.callbacks,
-        callback_state=continuation.callback_state,
+        checkpoint_every=1,
     )
     # endregion binding_bridge
     torch.testing.assert_close(containers(final), containers(explicit))
+    torch.testing.assert_close(
+        dict(last["callbacks"]["trace"]), dict(bound_aux["callbacks"]["trace"])
+    )
+
+    # region binding_resume
+    same_bound, continued_aux = dn.func.run(
+        bound,
+        bound_aux["continuation"],
+        steps=STEPS,
+        callbacks=program.callbacks,
+        checkpoint_every=1,
+    )
+    # endregion binding_resume
+    next_state, next_aux = program(bound_aux["continuation"])
+    torch.testing.assert_close(containers(same_bound), containers(next_state))
+    torch.testing.assert_close(
+        dict(continued_aux["callbacks"]["trace"]),
+        dict(next_aux["callbacks"]["trace"]),
+    )
+    assert continued_aux["continuation"].callback_state.plan_token is (
+        continuation.callback_state.plan_token
+    )
 
     reference_gain = gain.detach().clone().requires_grad_()
     reference_parameters = gain_parameters(program, reference_gain, source)
@@ -151,12 +173,12 @@ def run_model(model, *, network, backend):
     torch.testing.assert_close(containers(final), containers(expected))
     trace = {
         name: torch.cat((first["callbacks"]["trace"][name], suffix))
-        for name, suffix in last["callbacks"]["trace"].items()
+        for name, suffix in bound_aux["callbacks"]["trace"].items()
     }
     torch.testing.assert_close(trace, dict(whole["callbacks"]["trace"]))
     for name, values in trace.items():
         assert values.shape[0] == 2 * STEPS + 1
-        assert last["callbacks"]["trace"][name].shape[0] == STEPS
+        assert bound_aux["callbacks"]["trace"][name].shape[0] == STEPS
     gradient = torch.autograd.grad(trace_loss(trace), gain)[0]
     reference_gradient = torch.autograd.grad(
         trace_loss(whole["callbacks"]["trace"]), reference_gain
@@ -165,6 +187,30 @@ def run_model(model, *, network, backend):
     assert torch.isfinite(gradient) and gradient.abs() > 0
     torch.testing.assert_close(
         program.functional.extract().state, program.initial_state
+    )
+
+    # region restored_binding
+    receiver = compile_program(
+        make_network() if network else make_population(),
+        network=network,
+        backend=backend,
+    )
+    restored = receiver.restore_continuation(program.export_continuation(continuation))
+    restored_bound = receiver.kernel.bind(
+        restored.parameters, constants=restored.constants
+    )
+    restored_state, restored_aux = dn.func.run(
+        restored_bound,
+        restored,
+        steps=STEPS,
+        callbacks=receiver.callbacks,
+        checkpoint_every=1,
+    )
+    # endregion restored_binding
+    torch.testing.assert_close(containers(restored_state), containers(final))
+    torch.testing.assert_close(
+        dict(restored_aux["callbacks"]["trace"]),
+        dict(bound_aux["callbacks"]["trace"]),
     )
 
     # region fresh
@@ -194,7 +240,7 @@ def run_model(model, *, network, backend):
         assert containers(frame, check_identity) == containers(saved, check_identity)
     print(
         f"{'Network' if network else 'Population'}: effective overrides, aliases, "
-        "recorded continuation, checkpointed gradients and fresh bindings passed"
+        "bound continuation, checkpointed gradients and explicit restored bindings passed"
     )
 
 

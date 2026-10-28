@@ -42,6 +42,10 @@ class BoundNetwork:
     convention; use ``inputs={}`` for a step with only draws.
     Host ``run(bound, state, ...)``
     schedules arbitrary horizons and samples missing tapes in bounded spans.
+    It returns ``auxiliary['continuation']``; resume with ``run(bound, packet,
+    ...)`` when the packet's sources match this binding's Tensor objects.
+    Shared constant readers follow the Network's canonical parameter sources.
+    Different sources require an explicit new raw binding.
 
     Direct calls accept ``callbacks`` from ``functional.make_callbacks(...)``
     and return results in ``auxiliary['callbacks']``. Supply its ``state`` as

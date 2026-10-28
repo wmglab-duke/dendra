@@ -158,6 +158,36 @@ delivery and RNG continuation.
 A different threshold, selection, scope, timestep or lead field rejects
 restoration even if callback carry has the same Tensor shapes.
 
+### Resume through an explicit raw binding
+
+A restored continuation can also run through the receiving runner's kernel
+with the shared host scheduler. Restoration creates owned source leaves, so
+construct a new raw binding from those exact sources:
+
+```python
+bound = receiver.kernel.bind(restored.parameters, constants=restored.constants)
+state, auxiliary = dn.func.run(
+    bound, restored, steps=STEPS, callbacks=receiver.callbacks,
+)
+state, auxiliary = dn.func.run(
+    bound, auxiliary["continuation"], steps=STEPS, callbacks=receiver.callbacks,
+)
+```
+
+`run` keeps the binding's source ownership. A packet with different Tensor
+objects rejects rather than replacing that binding, even when its values and
+shapes match. Successful raw-bound runs return a continuation containing their
+state, effective sources and callback carry. Supplied callback collections
+still have to match the packet's restored carry. Do not also pass a non-`None`
+`callback_state=`. Input/draw tapes, runtime extracellular recipes and the next
+horizon are supplied separately.
+
+The complete
+{download}`functional_continuation.py <../../examples/functional_continuation.py>`
+example verifies same-binding continuation, joined recordings, spanning
+gradients and explicit binding of restored sources for both model kinds. See
+{ref}`functional-bound-continuation` for raw versus prepared binding ownership.
+
 ## Train after restoring
 
 Raw parameter and constant `requires_grad` flags are retained. Trainable restored
@@ -272,6 +302,8 @@ Restoration is the explicit checked bridge into an equivalent reconstructed
 collection. The public `(state, auxiliary)` result and `callback_state=`
 execution argument use the same contract for eager bindings, direct chunks,
 host scheduling, scan and supported inference while loops.
+Raw-bound `dn.func.run` additionally accepts the shared continuation packet;
+direct calls and prepared bindings keep explicit state and callback arguments.
 
 ## Save callback carry independently
 

@@ -19,6 +19,10 @@ from ._callbacks import (
     _complete_callback_results,
     _setup_callback_state,
 )
+from ._continuation import (
+    _complete_bound_continuation,
+    _resolve_bound_continuation,
+)
 from ._draws import (
     RuntimeDraws,
     _normalize_runtime_draws,
@@ -1513,6 +1517,12 @@ def run(
     Callbacks observe every accepted state, including within compiled chunks.
     Results are returned under ``auxiliary["callbacks"]``; pass their explicit
     ``state`` as ``callback_state`` when resuming to avoid duplicate frames.
+    Raw bindings also return ``auxiliary['continuation']``. Pass it as
+    ``run(bound, packet, ...)`` to continue state and callback carry together.
+    The packet must reference the binding's parameter/constant Tensor objects;
+    different sources require an explicit new raw binding. A packet cannot be
+    combined with non-None ``callback_state``. Prepared Population bindings and
+    the legacy form keep their explicit state/carry contract.
     This host scheduler stays outside torch.compile and torch.func boundaries.
     """
     from ._network_rollout import NetworkRolloutInput
@@ -1555,8 +1565,16 @@ def run(
                 isinstance(value, bool) or not isinstance(value, int) or value < 1
             ):
                 raise ValueError(f"{name} must be a positive integer")
+        state, callback_state = _resolve_bound_continuation(
+            bound, state, callback_state, callbacks
+        )
         if type(bound) is BoundNetwork:
-            return _run_bound_network(
+            previous = (
+                None
+                if bound.compiled_chunk is None
+                else bound.compiled_chunk.execution_report()
+            )
+            result = _run_bound_network(
                 bound,
                 state,
                 inputs,
@@ -1570,6 +1588,7 @@ def run(
                 callback_state=callback_state,
                 draws=draws,
             )
+            return _complete_bound_continuation(bound, result, previous)
         if draws is not None:
             inputs = _with_runtime_draws(inputs, draws)
         if bound._is_raw:
@@ -1580,8 +1599,13 @@ def run(
             bound.functional._validate_source()
             bound.functional._validate_parameters(bound._parameters)
             bound.functional._validate_state(state)
+            previous = (
+                None
+                if bound.compiled_chunk is None
+                else bound.compiled_chunk.execution_report()
+            )
             prepared_bound = bound._prepared_binding(source_validated=True)
-            return _run_source_validated(
+            result = _run_source_validated(
                 prepared_bound,
                 state,
                 inputs=inputs,
@@ -1595,6 +1619,7 @@ def run(
                 callbacks=callbacks,
                 callback_state=callback_state,
             )
+            return _complete_bound_continuation(bound, result, previous)
         return _run_schedule(
             bound.functional,
             bound,

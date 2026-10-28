@@ -38,6 +38,11 @@ class BoundPopulation:
     form. Reusable kernels retain neither bindings nor preparation graphs.
     Call ``run(bound, state, ...)`` to schedule arbitrary horizons.
 
+    Raw-bound host runs return ``auxiliary['continuation']``. Resume with
+    ``run(bound, packet, ...)`` when its sources match this binding's Tensor
+    objects. Different sources require a new raw binding. Prepared bindings
+    and direct calls retain their explicit state/callback-carry contract.
+
     Direct eager calls consume one :class:`Inputs` frame; compiled calls
     consume exactly ``steps`` time-leading samples. Supply ``callbacks`` from
     ``functional.make_callbacks(...)`` to return results in

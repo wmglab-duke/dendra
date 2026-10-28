@@ -200,7 +200,21 @@ def test_existing_raw_eager_binding_retains_its_captured_transition(monkeypatch)
 
     monkeypatch.setattr(functional, "step", override)
     _close(bound(state, dn.func.StepInput(ve=ve[0])), expected_direct)
-    _close(dn.func.run(bound, state, inputs=inputs), expected_run)
+    actual, auxiliary = dn.func.run(bound, state, inputs=inputs)
+    continuation = auxiliary["continuation"]
+    _close(continuation.state, actual)
+    assert continuation.callback_state is None
+    assert all(
+        continuation.parameters[key] is value for key, value in parameters.items()
+    )
+    assert all(continuation.constants[key] is value for key, value in constants.items())
+    _close(
+        (
+            actual,
+            {key: value for key, value in auxiliary.items() if key != "continuation"},
+        ),
+        expected_run,
+    )
 
 
 @pytest.mark.parametrize("compiled", (False, True))

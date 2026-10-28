@@ -100,10 +100,15 @@ inputs, draws and declared call-local ``extra=`` remain per-call arguments.
 
 .. autoclass:: dendra.func.Continuation
 
-Existing explicit-state/keyword calls retain their contracts. Raw/prepared
-bindings keep explicit ownership: create a binding with ``packet.parameters``
-and ``packet.constants`` and pass ``packet.state`` and ``packet.callback_state``
-through the usual execution arguments. Save portable detached checkpoints with
+Existing explicit-state/keyword calls retain their contracts. Raw bindings
+support ``dn.func.run(bound, packet, ...)`` and successful raw-bound host runs
+publish ``auxiliary["continuation"]``. Create the binding with
+``packet.parameters`` and ``constants=packet.constants``; its source Tensor
+identities, schemas and aliases remain authoritative. A packet with different
+sources requires an explicit new binding, including after portable restoration.
+Prepared Population bindings, direct calls and legacy scheduling keep explicit
+state/callback arguments. See :ref:`functional-bound-continuation`.
+Save portable detached checkpoints with
 ``runner.export_continuation(packet)`` and restore them with
 ``receiver.restore_continuation(saved)``. The versioned plain data/Tensor format
 preserves effective raw sources, tied Tensor identities and trainability.
@@ -135,6 +140,11 @@ Direct bindings and compiled chunks accept ``callbacks=`` and
 ``callback_state=`` and return ``(state, auxiliary)``. Bind a collection once
 with ``functional.make_callbacks``; its results and continuation carry appear
 under ``auxiliary["callbacks"]``.
+For raw-bound host scheduling, ``run(bound, packet, ...)`` carries state and
+callback memory together and returns the next ``auxiliary["continuation"]``.
+Supply the matching callback collection with ``callbacks=``; a non-``None``
+``callback_state=`` cannot also accompany a packet. Runtime inputs, draws,
+extracellular recipes and scheduling horizons remain per-call arguments.
 See :doc:`../advanced/A8_functional_populations` and
 :doc:`../advanced/A20_functional_network_rollout` for the execution and
 preparation lifetime contracts.
@@ -157,7 +167,8 @@ Functional callback checkpoints
 are omitted. Its ``export_state`` and ``restore_state`` methods provide checked
 portable continuation into an equivalent reconstructed collection. Exported
 carry is detached and excludes earlier recording results. Direct in-memory
-continuation retains the existing ``callback_state=`` contract. See
+calls retain the existing ``callback_state=`` contract; raw-bound host runs
+also accept it as part of a shared continuation packet. See
 :doc:`../advanced/A58_functional_callback_checkpoints` for complete Population
 and Network examples, ownership, and compatibility rules.
 

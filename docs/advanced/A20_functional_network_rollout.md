@@ -288,14 +288,40 @@ extracellular recipes separately on each invocation. See
 {download}`functional_continuation.py <../../examples/functional_continuation.py>`
 example for Population and Network workflows.
 
-Explicit raw/prepared bindings retain their source ownership. Bind a kernel to
-`continuation.parameters` and `continuation.constants`, then pass
-`continuation.state` and `callback_state=continuation.callback_state` to
-`dn.func.run`. Bindings and pure numerical kernels do not consume the packet
-directly.
+Raw Network bindings use the same packet through `dn.func.run`. Every successful
+raw-bound host run returns `aux["continuation"]`, including a run started from
+an ordinary state. To use a convenience runner's packet through its kernel:
+
+```python
+continuation = aux["continuation"]
+bound = program.kernel.bind(
+    continuation.parameters, constants=continuation.constants,
+)
+state, aux = dn.func.run(
+    bound, continuation, steps=STEPS, callbacks=program.callbacks,
+)
+state, aux = dn.func.run(
+    bound, aux["continuation"], steps=STEPS, callbacks=program.callbacks,
+)
+```
+
+The binding's sources remain authoritative. A packet must have matching source
+schemas, Tensor identities and aliases; the scheduler does not adopt different
+sources. A restored checkpoint owns new Tensor leaves and requires an explicit
+new binding. Network shared constant readers follow their canonical parameter
+source without mutating the binding's authored maps. Supply the same bound
+callback collection with the packet's carry, and do not also supply a
+non-`None` `callback_state=`. Input/draw tapes, runtime extracellular recipes
+and the horizon remain per-call arguments. See
+{ref}`functional-bound-continuation` for the shared Population/Network contract.
+
+Direct bindings and numerical chunks retain their explicit state/callback
+arguments. Prepared Population bindings also use that explicit form because
+they do not own raw constants.
 
 A returned Network state includes all Population carry, delivery queues,
-NetStim clock/RNG/calendar state, and the authoritative Network clock. Preserve
+NetStim clock/RNG/calendar state, and the authoritative Network clock. The
+explicit-state form remains supported: preserve
 `aux["callbacks"].state` alongside it when continuing the same callback
 collection:
 

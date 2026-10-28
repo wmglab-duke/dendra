@@ -322,6 +322,9 @@ slicing, automatic sampling and tail dispatch. `host_span_steps` bounds host
 work without checkpointing; `checkpoint_every` requests backward replay. Both
 accept `steps` or `duration` with the binding's timestep. Omit `steps` when the
 supplied input/draw tapes determine the horizon.
+Raw-bound host runs also return `auxiliary["continuation"]`; pass that packet
+as `dn.func.run(bound, packet, ...)` to continue state and callback carry with
+the same source binding. See {ref}`functional-bound-continuation`.
 
 ```{literalinclude} ../../examples/functional_api_overview.py
 :language: python
@@ -418,12 +421,18 @@ The complete
 {download}`functional_continuation.py <../../examples/functional_continuation.py>`
 example checks Population and connected-Network continuation, per-call
 parameter overrides, aliases, joined recordings, checkpointed gradients and
-fresh effective bindings. Run
+fresh effective bindings. It also checks raw-bound continuation and explicitly
+binds restored sources. Run
 `python examples/functional_continuation.py --backend aot_eager`.
 
-Explicit bindings keep their source ownership. To continue through a raw
-binding, construct it with the packet's sources and pass the state/carry
-explicitly:
+(functional-bound-continuation)=
+### Continue through a raw binding
+
+`dn.func.run(bound, continuation, ...)` accepts a raw `BoundPopulation` or
+`BoundNetwork`. Successful raw-bound host runs publish
+`auxiliary["continuation"]` whether their input is an ordinary state or a packet.
+An eager plan and a compiled chunk expose the same raw `bind` form. To execute
+a runner's continuation through its compiled kernel, bind the packet's sources:
 
 ```{literalinclude} ../../examples/functional_continuation.py
 :language: python
@@ -431,6 +440,46 @@ explicitly:
 :end-before: "# endregion binding_bridge"
 :dedent: 4
 ```
+
+The binding remains the owner of its parameter and constant sources. Packet
+Tensor identities, schemas and aliases must match those sources; equal values
+in a cloned Tensor do not establish the same binding. The scheduler does not
+adopt a different packet's parameters or constants. A returned packet can be
+resumed through that same binding:
+
+```{literalinclude} ../../examples/functional_continuation.py
+:language: python
+:start-after: "# region binding_resume"
+:end-before: "# endregion binding_resume"
+:dedent: 4
+```
+
+Supply the bound callback collection with `callbacks=` when continuing its
+carry. The collection must match the packet's callback state, and a non-`None`
+`callback_state=` cannot compete with the carry in the packet. Recording emits
+only the suffix's accepted steps, without repeating the boundary sample.
+`inputs=`, `draws=`, runtime `extra=`, and the horizon remain per-call arguments.
+Packet containers are independent snapshots; source Tensor identities and
+gradient history remain live.
+
+For Networks, shared constant readers follow their canonical parameter source;
+the binding's authored maps remain unchanged. Prepared Population bindings do
+not own raw constants and use their existing explicit state/callback-state
+contract. Direct binding calls, direct chunks and the legacy
+`run(functional, step, state, ...)` form retain their explicit contracts.
+
+Different sources, including the owned leaves from portable restoration,
+require an explicit new raw binding. The reusable kernel and receiving
+callback collection can still be used:
+
+```{literalinclude} ../../examples/functional_continuation.py
+:language: python
+:start-after: "# region restored_binding"
+:end-before: "# endregion restored_binding"
+:dedent: 4
+```
+
+### Save and restore a detached continuation
 
 `Continuation` retains in-memory graph history. For an independent portable
 checkpoint, use the shared methods on either convenience runner:
