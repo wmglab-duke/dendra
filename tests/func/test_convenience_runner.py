@@ -413,7 +413,7 @@ def test_invalid_execution_contract_is_rejected_before_compilation(kwargs, match
 
 
 def test_strict_while_rejects_capture_failure_without_unrolled_fallback(monkeypatch):
-    from dendra.func._recorder_while import _RecorderWhileExecutor
+    from dendra.func._population_while import _PopulationWhileExecutor
 
     graphs = []
 
@@ -430,7 +430,7 @@ def test_strict_while_rejects_capture_failure_without_unrolled_fallback(monkeypa
         callbacks={"trace": dn.func.Recorder("v")},
     )
     monkeypatch.setattr(
-        _RecorderWhileExecutor,
+        _PopulationWhileExecutor,
         "kernel_for",
         lambda *args: (None, "sentinel unsupported Recorder while capture"),
     )

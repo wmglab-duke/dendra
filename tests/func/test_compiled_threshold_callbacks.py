@@ -370,27 +370,31 @@ def test_custom_pure_callback_works_with_scan():
     _close_result(actual, expected)
 
 
-def test_strict_while_rejects_custom_callback_before_compiling_unrolled_horizon():
+def test_strict_while_rejects_uncapturable_custom_callback_before_compiling_unrolled_horizon():
+    class TensorBranch(_Energy):
+        def update(self, carry, state, auxiliary):
+            if state["integrator"]["v"].mean().item() > 0:
+                return carry + 1, None
+            return carry - 1, None
+
     captures = []
 
     def backend(graph, examples):
         captures.append(graph)
         return graph.forward
 
-    with pytest.raises(
-        (dn.func.FunctionalizationError, ValueError),
-        match="callback|Callback|unavailable|unsupported",
-    ):
-        runner = dn.func.compile(
-            _model(),
-            dt=DT,
-            steps=800,
-            execution="while",
-            callbacks={"energy": _Energy()},
-            backend=backend,
-        )
+    runner = dn.func.compile(
+        _model(),
+        dt=DT,
+        steps=800,
+        execution="while",
+        callbacks={"energy": TensorBranch()},
+        backend=backend,
+    )
+    with pytest.raises(dn.func.FunctionalizationError, match="unavailable"):
         runner()
     assert not captures
+    assert runner.execution_report() is None
 
 
 def test_callback_mapping_validation_and_trace_name_is_ordinary():
@@ -433,15 +437,16 @@ def test_callback_mapping_validation_and_trace_name_is_ordinary():
         backend="eager",
     )()
     assert trace_count[1]["callbacks"]["trace"].dtype == torch.int64
-    with pytest.raises(ValueError, match="callback|Callback"):
-        dn.func.compile(
-            model,
-            dt=DT,
-            steps=4,
-            execution="while",
-            callbacks={},
-            backend="eager",
-        )
+    unrecorded_while = dn.func.compile(
+        model,
+        dt=DT,
+        steps=4,
+        execution="while",
+        callbacks={},
+        backend="eager",
+    )()
+    assert "callbacks" not in unrecorded_while[1]
+    assert unrecorded_while[1]["continuation"].callback_state is None
 
 
 @pytest.mark.skipif(

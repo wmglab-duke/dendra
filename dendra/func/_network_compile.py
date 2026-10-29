@@ -84,9 +84,9 @@ class CompiledNetworkRunner:
     Initialization runs once before
     rollout/checkpoint spans; its graph is never cached. Inference while-loop
     execution uses ``execution='while', inference=True`` with the same pure
-    Network timestep and the Population packed loop engine. Qualified Recorders,
-    built-ins wrapped in ``PopulationCallback``, and execution without callbacks
-    are supported; use scan for custom callbacks and gradients. Short chunks
+    Network timestep and the Population packed loop engine. Pure callbacks,
+    including custom implementations and ``PopulationCallback`` scopes, and
+    execution without callbacks are supported; use scan for gradients. Short chunks
     contain only the bounded unrolled tail. ``extra`` maps Population names to
     ``(field, Waveform)`` pairs or contact sequences, using the Population
     stimulation machinery. Its fields and waveform leaves are independent
@@ -250,7 +250,6 @@ class CompiledNetworkRunner:
         self._kernel = self._functional.compile_rollout_chunk(
             self._chunk_steps, execution=execution, **keywords
         )
-        self._kernel._validate_while_callbacks(self._callbacks)
 
     @property
     def initial_state(self):

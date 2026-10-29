@@ -120,10 +120,11 @@ over the default C++ wrapper choice.
 Scan and while execution use Dendra's PyTorch 2.14+ baseline; supported features
 are not selected by patch-version number. The Population convenience runner's
 while execution requires a compiled chunk width of at least four steps,
-a capturable inference step, and supported built-ins when callbacks are supplied.
-Supported built-ins are ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``, ``APCount``,
-``Active``, ``ActiveAL``, and ``ActiveALCount``; scan also accepts pure custom
-functional callbacks. An unsupported while request raises an error
+a capturable inference step, and capture-compatible pure callbacks when supplied.
+Both scan and while accept ``FunctionalCallback`` implementations, including
+``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``, ``APCount``, ``Active``,
+``ActiveAL``, ``ActiveALCount``, and user-defined reducers and emitters. An
+unsupported while request raises an error
 instead of falling back to an unrolled simulation for the requested main
 chunk. Shorter final tails retain their bounded dispatch rules.
 
@@ -565,10 +566,8 @@ the reserved compact rowwise support encoding,
 MaterialProcesses with impure numerical hooks or custom imperative lifecycle
 overrides, delay-history resizing within
 captured execution,
-legacy or otherwise impure VoltageProcess hooks, imperative callback hooks, functional
-callback built-ins beyond ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``,
-``APCount``, ``Active``, ``ActiveAL``, and ``ActiveALCount``, other
-Population topologies
+legacy or otherwise impure VoltageProcess hooks, imperative callback hooks,
+other Population topologies
 (including generic ``Axon``, subclasses that replace supported execution hooks,
 nested ``MultiPopulation``,
 and mixtures of scalar and
@@ -2548,11 +2547,38 @@ methods form a pure reducer contract:
            return carry
 
    callbacks = fmodel.make_callbacks({"energy": VoltageEnergy()})
+   kernel = fmodel.compile_rollout_chunk(100, execution="while")
+   bound = kernel.bind(tensors)
+   with torch.no_grad():
+       final_state, auxiliary = dn.func.run(
+           bound, tensors.state, steps=203, callbacks=callbacks,
+       )
+       continued_state, continued = dn.func.run(
+           bound, auxiliary["continuation"], steps=100,
+           callbacks=callbacks,
+       )
+   accumulated_energy = continued["callbacks"]["energy"]
+
+The same callback supports eager execution, differentiable scan, and
+inference-only while. Select ``execution="scan"`` and leave gradients enabled
+when differentiating the accumulated result. While uses invocation-owned
+recording buffers for emissions; reducers that emit ``None`` retain only their
+carry. ``PopulationCallback(name, callback)`` applies the same contract to one
+Network Population. The complete
+:download:`functional_network_callbacks.py <../../examples/functional_network_callbacks.py>`
+example combines a custom reducer/emitter with built-ins and checks scan/while
+results and continuation.
+
+Custom callbacks support in-memory continuation with the matching bound
+collection. Portable export and restoration of custom callback configurations
+are currently unsupported; see :doc:`A58_functional_callback_checkpoints`.
 
 ``initialize`` returns explicit carry and an optional initial emission;
 ``update`` returns the next carry and an optional post-step emission; and
 ``finalize`` turns the carry and stacked emissions into the public result.
 Carry, emissions, and results must be tensor PyTrees with stable structure.
+An emission is ``None`` or a nonempty tensor tree. Use fixed tensors and masks
+for sparse observations rather than varying the output tree between steps.
 Carry and individual emissions must also preserve each leaf's shape, dtype,
 and device; a finalized recording may vary only along its leading sample axis.
 Results from callbacks that emit no samples must preserve their complete leaf
@@ -2881,7 +2907,7 @@ a Population or Network compiled chunk:
            bound, auxiliary["continuation"], steps=100,
        )
 
-Callbacks are optional. Supply the same supported built-in collection through
+Callbacks are optional. Supply the same pure functional collection through
 ``callbacks=`` when recording or reducing states. Enabled compiled calls require
 ``torch.no_grad()`` or ``torch.inference_mode()``. For Population widths of at
 least four steps, unavailable loop capture raises instead of silently selecting
@@ -2897,15 +2923,14 @@ kernel does not change other kernels or the kernel exposed by an existing
 Active ``torch.func`` transforms and forward AD retain the eager fallback
 described below; those calls do not receive compiled while acceleration.
 
-Built-in callbacks in compiled inference
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Pure callbacks in compiled inference
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 On PyTorch 2.14 or newer, a default compiled chunk can also use a bounded
-inference loop when every callback is a supported functional built-in:
-``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``, ``APCount``, ``Active``,
-``ActiveAL``, or ``ActiveALCount``. Run the call under ``torch.no_grad()``;
-chunks of at least four timesteps use the loop when their transition can be
-captured. No Recorder is required for a reducer-only callback collection.
+inference loop with built-in or custom pure ``FunctionalCallback`` objects.
+Run the call under ``torch.no_grad()``; chunks of at least four timesteps use
+the loop when the model transition and callback updates can be captured.
+No Recorder is required for a reducer-only callback collection.
 Recorder state selection, including ``v``, mechanism states such as ``hh.m``,
 ``t``, node indices, and ``max_only``
 reductions, retains its ordinary meaning. The runner still returns the initial
@@ -2933,10 +2958,11 @@ callback state does not repeat the initial sample. Registered intracellular
 and bound extracellular waveforms are evaluated at each accepted recurrent
 clock value, just as in an eager host run.
 
-Mixed collections of these built-ins remain eligible for the loop. Custom
-callbacks, gradient-enabled calls, and short chunks retain the unrolled path.
-Failed transition capture also falls back to unrolling. A final one-, two-, or
-three-step tail therefore reports
+Mixed collections of built-in and custom pure callbacks remain eligible for
+the loop. With the default selector, gradient-enabled calls and short chunks
+retain the unrolled path, and unavailable capture falls back to unrolling.
+Explicit ``execution="while"`` rejects unavailable capture for a full block.
+A final one-, two-, or three-step tail therefore reports
 ``compiled_unrolled`` even when preceding chunks used ``compiled_while_loop``.
 Consult the execution report rather than assuming a particular dispatch.
 

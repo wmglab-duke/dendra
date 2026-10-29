@@ -62,8 +62,8 @@ components after ``Network.concat()``; see
 :doc:`../advanced/A26_functional_network_regions`.
 ``PopulationCallback("left", callback)`` applies an existing functional
 Population callback to one named Population. LFP, threshold-analysis, anomaly,
-and scoped Recorder callbacks support scan and while execution; scoped custom
-callbacks support scan. See
+scoped Recorder callbacks, and custom pure callbacks support scan and
+inference-only while execution. See
 :doc:`../advanced/A27_functional_network_callbacks` for shapes, callback windows,
 lead-field gradients, packed components, and continuation.
 ``trainable`` accepts exact/unique partial names, glob patterns, and explicit

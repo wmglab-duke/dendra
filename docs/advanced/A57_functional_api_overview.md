@@ -709,9 +709,10 @@ its initial boundary sample. Native state is published only through an explicit
 | `torch.func` transforms or an outer `torch.compile` | Pure `prepare_and_step` / `prepare_and_rollout` | Keep host scheduling and sampling outside the transform |
 
 `dn.compile` selects scan by default. First-order training is supported by scan
-and compiled unrolled chunks. `execution="while"` is inference-only and supports
-its defined built-in callbacks, including supported Population scopes in a
-Network; custom callbacks use scan. Population while runners require a compiled
+and compiled unrolled chunks. `execution="while"` is inference-only. Both engines
+accept built-in and capture-compatible custom `FunctionalCallback` objects,
+including Population scopes in a Network, with the same explicit carry and
+emission contract. Population while runners require a compiled
 chunk width of at least four steps. Both kinds of runner support callback-free
 while inference; Networks also support short main chunks. Requested unsupported
 while execution raises rather than silently choosing another strategy for the

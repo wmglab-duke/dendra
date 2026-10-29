@@ -239,9 +239,7 @@ class _Counter(dn.func.FunctionalCallback):
 
 
 @pytest.mark.parametrize(("steps", "disabled"), ((1, False), (4, False), (4, True)))
-def test_while_rejects_custom_callbacks_before_backend_or_state_changes(
-    steps, disabled
-):
+def test_while_custom_callbacks_keep_tail_disabled_and_state_ownership(steps, disabled):
     functional, tensors, prepared = _case()
     callbacks = functional.make_callbacks({"counter": _Counter()})
     graphs = []
@@ -249,11 +247,28 @@ def test_while_rejects_custom_callbacks_before_backend_or_state_changes(
         steps, execution="while", backend=_backend(graphs), disable=disabled
     )
     frozen = _clone(tensors.state, detached=True)
-    with pytest.raises(
-        (ValueError, dn.func.FunctionalizationError), match="callback|built-in|Recorder"
-    ):
-        chunk(tensors.parameters, prepared, tensors.state, callbacks=callbacks)
-    assert not graphs and chunk.execution_report() is None
+    with torch.no_grad():
+        actual, auxiliary = chunk(
+            tensors.parameters, prepared, tensors.state, callbacks=callbacks
+        )
+        expected, reference = functional.rollout(
+            tensors.parameters,
+            prepared,
+            tensors.state,
+            steps=steps,
+            callbacks=callbacks,
+        )
+    _close(actual, expected)
+    _close(auxiliary["callbacks"]["counter"], reference["callbacks"]["counter"])
+    assert bool(graphs) is not disabled
+    assert chunk.execution_report().strategy == (
+        "eager_disabled"
+        if disabled
+        else "compiled_while_loop"
+        if steps >= 4
+        else "compiled_unrolled"
+    )
+    assert any(_has_while(graph) for graph in graphs) is (steps >= 4 and not disabled)
     _close(tensors.state, frozen)
 
 

@@ -423,21 +423,27 @@ def test_scoped_custom_callback_scan_receives_only_the_selected_population_and_a
 
 
 @pytest.mark.parametrize("steps", (1, 4))
-def test_scoped_custom_callback_while_rejection_also_applies_to_short_tails(steps):
+def test_scoped_custom_callback_while_support_includes_short_tails(steps):
     functional, tensors = dn.func.make_functional_network(_network())
     callbacks = functional.make_callbacks(
         {"energy": dn.func.PopulationCallback("left", _PopulationEnergy())}
     )
-    with (
-        torch.no_grad(),
-        pytest.raises(dn.func.FunctionalizationError, match="scan|Scan"),
-    ):
-        functional.run(
+    chunk = _chunk(functional, "while", steps)
+    with torch.no_grad():
+        actual, auxiliary = functional.run(
             *tensors,
             steps=steps,
             callbacks=callbacks,
-            compiled_chunk=_chunk(functional, "while", steps),
+            compiled_chunk=chunk,
         )
+        expected, reference = functional.prepare_and_rollout(
+            *tensors, steps=steps, callbacks=callbacks
+        )
+    _close(actual, expected)
+    _close(auxiliary["callbacks"]["energy"], reference["callbacks"]["energy"])
+    assert chunk.execution_report().strategy == (
+        "compiled_while_loop" if steps >= 4 else "compiled_unrolled"
+    )
 
 
 @pytest.mark.slow

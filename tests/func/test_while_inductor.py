@@ -98,18 +98,29 @@ def test_mode_options_conflict_preserves_upstream_error():
         )
 
 
-def test_custom_callback_while_declines_without_compiling_unrolled_fallback():
-    from dendra.func._recorder_while import _RecorderWhileExecutor
+def test_callback_capture_failure_declines_without_compiling_unrolled_fallback(
+    monkeypatch,
+):
+    from dendra.func._population_while import _PopulationWhileExecutor
 
-    executor = _RecorderWhileExecutor(
+    executor = _PopulationWhileExecutor(
         object(),
         steps=8,
         plans=[SimpleNamespace(callback=object())],
         compile_options={"backend": "inductor", "options": {"cpp_wrapper": True}},
     )
+    captures = []
+
+    def fail_capture(*operands):
+        captures.append(operands)
+        raise RuntimeError("sentinel authored callback capture")
+
+    monkeypatch.setattr(executor, "_capture", fail_capture)
     kernel, reason = executor.kernel_for(None, None, None, None, None, None)
-    assert kernel is None and "built-in" in reason
-    assert executor._kernels == {} and executor._capture_errors == {}
+    assert kernel is None and "sentinel authored callback capture" in reason
+    assert executor._kernels == {} and len(executor._capture_errors) == 1
+    assert executor.kernel_for(None, None, None, None, None, None) == (None, reason)
+    assert len(captures) == 1
 
 
 def _inputs(case, steps=8):
@@ -148,7 +159,7 @@ def _assert_upstream_compilers(kernel, *, recorded):
     if recorded:
         for chunks in kernel._callback_chunks.values():
             for chunk in chunks.values():
-                executor = chunk._recorder_while
+                executor = chunk._callback_while
                 if executor is not None:
                     functions.extend(executor._kernels.values())
     else:

@@ -11,7 +11,7 @@ import torch
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
-from dendra.func._recorder_while import _RecorderWhileExecutor
+from dendra.func._population_while import _PopulationWhileExecutor
 from tests.func.test_runtime_extra import DT, _close, _field
 from tests.func.test_runtime_extra import _model as _passive
 from tests.func.test_runtime_noise import DT as NOISE_DT
@@ -221,14 +221,14 @@ def test_bound_while_waveforms_use_native_clock_and_reuse_the_effective_child(
     functional, tensors, parameters, prepared, _amplitude = clock_case(stimulus_kind)
     kernel = functional.compile_rollout_chunk(STEPS, execution="while", backend="eager")
     executions = []
-    kernel_for = _RecorderWhileExecutor.kernel_for
+    kernel_for = _PopulationWhileExecutor.kernel_for
 
     def observe(executor, *args, **kwargs):
         if executor._functional is functional:
             executions.append(executor)
         return kernel_for(executor, *args, **kwargs)
 
-    monkeypatch.setattr(_RecorderWhileExecutor, "kernel_for", observe)
+    monkeypatch.setattr(_PopulationWhileExecutor, "kernel_for", observe)
     with torch.no_grad():
         expected = tensors.state
         for _ in range(STEPS + 1):
@@ -266,7 +266,7 @@ def test_explicit_while_capture_failures_preserve_last_report_and_backend(
         return None, "sentinel explicit Population while capture"
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(_RecorderWhileExecutor, "kernel_for", unavailable)
+        scoped.setattr(_PopulationWhileExecutor, "kernel_for", unavailable)
         with (
             torch.no_grad(),
             pytest.raises(dn.func.FunctionalizationError, match="sentinel explicit"),
@@ -278,7 +278,7 @@ def test_explicit_while_capture_failures_preserve_last_report_and_backend(
     report, count = kernel.execution_report(), len(graphs)
     assert count and _has_while(graphs)
     with monkeypatch.context() as scoped:
-        scoped.setattr(_RecorderWhileExecutor, "kernel_for", unavailable)
+        scoped.setattr(_PopulationWhileExecutor, "kernel_for", unavailable)
         with (
             torch.no_grad(),
             pytest.raises(dn.func.FunctionalizationError, match="sentinel explicit"),
@@ -385,7 +385,7 @@ def test_disabled_explicit_while_is_an_eager_diagnostic_dispatch():
     assert kernel.execution_report().strategy == "eager_disabled"
 
 
-def test_explicit_while_rejects_custom_reducers_even_for_a_short_chunk():
+def test_explicit_while_accepts_custom_reducers_for_a_short_chunk():
     class Custom(dn.func.FunctionalCallback):
         def initialize(self, state, auxiliary):
             return state["integrator"]["v"].new_zeros(()), None
@@ -399,12 +399,17 @@ def test_explicit_while_rejects_custom_reducers_even_for_a_short_chunk():
     _model, functional, tensors, prepared = _case()
     callbacks = functional.make_callbacks({"custom": Custom()})
     kernel = functional.compile_rollout_chunk(3, execution="while", backend="eager")
-    with (
-        torch.no_grad(),
-        pytest.raises(dn.func.FunctionalizationError, match="callback|scan"),
-    ):
-        kernel(tensors.parameters, prepared, tensors.state, callbacks=callbacks)
-    assert kernel.execution_report() is None
+    with torch.no_grad():
+        actual, auxiliary = kernel(
+            tensors.parameters, prepared, tensors.state, callbacks=callbacks
+        )
+        expected, reference = functional.rollout(
+            tensors.parameters, prepared, tensors.state, steps=3, callbacks=callbacks
+        )
+    _close(actual, expected)
+    _close(auxiliary["callbacks"]["custom"], reference["callbacks"]["custom"])
+    assert kernel.execution_report().strategy == "compiled_unrolled"
+    assert kernel.execution_report().callbacks
 
 
 @pytest.mark.mps

@@ -426,18 +426,6 @@ class CompiledNetworkChunk:
             )
         return self._tails[steps]
 
-    def _validate_while_callbacks(self, callbacks):
-        if self._execution != "while" or callbacks is None:
-            return
-        from ._callbacks import _is_builtin_callback
-
-        if any(not _is_builtin_callback(plan.callback) for plan in callbacks._plans):
-            raise FunctionalizationError(
-                "Network execution='while' supports qualified Recorders and "
-                "PopulationCallback scopes around supported built-ins; "
-                "use scan for custom callbacks or reducers."
-            )
-
     def _make_kernel(self, callbacks):
         functional = self._functional
         plans = None if callbacks is None else callbacks._plans
@@ -535,7 +523,6 @@ class CompiledNetworkChunk:
         )
 
     def _values(self, parameters, prepared, state, tape, callbacks, callback_state):
-        self._validate_while_callbacks(callbacks)
         transform = torch._C._are_functorch_transforms_active()
         forward_ad = torch.autograd.forward_ad._current_level >= 0
         disabled = self._options.get("disable", False)

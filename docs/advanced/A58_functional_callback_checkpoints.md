@@ -365,8 +365,10 @@ Active, ActiveAL and ActiveALCount, including supported Population scopes and
 physical Recorder regions. Eligibility follows the bound implementation:
 authored subclasses that bind to a supported built-in implementation use its
 checkpoint contract. Checkpoint export/restoration for custom bound callback
-implementations is currently unsupported; their ordinary functional execution
-and in-memory continuation use the existing contracts.
+implementations is currently unsupported. Their ordinary execution and
+in-memory continuation support both scan and inference-only while using the
+same bound callback collection; that execution support does not serialize the
+custom configuration.
 
 For LFP, restored lead-field carry is detached. It does not acquire a gradient
 connection to the receiving collection's lead-field Tensors. Use direct

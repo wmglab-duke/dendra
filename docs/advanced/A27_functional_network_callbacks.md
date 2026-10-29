@@ -32,7 +32,8 @@ The complete
 {download}`functional_network_callbacks.py <../../examples/functional_network_callbacks.py>`
 example compares scan and while execution for two connected, batched Populations.
 It checks LFP projections, all threshold-analysis callbacks, anomaly detection,
-regional recording, continuation, and scan gradients through lead fields. Run
+regional recording, a custom reducer/emitter, continuation, and scan gradients
+through lead fields. Run
 it from the repository root with `python examples/functional_network_callbacks.py`.
 
 ## Declare the Network and select callbacks
@@ -150,8 +151,9 @@ saved activations, rather than the returned recording arrays.
 ```
 
 Scan supports differentiable recordings and reducers. While execution is
-inference-only and supports these scoped built-ins alongside qualified
-Recorders. Unsupported explicit while configurations raise; the runner does
+inference-only and uses the same pure callback API, including custom callbacks,
+scoped built-ins, and qualified Recorders. Unsupported explicit while
+configurations raise; the runner does
 not silently select another executor. See {doc}`A25_functional_network_while`
 for execution reports and bounded tails.
 
@@ -181,7 +183,7 @@ The example verifies the output shapes and reduction relationships:
 :dedent: 4
 ```
 
-## Concatenated Populations and custom callbacks
+## Concatenated Populations
 
 Scope names refer to top-level Populations after transformations. With the
 default `network.concat()` grouping, use `"all_populations"`; a component name
@@ -222,11 +224,38 @@ callbacks["exc_lfp"] = dn.func.PopulationCallback(
 )
 ```
 
-A pure custom `FunctionalCallback` can also be wrapped to receive one
-Population's state and auxiliary mapping. A bare custom callback receives the
-complete Network packet. Custom callbacks support scan execution and are
-currently unsupported by while execution. Mutable native callbacks and
-their imperative hooks are not executed by a functional callback collection.
+## Custom callbacks across scan and while
+
+Implement `FunctionalCallback` once for both engines. The example accumulates a
+post-step voltage statistic in scalar carry and emits a scalar mean voltage at
+each boundary:
+
+```{literalinclude} ../../examples/functional_network_callbacks.py
+:language: python
+:start-after: "# region custom callback"
+:end-before: "# endregion custom callback"
+```
+
+`PopulationCallback("left", VoltageSummary())` supplies only that Population's
+state and auxiliary mapping. A bare custom callback receives the complete
+Network packet. The `summary` stream is mixed with the built-ins in the example;
+scan and inference-only while use the same object and result structure.
+
+Carry and individual emissions preserve their tensor tree structure, shape,
+dtype, and device. Emissions can be `None` for a constant-memory reducer; an
+emitter returns a nonempty tensor tree. Use fixed tensors and masks for sparse
+observations instead of changing the output structure. Keep callback objects
+immutable and implementations deterministic, side-effect-free, and compatible
+with graph capture. Mutable native callbacks and their imperative hooks are not
+executed by a functional callback collection.
+
+The example compares the custom mean-voltage trajectory with the Recorder,
+including its initial frame, and the accumulated energy with all post-step
+voltages. Continuation keeps the carry cumulative and does not repeat the shared
+boundary emission. The same bound collection supports in-memory continuation
+through `callback_state=` or a returned `Continuation`. Portable export and
+restoration of custom callback configurations are currently unsupported; see
+{doc}`A58_functional_callback_checkpoints`.
 
 The complete CPU example executes here:
 

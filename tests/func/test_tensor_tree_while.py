@@ -331,7 +331,7 @@ def test_population_outer_capture_cache_tracks_parameter_freezing():
         _ViewFunctional,
     )
 
-    from dendra.func._recorder_while import _RecorderWhileExecutor
+    from dendra.func._population_while import _PopulationWhileExecutor
 
     class FlagFunctional(_ViewFunctional):
         @staticmethod
@@ -346,7 +346,7 @@ def test_population_outer_capture_cache_tracks_parameter_freezing():
 
     case = _case(4)
     case.functional = FlagFunctional()
-    executor = _RecorderWhileExecutor(
+    executor = _PopulationWhileExecutor(
         case.functional,
         steps=4,
         plans=case.plans,

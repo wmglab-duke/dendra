@@ -1,11 +1,9 @@
-"""Bounded inference-only built-in callbacks with invocation-local buffers.
+"""Population adapter over the shared tensor-tree inference while engine.
 
-Recorder remains a pure per-step emitter. Only this private executor mutates
-fresh buffers allocated inside its compiled invocation; no public input,
-callback object, or persistent workspace is mutated. The buffers are captured
-inference outputs, not while-loop carries, so their indexed writes need not
-clone the complete recording every timestep.
-Reducer state, crossing latches, and callback phase are explicit loop carry.
+Bound-input assembly and accepted-step waveform clocks remain Population
+policy. Pure callback updates share the model transition; the engine owns
+packed recurrent carry and invocation-local emission buffers. Captured kernels
+retain schemas and graphs rather than invocation values or preparation graphs.
 """
 
 from __future__ import annotations
@@ -19,14 +17,14 @@ from torch.utils import _pytree as pytree
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._callback_recurrence import _transition_sample_values
-from ._callbacks import _is_builtin_callback, _update_callback_values
+from ._callbacks import _update_callback_values
 from ._draws import _has_runtime_stimulation
 from ._inputs import _RuntimeInputs
 from ._tensor_tree_while import _CompiledTensorTreeWhile, _schema
 from ._while_inductor import _compile_while
 
 
-class _RecorderWhileExecutor:
+class _PopulationWhileExecutor:
     """Capture one transition with explicit caller-owned waveform timing."""
 
     def __init__(
@@ -36,14 +34,12 @@ class _RecorderWhileExecutor:
         steps,
         plans,
         compile_options,
-        allow_empty_plans=False,
         stepwise_stimulation=True,
     ):
         self._functional = functional
         self._steps = steps
         self._plans = plans
         self._options = compile_options
-        self._allow_empty_plans = allow_empty_plans
         self._stepwise_stimulation = stepwise_stimulation
         self._kernels = {}
         self._capture_errors = {}
@@ -64,13 +60,6 @@ class _RecorderWhileExecutor:
 
         if self._steps < _STRUCTURED_ROLLOUT_CHUNK:
             return None, "The chunk is shorter than one inference loop block."
-        if (not self._plans and not self._allow_empty_plans) or not all(
-            _is_builtin_callback(plan.callback) for plan in self._plans
-        ):
-            return None, (
-                "Inference callback loops require supported built-in functional "
-                "callbacks; use scan for custom callbacks."
-            )
         # Captured-tensor mutation is part of the project's Torch>=2.14
         # baseline. Compile the selected route rather than choosing behavior
         # from a patch-version label.

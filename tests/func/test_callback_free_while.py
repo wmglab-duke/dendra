@@ -12,7 +12,7 @@ import torch
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
-from dendra.func._recorder_while import _RecorderWhileExecutor
+from dendra.func._population_while import _PopulationWhileExecutor
 from tests.func.test_runtime_extra import DT, _close, _field
 from tests.func.test_runtime_extra import _model as _passive
 from tests.func.test_runtime_noise import DT as NOISE_DT
@@ -103,7 +103,7 @@ def _observe_private_boundaries(monkeypatch, program):
     draws, executors = [], []
     plan = program.functional._runtime_draw_plan
     sample = plan.sample
-    kernel_for = _RecorderWhileExecutor.kernel_for
+    kernel_for = _PopulationWhileExecutor.kernel_for
 
     def sampled(state, *, steps=None):
         draws.append(steps)
@@ -116,14 +116,13 @@ def _observe_private_boundaries(monkeypatch, program):
                     executor._steps,
                     id(executor),
                     len(executor._plans),
-                    executor._allow_empty_plans,
                 )
             )
         return kernel_for(executor, *args, **kwargs)
 
     with monkeypatch.context() as scoped:
         scoped.setattr(plan, "sample", sampled)
-        scoped.setattr(_RecorderWhileExecutor, "kernel_for", selected)
+        scoped.setattr(_PopulationWhileExecutor, "kernel_for", selected)
         yield draws, executors
 
 
@@ -141,9 +140,7 @@ def test_callback_free_bounded_noise_replays_and_restores_a_portable_continuatio
     with _observe_private_boundaries(monkeypatch, source) as (draws, executors):
         automatic = source()
     assert draws and all(0 < count <= 4 for count in draws)
-    assert executors and all(
-        count <= 4 and plans == 0 and empty for count, _, plans, empty in executors
-    )
+    assert executors and all(count <= 4 and plans == 0 for count, _, plans in executors)
     with _observe_private_boundaries(monkeypatch, source) as (draws, _):
         explicit = source(draws=_slice(tape, 0, 9))
     assert draws == []
@@ -201,9 +198,9 @@ def test_callback_free_stimulation_uses_the_same_effective_executor_and_native_c
     with _observe_private_boundaries(monkeypatch, program) as (_, executors):
         actual = program(**({"extra": recipe} if stimulation == "runtime" else {}))
     _without_callbacks(actual)
-    full = [identity for count, identity, _, _ in executors if count == 4]
+    full = [identity for count, identity, _ in executors if count == 4]
     assert len(full) >= 2 and len(set(full)) == 1
-    assert all(plans == 0 and empty for _, _, plans, empty in executors)
+    assert all(plans == 0 for _, _, plans in executors)
     with torch.no_grad():
         for _ in range(5):
             native.step(DT, extra=recipe if stimulation != "registered" else None)
@@ -231,7 +228,7 @@ def test_callback_free_capture_failure_preserves_backend_and_last_report(monkeyp
         return None, "sentinel callback-free inference capture"
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(_RecorderWhileExecutor, "kernel_for", unavailable)
+        scoped.setattr(_PopulationWhileExecutor, "kernel_for", unavailable)
         with pytest.raises(dn.func.FunctionalizationError, match="sentinel"):
             program()
     assert graphs == [] and program.execution_report() is None
@@ -239,13 +236,13 @@ def test_callback_free_capture_failure_preserves_backend_and_last_report(monkeyp
     assert graphs
     count, report = len(graphs), program.execution_report()
     with monkeypatch.context() as scoped:
-        scoped.setattr(_RecorderWhileExecutor, "kernel_for", unavailable)
+        scoped.setattr(_PopulationWhileExecutor, "kernel_for", unavailable)
         with pytest.raises(dn.func.FunctionalizationError, match="sentinel"):
             program()
     assert len(graphs) == count
     assert program.execution_report() is report
 
-    kernel_for = _RecorderWhileExecutor.kernel_for
+    kernel_for = _PopulationWhileExecutor.kernel_for
     matching_calls = []
 
     def fail_during_execution(executor, *args, **kwargs):
@@ -256,7 +253,7 @@ def test_callback_free_capture_failure_preserves_backend_and_last_report(monkeyp
         return kernel_for(executor, *args, **kwargs)
 
     with monkeypatch.context() as scoped:
-        scoped.setattr(_RecorderWhileExecutor, "kernel_for", fail_during_execution)
+        scoped.setattr(_PopulationWhileExecutor, "kernel_for", fail_during_execution)
         with pytest.raises(dn.func.FunctionalizationError, match="sentinel execution"):
             program()
     assert len(matching_calls) >= 2
@@ -272,7 +269,7 @@ def test_failed_while_admission_does_not_enable_model_route_for_a_raw_empty_pack
     )
     with monkeypatch.context() as scoped:
         scoped.setattr(
-            _RecorderWhileExecutor,
+            _PopulationWhileExecutor,
             "kernel_for",
             lambda *args, **kwargs: (None, "sentinel failed admission"),
         )
@@ -283,7 +280,7 @@ def test_failed_while_admission_does_not_enable_model_route_for_a_raw_empty_pack
     def unexpected(*args, **kwargs):
         pytest.fail("raw empty packet selected a model-only while executor")
 
-    monkeypatch.setattr(_RecorderWhileExecutor, "kernel_for", unexpected)
+    monkeypatch.setattr(_PopulationWhileExecutor, "kernel_for", unexpected)
     functional = program.functional
     with torch.no_grad():
         prepared = functional.prepare(program.parameters, program.constants)
@@ -318,7 +315,7 @@ def test_callback_state_without_callbacks_is_rejected_before_capture(
     def unexpected(*args, **kwargs):
         pytest.fail("callback_state without callbacks reached while capture")
 
-    monkeypatch.setattr(_RecorderWhileExecutor, "kernel_for", unexpected)
+    monkeypatch.setattr(_PopulationWhileExecutor, "kernel_for", unexpected)
     with pytest.raises(ValueError, match="callback_state requires callbacks"):
         program(program.initial_state, callback_state={})
 
@@ -326,7 +323,7 @@ def test_callback_state_without_callbacks_is_rejected_before_capture(
 @pytest.mark.parametrize(
     "invalid", ("training", "disabled", "short_horizon", "short_chunk", "custom")
 )
-def test_callback_free_admission_keeps_other_while_restrictions(invalid):
+def test_callback_free_admission_keeps_policies_and_accepts_pure_callbacks(invalid):
     class Custom(dn.func.FunctionalCallback):
         def initialize(self, state, auxiliary):
             return state["integrator"]["v"].new_zeros(()), None
@@ -347,8 +344,23 @@ def test_callback_free_admission_keeps_other_while_restrictions(invalid):
     options = dict(dt=DT, steps=4, execution="while", backend="eager")
     keywords, match = choices[invalid]
     options.update(keywords)
-    with pytest.raises((ValueError, dn.func.FunctionalizationError), match=match):
-        dn.compile(_passive(batch=()), **options)()
+    if invalid == "custom":
+        program = dn.compile(_passive(batch=()), **options)
+        actual, auxiliary = program()
+        with torch.no_grad():
+            expected, reference = program.functional.prepare_and_rollout(
+                program.parameters,
+                program.constants,
+                program.initial_state,
+                steps=4,
+                callbacks=program.callbacks,
+            )
+        _close(actual, expected)
+        _close(auxiliary["callbacks"]["custom"], reference["callbacks"]["custom"])
+        assert program.execution_report().strategy == "compiled_while_loop"
+    else:
+        with pytest.raises((ValueError, dn.func.FunctionalizationError), match=match):
+            dn.compile(_passive(batch=()), **options)()
 
 
 @pytest.mark.mps

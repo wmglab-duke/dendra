@@ -84,10 +84,11 @@ update and gradients do not include initialization. Select fresh initialization
 to include that computation. Inference while loops share Population's packed
 carry and recording engine; see {doc}`A25_functional_network_while` for execution,
 recording, and continuation examples. Scan remains the default and supports
-training gradients and custom callbacks.
+training gradients. Both engines accept capture-compatible pure callbacks.
 Apply Population observation callbacks within a Network using
 `PopulationCallback("left", callback)`. LFP, threshold analysis, anomaly
-detection, and scoped Recorders support scan and while execution; see
+detection, scoped Recorders, and custom pure callbacks support scan and
+inference-only while execution; see
 {doc}`A27_functional_network_callbacks`.
 Use a canonical single-device Network with supported dense event queues,
 source-history training, packed-history or sparse-calendar inference, as

@@ -203,14 +203,13 @@ class CompiledPopulationChunk:
     def _model_while_executor(self):
         """Lazily reuse the shared loop with no callback carries or emissions."""
         if self._model_while is None:
-            from ._recorder_while import _RecorderWhileExecutor
+            from ._population_while import _PopulationWhileExecutor
 
-            self._model_while = _RecorderWhileExecutor(
+            self._model_while = _PopulationWhileExecutor(
                 self._functional,
                 steps=self._steps,
                 plans=(),
                 compile_options=self._compile_options,
-                allow_empty_plans=True,
                 stepwise_stimulation=self._lowered._stepwise_stimulation,
             )
         return self._model_while
@@ -601,18 +600,17 @@ class _CompiledCallbackPopulationChunk:
             plans=plans,
             stepwise_stimulation=stepwise_stimulation,
         )
-        self._recorder_while = None
+        self._callback_while = None
         if execution in ("default", "while") and not compile_options.get(
             "disable", False
         ):
-            from ._recorder_while import _RecorderWhileExecutor
+            from ._population_while import _PopulationWhileExecutor
 
-            self._recorder_while = _RecorderWhileExecutor(
+            self._callback_while = _PopulationWhileExecutor(
                 functional,
                 steps=steps,
                 plans=plans,
                 compile_options=compile_options,
-                allow_empty_plans=execution == "while",
                 stepwise_stimulation=stepwise_stimulation,
             )
         if execution == "scan":
@@ -631,16 +629,6 @@ class _CompiledCallbackPopulationChunk:
             )
 
     def _rollout_values(self, parameters, prepared, state, inputs, carries):
-        if self._execution == "while":
-            from ._callbacks import _is_builtin_callback
-
-            if any(
-                not _is_builtin_callback(plan.callback) for plan in self._lowered._plans
-            ):
-                raise FunctionalizationError(
-                    "Population execution='while' supports built-in functional "
-                    "callbacks; use scan for custom callbacks."
-                )
         inputs = _population_inputs(inputs)
         operands = (
             parameters,
@@ -688,13 +676,13 @@ class _CompiledCallbackPopulationChunk:
                     inputs.draws,
                 )
             while_kernel = None
-            if self._recorder_while is not None and not grad_enabled:
-                while_kernel, reason = self._recorder_while.kernel_for(*operands)
+            if self._callback_while is not None and not grad_enabled:
+                while_kernel, reason = self._callback_while.kernel_for(*operands)
             if while_kernel is not None:
                 result = while_kernel(*operands)
                 strategy = "compiled_while_loop"
             else:
-                if self._execution == "while" and self._recorder_while is not None:
+                if self._execution == "while" and self._callback_while is not None:
                     from ._population import _STRUCTURED_ROLLOUT_CHUNK
 
                     if self._steps >= _STRUCTURED_ROLLOUT_CHUNK:

@@ -14,6 +14,30 @@ DT = 0.1
 STEPS = 4
 
 
+# region custom callback
+class VoltageSummary(dn.func.FunctionalCallback):
+    """Accumulate post-step energy and emit one mean voltage per boundary."""
+
+    def initialize(self, state, auxiliary):
+        del auxiliary
+        voltage = state["integrator"]["v"]
+        return voltage.new_zeros(()), voltage.mean()
+
+    def update(self, carry, state, auxiliary):
+        del auxiliary
+        voltage = state["integrator"]["v"]
+        return carry + voltage.square().mean(), voltage.mean()
+
+    def finalize(self, carry, emissions):
+        return {
+            "energy": carry,
+            "mean_voltage": carry.new_empty((0,)) if emissions is None else emissions,
+        }
+
+
+# endregion custom callback
+
+
 def make_network():
     # region network
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, IMEM=True, DTYPE=torch.float64, DEVICE="cpu"):
@@ -73,6 +97,7 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         "anomaly": scoped("right", dn.func.AnomalyDetector()),
         "soma": scoped("left", dn.func.Recorder(("v", "t"), region=network.left.soma)),
         "trace": dn.func.Recorder(("left.v", "left.i_membrane", "t")),
+        "summary": scoped("left", VoltageSummary()),
     }
     # endregion callbacks
     # region compile
@@ -102,9 +127,14 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         for field, values in second["trace"].items()
     }
     soma = torch.cat((first["soma"]["v"], second["soma"]["v"]))
+    mean_voltage = torch.cat(
+        (first["summary"]["mean_voltage"], second["summary"]["mean_voltage"])
+    )
     # endregion continuation
     torch.testing.assert_close(lfp, whole["lfp"])
     torch.testing.assert_close(raster, whole["raster"])
+    torch.testing.assert_close(mean_voltage, whole["summary"]["mean_voltage"])
+    torch.testing.assert_close(second["summary"]["energy"], whole["summary"]["energy"])
     for name in ("counts", "active", "site_quorum", "event_quorum", "anomaly"):
         torch.testing.assert_close(second[name], whole[name])
     for field, values in trace.items():
@@ -131,6 +161,12 @@ def run_demo(*, execution="scan", backend="aot_eager"):
     # This low threshold illustrates callback phase, not physiological spikes.
     assert not raster[:2].any() and raster[2].all() and not raster[3:].any()
     assert not second["anomaly"].any()
+    voltage = trace["left.v"]
+    torch.testing.assert_close(mean_voltage, voltage.flatten(start_dim=1).mean(dim=1))
+    torch.testing.assert_close(
+        second["summary"]["energy"],
+        voltage[1:].square().flatten(start_dim=1).mean(dim=1).sum(),
+    )
     # endregion results
     # region gradients
     current = trace["left.i_membrane"]  # (frames, batch, cells, compartments).
@@ -149,7 +185,13 @@ def run_demo(*, execution="scan", backend="aot_eager"):
     # endregion gradients
     assert network.t.item() == 0.0
     assert final["clock"]["step"].item() == 2 * STEPS
-    return lfp.detach(), raster, second["counts"]
+    return (
+        lfp.detach(),
+        raster,
+        second["counts"],
+        mean_voltage.detach(),
+        second["summary"]["energy"].detach(),
+    )
 
 
 def main():

@@ -190,8 +190,9 @@ Keep schemas stable and implementations deterministic and side-effect-free;
 use explicit tensor carry for evolving values. The
 {doc}`A8_functional_populations` callback section explains the complete contract.
 Use `PopulationCallback("left", callback)` to apply LFP, threshold-analysis,
-anomaly, or local Recorder callbacks to one Population. Scoped built-ins support
-scan and while execution; custom callbacks support scan. Lead-field shapes,
+anomaly, local Recorder, or custom pure callbacks to one Population. Built-in
+and custom callbacks use the same contract in scan and inference-only while.
+Lead-field shapes,
 callback windows, packed components, and a runnable example are described in
 {doc}`A27_functional_network_callbacks`.
 Mutable native callbacks are not run by the functional Network.

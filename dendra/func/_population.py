@@ -18106,13 +18106,13 @@ class FunctionalPopulation:
         original compiler settings.
 
         The default uses a bounded inference loop when available, including
-        built-in functional callbacks. Gradient-enabled or
-        unsupported callback calls retain the unrolled recurrence. Select
+        capture-compatible pure functional callbacks. Gradient-enabled calls
+        and unavailable capture retain the unrolled recurrence. Select
         ``execution="unrolled"`` to require that recurrence in inference too.
         Inspect ``execution_report()`` after a call for its actual dispatch.
 
         ``execution="while"`` explicitly requests the shared inference loop,
-        with supported built-in callbacks or no callbacks. Enabled compiled
+        with capture-compatible pure callbacks or no callbacks. Enabled compiled
         calls require ``torch.no_grad()`` or ``torch.inference_mode()``. Chunks
         of at least four steps raise if their loop cannot be captured; shorter
         chunks and host-run tails use the bounded unrolled path. This does not

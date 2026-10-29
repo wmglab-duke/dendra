@@ -7,7 +7,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from dendra._bootstrap import torch_compiler_warning_context
-from dendra.func import StepInput, _recorder_while
+from dendra.func import StepInput, _population_while
 from dendra.func._callbacks import (
     AnomalyDetector,
     _BoundRecorder,
@@ -179,7 +179,7 @@ def _case(steps=9):
 
 
 def _capture(case, steps, options):
-    executor = _recorder_while._RecorderWhileExecutor(
+    executor = _population_while._PopulationWhileExecutor(
         case.functional, steps=steps, plans=case.plans, compile_options=options
     )
     kernel, reason = executor.kernel_for(
@@ -237,7 +237,7 @@ def _assert_owned(result, inputs):
 def test_authored_transition_does_not_clone_output_state_or_callback_carry(monkeypatch):
     case = _case(4)
     graphs = []
-    original_make_fx = _recorder_while.make_fx
+    original_make_fx = _population_while.make_fx
 
     def capture_graph(function):
         def trace(*arguments):
@@ -247,9 +247,9 @@ def test_authored_transition_does_not_clone_output_state_or_callback_carry(monke
 
         return trace
 
-    monkeypatch.setattr(_recorder_while, "make_fx", capture_graph)
+    monkeypatch.setattr(_population_while, "make_fx", capture_graph)
     monkeypatch.setattr(
-        _recorder_while, "_compile_while", lambda function, _options: function
+        _population_while, "_compile_while", lambda function, _options: function
     )
     _capture(case, 4, {})
     assert len(graphs) == 1

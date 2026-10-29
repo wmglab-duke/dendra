@@ -15,7 +15,7 @@ import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.func._network import FunctionalNetwork
 from dendra.func._population import FunctionalPopulation
-from dendra.func._recorder_while import _RecorderWhileExecutor
+from dendra.func._population_while import _PopulationWhileExecutor
 from tests.func.test_runtime_extra import DT, _field
 from tests.func.test_runtime_extra import _model as _passive
 from tests.func.test_stimulation_rng_sharing import DT as RANDOM_DT
@@ -293,7 +293,7 @@ def _observe_while_boundaries():
         if event == "call":
             if frame.f_code in sampling_codes:
                 samples.append(frame.f_locals.get("steps"))
-            elif frame.f_code is _RecorderWhileExecutor.kernel_for.__code__:
+            elif frame.f_code is _PopulationWhileExecutor.kernel_for.__code__:
                 loops.append(frame.f_locals["self"]._steps)
         if callable(previous):
             previous(frame, event, arg)

@@ -615,7 +615,7 @@ def test_while_rejects_ordinary_training_gradients_and_scan_retains_them():
 
 
 @pytest.mark.parametrize("steps", (1, 4))
-def test_while_rejects_custom_callback_reducers_before_tail_or_loop_dispatch(steps):
+def test_while_custom_callback_reducers_work_for_tail_and_loop_dispatch(steps):
     model = _eval(_mixed_network())
     functional, tensors = dn.func.make_functional_network(model)
     prepared = functional.prepare(tensors.parameters, tensors.constants)
@@ -623,22 +623,34 @@ def test_while_rejects_custom_callback_reducers_before_tail_or_loop_dispatch(ste
         steps, execution="while", backend="aot_eager"
     )
     callbacks = functional.make_callbacks({"energy": _VoltageEnergy()})
-    with (
-        torch.no_grad(),
-        pytest.raises((ValueError, dn.func.FunctionalizationError), match="[Ss]can"),
-    ):
-        chunk(tensors.parameters, prepared, tensors.state, callbacks=callbacks)
-    assert chunk.execution_report() is None
-    with pytest.raises((ValueError, dn.func.FunctionalizationError), match="[Ss]can"):
-        dn.compile(
-            model,
-            dt=DT,
-            steps=steps,
-            execution="while",
-            inference=True,
-            callbacks={"energy": _VoltageEnergy()},
-            backend="aot_eager",
+    with torch.no_grad():
+        actual, auxiliary = chunk(
+            tensors.parameters, prepared, tensors.state, callbacks=callbacks
         )
+        expected, reference = functional.rollout(
+            tensors.parameters,
+            prepared,
+            tensors.state,
+            steps=steps,
+            callbacks=callbacks,
+        )
+    _close(actual, expected)
+    _close(auxiliary["callbacks"]["energy"], reference["callbacks"]["energy"])
+    assert chunk.execution_report().strategy == (
+        "compiled_while_loop" if steps >= 4 else "compiled_unrolled"
+    )
+    runner = dn.compile(
+        model,
+        dt=DT,
+        steps=steps,
+        execution="while",
+        inference=True,
+        callbacks={"energy": _VoltageEnergy()},
+        backend="aot_eager",
+    )
+    observed, result = runner()
+    _close(observed, expected)
+    _close(result["callbacks"]["energy"], reference["callbacks"]["energy"])
 
 
 def test_while_disabled_lower_level_dispatch_is_reported_and_convenience_rejects_it():

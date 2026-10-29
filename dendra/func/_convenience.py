@@ -86,8 +86,8 @@ class CompiledRunner:
     Recording is explicit: use ``callbacks={'trace': dn.func.Recorder(('v',))}``
     to retain voltage at ``aux['callbacks']['trace']['v']``. Omitting callbacks
     or passing an empty mapping records no trajectory. Callback names have no
-    special meaning. Scan accepts pure custom callbacks; while supports the
-    built-in callbacks or execution without callbacks. Omitted callbacks or
+    special meaning. Scan and while accept capture-compatible pure callbacks;
+    while is inference-only. Omitted callbacks or
     an empty mapping produce no recording or callback continuation carry.
 
     Compilation is lazy. Snapshot inference reuses preparation with version
@@ -449,7 +449,7 @@ class CompiledRunner:
             )
             carries = carry.carries
             chunk = self._kernel._runner_callback_chunk(callbacks, steps)
-            executor = chunk._recorder_while
+            executor = chunk._callback_while
         if executor is None:
             raise FunctionalizationError(
                 "execution='while' has no functional callback loop executor"
@@ -760,11 +760,11 @@ def compile(
     Recordings use qualified names such as ``cell.v``, and parameters retain
     shared tensor identities. See
     :class:`CompiledNetworkRunner` for its restart and continuation contract.
-    Network inference supports ``execution='while'`` with qualified Recorders,
-    ``PopulationCallback`` scopes around supported built-ins, or without
-    callbacks; use scan for gradients and custom callbacks.
-    Population while inference also supports built-in callbacks or no
-    callbacks, with a compiled chunk width of at least four steps. Omitted
+    Population and Network inference support ``execution='while'`` with pure
+    callbacks, including custom ``FunctionalCallback`` implementations and
+    Network ``PopulationCallback`` scopes, or without callbacks. Use scan for
+    gradients. Population while inference requires a compiled chunk width of
+    at least four steps. Omitted
     callbacks and empty mappings return no recording or callback carry.
     ``pending_capacity`` configures Network pending-event calendars with one
     positive entry count or a mapping from connection names to counts. Overflow

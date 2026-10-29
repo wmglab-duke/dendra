@@ -237,31 +237,57 @@ def test_scoped_builtin_classification_keeps_lfp_invariant_and_fast_updates():
 
 @pytest.mark.parametrize("steps", (1, 4))
 @pytest.mark.parametrize("disable", (False, True))
-def test_scoped_custom_callbacks_reject_while_before_short_or_disabled_fallback(
-    steps, disable
-):
+def test_scoped_custom_callbacks_keep_short_and_disabled_fallbacks(steps, disable):
+    from tests.func.test_network_population_callbacks import _PopulationEnergy
+
     functional, tensors = _case()
     callbacks = functional.make_callbacks(
-        {"summary": _scoped("right", _ProjectionProbe())}
+        {"summary": _scoped("right", _PopulationEnergy())}
     )
     prepared = functional.prepare(tensors.parameters, tensors.constants)
     chunk = functional.compile_rollout_chunk(
         steps, execution="while", backend="eager", disable=disable
     )
-    with torch.no_grad(), pytest.raises(dn.func.FunctionalizationError, match="custom"):
-        chunk(tensors.parameters, prepared, tensors.state, callbacks=callbacks)
-    assert chunk.execution_report() is None
+    with torch.no_grad():
+        actual, auxiliary = chunk(
+            tensors.parameters, prepared, tensors.state, callbacks=callbacks
+        )
+        expected, reference = functional.rollout(
+            tensors.parameters,
+            prepared,
+            tensors.state,
+            steps=steps,
+            callbacks=callbacks,
+        )
+    _close(actual, expected)
+    _close(auxiliary["callbacks"]["summary"], reference["callbacks"]["summary"])
+    assert chunk.execution_report().strategy == (
+        "eager_disabled"
+        if disable
+        else "compiled_while_loop"
+        if steps >= 4
+        else "compiled_unrolled"
+    )
 
 
-def test_scoped_builtin_subclass_keeps_custom_validation_and_while_policy():
-    functional, _ = _case()
+def test_scoped_builtin_subclass_keeps_custom_validation_in_while_execution():
+    functional, tensors = _case()
     callbacks = functional.make_callbacks(
         {"anomaly": _scoped("left", _CustomAnomaly())}
     )
     assert callbacks._plans[0].validate_updates
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
     chunk = functional.compile_rollout_chunk(4, execution="while", backend="eager")
-    with pytest.raises(dn.func.FunctionalizationError, match="custom"):
-        chunk._validate_while_callbacks(callbacks)
+    with torch.no_grad():
+        actual, auxiliary = chunk(
+            tensors.parameters, prepared, tensors.state, callbacks=callbacks
+        )
+        expected, reference = functional.rollout(
+            tensors.parameters, prepared, tensors.state, steps=4, callbacks=callbacks
+        )
+    _close(actual, expected)
+    _close(auxiliary["callbacks"]["anomaly"], reference["callbacks"]["anomaly"])
+    assert chunk.execution_report().strategy == "compiled_while_loop"
 
 
 @pytest.mark.parametrize(

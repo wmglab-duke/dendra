@@ -46,6 +46,10 @@ class FunctionalCallback(ABC):
     callback objects, perform I/O, consume hidden randomness, call ``.item()``,
     or branch in Python on tensor values. These constraints make callbacks
     safe for autograd, ``torch.func``, compilation, and checkpoint replay.
+    The same implementation supports scan and inference-only while execution
+    when its tensor operations can be captured. Both engines require stable
+    carry and emission schemas; sparse observations use fixed tensors and
+    masks rather than changing the emitted structure between steps.
     """
 
     @abstractmethod
@@ -80,8 +84,8 @@ class PopulationCallback(FunctionalCallback):
     ``population`` is an exact top-level Network Population name. A concatenated
     MultiPopulation is one such owner: use its packed coordinates for threshold
     selections and lead fields, or named Slice regions in a scoped Recorder.
-    Pure custom callbacks support scan; inference while execution supports the
-    same built-ins as Population execution.
+    Pure custom callbacks use the same contract in scan and inference while
+    execution, including this Population scope.
     """
 
     population: str
