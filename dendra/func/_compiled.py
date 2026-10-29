@@ -57,6 +57,13 @@ class CompiledPopulationChunk:
     arbitrary horizons with ``dn.func.run(bound, state_or_continuation, ...)``.
     Direct chunk calls retain the explicit parameters/prepared/state contract
     and return callback carry separately.
+
+    ``execution="while"`` explicitly selects the shared inference loop. Enabled
+    ordinary calls require ``torch.no_grad()`` or ``torch.inference_mode()``;
+    chunks of at least four steps reject unavailable capture, while shorter
+    chunks use the bounded unrolled tail. ``execution="default"`` retains its
+    gradient and fallback behavior. Explicitly disabled compilation and active
+    functional transforms or forward AD retain their eager paths.
     """
 
     def __init__(
@@ -69,8 +76,10 @@ class CompiledPopulationChunk:
         _stepwise_stimulation: bool = False,
         _report_state: _ExecutionReportState | None = None,
     ):
-        if execution not in ("default", "unrolled", "scan"):
-            raise ValueError("execution must be 'default', 'unrolled', or 'scan'")
+        if execution not in ("default", "unrolled", "scan", "while"):
+            raise ValueError(
+                "execution must be 'default', 'unrolled', 'scan', or 'while'"
+            )
         self._execution = execution
         self._capabilities = _capabilities(execution)
         self._report_state = (
@@ -122,7 +131,7 @@ class CompiledPopulationChunk:
                 compile_options=options,
                 stepwise_stimulation=_stepwise_stimulation,
             )
-        elif execution == "default":
+        elif execution in ("default", "while"):
             from ._while_inductor import _compile_while
 
             self._compiled = _compile_while(self._lowered.__call__, options)
@@ -232,12 +241,25 @@ class CompiledPopulationChunk:
             )
             self._record_execution(strategy, grad_enabled=grad_enabled)
             return result
+        if (
+            self._execution == "while"
+            and grad_enabled
+            and not self._compile_options.get("disable", False)
+        ):
+            raise FunctionalizationError(
+                "Population execution='while' is inference-only; use torch.no_grad() "
+                "or scan for gradients."
+            )
         if not self._compile_options.get("disable", False):
             state = _canonicalize_inference_tree(operands.state)
             if state is not operands.state:
                 operands = operands._replace(state=state)
         if (
-            self._model_while_enabled
+            (
+                self._execution == "while"
+                and not self._compile_options.get("disable", False)
+            )
+            or self._model_while_enabled
             or (
                 self._model_while is not None
                 and (
@@ -276,7 +298,7 @@ class CompiledPopulationChunk:
                 )
                 self._record_execution("compiled_while_loop", grad_enabled=False)
                 return final, auxiliary
-            if self._model_while_enabled:
+            if self._execution == "while" or self._model_while_enabled:
                 from ._population import _STRUCTURED_ROLLOUT_CHUNK
 
                 if self._steps >= _STRUCTURED_ROLLOUT_CHUNK:
@@ -309,6 +331,11 @@ class CompiledPopulationChunk:
             return "compiled_scan", None
         if self._execution == "unrolled":
             return "compiled_unrolled", "Unrolled execution was explicitly selected."
+        if self._execution == "while":
+            return (
+                "compiled_unrolled",
+                "The chunk is shorter than one inference loop block.",
+            )
         if grad_enabled:
             return (
                 "compiled_unrolled",
@@ -575,7 +602,9 @@ class _CompiledCallbackPopulationChunk:
             stepwise_stimulation=stepwise_stimulation,
         )
         self._recorder_while = None
-        if execution == "default" and not compile_options.get("disable", False):
+        if execution in ("default", "while") and not compile_options.get(
+            "disable", False
+        ):
             from ._recorder_while import _RecorderWhileExecutor
 
             self._recorder_while = _RecorderWhileExecutor(
@@ -583,6 +612,7 @@ class _CompiledCallbackPopulationChunk:
                 steps=steps,
                 plans=plans,
                 compile_options=compile_options,
+                allow_empty_plans=execution == "while",
                 stepwise_stimulation=stepwise_stimulation,
             )
         if execution == "scan":
@@ -601,6 +631,16 @@ class _CompiledCallbackPopulationChunk:
             )
 
     def _rollout_values(self, parameters, prepared, state, inputs, carries):
+        if self._execution == "while":
+            from ._callbacks import _is_builtin_callback
+
+            if any(
+                not _is_builtin_callback(plan.callback) for plan in self._lowered._plans
+            ):
+                raise FunctionalizationError(
+                    "Population execution='while' supports built-in functional "
+                    "callbacks; use scan for custom callbacks."
+                )
         inputs = _population_inputs(inputs)
         operands = (
             parameters,
@@ -625,6 +665,15 @@ class _CompiledCallbackPopulationChunk:
                 else "eager_forward_ad_fallback"
             )
         else:
+            if (
+                self._execution == "while"
+                and grad_enabled
+                and not self._compile_options.get("disable", False)
+            ):
+                raise FunctionalizationError(
+                    "Population execution='while' is inference-only; use torch.no_grad() "
+                    "or scan for gradients."
+                )
             if not self._compile_options.get("disable", False):
                 state, carries = _canonicalize_inference_tree((state, carries))
                 operands = (
@@ -645,6 +694,13 @@ class _CompiledCallbackPopulationChunk:
                 result = while_kernel(*operands)
                 strategy = "compiled_while_loop"
             else:
+                if self._execution == "while" and self._recorder_while is not None:
+                    from ._population import _STRUCTURED_ROLLOUT_CHUNK
+
+                    if self._steps >= _STRUCTURED_ROLLOUT_CHUNK:
+                        raise FunctionalizationError(
+                            f"execution='while' is unavailable: {reason}"
+                        )
                 result = self._compiled(*operands)
                 if self._compile_options.get("disable", False):
                     strategy = "eager_disabled"

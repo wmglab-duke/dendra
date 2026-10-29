@@ -2865,6 +2865,38 @@ unrolled fallback, but compilation cost and graph size grow with the rollout.
 ``compile_rollout_chunk`` performs this prewarm automatically on its first
 ordinary no-gradient call.
 
+Explicit while inference
+~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use ``execution="while"`` to request the shared inference loop explicitly on
+a Population or Network compiled chunk:
+
+.. code-block:: python
+
+   kernel = fmodel.compile_rollout_chunk(100, execution="while")
+   bound = kernel.bind(tensors)
+   with torch.no_grad():
+       final_state, auxiliary = dn.func.run(bound, tensors.state, steps=203)
+       continued_state, continued = dn.func.run(
+           bound, auxiliary["continuation"], steps=100,
+       )
+
+Callbacks are optional. Supply the same supported built-in collection through
+``callbacks=`` when recording or reducing states. Enabled compiled calls require
+``torch.no_grad()`` or ``torch.inference_mode()``. For Population widths of at
+least four steps, unavailable loop capture raises instead of silently selecting
+unrolled execution. Raw widths and host-run tails of one, two or three steps
+use the bounded unrolled path. Reports describe the most recent kernel
+dispatch, including a shorter tail. The ``dn.compile`` Population runner keeps
+its minimum-four regular width.
+
+The default Population selector retains its conditional inference loop and
+ordinary first-order training behavior. Selecting explicit while on a raw
+kernel does not change other kernels or the kernel exposed by an existing
+``dn.compile`` runner. ``disable=True`` retains eager diagnostic execution.
+Active ``torch.func`` transforms and forward AD retain the eager fallback
+described below; those calls do not receive compiled while acceleration.
+
 Built-in callbacks in compiled inference
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -2914,8 +2946,9 @@ ordinary compiled recurrence even under ``torch.no_grad()`` and applies to
 both recorded and final-state-only runs; it does not change the numerical
 model, recording contract, or gradient availability.
 
-Grad-enabled calls, direct forward-mode AD, and calls inside an active
-``torch.func`` transform retain the differentiable unrolled path. Compile and
+With the default selector, grad-enabled calls, direct forward-mode AD, and
+calls inside an active ``torch.func`` transform retain the differentiable
+unrolled path. Compile and
 first call an inference workload inside the same no-gradient context. A
 different time-axis length may create another PyTorch specialization, but each
 prewarmed structured graph retains the bounded loop body.

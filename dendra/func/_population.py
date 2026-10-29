@@ -18086,9 +18086,9 @@ class FunctionalPopulation:
         """Create a freshness-checked fixed-length compiled rollout.
 
         Preparation remains outside the compiled boundary and can therefore be
-        reused across calls. Grad-enabled calls compose through ordinary
-        autograd, allowing a Python loop over this callable to build exact BPTT
-        without statically compiling the complete time horizon.
+        reused across calls. The default, scan and unrolled modes support
+        ordinary autograd, allowing a Python loop over this callable to build
+        exact BPTT without statically compiling the complete time horizon.
 
         ``execution="scan"`` opts into a horizon-independent loop graph on
         PyTorch 2.14 or newer. Dendra qualifies the compiler's correctness
@@ -18110,6 +18110,15 @@ class FunctionalPopulation:
         unsupported callback calls retain the unrolled recurrence. Select
         ``execution="unrolled"`` to require that recurrence in inference too.
         Inspect ``execution_report()`` after a call for its actual dispatch.
+
+        ``execution="while"`` explicitly requests the shared inference loop,
+        with supported built-in callbacks or no callbacks. Enabled compiled
+        calls require ``torch.no_grad()`` or ``torch.inference_mode()``. Chunks
+        of at least four steps raise if their loop cannot be captured; shorter
+        chunks and host-run tails use the bounded unrolled path. This does not
+        change the default mode's gradient or automatic fallback behavior.
+        ``disable=True`` retains eager diagnostic execution, and active
+        ``torch.func`` transforms or forward AD retain their eager fallback.
         """
         from ._compiled import CompiledPopulationChunk
 

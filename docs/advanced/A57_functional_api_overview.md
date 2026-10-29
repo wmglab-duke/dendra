@@ -717,6 +717,23 @@ while inference; Networks also support short main chunks. Requested unsupported
 while execution raises rather than silently choosing another strategy for the
 main chunk. Shorter tails retain their bounded dispatch rules.
 
+Raw Population and Network chunks also accept `execution="while"`:
+
+```python
+kernel = functional.compile_rollout_chunk(128, execution="while")
+bound = kernel.bind(tensors)
+with torch.no_grad():
+    state, auxiliary = dn.func.run(bound, tensors.state, steps=1000)
+```
+
+For Populations, explicit while chunks use the shared inference engine and
+reject unavailable capture for widths of at least four steps. Raw widths and
+host tails of one to three steps use a bounded unrolled path. The Population
+default selector retains automatic inference selection and first-order
+training; selecting explicit while does not alter other kernels or a
+`dn.compile` runner's exposed kernel. `disable=True` retains eager diagnostic
+execution, and active transforms retain the eager fallback described below.
+
 `vmap`, forward-mode AD and higher-order differentiation have a different
 execution contract from ordinary first-order compiled training. Supported
 transforms can execute through the eager pure path or its fallback; a compiled

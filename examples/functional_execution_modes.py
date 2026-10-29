@@ -118,8 +118,9 @@ def eager_example(functional, tensors, inputs, initial, parameters, voltage, los
 def inference_example(
     functional, tensors, inputs, initial, parameters, voltage, backend
 ):
-    # The convenience wrapper automatically prewarms eligible inference loops.
-    kernel = functional.compile_rollout_chunk(STEPS, backend=backend)
+    # Explicit while selection requires captured inference for regular chunks.
+    # The default selector also supports training and automatic fallback.
+    kernel = functional.compile_rollout_chunk(STEPS, execution="while", backend=backend)
     with torch.no_grad():
         local_parameters = parameters(initial)
         prepared = functional.prepare(local_parameters, tensors.constants)
@@ -127,6 +128,8 @@ def inference_example(
         final, _ = bound(tensors.state, inputs)
         check(final["integrator"]["v"], voltage(initial))
         assert not final["integrator"]["v"].requires_grad
+        assert kernel.execution_report().requested_execution == "while"
+        assert kernel.execution_report().strategy == "compiled_while_loop"
 
         # Alternative: include preparation in the user-owned compiled function.
         # Prewarm before entering that boundary; this example has only ve input.
