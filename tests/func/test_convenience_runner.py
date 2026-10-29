@@ -395,8 +395,6 @@ def test_bound_stimulation_is_included_and_amplitude_can_be_trainable(
 @pytest.mark.parametrize(
     "kwargs,match",
     [
-        ({"execution": "while", "callbacks": None}, "callback"),
-        ({"execution": "while", "callbacks": {}}, "callback"),
         ({"execution": "while", "steps": 3}, "4|four"),
         ({"execution": "while", "inference": False}, "inference"),
         ({"execution": "unrolled"}, "execution"),

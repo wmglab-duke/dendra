@@ -101,7 +101,8 @@ class CompiledPopulationChunk:
         # Lowerers retain its static entries, never the collection used here as
         # the weak key, so dropping that collection also releases its kernels.
         self._callback_chunks = weakref.WeakKeyDictionary()
-        self._noise_while = None
+        self._model_while = None
+        self._model_while_enabled = False
         if (
             execution == "default"
             and (
@@ -110,16 +111,7 @@ class CompiledPopulationChunk:
             )
             and not options.get("disable", False)
         ):
-            from ._recorder_while import _RecorderWhileExecutor
-
-            self._noise_while = _RecorderWhileExecutor(
-                functional,
-                steps=steps,
-                plans=(),
-                compile_options=options,
-                allow_empty_plans=True,
-                stepwise_stimulation=_stepwise_stimulation,
-            )
+            self._model_while_executor()
 
         if execution == "scan":
             from ._scan import _CompiledScanPopulationChunk
@@ -194,7 +186,31 @@ class CompiledPopulationChunk:
                 _stepwise_stimulation=stepwise_stimulation,
                 _report_state=self._report_state,
             )
-        return self._runner_chunks[steps]
+        chunk = self._runner_chunks[steps]
+        if self._model_while_enabled:
+            chunk._enable_model_while()
+        return chunk
+
+    def _model_while_executor(self):
+        """Lazily reuse the shared loop with no callback carries or emissions."""
+        if self._model_while is None:
+            from ._recorder_while import _RecorderWhileExecutor
+
+            self._model_while = _RecorderWhileExecutor(
+                self._functional,
+                steps=self._steps,
+                plans=(),
+                compile_options=self._compile_options,
+                allow_empty_plans=True,
+                stepwise_stimulation=self._lowered._stepwise_stimulation,
+            )
+        return self._model_while
+
+    def _enable_model_while(self):
+        """Publish successful host preflight to this wrapper's cached family."""
+        self._model_while_enabled = True
+        for chunk in self._runner_chunks.values():
+            chunk._enable_model_while()
 
     def _execute_operands(self, operands, *, prewarm_structured: bool):
         """Execute validated tensor operands through the owned kernel."""
@@ -221,15 +237,21 @@ class CompiledPopulationChunk:
             if state is not operands.state:
                 operands = operands._replace(state=state)
         if (
-            self._noise_while is not None
-            and (
-                operands.noise is not None
-                or operands.stimulation is not None
-                or operands.draws is not None
+            self._model_while_enabled
+            or (
+                self._model_while is not None
+                and (
+                    self._functional._noise_plan is not None
+                    or getattr(self._functional, "_poisson_plan", None) is not None
+                )
+                and (
+                    operands.noise is not None
+                    or operands.stimulation is not None
+                    or operands.draws is not None
+                )
             )
-            and not grad_enabled
-        ):
-            kernel, reason = self._noise_while.kernel_for(
+        ) and not grad_enabled:
+            kernel, reason = self._model_while_executor().kernel_for(
                 operands.parameters,
                 operands.prepared,
                 operands.state,
@@ -254,6 +276,13 @@ class CompiledPopulationChunk:
                 )
                 self._record_execution("compiled_while_loop", grad_enabled=False)
                 return final, auxiliary
+            if self._model_while_enabled:
+                from ._population import _STRUCTURED_ROLLOUT_CHUNK
+
+                if self._steps >= _STRUCTURED_ROLLOUT_CHUNK:
+                    raise FunctionalizationError(
+                        f"execution='while' is unavailable: {reason}"
+                    )
         if (
             self._execution == "default"
             and operands.noise is None

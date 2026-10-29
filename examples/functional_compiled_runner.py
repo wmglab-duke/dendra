@@ -18,6 +18,8 @@ includes compilation; reuse the runner for warm execution. ``--backend
 aot_eager`` exercises capture without native kernel generation. Both modes use
 Dendra's PyTorch 2.14+ baseline and compiler-contract checks. This is a usage example,
 not a performance benchmark or a convergence demonstration.
+Inference also compares the recorded run with final-state execution that omits
+callbacks, including explicit continuation, for either execution mode.
 """
 
 from __future__ import annotations
@@ -159,6 +161,31 @@ def main():
         print(
             f"recorded {voltage.shape[0]} voltage frames; explicit continuation succeeded"
         )
+
+        # region unrecorded
+        unrecorded_runner = dn.compile(
+            model,
+            dt=0.01,
+            steps=8,
+            chunk_steps=args.chunk_steps,
+            extra=extra,
+            execution=args.execution,
+            initialization=args.initialization,
+            backend=args.backend,
+        )
+        unrecorded, unrecorded_aux = unrecorded_runner()
+        torch.testing.assert_close(unrecorded, final)
+        assert "callbacks" not in unrecorded_aux
+        assert unrecorded_aux["continuation"].callback_state is None
+        assert unrecorded_runner.execution_report().callbacks is False
+        unrecorded_continued, resumed_aux = unrecorded_runner(
+            unrecorded_aux["continuation"]
+        )
+        torch.testing.assert_close(unrecorded_continued, continued)
+        assert "callbacks" not in resumed_aux
+        assert resumed_aux["continuation"].callback_state is None
+        # endregion unrecorded
+        print("unrecorded inference and continuation match the recorded states")
 
     torch.testing.assert_close(model.v, original_voltage)
     print(f"steps per call: 8; compiled chunk width: {runner.kernel.steps}")

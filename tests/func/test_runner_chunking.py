@@ -357,10 +357,11 @@ def test_population_while_keeps_minimum_chunk_and_callback_admission():
                 callbacks=_callbacks(False),
                 backend="eager",
             )
-    with pytest.raises(ValueError, match="nonempty callbacks"):
-        dn.compile(
-            model, dt=DT, steps=9, chunk_steps=4, execution="while", backend="eager"
-        )
+    callback_free = dn.compile(
+        model, dt=DT, steps=9, chunk_steps=4, execution="while", backend="eager"
+    )
+    assert callback_free.callbacks is None
+    assert callback_free.kernel.steps == 4
 
 
 def test_network_short_callback_free_while_chunks_keep_the_full_horizon():

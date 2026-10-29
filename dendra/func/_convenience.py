@@ -87,7 +87,8 @@ class CompiledRunner:
     to retain voltage at ``aux['callbacks']['trace']['v']``. Omitting callbacks
     or passing an empty mapping records no trajectory. Callback names have no
     special meaning. Scan accepts pure custom callbacks; while supports the
-    built-in callbacks and requires a nonempty mapping.
+    built-in callbacks or execution without callbacks. Omitted callbacks or
+    an empty mapping produce no recording or callback continuation carry.
 
     Compilation is lazy. Snapshot inference reuses preparation with version
     checks; fresh initialization, training, and explicit parameter overrides
@@ -177,10 +178,6 @@ class CompiledRunner:
             if not inference:
                 raise ValueError(
                     "execution='while' is inference-only; use scan for gradients"
-                )
-            if not configured_callbacks:
-                raise ValueError(
-                    "execution='while' requires a nonempty callbacks mapping"
                 )
             if steps < 4:
                 raise ValueError("execution='while' requires at least four steps")
@@ -387,6 +384,8 @@ class CompiledRunner:
 
     def _require_while(self, parameters, prepared, state, inputs, callback_state):
         """Fail before a rejected structured loop could compile an unrolled horizon."""
+        if self._callbacks is None and callback_state is not None:
+            raise ValueError("callback_state requires callbacks")
         functional = self._functional
         functional._validate_state(state)
         values = functional._validate_prepared(prepared, parameters)
@@ -438,13 +437,19 @@ class CompiledRunner:
             values = functional._validate_prepared(prepared, parameters)
         ve, intra, _ = functional._resolve_rollout_inputs(inputs, steps)
         callbacks = self._callbacks
-        carry = (
-            callbacks._initialize(state)[0]
-            if callback_state is None
-            else callbacks._validate_state(callback_state)
-        )
-        chunk = self._kernel._runner_callback_chunk(callbacks, steps)
-        executor = chunk._recorder_while
+        if callbacks is None:
+            carries = ()
+            chunk = self._kernel._runner_chunk(steps)
+            executor = chunk._model_while_executor()
+        else:
+            carry = (
+                callbacks._initialize(state)[0]
+                if callback_state is None
+                else callbacks._validate_state(callback_state)
+            )
+            carries = carry.carries
+            chunk = self._kernel._runner_callback_chunk(callbacks, steps)
+            executor = chunk._recorder_while
         if executor is None:
             raise FunctionalizationError(
                 "execution='while' has no functional callback loop executor"
@@ -455,13 +460,15 @@ class CompiledRunner:
             state,
             ve,
             intra,
-            carry.carries,
+            carries,
             None if inputs is None else inputs.noise,
             None if inputs is None else inputs.stimulation,
             None if inputs is None else inputs.draws,
         )
         if kernel is None:
             raise FunctionalizationError(f"execution='while' is unavailable: {reason}")
+        if callbacks is None:
+            self._kernel._enable_model_while()
 
     def __call__(
         self,
@@ -756,6 +763,9 @@ def compile(
     Network inference supports ``execution='while'`` with qualified Recorders,
     ``PopulationCallback`` scopes around supported built-ins, or without
     callbacks; use scan for gradients and custom callbacks.
+    Population while inference also supports built-in callbacks or no
+    callbacks, with a compiled chunk width of at least four steps. Omitted
+    callbacks and empty mappings return no recording or callback carry.
     ``pending_capacity`` configures Network pending-event calendars with one
     positive entry count or a mapping from connection names to counts. Overflow
     raises before a result is returned; increase capacity and retry from a valid

@@ -126,6 +126,12 @@ The complete example checks restart, recording and shared continuation:
 The separate simulation-state and `callback_state=` form remains available
 when an application manages those operands individually.
 
+For final-state inference, omit `callbacks` or pass `callbacks={}` with scan or
+while execution. This works for both Populations and Networks. The auxiliary
+mapping has no `"callbacks"` entry, its continuation has `callback_state=None`,
+and `execution_report().callbacks` is `False`. Resume the continuation in the
+same way as a recorded run; no recording or callback carry is allocated.
+
 Network Recorders qualify physical fields, such as `left.v`, `right.v` and
 `right.mech.event.g`. `t` selects the Network clock. `region=some_slice` selects
 a named Population or compartment region, including a labeled region of a
@@ -706,10 +712,10 @@ its initial boundary sample. Native state is published only through an explicit
 and compiled unrolled chunks. `execution="while"` is inference-only and supports
 its defined built-in callbacks, including supported Population scopes in a
 Network; custom callbacks use scan. Population while runners require a compiled
-chunk width of at least four steps and a nonempty supported callback collection.
-Network while runners also support callback-free execution and short tails.
-Requested unsupported while execution raises rather than silently choosing
-another strategy.
+chunk width of at least four steps. Both kinds of runner support callback-free
+while inference; Networks also support short main chunks. Requested unsupported
+while execution raises rather than silently choosing another strategy for the
+main chunk. Shorter tails retain their bounded dispatch rules.
 
 `vmap`, forward-mode AD and higher-order differentiation have a different
 execution contract from ordinary first-order compiled training. Supported

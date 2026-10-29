@@ -89,10 +89,26 @@ The mapping accepts ``dn.func.FunctionalCallback`` configurations, not mutable
 ``"trace"`` are user-defined and have no special meaning. Threshold-only reducers
 need no voltage trajectory, so the example above allocates no full-trace
 storage. Omitting ``callbacks`` or passing ``callbacks={}`` selects no callbacks;
-this is supported by scan. The Population convenience runner's while execution
-requires a nonempty supported callback collection. The Network convenience
-runner also supports callback-free while execution; see
-:doc:`A25_functional_network_while`.
+this is supported by scan and inference while execution for both Populations
+and Networks. For final-state inference without a trajectory:
+
+.. code-block:: python
+
+   unrecorded = dn.compile(
+       model, dt=0.025, steps=800, chunk_steps=128, execution="while",
+   )
+   final_state, auxiliary = unrecorded()
+   assert "callbacks" not in auxiliary
+   assert auxiliary["continuation"].callback_state is None
+   assert unrecorded.execution_report().callbacks is False
+
+Continue with ``unrecorded(auxiliary["continuation"])`` using the same state and
+source ownership as a recorded run. No callback carry or recording is created.
+The complete
+:download:`functional_compiled_runner.py <../../examples/functional_compiled_runner.py>`
+example compares recorded and
+unrecorded inference states and continuation in both execution modes. See
+:doc:`A25_functional_network_while` for Network examples.
 
 Choose ``execution="while"`` for the inference-only ``torch.while_loop``
 path. Both modes default to ``inference=True``: the runner manages
@@ -104,13 +120,12 @@ over the default C++ wrapper choice.
 Scan and while execution use Dendra's PyTorch 2.14+ baseline; supported features
 are not selected by patch-version number. The Population convenience runner's
 while execution requires a compiled chunk width of at least four steps,
-a nonempty collection of supported built-in callbacks, and a capturable
-inference step.
+a capturable inference step, and supported built-ins when callbacks are supplied.
 Supported built-ins are ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``, ``APCount``,
 ``Active``, ``ActiveAL``, and ``ActiveALCount``; scan also accepts pure custom
 functional callbacks. An unsupported while request raises an error
-instead of falling back to an unrolled simulation; it does not silently compile a
-different execution strategy.
+instead of falling back to an unrolled simulation for the requested main
+chunk. Shorter final tails retain their bounded dispatch rules.
 
 State stays explicit. By default, every ``runner()`` starts from the captured
 ``runner.initial_state`` snapshot; the runner never advances or commits state
