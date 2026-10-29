@@ -93,6 +93,17 @@ and constants, while parameter-invariant connection histories use current
 connection values. Cache packets and explicit continuation are described in
 :doc:`../advanced/A29_functional_network_cache_initialization`.
 
+For explicitly lowered execution, ``dn.func.initialize(functional, tensors)``
+accepts a ``NetworkTensors`` bundle and defaults to
+``functional.initialization_inputs``. Supply an explicit
+``NetworkInitializationInput`` through ``initialization=`` when needed.
+The host facade preserves native initialization/cache ordering and samples
+missing draws from explicit RNG carry. It returns a ``Continuation`` with
+effective sources and no callback carry, without running an accepted timestep
+or changing the native Network. Bind the returned sources, then pass its packet
+to ``dn.func.run`` with the intended callback collection. The same facade
+supports Population bundles; see :ref:`functional-explicit-initialization`.
+
 Each successful convenience-runner call publishes an in-memory
 ``dn.func.Continuation`` at ``auxiliary["continuation"]``. Pass that packet as
 the next call's state argument to retain complete Network state, effective

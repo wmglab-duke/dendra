@@ -188,6 +188,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "compile",
         "export_continuation",
         "inspect_sources",
+        "initialize",
         "longrun",
         "longrun_checkpointed",
         "make_functional",

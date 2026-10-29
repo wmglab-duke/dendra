@@ -417,6 +417,66 @@ compile-time bound stimulation. See {ref}`functional-runtime-extra`.
 
 ## Initialization and saved continuation
 
+(functional-explicit-initialization)=
+### Initialize explicit sources
+
+`dn.func.initialize` initializes a lowered Population or Network from its
+matching tensor bundle and returns a `dn.func.Continuation`:
+
+```python
+functional, tensors = dn.func.make_functional(model, dt=DT)
+initial = dn.func.initialize(functional, tensors)
+callbacks = functional.make_callbacks({"trace": dn.func.Recorder(("v", "t"))})
+bound = functional.bind(initial.parameters, constants=initial.constants)
+state, auxiliary = dn.func.run(bound, initial, steps=100, callbacks=callbacks)
+```
+
+For a Network, use qualified Recorder paths such as `"left.v"`. Bind the
+returned parameter and constant objects: initialization transforms and caches
+can replace the incoming sources. Their effective identities, aliases and
+gradients travel with the returned state. The packet has `callback_state=None`;
+the first `run` initializes the supplied callbacks once, including their
+initial boundary sample. Subsequent calls with `auxiliary["continuation"]`
+continue without reinitializing the model or repeating that sample.
+
+The default initialization recipe is `tensors.initialization` for a
+`PopulationTensors` bundle and `functional.initialization_inputs` for a
+`NetworkTensors` bundle. Supply the corresponding existing
+`InitializationInput` or `NetworkInitializationInput` through
+`initialization=` to override it. The bundle's state supplies explicit incoming
+carry; each model's existing initialization rules determine its resulting clock
+and histories. No accepted timestep is executed, and the native model and its
+RNG are unchanged.
+
+This host operation samples missing stochastic initialization packets from
+explicit RNG carry in native order. Explicit draw fields are replayed. In
+particular, draws retained in an initialized `PopulationTensors.initialization`
+are kept when that bundle is supplied again. Clear the intended draw fields
+explicitly when host sampling should supply them. Runtime `draws=` tapes remain
+separate arguments to `run`. Steady-state caches keep their native precedence
+and detached warmup semantics.
+
+Initialization follows ambient gradient mode. With gradients enabled, derived
+state and effective sources retain their parameter and initialization-input
+connections. Inference-mode calls produce ordinary Tensor results without
+constructing a training graph. Call `dn.func.initialize` outside
+`torch.compile`, `torch.func` and forward AD. The existing pure
+`functional.initialize(...)` methods and their model-specific typed results
+remain available for transformed code with explicit initialization draws.
+
+The complete
+{download}`functional_explicit_initialization.py <../../examples/functional_explicit_initialization.py>`
+example supplies a raw parameter override and a registered pre-initialization
+transform for both model kinds. It checks effective shared aliases, live
+initialization gradients, portable continuation and suffix optimization leaves:
+
+```console
+python examples/functional_explicit_initialization.py
+python examples/functional_explicit_initialization.py --backend aot_eager
+```
+
+### Fresh starts with a convenience runner
+
 Choose `initialization="fresh"` when no-state calls should initialize from the
 current parameters, rather than restart a captured state. Edit
 `runner.initialization_inputs` or supply `initialization=...` for a fresh call.

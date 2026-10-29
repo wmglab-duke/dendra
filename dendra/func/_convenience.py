@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from contextlib import nullcontext
 from types import MappingProxyType
 
@@ -13,6 +12,7 @@ from ._binding import BoundPopulation
 from ._compiled import CompiledPopulationChunk
 from ._continuation import _complete_continuation, _resolve_continuation
 from ._draws import _with_runtime_draws
+from ._initialization import _initialization_input_mapping, _initialize_host
 from ._inputs import _population_inputs
 from ._parameter_queries import matching_names
 from ._parameter_queries import parameter_name as _parameter_name
@@ -40,7 +40,7 @@ from ._runtime_extra import (
     VarInput,
     _runtime_extra_chunk_steps,
 )
-from ._types import FunctionalizationError, InitializationInput
+from ._types import FunctionalizationError
 
 _OWNED_PREPARE = FunctionalPopulation.prepare
 _OWNED_BIND = CompiledPopulationChunk.bind
@@ -49,24 +49,6 @@ _OWNED_NOISE_TAPE = FunctionalPopulation.sample_noise_draw_tape
 _OWNED_STIMULATION_TAPE = FunctionalPopulation.sample_stimulation_draw_tape
 _OWNED_MISSING_DRAWS = FunctionalPopulation._sample_missing_runtime_draws
 _OWNED_RUNTIME_DRAW_SAMPLER = FunctionalPopulation.sample_runtime_draws
-
-
-def _initialization_input_mapping(inputs):
-    """Snapshot external mappings without severing differentiable leaves."""
-    if not isinstance(inputs, InitializationInput):
-        raise TypeError("initialization must be an InitializationInput")
-    mappings = []
-    for name, values in (
-        ("states", inputs.states),
-        ("transforms", inputs.transforms),
-        ("cache", inputs.cache),
-    ):
-        if values is not None and not isinstance(values, Mapping):
-            raise TypeError(f"initialization {name} must be a mapping")
-        mappings.append(None if values is None else dict(values))
-    return InitializationInput(
-        inputs.v_init, *mappings, inputs.random_draw, inputs.stimulation
-    )
 
 
 def _initialization_writes_parameters(functional):
@@ -549,11 +531,12 @@ class CompiledRunner:
                 torch.inference_mode(False),
                 torch.set_grad_enabled(initialization_grad),
             ):
-                initialized = self._functional.initialize_host(
+                initialized = _initialize_host(
+                    self._functional,
                     selected_parameters,
                     selected_constants,
+                    selected_state,
                     selected_initialization,
-                    state=selected_state,
                 )
             selected_state = initialized.state
             selected_parameters = initialized.parameters

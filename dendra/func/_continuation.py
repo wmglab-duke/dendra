@@ -38,6 +38,10 @@ class Continuation:
     match the binding's sources. Different sources require an explicit new raw
     binding. Prepared Population bindings retain explicit state/carry calls.
 
+    ``dn.func.initialize(functional, tensors)`` returns the same packet with
+    effective initialized sources and no callback carry. Bind its sources and
+    pass callbacks to the first run to begin fresh recording and reductions.
+
     Fields cannot be reassigned. Ordinary containers are independent snapshots
     and remain editable, like explicit simulation state. Tensor objects, views,
     aliases and autograd history are retained without cloning or detachment.

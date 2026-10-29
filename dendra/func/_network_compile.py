@@ -13,6 +13,7 @@ from dendra.models.core import _validate_time_scalar
 
 from ._continuation import _complete_continuation, _resolve_continuation
 from ._draws import _normalize_runtime_draws
+from ._initialization import _initialize_host
 from ._lowering import _lower_network
 from ._network_bindings import _map_containers
 from ._network_initialization import NetworkInitializationInput
@@ -466,7 +467,8 @@ class CompiledNetworkRunner:
                     torch.inference_mode(False),
                     torch.set_grad_enabled(initialization_grad),
                 ):
-                    initialized = self._functional._initialize_host(
+                    initialized = _initialize_host(
+                        self._functional,
                         selected_parameters,
                         selected_constants,
                         selected_state,

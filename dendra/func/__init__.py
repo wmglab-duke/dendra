@@ -28,6 +28,7 @@ from ._continuous import (
 from ._convenience import CompiledRunner, compile
 from ._draws import RuntimeDraws
 from ._execution import ExecutionCapabilities, ExecutionReport
+from ._initialization import initialize
 from ._inputs import Inputs
 from ._lowering import make_functional
 from ._netcon import FunctionalNetCon, NetConTensors, make_functional_netcon
@@ -121,6 +122,7 @@ __all__ = [
     "compile",
     "export_continuation",
     "inspect_sources",
+    "initialize",
     "longrun",
     "longrun_checkpointed",
     "make_functional",

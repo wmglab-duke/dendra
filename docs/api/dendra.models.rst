@@ -23,6 +23,22 @@ binding flow and the compatible ``make_functional_network`` form.
 
 .. autofunction:: dendra.func.make_functional
 
+``dn.func.initialize(functional, tensors, initialization=...)`` initializes the
+matching ``PopulationTensors`` or ``NetworkTensors`` bundle and returns a shared
+``Continuation``. Bind its effective ``parameters`` and ``constants`` before
+calling ``dn.func.run``. The default recipe is ``tensors.initialization`` for a
+Population and ``functional.initialization_inputs`` for a Network. Explicit
+draw packets are replayed; missing packets are sampled from explicit RNG carry
+in native order. No accepted timestep runs, and the native model is unchanged.
+The returned callback carry is ``None``; callbacks initialize on the first run.
+This host entry point follows ambient gradient mode and runs outside
+``torch.compile``, ``torch.func`` and forward AD. The existing pure plan methods
+and typed initialization results remain available. See
+:ref:`functional-explicit-initialization` for ownership, caches, stochastic
+replay and complete examples.
+
+.. autofunction:: dendra.func.initialize
+
 ``dn.compile(Population)`` returns independent parameter leaves selectable by
 exact/unique partial names, glob patterns, or explicit regex selectors. Use
 ``find_parameters`` to preview matches and ``trainable_parameters`` to inspect

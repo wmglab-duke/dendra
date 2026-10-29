@@ -63,6 +63,17 @@ directly to the next call. Portable export is a separate operation with an
 explicit autograd boundary. Save the result of `export_continuation`, rather
 than pickling the in-memory `Continuation` object.
 
+`dn.func.initialize(functional, tensors)` supplies a fresh initialized packet
+for explicit execution; see {ref}`functional-explicit-initialization`. Its
+callback carry is `None`. Export that initial boundary without `callbacks=`,
+or first run with the intended callbacks and export the returned continuation
+with that collection. Restore resumes the saved initialization and does not
+reapply initialization transforms or resample its selected realization. The
+complete
+{download}`functional_explicit_initialization.py <../../examples/functional_explicit_initialization.py>`
+example checks initialization gradients before this boundary and trainable
+effective sources after restoration.
+
 The complete inference
 {download}`functional_callback_checkpoints.py <../../examples/functional_callback_checkpoints.py>`
 example writes actual temporary checkpoint files and reconstructs both a

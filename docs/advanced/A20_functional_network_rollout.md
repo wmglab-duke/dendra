@@ -45,6 +45,18 @@ modes. Configure training, differentiability, and the timestep before lowering.
 The supplied `dt` must match the initialized Network timestep. The compatible
 `make_functional_network(network, ...)` form uses that timestep implicitly.
 
+For a fresh initialized boundary from explicit sources, call
+`initial = dn.func.initialize(plan, tensors)`, where `tensors` is the
+`NetworkTensors` bundle returned by lowering. Bind `initial.parameters` and
+`initial.constants`, then supply `initial` to `dn.func.run`. The default recipe
+is `plan.initialization_inputs`; `initialization=` accepts an explicit
+`NetworkInitializationInput`. The host initializer samples missing draw packets
+from explicit RNG carry, preserves native Population/cache/connection ordering
+and returns no callback carry. The first run initializes its callbacks once.
+The native Network is unchanged and no accepted timestep is executed. See
+{ref}`functional-explicit-initialization` for the shared Population/Network
+contract, pure initialization methods and a complete training example.
+
 ## Supply canonical runtime draws
 
 `plan.sample_runtime_draws(state, steps=N)` supplies one `RuntimeDraws` packet

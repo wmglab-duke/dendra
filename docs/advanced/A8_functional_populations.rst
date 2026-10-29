@@ -229,6 +229,32 @@ not reset the captured initial state or perform differentiable initialization.
 Opt-in fresh initialization
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
+Explicit lowering uses ``dn.func.initialize(functional, tensors)`` for either
+a Population or a Network. It returns a ``Continuation`` with initialized state,
+effective parameters/constants and no callback carry:
+
+.. code-block:: python
+
+   functional, tensors = dn.func.make_functional(model, dt=0.025)
+   initial = dn.func.initialize(functional, tensors)
+   bound = functional.bind(initial.parameters, constants=initial.constants)
+   final_state, auxiliary = dn.func.run(bound, initial, steps=800)
+
+Bind the returned sources because initialization can replace raw parameters and
+retain effective materializations. The default recipe is
+``tensors.initialization`` for Populations or
+``functional.initialization_inputs`` for Networks; ``initialization=`` accepts
+the corresponding existing input packet. Missing stochastic initialization
+draws are sampled from explicit RNG carry in native order, while supplied
+draws are replayed, including those retained in an initialized Population
+bundle. The host facade preserves cache precedence and ambient gradient mode,
+does not execute an accepted timestep, and leaves the native model unchanged.
+Call it outside ``torch.compile``, ``torch.func`` and forward AD. The existing
+pure plan initialization methods remain available for transformed code.
+See :ref:`functional-explicit-initialization` and the complete
+:download:`functional_explicit_initialization.py <../../examples/functional_explicit_initialization.py>`
+example for training, shared aliases and portable continuation.
+
 Use ``initialization="fresh"`` to initialize every call **without** explicit
 state. A Population with an owned ``steady_state`` cache restores that saved
 state; an uncached Population constructs its initial state from current model
