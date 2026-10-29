@@ -97,6 +97,7 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         "anomaly": scoped("right", dn.func.AnomalyDetector()),
         "soma": scoped("left", dn.func.Recorder(("v", "t"), region=network.left.soma)),
         "trace": dn.func.Recorder(("left.v", "left.i_membrane", "t")),
+        "coarse": dn.func.Recorder(("left.v", "t"), dt=2 * DT),
         "summary": scoped("left", VoltageSummary()),
     }
     # endregion callbacks
@@ -126,6 +127,10 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         field: torch.cat((first["trace"][field], values))
         for field, values in second["trace"].items()
     }
+    coarse = {
+        field: torch.cat((first["coarse"][field], values))
+        for field, values in second["coarse"].items()
+    }
     soma = torch.cat((first["soma"]["v"], second["soma"]["v"]))
     mean_voltage = torch.cat(
         (first["summary"]["mean_voltage"], second["summary"]["mean_voltage"])
@@ -139,6 +144,8 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         torch.testing.assert_close(second[name], whole[name])
     for field, values in trace.items():
         torch.testing.assert_close(values, whole["trace"][field])
+    for field, values in coarse.items():
+        torch.testing.assert_close(values, whole["coarse"][field])
     for name in ("left", "right"):
         torch.testing.assert_close(
             final["populations"][name]["integrator"]["v"],
@@ -148,6 +155,12 @@ def run_demo(*, execution="scan", backend="aot_eager"):
     assert lfp.shape == (2 * STEPS + 1, 2, 2)  # Frames, batch, contacts.
     assert raster.shape == (2 * STEPS, 2, 2, 2)  # Steps, batch, cells, sites.
     assert soma.shape == (2 * STEPS + 1, 2, 2)
+    # Native in-memory cadence includes the initial boundary and first step.
+    selected_frames = torch.tensor([0, 1, 3, 5, 7])
+    for field, values in coarse.items():
+        torch.testing.assert_close(
+            values, trace[field].index_select(0, selected_frames)
+        )
     assert second["counts"].shape == (2, 2, 2)
     assert second["anomaly"].shape == (2, 2)
     torch.testing.assert_close(second["counts"], raster.sum(dim=0))
@@ -191,6 +204,7 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         second["counts"],
         mean_voltage.detach(),
         second["summary"]["energy"].detach(),
+        coarse["left.v"].detach(),
     )
 
 

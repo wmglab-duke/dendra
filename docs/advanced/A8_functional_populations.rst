@@ -2606,9 +2606,58 @@ do not hide evolving values on the callback object.
 The functional ``Recorder`` currently supports explicit transition-state
 names such as ``"v"``, ``"vc"``, ``"i_membrane"``, ``"t"``, and ``"hh.m"``,
 plus ``node_indices``, ``max_only``, and ``partition`` for non-scalar states,
-or physical Slice selection through ``region``. ``Recorder(dt=...)``,
-sliding-window postprocessing, and HDF5 storage are not part of its current
-pure contract; apply tensor reductions or storage after the run instead.
+or physical Slice selection through ``region``. ``Recorder(dt=...)`` selects
+the recording cadence described below. Sliding-window postprocessing and HDF5
+storage are currently unsupported by the pure Recorder; apply tensor reductions
+or storage after the run instead.
+
+.. _functional-recorder-cadence:
+
+Recorder sampling cadence
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``dn.func.Recorder(("v", "t"), dt=record_dt)`` uses the same sampling rule as
+the native in-memory Recorder. The solver still advances at its configured
+timestep. The recording stride is ``int(record_dt / solver_dt)``: a positive
+noninteger ratio rounds down. ``record_dt`` must be finite and positive, and
+must span at least one solver step. Omitting ``dt`` records every step and
+retains the ordinary empty Recorder carry.
+
+Cadence is bound to the functional plan's solver timestep. A different runtime
+or prepared timestep raises; create matching callbacks when changing it.
+
+A fresh recording includes the initial boundary. Its post-step counter starts
+at zero and is tested before incrementing, so a stride of two selects the
+initial boundary and accepted steps 1, 3, 5, and so on. With a solver timestep
+of 0.1 ms and ``dt=0.2``, the selected times are 0, 0.1, 0.3, 0.5 ms, and so
+on, relative to the starting clock. This matches native in-memory timing;
+it is not a separate interpolation grid.
+
+Each Recorder owns its phase in explicit callback carry. Different Recorders
+may use different cadences in the same collection, including regional and
+Population-scoped Network Recorders. Continue with the returned
+``Continuation`` or simulation state and ``callback_state`` to preserve that
+phase without repeating the shared boundary. Zero-step continuation does not
+advance it. A fresh runner call starts a new recording history. Built-in
+callback checkpoints preserve cadence and phase across reconstruction.
+
+Selected floating-point samples remain connected to the model's autograd graph.
+Sampling changes the returned recording, not the simulation or the update
+frequency of other callbacks. Cadence selection runs during result finalization
+after dense timestep emissions have been collected; it does not reduce the
+loop's peak recording allocation. Use the host chunk/run wrappers when compiling
+cadenced recording, so finalization remains outside the compiled tensor loop.
+An outer compilation of an atomic callback rollout includes that finalization
+and requires the backend to support dynamic output shapes. With AOT eager,
+PyTorch's ``capture_dynamic_output_shape_ops`` setting enables this capture;
+the ordinary compiled chunk/run wrappers do not require it.
+
+The complete
+:download:`functional_network_callbacks.py <../../examples/functional_network_callbacks.py>`
+example compares a cadenced stream with a full recording in scan and while
+execution. The
+:download:`functional_callback_checkpoints.py <../../examples/functional_callback_checkpoints.py>`
+example checks its sampling phase after portable checkpoint restoration.
 
 Functional optimization
 ~~~~~~~~~~~~~~~~~~~~~~~

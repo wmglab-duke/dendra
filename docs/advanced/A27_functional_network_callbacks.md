@@ -32,7 +32,7 @@ The complete
 {download}`functional_network_callbacks.py <../../examples/functional_network_callbacks.py>`
 example compares scan and while execution for two connected, batched Populations.
 It checks LFP projections, all threshold-analysis callbacks, anomaly detection,
-regional recording, a custom reducer/emitter, continuation, and scan gradients
+regional and cadenced recording, a custom reducer/emitter, continuation, and scan gradients
 through lead fields. Run
 it from the repository root with `python examples/functional_network_callbacks.py`.
 
@@ -256,6 +256,13 @@ boundary emission. The same bound collection supports in-memory continuation
 through `callback_state=` or a returned `Continuation`. Portable export and
 restoration of custom callback configurations are currently unsupported; see
 {doc}`A58_functional_callback_checkpoints`.
+
+The independent `coarse` Recorder uses `dt=2 * DT`. With native in-memory
+timing it selects frames 0, 1, 3, 5, and 7 from the eight-step full recording.
+Joining the two execution segments gives the same selected frames as one
+uninterrupted call. This cadence does not change the custom callback or the
+other Recorders. The loop collects dense intermediate emissions and selects
+the returned cadence during finalization; see {ref}`functional-recorder-cadence`.
 
 The complete CPU example executes here:
 

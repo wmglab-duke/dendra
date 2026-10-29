@@ -167,12 +167,20 @@ class _BoundPopulationCallback(FunctionalCallback):
 
 
 class Recorder(FunctionalCallback):
-    """Record explicit functional state at the initial boundary and each step.
+    """Record explicit functional state with optional native sampling cadence.
 
     The constructor mirrors the ordinary :class:`dendra.callbacks.Recorder`
-    where the pure in-memory semantics overlap. ``dt`` and
-    ``sliding_window`` are reserved but not yet supported because their phase
-    must remain explicit across segmented and transformed executions.
+    where the pure in-memory semantics overlap. ``dt=None`` records the initial
+    boundary and every post-step value. ``dt`` selects the native integer stride
+    ``int(dt / simulation_dt)``. A fresh recording retains its initial frame,
+    then post-step frames 1, 1 + stride, and so on. Explicit counter carry keeps
+    that phase across chunks and continuation, without another initial sample.
+    ``sliding_window`` is currently unsupported.
+
+    Cadence selection occurs during finalization; chunk emissions remain
+    dense. Compiled chunks and ``run`` keep finalization outside their tensor
+    kernel. Compiling an atomic callback rollout that includes finalization
+    requires the PyTorch backend to support dynamic output shapes.
 
     ``region`` accepts a physical Slice belonging to the exact source
     Population, including a named child selection such as
@@ -268,11 +276,20 @@ class Recorder(FunctionalCallback):
 
     def _bind_paths(self, functional, paths, region):
         """Bind shared recording options after path and region resolution."""
+        save_every = None
         if self.dt is not None:
-            raise FunctionalizationError(
-                "dn.func.Recorder does not yet support dt; it records the "
-                "initial boundary and every post-step value"
-            )
+            from dendra.models._recorder_cadence import _recorder_stride
+
+            interval = float(self.dt)
+            if not math.isfinite(interval) or interval <= 0:
+                raise FunctionalizationError(
+                    "dn.func.Recorder dt must be positive and finite"
+                )
+            save_every = _recorder_stride(self.dt, functional.dt)
+            if save_every < 1:
+                raise FunctionalizationError(
+                    "dn.func.Recorder dt must span at least one simulation timestep"
+                )
         if self.sliding_window is not None:
             raise FunctionalizationError(
                 "dn.func.Recorder does not yet support sliding_window; apply a "
@@ -329,7 +346,7 @@ class Recorder(FunctionalCallback):
                         f"and {schema.shape[-1]}"
                     )
 
-        return _BoundRecorder(
+        recorder = _BoundRecorder(
             states=self.states,
             paths=paths,
             max_only=self.max_only,
@@ -337,6 +354,9 @@ class Recorder(FunctionalCallback):
             partition=partition,
             region=region,
         )
+        if save_every is None:
+            return recorder
+        return _BoundCadencedRecorder(recorder, save_every, functional.dt)
 
     def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
         del state, auxiliary
@@ -404,6 +424,35 @@ class _BoundRecorder(FunctionalCallback):
     def finalize(self, carry, emissions):
         del carry
         return emissions
+
+
+@dataclass(frozen=True)
+class _BoundCadencedRecorder(FunctionalCallback):
+    recorder: _BoundRecorder
+    save_every: int
+    callback_dt: float
+
+    def initialize(self, state, auxiliary):
+        del auxiliary
+        observed = self.recorder._observe(state)
+        device = next(iter(observed.values())).device
+        return torch.zeros((), dtype=torch.int64, device=device), observed
+
+    def update(self, carry, state, auxiliary):
+        del auxiliary
+        return carry + 1, self.recorder._observe(state)
+
+    def finalize(self, carry, emissions):
+        from dendra.models._recorder_cadence import _recorder_indices
+
+        if emissions is None:
+            return None
+        size = next(iter(emissions.values())).shape[0]
+        indices = _recorder_indices(carry, size, self.save_every)
+        return {
+            name: value.index_select(0, indices.to(device=value.device))
+            for name, value in emissions.items()
+        }
 
 
 class LFP(FunctionalCallback):
@@ -993,6 +1042,7 @@ def _callback_implementation(callback):
 def _is_builtin_callback(callback):
     return type(_callback_implementation(callback)) in {
         _BoundRecorder,
+        _BoundCadencedRecorder,
         _BoundLFP,
         AnomalyDetector,
         _BoundRaster,
@@ -1534,6 +1584,12 @@ class FunctionalCallbacks:
     def _validate_runtime_dt(self, dt: float) -> None:
         for plan in self._plans:
             callback = _callback_implementation(plan.callback)
+            if isinstance(callback, _BoundCadencedRecorder):
+                if dt != callback.callback_dt:
+                    raise FunctionalizationError(
+                        "functional Recorder dt does not match the "
+                        f"runtime timestep: expected {callback.callback_dt}, got {dt}"
+                    )
             if isinstance(callback, (_BoundRaster, _BoundAPCount)) and (
                 dt != callback.callback_dt
             ):
@@ -1545,11 +1601,19 @@ class FunctionalCallbacks:
     def _validate_runtime_dt_tensor(self, dt: torch.Tensor) -> None:
         for plan in self._plans:
             callback = _callback_implementation(plan.callback)
-            if not isinstance(callback, (_BoundRaster, _BoundAPCount)):
+            if not isinstance(
+                callback, (_BoundRaster, _BoundAPCount, _BoundCadencedRecorder)
+            ):
                 continue
             expected = dt.new_tensor(callback.callback_dt)
             message = (
-                "functional threshold callback dt does not match the prepared "
+                "functional "
+                + (
+                    "Recorder"
+                    if isinstance(callback, _BoundCadencedRecorder)
+                    else "threshold callback"
+                )
+                + " dt does not match the prepared "
                 f"timestep {callback.callback_dt}"
             )
             if (

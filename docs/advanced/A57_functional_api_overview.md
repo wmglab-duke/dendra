@@ -105,8 +105,14 @@ uses the full horizon for ordinary runners, or at most 64 steps for runtime
 `extra=dn.VarInput()` slots. Registered and compile-time bound stimulation use
 the ordinary setting. Chunking does not remove requested recording storage.
 
-Recording is an explicit named callback. A fresh Recorder includes the initial
-sample, followed by every accepted step. `auxiliary["continuation"]` carries
+Recording is an explicit named callback. By default a fresh Recorder includes
+the initial sample, followed by every accepted step. `Recorder(dt=record_dt)`
+selects a cadence with the native in-memory sampling rule; its phase is explicit
+carry and survives chunks and continuation. Different Recorders can use different
+cadences. Selection occurs after dense emissions are collected, so it changes
+returned samples without reducing peak loop recording allocation; see
+{ref}`functional-recorder-cadence` for timing and compilation details.
+`auxiliary["continuation"]` carries
 the returned simulation state, effective bindings and callback state together.
 Pass it to the next call to continue without recording the shared boundary twice:
 

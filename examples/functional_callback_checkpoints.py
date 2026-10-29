@@ -96,6 +96,7 @@ def compile_runner(model, *, network, backend, execution, steps=STEPS, threshold
     if network:
         callbacks = {
             "trace": dn.func.Recorder(("left.v", "right.v", "t")),
+            "cadence": dn.func.Recorder(("left.v", "t"), dt=3 * DT),
             "raster": dn.func.PopulationCallback("left", dn.func.Raster(**options)),
             "counts": dn.func.PopulationCallback("left", dn.func.APCount(**options)),
             "anomalies": dn.func.PopulationCallback("right", dn.func.AnomalyDetector()),
@@ -103,6 +104,7 @@ def compile_runner(model, *, network, backend, execution, steps=STEPS, threshold
     else:
         callbacks = {
             "trace": dn.func.Recorder(("v", "t")),
+            "cadence": dn.func.Recorder(("v", "t"), dt=3 * DT),
             "raster": dn.func.Raster(**options),
             "counts": dn.func.APCount(**options),
             "anomalies": dn.func.AnomalyDetector(),
@@ -154,6 +156,16 @@ def verify_continuation(first, resumed, expected):
         assert value.shape[0] == 2 * STEPS + 1
     for value in resumed_auxiliary["callbacks"]["trace"].values():
         assert value.shape[0] == STEPS  # No repeated boundary sample.
+    selected_frames = torch.tensor([0, 1, 4, 7])
+    for name, suffix in resumed_auxiliary["callbacks"]["cadence"].items():
+        samples = torch.cat((first["callbacks"]["cadence"][name], suffix))
+        torch.testing.assert_close(
+            samples, expected_auxiliary["callbacks"]["cadence"][name]
+        )
+        torch.testing.assert_close(
+            samples, observed[name].index_select(0, selected_frames)
+        )
+        assert suffix.shape[0] == 1  # Resumed phase selects only the seventh step.
     raster = torch.cat(
         (first["callbacks"]["raster"], resumed_auxiliary["callbacks"]["raster"])
     )

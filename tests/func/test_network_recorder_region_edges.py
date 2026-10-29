@@ -207,7 +207,6 @@ def test_packed_region_requires_parent_root_instead_of_original_child():
         {"node_indices": []},
         {"max_only": True},
         {"partition": [4]},
-        {"dt": 0.1},
         {"sliding_window": 3},
     ),
 )

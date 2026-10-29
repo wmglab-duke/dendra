@@ -38,6 +38,7 @@ class _NetworkRecorderLayout:
     """A cold Recorder naming adapter; it never executes a Network timestep."""
 
     def __init__(self, functional):
+        self._functional = functional
         self.device = functional.device
         self._state_schema = functional._state_schema
         aliases = {}
@@ -69,6 +70,10 @@ class _NetworkRecorderLayout:
             _RecorderLeaf(path, alias) for alias, path in aliases.items()
         )
         self.ambiguous = frozenset(ambiguous)
+
+    @property
+    def dt(self):
+        return self._functional.dt
 
 
 def _bind_network_region(functional, callback, paths):

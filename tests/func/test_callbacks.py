@@ -1218,8 +1218,15 @@ def test_functional_recorder_fails_closed_on_unsupported_or_stale_configuration(
         functional.make_callbacks({"trace": CustomRecorder(["v"])})
     with pytest.raises(dn.func.FunctionalizationError, match="explicit transition"):
         functional.make_callbacks({"trace": FunctionalRecorder(["diam"])})
-    with pytest.raises(dn.func.FunctionalizationError, match="does not yet support"):
-        functional.make_callbacks({"trace": FunctionalRecorder(["v"], dt=0.01)})
+    cadenced = functional.make_callbacks({"trace": FunctionalRecorder(["v"], dt=0.01)})
+    _, sampled = functional.prepare_and_rollout(
+        tensors.parameters,
+        tensors.constants,
+        tensors.state,
+        steps=2,
+        callbacks=cadenced,
+    )
+    assert sampled["callbacks"]["trace"]["v"].shape[0] == 2
     with pytest.raises(dn.func.FunctionalizationError, match="sliding_window"):
         functional.make_callbacks(
             {"trace": FunctionalRecorder(["v"], sliding_window=3)}

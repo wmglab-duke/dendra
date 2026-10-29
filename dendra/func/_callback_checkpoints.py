@@ -15,6 +15,7 @@ from ._callbacks import (
     _BoundActiveAL,
     _BoundActiveALCount,
     _BoundAPCount,
+    _BoundCadencedRecorder,
     _BoundLFP,
     _BoundPopulationCallback,
     _BoundRaster,
@@ -30,6 +31,7 @@ _FORMAT = "dendra.func.callback_state"
 _VERSION = 1
 _KINDS = {
     _BoundRecorder: "Recorder",
+    _BoundCadencedRecorder: "CadencedRecorder",
     _BoundLFP: "LFP",
     _BoundRaster: "Raster",
     _BoundAPCount: "APCount",

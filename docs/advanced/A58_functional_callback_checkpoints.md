@@ -123,9 +123,9 @@ schemas must be compatible. Saved parameter and constant values can differ
 from the receiving model or runner's defaults. Callback names and their bound
 configurations must match: this includes observation paths and indices,
 physical regions, Population scopes,
-timestep, threshold windows, activity rules and LFP lead fields.
+timestep, Recorder cadence, threshold windows, activity rules and LFP lead fields.
 
-The example configures a Recorder, Raster, APCount and AnomalyDetector. Its
+The example configures full-rate and cadenced Recorders, Raster, APCount and AnomalyDetector. Its
 Network has two Populations linked continuously and an event synapse driven by
 a noisy NetStim. Network callback scopes select the Population whose voltages
 the threshold and anomaly analyses observe:
@@ -193,8 +193,12 @@ and mismatched callback configurations reject restoration without changing the
 receiver or supplied packet.
 
 The example compares the reconstructed runner's complete state and joined
-recordings with one uninterrupted run. A resumed Recorder emits only new
-post-step samples, so joining the prefix and suffix has one initial frame.
+recordings with one uninterrupted run. A resumed Recorder returns only new
+selected post-step samples, so joining the prefix and suffix has one initial frame.
+Cadenced Recorders preserve their post-step counter. The example's `dt=3 * DT`
+stream selects frames 0, 1, 4, and 7 of an eight-step run; restoring after step
+four retains that phase and selects only frame 7 from the suffix. Cadence-free
+Recorder configuration and carry retain their existing checkpoint form.
 Raster emissions preserve their step phase; APCount and anomaly results retain
 their cumulative carry. Comparing complete Network state also checks pending
 delivery and RNG continuation.

@@ -163,11 +163,17 @@ Bind functional callback configurations to the Network plan:
 Recorder names begin with the Population name: `left.v` and
 `right.mech.event.g` select explicit transition state. `t` selects the
 authoritative Network clock. Explicit paths such as
-`populations.right.integrator.v` are also accepted. A new callback collection
-records the initial frame and then every accepted timestep, giving `steps + 1`
-samples. The results appear under `aux["callbacks"]["trace"]` and preserve
+`populations.right.integrator.v` are also accepted. With the default `dt=None`,
+a new Recorder records the initial frame and then every accepted timestep,
+giving `steps + 1` samples. The results appear under `aux["callbacks"]["trace"]` and preserve
 gradients. `node_indices`, `max_only`, and `partition` follow the ordinary
 functional Recorder contract.
+
+`Recorder(dt=record_dt)` selects samples with native in-memory timing and keeps
+its sampling phase in explicit carry. Each Recorder may use a different cadence;
+continuation does not restart it or repeat the shared boundary. See
+{ref}`functional-recorder-cadence` for stride rounding, initial/post-step timing,
+and the dense-intermediate storage contract.
 
 Use `region=network.left.soma` with qualified physical fields such as `left.v`
 to record a labeled Population Slice. For a concatenated Network, select

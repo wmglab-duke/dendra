@@ -13,6 +13,7 @@ from h5py import File
 from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ..helpers import nojit
+from ._recorder_cadence import _recorder_should_save, _recorder_stride
 from .backend import Backend as A
 
 # Kept as a module-level compatibility hook, but initialized lazily by Recorder.
@@ -158,7 +159,7 @@ class CallbackList(torch.nn.Module):
 template = """
 def recorder(self, model):
   if self.save_every is not None:
-    save = self.i % self.save_every == 0
+    save = _recorder_should_save(self.i, self.save_every)
   else:
     save = True
   if save:
@@ -292,6 +293,7 @@ def _build_recorder_func(states, max_only, indexed):
         func_name="recorder",
         filename_prefix="dendra.callbacks.recorder_func",
         global_ns=globals(),
+        extra_ns={"_recorder_should_save": _recorder_should_save},
     )
 
 
@@ -416,8 +418,10 @@ class Recorder(Callback):
         Indices of specific nodes to record. If None, all nodes are recorded.
         Default is None.
     dt : float, optional
-        Time step for recording. If provided, states are recorded every
-        dt/model.dt steps. Default is None (record every step).
+        Recording interval, converted to the integer stride ``int(dt/model.dt)``
+        without rounding. Default is None (record every step). A fresh in-memory
+        recording retains the initial boundary, then post-step frames 1,
+        1 + stride, and so on.
     sliding_window : int, optional
         Size of sliding window for temporal averaging of recorded data.
         Default is None (no averaging).
@@ -482,7 +486,9 @@ class Recorder(Callback):
         self._dt = None
         self.save_dt = dt
         self.save_every = (
-            int(self.save_dt / self.dt) if self.save_dt is not None else None
+            _recorder_stride(self.save_dt, self.dt)
+            if self.save_dt is not None
+            else None
         )
 
         # HDF5 -- optional -- for large data
@@ -518,7 +524,7 @@ class Recorder(Callback):
     def dt(self, value):
         self._dt = value
         if self.save_dt is not None:
-            self.save_every = int(self.save_dt / self.dt)
+            self.save_every = _recorder_stride(self.save_dt, self.dt)
 
     def set_hdf5(self, hdf5: str, cache_every: int = 10000) -> "Recorder":
         """
