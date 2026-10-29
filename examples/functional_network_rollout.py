@@ -137,14 +137,11 @@ def run_demo(*, compiled=False):
     right_v = initial["populations"]["right"]["integrator"]["v"]
     left_current = left_v.new_full((STEPS, *left_v.shape), 0.02).requires_grad_()
     right_current = right_v.new_full((STEPS, *right_v.shape), -0.01)
-    draws = plan.sample_draw_tape(initial, STEPS)
-    inputs = dn.func.NetworkRolloutInput(
-        populations={
-            "left": dn.func.RolloutInput(intra=left_current),
-            "right": dn.func.RolloutInput(intra=right_current),
-        },
-        netstim=draws,
-    )
+    draws = plan.sample_runtime_draws(initial, steps=STEPS)
+    inputs = {
+        "left": dn.func.Inputs(intra=left_current),
+        "right": dn.func.Inputs(intra=right_current),
+    }
     # endregion inputs
     original = clone_tree(initial)
     # region callbacks
@@ -158,7 +155,7 @@ def run_demo(*, compiled=False):
     # region eager
     prepared = plan.prepare(parameters, constants)
     expected, expected_aux = plan.rollout(
-        parameters, prepared, initial, inputs, callbacks=callbacks
+        parameters, prepared, initial, inputs, draws=draws, callbacks=callbacks
     )
     # endregion eager
     # region chunk
@@ -169,15 +166,12 @@ def run_demo(*, compiled=False):
     )
     # endregion chunk
     # region run
-    bound = (
-        plan.bind(parameters, constants)
-        if chunk is None
-        else chunk.bind(parameters, constants)
-    )
+    bound = plan.bind(tensors) if chunk is None else chunk.bind(tensors)
     final, auxiliary = dn.func.run(
         bound,
         initial,
         inputs=inputs,
+        draws=draws,
         checkpoint_every=4,
         callbacks=callbacks,
     )
@@ -188,23 +182,20 @@ def run_demo(*, compiled=False):
     assert_tree(trace, expected_aux["callbacks"]["trace"])
 
     # region continuation
-    prefix, prefix_aux = dn.func.run(
+    _, prefix_aux = dn.func.run(
         bound,
         initial,
         inputs=slice_inputs(inputs, 0, SPLIT),
+        draws=slice_inputs(draws, 0, SPLIT),
         callbacks=callbacks,
     )
-    saved = {
-        "state": clone_tree(prefix),
-        "callbacks": clone_tree(prefix_aux["callbacks"].state),
-        "step": SPLIT,
-    }
+    saved = prefix_aux["continuation"]
     resumed, resumed_aux = dn.func.run(
         bound,
-        saved["state"],
-        inputs=slice_inputs(inputs, saved["step"], STEPS),
+        saved,
+        inputs=slice_inputs(inputs, SPLIT, STEPS),
+        draws=slice_inputs(draws, SPLIT, STEPS),
         callbacks=callbacks,
-        callback_state=saved["callbacks"],
     )
     joined = {
         name: torch.cat((prefix_aux["callbacks"]["trace"][name], values))
@@ -241,7 +232,7 @@ def run_demo(*, compiled=False):
     native = make_network()
     plan.commit_state_(native, final)
     next_state, _ = plan.prepare_and_step(
-        parameters, constants, final, netstim_draw=plan.sample_step_draw(final)
+        parameters, constants, final, inputs={}, draws=plan.sample_runtime_draws(final)
     )
     native.step()
     assert_tree(next_state, plan.extract(native).state)

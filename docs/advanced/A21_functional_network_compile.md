@@ -147,7 +147,16 @@ renewal retains its configured gradient policy. Consumed heap cursors and
 seeder state are preserved, while delivery queues and detector carry reset.
 Neither the source Network's RNG nor its state is changed.
 
-The lower-level `FunctionalNetwork.initialize` consumes explicit parameters,
+For explicit initialization without a convenience runner, call
+`initial = dn.func.initialize(plan, tensors)`, using the matching `NetworkTensors`
+bundle. Bind the returned packet with `plan.bind(initial)` or
+`kernel.bind(initial)`, then pass it separately to `dn.func.run`. The host facade
+samples missing initialization packets from explicit carry and returns effective
+parameters/constants with no callback state. See
+{ref}`functional-explicit-initialization` for a complete Population/Network
+workflow with gradients and portable checkpoints.
+
+The pure `FunctionalNetwork.initialize` consumes explicit parameters,
 constants, prior carry, and initialization inputs, returning `NetworkTensors`.
 Supply an initialization draw when the graph contains a NetStim. The prior
 carry supplies calendar cursors and RNG/seeder state; it does not replace
@@ -384,9 +393,10 @@ gradients for both a Population and a Network with shared connection weights:
 :tags: [remove-input]
 ```
 
-## Supply Population inputs and explicit NetStim tapes
+## Supply Population inputs and runtime draws
 
-Supply runtime inputs with `NetworkRolloutInput`:
+Supply a mapping of `Inputs` for deterministic per-Population tapes, and a
+separate `RuntimeDraws` packet for stochastic requests:
 
 ```{literalinclude} ../../examples/functional_network_compile.py
 :language: python
@@ -396,17 +406,20 @@ Supply runtime inputs with `NetworkRolloutInput`:
 ```
 
 Each provided field has one leading time axis. Each runner call receives
-exactly `runner.kernel.steps` samples. The example prepares six samples and
+exactly its configured `steps` samples; the host handles any shorter compiled
+chunk width. The example prepares six samples and
 slices them into two three-step calls. Per-population `intra` values are
-assembled current densities in mA/cm²; `ve` contains external potentials in
+assembled absolute intracellular currents in mA; `ve` contains external potentials in
 mV for integrators that accept them. Their remaining dimensions follow each
 Population's input contract. Tensor slices preserve gradient history.
 
-`runner.functional.sample_draw_tape(state, steps)` samples NetStim packets
-outside compiled execution, from an independent copy of explicit RNG state.
-Keep `exp_rand` and matching post-draw `rng_state` bytes together when slicing.
-The runner can also omit the NetStim tape and sample bounded packets from its
-input state's RNG carry. Checkpoint backward reuses the forward packets.
+`runner.functional.sample_runtime_draws(state, steps=N)` samples all requested
+draw families outside compiled execution, from independent copies of explicit
+RNG carry. It preserves native order and shared stream boundaries for NetStim,
+model NOISE/SDE and randomized Poisson stimulation. Slice the complete packet
+so numerical draws and their authoritative RNG timelines remain together.
+The runner can also omit `draws=` and sample bounded packets from its input
+state's carry. Checkpoint backward reuses the forward packets.
 The example checks that automatic sampling matches the supplied tape:
 
 ```{literalinclude} ../../examples/functional_network_compile.py
@@ -424,6 +437,11 @@ extracellular contacts and Waveforms. Their field and waveform leaves support
 trainable selection, shared aliases, and the same continuation clock; see
 {doc}`A28_functional_network_extra`. An explicit `ve` tape remains available for
 any Population without bound `extra`.
+
+The existing `NetworkRolloutInput(populations=..., netstim=...)` and NetStim-only
+`sample_draw_tape` forms retain their contracts. Do not combine their stochastic
+fields with `draws=`. See {ref}`functional-runtime-inputs` and
+{ref}`functional-runtime-draws` for the shared Population/Network packets.
 
 ## Restart or continue explicitly
 
@@ -455,8 +473,8 @@ same result, without consuming the native Network's clock or RNG:
 :dedent: 4
 ```
 
-Pass returned state to continue. Preserve `aux["callbacks"].state` when
-continuing recordings and reducers from the same runner:
+Pass the returned continuation to retain effective sources, simulation state
+and callback memory together:
 
 ```{literalinclude} ../../examples/functional_network_compile.py
 :language: python

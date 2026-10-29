@@ -1060,9 +1060,6 @@ class _dhs(Integrator):
     def step(self, model, dt, ve=None, intra=None):
         if self._cpu_plan_available:
             self._refresh_cpu_topology_plan()
-        binding = self._tensor_step_binding
-        if binding is not None and binding.try_step(model, dt, ve, intra):
-            return
         v_new, i_membrane = self._call_kernel(
             "_step", model.v, dt, model.celsius, ve, intra
         )

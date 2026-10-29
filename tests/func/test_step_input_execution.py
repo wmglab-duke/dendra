@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch.utils import _pytree as pytree
 
+from dendra.func._inputs import _population_inputs, _RuntimeInputs
 from dendra.func._lowered import (
     _LoweredCallbackPopulationChunk,
     _LoweredPopulationChunk,
@@ -14,7 +15,6 @@ from dendra.func._runners import _execute_steps, _execute_steps_with_callbacks
 from dendra.func._types import (
     RolloutInput,
     RuntimeNoiseDraw,
-    StepInput,
     StimulationDraw,
 )
 
@@ -24,22 +24,29 @@ pytestmark = pytest.mark.cpu
 def _inputs():
     base = torch.arange(24, dtype=torch.float64).reshape(3, 8).requires_grad_()
     frames = torch.arange(15, dtype=torch.uint8).reshape(5, 3).t()
-    return base, RolloutInput(
-        ve=base[:, ::4],
-        intra=base[:, 1::4],
-        noise=RuntimeNoiseDraw({"eta": base[:, 2::4]}, {"stream": {"bytes": frames}}),
-        stimulation=StimulationDraw({"u": base[:, 3::4]}, {"generator": frames}),
+    return base, _population_inputs(
+        RolloutInput(
+            ve=base[:, ::4],
+            intra=base[:, 1::4],
+            noise=RuntimeNoiseDraw(
+                {"eta": base[:, 2::4]}, {"stream": {"bytes": frames}}
+            ),
+            stimulation=StimulationDraw({"u": base[:, 3::4]}, {"generator": frames}),
+        )
     )
 
 
 def _transition(state, inputs):
-    return (
-        state
+    voltage = (
+        state["integrator"]["v"]
         + inputs.ve
         + 2 * inputs.intra
         + 3 * inputs.noise.draws["eta"]
-        + 4 * inputs.stimulation.draws["u"],
-        (inputs.noise.rng, inputs.stimulation.rng),
+        + 4 * inputs.stimulation.draws["u"]
+    )
+    return {"integrator": {"v": voltage}}, (
+        inputs.noise.rng,
+        inputs.stimulation.rng,
     )
 
 
@@ -87,27 +94,33 @@ def _executor(entry, step):
 )
 def test_all_indexed_loops_pass_borrowed_rows_and_retain_gradients(entry):
     base, inputs = _inputs()
-    frozen = pytree.tree_map(torch.clone, inputs)
+    frozen = pytree.tree_map_only(torch.Tensor, torch.clone, inputs)
     received = []
 
     def observe(state, row):
-        assert type(row) is StepInput
+        assert type(row) is _RuntimeInputs
+        assert row.draws is None
         received.append(row)
         return _transition(state, row)
 
-    result = _executor(entry, observe)(torch.zeros(2, dtype=torch.float64), inputs)
+    initial = {"integrator": {"v": torch.zeros(2, dtype=torch.float64)}}
+    result = _executor(entry, observe)(initial, inputs)
+    voltage = result[0]["integrator"]["v"]
     weights = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.float64).repeat(2)
     torch.testing.assert_close(
-        result[0], (base.reshape(3, 2, 4) * weights[:4]).sum((0, 2))
+        voltage, (base.reshape(3, 2, 4) * weights[:4]).sum((0, 2))
     )
     torch.testing.assert_close(
-        torch.autograd.grad(result[0].sum(), base)[0], weights.expand_as(base)
+        torch.autograd.grad(voltage.sum(), base)[0], weights.expand_as(base)
     )
     assert len(received) == 3
     for index, row in enumerate(received):
         for actual, tape in zip(
             pytree.tree_leaves(row), pytree.tree_leaves(inputs), strict=True
         ):
+            if actual is None:
+                assert tape is None
+                continue
             expected = tape[index]
             assert (
                 actual.untyped_storage().data_ptr() == tape.untyped_storage().data_ptr()
@@ -131,11 +144,15 @@ def test_all_indexed_loops_pass_borrowed_rows_and_retain_gradients(entry):
 def test_indexed_tensor_loops_compile_fullgraph_with_all_input_columns(entry):
     base, inputs = _inputs()
     execute = _executor(entry, _transition)
-    initial = torch.zeros(2, dtype=torch.float64)
+    initial = {"integrator": {"v": torch.zeros(2, dtype=torch.float64)}}
     expected = execute(initial, inputs)
     compiled = torch.compile(execute, backend="aot_eager", fullgraph=True)
     actual = compiled(initial, inputs)
     pytree.tree_map(torch.testing.assert_close, actual, expected)
-    expected_gradient = torch.autograd.grad(expected[0].square().sum(), base)[0]
-    actual_gradient = torch.autograd.grad(actual[0].square().sum(), base)[0]
+    expected_gradient = torch.autograd.grad(
+        expected[0]["integrator"]["v"].square().sum(), base
+    )[0]
+    actual_gradient = torch.autograd.grad(
+        actual[0]["integrator"]["v"].square().sum(), base
+    )[0]
     torch.testing.assert_close(actual_gradient, expected_gradient)

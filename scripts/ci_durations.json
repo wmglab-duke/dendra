@@ -1914,10 +1914,6 @@
       "seconds": 1.455380373110529,
       "tests": 11
     },
-    "tests/test_population_tensor_step.py": {
-      "seconds": 24.894475046603475,
-      "tests": 32
-    },
     "tests/test_pytest_warning_policy.py": {
       "seconds": 0.014664630638435483,
       "tests": 31

@@ -219,7 +219,12 @@ class PopulationTensors(NamedTuple):
 
 
 class StepInput(NamedTuple):
-    """Assembled voltage/current inputs and explicit stochastic draw packets."""
+    """Assembled voltage/current inputs and explicit stochastic draw packets.
+
+    :class:`~dendra.func.Inputs` supplies deterministic frames and :class:`~dendra.func.RuntimeDraws`
+    supplies stochastic values through ``draws=``. This combined packet remains
+    supported with its separate noise and stimulation fields.
+    """
 
     ve: torch.Tensor | None = None
     intra: torch.Tensor | None = None
@@ -228,7 +233,12 @@ class StepInput(NamedTuple):
 
 
 class RolloutInput(NamedTuple):
-    """Time-first voltage/current inputs and explicit stochastic draw/RNG tapes."""
+    """Time-first voltage/current inputs and explicit stochastic draw/RNG tapes.
+
+    :class:`~dendra.func.Inputs` supplies deterministic tapes and :class:`~dendra.func.RuntimeDraws`
+    supplies stochastic values through ``draws=``. This combined packet remains
+    supported with its separate noise and stimulation fields.
+    """
 
     ve: torch.Tensor | None = None
     intra: torch.Tensor | None = None
@@ -246,7 +256,7 @@ def _index_step_input(ve, intra, noise, stimulation, index) -> StepInput:
 
 
 class FunctionalizationError(RuntimeError):
-    """Raised when a Population cannot yet be lowered without semantic loss."""
+    """Raised when functional execution cannot preserve its declared contract."""
 
 
 __all__ = [

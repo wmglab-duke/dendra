@@ -168,7 +168,7 @@ Independently managed callbacks use ``callbacks.export_state(...)`` /
 rules and complete disk-checkpoint examples.
 
 Registered stimuli are captured with the model. Explicit time-first waveform
-inputs can instead be supplied with ``runner(inputs=dn.func.RolloutInput(...))``.
+inputs can instead be supplied with ``runner(inputs=dn.func.Inputs(...))``.
 The runner exposes ``parameters`` as a read-only mapping of independent tensor
 copies, as well as ``constants``, ``functional``, and the compiled ``kernel``.
 Use ``runner.execution_report()`` after a call to inspect the selected strategy.
@@ -1552,7 +1552,7 @@ For multiple timesteps, pass time-first drive tensors to ``rollout``:
        tensors.parameters,
        prepared,
        tensors.state,
-       dn.func.RolloutInput(ve=ve_over_time, intra=intra_over_time),
+       dn.func.Inputs(ve=ve_over_time, intra=intra_over_time),
    )
 
 When both drives are omitted, supply ``steps=...`` explicitly. ``step`` and
@@ -1573,7 +1573,8 @@ Population execution. Ordinary trailing PyTorch broadcasting is tried first;
 only if that fails may a low-rank value broadcast over the explicit batch
 shape. Consequently, when batch and compartment sizes coincide, ``[C]`` means
 a shared compartment profile. Use ``[B, 1, 1]`` for an explicitly per-batch
-value. ``RolloutInput`` adds the leading time axis to these per-step forms.
+value. ``Inputs`` uses a leading time axis for rollouts; the existing
+``StepInput`` and ``RolloutInput`` forms retain their contracts.
 
 The functional API does not accept manually installed per-replica geometry
 tensors, including native-Cable, scalar-Tree, or ExtCellTree area and
@@ -1691,9 +1692,9 @@ boundaries.
 Bound ``extra`` works with scan, checkpointed training scan, and inference-only
 while execution. Waveforms follow the accepted simulation clock, including
 explicit continuation and checkpoint replay. Do not pass an explicit
-``RolloutInput.ve`` alongside bound ``extra``. Constructor binding requires
+``Inputs.ve`` alongside bound ``extra``. Constructor binding requires
 Waveform temporal specifications; for already sampled stimulation, assemble a
-time-first mV tensor and pass ``runner(inputs=dn.func.RolloutInput(ve=ve))``
+time-first mV tensor and pass ``runner(inputs=dn.func.Inputs(ve=ve))``
 instead. Both routes preserve the model's ordinary scalar-cable or
 finite-extracellular interpretation of the supplied potential.
 
@@ -1749,7 +1750,7 @@ by their global sample index for the call.
 potential. The same compiled model accepts zero stimulation and every valid
 contact recipe. A runner constructed without ``VarInput`` rejects call-local
 ``extra`` overrides, including ``None``. Runtime ``extra`` cannot be combined
-with an explicit ``RolloutInput.ve`` source.
+with an explicit ``Inputs.ve`` source.
 
 The host evaluates the selected contacts and passes assembled extracellular
 voltage to the compiled model in bounded chunks. Changing a Waveform type,
@@ -1835,9 +1836,9 @@ remain runtime ``extra`` inputs: a standalone bound ``step`` has no implicit
 sequence cursor.
 
 Do not specify two sources for the same drive. Registered functional intra
-cannot be combined with an explicit ``StepInput.intra`` or
-``RolloutInput.intra``; raw or bound ``extra`` cannot be combined with explicit
-``ve``; and runtime ``extra`` cannot be combined with an ``extra`` already
+cannot be combined with an explicit ``Inputs.intra`` (or the corresponding
+``StepInput``/``RolloutInput`` field); raw or bound ``extra`` cannot be combined
+with explicit ``ve``; and runtime ``extra`` cannot be combined with an ``extra`` already
 bound by ``make_functional``.
 
 Functional waveform evaluation must be deterministic and side-effect-free
@@ -2665,9 +2666,9 @@ validate drives against it. All legacy forms default to ``fmodel.dt``. In the tw
 ``chunklength`` controls host/checkpoint spacing. Use the binding form
 for the explicit ``steps``, ``duration``, and span options.
 
-Time-first ``RolloutInput`` tensors remain available for already assembled
-drives. Registered intracellular and bound extracellular Waveforms are evaluated
-at each accepted state clock, preserving the one-step runner's sampling even
+Time-first ``Inputs`` tensors supply already assembled drives; the compatible
+``RolloutInput`` form remains available. Registered intracellular and bound
+extracellular Waveforms are evaluated at each accepted state clock, preserving the one-step runner's sampling even
 at sharp pulse boundaries. Changing the compiled kernel's timestep count does
 not change this sampling. A raw ``extra`` specification is lowered once and
 evaluated at each host chunk. Tensor-valued extracellular waveforms use the

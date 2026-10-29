@@ -42,6 +42,10 @@ from ._types import FunctionalizationError, RolloutInput
 class NetworkRolloutInput(NamedTuple):
     """Time-leading per-Population inputs and explicit stochastic draw tapes.
 
+    Network execution accepts a mapping from Population names to :class:`~dendra.func.Inputs`
+    and a separate :class:`~dendra.func.RuntimeDraws` packet through ``draws=``. This combined
+    packet remains supported for callers using its component-specific fields.
+
     ``populations`` maps names to :class:`RolloutInput`, including each
     Population's ``noise`` and ``stimulation`` draw/RNG tapes. ``netstim`` is a
     :class:`NetStimDraw` whose two Tensor fields have one leading time axis.

@@ -449,9 +449,7 @@ def _population_membrane_metadata_plain(handler):
 def _population_step_context(integrator, *, stable=False):
     """Temporarily reuse a proof supplied by an observer-stable host loop."""
     previous = integrator._direct_membrane_structure_prevalidated
-    previous_tensor_step = integrator._tensor_step_binding
     integrator._direct_membrane_structure_prevalidated = False
-    integrator._tensor_step_binding = None
     try:
         if (
             stable
@@ -478,23 +476,8 @@ def _population_step_context(integrator, *, stable=False):
                 and handler._can_evaluate_direct_membrane_frame()
             ):
                 integrator._direct_membrane_structure_prevalidated = True
-        if (
-            integrator._tensor_step_enabled
-            and integrator._direct_membrane_structure_prevalidated
-        ):
-            from ._tensor_step import _make_tensor_step_binding
-
-            integrator._tensor_step_binding = _make_tensor_step_binding(integrator)
         yield
     finally:
-        binding = integrator._tensor_step_binding
-        if binding is not None:
-            integrator._tensor_step_report = {
-                "successful_calls": binding.successful_calls,
-                "capture_count": binding.capture_count,
-                "operand_count": binding.last_operand_count,
-            }
-        integrator._tensor_step_binding = previous_tensor_step
         integrator._direct_membrane_structure_prevalidated = previous
 
 
@@ -521,8 +504,6 @@ class Integrator(torch.nn.Module):
     # Old serialized integrators predate the instance marker. An absent field
     # must retain the ordinary per-step structural validation after restoration.
     _direct_membrane_structure_prevalidated = False
-    _tensor_step_enabled = False
-    _tensor_step_binding = None
 
     def __init__(self, model, mech, imem=None):
         super().__init__()
@@ -995,9 +976,6 @@ class Integrator(torch.nn.Module):
         if "_compiled_kernel_sources" in state:
             state["_compiled_kernel_sources"] = {}
         state["_direct_membrane_structure_prevalidated"] = False
-        state["_tensor_step_binding"] = None
-        state["_tensor_step_graphs"] = {}
-        state["_tensor_step_capture_errors"] = {}
         return state
 
     def _kernel(self, name: str, *args, **kwargs):

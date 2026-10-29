@@ -141,14 +141,7 @@ def main():
         )
 
         # Explicit continuation leaves the source Population unchanged.
-        continuation_parameters = (
-            auxiliary["parameters"] if args.initialization == "fresh" else None
-        )
-        continued, _ = runner(
-            final,
-            parameters=continuation_parameters,
-            callback_state=auxiliary["callbacks"].state,
-        )
+        continued, _ = runner(auxiliary["continuation"])
         assert torch.isfinite(continued["integrator"]["v"]).all()
         print(
             f"recorded {voltage.shape[0]} voltage frames; explicit continuation succeeded"

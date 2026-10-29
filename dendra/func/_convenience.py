@@ -104,7 +104,7 @@ class CompiledRunner:
     Field and waveform leaves become independent ``stimulation.extra.*``
     parameters, selectable with ``trainable`` like model parameters. Bound
     waveforms follow the accepted simulation clock across continuation and
-    checkpoint replay. Explicit ``RolloutInput.ve`` cannot be combined with
+    checkpoint replay. Explicit ``Inputs.ve`` cannot be combined with
     bound ``extra``; use it instead for already assembled time-first voltages.
 
     ``extra=VarInput()`` declares a required call-local stimulation input.
@@ -730,9 +730,11 @@ def compile(
     """Create a reusable Population or Network runner (scan by default).
 
     Initialized canonical Networks return :class:`CompiledNetworkRunner` with
-    their existing timestep/mode. Their
-    inputs use :class:`NetworkRolloutInput`, recordings use qualified names
-    such as ``cell.v``, and parameters retain shared tensor identities. See
+    their existing timestep/mode. Their inputs map Population names to
+    :class:`~dendra.func.Inputs`; :class:`~dendra.func.RuntimeDraws` supplies explicit stochastic tapes
+    through ``draws=``. :class:`NetworkRolloutInput` remains supported.
+    Recordings use qualified names such as ``cell.v``, and parameters retain
+    shared tensor identities. See
     :class:`CompiledNetworkRunner` for its restart and continuation contract.
     Network inference supports ``execution='while'`` with qualified Recorders,
     ``PopulationCallback`` scopes around supported built-ins, or without
@@ -766,7 +768,9 @@ def compile(
     call's ``initialization=`` override. Fresh-policy results expose effective
     mappings at ``aux['parameters']`` and ``aux['constants']``. Parameter-writing
     initialization requires the returned parameters for continuation; cached
-    initialization also requires the returned constants.
+    initialization also requires the returned constants. Resume with
+    ``runner(aux['continuation'])`` to carry effective parameters, constants,
+    state and callback carry together.
     For Populations, ``extra=(field, waveform)`` or a sequence of such pairs
     binds extracellular stimulation. For Networks, ``extra`` maps Population
     names to those same bindings. Select independent fields and waveform leaves

@@ -90,23 +90,22 @@ def run_demo():
     # region inputs
     voltage = initial["populations"]["left"]["integrator"]["v"]
     current = voltage.new_full((TOTAL_STEPS, *voltage.shape), 0.02).requires_grad_()
-    inputs = dn.func.NetworkRolloutInput(
-        populations={"left": dn.func.RolloutInput(intra=current)},
-        netstim=runner.functional.sample_draw_tape(initial, TOTAL_STEPS),
-    )
+    inputs = {"left": dn.func.Inputs(intra=current)}
+    draws = runner.functional.sample_runtime_draws(initial, steps=TOTAL_STEPS)
     # endregion inputs
     # region restart
     prefix_inputs = slice_inputs(inputs, 0, STEPS)
-    prefix, prefix_aux = runner(inputs=prefix_inputs)
-    repeated, repeated_aux = runner(inputs=prefix_inputs)
+    prefix_draws = slice_inputs(draws, 0, STEPS)
+    prefix, prefix_aux = runner(inputs=prefix_inputs, draws=prefix_draws)
+    repeated, repeated_aux = runner(inputs=prefix_inputs, draws=prefix_draws)
     assert_tree(repeated, prefix)
     assert_tree(repeated_aux["callbacks"]["trace"], prefix_aux["callbacks"]["trace"])
     # endregion restart
     # region continuation
     final, final_aux = runner(
-        prefix,
+        prefix_aux["continuation"],
         inputs=slice_inputs(inputs, STEPS, TOTAL_STEPS),
-        callback_state=prefix_aux["callbacks"].state,
+        draws=slice_inputs(draws, STEPS, TOTAL_STEPS),
     )
     trace = {
         name: torch.cat((prefix_aux["callbacks"]["trace"][name], values))
@@ -122,6 +121,7 @@ def run_demo():
         runner.constants,
         runner.initial_state,
         inputs,
+        draws=draws,
         callbacks=reference_callbacks,
     )
     expected_trace = expected_aux["callbacks"]["trace"]
@@ -142,9 +142,7 @@ def run_demo():
         assert torch.isfinite(value).all()
     # endregion gradients
     # region automatic-draws
-    automatic, automatic_aux = runner(
-        inputs=dn.func.NetworkRolloutInput(populations=prefix_inputs.populations)
-    )
+    automatic, automatic_aux = runner(inputs=prefix_inputs)
     assert_tree(automatic, prefix)
     assert_tree(automatic_aux["callbacks"]["trace"], prefix_aux["callbacks"]["trace"])
     # endregion automatic-draws

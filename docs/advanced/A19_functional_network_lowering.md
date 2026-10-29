@@ -96,9 +96,16 @@ leaves are needed for either kind of model.
 Both plans support the same raw binding and host execution spelling:
 
 ```python
-bound = plan.bind(tensors.parameters, constants=tensors.constants)
+bound = plan.bind(tensors)
 state, auxiliary = dn.func.run(bound, tensors.state, steps=8)
 ```
+
+For a fresh start from the selected sources, use
+`initial = dn.func.initialize(plan, tensors)`, bind `initial`, and pass it
+explicitly to `run`. Initialization returns the effective sources alongside
+state; native initialization order, cache precedence and stochastic replay
+follow {ref}`functional-explicit-initialization`. Binding selects only parameter
+and constant frames; it does not adopt state or callback carry.
 
 The complete
 {download}`functional_lowering_api.py <../../examples/functional_lowering_api.py>`
@@ -121,8 +128,10 @@ without committing to the source Network. The split API is
 changing parameters or constants. Pass per-population explicit `inputs`,
 `extra`, and `intra` values through the corresponding keyword mappings when
 needed, following the functional Population contracts. `inputs` maps names to
-`dn.func.StepInput` values; an `intra` entry overrides that Population's
-`StepInput.intra`. Registered Population stimulation remains active.
+`dn.func.Inputs` values with one frame per Population. The existing `StepInput`
+form and separate `extra`/`intra` keyword mappings remain available; an `intra`
+entry overrides that Population's packet field. Registered Population
+stimulation remains active.
 Imperative callbacks are not executed by this timestep.
 
 For a reusable runner with snapshot or fresh restart and recording, use `dn.compile`
@@ -158,9 +167,25 @@ receives in connection order. First-delivery `min`/`max` behavior and true zero
 deliveries retain native semantics. A returned Network state is a complete
 timestep boundary; partial delivery-phase continuation is currently unsupported.
 
-## Keep NetStim draws explicit
+## Keep runtime draws explicit
 
-When a Network has a NetStim, call `plan.sample_step_draw(state)` outside
+`plan.sample_runtime_draws(state)` captures one `RuntimeDraws` packet for the
+Network's stochastic requests from its explicit RNG carry. Pass the packet
+through `draws=` to a pure timestep, keeping deterministic inputs separate:
+
+```python
+draws = plan.sample_runtime_draws(state)
+next_state, auxiliary = plan.prepare_and_step(
+    parameters, constants, state, inputs={}, draws=draws,
+)
+```
+
+Sampling is a host operation outside compiled or transformed code. It leaves
+the source model and supplied state unchanged. A time-leading tape uses
+`sample_runtime_draws(state, steps=N)`; host `dn.func.run` can sample missing
+runtime packets automatically. See {ref}`functional-runtime-draws`.
+
+For the existing NetStim-specific form, call `plan.sample_step_draw(state)` outside
 compiled or transformed code and pass the returned packet as `netstim_draw`.
 The sampler uses an independent generator initialized from the explicit state;
 it mutates neither that state nor the native NetStim. Without a NetStim it
@@ -190,10 +215,15 @@ CPU even when the simulation components use an accelerator.
 :dedent: 12
 ```
 
-Clone live carry without detaching it when gradients must cross the saved
-prefix. Serialize or detach it deliberately for an independent saved run. Keep
-the matching parameters, constants, and frozen Network configuration with the
-checkpoint. Dense queued payloads retain enqueue-time weights and transform
+The example's saved dictionary is an in-memory checkpoint: its cloned carry
+retains the prefix's autograd graph. Host runs return
+`auxiliary["continuation"]` with state, effective parameter/constants and callback
+carry together. For portable detached data, use `dn.func.export_continuation`
+and `dn.func.restore_continuation` against a compatible receiving plan, then
+bind the restored packet before resuming. Save model declarations, runtime
+tapes, optimizer state and earlier recordings separately. See
+{doc}`A58_functional_callback_checkpoints` for supported callbacks and complete
+disk examples. Dense queued payloads retain enqueue-time weights and transform
 values. Source-history training reconstructs deliveries from past activity
 using current weights and delays; see {doc}`A22_functional_source_history`.
 

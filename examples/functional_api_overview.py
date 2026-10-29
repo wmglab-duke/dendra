@@ -86,7 +86,7 @@ def inference_demo(*, backend):
     assert first["callbacks"]["trace"]["v"].shape[0] == STEPS + 1
     assert not first["callbacks"]["trace"]["v"].requires_grad
 
-    continued, second = runner(final, callback_state=first["callbacks"].state)
+    continued, second = runner(first["continuation"])
     whole = dn.compile(
         model,
         dt=DT,
@@ -206,14 +206,13 @@ def explicit_demo(*, backend):
     model = make_cable()
     functional, tensors = dn.func.make_functional(model, dt=DT)
     parameters = tensors.independent_parameters(trainable="*.g_param")
-    constants = tensors.constants
     initial = copy_state(tensors.state)
     voltage = initial["integrator"]["v"]
     current = voltage.new_full((STEPS, *voltage.shape), 0.02 * nA).requires_grad_()
     inputs = dn.func.Inputs(intra=current)
     callbacks = functional.make_callbacks({"trace": dn.func.Recorder(("v", "t"))})
     kernel = functional.compile_rollout_chunk(WIDTH, backend=backend)
-    bound = kernel.bind(parameters, constants=constants)
+    bound = kernel.bind(tensors._replace(parameters=parameters))
 
     # Direct calls consume exactly WIDTH time-leading input frames.
     prefix, first = bound(initial, inputs=window(inputs, 0, WIDTH), callbacks=callbacks)
@@ -266,7 +265,7 @@ def draws_demo(*, backend):
         {"trace": dn.func.Recorder(("left.v", "right.v", "t"))}
     )
     kernel = functional.compile_rollout_chunk(WIDTH, backend=backend)
-    bound = kernel.bind(tensors.parameters, constants=tensors.constants)
+    bound = kernel.bind(tensors)
     # Sampling consumes explicit carry, leaving the native Network/RNG unchanged.
     draws = functional.sample_runtime_draws(initial, steps=STEPS)
     assert isinstance(draws, dn.func.RuntimeDraws)
@@ -331,9 +330,7 @@ def extra_demo(*, backend):
     zero, _ = runner(extra=None)
     assert not torch.equal(changed["integrator"]["v"], first_state["integrator"]["v"])
     assert not torch.equal(zero["integrator"]["v"], first_state["integrator"]["v"])
-    final, second = runner(
-        first_state, extra=one_contact, callback_state=first["callbacks"].state
-    )
+    final, second = runner(first["continuation"], extra=one_contact)
     whole_runner = dn.compile(
         model,
         dt=DT,

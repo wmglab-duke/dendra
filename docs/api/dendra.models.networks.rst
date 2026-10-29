@@ -41,6 +41,14 @@ recurrent delivery follows native execution order. See
 :doc:`../advanced/A19_functional_network_lowering` for a runnable example of
 pure timesteps, parameter gradients, NetStim draw packets, and checkpoint
 continuation.
+Bind the returned bundle with ``plan.bind(tensors)`` and supply explicit state
+to ``dn.func.run``. For fresh initialization, ``dn.func.initialize(plan, tensors)``
+returns effective sources with state in a shared continuation; bind and run
+that packet explicitly. Deterministic inputs use mappings from Population names
+to ``dn.func.Inputs``. Supply the ``RuntimeDraws`` from
+``plan.sample_runtime_draws`` separately through ``draws=``, or use automatic
+host sampling. See :ref:`functional-runtime-inputs` and
+:ref:`functional-runtime-draws` for the shared Population/Network contracts.
 Rollouts, compiled chunks, per-population input tapes, qualified
 recordings, and checkpointed host execution are described in
 :doc:`../advanced/A20_functional_network_rollout`.

@@ -45,12 +45,18 @@ class CompiledPopulationChunk:
     constructed. Later edits to the imperative source Population do not alter
     the compiled kernel; create a new functional plan after structural edits.
 
-    ``inputs`` supplies exactly ``steps`` time-leading samples. Optional
+    ``inputs=Inputs(...)`` supplies exactly ``steps`` time-leading samples;
+    ``draws=RuntimeDraws(...)`` supplies explicit stochastic tapes. Optional
     ``callbacks`` from ``functional.make_callbacks(...)`` use the same
     stimulation clock and return results in ``auxiliary['callbacks']``.
     Continue with the returned simulation state and
     ``callback_state=auxiliary['callbacks'].state``; resumed recording contains
     only samples produced by the new call.
+
+    Bind raw sources with ``kernel.bind(tensors_or_continuation)`` and schedule
+    arbitrary horizons with ``dn.func.run(bound, state_or_continuation, ...)``.
+    Direct chunk calls retain the explicit parameters/prepared/state contract
+    and return callback carry separately.
     """
 
     def __init__(

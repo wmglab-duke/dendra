@@ -120,3 +120,50 @@ def test_outer_index_replacement_refreshes_the_watched_coordinate_identity(
         rtol=0,
         atol=0,
     )
+
+    dispatches = []
+
+    class AuthoredCoordinate(torch.Tensor):
+        @property
+        def _version(self):
+            raise AssertionError("coordinate guards must not read authored versions")
+
+        @classmethod
+        def __torch_function__(cls, function, types, args=(), kwargs=None):
+            dispatches.append(function)
+            return super().__torch_function__(function, types, args, kwargs or {})
+
+    gradient_samples = [sample.detach().clone().requires_grad_() for sample in samples]
+    frozen_samples = [sample.detach().clone() for sample in gradient_samples]
+    frozen_indices = [
+        tuple(item.detach().clone() for item in index) for index in indices
+    ]
+    authored = changed.as_subclass(AuthoredCoordinate)
+    indices[0] = (*indices[0][:-1], authored)
+    dispatches.clear()
+    # A warm plain-coordinate cache cannot certify replacement authored indices.
+    # Fall back before consulting their metadata, mutation counters or dispatch.
+    assert intra._prepare_assembly(gradient_samples, indices) is indices
+    assert dispatches == []
+
+    actual = intra(gradient_samples, indices)
+    assert torch.Tensor.index_put_ in dispatches
+    expected = _ordered_reference(intra, gradient_samples, frozen_indices)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    weights = torch.arange(1, actual.numel() + 1, dtype=actual.dtype).reshape_as(actual)
+    actual_gradients = torch.autograd.grad((actual * weights).sum(), gradient_samples)
+    expected_gradients = torch.autograd.grad(
+        (expected * weights).sum(), gradient_samples
+    )
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+        assert torch.isfinite(actual_gradient).all() and (actual_gradient != 0).all()
+    for sample, frozen in zip(gradient_samples, frozen_samples, strict=True):
+        torch.testing.assert_close(sample, frozen, rtol=0, atol=0)
+    for index, frozen in zip(indices, frozen_indices, strict=True):
+        for item, original_item in zip(index, frozen, strict=True):
+            torch.testing.assert_close(
+                item.as_subclass(torch.Tensor), original_item, rtol=0, atol=0
+            )

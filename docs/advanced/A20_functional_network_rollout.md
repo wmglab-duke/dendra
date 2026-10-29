@@ -81,6 +81,16 @@ example for replay, gradients, checkpointing, and continuation.
 
 ## Per-population tapes
 
+The complete example creates deterministic input tapes and a separate runtime
+draw packet:
+
+```{literalinclude} ../../examples/functional_network_rollout.py
+:language: python
+:start-after: "# region inputs"
+:end-before: "# endregion inputs"
+:dedent: 4
+```
+
 Use the same deterministic `Inputs` packet as Population execution:
 
 ```python
@@ -101,16 +111,15 @@ Population/Network example.
 
 ## Compatibility NetStim packets
 
-The existing `NetworkRolloutInput` retains two optional fields. `populations` maps the Network's
-Population names to `RolloutInput(ve=..., intra=...)`; `netstim` supplies explicit
-NetStim draws with their matching post-draw RNG bytes. Each supplied tensor has
-one leading time axis:
+The existing `NetworkRolloutInput` combines two optional fields. `populations`
+maps Population names to `RolloutInput(ve=..., intra=...)`; `netstim` supplies
+NetStim draws with matching post-draw RNG bytes:
 
-```{literalinclude} ../../examples/functional_network_rollout.py
-:language: python
-:start-after: "# region inputs"
-:end-before: "# endregion inputs"
-:dedent: 4
+```python
+legacy = dn.func.NetworkRolloutInput(
+    populations={"left": dn.func.RolloutInput(intra=left_current)},
+    netstim=plan.sample_draw_tape(initial, STEPS),
+)
 ```
 
 The remaining dimensions follow each Population's functional input contract.
@@ -335,11 +344,10 @@ Direct bindings and numerical chunks retain their explicit state/callback
 arguments. Prepared Population bindings also use that explicit form because
 they do not own raw constants.
 
-A returned Network state includes all Population carry, delivery queues,
-NetStim clock/RNG/calendar state, and the authoritative Network clock. The
-explicit-state form remains supported: preserve
-`aux["callbacks"].state` alongside it when continuing the same callback
-collection:
+A returned continuation includes all Population carry, delivery queues,
+NetStim clock/RNG/calendar state, the authoritative Network clock and effective
+sources, with callback memory from the same collection. The example resumes
+that packet with separately sliced deterministic inputs and runtime draws:
 
 ```{literalinclude} ../../examples/functional_network_rollout.py
 :language: python
@@ -355,8 +363,12 @@ each returned recording contains that call's samples. Treat callback state as
 an opaque carry object bound to the same callback collection. Passing no
 callback state starts a fresh collection at the supplied Network boundary.
 
-The example clones carry without detaching it, preserving gradients across the
-prefix. Save complete detached continuation with
+The packet preserves live Tensor identities and gradients across the prefix.
+The explicit-state form also remains available: supply
+`callback_state=prefix_aux["callbacks"].state` with the corresponding simulation
+state. Direct chunks use that form as well.
+
+For qualified built-in callback collections, save detached continuation with
 `dn.func.export_continuation(plan, aux["continuation"], callbacks=callbacks)`.
 Restore the plain data/Tensor packet against a compatible receiving lowered plan
 with `dn.func.restore_continuation(receiving, saved, callbacks=receiving_callbacks)`,
@@ -366,7 +378,10 @@ effective sources, raw parameter/constant aliases, trainability and callback
 phase. Runtime tapes, model configuration, optimizer state and prior recordings
 remain separate. Convenience runners provide the same portable format through
 `program.export_continuation(...)` and `receiver.restore_continuation(...)`;
-their bound callback collection is available as `runner.callbacks`.
+their bound callback collection is available as `runner.callbacks`. The example's
+custom `VoltageEnergy` reducer supports live in-memory continuation;
+portable export of custom bound callback implementations is currently
+unsupported.
 Independently saved analysis can use `callbacks.export_state(...)` and
 `callbacks.restore_state(...)` directly. The portable bridge validates callback settings and
 source/state schemas; see

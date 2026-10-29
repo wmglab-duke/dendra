@@ -102,14 +102,16 @@ state, auxiliary = runner()
 state, auxiliary = runner(auxiliary["continuation"])
 ```
 
-Supplying simulation state and `callback_state=` explicitly uses the same
-continuation contract:
+The complete example checks restart, recording and shared continuation:
 
 ```{literalinclude} ../../examples/functional_api_overview.py
 :language: python
 :start-after: "# region inference"
 :end-before: "# endregion inference"
 ```
+
+The separate simulation-state and `callback_state=` form remains available
+when an application manages those operands individually.
 
 Network Recorders qualify physical fields, such as `left.v`, `right.v` and
 `right.mech.event.g`. `t` selects the Network clock. `region=some_slice` selects
@@ -180,7 +182,7 @@ functional, tensors = dn.func.make_functional(model, dt=DT)
 print(dn.func.inspect_sources(tensors))
 parameters = tensors.independent_parameters(trainable="*.g_param")
 kernel = functional.compile_rollout_chunk(2, backend="aot_eager")
-bound = kernel.bind(parameters, constants=tensors.constants)
+bound = kernel.bind(tensors._replace(parameters=parameters))
 print(dn.func.inspect_sources(bound))
 ```
 
