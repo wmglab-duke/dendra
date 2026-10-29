@@ -109,8 +109,11 @@ Recording is an explicit named callback. By default a fresh Recorder includes
 the initial sample, followed by every accepted step. `Recorder(dt=record_dt)`
 selects a cadence with the native in-memory sampling rule; its phase is explicit
 carry and survives chunks and continuation. Different Recorders can use different
-cadences. Selection occurs after dense emissions are collected, so it changes
-returned samples without reducing peak loop recording allocation; see
+cadences. Host schedules retain selected frames between emission segments.
+With bounded chunks or host/checkpoint spans, that Recorder's payload scales
+with selected history plus bounded dense segments. Each compiled invocation still
+emits dense data; full-rate/custom streams, autograd and input tapes have
+separate storage requirements. Atomic rollouts retain dense finalization; see
 {ref}`functional-recorder-cadence` for timing and compilation details.
 `auxiliary["continuation"]` carries
 the returned simulation state, effective bindings and callback state together.

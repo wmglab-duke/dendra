@@ -7225,8 +7225,11 @@ class Population(P, Sliceable):
             functional_callback_binding = None
         else:
             from dendra.func._callbacks import (
-                FunctionalCallbackResults,
                 FunctionalCallbacks,
+                _collect_callback_emissions,
+                _complete_callback_results,
+                _host_callback_parts,
+                _setup_callback_state,
             )
 
             if not isinstance(functional_callbacks, FunctionalCallbacks):
@@ -7336,33 +7339,22 @@ class Population(P, Sliceable):
 
             if functional_callback_binding is None:
                 return None, []
-            if functional_callback_state is None:
-                native_state, initial_emission = functional_callbacks._initialize(
-                    functional_callback_binding.state()
-                )
-                initial_part = functional_callbacks._stack([initial_emission])
-                parts = (
-                    [initial_part]
-                    if functional_callbacks._has_emissions(initial_part)
-                    else []
-                )
-                return native_state, parts
-            return functional_callbacks._validate_state(functional_callback_state), []
+            model_state = (
+                functional_callback_binding.state()
+                if functional_callback_state is None
+                else None
+            )
+            native_state, parts = _setup_callback_state(
+                functional_callbacks, functional_callback_state, model_state
+            )
+            return native_state, _host_callback_parts(
+                functional_callbacks, native_state, parts
+            )
 
         def _finalize_functional_callback_results(native_state, parts):
             """Finalize one imperative execution segment without hiding carry."""
 
-            stacked = functional_callbacks._concatenate(parts)
-            native_state = functional_callbacks._capture_emission_schemas(
-                native_state,
-                stacked,
-            )
-            outputs = functional_callbacks._finalize(native_state, stacked)
-            native_state = functional_callbacks._materialize_state(native_state)
-            return FunctionalCallbackResults(
-                state=native_state,
-                outputs=outputs,
-            )
+            return _complete_callback_results(functional_callbacks, native_state, parts)
 
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
@@ -7664,8 +7656,13 @@ class Population(P, Sliceable):
                             native_state,
                             **checkpoint_options,
                         )
-                        if functional_callbacks._has_emissions(emitted_part):
-                            callback_parts.append(emitted_part)
+                        _collect_callback_emissions(
+                            functional_callbacks,
+                            native_state,
+                            callback_parts,
+                            emitted_part,
+                        )
+                        del emitted_part
 
                     total_loss, _ = _add_loss(total_loss, chunk_loss)
                     saw_any_loss = saw_any_loss or bool(int(saw_loss_flag.item()))

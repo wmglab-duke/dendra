@@ -104,6 +104,7 @@ def run_demo(*, execution="scan", backend="aot_eager"):
     # region compile
     options = {
         "dt": DT,
+        "chunk_steps": STEPS,
         "execution": execution,
         "inference": execution == "while",
         "callbacks": callbacks,

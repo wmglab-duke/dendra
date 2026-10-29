@@ -16,7 +16,11 @@ from dendra.models.core import _duration_step_budget, _validate_time_scalar
 from ._binding import BoundPopulation
 from ._callbacks import (
     FunctionalCallbacks,
+    _CallbackCollector,
+    _collect_callback_emissions,
     _complete_callback_results,
+    _concatenate_callback_parts,
+    _host_callback_parts,
     _setup_callback_state,
 )
 from ._continuation import (
@@ -681,6 +685,8 @@ def _execute_steps_with_callbacks(
     steps: int,
     callbacks: FunctionalCallbacks,
     callback_state,
+    *,
+    retain=False,
 ):
     """Advance one chunk while threading pure callback carry.
 
@@ -692,7 +698,7 @@ def _execute_steps_with_callbacks(
     if isinstance(step, _StepExecution) and step.compiled_chunks is not None:
         binding = step.binding
         width = binding.compiled_chunk.steps
-        parts = []
+        parts = _host_callback_parts(callbacks, callback_state, []) if retain else []
         for start in range(0, steps, width):
             stop = min(start + width, steps)
             kernel = step.compiled_chunks[stop - start]
@@ -706,13 +712,13 @@ def _execute_steps_with_callbacks(
             callback_state = callbacks._wrap_compiled_update(
                 callback_state, carries, emitted
             )
-            if callbacks._has_emissions(emitted):
-                parts.append(emitted)
+            _collect_callback_emissions(callbacks, callback_state, parts, emitted)
+            del emitted
         return (
             state,
             auxiliary,
             callback_state,
-            callbacks._concatenate(parts, borrow_single=True),
+            _concatenate_callback_parts(callbacks, parts, borrow_single=True),
         )
     emissions = []
     for index in range(steps):
@@ -737,12 +743,13 @@ def _execute_steps_with_callbacks(
         )
         if emitted is not None:
             emissions.append(emitted)
-    return (
-        state,
-        auxiliary,
-        callback_state,
-        callbacks._stack(emissions),
-    )
+    emitted = callbacks._stack(emissions)
+    if retain:
+        parts = _host_callback_parts(callbacks, callback_state, [])
+        if isinstance(parts, _CallbackCollector):
+            _collect_callback_emissions(callbacks, callback_state, parts, emitted)
+            emitted = parts.concatenate(borrow_single=True)
+    return state, auxiliary, callback_state, emitted
 
 
 def _prepare_callback_collection(
@@ -934,9 +941,11 @@ def _execute_chunks(
                 stop - start,
                 callbacks,
                 callback_state,
+                retain=True,
             )
-            if callbacks._has_emissions(emitted):
-                callback_parts.append(emitted)
+            _collect_callback_emissions(
+                callbacks, callback_state, callback_parts, emitted, retained=True
+            )
         _validate_returned_state(
             functional,
             state,
@@ -1108,6 +1117,7 @@ def _execute_checkpointed_chunks(
                 chunk_steps,
                 callbacks,
                 callback_state_in,
+                retain=True,
             )
 
         checkpoint_result = _checkpoint_tensor_tree(execute_chunk, checkpoint_inputs)
@@ -1115,8 +1125,9 @@ def _execute_checkpointed_chunks(
             state, auxiliary = checkpoint_result
         else:
             state, auxiliary, callback_state, emitted = checkpoint_result
-            if callbacks._has_emissions(emitted):
-                callback_parts.append(emitted)
+            _collect_callback_emissions(
+                callbacks, callback_state, callback_parts, emitted, retained=True
+            )
         _validate_returned_state(
             functional,
             state,
@@ -1340,6 +1351,8 @@ def _execute_schedule(
     callbacks, callback_state, callback_parts = _prepare_callback_collection(
         functional, callbacks, callback_state, state, dt
     )
+    if callbacks is not None:
+        callback_parts = _host_callback_parts(callbacks, callback_state, callback_parts)
     execution = _prepare_compiled_schedule(
         execution, steps, chunklength, callbacks=callbacks
     )

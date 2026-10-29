@@ -261,8 +261,11 @@ The independent `coarse` Recorder uses `dt=2 * DT`. With native in-memory
 timing it selects frames 0, 1, 3, 5, and 7 from the eight-step full recording.
 Joining the two execution segments gives the same selected frames as one
 uninterrupted call. This cadence does not change the custom callback or the
-other Recorders. The loop collects dense intermediate emissions and selects
-the returned cadence during finalization; see {ref}`functional-recorder-cadence`.
+other Recorders. The example uses bounded compiled chunks; the host retains
+the selected `coarse` frames between those chunks. The dense `trace` stream
+remains in the example for comparison and retains its full requested history.
+Each loop invocation still emits dense intermediate data; see
+{ref}`functional-recorder-cadence` for the storage contract.
 
 The complete CPU example executes here:
 

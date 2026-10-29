@@ -173,7 +173,9 @@ functional Recorder contract.
 its sampling phase in explicit carry. Each Recorder may use a different cadence;
 continuation does not restart it or repeat the shared boundary. See
 {ref}`functional-recorder-cadence` for stride rounding, initial/post-step timing,
-and the dense-intermediate storage contract.
+and host retention. Host schedules retain selected frames between chunks or
+spans; each compiled invocation still emits a dense segment. This changes
+cadenced recording storage without bounding autograd or input-tape storage.
 
 Use `region=network.left.soma` with qualified physical fields such as `left.v`
 to record a labeled Population Slice. For a concatenated Network, select

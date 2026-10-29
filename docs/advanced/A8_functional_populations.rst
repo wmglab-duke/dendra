@@ -2643,10 +2643,17 @@ callback checkpoints preserve cadence and phase across reconstruction.
 
 Selected floating-point samples remain connected to the model's autograd graph.
 Sampling changes the returned recording, not the simulation or the update
-frequency of other callbacks. Cadence selection runs during result finalization
-after dense timestep emissions have been collected; it does not reduce the
-loop's peak recording allocation. Use the host chunk/run wrappers when compiling
-cadenced recording, so finalization remains outside the compiled tensor loop.
+frequency of other callbacks. Host schedules retain cadence-selected frames at
+emission-segment boundaries. With bounded compiled chunks or host/checkpoint
+spans, that Recorder's retained payload scales with its selected history plus
+bounded dense emission segments. Each scan/while invocation still emits dense
+timestep data. Other callback streams retain their requested outputs, and
+autograd, input tapes and preparation have their own storage requirements.
+
+Atomic rollouts and direct fixed-width chunk calls retain their dense emission
+path and select the returned cadence during finalization. Use the host
+chunk/run wrappers to collect selected frames between bounded segments and keep
+finalization outside the compiled tensor loop.
 An outer compilation of an atomic callback rollout includes that finalization
 and requires the backend to support dynamic output shapes. With AOT eager,
 PyTorch's ``capture_dynamic_output_shape_ops`` setting enables this capture;

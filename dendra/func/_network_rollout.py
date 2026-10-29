@@ -11,7 +11,12 @@ import torch
 from torch.utils import _pytree as pytree
 
 from ._binding_sources import _BINDING_UNSET, _is_binding_packet
-from ._callbacks import _update_callback_values
+from ._callbacks import (
+    _collect_callback_emissions,
+    _concatenate_callback_parts,
+    _host_callback_parts,
+    _update_callback_values,
+)
 from ._execution import (
     ExecutionCapabilities,
     ExecutionReport,
@@ -702,6 +707,8 @@ def run(
     callbacks, callback_state, parts = _validate(
         functional, parameters, state, callbacks, callback_state
     )
+    if callbacks is not None:
+        parts = _host_callback_parts(callbacks, callback_state, parts)
     _validate_tree(constants, functional._constant_schema, "constants")
     tape, steps = _resolve_inputs(
         functional, inputs, steps, allow_missing_draws=True, draws=draws
@@ -812,7 +819,11 @@ def run(
         functional._validate_parameters(parameters_in)
         functional._validate_state(state_in)
         values = functional._prepare_values(parameters_in, constants_in)
-        emitted_parts = []
+        emitted_parts = (
+            _host_callback_parts(callbacks, callback_in, [])
+            if callbacks is not None
+            else []
+        )
         auxiliary_in = _auxiliary(functional, state_in)
         for start, stop in _execution_spans(span_steps, kernel_width):
             selected = _slice(tape_in, start, stop)
@@ -872,9 +883,16 @@ def run(
                     parameters_in, values, state_in, selected, callbacks, callback_in
                 )
             functional.check_overflow(state_in)
-            if callbacks is not None and callbacks._has_emissions(emitted):
-                emitted_parts.append(emitted)
-        emitted = None if callbacks is None else callbacks._concatenate(emitted_parts)
+            if callbacks is not None:
+                _collect_callback_emissions(
+                    callbacks, callback_in, emitted_parts, emitted
+                )
+            del emitted
+        emitted = (
+            None
+            if callbacks is None
+            else _concatenate_callback_parts(callbacks, emitted_parts)
+        )
         return state_in, auxiliary_in, callback_in, emitted
 
     with (
@@ -1000,8 +1018,10 @@ def run(
                 state, auxiliary, callback_state, emitted = _checkpoint_tensor_tree(
                     execute, operands
                 )
-            if callbacks is not None and callbacks._has_emissions(emitted):
-                parts.append(emitted)
+            if callbacks is not None:
+                _collect_callback_emissions(
+                    callbacks, callback_state, parts, emitted, retained=True
+                )
         return state, _attach_callback_results(
             auxiliary, callbacks, callback_state, parts
         )

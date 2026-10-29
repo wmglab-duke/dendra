@@ -177,10 +177,11 @@ class Recorder(FunctionalCallback):
     that phase across chunks and continuation, without another initial sample.
     ``sliding_window`` is currently unsupported.
 
-    Cadence selection occurs during finalization; chunk emissions remain
-    dense. Compiled chunks and ``run`` keep finalization outside their tensor
-    kernel. Compiling an atomic callback rollout that includes finalization
-    requires the PyTorch backend to support dynamic output shapes.
+    Host schedules retain selected frames between chunks; each tensor kernel
+    still emits dense data. Atomic rollouts and direct chunk calls select
+    cadence during finalization. Compiling an atomic callback rollout that
+    includes finalization requires the PyTorch backend to support dynamic
+    output shapes.
 
     ``region`` accepts a physical Slice belonging to the exact source
     Population, including a named child selection such as
@@ -443,6 +444,9 @@ class _BoundCadencedRecorder(FunctionalCallback):
         return carry + 1, self.recorder._observe(state)
 
     def finalize(self, carry, emissions):
+        return self._select_emissions(carry, emissions)
+
+    def _select_emissions(self, carry, emissions):
         from dendra.models._recorder_cadence import _recorder_indices
 
         if emissions is None:
@@ -1416,16 +1420,84 @@ def _setup_callback_state(callbacks, callback_state, state):
     return callback_state, parts
 
 
+class _CallbackCollector:
+    """Invocation-local sampled history outside the numerical loop boundary."""
+
+    def __init__(self, callbacks, cadences):
+        self._callbacks = callbacks
+        self._cadences = cadences
+        self.parts = []
+
+    def append(self, callback_state, emitted, *, retained=False):
+        if not retained:
+            emitted = dict(emitted)
+            for name, recorder in self._cadences:
+                emitted[name] = recorder._select_emissions(
+                    callback_state[name], emitted[name]
+                )
+        # Empty selections still own a connected zero VJP. Retain their tensor
+        # parts instead of synthesizing detached empties during completion.
+        self.parts.append(emitted)
+
+    def concatenate(self, *, borrow_single=False):
+        return self._callbacks._concatenate(self.parts, borrow_single=borrow_single)
+
+
+def _host_callback_parts(callbacks, callback_state, parts):
+    """Opt owned host collections into retention without changing atomic calls."""
+    if type(callbacks) is not FunctionalCallbacks:
+        return parts
+    for name, original in _CALLBACK_RETENTION_HOOKS:
+        method = getattr(callbacks, name)
+        if getattr(method, "__func__", method) is not original:
+            return parts
+    cadences = []
+    for plan in callbacks._plans:
+        implementation = _callback_implementation(plan.callback)
+        if type(implementation) is _BoundCadencedRecorder:
+            cadences.append((plan.name, implementation))
+    if not cadences:
+        return parts
+    collector = _CallbackCollector(callbacks, tuple(cadences))
+    for part in parts:
+        collector.append(callback_state, part)
+    return collector
+
+
+def _collect_callback_emissions(
+    callbacks, callback_state, parts, emitted, *, retained=False
+):
+    if callbacks._has_emissions(emitted):
+        if isinstance(parts, _CallbackCollector):
+            parts.append(callback_state, emitted, retained=retained)
+        else:
+            parts.append(emitted)
+
+
+def _concatenate_callback_parts(callbacks, parts, *, borrow_single=False):
+    if isinstance(parts, _CallbackCollector):
+        return parts.concatenate(borrow_single=borrow_single)
+    if borrow_single:
+        return callbacks._concatenate(parts, borrow_single=True)
+    return callbacks._concatenate(parts)
+
+
 def _complete_callback_results(
     callbacks, callback_state, parts
 ) -> FunctionalCallbackResults:
     """Finalize one segment before materializing its continuation carry."""
-    stacked = callbacks._concatenate(parts)
+    if isinstance(parts, _CallbackCollector):
+        stacked = parts.concatenate()
+    else:
+        stacked = callbacks._concatenate(parts)
     callback_state = callbacks._capture_emission_schemas(
         callback_state,
         stacked,
     )
-    outputs = callbacks._finalize(callback_state, stacked)
+    if isinstance(parts, _CallbackCollector):
+        outputs = callbacks._finalize(callback_state, stacked, _retained=True)
+    else:
+        outputs = callbacks._finalize(callback_state, stacked)
     callback_state = callbacks._materialize_state(callback_state)
     return FunctionalCallbackResults(
         state=callback_state,
@@ -1846,15 +1918,20 @@ class FunctionalCallbacks:
             _emission_schemas=tuple(schemas),
         )
 
-    def _finalize(self, callback_state, emissions):
+    def _finalize(self, callback_state, emissions, *, _retained=False):
         self._validate_state(callback_state)
-        outputs = {
-            plan.name: plan.callback.finalize(
-                callback_state[plan.name],
-                emissions[plan.name],
+        outputs = {}
+        for plan in self._plans:
+            if _retained:
+                implementation = _callback_implementation(plan.callback)
+                if type(implementation) is _BoundCadencedRecorder:
+                    outputs[plan.name] = implementation.recorder.finalize(
+                        (), emissions[plan.name]
+                    )
+                    continue
+            outputs[plan.name] = plan.callback.finalize(
+                callback_state[plan.name], emissions[plan.name]
             )
-            for plan in self._plans
-        }
         for plan in self._plans:
             leaves, spec = torch.utils._pytree.tree_flatten(outputs[plan.name])
             if spec != plan.result_schema.spec:
@@ -1888,6 +1965,23 @@ class FunctionalCallbacks:
                         "result leaf's dtype, device, rank, or trailing shape"
                     )
         return outputs
+
+
+_CALLBACK_RETENTION_HOOKS = tuple(
+    (name, getattr(FunctionalCallbacks, name))
+    for name in (
+        "_initialize",
+        "_validate_state",
+        "_update",
+        "_stack",
+        "_wrap_compiled_update",
+        "_concatenate",
+        "_has_emissions",
+        "_capture_emission_schemas",
+        "_finalize",
+        "_materialize_state",
+    )
+)
 
 
 __all__ = [
