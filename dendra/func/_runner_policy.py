@@ -7,6 +7,21 @@ import torch
 from ._callbacks import FunctionalCallback
 from ._types import FunctionalizationError
 
+_DEFAULT_RUNTIME_EXTRA_CHUNK_STEPS = 64
+
+
+def _runner_chunk_steps(chunk_steps, *, steps, runtime_extra):
+    """Resolve compiled width without changing the runner's complete horizon."""
+    if chunk_steps is not None:
+        if (
+            isinstance(chunk_steps, bool)
+            or not isinstance(chunk_steps, int)
+            or chunk_steps < 1
+        ):
+            raise ValueError("chunk_steps must be a positive integer")
+        return min(steps, chunk_steps)
+    return min(steps, _DEFAULT_RUNTIME_EXTRA_CHUNK_STEPS) if runtime_extra else steps
+
 
 def _validate_host_construction(compile_options):
     if torch.compiler.is_compiling():

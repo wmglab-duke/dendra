@@ -4,9 +4,11 @@
 Run from the repository root::
 
     python examples/functional_compiled_runner.py --execution scan
+    python examples/functional_compiled_runner.py --chunk-steps 3
     python examples/functional_compiled_runner.py --execution while --threads 4
     python examples/functional_compiled_runner.py --execution scan --grad
     python examples/functional_compiled_runner.py --grad --checkpoint-every 3
+    python examples/functional_compiled_runner.py --grad --chunk-steps 3 --checkpoint-every 5
     python examples/functional_compiled_runner.py --extra --grad --checkpoint-every 4
     python examples/functional_compiled_runner.py --initialization fresh --grad --checkpoint-every 4
 
@@ -60,6 +62,11 @@ def main():
         "--extra", action="store_true", help="bind an extracellular field and waveform"
     )
     parser.add_argument(
+        "--chunk-steps",
+        type=int,
+        help="compiled chunk width; the call still advances eight steps",
+    )
+    parser.add_argument(
         "--checkpoint-every",
         type=int,
         help="recompute training scan spans of this many steps during backward",
@@ -67,6 +74,11 @@ def main():
     args = parser.parse_args()
     if args.grad and args.execution != "scan":
         parser.error("--grad requires --execution scan; while is inference-only")
+    if args.chunk_steps is not None:
+        if args.chunk_steps < 1:
+            parser.error("--chunk-steps must be a positive integer")
+        if args.execution == "while" and min(8, args.chunk_steps) < 4:
+            parser.error("--execution while requires a chunk width of at least four")
     if args.checkpoint_every is not None:
         if args.checkpoint_every < 1:
             parser.error("--checkpoint-every must be a positive integer")
@@ -100,6 +112,7 @@ def main():
         model,
         dt=0.01,
         steps=8,
+        chunk_steps=args.chunk_steps,
         extra=extra,
         execution=args.execution,
         callbacks={"trace": dn.func.Recorder(("v", "t"))},
@@ -148,6 +161,7 @@ def main():
         )
 
     torch.testing.assert_close(model.v, original_voltage)
+    print(f"steps per call: 8; compiled chunk width: {runner.kernel.steps}")
     print(f"execution strategy: {runner.execution_report().strategy}")
 
 

@@ -40,11 +40,22 @@ initialized, functionally supported Population:
        model,
        dt=0.025,
        steps=800,
+       chunk_steps=128,
        execution="scan",
        callbacks={"trace": dn.func.Recorder(("v",))},
    )
    final_state, auxiliary = runner()
    voltage = auxiliary["callbacks"]["trace"]["v"]
+
+``steps`` is the fixed number of accepted timesteps per call.
+``chunk_steps=C`` selects a positive compiled chunk width, capped at ``steps``;
+it need not divide the horizon. The scheduler uses cached shorter tails where
+needed. Without activation checkpointing, it also groups host work into spans
+of this width. With ``chunk_steps=None``, an ordinary runner uses the full
+horizon. A runner with ``extra=dn.VarInput()`` defaults to at most 64 steps
+per chunk.
+Registered stimulation and compile-time bound ``extra`` use the ordinary
+runner default. Requested recordings retain the complete selected trajectory.
 
 Recording is configured only through the named ``callbacks`` mapping; no
 recorder is added implicitly. ``Recorder`` includes the initial frame, so
@@ -92,8 +103,9 @@ Explicit compiler modes and alternate code-generation options take precedence
 over the default C++ wrapper choice.
 Scan and while execution use Dendra's PyTorch 2.14+ baseline; supported features
 are not selected by patch-version number. The Population convenience runner's
-while execution requires at least four steps, a nonempty collection of supported
-built-in callbacks, and a capturable inference step.
+while execution requires a compiled chunk width of at least four steps,
+a nonempty collection of supported built-in callbacks, and a capturable
+inference step.
 Supported built-ins are ``Recorder``, ``LFP``, ``AnomalyDetector``, ``Raster``, ``APCount``,
 ``Active``, ``ActiveAL``, and ``ActiveALCount``; scan also accepts pure custom
 functional callbacks. An unsupported while request raises an error
@@ -360,6 +372,7 @@ scan configuration:
        model,
        dt=0.025,
        steps=20_000,
+       chunk_steps=128,
        execution="scan",
        inference=False,
        checkpoint_every=256,
@@ -373,8 +386,10 @@ scan configuration:
 
 ``checkpoint_every=H`` is a positive integer controlling the maximum number of
 accepted steps in each checkpoint span, not an alternative execution mode.
-The scheduler runs cached compiled scan chunks and a cached shorter tail when
-needed. Non-reentrant activation checkpointing replays these spans during
+For an ordinary runner, it is independent of ``chunk_steps=C``: neither
+``H`` nor ``C`` needs to divide the other or the call's horizon. Each checkpoint
+span uses cached compiled scan chunks and a shorter tail when needed.
+Non-reentrant activation checkpointing replays these spans during
 backward; it preserves gradients across the full simulation, initial state,
 parameters, explicit inputs, and callback carry. Steps and custom callbacks must
 be pure, deterministic, and replay-safe. Replay retains source and prepared-input
@@ -1755,11 +1770,11 @@ with an explicit ``Inputs.ve`` source.
 The host evaluates the selected contacts and passes assembled extracellular
 voltage to the compiled model in bounded chunks. Changing a Waveform type,
 contact count, or field value reuses that model kernel and the Population's
-valid inference preparation. ``chunk_steps`` is a positive integer accepted
-only with ``VarInput``. Its default is 64; the kernel width is capped at the
-runner's ``steps``. This bounds the temporary assembled voltage tape by the
-chunk width. Requested recordings still retain their selected trajectory,
-and training retains the activations needed for gradients. In training scan,
+valid inference preparation. With ``VarInput``, ``chunk_steps`` defaults to 64;
+the kernel width is capped at the runner's ``steps``. This bounds the temporary
+assembled voltage tape by the chunk width. Requested recordings still retain
+their selected trajectory, and training retains the activations needed for
+gradients. In training scan,
 ``checkpoint_every=H`` uses checkpoint spans of at most
 ``min(H, chunk_steps)`` steps.
 

@@ -92,6 +92,19 @@ It enters inference mode during execution. Every no-state call restarts from
 the initialized snapshot; an explicit state continues that simulation. It does
 not advance the native model or overwrite its snapshot.
 
+`steps` fixes each call's horizon; `chunk_steps` selects the compiled width for
+both Populations and Networks:
+
+```python
+runner = dn.compile(model, dt=DT, steps=1_000, chunk_steps=128)
+state, auxiliary = runner()  # All 1,000 steps, including the shorter tail.
+```
+
+The positive chunk width is capped at `steps` and need not divide it. Omission
+uses the full horizon for ordinary runners, or at most 64 steps for runtime
+`extra=dn.VarInput()` slots. Registered and compile-time bound stimulation use
+the ordinary setting. Chunking does not remove requested recording storage.
+
 Recording is an explicit named callback. A fresh Recorder includes the initial
 sample, followed by every accepted step. `auxiliary["continuation"]` carries
 the returned simulation state, effective bindings and callback state together.
@@ -149,6 +162,9 @@ runner across optimizer iterations does not retain an old preparation graph.
 `checkpoint_every=H` recomputes exact H-step spans during backward; gradients
 continue through the entire simulation. It does not truncate history or remove
 the storage required by requested full recordings.
+For ordinary runners, H is independent of `chunk_steps=C`, including when
+neither divides the other. Runtime `VarInput` assembly retains checkpoint spans
+bounded by `min(H, C)`.
 
 The runner's parameter mappings are read-only containers with editable Tensor
 leaves. Per-call `parameters=` and `constants=` overrides retain the supplied
@@ -689,10 +705,11 @@ its initial boundary sample. Native state is published only through an explicit
 `dn.compile` selects scan by default. First-order training is supported by scan
 and compiled unrolled chunks. `execution="while"` is inference-only and supports
 its defined built-in callbacks, including supported Population scopes in a
-Network; custom callbacks use scan. Population while runners require at least
-four steps and a nonempty supported callback collection. Network while runners
-also support callback-free execution and short tails. Requested unsupported
-while execution raises rather than silently choosing another strategy.
+Network; custom callbacks use scan. Population while runners require a compiled
+chunk width of at least four steps and a nonempty supported callback collection.
+Network while runners also support callback-free execution and short tails.
+Requested unsupported while execution raises rather than silently choosing
+another strategy.
 
 `vmap`, forward-mode AD and higher-order differentiation have a different
 execution contract from ordinary first-order compiled training. Supported

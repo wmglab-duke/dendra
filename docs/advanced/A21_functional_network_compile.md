@@ -63,6 +63,14 @@ topology, component schemas, and timestep are fixed by the compiled plan.
 Changing them requires a new runner; initialize the Network again when its
 configuration requires it, including after changing the timestep.
 
+`chunk_steps=C` selects a positive compiled width capped at `steps`. Each call
+still advances the complete horizon, using cached shorter tails when needed;
+there is no divisibility requirement. Without activation checkpointing, C also
+sets the host span width. Omitting it uses the full horizon for an
+ordinary runner, or at most 64 steps with runtime `extra=dn.VarInput()` slots.
+Registered stimulation and compile-time bound `extra` use the same ordinary
+chunk selection. This width does not bound requested recording storage.
+
 Network runners support `initialization="snapshot"` (the default),
 `initialization="fresh"`, and `execution="scan"` or inference-only
 `execution="while"`. The snapshot includes Population carry, connection queues,
@@ -527,6 +535,9 @@ lower activation storage. Exact shorter tails are executed when H does not
 divide the call's horizon. Gradients include the entire prefix and suffix;
 checkpointing does not truncate their history. Requested recordings still
 occupy their normal output storage.
+For an ordinary runner, H is independent of `chunk_steps=C`: a checkpoint span
+can contain multiple chunks, and neither width needs to divide the other.
+Runtime `VarInput` assembly retains its bounded spans of at most `min(H, C)`.
 
 The example compares the compiled two-call run to one uninterrupted eager
 rollout using the same explicit parameter leaves, drive tape, and NetStim

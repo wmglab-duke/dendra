@@ -249,8 +249,9 @@ no `stimulation.extra.*` runner parameter leaves and do not use `trainable`.
 The compiled Network consumes assembled extracellular voltage in bounded
 chunks. Changes to runtime contact recipes reuse its model kernel;
 call-local contact plans and autograd graphs are not retained between calls.
-`chunk_steps` is a positive integer accepted only when runtime slots are
-declared. It defaults to 64, with the kernel width capped at `steps`.
+With runtime slots, `chunk_steps` defaults to 64, with the positive kernel
+width capped at `steps`. Ordinary runners also accept an explicit chunk width;
+see {doc}`A21_functional_network_compile` for its horizon and checkpoint rules.
 In training scan, `checkpoint_every=H` uses spans of at most
 `min(H, chunk_steps)` steps. Recordings retain their requested trajectory.
 Inference-only while execution keeps the usual bounded tail behavior;

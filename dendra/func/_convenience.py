@@ -24,6 +24,7 @@ from ._population import (
 from ._runner_policy import (
     _configured_callbacks,
     _inference_compile_options,
+    _runner_chunk_steps,
     _validate_host_call,
     _validate_host_construction,
 )
@@ -38,7 +39,6 @@ from ._runners import (
 from ._runtime_extra import (
     _MISSING_RUNTIME_EXTRA,
     VarInput,
-    _runtime_extra_chunk_steps,
 )
 from ._types import FunctionalizationError
 
@@ -100,6 +100,14 @@ class CompiledRunner:
     This is a host-side convenience object, not a torch.compile/torch.func
     transform target; those uses retain the lower-level functional API.
 
+    ``chunk_steps`` selects a compiled kernel width capped to ``steps``. The
+    default width is the complete horizon, or at most 64 steps for runtime
+    ``extra`` slots. Ordinary calls group execution by that width; training
+    checkpoints retain their separate ``checkpoint_every`` boundaries. Compiled
+    scan/while kernels execute within each span, with cached shorter tails.
+    Neither span has to divide the other. Recording retains the full requested
+    trajectory, regardless of kernel width.
+
     ``extra`` binds one ``(field, Waveform)`` pair or a sequence of contacts.
     Field and waveform leaves become independent ``stimulation.extra.*``
     parameters, selectable with ``trainable`` like model parameters. Bound
@@ -110,9 +118,9 @@ class CompiledRunner:
     ``extra=VarInput()`` declares a required call-local stimulation input.
     Supply ``extra=(field, waveform)`` or a contact sequence to each invocation;
     deterministic waveform recipes and contact counts may differ between calls.
-    Explicit ``extra=None`` supplies zero drive. ``chunk_steps`` bounds the
-    assembled voltage block independently of the complete ``steps`` horizon
-    and defaults to 64 (capped to that horizon). Checkpoint spans are bounded
+    Explicit ``extra=None`` supplies zero drive. ``chunk_steps`` also bounds the
+    assembled voltage block independently of the complete ``steps`` horizon.
+    Runtime-extra checkpoint spans are bounded
     by both ``checkpoint_every`` and ``chunk_steps``. Runtime waveforms are not
     retained by the runner or included in its default parameter mappings.
     Runtime randomized Poisson stimulation is currently unsupported.
@@ -184,12 +192,14 @@ class CompiledRunner:
         self._steps = steps
         self._checkpoint_every = checkpoint_every
         self._runtime_extra = isinstance(extra, VarInput)
-        self._chunk_steps = _runtime_extra_chunk_steps(
-            chunk_steps, steps=steps, enabled=self._runtime_extra
+        self._chunk_steps = _runner_chunk_steps(
+            chunk_steps, steps=steps, runtime_extra=self._runtime_extra
         )
-        if self._runtime_extra and execution == "while" and self._chunk_steps < 4:
+        if execution == "while" and self._chunk_steps < 4:
             raise ValueError(
-                "execution='while' requires runtime extra chunk_steps of at least four"
+                "execution='while' requires "
+                + ("runtime extra " if self._runtime_extra else "")
+                + "chunk_steps of at least four"
             )
         # Versioned snapshots must remain ordinary tensors even when the
         # convenience constructor is called inside inference_mode().
@@ -380,18 +390,23 @@ class CompiledRunner:
         functional = self._functional
         functional._validate_state(state)
         values = functional._validate_prepared(prepared, parameters)
-        steps = self._kernel.steps if self._runtime_extra else self._steps
-        if self._runtime_extra:
+        steps = self._kernel.steps
+        if self._runtime_extra or steps < self._steps:
+            if not self._runtime_extra:
+                # Qualify the full call before a shorter preflight could hide
+                # an invalid time axis. Missing drives remain unmaterialized.
+                functional._resolve_rollout_inputs(inputs, self._steps)
             # Only inspect one bounded loop signature. The actual schedule
             # samples draw packets and assembles stimulation span by span.
             inputs = _slice_inputs(inputs, 0, steps)
-            inputs = inputs._replace(
-                ve=torch.zeros(
-                    (steps, *functional.shape),
-                    device=functional.device,
-                    dtype=functional.dtype,
+            if self._runtime_extra:
+                inputs = inputs._replace(
+                    ve=torch.zeros(
+                        (steps, *functional.shape),
+                        device=functional.device,
+                        dtype=functional.dtype,
+                    )
                 )
-            )
             if _canonical_runtime_sampling_available(functional, inputs):
                 inputs = _prepare_chunk_inputs(
                     functional, state, inputs, 0, steps, canonical=True
@@ -601,6 +616,7 @@ class CompiledRunner:
                 else self._kernel.bind(selected_parameters, prepared)
             )
             inputs = _population_inputs(inputs)
+            bounded_while = self._runtime_extra or self._chunk_steps < self._steps
             if self._runtime_extra and inputs.ve is not None:
                 raise ValueError("explicit ve cannot be combined with runtime extra")
             if inputs.draws is not None:
@@ -609,7 +625,7 @@ class CompiledRunner:
                 )
             if (
                 self._execution == "while"
-                and not self._runtime_extra
+                and not bounded_while
                 and _canonical_runtime_sampling_available(self._functional, inputs)
             ):
                 inputs = _prepare_chunk_inputs(
@@ -622,7 +638,7 @@ class CompiledRunner:
                 )
             if (
                 self._execution == "while"
-                and not self._runtime_extra
+                and not bounded_while
                 and inputs.draws is None
             ):
                 inputs = self._functional._sample_missing_runtime_draws(
@@ -630,7 +646,7 @@ class CompiledRunner:
                 )
             if (
                 self._execution == "while"
-                and not self._runtime_extra
+                and not bounded_while
                 and getattr(inputs, "draws", None) is None
                 and inputs.noise is None
             ):
@@ -644,7 +660,7 @@ class CompiledRunner:
                 )
             if (
                 self._execution == "while"
-                and not self._runtime_extra
+                and not bounded_while
                 and getattr(inputs, "draws", None) is None
                 and inputs.stimulation is None
                 and getattr(self._functional, "_poisson_plan", None) is not None
@@ -658,7 +674,7 @@ class CompiledRunner:
                     stimulation=sample_stimulation(selected_state, self._steps)
                 )
             if self._execution == "while":
-                if not self._runtime_extra:
+                if not bounded_while:
                     inputs = _normalize_sampled_inputs(
                         self._functional,
                         inputs,
@@ -680,12 +696,13 @@ class CompiledRunner:
             )
             if self._runtime_extra:
                 schedule_options.update(extra=extra, _runtime_extra_slot=True)
-                if self._checkpoint_every is None:
+            if self._checkpoint_every is None:
+                if self._runtime_extra or self._chunk_steps < self._steps:
                     schedule_options["host_span_steps"] = self._chunk_steps
-                else:
-                    schedule_options["checkpoint_every"] = min(
-                        self._checkpoint_every, self._chunk_steps
-                    )
+            elif self._runtime_extra:
+                schedule_options["checkpoint_every"] = min(
+                    self._checkpoint_every, self._chunk_steps
+                )
             previous_report = self._kernel.execution_report()
             final, auxiliary = schedule(
                 bound,
@@ -778,8 +795,12 @@ def compile(
     ``extra=VarInput()`` declares call-local deterministic stimulation instead
     of binding a concrete recipe. Calls require an ``extra=`` specification;
     use ``None`` for zero drive. Waveform types and contact counts may differ
-    between calls. ``chunk_steps`` bounds its assembly and kernel width and
-    defaults to 64, capped to ``steps``. It requires a runtime-extra declaration.
+    between calls. ``chunk_steps`` selects a compiled width capped to ``steps``
+    for either runner. Its default is the full horizon for ordinary runners,
+    or at most 64 steps with runtime-extra slots, where it also bounds
+    stimulation assembly. Ordinary activation-checkpoint spans remain
+    independent of the kernel width; runtime-extra spans retain the additional
+    assembly bound. Short tails are cached without a divisibility requirement.
     Networks also accept ``extra={name: VarInput(), ...}`` to declare selected
     Population inputs alongside other bound stimulation. Runtime overrides map
     only those declared names to specs; omitted names receive zero drive.

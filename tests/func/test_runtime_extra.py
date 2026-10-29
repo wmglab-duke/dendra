@@ -231,10 +231,10 @@ def test_invalid_chunk_steps_fails_before_functionalization(monkeypatch, chunk_s
         )
 
 
-def test_chunk_steps_requires_a_runtime_slot_and_caps_the_compiled_width():
+def test_chunk_steps_bounds_ordinary_and_runtime_compiled_widths():
     model = _model()
-    with pytest.raises(ValueError, match="chunk_steps.*VarInput|chunk_steps.*runtime"):
-        dn.compile(model, dt=DT, steps=STEPS, chunk_steps=4, backend="eager")
+    ordinary = dn.compile(model, dt=DT, steps=STEPS, chunk_steps=4, backend="eager")
+    assert ordinary.kernel.steps == 4
     assert _runner(model, steps=5, chunk_steps=20).kernel.steps == 5
     assert _runner(model, steps=73, chunk_steps=None).kernel.steps == 64
 

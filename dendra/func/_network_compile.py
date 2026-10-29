@@ -26,13 +26,13 @@ from ._network_parameters import (
 from ._runner_policy import (
     _configured_callbacks,
     _inference_compile_options,
+    _runner_chunk_steps,
     _validate_host_call,
     _validate_host_construction,
 )
 from ._runtime_extra import (
     _MISSING_RUNTIME_EXTRA,
     VarInput,
-    _runtime_extra_chunk_steps,
 )
 from ._types import FunctionalizationError
 
@@ -66,7 +66,12 @@ class CompiledNetworkRunner:
     pure callback reducers use the existing Network callback binding.
 
     Preparation and output graphs are invocation-local; only compiled kernels
-    are cached. ``checkpoint_every`` preserves gradients across exact spans.
+    are cached. ``chunk_steps`` selects the compiled kernel width capped to the
+    complete ``steps`` horizon; omission uses that horizon, or at most 64 steps
+    with runtime ``extra`` slots. ``checkpoint_every`` preserves gradients
+    across independent activation-checkpoint spans. Each span executes compiled
+    scan/while chunks and cached shorter tails, without a divisibility
+    requirement. Requested recordings remain retained across the complete run.
     The initialized Network's mode and timestep are frozen. Gradient execution
     requires a Network initialized in training mode. Fresh calls accept a
     :class:`NetworkInitializationInput` override and return effective parameters
@@ -93,7 +98,8 @@ class CompiledNetworkRunner:
     an ``extra`` mapping (or ``None``); omitted declared names receive zero
     stimulation. Recipe types and contact counts may vary between calls.
     ``chunk_steps`` bounds call-local assembly and compiled kernel width,
-    defaulting to 64 for runtime slots. Runtime stimulation is deterministic;
+    with runtime-extra checkpoint spans capped to that width as well.
+    Runtime stimulation is deterministic;
     bind randomized Poisson waveforms when compiling.
 
     ``pending_capacity`` sets the entry count for packed scheduled traffic and
@@ -172,8 +178,8 @@ class CompiledNetworkRunner:
         else:
             runtime_extra_names, bound_extra = (), extra
         self._runtime_extra_names = runtime_extra_names
-        self._chunk_steps = _runtime_extra_chunk_steps(
-            chunk_steps, steps=steps, enabled=bool(runtime_extra_names)
+        self._chunk_steps = _runner_chunk_steps(
+            chunk_steps, steps=steps, runtime_extra=bool(runtime_extra_names)
         )
         with torch.inference_mode(False), torch.no_grad():
             self._functional, tensors = _lower_network(
