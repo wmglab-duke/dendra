@@ -139,9 +139,7 @@ lowered Population or Network, use the shared functions:
        receiving, torch.load(path, weights_only=True),
        callbacks=receiving_callbacks,
    )
-   bound = receiving_kernel.bind(
-       restored.parameters, constants=restored.constants,
-   )
+   bound = receiving_kernel.bind(restored)
    state, auxiliary = dn.func.run(
        bound, restored, steps=100, callbacks=receiving_callbacks,
    )
@@ -237,7 +235,7 @@ effective parameters/constants and no callback carry:
 
    functional, tensors = dn.func.make_functional(model, dt=0.025)
    initial = dn.func.initialize(functional, tensors)
-   bound = functional.bind(initial.parameters, constants=initial.constants)
+   bound = functional.bind(initial)
    final_state, auxiliary = dn.func.run(bound, initial, steps=800)
 
 Bind the returned sources because initialization can replace raw parameters and
@@ -1999,11 +1997,11 @@ Host-side simulation
 Use ``dn.func.run`` to advance an explicit state through a binding. It is the
 common host scheduling interface for Populations and Networks. Population
 and Network bindings use the same raw parameter/constant contract. Bind an eager
-step with explicit constants:
+step from its tensor bundle:
 
 .. code-block:: python
 
-   eager_step = fmodel.bind(tensors.parameters, constants=tensors.constants)
+   eager_step = fmodel.bind(tensors)
    drives = dn.func.Inputs(
        ve=ve_over_time,
        intra=intra_over_time,
@@ -2018,6 +2016,19 @@ properties expose read-only snapshots of the mapping containers and tensor
 references. Shared tensor aliases and autograd history remain live. Replacing
 a leaf in the caller's mapping requires a new binding; in-place tensor edits,
 including optimizer updates, are visible on the next invocation.
+
+Eager plans and compiled chunks accept the matching ``PopulationTensors`` or
+``NetworkTensors`` bundle, or a ``Continuation``, as the source argument.
+``kernel.bind(initial)`` and ``kernel.bind(restored)`` select only the packet's
+parameters and constants. They do not choose, retain or validate its state,
+callback carry or initialization recipe. Pass the intended state or packet to
+``dn.func.run`` explicitly, with the matching callback collection when needed.
+Raw binding construction snapshots source containers and preserves live Tensor
+identities without cloning, detaching, initializing, sampling or preparing.
+When using a bundle or continuation, omit ``constants`` and ``prepared``;
+supplying either, including ``None``, conflicts with the packet's sources.
+The existing ``bind(parameters, constants=constants)`` mapping form and
+Population ``bind(parameters, prepared)`` form retain their contracts.
 
 Successful ``dn.func.run`` calls with a raw binding return a
 ``dn.func.Continuation`` at ``auxiliary["continuation"]``. Continue through the

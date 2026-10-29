@@ -24,7 +24,7 @@ torch.save(packet, path)
 restored = dn.func.restore_continuation(
     receiving, torch.load(path, weights_only=True), callbacks=receiving_callbacks,
 )
-bound = receiving_kernel.bind(restored.parameters, constants=restored.constants)
+bound = receiving_kernel.bind(restored)
 state, auxiliary = dn.func.run(
     bound, restored, steps=100, callbacks=receiving_callbacks,
 )
@@ -224,12 +224,14 @@ Omit `callbacks=` only when the checkpoint has no callback carry.
 :dedent: 4
 ```
 
-Restoration creates owned source leaves, so construct a new raw binding from
-those exact sources. The same host scheduler also works with a receiving
-runner's kernel:
+Restoration creates owned source leaves, so construct a new raw binding with
+`receiving_kernel.bind(restored)`. Binding selects only its parameter/constant
+sources; it neither adopts nor validates state or callback carry. Supply the
+restored packet and matching callbacks separately to `run`. The same host
+scheduler also works with a receiving runner's kernel:
 
 ```python
-bound = receiver.kernel.bind(restored.parameters, constants=restored.constants)
+bound = receiver.kernel.bind(restored)
 print(dn.func.inspect_sources(bound))
 state, auxiliary = dn.func.run(
     bound, restored, steps=STEPS, callbacks=receiver.callbacks,

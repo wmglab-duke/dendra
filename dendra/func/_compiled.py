@@ -152,7 +152,12 @@ class CompiledPopulationChunk:
         return self._report_state.report
 
     def bind(self, parameters, prepared=_BINDING_UNSET, *, constants=_BINDING_UNSET):
-        """Bind raw constants per invocation or an explicit prepared frame."""
+        """Bind a matching tensor bundle, Continuation, or explicit raw/prepared sources.
+
+        Packet forms select only parameters/constants and cannot be combined
+        with ``prepared`` or ``constants``. State and callback carry remain
+        explicit operands of ``dn.func.run``.
+        """
         from ._binding import BoundPopulation
 
         return BoundPopulation(

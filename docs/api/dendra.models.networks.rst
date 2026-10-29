@@ -100,8 +100,9 @@ accepts a ``NetworkTensors`` bundle and defaults to
 The host facade preserves native initialization/cache ordering and samples
 missing draws from explicit RNG carry. It returns a ``Continuation`` with
 effective sources and no callback carry, without running an accepted timestep
-or changing the native Network. Bind the returned sources, then pass its packet
-to ``dn.func.run`` with the intended callback collection. The same facade
+or changing the native Network. Use ``bound = functional.bind(initial)``, then
+pass ``initial`` separately to ``dn.func.run`` with the intended callback
+collection. The same facade
 supports Population bundles; see :ref:`functional-explicit-initialization`.
 
 Each successful convenience-runner call publishes an in-memory
@@ -116,8 +117,14 @@ contract. Raw-bound host runs also consume and publish that packet through
 ``dn.func.run(bound, packet, ...)``. The binding owns its sources: schemas,
 Tensor identities and aliases must match, with Network shared constant readers
 resolved against their parameter owners. Different or restored sources require
-explicit rebinding. Callback collections still have to match the carry, and
-direct binding/chunk calls retain their explicit state/callback arguments. See
+explicit rebinding, such as ``kernel.bind(restored)``. Eager plans and compiled
+chunks also accept a ``NetworkTensors`` bundle directly. Binding reads only
+parameter/constant sources and does not adopt or validate its state, callback
+carry or initialization inputs; pass state and callbacks to execution
+explicitly. The packet cannot accompany another constant argument, even
+``None``. Existing raw mapping forms remain supported. Callback collections
+still have to match the carry, and direct binding/chunk calls retain their
+explicit state/callback arguments. See
 :ref:`functional-bound-continuation`.
 
 ``dn.func.export_continuation(functional, packet, callbacks=callbacks)`` exports
@@ -144,7 +151,7 @@ optimizer state and recording history remain separate. See
 .. autofunction:: dendra.func.make_functional_network
 
 .. autoclass:: dendra.func.FunctionalNetwork
-   :members: initialization_inputs, initialize, sample_initialization_draw, prepare, step, prepare_and_step, make_callbacks, sample_step_draw, sample_draw_tape, rollout, prepare_and_rollout, compile_rollout_chunk, run, extract, check_overflow, commit_state_
+   :members: initialization_inputs, initialize, bind, sample_initialization_draw, prepare, step, prepare_and_step, make_callbacks, sample_step_draw, sample_draw_tape, rollout, prepare_and_rollout, compile_rollout_chunk, run, extract, check_overflow, commit_state_
 
 .. autoclass:: dendra.func.NetworkTensors
    :members:
@@ -159,7 +166,7 @@ optimizer state and recording history remain separate. See
    :members:
 
 .. autoclass:: dendra.func.CompiledNetworkChunk
-   :members: steps, capabilities, execution_report
+   :members: steps, bind, capabilities, execution_report
    :special-members: __call__
 
 NetStim

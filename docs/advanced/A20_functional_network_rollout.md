@@ -47,8 +47,8 @@ The supplied `dt` must match the initialized Network timestep. The compatible
 
 For a fresh initialized boundary from explicit sources, call
 `initial = dn.func.initialize(plan, tensors)`, where `tensors` is the
-`NetworkTensors` bundle returned by lowering. Bind `initial.parameters` and
-`initial.constants`, then supply `initial` to `dn.func.run`. The default recipe
+`NetworkTensors` bundle returned by lowering. Use `bound = plan.bind(initial)`,
+then supply `initial` separately to `dn.func.run`. The default recipe
 is `plan.initialization_inputs`; `initialization=` accepts an explicit
 `NetworkInitializationInput`. The host initializer samples missing draw packets
 from explicit RNG carry, preserves native Population/cache/connection ordering
@@ -306,9 +306,7 @@ an ordinary state. To use a convenience runner's packet through its kernel:
 
 ```python
 continuation = aux["continuation"]
-bound = program.kernel.bind(
-    continuation.parameters, constants=continuation.constants,
-)
+bound = program.kernel.bind(continuation)
 state, aux = dn.func.run(
     bound, continuation, steps=STEPS, callbacks=program.callbacks,
 )
@@ -316,6 +314,12 @@ state, aux = dn.func.run(
     bound, aux["continuation"], steps=STEPS, callbacks=program.callbacks,
 )
 ```
+
+Binding accepts a `NetworkTensors` bundle or `Continuation` and reads only its
+parameters/constants. State and callback carry are supplied explicitly to
+execution; binding does not retain the packet or resume it. Omit additional
+constant arguments, including `None`, when binding a packet. The explicit
+mapping form remains available.
 
 The binding's sources remain authoritative. A packet must have matching source
 schemas, Tensor identities and aliases; the scheduler does not adopt different

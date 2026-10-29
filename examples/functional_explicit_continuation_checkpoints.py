@@ -69,7 +69,7 @@ def demo(network, backend, directory):
     parameters = tensors.independent_parameters(trainable="*.g_param")
     callbacks = functional.make_callbacks({"trace": dn.func.Recorder(paths)})
     kernel = functional.compile_rollout_chunk(STEPS, backend=backend)
-    bound = kernel.bind(parameters, constants=tensors.constants)
+    bound = kernel.bind(tensors._replace(parameters=parameters))
     _, first = dn.func.run(bound, tensors.state, steps=STEPS, callbacks=callbacks)
     # endregion lower
 
@@ -89,9 +89,9 @@ def demo(network, backend, directory):
         torch.load(path, weights_only=True),
         callbacks=receiving_callbacks,
     )
-    # Restoration creates owned source leaves. Bind these exact objects.
+    # Restoration creates owned source leaves. Bind them from the packet.
     receiving_kernel = receiving.compile_rollout_chunk(STEPS, backend=backend)
-    resumed = receiving_kernel.bind(restored.parameters, constants=restored.constants)
+    resumed = receiving_kernel.bind(restored)
     final, last = dn.func.run(
         resumed, restored, steps=STEPS, callbacks=receiving_callbacks
     )

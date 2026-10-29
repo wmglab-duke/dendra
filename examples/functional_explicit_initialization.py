@@ -112,7 +112,8 @@ def demo(network, backend, directory):
     # region run
     callbacks = functional.make_callbacks({"trace": dn.func.Recorder(paths)})
     kernel = functional.compile_rollout_chunk(STEPS, backend=backend)
-    bound = kernel.bind(initial.parameters, constants=initial.constants)
+    # Binding takes sources; the run still receives state and callbacks explicitly.
+    bound = kernel.bind(initial)
     _, first = dn.func.run(bound, initial, steps=STEPS, callbacks=callbacks)
     live_final, live_last = dn.func.run(
         bound, first["continuation"], steps=STEPS, callbacks=callbacks
@@ -139,7 +140,7 @@ def demo(network, backend, directory):
         callbacks=receiving_callbacks,
     )
     receiving_kernel = receiving.compile_rollout_chunk(STEPS, backend=backend)
-    resumed = receiving_kernel.bind(restored.parameters, constants=restored.constants)
+    resumed = receiving_kernel.bind(restored)
     final, last = dn.func.run(
         resumed, restored, steps=STEPS, callbacks=receiving_callbacks
     )

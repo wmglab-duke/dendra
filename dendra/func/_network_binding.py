@@ -10,6 +10,11 @@ from typing import TYPE_CHECKING
 import torch
 from torch.utils import _pytree as pytree
 
+from ._binding_sources import (
+    _BINDING_UNSET,
+    _binding_packet_sources,
+    _is_binding_packet,
+)
 from ._inputs import Inputs
 from ._network_bindings import _canonicalize_mapping_tree, _map_containers
 from ._types import FunctionalizationError
@@ -29,6 +34,12 @@ class BoundNetwork:
     Mapping containers are snapshotted; tensor leaves retain their identities,
     aliases, and autograd history. Replacing a caller mapping entry requires a
     new binding. In-place parameter changes remain live.
+
+    ``bind(tensors)`` accepts an exact ``NetworkTensors`` bundle and
+    ``bind(continuation)`` selects its effective sources. Packet forms cannot
+    be combined with explicit constants, including ``None``. Only parameters
+    and constants are read and snapshotted; state, callback carry and the packet
+    itself remain caller-owned. Pass state or the continuation to ``run``.
 
     Network bindings retain raw constants rather than prepared coefficients.
     Each invocation derives fresh coefficients, preserving the graph lifetime
@@ -59,12 +70,23 @@ class BoundNetwork:
     _compiled_chunk: CompiledNetworkChunk | None
     _eager_rollout: object
 
-    def __init__(self, functional, parameters, constants, *, compiled_chunk=None):
+    def __init__(
+        self, functional, parameters, constants=_BINDING_UNSET, *, compiled_chunk=None
+    ):
+        if constants is _BINDING_UNSET and not _is_binding_packet(parameters):
+            raise TypeError(
+                "BoundNetwork.__init__() missing 1 required positional argument: 'constants'"
+            )
         if torch.compiler.is_compiling():
             raise FunctionalizationError(
                 "BoundNetwork is an eager binding; use prepare_and_step() "
                 "or prepare_and_rollout() inside torch.compile"
             )
+        sources = _binding_packet_sources(
+            parameters, population=False, constants=constants
+        )
+        if sources is not None:
+            parameters, constants = sources
         # Public Mapping methods can execute authored Python. Finish both
         # snapshots before validating the source or resolving owned methods.
         parameters = _map_containers(parameters, dict)

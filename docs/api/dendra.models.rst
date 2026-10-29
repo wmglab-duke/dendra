@@ -25,9 +25,10 @@ binding flow and the compatible ``make_functional_network`` form.
 
 ``dn.func.initialize(functional, tensors, initialization=...)`` initializes the
 matching ``PopulationTensors`` or ``NetworkTensors`` bundle and returns a shared
-``Continuation``. Bind its effective ``parameters`` and ``constants`` before
-calling ``dn.func.run``. The default recipe is ``tensors.initialization`` for a
-Population and ``functional.initialization_inputs`` for a Network. Explicit
+``Continuation``. Use ``bound = functional.bind(initial)`` to bind its effective
+sources, then pass ``initial`` explicitly to ``dn.func.run``. The default recipe
+is ``tensors.initialization`` for a Population and
+``functional.initialization_inputs`` for a Network. Explicit
 draw packets are replayed; missing packets are sampled from explicit RNG carry
 in native order. No accepted timestep runs, and the native model is unchanged.
 The returned callback carry is ``None``; callbacks initialize on the first run.
@@ -124,8 +125,9 @@ inputs, draws and declared call-local ``extra=`` remain per-call arguments.
 Existing explicit-state/keyword calls retain their contracts. Raw bindings
 support ``dn.func.run(bound, packet, ...)`` and successful raw-bound host runs
 publish ``auxiliary["continuation"]``. Create the binding with
-``packet.parameters`` and ``constants=packet.constants``; its source Tensor
-identities, schemas and aliases remain authoritative. A packet with different
+``packet`` directly, or with ``packet.parameters`` and
+``constants=packet.constants``; its source Tensor identities, schemas and aliases
+remain authoritative. A packet with different
 sources requires an explicit new binding, including after portable restoration.
 Prepared Population bindings, direct calls and legacy scheduling keep explicit
 state/callback arguments. See :ref:`functional-bound-continuation`.
@@ -135,8 +137,7 @@ against a compatible receiving plan with
 ``dn.func.restore_continuation(receiving, saved, callbacks=receiving_callbacks)``.
 Each explicitly supplied callback collection must belong to its respective
 plan; omit it for callback-free continuation. Bind the returned sources with
-``receiving_kernel.bind(restored.parameters, constants=restored.constants)``
-before using ``dn.func.run``. The same format is supported by
+``receiving_kernel.bind(restored)`` before using ``dn.func.run``. The same format is supported by
 ``runner.export_continuation(packet)`` and
 ``receiver.restore_continuation(saved)``. The versioned plain data/Tensor format
 preserves effective raw sources, tied Tensor identities and trainability.
@@ -161,13 +162,22 @@ Functional host scheduling
 
 ``dn.func.run`` schedules Population and Network bindings with explicit steps
 or duration, host spans, activation checkpointing, and callback continuation.
-Both use ``functional.bind(parameters, constants=constants)`` or the same form
-on a compiled chunk. Bindings snapshot mapping containers, retain tensor
-aliases and gradients, and expose read-only ``parameters`` and ``constants``.
+Both use ``functional.bind(tensors)`` or ``functional.bind(continuation)``, or
+the same form on a compiled chunk. The bundle must match the plan's model
+family. These forms read only parameter/constant sources; state, callback carry
+and initialization inputs are not bound or validated. A binding does not retain
+the packet. Supply the intended state or continuation and callbacks explicitly
+to execution. Omit additional ``constants``/``prepared`` arguments when binding
+a packet, including explicit ``None``. The existing
+``bind(parameters, constants=constants)`` form remains available. Raw
+``BoundPopulation`` and ``BoundNetwork`` constructors accept the same source
+forms. Bindings snapshot mapping containers, retain tensor aliases and gradients,
+and expose read-only ``parameters`` and ``constants``.
 Independent runs derive fresh training preparation; safe Population inference
 preparation is reused until its inputs change. In-place optimizer updates are
 visible on the next run. Replacing a mapping entry requires a new binding.
-Bindings do not own simulation state. Population's explicit
+Constructing a raw binding does not clone or detach Tensors, initialize, sample
+or prepare the model. Bindings do not own simulation state. Population's explicit
 ``bind(parameters, prepared)`` form remains available for graph-local control.
 Direct bindings and compiled chunks accept ``callbacks=`` and
 ``callback_state=`` and return ``(state, auxiliary)``. Bind a collection once
@@ -191,6 +201,10 @@ preparation lifetime contracts.
    :special-members: __call__
 
 .. autofunction:: dendra.func.run
+
+.. automethod:: dendra.func.FunctionalPopulation.bind
+
+.. automethod:: dendra.func.CompiledPopulationChunk.bind
 
 
 Functional callback checkpoints

@@ -10,6 +10,7 @@ from typing import NamedTuple
 import torch
 from torch.utils import _pytree as pytree
 
+from ._binding_sources import _BINDING_UNSET, _is_binding_packet
 from ._callbacks import _update_callback_values
 from ._execution import (
     ExecutionCapabilities,
@@ -325,12 +326,19 @@ class CompiledNetworkChunk:
     tensor-only kernel. Kernel caches retain no live input/preparation graphs.
     """
 
-    def bind(self, parameters, constants):
+    def bind(self, parameters, constants=_BINDING_UNSET):
         """Bind raw inputs with ``bind(parameters, constants=constants)``.
 
         Positional constants remain supported. Each direct call prepares fresh
         values; host scheduling retains its per-span preparation boundaries.
+        ``bind(tensors)`` or ``bind(continuation)`` selects both source frames,
+        leaving state and callback carry explicit to ``run``. Packet forms
+        cannot be combined with explicit constants, including ``None``.
         """
+        if constants is _BINDING_UNSET and not _is_binding_packet(parameters):
+            raise TypeError(
+                "CompiledNetworkChunk.bind() missing 1 required positional argument: 'constants'"
+            )
         from ._network_binding import BoundNetwork
 
         return BoundNetwork(

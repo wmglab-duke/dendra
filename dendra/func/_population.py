@@ -18070,6 +18070,11 @@ class FunctionalPopulation:
         host run owns its preparation graph, with safe inference reuse.
         ``bind(parameters, prepared)`` retains an explicit prepared value;
         prepare and bind again for independent backward graphs in that form.
+
+        ``bind(tensors)`` or ``bind(continuation)`` selects both raw source
+        frames from an exact matching bundle or Continuation. Packet forms
+        cannot be combined with ``prepared`` or ``constants``, including
+        ``None``. State and callback carry remain explicit operands of ``run``.
         """
         from ._binding import BoundPopulation
 

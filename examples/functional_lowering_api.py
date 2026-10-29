@@ -102,9 +102,11 @@ def run_model(model, *, paths, backend):
     extracted = dn.func.inspect_sources(tensors)
     print(extracted)
     parameters = tensors.independent_parameters(trainable="*.g_param")
+    selected = tensors._replace(parameters=parameters)
     callbacks = functional.make_callbacks({"trace": dn.func.Recorder(paths)})
+    eager = functional.bind(selected)
     kernel = functional.compile_rollout_chunk(WIDTH, backend=backend)
-    bound = kernel.bind(parameters, constants=tensors.constants)
+    bound = kernel.bind(selected)
     # A raw binding reports the sources it consumes, including canonical
     # parameter-owned readers in a Network's constant frame.
     bound_report = dn.func.inspect_sources(bound)
@@ -113,6 +115,7 @@ def run_model(model, *, paths, backend):
     check_extraction(model, functional, tensors)
     extracted_signature = source_signature(extracted)
     bound_signature = source_signature(bound_report)
+    assert source_signature(dn.func.inspect_sources(eager)) == bound_signature
     assert all(
         value.requires_grad and value.is_leaf for value in bound_report.trainable_leaves
     )
@@ -129,7 +132,7 @@ def run_model(model, *, paths, backend):
         callbacks=callbacks,
     )
     expected, whole = dn.func.run(
-        bound, tensors.state, steps=STEPS, callbacks=callbacks
+        eager, tensors.state, steps=STEPS, callbacks=callbacks
     )
     # endregion run_and_continue
     # region inspect_continuation

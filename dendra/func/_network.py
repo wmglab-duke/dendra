@@ -19,6 +19,7 @@ from dendra.models.networks.net import (
 from dendra.models.networks.net import step as _native_step
 
 from . import _network_parameters
+from ._binding_sources import _BINDING_UNSET, _is_binding_packet
 from ._connection_parameters import ConnectionParameterPlan
 from ._connection_sampling import ConnectionSamplingPlan
 from ._continuous import FunctionalContinuousCon
@@ -1704,7 +1705,7 @@ class FunctionalNetwork:
             self, steps=steps, execution=execution, **compile_options
         )
 
-    def bind(self, parameters, constants, *, compiled_chunk=None):
+    def bind(self, parameters, constants=_BINDING_UNSET, *, compiled_chunk=None):
         """Bind raw inputs for eager steps or canonical host scheduling.
 
         Use ``bind(parameters, constants=constants)`` for the shared Population
@@ -1713,7 +1714,16 @@ class FunctionalNetwork:
         constants, deriving fresh coefficients for every invocation instead of
         retaining graph-bearing materializations. Use ``chunk.bind`` for a
         compiled transition; both bindings work with ``dn.func.run``.
+
+        ``bind(tensors)`` or ``bind(continuation)`` selects both raw source
+        frames from an exact matching bundle or Continuation, without reading
+        state or callback carry. Pass those explicitly to ``run``. Packet
+        forms cannot be combined with explicit constants, including ``None``.
         """
+        if constants is _BINDING_UNSET and not _is_binding_packet(parameters):
+            raise TypeError(
+                "FunctionalNetwork.bind() missing 1 required positional argument: 'constants'"
+            )
         from ._network_binding import BoundNetwork
 
         return BoundNetwork(self, parameters, constants, compiled_chunk=compiled_chunk)

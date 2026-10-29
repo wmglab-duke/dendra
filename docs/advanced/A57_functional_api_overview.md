@@ -341,10 +341,32 @@ initialized Network timestep implicitly. Use the same raw binding spelling for
 eager and compiled execution:
 
 ```python
-eager = functional.bind(parameters, constants=constants)
+eager = functional.bind(tensors)
 kernel = functional.compile_rollout_chunk(2, backend="aot_eager")
-bound = kernel.bind(parameters, constants=constants)
+bound = kernel.bind(tensors)
 ```
+
+`bind` accepts the matching `PopulationTensors` or `NetworkTensors` bundle, or
+a `Continuation` from initialization, execution or portable restoration:
+
+```python
+initial = dn.func.initialize(functional, tensors)
+bound = kernel.bind(initial)
+state, auxiliary = dn.func.run(bound, initial, steps=100, callbacks=callbacks)
+```
+
+Binding reads only `parameters` and `constants`. State, callback carry and
+initialization inputs are not selected or validated by `bind`; supply the
+intended state or continuation and callbacks to execution explicitly. A binding
+retains source Tensor references and snapshots their containers, without
+retaining the packet itself. It does not clone, detach, initialize, sample or
+prepare the model. A bundle must match the plan's model family. When binding a
+bundle or continuation, omit `constants` and `prepared` entirely: even an
+explicit `None` conflicts with the packet's sources.
+
+The mapping form `bind(parameters, constants=constants)` remains available on
+eager plans and compiled chunks. It uses the same raw binding ownership and
+preparation policies as the packet form.
 
 The complete
 {download}`functional_lowering_api.py <../../examples/functional_lowering_api.py>`
@@ -427,7 +449,7 @@ matching tensor bundle and returns a `dn.func.Continuation`:
 functional, tensors = dn.func.make_functional(model, dt=DT)
 initial = dn.func.initialize(functional, tensors)
 callbacks = functional.make_callbacks({"trace": dn.func.Recorder(("v", "t"))})
-bound = functional.bind(initial.parameters, constants=initial.constants)
+bound = functional.bind(initial)
 state, auxiliary = dn.func.run(bound, initial, steps=100, callbacks=callbacks)
 ```
 
@@ -533,7 +555,9 @@ binds restored sources. Run
 `BoundNetwork`. Successful raw-bound host runs publish
 `auxiliary["continuation"]` whether their input is an ordinary state or a packet.
 An eager plan and a compiled chunk expose the same raw `bind` form. To execute
-a runner's continuation through its compiled kernel, bind the packet's sources:
+a runner's continuation through its compiled kernel, use
+`bound = runner.kernel.bind(continuation)` and pass that continuation separately
+to `dn.func.run`. The equivalent explicit mapping form is:
 
 ```{literalinclude} ../../examples/functional_continuation.py
 :language: python
@@ -595,7 +619,7 @@ torch.save(saved, path)
 restored = dn.func.restore_continuation(
     receiving, torch.load(path, weights_only=True), callbacks=receiving_callbacks,
 )
-bound = receiving_kernel.bind(restored.parameters, constants=restored.constants)
+bound = receiving_kernel.bind(restored)
 state, auxiliary = dn.func.run(
     bound, restored, steps=100, callbacks=receiving_callbacks,
 )

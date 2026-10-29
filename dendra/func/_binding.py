@@ -9,15 +9,13 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from ._binding_sources import _BINDING_UNSET, _binding_packet_sources
 from ._inputs import Inputs
 from ._types import FunctionalizationError, RolloutInput, StepInput
 
 if TYPE_CHECKING:
     from ._compiled import CompiledPopulationChunk
     from ._population import FunctionalPopulation
-
-
-_BINDING_UNSET = object()
 
 
 @dataclass(frozen=True, eq=False, init=False)
@@ -30,6 +28,12 @@ class BoundPopulation:
     and autograd history remain live. Each complete invocation owns its
     preparation graph. Safe inference preparation can be reused while its
     parameter and constant bindings remain fresh.
+
+    ``bind(tensors)`` selects raw sources from an exact ``PopulationTensors``
+    bundle; ``bind(continuation)`` selects its effective sources. Packet forms
+    cannot be combined with ``prepared`` or ``constants``. They read only
+    parameters/constants and retain no packet, state, initialization recipe or
+    callback carry. Supply state or the continuation explicitly to ``run``.
 
     ``bind(parameters, prepared)`` retains explicit preparation for advanced
     use. Recreate that prepared binding for each independent backward graph;
@@ -69,11 +73,17 @@ class BoundPopulation:
         constants=_BINDING_UNSET,
         compiled_chunk=None,
     ):
-        if prepared is _BINDING_UNSET and constants is _BINDING_UNSET:
-            raise TypeError("bind requires prepared or constants")
-        if prepared is not _BINDING_UNSET and constants is not _BINDING_UNSET:
-            raise TypeError("prepared and constants are mutually exclusive")
-        if constants is not _BINDING_UNSET:
+        sources = _binding_packet_sources(
+            parameters, population=True, prepared=prepared, constants=constants
+        )
+        if sources is None:
+            if prepared is _BINDING_UNSET and constants is _BINDING_UNSET:
+                raise TypeError("bind requires prepared or constants")
+            if prepared is not _BINDING_UNSET and constants is not _BINDING_UNSET:
+                raise TypeError("prepared and constants are mutually exclusive")
+        else:
+            parameters, constants = sources
+        if sources is not None or constants is not _BINDING_UNSET:
             from ._network_bindings import _map_containers
 
             # Public Mapping traversal can execute authored Python. Finish
