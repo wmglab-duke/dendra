@@ -148,7 +148,8 @@ step phase with the per-callback carry schemas. Restoring this data
 resumes the receiving callback's pure hooks without serializing a Python
 callback instance.
 
-Native `dn.callbacks.APCount`, `Raster` and `AnomalyDetector` configurations
+Native `dn.callbacks.APCount`, `Raster`, `Active`, `ActiveAL`, `ActiveALCount`
+and `AnomalyDetector` configurations
 bind to independent pure implementations for functional execution. Exported
 callback carry describes that functional execution's detection history; it does
 not copy the supplied native object's `record`, crossing cache or run counter.
@@ -157,6 +158,18 @@ matching callback carry. Constructor namespace does not replace the resolved
 configuration and schema checks. Raster configurations share the same
 compact-window result and checkpoint contract when their resolved indices,
 window and timestep match.
+
+Native activity configurations capture their unpartitioned query, including
+`at_least` and `inv`, while their native histories remain separate. The same
+activity checkpoint contract applies to native and `dn.func` configurations
+whose resolved queries match. Counts, crossing latches and step phase resume
+in explicit carry; results remain cumulative Boolean masks. Native and `dn.func`
+activity constructors require the same positive integer `at_least`, captured
+as static configuration. Accepted integral scalar types are normalized to
+Python integers. Construct a matching query before portable restoration,
+including the same `at_least` and inversion settings. See the
+{ref}`activity configuration example <functional-shared-activity-configuration>`
+for scoped Network and Population continuation.
 
 Native and functional APCount use `torch.int32` counts. Portable restoration
 also accepts legacy `int64` and `float32` count carry when every value is a

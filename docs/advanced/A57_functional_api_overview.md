@@ -200,8 +200,9 @@ remains available for continuation. In-memory recordings retain gradients;
 persisted samples are detached. See {ref}`functional-recorder-storage` for file
 segments, bounded storage and the complete runnable example.
 
-Use `dn.callbacks.APCount`, `Raster` and `AnomalyDetector` to configure native
-or functional spike analysis and anomaly detection. Functional binding captures
+Use `dn.callbacks.APCount`, `Raster`, `Active`, `ActiveAL`, `ActiveALCount`
+and `AnomalyDetector` to configure native or functional spike analysis and
+anomaly detection. Functional binding captures
 these settings into independent pure callbacks; native histories and counters
 remain separate. The corresponding `dn.func` constructors are also supported.
 For a Network, select the observed Population with
@@ -213,6 +214,16 @@ crossing latches and window phase remain explicit carry.
 Both APCount entry points return `torch.int32` counts, with four bytes per
 checked slot. These exact integer observations do not require gradients;
 gradients through model state and floating-point recordings remain available.
+
+`ActiveAL(at_least=k)` compares the number of selected slots that fired at
+least once against `k`; `ActiveALCount(at_least=k)` compares total crossing
+events, including repeats. `inv=True` inverts the Boolean result. Native
+configurations select their unpartitioned query; use the `dn.func` constructors
+with `partition=...` for static grouped output. Both constructor families
+require a positive integer `at_least`; booleans, floats and Tensors are not
+accepted. The target is static callback configuration. See the
+{ref}`activity configuration example <functional-shared-activity-configuration>`
+for inversion, groups and continuation.
 
 `dn.callbacks.LFP(fields)` configures native and functional extracellular
 recording; `dn.func.LFP` remains supported. Wrap it in `PopulationCallback` for

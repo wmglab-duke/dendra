@@ -78,23 +78,23 @@ likewise prepare independent immutable implementations. A Recorder retains
 resolved state paths,
 physical regions and index or partition selections; an LFP retains its field
 references and projection metadata. The supplied configuration objects remain
-unchanged. These public classes implement the pure callback hooks; evolving
+unchanged. The prepared implementations expose the pure callback hooks; evolving
 values and recording phase
 belong to explicit carry. Prepared Network Recorder paths and regions keep
 their resolved meaning when used by the collection.
 
-`dn.callbacks.LFP`, `APCount`, `Raster` and `AnomalyDetector` configurations can also
-be supplied to functional binding and `dn.compile`; their `dn.func` counterparts
-remain supported. Wrap them in `PopulationCallback` for a Network. APCount and
-Raster use authored selectors and timing settings, rather than importing native
+`dn.callbacks.LFP`, `APCount`, `Raster`, `Active`, `ActiveAL`, `ActiveALCount`
+and `AnomalyDetector` configurations can also be supplied to functional binding
+and `dn.compile`; their `dn.func` counterparts remain supported. Wrap them in
+`PopulationCallback` for a Network. Threshold configurations use authored
+selectors and timing settings, rather than importing native
 counts, crossing latches, normalized indices or run counters. Negative selectors
 resolve against the selected Population. An omitted `dt` uses its functional
 timestep; an explicit value must match. Bind a new collection after editing
 configuration. Native execution retains ownership of its callback histories.
-Use the `dn.func` constructors for Active-family callbacks; their native
-configurations are currently unsupported in functional binding. Native LFP
-configuration supplies lead-field sources and projection settings without
-importing or updating its recording history.
+Native activity configurations select their configured unpartitioned query.
+Native LFP configuration supplies lead-field sources and projection settings
+without importing or updating its recording history.
 
 Record mechanism state with qualified names such as `"left.hh.m"`, or relative
 names such as `"hh.m"` inside a Population-scoped Recorder. The result keeps the
@@ -214,6 +214,51 @@ inside `PopulationCallback`:
 :dedent: 4
 ```
 
+(functional-shared-activity-configuration)=
+## Share activity configuration
+
+Use `dn.callbacks.Active`, `ActiveAL` and `ActiveALCount` to configure native
+or functional activity detection. `Active` tests whether any selected slot has
+fired. `ActiveAL(at_least=k)` tests how many selected slots fired at least
+once; repeated events at one slot count once. `ActiveALCount(at_least=k)`
+tests the total events across those slots, including repeated events. Each
+returns a cumulative Boolean result, inverted when `inv=True`.
+
+Functional binding captures the native configuration's unpartitioned
+`is_active()` query. Native and `dn.func` activity constructors require a
+positive integer `at_least`. Booleans, floats, Tensors and strings are rejected
+with `TypeError`; zero and negative integers raise `ValueError`. Other integral
+scalar types, including NumPy integers, are accepted. Binding and native
+queries apply the same validation. The target is static configuration and has
+no gradient. Bind a new collection after changing the query. Functional execution
+does not import or update the native object's counts, crossing cache or timer.
+Continue with explicit callback carry rather than the native history.
+
+Native `is_active(partition=...)` and `numpy(partition=...)` remain post-run
+queries over native counts. Native constructors do not accept `partition`.
+For static grouped functional results, use `dn.func.ActiveAL` or
+`dn.func.ActiveALCount` with `partition=...`. Each partition length must be at
+least `at_least`.
+
+The complete
+{download}`functional_activity_configuration.py <../../examples/functional_activity_configuration.py>`
+example checks activity against per-slot APCount results, inversion, static
+groups, recording gradients, explicit continuation and portable checkpoints
+for a Population and scoped Network:
+
+```bash
+python examples/functional_activity_configuration.py
+python examples/functional_activity_configuration.py --backend aot_eager
+python examples/functional_activity_configuration.py --section network --execution while
+```
+
+```{literalinclude} ../../examples/functional_activity_configuration.py
+:language: python
+:start-after: "# region configuration"
+:end-before: "# endregion configuration"
+:dedent: 4
+```
+
 ## Threshold windows and result memory
 
 Threshold preparation resolves compartment indices, timestep and window bounds.
@@ -228,8 +273,8 @@ rearms that site. This is a hard observation rule and does not supply gradients
 of threshold decisions.
 
 The first post-step sample has callback index zero. A window checks
-`int(t_start_check / dt) <= index < int(t_end_check / dt)`. Native APCount and
-Raster configurations use their `1e9` ms default end when it is omitted;
+`int(t_start_check / dt) <= index < int(t_end_check / dt)`. Native threshold
+configurations use their `1e9` ms default end when it is omitted;
 `dn.func` constructors leave an omitted end open. An explicit finite end gives
 the same window with either constructor. These bounds follow the callback's
 phase rather than the Network's absolute clock. Starting a new collection at a
@@ -251,8 +296,9 @@ For `K` checked slots in a selected Population with shape `(*batch, N, C)`:
 | `Recorder` | Selected state trajectory | One frame per recorded boundary |
 
 `ActiveAL` counts selected slots with at least one event; repeated spikes within
-one slot contribute separately only to `ActiveALCount`. The Active family also supports `inv=True`
-and static `partition` groups over the selected-slot axis. Repeated `node_check`
+one slot contribute separately only to `ActiveALCount`. Both constructor families
+support `inv=True`. The `dn.func` constructors additionally support static
+`partition` groups over the selected-slot axis. Repeated `node_check`
 indices retain their multiplicity. These settings follow the full
 {doc}`A8_functional_populations` callback contract.
 

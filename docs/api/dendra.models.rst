@@ -271,15 +271,16 @@ recording history separately. LFP and threshold configurations likewise prepare
 independent immutable implementations. ``Recorder`` resolves paths, regions and
 selections; ``LFP`` retains raw field Tensor references and projection metadata;
 threshold callbacks resolve indices, windows and timestep metadata. These
-public classes
-implement the pure hooks directly. ``Active`` uses the ``ActiveAL(at_least=1)``
+prepared implementations
+expose the pure hooks. ``Active`` uses the ``ActiveAL(at_least=1)``
 rule. Changing analysis state belongs to explicit carry, and supplied
 configuration objects remain unchanged. Each fresh LFP initialization builds a
 new differentiable field stack from its bound Tensor sources. See
 :doc:`../advanced/A27_functional_network_callbacks` for timing, result shapes
 and Population scopes.
 
-Native ``dn.callbacks.LFP``, ``APCount``, ``Raster`` and ``AnomalyDetector``
+Native ``dn.callbacks.LFP``, ``APCount``, ``Raster``, ``Active``, ``ActiveAL``,
+``ActiveALCount`` and ``AnomalyDetector``
 configurations are accepted by functional callback collections and ``dn.compile``.
 Their ``dn.func`` entry points remain supported. Population-scoped Network
 bindings use ``dn.func.PopulationCallback(name, callback)``. Configuration
@@ -295,6 +296,21 @@ bytes per checked slot. Threshold detection and count updates are
 nondifferentiable. Portable restoration accepts valid legacy ``int64`` and
 ``float32`` count carry after checking that its values are finite, nonnegative
 integers within the ``int32`` range; unsafe values are rejected.
+
+Native activity configurations select their configured unpartitioned
+``is_active()`` query. ``ActiveAL`` compares the number of selected slots that
+fired at least once; ``ActiveALCount`` compares the total crossing events,
+including repeats. ``inv=True`` inverts the Boolean result. Native and
+``dn.func`` activity constructors require a positive integer ``at_least``.
+Booleans, floats, Tensors and strings raise ``TypeError``; zero or negative
+integers raise ``ValueError``. Integral scalar types such as NumPy integers
+are accepted and normalized to Python integers. Binding and native queries
+apply the same validation. Native
+``is_active(partition=...)`` and ``numpy(partition=...)``
+remain post-run methods. For static grouped functional output, use the
+``dn.func`` activity constructors with ``partition=...``. Native constructors
+do not accept ``partition``.
+See :ref:`functional-shared-activity-configuration` for the runnable example.
 
 Native and functional LFP share a batch-preserving default projection, summing
 cell and compartment axes. Explicit ``rule`` strings select exactly that

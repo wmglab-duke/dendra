@@ -2,9 +2,20 @@
 
 from __future__ import annotations
 
+from numbers import Integral
+
 import torch
 
 _COUNT_DTYPE = torch.int32
+
+
+def _validate_activity_target(at_least):
+    """Normalize the positive integer target shared by activity callbacks."""
+    if isinstance(at_least, bool) or not isinstance(at_least, Integral):
+        raise TypeError("at_least must be a positive integer")
+    if at_least < 1:
+        raise ValueError("at_least must be a positive integer")
+    return int(at_least)
 
 
 def _restore_count(value, *, label):

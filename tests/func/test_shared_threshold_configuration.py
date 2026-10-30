@@ -345,16 +345,6 @@ def test_native_subclasses_and_custom_imperative_hooks_are_not_silently_lowered(
             match="FunctionalCallback|pure|custom|hook|configuration",
         ):
             functional.make_callbacks({"analysis": configured})
-    for excluded in (
-        dn.callbacks.Active,
-        dn.callbacks.ActiveAL,
-        dn.callbacks.ActiveALCount,
-    ):
-        with pytest.raises(
-            (TypeError, dn.func.FunctionalizationError),
-            match="FunctionalCallback|pure|custom|configuration",
-        ):
-            functional.make_callbacks({"analysis": excluded(node_check=[0])})
 
 
 def test_explicit_functional_binding_retains_authority_for_a_native_subclass():

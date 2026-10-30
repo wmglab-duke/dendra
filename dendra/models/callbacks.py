@@ -19,7 +19,12 @@ from ._lfp_callbacks import (
     _validate_lfp_fields,
 )
 from ._recorder_cadence import _recorder_should_save, _recorder_stride
-from ._threshold_callbacks import _COUNT_DTYPE, _anomaly_flags, _restore_count
+from ._threshold_callbacks import (
+    _COUNT_DTYPE,
+    _anomaly_flags,
+    _restore_count,
+    _validate_activity_target,
+)
 from ._threshold_callbacks import accumulate_count as _accumulate_count
 from ._threshold_callbacks import activity_from_counts as _activity_from_counts
 from ._threshold_callbacks import threshold_crossing as _threshold_crossing
@@ -1653,14 +1658,22 @@ class APCount(ThresholdCallback):
         """Return an owned int32 Tensor of per-node spike counts."""
         return self.record.to(dtype=_COUNT_DTYPE, copy=True)
 
+    def _functional_activity_configuration(self):
+        """Project activity settings independently of native query history."""
+        return {
+            **self._functional_threshold_configuration(),
+            "at_least": self.at_least,
+            "inv": self.inv,
+        }
+
 
 class ActiveAL(APCount):
     """
-    Callback for detecting if axons fire at least a specified number of times.
+    Detect activity in at least a specified number of checked slots.
 
-    This class extends APCount to detect if the membrane potential crosses a specified
-    voltage threshold at least N times during the simulation. It marks an axon as
-    "active" only if the threshold is crossed at least the specified number of times.
+    A checked slot qualifies after any upward voltage-threshold crossing.
+    Repeated crossings at one slot contribute only once to this criterion;
+    use :class:`ActiveALCount` to compare the total number of crossings instead.
 
     Parameters
     ----------
@@ -1675,8 +1688,9 @@ class ActiveAL(APCount):
     dt : float, optional
         Time step in ms. If None, uses the default from backend. Default is None.
     at_least : int, optional
-        Minimum number of threshold crossings required to mark an axon as active.
-        Default is 1.
+        Minimum number of checked slots with at least one crossing required
+        to mark a logical population entry as active. Must be a positive
+        integer; Boolean values are not accepted. Default is 1.
     inv : bool, optional
         If True, inverts the active detection (marks axons as inactive if they
         meet the threshold). Default is False.
@@ -1685,14 +1699,15 @@ class ActiveAL(APCount):
     --------
     APCount : Callback for counting total spikes during simulation
     Active : Callback for detecting if axons fire at any point during simulation
+    ActiveALCount : Callback for a total crossing-count criterion
 
     Examples
     --------
-    >>> # Detect axons that fire at least 3 times
-    >>> detector = ActiveAL(threshold=20.0, at_least=3)
+    >>> # Require a crossing at each of three checked slots.
+    >>> detector = ActiveAL(threshold=20.0, node_check=[0, 1, -1], at_least=3)
     >>> model.run(ve, callbacks=[detector])
     >>> active_axons = detector.numpy()  # Get boolean array of active axons
-    >>> active_count = active_axons.sum()  # Count how many axons fired ≥3 times
+    >>> active_count = active_axons.sum()  # Count axons firing at three checked slots
 
     Attributes
     ----------
@@ -1701,7 +1716,7 @@ class ActiveAL(APCount):
     state_cache : torch.Tensor
         Boolean tensor tracking membrane potential state relative to threshold.
     at_least : int
-        Minimum number of threshold crossings required to mark an axon as active.
+        Positive integer number of checked slots with at least one crossing.
     """
 
     def __init__(
@@ -1715,7 +1730,7 @@ class ActiveAL(APCount):
         inv=False,
     ):
         super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
-        self.at_least = at_least
+        self.at_least = _validate_activity_target(at_least)
         self.inv = inv
 
     def is_active(self, partition=None):
@@ -1768,8 +1783,9 @@ class ActiveALCount(APCount):
 
     This class extends APCount to determine if an axon is "active" based on whether
     the total number of threshold crossings across all monitored nodes meets or
-    exceeds a specified count. It marks an axon as active if the total spike count
-    is at least the specified threshold.
+    exceeds a specified count. Repeated crossings at one checked slot contribute
+    separately to this total, including the multiplicity of repeated
+    ``node_check`` entries.
 
     Parameters
     ----------
@@ -1785,7 +1801,7 @@ class ActiveALCount(APCount):
         Time step in ms. If None, uses the default from backend. Default is None.
     at_least : int, optional
         Minimum total spike count across all monitored nodes required to mark an axon as active.
-        Default is 1.
+        Must be a positive integer; Boolean values are not accepted. Default is 1.
     inv : bool, optional
         If True, inverts the active detection (marks axons as inactive if they
         meet the count threshold). Default is False.
@@ -1802,7 +1818,7 @@ class ActiveALCount(APCount):
         inv=False,
     ):
         super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
-        self.at_least = at_least
+        self.at_least = _validate_activity_target(at_least)
         self.inv = inv
 
     def is_active(self, partition=None):
@@ -2231,11 +2247,13 @@ def _validate_activity_partition(record, at_least, partition):
 
 
 def _is_active(record, at_least: int, partition=None) -> torch.Tensor:
+    at_least = _validate_activity_target(at_least)
     partition = _validate_activity_partition(record, at_least, partition)
     return _activity_from_counts(record, at_least, partition)
 
 
 def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
+    at_least = _validate_activity_target(at_least)
     partition = _validate_activity_partition(record, at_least, partition)
     return _activity_from_counts(record, at_least, partition, total=True)
 

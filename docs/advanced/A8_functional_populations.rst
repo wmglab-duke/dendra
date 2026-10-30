@@ -110,8 +110,9 @@ execution mode:
    counts = auxiliary["callbacks"]["counts"]
 
 The mapping accepts ``dn.func.FunctionalCallback`` configurations and the
-built-in ``dn.Recorder``, ``dn.callbacks.LFP``, ``APCount``, ``Raster`` and
-``AnomalyDetector`` configurations. Pass configurations rather than an
+built-in ``dn.Recorder``, ``dn.callbacks.LFP``, ``APCount``, ``Raster``,
+``Active``, ``ActiveAL``, ``ActiveALCount`` and ``AnomalyDetector``
+configurations. Pass configurations rather than an
 already-bound collection. Names such as
 ``"trace"`` are user-defined and have no special meaning. Threshold-only reducers
 need no voltage trajectory, so the example above allocates no full-trace
@@ -2263,7 +2264,8 @@ runners, and functional callback collections. ``dn.func.Recorder`` remains a
 supported entry point for pure recording. Functional execution prepares the
 selected observations without invoking an imperative callback's hooks or
 reading changing values from the source model. Native ``dn.callbacks.LFP``,
-``APCount``, ``Raster`` and ``AnomalyDetector`` configurations also bind to functional
+``APCount``, ``Raster``, ``Active``, ``ActiveAL``, ``ActiveALCount`` and
+``AnomalyDetector`` configurations also bind to functional
 execution; the corresponding ``dn.func`` constructors remain supported. Other
 functional callbacks use the pure ``FunctionalCallback`` API. Give each callback
 a stable result name and bind the collection once, outside repeated simulations:
@@ -2276,7 +2278,7 @@ a stable result name and bind the collection once, outside repeated simulations:
            "anomalies": dn.callbacks.AnomalyDetector(),
            "raster": dn.callbacks.Raster(node_check=[0, -1]),
            "spike_count": dn.callbacks.APCount(node_check=[0, -1]),
-           "active": dn.func.Active(node_check=[0, -1]),
+           "active": dn.callbacks.Active(node_check=[0, -1]),
        }
    )
    final_state, auxiliary = dn.func.run(
@@ -2301,7 +2303,7 @@ regions and selections; an
 field carry and sampling phase remain explicit callback carry. Configure selections
 before binding, and bind a new collection to change them.
 
-Native APCount and Raster configuration retains the authored compartment
+Native threshold configuration retains the authored compartment
 selectors and timestep choice separately from native execution's normalized
 indices and effective timestep. Negative indices resolve against the Population
 being bound. Omitting ``dt`` uses that functional Population's timestep; an
@@ -2309,8 +2311,9 @@ explicit ``dt`` must match it. Binding captures configuration without importing
 or updating native ``record``, ``state_cache`` or step counters. AnomalyDetector
 likewise starts from fresh explicit carry. Continue detection with the returned
 ``Continuation`` or callback state, rather than a mutable native callback's
-history. Native Active-family configurations are currently unsupported;
-use their ``dn.func`` constructors. Native ``dn.callbacks.LFP`` captures its
+history. Native activity configurations use their configured unpartitioned
+``is_active()`` query, with inversion when requested. Native
+``dn.callbacks.LFP`` captures its
 projection configuration and lead-field sources without importing or updating
 native recording history.
 
@@ -2513,8 +2516,8 @@ initial model frame is not inspected. The first checked post-step sample is
 armed even if it is already above threshold; a subsequent below-threshold
 checked sample rearms that site. The first post-step sample has callback index
 zero, and the checked window uses
-``int(t_start_check / dt) <= index < int(t_end_check / dt)``. Native APCount and
-Raster configurations retain their default ``t_end_check=1e9`` ms when the
+``int(t_start_check / dt) <= index < int(t_end_check / dt)``. Native threshold
+configurations retain their default ``t_end_check=1e9`` ms when the
 constructor argument is omitted. The ``dn.func`` constructors use an open-ended
 window for an omitted end. Supply an explicit end to define the same finite
 window with either constructor. These bounds use callback sample indices, not a
@@ -2548,17 +2551,33 @@ For ``K`` selected slots in ``node_check``, the finalized results are:
 
 ``ActiveAL`` counts sites, not repeated spikes at one site. In contrast,
 ``ActiveALCount`` sums all events, including repeated spikes. This distinction
-matches the actual imperative ``is_active`` reductions. The Active family
-accepts ``inv=True`` to invert the finalized Boolean result, and a keyword-only
-``partition`` configuration to reduce contiguous groups of the selected slots
-independently. ``at_least`` must be a positive integer; each partition length
-must be at least ``at_least``, matching the existing partition contract.
+matches the imperative ``is_active`` reductions. Both constructor families
+accept ``inv=True`` to invert the finalized Boolean result. Native and
+``dn.func`` activity constructors require a positive integer ``at_least``.
+Boolean, floating-point, Tensor and string values raise ``TypeError``;
+zero or negative integers raise ``ValueError``. Other integral scalar types,
+including NumPy integers, are accepted and normalized to Python integers.
+The same validation applies when binding and evaluating native activity
+queries. ``at_least`` is static configuration and has no gradient. Bind a new
+collection to change the query.
+
+The ``dn.func`` constructors accept a keyword-only ``partition`` configuration
+to reduce contiguous groups of selected slots independently. Each partition
+length must be at least ``at_least``.
 For example, ``node_check=[0, 2, 5, -1], partition=(2, 2)``
 reduces two pairs of checked slots and returns ``(*batch, N, 2)``. Partitions
-describe this selected-slot axis, not anatomical branches or Population groups;
-they are static callback configuration, not a post-run ``is_active`` argument.
+describe this selected-slot axis, not anatomical branches or Population groups.
+Native ``is_active(partition=...)`` and ``numpy(partition=...)`` remain post-run
+queries; supplying a native configuration to functional execution selects its
+unpartitioned query. Use ``dn.func.ActiveAL(..., partition=...)`` or
+``dn.func.ActiveALCount(..., partition=...)`` for static grouped functional
+output. Native constructors do not accept ``partition``.
 The selected-slot order follows ``node_check``; repeated node indices retain
 their multiplicity rather than being deduplicated.
+The complete
+:ref:`shared activity configuration example <functional-shared-activity-configuration>`
+checks both reductions, inversion, groups and continuation for a Population
+and Network.
 
 ``Active``, ``ActiveAL``, ``ActiveALCount``, and ``APCount`` emit no trajectory
 and use callback memory independent of the timestep count. Native and functional

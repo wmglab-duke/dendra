@@ -12,7 +12,6 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import FrozenInstanceError, dataclass
-from numbers import Integral
 from typing import TYPE_CHECKING
 
 import torch
@@ -25,6 +24,7 @@ from dendra.models._lfp_callbacks import (
 from dendra.models._threshold_callbacks import (
     _COUNT_DTYPE,
     _anomaly_flags,
+    _validate_activity_target,
     accumulate_count,
     activity_from_counts,
     threshold_crossing,
@@ -152,6 +152,9 @@ def _native_callback_implementations():
         (native.LFP, LFP),
         (native.APCount, APCount),
         (native.Raster, Raster),
+        (native.Active, ActiveAL),
+        (native.ActiveAL, ActiveAL),
+        (native.ActiveALCount, ActiveALCount),
         (native.AnomalyDetector, AnomalyDetector),
     )
 
@@ -206,6 +209,15 @@ def _coerce_callback_configuration(callback):
             configured = implementation(**callback._functional_lfp_configuration())
             configured._stacked_source = callback._lfp_stacked_source()
             return configured
+        if implementation is ActiveAL or implementation is ActiveALCount:
+            for name in ("is_active", "numpy"):
+                if getattr(getattr(callback, name), "__func__", None) is not getattr(
+                    type(callback), name
+                ):
+                    raise FunctionalizationError(
+                        f"custom imperative {type(callback).__name__} queries cannot be lowered; implement a FunctionalCallback"
+                    )
+            return implementation(**callback._functional_activity_configuration())
         return implementation(**callback._functional_threshold_configuration())
     generated = getattr(callback, "_recorder_generated_hooks", ())
     if (
@@ -1024,7 +1036,7 @@ class APCount(_ThresholdCallback):
         return count
 
 
-def _bind_activity_partition(partition, checked_nodes: int, at_least: int):
+def _bind_activity_partition(partition, checked_nodes: int, at_least):
     """Resolve contiguous checked-slot groups before transformed execution."""
     if partition is None:
         return None
@@ -1065,7 +1077,8 @@ class ActiveAL(APCount):
     is fixed when callbacks are bound, so execution remains pure and compiled.
     ``inv`` complements the final result. Hard activity is nondifferentiable;
     adding this callback does not detach model state or Recorder outputs.
-    ``at_least`` must be a positive integer.
+    ``at_least`` must be a positive integer, using the same validation as
+    native activity callbacks.
     """
 
     _checkpoint_fields = _ThresholdCallback._checkpoint_fields + (
@@ -1087,12 +1100,8 @@ class ActiveAL(APCount):
         partition=None,
     ) -> None:
         super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
-        if isinstance(at_least, bool) or not isinstance(at_least, Integral):
-            raise TypeError("at_least must be a positive integer")
-        if at_least < 1:
-            raise ValueError("at_least must be a positive integer")
-        self.at_least = int(at_least)
-        self.inv = bool(inv)
+        self.at_least = _validate_activity_target(at_least)
+        self.inv = inv
         self.partition = partition
 
     def _bind(self, functional: FunctionalPopulation):
@@ -1106,11 +1115,12 @@ class ActiveAL(APCount):
             node_check=self.node_check,
             dt=self.dt,
         )
+        target = _validate_activity_target(self.at_least)
         partition = _bind_activity_partition(
-            self.partition, configuration[0].numel(), self.at_least
+            self.partition, configuration[0].numel(), target
         )
         return _prepare_threshold_callback(
-            self._bound_type, configuration, (self.at_least, self.inv, partition)
+            self._bound_type, configuration, (target, bool(self.inv), partition)
         )
 
     def finalize(self, carry, emissions):
