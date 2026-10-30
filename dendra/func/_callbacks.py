@@ -11,11 +11,17 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import FrozenInstanceError, dataclass
 from numbers import Integral
 from typing import TYPE_CHECKING
 
 import torch
+
+from dendra.models._threshold_callbacks import (
+    accumulate_count,
+    activity_from_counts,
+    threshold_crossing,
+)
 
 from ._tree_paths import _get_path, _put_path
 from ._types import FunctionalizationError
@@ -691,11 +697,12 @@ def _bind_threshold_configuration(
             "node_check entries must be valid compartment indices in "
             f"[-{compartments}, {compartments - 1}]; got {invalid_values}"
         )
-    node_indices = torch.where(
-        node_indices < 0,
-        node_indices + compartments,
-        node_indices,
-    )
+    with torch.inference_mode(False):
+        node_indices = torch.where(
+            node_indices < 0,
+            node_indices + compartments,
+            node_indices,
+        )
 
     try:
         threshold = float(threshold)
@@ -735,6 +742,14 @@ class _ThresholdCallback(FunctionalCallback):
     """Static user-facing configuration shared by threshold built-ins."""
 
     _bound_type = None
+    _prepared = False
+    _checkpoint_fields = (
+        "node_indices",
+        "threshold",
+        "start_step",
+        "end_step",
+        "callback_dt",
+    )
 
     def __init__(
         self,
@@ -751,6 +766,8 @@ class _ThresholdCallback(FunctionalCallback):
         self.dt = dt
 
     def _bind(self, functional: FunctionalPopulation):
+        if self._prepared:
+            return self
         configuration = _bind_threshold_configuration(
             functional,
             threshold=self.threshold,
@@ -759,28 +776,43 @@ class _ThresholdCallback(FunctionalCallback):
             node_check=self.node_check,
             dt=self.dt,
         )
-        return self._bound_type(*configuration)
+        return _prepare_threshold_callback(self._bound_type, configuration)
 
-    def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
-        del state, auxiliary
-        raise FunctionalizationError(
-            "functional threshold callbacks must be bound with "
-            "functional.make_callbacks(...)"
-        )
+    def _require_prepared(self):
+        if not self._prepared:
+            raise FunctionalizationError(
+                "functional threshold callbacks must be bound with "
+                "functional.make_callbacks(...)"
+            )
 
-    def update(self, carry, state, auxiliary):  # pragma: no cover - guarded
-        del carry, state, auxiliary
-        raise FunctionalizationError(
-            "functional threshold callbacks must be bound with "
-            "functional.make_callbacks(...)"
-        )
+    def __setattr__(self, name, value):
+        if object.__getattribute__(self, "__dict__").get("_prepared", False):
+            raise FrozenInstanceError(f"cannot assign to field {name!r}")
+        object.__setattr__(self, name, value)
 
-    def finalize(self, carry, emissions):  # pragma: no cover - guarded by bind
-        del carry, emissions
-        raise FunctionalizationError(
-            "functional threshold callbacks must be bound with "
-            "functional.make_callbacks(...)"
-        )
+    def __delattr__(self, name):
+        if object.__getattribute__(self, "__dict__").get("_prepared", False):
+            raise FrozenInstanceError(f"cannot delete field {name!r}")
+        object.__delattr__(self, name)
+
+
+def _prepare_threshold_callback(factory, configuration, activity=()):
+    # Custom factories retain the normalized positional argument contract.
+    if not any(factory is cls for cls in (Raster, APCount, ActiveAL, ActiveALCount)):
+        return factory(*configuration, *activity)
+    prepared = object.__new__(factory)
+    values = dict(
+        zip(_ThresholdCallback._checkpoint_fields, configuration, strict=True)
+    )
+    if activity:
+        values.update(zip(("at_least", "inv", "partition"), activity, strict=True))
+    values["_prepared"] = True
+    object.__getattribute__(prepared, "__dict__").update(values)
+    return prepared
+
+
+def _is_prepared_threshold_callback(callback):
+    return issubclass(type(callback), _ThresholdCallback) and callback._prepared
 
 
 def _selected_voltage(state, node_indices):
@@ -801,22 +833,25 @@ def _threshold_crossing(
     end_step,
 ):
     selected = _selected_voltage(state, node_indices)
-    above = selected >= threshold
+    next_below, spikes = threshold_crossing(below, selected, threshold)
     within_window = (step >= start_step) & (step < end_step)
-    spikes = above & below & within_window
-    next_below = torch.where(within_window, ~above, below)
+    spikes = spikes & within_window
+    next_below = torch.where(within_window, next_below, below)
     return next_below, spikes
 
 
-@dataclass(frozen=True)
-class _BoundRaster(FunctionalCallback):
-    node_indices: torch.Tensor
-    threshold: float
-    start_step: int
-    end_step: int
-    callback_dt: float
+class Raster(_ThresholdCallback):
+    """Record post-step upward threshold crossings as a Boolean trajectory.
+
+    The constructor mirrors :class:`dendra.callbacks.Raster`. The result has
+    shape ``(steps, *batch, N, K)`` for ``K`` selected compartments. Unlike the
+    mutable callback, the functional result retains every simulated step and
+    masks events outside ``[t_start_check, t_end_check)`` to preserve a static,
+    transform-friendly time axis.
+    """
 
     def initialize(self, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         selected = _selected_voltage(state, self.node_indices)
         carry = (
@@ -826,6 +861,7 @@ class _BoundRaster(FunctionalCallback):
         return carry, None
 
     def update(self, carry, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         below, step = carry
         next_below, spikes = _threshold_crossing(
@@ -840,34 +876,23 @@ class _BoundRaster(FunctionalCallback):
         return (next_below, step + 1), spikes
 
     def finalize(self, carry, emissions):
+        self._require_prepared()
         below, _step = carry
         if emissions is None:
             return below.new_empty((0, *below.shape))
         return emissions
 
 
-class Raster(_ThresholdCallback):
-    """Record post-step upward threshold crossings as a Boolean trajectory.
+class APCount(_ThresholdCallback):
+    """Count upward voltage-threshold crossings in constant callback memory.
 
-    The constructor mirrors :class:`dendra.callbacks.Raster`. The result has
-    shape ``(steps, *batch, N, K)`` for ``K`` selected compartments. Unlike the
-    mutable callback, the functional result retains every simulated step and
-    masks events outside ``[t_start_check, t_end_check)`` to preserve a static,
-    transform-friendly time axis.
+    The returned integer tensor has shape ``(*batch, N, K)`` for ``K``
+    selected compartments. Crossing state, counts, and timestep phase all live
+    in explicit carry, so segmented and checkpointed execution resume exactly.
     """
 
-    _bound_type = _BoundRaster
-
-
-@dataclass(frozen=True)
-class _BoundAPCount(FunctionalCallback):
-    node_indices: torch.Tensor
-    threshold: float
-    start_step: int
-    end_step: int
-    callback_dt: float
-
     def initialize(self, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         selected = _selected_voltage(state, self.node_indices)
         carry = (
@@ -878,6 +903,7 @@ class _BoundAPCount(FunctionalCallback):
         return carry, None
 
     def update(self, carry, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         below, count, step = carry
         next_below, spikes = _threshold_crossing(
@@ -889,24 +915,14 @@ class _BoundAPCount(FunctionalCallback):
             self.start_step,
             self.end_step,
         )
-        return (next_below, count + spikes.to(count.dtype), step + 1), None
+        return (next_below, accumulate_count(count, spikes), step + 1), None
 
     def finalize(self, carry, emissions):
+        self._require_prepared()
         if emissions is not None:  # pragma: no cover - collection owns schema
             raise FunctionalizationError("APCount does not emit samples")
         _below, count, _step = carry
         return count
-
-
-class APCount(_ThresholdCallback):
-    """Count upward voltage-threshold crossings in constant callback memory.
-
-    The returned integer tensor has shape ``(*batch, N, K)`` for ``K``
-    selected compartments. Crossing state, counts, and timestep phase all live
-    in explicit carry, so segmented and checkpointed execution resume exactly.
-    """
-
-    _bound_type = _BoundAPCount
 
 
 def _bind_activity_partition(partition, checked_nodes: int, at_least: int):
@@ -933,44 +949,8 @@ def _bind_activity_partition(partition, checked_nodes: int, at_least: int):
 
 
 def _activity_from_counts(count, at_least, inv, partition, *, total):
-    def reduce(values):
-        measure = values.sum(dim=-1) if total else torch.count_nonzero(values, dim=-1)
-        return measure >= at_least
-
-    if partition is None:
-        active = reduce(count)
-    else:
-        active = torch.stack(
-            [reduce(group) for group in torch.split(count, partition, dim=-1)],
-            dim=-1,
-        )
+    active = activity_from_counts(count, at_least, partition, total=total)
     return ~active if inv else active
-
-
-@dataclass(frozen=True)
-class _BoundActiveAL(_BoundAPCount):
-    at_least: int
-    inv: bool
-    partition: tuple[int, ...] | None
-
-    def finalize(self, carry, emissions):
-        if emissions is not None:  # pragma: no cover - collection owns schema
-            raise FunctionalizationError("ActiveAL does not emit samples")
-        _below, count, _step = carry
-        return _activity_from_counts(
-            count, self.at_least, self.inv, self.partition, total=False
-        )
-
-
-@dataclass(frozen=True)
-class _BoundActiveALCount(_BoundActiveAL):
-    def finalize(self, carry, emissions):
-        if emissions is not None:  # pragma: no cover - collection owns schema
-            raise FunctionalizationError("ActiveALCount does not emit samples")
-        _below, count, _step = carry
-        return _activity_from_counts(
-            count, self.at_least, self.inv, self.partition, total=True
-        )
 
 
 class ActiveAL(APCount):
@@ -989,7 +969,11 @@ class ActiveAL(APCount):
     ``at_least`` must be a positive integer.
     """
 
-    _bound_type = _BoundActiveAL
+    _checkpoint_fields = _ThresholdCallback._checkpoint_fields + (
+        "at_least",
+        "inv",
+        "partition",
+    )
 
     def __init__(
         self,
@@ -1013,6 +997,8 @@ class ActiveAL(APCount):
         self.partition = partition
 
     def _bind(self, functional: FunctionalPopulation):
+        if self._prepared:
+            return self
         configuration = _bind_threshold_configuration(
             functional,
             threshold=self.threshold,
@@ -1024,7 +1010,18 @@ class ActiveAL(APCount):
         partition = _bind_activity_partition(
             self.partition, configuration[0].numel(), self.at_least
         )
-        return self._bound_type(*configuration, self.at_least, self.inv, partition)
+        return _prepare_threshold_callback(
+            self._bound_type, configuration, (self.at_least, self.inv, partition)
+        )
+
+    def finalize(self, carry, emissions):
+        self._require_prepared()
+        if emissions is not None:  # pragma: no cover - collection owns schema
+            raise FunctionalizationError("ActiveAL does not emit samples")
+        _below, count, _step = carry
+        return _activity_from_counts(
+            count, self.at_least, self.inv, self.partition, total=False
+        )
 
 
 class ActiveALCount(ActiveAL):
@@ -1035,7 +1032,14 @@ class ActiveALCount(ActiveAL):
     :class:`ActiveAL`. The returned tensor is Boolean, not a spike count.
     """
 
-    _bound_type = _BoundActiveALCount
+    def finalize(self, carry, emissions):
+        self._require_prepared()
+        if emissions is not None:  # pragma: no cover - collection owns schema
+            raise FunctionalizationError("ActiveALCount does not emit samples")
+        _below, count, _step = carry
+        return _activity_from_counts(
+            count, self.at_least, self.inv, self.partition, total=True
+        )
 
 
 class Active(ActiveAL):
@@ -1064,21 +1068,30 @@ class Active(ActiveAL):
         )
 
 
+# Default binding canonicalizes authored subclasses just as the existing factory
+# contract does; custom _bind hooks and _bound_type factories remain explicit.
+Raster._bound_type = Raster
+APCount._bound_type = APCount
+ActiveAL._bound_type = ActiveAL
+ActiveALCount._bound_type = ActiveALCount
+
+
 def _callback_implementation(callback):
     """Expose built-in policy through an exact, trusted Population adapter."""
     return callback.callback if type(callback) is _BoundPopulationCallback else callback
 
 
 def _is_builtin_callback(callback):
-    return type(_callback_implementation(callback)) in {
+    callback = _callback_implementation(callback)
+    if _is_prepared_threshold_callback(callback):
+        return any(
+            type(callback) is cls for cls in (Raster, APCount, ActiveAL, ActiveALCount)
+        )
+    return type(callback) in {
         _BoundRecorder,
         _BoundCadencedRecorder,
         _BoundLFP,
         AnomalyDetector,
-        _BoundRaster,
-        _BoundAPCount,
-        _BoundActiveAL,
-        _BoundActiveALCount,
     }
 
 
@@ -1689,7 +1702,7 @@ class FunctionalCallbacks:
                         "functional Recorder dt does not match the "
                         f"runtime timestep: expected {callback.callback_dt}, got {dt}"
                     )
-            if isinstance(callback, (_BoundRaster, _BoundAPCount)) and (
+            if _is_prepared_threshold_callback(callback) and (
                 dt != callback.callback_dt
             ):
                 raise FunctionalizationError(
@@ -1700,8 +1713,9 @@ class FunctionalCallbacks:
     def _validate_runtime_dt_tensor(self, dt: torch.Tensor) -> None:
         for plan in self._plans:
             callback = _callback_implementation(plan.callback)
-            if not isinstance(
-                callback, (_BoundRaster, _BoundAPCount, _BoundCadencedRecorder)
+            if not (
+                _is_prepared_threshold_callback(callback)
+                or isinstance(callback, _BoundCadencedRecorder)
             ):
                 continue
             expected = dt.new_tensor(callback.callback_dt)

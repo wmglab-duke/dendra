@@ -714,18 +714,24 @@ def _legacy_configuration_value(value):
         "_BoundRecorder": "Recorder",
         "_BoundCadencedRecorder": "CadencedRecorder",
         "_BoundLFP": "LFP",
-        "_BoundRaster": "Raster",
-        "_BoundAPCount": "APCount",
-        "_BoundActiveAL": "ActiveAL",
-        "_BoundActiveALCount": "ActiveALCount",
+        "Raster": "Raster",
+        "APCount": "APCount",
+        "ActiveAL": "ActiveAL",
+        "ActiveALCount": "ActiveALCount",
         "_BoundPopulationCallback": "PopulationCallback",
         "_RecorderRegion": "RecorderRegion",
     }
+    kind = kinds[type(value).__name__]
+    if kind in ("Raster", "APCount", "ActiveAL", "ActiveALCount"):
+        names = ("node_indices", "threshold", "start_step", "end_step", "callback_dt")
+        if kind in ("ActiveAL", "ActiveALCount"):
+            names += ("at_least", "inv", "partition")
+    else:
+        names = tuple(field.name for field in fields(value))
     return {
-        "kind": kinds[type(value).__name__],
+        "kind": kind,
         "fields": {
-            field.name: _legacy_configuration_value(getattr(value, field.name))
-            for field in fields(value)
+            name: _legacy_configuration_value(getattr(value, name)) for name in names
         },
     }
 

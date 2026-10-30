@@ -264,6 +264,15 @@ also accept it as part of a shared continuation packet. See
 :doc:`../advanced/A58_functional_callback_checkpoints` for complete Population
 and Network examples, ownership, and compatibility rules.
 
+Threshold callback configurations prepare independent immutable instances with
+resolved indices, windows and timestep metadata. ``Raster``, ``APCount``,
+``ActiveAL`` and ``ActiveALCount`` implement the pure hooks directly;
+``Active`` uses the ``ActiveAL(at_least=1)`` rule. Evolving crossing latches,
+counts and phase belong to explicit carry, rather than the prepared callback.
+Supplied configuration objects remain unchanged. See
+:doc:`../advanced/A27_functional_network_callbacks` for timing, result shapes
+and Population scopes.
+
 Custom ``FunctionalCallback`` implementations support portable continuation with
 the optional ``checkpoint_configuration()`` hook. It returns a plain dictionary
 with a stable namespaced ``kind`` string, positive integer ``version`` and a

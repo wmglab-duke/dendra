@@ -10,17 +10,18 @@ import torch
 from torch.utils import _pytree as pytree
 
 from ._callbacks import (
+    ActiveAL,
+    ActiveALCount,
     AnomalyDetector,
+    APCount,
     FunctionalCallback,
     FunctionalCallbackState,
-    _BoundActiveAL,
-    _BoundActiveALCount,
-    _BoundAPCount,
+    Raster,
     _BoundCadencedRecorder,
     _BoundLFP,
     _BoundPopulationCallback,
-    _BoundRaster,
     _BoundRecorder,
+    _is_prepared_threshold_callback,
     _TensorLeafSchema,
     _TensorTreeSchema,
     _validate_tree,
@@ -35,10 +36,10 @@ _KINDS = {
     _BoundRecorder: "Recorder",
     _BoundCadencedRecorder: "CadencedRecorder",
     _BoundLFP: "LFP",
-    _BoundRaster: "Raster",
-    _BoundAPCount: "APCount",
-    _BoundActiveAL: "ActiveAL",
-    _BoundActiveALCount: "ActiveALCount",
+    Raster: "Raster",
+    APCount: "APCount",
+    ActiveAL: "ActiveAL",
+    ActiveALCount: "ActiveALCount",
     _BoundPopulationCallback: "PopulationCallback",
     _RecorderRegion: "RecorderRegion",
 }
@@ -142,6 +143,9 @@ def _legacy_configuration_value(value):
 def _builtin_kind(value):
     if type(value) is AnomalyDetector:
         return "AnomalyDetector"
+    if any(type(value) is cls for cls in (Raster, APCount, ActiveAL, ActiveALCount)):
+        if not _is_prepared_threshold_callback(value):
+            return None
     return next(
         (
             kind
@@ -160,14 +164,16 @@ def _builtin_callback_configuration(callback):
             "callback checkpoints currently support built-in callbacks only; "
             "custom callbacks are unsupported"
         )
-    values = (
-        {}
+    names = (
+        ()
         if type(callback) is AnomalyDetector
-        else {
-            field.name: _legacy_configuration_value(getattr(callback, field.name))
-            for field in fields(callback)
-        }
+        else callback._checkpoint_fields
+        if _is_prepared_threshold_callback(callback)
+        else tuple(field.name for field in fields(callback))
     )
+    values = {
+        name: _legacy_configuration_value(getattr(callback, name)) for name in names
+    }
     return {"kind": kind, "version": 1, "fields": values}
 
 
@@ -444,7 +450,7 @@ def _validate_emissions(callbacks, schemas):
         if type(implementation) is _BoundPopulationCallback:
             implementation = implementation.callback
         expected = plan.emission_schema
-        if type(implementation) is _BoundRaster and schema is not None:
+        if type(implementation) is Raster and schema is not None:
             expected = _TensorTreeSchema(
                 plan.result_schema.spec,
                 tuple(

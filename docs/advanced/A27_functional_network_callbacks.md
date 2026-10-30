@@ -102,6 +102,14 @@ gradient. Omit that Recorder when only electrode signals are needed.
 
 ## Threshold windows and result memory
 
+`Raster`, `APCount`, `ActiveAL` and `ActiveALCount` implement the pure callback
+hooks directly. Binding prepares a separate immutable instance with resolved
+compartment indices, timestep and window bounds; the supplied configuration
+object remains unchanged. `Active` uses the `ActiveAL(at_least=1)` rule. Configure
+the supplied object before binding, and bind a new collection when changing its
+settings. Prepared metadata contains no evolving analysis state: crossing
+latches, counts and step phase travel in explicit carry.
+
 Threshold callbacks inspect accepted post-step voltages. The initial model frame
 does not trigger a crossing. The first checked sample is armed, including when
 its voltage is already at or above `threshold`; a checked below-threshold sample
@@ -134,6 +142,11 @@ one slot contribute separately only to `ActiveALCount`. The Active family also s
 and static `partition` groups over the selected-slot axis. Repeated `node_check`
 indices retain their multiplicity. These settings follow the full
 {doc}`A8_functional_populations` callback contract.
+
+Native and functional threshold analyses share their numerical crossing,
+counting and activity reductions. Each execution API retains its observation
+window, counter and recording policies; the functional shapes and timing are
+specified here.
 
 `Raster` retains every accepted timestep, with `False` outside its checked
 window. Reducers and anomaly detection emit no trajectory, so their callback

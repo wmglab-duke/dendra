@@ -14,6 +14,9 @@ from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ..helpers import nojit
 from ._recorder_cadence import _recorder_should_save, _recorder_stride
+from ._threshold_callbacks import accumulate_count as _accumulate_count
+from ._threshold_callbacks import activity_from_counts as _activity_from_counts
+from ._threshold_callbacks import threshold_crossing as _threshold_crossing
 from .backend import Backend as A
 
 # Kept as a module-level compatibility hook, but initialized lazily by Recorder.
@@ -1494,8 +1497,9 @@ class Active(ActiveAL):
     Attributes
     ----------
     record : torch.Tensor
-        Boolean tensor of shape ``(*batch, N)`` indicating which logical
-        population entries fired at least once.
+        Float32 per-slot spike counters of shape ``(*batch, N, K)``, inherited
+        from APCount. ``is_active()`` returns the Boolean activity mask shaped
+        ``(*batch, N)``.
     state_cache : torch.Tensor
         Boolean tensor of shape ``(*batch, N, K)`` tracking membrane potential
         state at the ``K`` checked compartments.
@@ -1800,80 +1804,55 @@ class Raster(ThresholdCallback):
 
 
 def _increment_count(vm, vm_new, record, threshold: float):  # pragma: no cover
-    m = vm_new >= threshold
-    mask = m & vm  # fused compare + and
-    record = record + mask.to(record.dtype)  # one fused kernel
-    next_mask = ~m  # can tag-on to same kernel
-    return next_mask, record
+    next_mask, spikes = _threshold_crossing(vm, vm_new, threshold)
+    return next_mask, _accumulate_count(record, spikes)
 
 
 def _increment_act(vm, vm_new, threshold: float):  # pragma: no cover
-    m = vm_new >= threshold
-    mask = m & vm  # fused compare + and
-    next_mask = ~m  # can tag-on to same kernel
-    return next_mask, mask
+    return _threshold_crossing(vm, vm_new, threshold)
 
 
 def _update_active(
     vm, vm_new, record, threshold: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover
-    ge = vm_new >= threshold
-    record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=-1))
-    return ~ge, record
+    next_mask, spikes = _threshold_crossing(vm, vm_new, threshold)
+    record = torch.logical_or(record, torch.any(spikes, dim=-1))
+    return next_mask, record
+
+
+def _validate_activity_partition(record, at_least, partition):
+    if partition is None:
+        return None
+
+    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
+    if lengths.dim() != 1:
+        raise ValueError("partition must be a 1D sequence of integers.")
+
+    lengths_list = lengths.tolist()
+    if not lengths_list:
+        raise ValueError("partition must be non-empty.")
+    if sum(lengths_list) != record.shape[-1]:
+        raise ValueError(
+            "sum(partition) must equal record.shape[-1]; "
+            f"got {sum(lengths_list)} and {record.shape[-1]}."
+        )
+    if min(lengths_list) < at_least:
+        raise ValueError(
+            "all partition values must be at least `at_least`; "
+            f"minimum was {min(lengths_list)}."
+        )
+
+    return lengths_list
 
 
 def _is_active(record, at_least: int, partition=None) -> torch.Tensor:
-    if partition is None:
-        return torch.count_nonzero(record, dim=-1) >= at_least
-
-    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
-    if lengths.dim() != 1:
-        raise ValueError("partition must be a 1D sequence of integers.")
-
-    lengths_list = lengths.tolist()
-    if not lengths_list:
-        raise ValueError("partition must be non-empty.")
-    if sum(lengths_list) != record.shape[-1]:
-        raise ValueError(
-            "sum(partition) must equal record.shape[-1]; "
-            f"got {sum(lengths_list)} and {record.shape[-1]}."
-        )
-    if min(lengths_list) < at_least:
-        raise ValueError(
-            "all partition values must be at least `at_least`; "
-            f"minimum was {min(lengths_list)}."
-        )
-
-    segments = torch.split(record, lengths_list, dim=-1)
-    return torch.stack(
-        [torch.count_nonzero(seg, dim=-1) >= at_least for seg in segments], dim=-1
-    )
+    partition = _validate_activity_partition(record, at_least, partition)
+    return _activity_from_counts(record, at_least, partition)
 
 
 def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
-    if partition is None:
-        return record.sum(dim=-1) >= at_least
-
-    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
-    if lengths.dim() != 1:
-        raise ValueError("partition must be a 1D sequence of integers.")
-
-    lengths_list = lengths.tolist()
-    if not lengths_list:
-        raise ValueError("partition must be non-empty.")
-    if sum(lengths_list) != record.shape[-1]:
-        raise ValueError(
-            "sum(partition) must equal record.shape[-1]; "
-            f"got {sum(lengths_list)} and {record.shape[-1]}."
-        )
-    if min(lengths_list) < at_least:
-        raise ValueError(
-            "all partition values must be at least `at_least`; "
-            f"minimum was {min(lengths_list)}."
-        )
-
-    segments = torch.split(record, lengths_list, dim=-1)
-    return torch.stack([seg.sum(dim=-1) >= at_least for seg in segments], dim=-1)
+    partition = _validate_activity_partition(record, at_least, partition)
+    return _activity_from_counts(record, at_least, partition, total=True)
 
 
 def _sliding_window_average(x, window_size: int):

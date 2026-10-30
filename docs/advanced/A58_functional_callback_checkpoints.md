@@ -140,6 +140,14 @@ observation paths and indices,
 physical regions, Population scopes,
 timestep, Recorder cadence, threshold windows, activity rules and LFP lead fields.
 
+For threshold callbacks, compatibility checks use prepared compartment indices,
+window bounds, timestep and activity settings. Preparation is separate from the
+authored configuration object and contains no changing analysis state. The
+checkpoint carries crossing latches, accumulated counts where applicable, and
+step phase with the per-callback carry schemas. Restoring this data
+resumes the receiving callback's pure hooks without serializing a Python
+callback instance.
+
 The example configures full-rate and cadenced Recorders, Raster, APCount and AnomalyDetector. Its
 Network has two Populations linked continuously and an event synapse driven by
 a noisy NetStim. Network callback scopes select the Population whose voltages
