@@ -135,6 +135,27 @@ explicit continuation.
 
 ## Initialize from current parameters
 
+Use `dn.func.initialize(runner)` for explicit fresh initialization before the
+first rollout. It returns a `Continuation` containing initialized state and
+effective parameters/constants, with aliases and gradient history retained:
+
+```python
+initial = dn.func.initialize(runner, initialization=runner.initialization_inputs)
+print(dn.func.inspect_sources(initial))
+state, auxiliary = runner(initial, duration=25.0)
+```
+
+Optional `parameters=` and `constants=` arguments override the runner's defaults
+for this initialization. The operation follows native initialization, cache and
+RNG ordering and leaves the defaults and source Network unchanged. It starts no
+callbacks or recording and performs no rollout; the first call with the packet
+starts the runner's configured callbacks at the initialized boundary. Explicit
+initialization always uses the fresh protocol, independently of the runner's
+automatic restart policy. See {ref}`functional-runner-initialization` and the
+complete
+{download}`functional_runner_initialization.py <../../examples/functional_runner_initialization.py>`
+example for both model families.
+
 Select `initialization="fresh"` to construct initial state from current
 parameters on each call without explicit state. Population initialization,
 connection resets, and NetStim initialization use the same pure components as

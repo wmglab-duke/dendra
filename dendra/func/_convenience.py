@@ -12,7 +12,7 @@ from ._binding import BoundPopulation
 from ._compiled import CompiledPopulationChunk
 from ._continuation import _complete_continuation, _resolve_continuation
 from ._draws import _with_runtime_draws
-from ._initialization import _initialization_input_mapping, _initialize_host
+from ._initialization import _initialize_fresh, _runner_sources
 from ._inputs import _population_inputs
 from ._parameter_queries import matching_names
 from ._parameter_queries import parameter_name as _parameter_name
@@ -559,35 +559,21 @@ class CompiledRunner:
         # An external Mapping can execute arbitrary Python while materializing
         # its entries. Snapshot it before checking source structure, rather than
         # letting iteration invalidate that check between owned boundaries.
-        selected_parameters = (
-            self._parameters if parameters is None else dict(parameters)
+        selected_parameters, selected_constants, selected_initialization, _ = (
+            _runner_sources(self, parameters, constants, initialization, fresh=fresh)
         )
-        selected_initialization = (
-            _initialization_input_mapping(
-                self._initialization_inputs
-                if initialization is None
-                else initialization
-            )
-            if fresh
-            else None
-        )
-        selected_constants = self._constants if constants is None else dict(constants)
         if fresh:
             # Physical preparation requires ordinary, versioned tensors even
             # for inference. Respect the caller's grad context and never retain
             # this initialization graph or its parameter replacements.
-            initialization_grad = torch.is_grad_enabled() and not self._inference
-            with (
-                torch.inference_mode(False),
-                torch.set_grad_enabled(initialization_grad),
-            ):
-                initialized = _initialize_host(
-                    self._functional,
-                    selected_parameters,
-                    selected_constants,
-                    selected_state,
-                    selected_initialization,
-                )
+            initialized = _initialize_fresh(
+                self._functional,
+                selected_parameters,
+                selected_constants,
+                selected_state,
+                selected_initialization,
+                gradient=torch.is_grad_enabled() and not self._inference,
+            )
             selected_state = initialized.state
             selected_parameters = initialized.parameters
             selected_constants = initialized.constants

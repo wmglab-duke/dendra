@@ -503,6 +503,65 @@ compile-time bound stimulation. See {ref}`functional-runtime-extra`.
 
 ## Initialization and saved continuation
 
+(functional-runner-initialization)=
+### Initialize a compiled runner
+
+`dn.func.initialize(program)` returns an initialized `Continuation` for either
+kind of compiled runner:
+
+```python
+initial = dn.func.initialize(program)
+print(dn.func.inspect_sources(initial))
+state, auxiliary = program(initial, duration=25.0)
+```
+
+This explicit operation always follows the fresh initialization protocol,
+including native cache precedence and RNG policies. The runner's
+`initialization="snapshot"` or `"fresh"` setting still controls ordinary calls
+without state. Initialization reads the runner's default parameters, constants,
+initial state and initialization inputs. Optional `parameters=`, `constants=`
+and `initialization=` arguments replace those sources for this initialization;
+they do not change the defaults.
+
+The returned packet retains the effective initialized sources, including
+parameter replacements, aliases and gradient history. It has
+`callback_state=None`: initialization starts no callback or recording, performs
+no rollout and captures no execution kernel. Initialization itself builds the
+coefficients and samples the initialization draws required by the model's
+existing protocol. Runtime input tapes, `draws=` and call-local `extra` belong
+to the subsequent run; a runner with `extra=dn.VarInput()` needs no runtime
+recipe for this initialization call.
+
+Explicit initialization follows the caller's gradient mode and native model
+policy. The runner's `inference` setting governs execution when the packet is
+passed to `program(...)`. Inspect, bind or export the initialized continuation
+through the existing APIs. The first execution starts the configured callbacks
+and records their initial boundary once; subsequent continuation calls retain
+their carry and sampling phase.
+
+To export an initialized packet before callbacks begin, use the shared checkpoint
+functions with callbacks omitted:
+
+```python
+saved = dn.func.export_continuation(program.functional, initial)
+restored = dn.func.restore_continuation(program.functional, saved)
+state, auxiliary = program(restored)
+```
+
+Restoration creates detached source leaves, following the checkpoint contract
+below. The runner starts its configured callbacks on the restored initial state.
+
+The complete
+{download}`functional_runner_initialization.py <../../examples/functional_runner_initialization.py>`
+example initializes snapshot-policy Population and Network runners with raw
+parameter and voltage overrides. It checks effective shared sources, live
+gradients and joined recordings:
+
+```console
+python examples/functional_runner_initialization.py
+python examples/functional_runner_initialization.py --backend aot_eager
+```
+
 (functional-explicit-initialization)=
 ### Initialize explicit sources
 

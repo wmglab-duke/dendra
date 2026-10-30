@@ -13,7 +13,7 @@ from dendra.models.core import _validate_time_scalar
 
 from ._continuation import _complete_continuation, _resolve_continuation
 from ._draws import _normalize_runtime_draws
-from ._initialization import _initialize_host
+from ._initialization import _initialize_fresh, _runner_sources
 from ._lowering import _lower_network
 from ._network_bindings import _map_containers
 from ._network_initialization import NetworkInitializationInput
@@ -452,27 +452,13 @@ class CompiledNetworkRunner:
         selected_state = self._initial_state if state is None else state
         # Materialize external container code before the plan validates native
         # source structure. Tensor identities/history, including ties, survive.
-        selected_parameters = (
-            self._parameters
-            if parameters is None
-            else _map_containers(parameters, dict)
-        )
-        selected_inputs = _map_containers(inputs, dict)
-        selected_initialization = (
-            _map_containers(
-                self._initialization_inputs
-                if initialization is None
-                else initialization,
-                dict,
-            )
-            if fresh
-            else None
-        )
-        selected_constants = (
-            self._constants if constants is None else _map_containers(constants, dict)
-        )
-        selected_constants = self._functional._bind_parameter_constants(
-            selected_parameters, selected_constants
+        (
+            selected_parameters,
+            selected_constants,
+            selected_initialization,
+            selected_inputs,
+        ) = _runner_sources(
+            self, parameters, constants, initialization, fresh=fresh, inputs=inputs
         )
         previous = self._kernel.execution_report()
         try:
@@ -481,20 +467,14 @@ class CompiledNetworkRunner:
                     raise TypeError(
                         "initialization must be a NetworkInitializationInput"
                     )
-                # Fresh coefficients and effective parameters require ordinary,
-                # versioned tensors even under an outer inference context.
-                initialization_grad = torch.is_grad_enabled() and not self._inference
-                with (
-                    torch.inference_mode(False),
-                    torch.set_grad_enabled(initialization_grad),
-                ):
-                    initialized = _initialize_host(
-                        self._functional,
-                        selected_parameters,
-                        selected_constants,
-                        selected_state,
-                        selected_initialization,
-                    )
+                initialized = _initialize_fresh(
+                    self._functional,
+                    selected_parameters,
+                    selected_constants,
+                    selected_state,
+                    selected_initialization,
+                    gradient=torch.is_grad_enabled() and not self._inference,
+                )
                 selected_parameters = initialized.parameters
                 selected_constants = initialized.constants
                 selected_state = initialized.state

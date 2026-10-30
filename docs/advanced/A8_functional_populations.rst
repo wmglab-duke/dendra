@@ -179,6 +179,24 @@ Raw-bound host scheduling accepts the same packet as
 ``dn.func.run(bound, auxiliary["continuation"], ...)`` when its sources match
 the binding; see :ref:`functional-bound-continuation`.
 
+Use ``dn.func.initialize(runner)`` to obtain fresh initialized state and effective
+sources before starting callbacks or executing a rollout:
+
+.. code-block:: python
+
+   initial = dn.func.initialize(runner)
+   print(dn.func.inspect_sources(initial))
+   state, auxiliary = runner(initial)
+
+Explicit initialization follows the fresh protocol even for a snapshot-policy
+runner. Optional ``parameters=``, ``constants=`` and ``initialization=`` overrides
+retain their Tensor identities and gradients; the returned ``Continuation``
+holds any effective replacements and has ``callback_state=None``. Ordinary
+no-state runner calls retain their configured restart policy. See
+:ref:`functional-runner-initialization` and the complete
+:download:`functional_runner_initialization.py <../../examples/functional_runner_initialization.py>`
+example for Population and Network usage.
+
 To save a complete portable continuation and restore it into a compatible
 lowered Population or Network, use the shared functions:
 

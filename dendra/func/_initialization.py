@@ -10,6 +10,8 @@ from ._continuation import Continuation
 from ._network_bindings import _map_containers
 from ._types import FunctionalizationError, InitializationInput, PopulationTensors
 
+_UNSET = object()
+
 
 def _initialization_input_mapping(inputs):
     """Snapshot external mappings without severing differentiable leaves."""
@@ -40,11 +42,121 @@ def _initialize_host(functional, parameters, constants, state, initialization):
     )
 
 
-def initialize(functional, tensors, *, initialization=None):
-    """Initialize a lowered Population or Network and return a Continuation.
+def _initialize_fresh(
+    functional, parameters, constants, state, initialization, *, gradient
+):
+    """Run one fresh initialization with ordinary, versioned tensor outputs."""
+    with torch.inference_mode(False), torch.set_grad_enabled(gradient):
+        return _initialize_host(
+            functional, parameters, constants, state, initialization
+        )
 
-    ``tensors`` is the matching ``PopulationTensors`` or ``NetworkTensors`` bundle
-    returned by ``make_functional``. Its explicit state, parameters and constants
+
+def _runner_sources(
+    runner, parameters, constants, initialization, *, fresh, inputs=None
+):
+    """Select raw frames in each runner's authored-container traversal order."""
+    from ._network import FunctionalNetwork
+
+    if isinstance(runner._functional, FunctionalNetwork):
+        selected_parameters = (
+            runner._parameters
+            if parameters is None
+            else _map_containers(parameters, dict)
+        )
+        selected_inputs = _map_containers(inputs, dict)
+        selected_initialization = (
+            _map_containers(
+                runner._initialization_inputs
+                if initialization is None
+                else initialization,
+                dict,
+            )
+            if fresh
+            else None
+        )
+        selected_constants = (
+            runner._constants if constants is None else _map_containers(constants, dict)
+        )
+        selected_constants = runner._functional._bind_parameter_constants(
+            selected_parameters, selected_constants
+        )
+    else:
+        selected_parameters = (
+            runner._parameters if parameters is None else dict(parameters)
+        )
+        selected_inputs = inputs
+        selected_initialization = (
+            _initialization_input_mapping(
+                runner._initialization_inputs
+                if initialization is None
+                else initialization
+            )
+            if fresh
+            else None
+        )
+        selected_constants = runner._constants if constants is None else dict(constants)
+    return (
+        selected_parameters,
+        selected_constants,
+        selected_initialization,
+        selected_inputs,
+    )
+
+
+def _initialize_runner(runner, parameters, constants, initialization):
+    """Initialize from runner defaults without entering its execution lifecycle."""
+    state = runner._initial_state
+    parameters, constants, selected, _ = _runner_sources(
+        runner, parameters, constants, initialization, fresh=True
+    )
+    return _initialize_continuation(
+        runner._functional, parameters, constants, state, selected
+    )
+
+
+def _initialize_continuation(functional, parameters, constants, state, selected):
+    """Publish effective initialization frames under the caller's gradient mode."""
+    from ._network import FunctionalNetwork
+
+    gradient = torch.is_grad_enabled()
+    with torch.inference_mode(False), torch.set_grad_enabled(gradient):
+        initialized = _initialize_fresh(
+            functional,
+            parameters,
+            constants,
+            state,
+            selected,
+            gradient=gradient,
+        )
+        parameters, constants = initialized.parameters, initialized.constants
+        if isinstance(functional, FunctionalNetwork):
+            constants = functional._bind_parameter_constants(parameters, constants)
+        return Continuation(initialized.state, parameters, constants)
+
+
+def initialize(
+    functional,
+    tensors=_UNSET,
+    *,
+    initialization=None,
+    parameters=_UNSET,
+    constants=_UNSET,
+):
+    """Initialize a runner or lowered model and return a Continuation.
+
+    ``initialize(program)`` uses either compiled runner's raw defaults and
+    initial clock/RNG snapshot. Optional ``parameters=`` and ``constants=``
+    mappings override those sources; ``None`` retains the corresponding
+    defaults. ``initialization=`` overrides its initialization-input packet.
+    This explicit operation always runs fresh initialization, including bound
+    caches and their RNG policies. The runner's snapshot/fresh policy continues
+    to control ordinary no-state calls. Runner defaults, prepared caches and
+    execution reports remain unchanged.
+
+    For a lowered model, ``tensors`` is the matching ``PopulationTensors`` or
+    ``NetworkTensors`` bundle returned by ``make_functional``. Its explicit
+    state, parameters and constants
     supply the starting clock/RNG carry and raw sources; no native extraction is
     performed. The result retains effective initialization replacements, aliases
     and gradient history without copying or detaching Tensor leaves.
@@ -60,7 +172,9 @@ def initialize(functional, tensors, *, initialization=None):
     forward AD. The pure ``functional.initialize`` methods and their existing
     result types remain available for transforms. Initialization creates ordinary
     Tensors even inside inference mode, while respecting the caller's gradient
-    mode and the model's native training policy.
+    mode and the model's native training policy. For explicit runner
+    initialization, the caller's gradient mode also applies independently of
+    the runner's inference flag; that flag controls subsequent execution.
 
     The returned packet has no callback carry or recording history and advances
     no accepted timestep. Bind its effective sources, then start callbacks on the
@@ -73,6 +187,25 @@ def initialize(functional, tensors, *, initialization=None):
     Source models, bundle containers and initialization defaults are unchanged.
     Runtime ``Inputs``, ``RuntimeDraws`` and waveform recipes remain run inputs.
     """
+    from ._convenience import CompiledRunner
+    from ._network_compile import CompiledNetworkRunner
+
+    is_runner = type(functional) in (CompiledRunner, CompiledNetworkRunner)
+    if is_runner:
+        if tensors is not _UNSET:
+            raise TypeError(
+                "tensors cannot be supplied when initializing a compiled runner"
+            )
+    else:
+        for name, value in (("parameters", parameters), ("constants", constants)):
+            if value is not _UNSET:
+                raise TypeError(
+                    f"initialize() got an unexpected keyword argument {name!r}"
+                )
+        if tensors is _UNSET:
+            raise TypeError(
+                "initialize() missing 1 required positional argument: 'tensors'"
+            )
     if (
         torch.compiler.is_compiling()
         or torch._C._are_functorch_transforms_active()
@@ -80,6 +213,14 @@ def initialize(functional, tensors, *, initialization=None):
     ):
         raise FunctionalizationError(
             "initialize must run outside torch.compile, torch.func and forward AD"
+        )
+
+    if is_runner:
+        return _initialize_runner(
+            functional,
+            None if parameters is _UNSET else parameters,
+            None if constants is _UNSET else constants,
+            initialization,
         )
 
     from ._network import FunctionalNetwork, NetworkTensors
@@ -117,15 +258,7 @@ def initialize(functional, tensors, *, initialization=None):
     else:
         constants = functional._bind_parameter_constants(parameters, constants)
 
-    gradient = torch.is_grad_enabled()
-    with torch.inference_mode(False), torch.set_grad_enabled(gradient):
-        initialized = _initialize_host(
-            functional, parameters, constants, state, selected
-        )
-        parameters, constants = initialized.parameters, initialized.constants
-        if type(functional) is FunctionalNetwork:
-            constants = functional._bind_parameter_constants(parameters, constants)
-        return Continuation(initialized.state, parameters, constants)
+    return _initialize_continuation(functional, parameters, constants, state, selected)
 
 
 __all__ = ["initialize"]
