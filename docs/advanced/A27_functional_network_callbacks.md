@@ -253,9 +253,10 @@ The example compares the custom mean-voltage trajectory with the Recorder,
 including its initial frame, and the accumulated energy with all post-step
 voltages. Continuation keeps the carry cumulative and does not repeat the shared
 boundary emission. The same bound collection supports in-memory continuation
-through `callback_state=` or a returned `Continuation`. Portable export and
-restoration of custom callback configurations are currently unsupported; see
-{doc}`A58_functional_callback_checkpoints`.
+through `callback_state=` or a returned `Continuation`. Custom bound callbacks
+can support portable export and restoration by implementing
+`checkpoint_configuration()`; see
+{ref}`functional-callback-checkpoint-protocol`.
 
 The independent `coarse` Recorder uses `dt=2 * DT`. With native in-memory
 timing it selects frames 0, 1, 3, 5, and 7 from the eight-step full recording.

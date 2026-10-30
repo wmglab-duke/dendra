@@ -377,20 +377,22 @@ The explicit-state form also remains available: supply
 `callback_state=prefix_aux["callbacks"].state` with the corresponding simulation
 state. Direct chunks use that form as well.
 
-For qualified built-in callback collections, save detached continuation with
+For built-in callbacks and custom callbacks implementing
+`checkpoint_configuration()`, save detached continuation with
 `dn.func.export_continuation(plan, aux["continuation"], callbacks=callbacks)`.
 Restore the plain data/Tensor packet against a compatible receiving lowered plan
 with `dn.func.restore_continuation(receiving, saved, callbacks=receiving_callbacks)`,
-then bind its restored parameter/constant leaves before resuming with `dn.func.run`.
+then pass the returned `Continuation` to `dn.func.run` with the receiving plan
+or compiled chunk.
 Each callback collection belongs to its corresponding plan. This retains
 effective sources, raw parameter/constant aliases, trainability and callback
 phase. Runtime tapes, model configuration, optimizer state and prior recordings
 remain separate. Convenience runners provide the same portable format through
 `program.export_continuation(...)` and `receiver.restore_continuation(...)`;
 their bound callback collection is available as `runner.callbacks`. The example's
-custom `VoltageEnergy` reducer supports live in-memory continuation;
-portable export of custom bound callback implementations is currently
-unsupported.
+custom `VoltageEnergy` reducer supports live in-memory continuation. Add a
+`checkpoint_configuration()` declaration to a custom bound callback to enable
+portable restoration; see {ref}`functional-callback-checkpoint-protocol`.
 Independently saved analysis can use `callbacks.export_state(...)` and
 `callbacks.restore_state(...)` directly. The portable bridge validates callback settings and
 source/state schemas; see

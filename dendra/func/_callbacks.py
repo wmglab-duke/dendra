@@ -64,6 +64,32 @@ class FunctionalCallback(ABC):
     def finalize(self, carry, emissions):
         """Return the public tensor result for this execution segment."""
 
+    def checkpoint_configuration(self):
+        """Declare compatibility metadata for portable callback checkpoints.
+
+        Custom bound implementations opt in by returning an exact dict with
+        ``kind`` (a nonempty stable string), ``version`` (a positive integer),
+        and ``fields`` (an exact dict with string keys). Fields contain only
+        plain scalars, acyclic dict/list/tuple containers and ordinary Tensor
+        or Parameter values. Tensor metadata is frozen into detached owned
+        CPU values with dtype/device descriptors during export and comparison.
+
+        Include all static configuration that affects carry, emissions or
+        results. Use a distinct kind and increment the version when their
+        interpretation changes. The receiving application constructs its own
+        callback; checkpoint metadata never reconstructs objects or imports
+        implementations. Carry and emission schemas retain their normal checks.
+
+        This deterministic, side-effect-free hook is called only during host
+        export/restore, not binding, numerical execution or checkpoint replay.
+        It belongs to the bound callback returned by ``_bind``. The default
+        retains built-in checkpoint formats and rejects other implementations;
+        overriding it is optional for execution and in-memory continuation.
+        """
+        from ._callback_checkpoints import _builtin_callback_configuration
+
+        return _builtin_callback_configuration(self)
+
     def _bind(self, functional: FunctionalPopulation):
         """Resolve static plan-specific configuration for a built-in callback."""
 
@@ -1533,8 +1559,9 @@ class FunctionalCallbacks:
 
         The versioned plain data/Tensor packet can be saved with ``torch.save``
         and loaded with ``torch.load(..., weights_only=True)``. It contains
-        callback carry and emission metadata, without recording history. Only
-        qualified built-in callbacks and Population scopes are supported.
+        callback carry and emission metadata, without recording history.
+        Built-in callbacks, Population scopes and custom bound callbacks with
+        ``checkpoint_configuration()`` support portable restoration.
         Export runs outside compilation, function transforms and forward AD.
         """
         from ._callback_checkpoints import export_state

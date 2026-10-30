@@ -11,6 +11,7 @@ from torch.utils import _pytree as pytree
 
 from ._callbacks import (
     AnomalyDetector,
+    FunctionalCallback,
     FunctionalCallbackState,
     _BoundActiveAL,
     _BoundActiveALCount,
@@ -29,6 +30,7 @@ from ._types import FunctionalizationError
 
 _FORMAT = "dendra.func.callback_state"
 _VERSION = 1
+# Historical wire names for default adapters; custom hooks need no registration.
 _KINDS = {
     _BoundRecorder: "Recorder",
     _BoundCadencedRecorder: "CadencedRecorder",
@@ -60,7 +62,7 @@ def _cold_boundary():
 
 
 def _tensor(value, *, copy):
-    if type(value) not in (torch.Tensor, torch.nn.Parameter):
+    if type(value) is not torch.Tensor and type(value) is not torch.nn.Parameter:
         raise FunctionalizationError(
             "callback checkpoints require ordinary Tensors; Tensor subclasses "
             "are currently unsupported"
@@ -101,23 +103,18 @@ def _tensor_tree(value, *, copy, active=None):
         active.remove(identity)
 
 
-def _configuration_value(value):
-    """Project only exact trusted implementations, never authored object state."""
+def _legacy_configuration_value(value):
+    """Describe trusted built-in fields without freezing Tensor values twice."""
     if isinstance(value, str):
         return str.__str__(value)
     if value is None or type(value) in (bool, int, float):
         return value
     if isinstance(value, torch.Tensor):
-        value = _tensor(value, copy=False)
-        return {
-            "tensor": value.detach().to(device="cpu").clone(),
-            "dtype": str(value.dtype),
-            "device": str(value.device),
-        }
+        return _tensor(value, copy=False)
     if isinstance(value, (torch.dtype, torch.device)):
         return str(value)
     if type(value) in (tuple, list):
-        return [_configuration_value(child) for child in value]
+        return [_legacy_configuration_value(child) for child in value]
     if type(value) is slice:
         components = (value.start, value.stop, value.step)
         if not all(part is None or isinstance(part, Integral) for part in components):
@@ -125,9 +122,9 @@ def _configuration_value(value):
                 "callback checkpoints require plain integer Slice selectors"
             )
         return {"slice": [None if part is None else int(part) for part in components]}
-    if type(value) is AnomalyDetector:
-        return {"kind": "AnomalyDetector"}
-    kind = _KINDS.get(type(value))
+    if isinstance(value, FunctionalCallback):
+        return _callback_configuration(value)
+    kind = _builtin_kind(value)
     if kind is None:
         raise FunctionalizationError(
             "callback checkpoints currently support built-in callbacks only; "
@@ -136,10 +133,124 @@ def _configuration_value(value):
     return {
         "kind": kind,
         "fields": {
-            field.name: _configuration_value(getattr(value, field.name))
+            field.name: _legacy_configuration_value(getattr(value, field.name))
             for field in fields(value)
         },
     }
+
+
+def _builtin_kind(value):
+    if type(value) is AnomalyDetector:
+        return "AnomalyDetector"
+    return next(
+        (
+            kind
+            for implementation, kind in _KINDS.items()
+            if type(value) is implementation
+        ),
+        None,
+    )
+
+
+def _builtin_callback_configuration(callback):
+    """Adapt exact historical implementations to the shared declaration contract."""
+    kind = _builtin_kind(callback)
+    if kind is None:
+        raise FunctionalizationError(
+            "callback checkpoints currently support built-in callbacks only; "
+            "custom callbacks are unsupported"
+        )
+    values = (
+        {}
+        if type(callback) is AnomalyDetector
+        else {
+            field.name: _legacy_configuration_value(getattr(callback, field.name))
+            for field in fields(callback)
+        }
+    )
+    return {"kind": kind, "version": 1, "fields": values}
+
+
+def _default_checkpoint_configuration(callback):
+    return (
+        getattr(callback.checkpoint_configuration, "__func__", None)
+        is FunctionalCallback.checkpoint_configuration
+    )
+
+
+def _callback_configuration(callback):
+    """Validate a declaration and retain the established built-in wire envelope."""
+    declaration = callback.checkpoint_configuration()
+    _keys(
+        declaration,
+        ("kind", "version", "fields"),
+        label="callback checkpoint configuration",
+    )
+    kind, version, values = (
+        declaration["kind"],
+        declaration["version"],
+        declaration["fields"],
+    )
+    if type(kind) is not str or not kind:
+        raise ValueError(
+            "callback checkpoint configuration kind must be a nonempty string"
+        )
+    if type(version) is not int or version < 1:
+        raise ValueError(
+            "callback checkpoint configuration version must be a positive integer"
+        )
+    if type(values) is not dict:
+        raise TypeError("callback checkpoint configuration fields must be a plain dict")
+    if (
+        _default_checkpoint_configuration(callback)
+        and _builtin_kind(callback) is not None
+    ):
+        if type(callback) is AnomalyDetector:
+            return {"kind": kind}
+        return {"kind": kind, "fields": values}
+    return {"kind": kind, "version": version, "fields": values}
+
+
+def _plain_configuration_value(value, active=None):
+    """Freeze a narrow plain-data tree, allowing aliases but rejecting cycles."""
+    if value is None or any(
+        type(value) is scalar for scalar in (bool, int, float, str)
+    ):
+        return value
+    if issubclass(type(value), torch.Tensor):
+        value = _tensor(value, copy=False)
+        return {
+            "tensor": value.detach().to(device="cpu").clone(),
+            "dtype": str(value.dtype),
+            "device": str(value.device),
+        }
+    if type(value) is not dict and type(value) is not list and type(value) is not tuple:
+        raise TypeError(
+            "callback checkpoint configuration must contain plain data or ordinary Tensors"
+        )
+    active = set() if active is None else active
+    identity = id(value)
+    if identity in active:
+        raise ValueError("callback checkpoint configuration must not contain cycles")
+    active.add(identity)
+    try:
+        if type(value) is dict:
+            if not all(type(key) is str for key in value):
+                raise TypeError(
+                    "callback checkpoint configuration keys must be plain strings"
+                )
+            return {
+                key: _plain_configuration_value(child, active)
+                for key, child in value.items()
+            }
+        children = [_plain_configuration_value(child, active) for child in value]
+        return tuple(children) if type(value) is tuple else children
+    finally:
+        active.remove(identity)
+
+
+def _configuration_value(value):
+    return _plain_configuration_value(_legacy_configuration_value(value))
 
 
 def _configuration(callbacks):
@@ -341,6 +452,12 @@ def _validate_emissions(callbacks, schemas):
                     for leaf in plan.result_schema.leaves
                 ),
             )
+        elif expected is None and not _default_checkpoint_configuration(implementation):
+            # A custom callback can first emit after initialization. Preserve
+            # its validated captured schema, as in an in-memory continuation;
+            # ordinary resumed updates validate every subsequent emission.
+            if schema is None or schema.leaves:
+                continue
         if schema != expected:
             raise FunctionalizationError(
                 f"callback checkpoint emission schema for {plan.name!r} "

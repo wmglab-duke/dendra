@@ -264,6 +264,21 @@ also accept it as part of a shared continuation packet. See
 :doc:`../advanced/A58_functional_callback_checkpoints` for complete Population
 and Network examples, ownership, and compatibility rules.
 
+Custom ``FunctionalCallback`` implementations support portable continuation with
+the optional ``checkpoint_configuration()`` hook. It returns a plain dictionary
+with a stable namespaced ``kind`` string, positive integer ``version`` and a
+plain string-keyed ``fields`` dictionary describing all static configuration.
+Nested plain acyclic data and ordinary Tensor/Parameter metadata are supported.
+Explicit receiving callbacks must have matching metadata, carry and emission
+schemas. Restoration does not import or reconstruct callback code. The hook is
+called only during cold checkpoint export/restore; callbacks without it retain
+ordinary execution and in-memory continuation. Existing built-in checkpoint
+formats remain unchanged. See :ref:`functional-callback-checkpoint-protocol`
+for the full contract and runnable custom reducer/emitter example.
+
+.. autoclass:: dendra.func.FunctionalCallback
+   :members: initialize, update, finalize, checkpoint_configuration
+
 .. autoclass:: dendra.func.FunctionalCallbacks
    :members: export_state, restore_state
 

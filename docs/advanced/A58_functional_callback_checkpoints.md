@@ -24,9 +24,8 @@ torch.save(packet, path)
 restored = dn.func.restore_continuation(
     receiving, torch.load(path, weights_only=True), callbacks=receiving_callbacks,
 )
-bound = receiving_kernel.bind(restored)
 state, auxiliary = dn.func.run(
-    bound, restored, steps=100, callbacks=receiving_callbacks,
+    receiving_kernel, restored, steps=100, callbacks=receiving_callbacks,
 )
 ```
 
@@ -156,6 +155,101 @@ The {download}`complete script <../../examples/functional_callback_checkpoints.p
 supplies all imports, helper functions and model constructors. Times are in ms;
 the examples use CPU float64 and a fixed timestep of 0.025 ms.
 
+(functional-callback-checkpoint-protocol)=
+## Describe a custom callback's checkpoint configuration
+
+A custom `dn.func.FunctionalCallback` can support portable continuation by
+implementing `checkpoint_configuration()`. This optional hook describes the
+callback's static meaning; evolving values remain in the callback carry. It
+returns an exact plain dictionary with these three entries:
+
+```python
+{
+    "kind": "org.example.voltage_energy",
+    "version": 1,
+    "fields": {"reference": -70.0, "scale": scale},
+}
+```
+
+`kind` is a stable, nonempty ordinary namespaced string chosen by the callback author.
+`version` is a positive ordinary integer; a boolean is not a version.
+`fields` is an exact plain dictionary with ordinary string keys. Its values can contain
+acyclic plain dictionaries, lists and tuples, `None`, ordinary boolean,
+integer, float and string values, and ordinary `torch.Tensor` or
+`torch.nn.Parameter` objects. Nested dictionary keys are also strings.
+Arbitrary objects, callable values, subclasses of the allowed types and cycles
+are not supported. Represent settings such as dtypes, devices or slices using
+plain strings or their plain-data components.
+
+Describe every setting that changes the meaning of the analysis, including
+reference values, selections, scales or units as applicable. Choose a different
+version when the meaning of the saved carry or its interpretation changes.
+Equal carry shapes alone do not establish compatibility. Configuration tensors
+are detached snapshots of metadata; their values, shape, dtype and declared
+device participate in matching. They do not retain gradients or replace the
+receiving callback's own configuration tensors.
+
+The following callback accumulates squared, scaled voltage deviations and emits
+each value and its sample number after each accepted step. Its initial emission
+is `None`, so the first accepted step establishes its emission schema. Empty finalization
+still returns the same result structure with explicitly shaped empty streams:
+
+```{literalinclude} ../../examples/functional_callback_checkpoint_protocol.py
+:language: python
+:start-after: "# region custom_callback"
+:end-before: "# endregion custom_callback"
+```
+
+`checkpoint_configuration()` must be pure and deterministic. Return metadata
+without mutating the callback, consuming randomness or changing external state.
+Dendra calls it during host checkpoint export and restoration, rather than
+during binding, callback initialization, updates or finalization. If `_bind`
+returns a separate custom callback implementation, implement the hook on that
+returned object. `PopulationCallback` preserves its Population scope around the
+inner callback's configuration:
+
+```{literalinclude} ../../examples/functional_callback_checkpoint_protocol.py
+:language: python
+:start-after: "# region callback_configuration"
+:end-before: "# endregion callback_configuration"
+:dedent: 4
+```
+
+Construct the receiving callback explicitly with compatible configuration.
+Restoration compares its metadata, then checks carry and emission schemas and
+attaches the receiving collection's identity. The checkpoint does not import
+callback code, instantiate a class or reconstruct a callback from these fields:
+
+```{literalinclude} ../../examples/functional_callback_checkpoint_protocol.py
+:language: python
+:start-after: "# region custom_checkpoint"
+:end-before: "# endregion custom_checkpoint"
+:dedent: 4
+```
+
+When initialization emits `None`, the checkpoint retains the emission schema
+discovered during execution. Restoration validates that saved schema without
+running initialization or trial updates to discover a new one. Resumed updates
+must match it. The configuration descriptor remains the author's declaration
+that the receiving implementation gives those values the same meaning.
+
+Custom callbacks without this hook retain ordinary execution and live in-memory
+continuation. Portable callback export requires the hook when the bound
+implementation does not use a supported built-in checkpoint contract.
+Built-in callbacks retain their existing checkpoint formats.
+
+The complete
+{download}`functional_callback_checkpoint_protocol.py <../../examples/functional_callback_checkpoint_protocol.py>`
+example runs a Population and a connected Network with shared parameters and a
+Population-scoped custom analysis. It writes and restores checkpoint files,
+checks cumulative and emitted results, preserves a cadenced Recorder's phase,
+and checks live and detached-suffix gradients:
+
+```console
+python examples/functional_callback_checkpoint_protocol.py
+python examples/functional_callback_checkpoint_protocol.py --backend aot_eager
+```
+
 ## Export and save a checkpoint
 
 `dn.func.export_continuation(program, auxiliary["continuation"])`
@@ -200,8 +294,9 @@ the declarations that created them.
 and `receiver.restore_continuation(packet)` validate the checkpoint against the
 receiving source plan and callback collection. They return independently owned,
 detached ordinary Tensor trees in a `Continuation`. Saved callback carry uses
-the receiving collection's identity. Resume with a new raw binding or
-`receiver(restored)`.
+the receiving collection's identity. Resume with
+`dn.func.run(receiving_kernel, restored, ..., callbacks=receiving_callbacks)`,
+a matching raw binding, or `receiver(restored)`.
 
 Restoration does not initialize, prepare, sample or execute the model, advance
 its clock/RNG, or replace runner defaults. Existing source, schema and required
@@ -383,15 +478,16 @@ collection. Cross-device and dtype-changing restoration are currently
 unsupported. Save and load a compatible model configuration rather than
 changing checkpoint metadata to force acceptance.
 
-Supported callbacks are Recorder, LFP, AnomalyDetector, Raster, APCount,
+Supported built-in callbacks are Recorder, LFP, AnomalyDetector, Raster, APCount,
 Active, ActiveAL and ActiveALCount, including supported Population scopes and
 physical Recorder regions. Eligibility follows the bound implementation:
 authored subclasses that bind to a supported built-in implementation use its
-checkpoint contract. Portable export/restoration of custom bound callback carry
-is currently unsupported. Their ordinary execution and
-in-memory continuation support both scan and inference-only while using the
-same bound callback collection; that execution support does not serialize the
-custom configuration.
+checkpoint contract. Custom bound callbacks describe their configuration through
+`checkpoint_configuration()` and use the same carry/emission validation and
+restoration bridge. See {ref}`functional-callback-checkpoint-protocol`.
+Their ordinary execution and in-memory continuation support both scan and
+inference-only while using the same bound callback collection, including when
+the optional checkpoint hook is absent.
 
 For LFP, restored lead-field carry is detached. It does not acquire a gradient
 connection to the receiving collection's lead-field Tensors. Use direct

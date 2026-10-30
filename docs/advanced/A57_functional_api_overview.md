@@ -989,6 +989,14 @@ complete
 {download}`functional_continuation_checkpoints.py <../../examples/functional_continuation_checkpoints.py>`
 example for fresh replacements, shared sources and suffix gradients.
 
+Custom pure callbacks support portable continuation by implementing
+`FunctionalCallback.checkpoint_configuration()`, which describes their static
+configuration as versioned plain data and Tensor metadata. Construct receiving
+callbacks explicitly; restoration checks their configuration and carry/emission
+schemas. Callbacks without the optional hook retain live in-memory continuation.
+See {ref}`functional-callback-checkpoint-protocol` for the contract and a complete
+Population/scoped-Network example.
+
 Callback carry is tagged with its in-memory collection's identity. Portable
 restoration uses the checked callback export/restore bridge to attach
 the receiving identity. Independently managed callbacks use
