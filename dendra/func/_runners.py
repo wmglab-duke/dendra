@@ -44,6 +44,7 @@ from ._inputs import (
 )
 from ._network_binding import BoundNetwork
 from ._population import FunctionalPopulation
+from ._recording import _host_recording, _recording_span
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._tensor_contracts import _tensor_binding
 from ._types import FunctionalizationError, RolloutInput, StepInput
@@ -945,7 +946,12 @@ def _execute_chunks(
                 retain=True,
             )
             _collect_callback_emissions(
-                callbacks, callback_state, callback_parts, emitted, retained=True
+                callbacks,
+                callback_state,
+                callback_parts,
+                emitted,
+                retained=True,
+                steps=stop - start,
             )
         _validate_returned_state(
             functional,
@@ -1127,7 +1133,12 @@ def _execute_checkpointed_chunks(
         else:
             state, auxiliary, callback_state, emitted = checkpoint_result
             _collect_callback_emissions(
-                callbacks, callback_state, callback_parts, emitted, retained=True
+                callbacks,
+                callback_state,
+                callback_parts,
+                emitted,
+                retained=True,
+                steps=stop - start,
             )
         _validate_returned_state(
             functional,
@@ -1312,6 +1323,7 @@ def _run_validated_schedule(
     )
 
 
+@_host_recording
 def _execute_schedule(
     functional,
     execution,
@@ -1328,6 +1340,7 @@ def _execute_schedule(
     _runtime_extra_slot,
     callbacks,
     callback_state,
+    _recording_sessions=None,
 ):
     """Execute resolved scheduling operands without legacy horizon policies."""
     inputs, steps = _resolve_inputs(functional, inputs, steps)
@@ -1344,6 +1357,8 @@ def _execute_schedule(
             inputs.noise, inputs.stimulation
         )
     chunklength = max(steps, 1) if span is None else span
+    if not checkpointed:
+        chunklength = _recording_span(callbacks, chunklength)
     use_checkpoint = checkpointed and torch.is_grad_enabled() and steps > 0
     if use_checkpoint:
         # Checkpoint cannot save inference tensors for backward. Preserve all
@@ -1353,7 +1368,9 @@ def _execute_schedule(
         functional, callbacks, callback_state, state, dt
     )
     if callbacks is not None:
-        callback_parts = _host_callback_parts(callbacks, callback_state, callback_parts)
+        callback_parts = _host_callback_parts(
+            callbacks, callback_state, callback_parts, storage=_recording_sessions
+        )
     execution = _prepare_compiled_schedule(
         execution, steps, chunklength, callbacks=callbacks
     )

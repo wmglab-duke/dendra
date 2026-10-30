@@ -156,8 +156,8 @@ def run_demo(*, execution="scan", backend="aot_eager"):
     assert lfp.shape == (2 * STEPS + 1, 2, 2)  # Frames, batch, contacts.
     assert raster.shape == (2 * STEPS, 2, 2, 2)  # Steps, batch, cells, sites.
     assert soma.shape == (2 * STEPS + 1, 2, 2)
-    # Native in-memory cadence includes the initial boundary and first step.
-    selected_frames = torch.tensor([0, 1, 3, 5, 7])
+    # Recording includes the initial boundary and accepted multiples of the stride.
+    selected_frames = torch.tensor([0, 2, 4, 6, 8])
     for field, values in coarse.items():
         torch.testing.assert_close(
             values, trace[field].index_select(0, selected_frames)

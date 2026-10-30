@@ -137,6 +137,67 @@ def _is_prepared_callback(callback):
     return issubclass(type(callback), _PreparedCallback) and callback._prepared
 
 
+def _is_callback_configuration(callback):
+    from dendra.models.callbacks import Recorder as NativeRecorder
+
+    return isinstance(callback, FunctionalCallback) or type(callback) is NativeRecorder
+
+
+def _coerce_callback_configuration(callback):
+    """Snapshot a canonical Recorder without importing its mutable history."""
+    from dendra.models.callbacks import Callback
+    from dendra.models.callbacks import Recorder as NativeRecorder
+
+    if isinstance(callback, FunctionalCallback):
+        return callback
+    if type(callback) is not NativeRecorder:
+        raise TypeError(
+            "functional callback values must be FunctionalCallback objects or dn.Recorder configurations"
+        )
+    for name in (
+        "pre_loop_hook",
+        "post_loop_hook",
+        "pre_step_hook",
+        "post_step_hook",
+        "pre_chunk_hook",
+        "post_chunk_hook",
+    ):
+        expected = getattr(NativeRecorder, name, getattr(Callback, name, None))
+        if getattr(getattr(callback, name), "__func__", None) is not expected:
+            raise FunctionalizationError(
+                "custom imperative Recorder hooks cannot be lowered; implement a FunctionalCallback"
+            )
+    generated = getattr(callback, "_recorder_generated_hooks", ())
+    if (
+        tuple(
+            getattr(getattr(callback, name), "__func__", None)
+            for name in ("_pre_loop_hook", "_post_step_hook")
+        )
+        != generated
+    ):
+        raise FunctionalizationError(
+            "custom imperative Recorder hooks cannot be lowered; implement a FunctionalCallback"
+        )
+    recorder = Recorder(
+        tuple(callback.states),
+        max_only=callback.max_only,
+        node_indices=callback.node_indices,
+        dt=callback.save_dt,
+        sliding_window=callback.sliding_window,
+        partition=callback.partition,
+        region=callback.region,
+    )
+    if callback.cache_with_hdf5:
+        recorder._host_storage = (
+            callback,
+            callback.queue,
+            callback.hdf5_path,
+            callback.cache_every,
+            tuple(callback.states),
+        )
+    return recorder
+
+
 @dataclass(frozen=True)
 class PopulationCallback(FunctionalCallback):
     """Apply an existing pure callback to one Population in a Network.
@@ -162,8 +223,10 @@ class PopulationCallback(FunctionalCallback):
             raise TypeError("PopulationCallback population must be a string")
         if not self.population:
             raise ValueError("PopulationCallback population must not be empty")
-        if not isinstance(self.callback, FunctionalCallback):
-            raise TypeError("PopulationCallback requires a pure FunctionalCallback")
+        if not _is_callback_configuration(self.callback):
+            raise TypeError(
+                "PopulationCallback requires a pure FunctionalCallback or dn.Recorder"
+            )
         if isinstance(self.callback, PopulationCallback):
             raise ValueError("PopulationCallback scopes cannot be nested")
 
@@ -180,7 +243,9 @@ class PopulationCallback(FunctionalCallback):
                 f"Unknown Network Population {self.population!r}; "
                 f"available names are {tuple(functional.populations)}"
             )
-        bound = self.callback._bind(functional.populations[self.population])
+        bound = _coerce_callback_configuration(self.callback)._bind(
+            functional.populations[self.population]
+        )
         if not isinstance(bound, FunctionalCallback):
             raise FunctionalizationError(
                 "PopulationCallback inner callback returned an invalid bound object"
@@ -239,7 +304,7 @@ class Recorder(_PreparedCallback):
     where the pure in-memory semantics overlap. ``dt=None`` records the initial
     boundary and every post-step value. ``dt`` selects the native integer stride
     ``int(dt / simulation_dt)``. A fresh recording retains its initial frame,
-    then post-step frames 1, 1 + stride, and so on. Explicit counter carry keeps
+    then accepted steps stride, 2 * stride, and so on. Explicit counter carry keeps
     that phase across chunks and continuation, without another initial sample.
     ``sliding_window`` is currently unsupported.
 
@@ -267,6 +332,7 @@ class Recorder(_PreparedCallback):
     _preparation_error = (
         "dn.func.Recorder must be bound with functional.make_callbacks(...)"
     )
+    _host_storage = None
     _checkpoint_fields = (
         "states",
         "paths",
@@ -436,6 +502,7 @@ class Recorder(_PreparedCallback):
                 "node_indices": node_indices,
                 "partition": partition,
                 "region": region,
+                "_host_storage": self._host_storage,
             },
         )
         if save_every is None:
@@ -1475,19 +1542,33 @@ class _CallbackCollector:
         return self._callbacks._concatenate(self.parts, borrow_single=borrow_single)
 
 
-def _host_callback_parts(callbacks, callback_state, parts):
+def _host_callback_parts(callbacks, callback_state, parts, *, storage=None):
     """Opt owned host collections into retention without changing atomic calls."""
     if type(callbacks) is not FunctionalCallbacks:
+        if storage and getattr(callbacks, "_storage", None):
+            raise FunctionalizationError(
+                "HDF5 recording requires the standard host callback collector"
+            )
         return parts
     for name, original in _CALLBACK_RETENTION_HOOKS:
         method = getattr(callbacks, name)
         if getattr(method, "__func__", method) is not original:
+            if storage and callbacks._storage:
+                raise FunctionalizationError(
+                    "HDF5 recording requires the standard host callback collector"
+                )
             return parts
     cadences = []
     for plan in callbacks._plans:
         implementation = _callback_implementation(plan.callback)
         if type(implementation) is _BoundCadencedRecorder:
             cadences.append((plan.name, implementation))
+    if storage and callbacks._storage:
+        from ._recording import _recording_collector
+
+        return _recording_collector(
+            callbacks, callback_state, tuple(cadences), parts, storage
+        )
     if not cadences:
         return parts
     collector = _CallbackCollector(callbacks, tuple(cadences))
@@ -1497,11 +1578,12 @@ def _host_callback_parts(callbacks, callback_state, parts):
 
 
 def _collect_callback_emissions(
-    callbacks, callback_state, parts, emitted, *, retained=False
+    callbacks, callback_state, parts, emitted, *, retained=False, steps=None
 ):
     if callbacks._has_emissions(emitted):
         if isinstance(parts, _CallbackCollector):
-            parts.append(callback_state, emitted, retained=retained)
+            options = {"steps": steps} if hasattr(parts, "storage_names") else {}
+            parts.append(callback_state, emitted, retained=retained, **options)
         else:
             parts.append(emitted)
 
@@ -1530,6 +1612,12 @@ def _complete_callback_results(
         outputs = callbacks._finalize(callback_state, stacked, _retained=True)
     else:
         outputs = callbacks._finalize(callback_state, stacked)
+    if isinstance(parts, _CallbackCollector) and hasattr(parts, "storage_names"):
+        outputs = {
+            name: value
+            for name, value in outputs.items()
+            if name not in parts.storage_names
+        }
     callback_state = callbacks._materialize_state(callback_state)
     return FunctionalCallbackResults(
         state=callback_state,
@@ -1614,14 +1702,26 @@ class FunctionalCallbacks:
                 )
             plans.append(self._probe(name, bound, example_state))
         self._plans = tuple(plans)
+        storage = {}
+        seen = set()
+        for plan in self._plans:
+            implementation = _callback_implementation(plan.callback)
+            if type(implementation) is _BoundCadencedRecorder:
+                implementation = implementation.recorder
+            if (
+                type(implementation) is Recorder
+                and implementation._host_storage is not None
+            ):
+                binding = implementation._host_storage
+                if id(binding[0]) in seen:
+                    raise FunctionalizationError(
+                        "an HDF5 Recorder can name only one output in a callback collection"
+                    )
+                seen.add(id(binding[0]))
+                storage[plan.name] = binding
+        self._storage = storage
 
-    @staticmethod
-    def _coerce_callback(callback) -> FunctionalCallback:
-        if not isinstance(callback, FunctionalCallback):
-            raise TypeError(
-                "functional callback values must be FunctionalCallback objects"
-            )
-        return callback
+    _coerce_callback = staticmethod(_coerce_callback_configuration)
 
     @staticmethod
     def _pair(value, *, label: str):
@@ -1731,6 +1831,10 @@ class FunctionalCallbacks:
                 raise FunctionalizationError(message)
 
     def _bind_imperative(self, population):
+        if self._storage:
+            raise FunctionalizationError(
+                "use native callbacks=[recorder] or dn.func.run for HDF5 recording"
+            )
         if population is not self._functional._population:
             raise FunctionalizationError(
                 "functional callbacks must be bound to the exact source "

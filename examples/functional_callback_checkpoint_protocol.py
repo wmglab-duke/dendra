@@ -170,7 +170,7 @@ def demo(network, backend, directory):
     for name, suffix in restored_aux["callbacks"]["trace"].items():
         joined = torch.cat((first["callbacks"]["trace"][name], suffix))
         torch.testing.assert_close(joined, whole["callbacks"]["trace"][name])
-        assert joined.shape[0] == 4  # Frames 0, 1, 4 and 7 retain the Recorder phase.
+        assert joined.shape[0] == 3  # Frames 0, 3 and 6 retain the Recorder phase.
         assert suffix.shape[0] == 1
     joined_samples = torch.cat(
         (

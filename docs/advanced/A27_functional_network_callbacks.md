@@ -32,8 +32,8 @@ The complete
 {download}`functional_network_callbacks.py <../../examples/functional_network_callbacks.py>`
 example compares scan and while execution for two connected, batched Populations.
 It checks LFP projections, all threshold-analysis callbacks, anomaly detection,
-regional and cadenced recording, a custom reducer/emitter, continuation, and scan gradients
-through lead fields. Run
+regional and cadenced recording, a custom reducer/emitter, continuation, and
+scan gradients through lead fields. Run
 it from the repository root with `python examples/functional_network_callbacks.py`.
 
 ## Declare the Network and select callbacks
@@ -71,13 +71,30 @@ Population scope is fixed when callbacks bind. An unknown name or a nested
 collections; use the underlying callback directly for a standalone Population.
 Configure and bind a new collection to change a scope or selection.
 
-Binding a Recorder, LFP or threshold callback prepares a separate immutable
-instance of its public callback class. A Recorder retains resolved state paths,
+Use `dn.Recorder` to configure recording in native and functional execution;
+`dn.func.Recorder` remains supported. Binding captures Recorder configuration
+into a separate immutable pure implementation. LFP and threshold callbacks
+likewise prepare independent immutable implementations. A Recorder retains
+resolved state paths,
 physical regions and index or partition selections; an LFP retains its field
 references and projection metadata. The supplied configuration objects remain
-unchanged. These public classes implement the pure callback hooks; evolving values and recording phase
+unchanged. These public classes implement the pure callback hooks; evolving
+values and recording phase
 belong to explicit carry. Prepared Network Recorder paths and regions keep
 their resolved meaning when used by the collection.
+
+Record mechanism state with qualified names such as `"left.hh.m"`, or relative
+names such as `"hh.m"` inside a Population-scoped Recorder. The result keeps the
+supplied name and the mechanism's local tensor shape. Physical `region=`
+selection remains limited to `v`, `vc` and `i_membrane` (with scalar `t` allowed
+alongside them); mechanism slots can have sparse support.
+
+HDF5-configured `dn.Recorder` instances use the host runner's storage path. Disk
+trajectories are omitted from returned callback outputs while their sampling
+carry remains in the continuation. The same selected names, shapes and cadence
+are written through the existing HDF5 format and reader. See
+{ref}`functional-recorder-storage` for bounded collection, gradients, file
+segments and portable continuation.
 
 ## LFP shape, units, and gradients
 
@@ -218,7 +235,7 @@ network = network.concat()
 packed = network.all_populations
 callbacks = {
     "exc_voltage": dn.func.PopulationCallback(
-        "all_populations", dn.func.Recorder(("v",), region=packed.exc)
+        "all_populations", dn.Recorder(("v",), region=packed.exc)
     ),
 }
 ```
@@ -281,8 +298,9 @@ can support portable export and restoration by implementing
 `checkpoint_configuration()`; see
 {ref}`functional-callback-checkpoint-protocol`.
 
-The independent `coarse` Recorder uses `dt=2 * DT`. With native in-memory
-timing it selects frames 0, 1, 3, 5, and 7 from the eight-step full recording.
+The independent `coarse` Recorder uses `dt=2 * DT`. It selects frames
+0, 2, 4, 6, and 8 from the eight-step full recording, using the same cadence
+for in-memory and HDF5 storage.
 Joining the two execution segments gives the same selected frames as one
 uninterrupted call. This cadence does not change the custom callback or the
 other Recorders. The example uses bounded compiled chunks; the host retains

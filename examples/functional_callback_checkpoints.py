@@ -156,7 +156,7 @@ def verify_continuation(first, resumed, expected):
         assert value.shape[0] == 2 * STEPS + 1
     for value in resumed_auxiliary["callbacks"]["trace"].values():
         assert value.shape[0] == STEPS  # No repeated boundary sample.
-    selected_frames = torch.tensor([0, 1, 4, 7])
+    selected_frames = torch.tensor([0, 3, 6])
     for name, suffix in resumed_auxiliary["callbacks"]["cadence"].items():
         samples = torch.cat((first["callbacks"]["cadence"][name], suffix))
         torch.testing.assert_close(
@@ -165,7 +165,7 @@ def verify_continuation(first, resumed, expected):
         torch.testing.assert_close(
             samples, observed[name].index_select(0, selected_frames)
         )
-        assert suffix.shape[0] == 1  # Resumed phase selects only the seventh step.
+        assert suffix.shape[0] == 1  # Resumed phase selects only the sixth step.
     raster = torch.cat(
         (first["callbacks"]["raster"], resumed_auxiliary["callbacks"]["raster"])
     )

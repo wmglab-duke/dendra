@@ -37,7 +37,7 @@ def _environment():
 
 
 def _indices(steps, stride):
-    return [0, *range(1, steps + 1, stride)]
+    return list(range(0, steps + 1, stride))
 
 
 def _select(trace, indices):
@@ -49,7 +49,7 @@ def _select(trace, indices):
 
 @pytest.mark.parametrize("save_dt", (None, 0.1, 0.25, 0.3))
 @pytest.mark.parametrize("streaming", (False, True), ids=("memory", "stream-phase"))
-def test_native_recorder_keeps_initial_then_preincrement_poststep_sampling(
+def test_native_recorders_share_initial_then_stride_aligned_sampling(
     save_dt, streaming
 ):
     solver_dt = 0.1
@@ -57,7 +57,7 @@ def test_native_recorder_keeps_initial_then_preincrement_poststep_sampling(
     model = SimpleNamespace(v=torch.zeros((1, 2), dtype=torch.float64))
     recorder = NativeRecorder(["v"], dt=save_dt)
     recorder.dt = solver_dt
-    # Exercise native stream-phase accounting without starting an I/O worker.
+    # Exercise HDF5's identical sampling policy without starting an I/O worker.
     recorder.cache_with_hdf5 = streaming
     recorder.cache_every = 1000
     try:
@@ -67,20 +67,51 @@ def test_native_recorder_keeps_initial_then_preincrement_poststep_sampling(
             recorder.post_step_hook(model)
         if stride is None:
             expected = list(range(8))
-        elif streaming:
-            expected = [0, *range(stride, 8, stride)]
         else:
             expected = _indices(7, stride)
         torch.testing.assert_close(
             recorder.stack("v")[:, 0, 0], torch.tensor(expected, dtype=torch.float64)
         )
-        assert recorder.i == 7 + int(streaming) and recorder.save_every == stride
+        assert recorder.i == 8 and recorder.save_every == stride
         if save_dt == 0.3:
             assert stride == 2  # Preserve int(0.3 / 0.1), including float truncation.
         recorder.reset()
         assert recorder.i == 0 and recorder.rec == {"v": []}
     finally:
         recorder.cache_with_hdf5 = False
+
+
+def test_recording_phase_starts_at_the_selected_initial_frame_and_continues_off_phase():
+    functional, tensors = dn.func.make_functional(_population(), dt=DT)
+    state = {
+        **tensors.state,
+        "clock": {
+            **tensors.state["clock"],
+            "t": tensors.state["clock"]["t"].new_tensor(11 * DT),
+        },
+    }
+    dense = functional.make_callbacks({"trace": dn.func.Recorder(("v", "t"))})
+    sampled = functional.make_callbacks(
+        {"trace": dn.func.Recorder(("v", "t"), dt=3.5 * DT)}
+    )
+    bound = functional.bind(tensors)
+    expected, reference = dn.func.run(bound, state, steps=7, callbacks=dense)
+    _, first = dn.func.run(bound, state, steps=2, callbacks=sampled)
+    assert first["callbacks"]["trace"]["t"].shape == (1,)
+    unchanged, empty = dn.func.run(
+        bound, first["continuation"], steps=0, callbacks=sampled
+    )
+    _close(unchanged, first["continuation"].state)
+    assert empty["callbacks"]["trace"]["t"].shape == (0,)
+    actual, last = dn.func.run(bound, empty["continuation"], steps=5, callbacks=sampled)
+    _close(actual, expected)
+    observed = {
+        name: torch.cat((first["callbacks"]["trace"][name], value))
+        for name, value in last["callbacks"]["trace"].items()
+    }
+    _close(observed, _select(reference["callbacks"]["trace"], [0, 3, 6]))
+    _close(observed["t"][0], state["clock"]["t"])
+    assert last["callbacks"].state["trace"].item() == 7
 
 
 class _EveryStep(dn.func.FunctionalCallback):
@@ -561,7 +592,7 @@ def test_mps_while_recorder_cadence_matches_selected_dense_samples():
         selected = recorder.finalize(carry, emitted)
         for name, value in emitted.items():
             expected = value.index_select(
-                0, torch.tensor([0, 1, 3, 5], dtype=torch.long, device=value.device)
+                0, torch.tensor([0, 2, 4], dtype=torch.long, device=value.device)
             )
             assert selected[name].device == value.device
             torch.testing.assert_close(selected[name], expected)

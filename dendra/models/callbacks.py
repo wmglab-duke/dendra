@@ -2,7 +2,7 @@ import gc
 import multiprocessing as mp
 from contextlib import nullcontext
 from numbers import Integral
-from queue import Queue
+from queue import Full, Queue
 from types import MethodType
 from typing import Dict, List, Tuple
 
@@ -260,7 +260,7 @@ def _is_state(s):
 
 
 def _parse_template(full_state, max_only=False, indexed=False):
-    mech, state = full_state.split(".")
+    mech, state = full_state.rsplit(".", 1)
     if max_only:
         impl = max_only_t
     elif indexed:
@@ -400,6 +400,28 @@ class AnomalyDetector(Callback):
         return None
 
 
+class _RecorderRegionView:
+    """Read physical Slice tensors while keeping the full model's scalar clock."""
+
+    def __init__(self, model, region):
+        self.model = model
+        self.index = region.flat_index
+        self.shape = tuple(region.shape)
+        self.physical_shape = tuple(model.shape)
+
+    def __getattr__(self, name):
+        value = getattr(self.model, name)
+        if name == "t":
+            return value
+        payload = tuple(value.shape[len(self.physical_shape) :])
+        if tuple(value.shape[: len(self.physical_shape)]) != self.physical_shape:
+            raise ValueError(
+                "Recorder region requires a full-coordinate physical tensor."
+            )
+        flattened = value.reshape(-1, *payload)
+        return flattened.index_select(0, self.index).reshape((*self.shape, *payload))
+
+
 class Recorder(Callback):
     """
     Record and store model states during simulation.
@@ -423,8 +445,8 @@ class Recorder(Callback):
     dt : float, optional
         Recording interval, converted to the integer stride ``int(dt/model.dt)``
         without rounding. Default is None (record every step). A fresh in-memory
-        recording retains the initial boundary, then post-step frames 1,
-        1 + stride, and so on.
+        recording retains the initial boundary, then post-step frames stride,
+        2 * stride, and so on.
     sliding_window : int, optional
         Size of sliding window for temporal averaging of recorded data.
         Default is None (no averaging).
@@ -432,6 +454,10 @@ class Recorder(Callback):
         With ``max_only=True``, contiguous segment lengths along the final
         compartment axis. One maximum per segment is appended as the final
         output axis.
+    region : Slice, optional
+        Physical Population coordinates to select for ``v``, ``vc``, and
+        ``i_membrane``. Scalar ``t`` is left unchanged. Cannot be combined
+        with node indices, maximum reduction, or partitions.
 
     Notes
     -----
@@ -467,9 +493,14 @@ class Recorder(Callback):
         dt=None,
         sliding_window=None,
         partition=None,
+        *,
+        region=None,
     ):
         super().__init__()
+        states = (states,) if isinstance(states, str) else states
         self.states = states
+        self.region = region
+        self._region_reader = None
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
         self.partition = None
@@ -485,6 +516,10 @@ class Recorder(Callback):
         rfunc = _build_recorder_func(states, self.max_only, self.indexed)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
+        self._recorder_generated_hooks = (
+            self._pre_loop_hook.__func__,
+            self._post_step_hook.__func__,
+        )
 
         self._dt = None
         self.save_dt = dt
@@ -507,6 +542,8 @@ class Recorder(Callback):
         self.data_pinned = {}
         self.stream = None
         self._transfer_streams = {}
+        self._hdf5_session = None
+        self._native_hdf5_active = False
 
     def set_partition(self, partition=None):
         if partition is not None:
@@ -566,7 +603,7 @@ class Recorder(Callback):
         self.hdf5_path = hdf5
         mp.set_start_method("spawn", force=True)
         self.manager = mp.Manager()
-        self.queue = self.manager.Queue()
+        self.queue = self.manager.Queue(maxsize=2)
         self.writer_thread = mp.Process(
             target=_hdf5_write, args=(self.queue, self.hdf5_path)
         )
@@ -582,14 +619,50 @@ class Recorder(Callback):
         - Moves ``node_indices`` to the model device if indexed recording is used.
         - Executes the generated recorder function once to capture the initial
           state (so ``t=0`` is included).
-        - Advances the internal step counter if HDF5 caching is enabled so that
-          cache flushing cadence aligns with subsequent ``post_step_hook`` calls.
+        - Advances the internal step counter so subsequent samples use the
+          same cadence for in-memory and HDF5 recording.
         """
+        self._check_recording_session()
+        if self._native_hdf5_active:
+            raise RuntimeError("Recorder already has an active native HDF5 run.")
+        reader = self._bind_region_reader(model)
+        # A source Population must never become a registered child module of
+        # its own callback. Only the non-Module physical view is retained.
+        self._region_reader = None if reader is model else reader
         if self.indexed:
             self.node_indices = self.node_indices.to(model.device())
-        self._pre_loop_hook(model)
-        if self.cache_with_hdf5:
-            self.i += 1
+        self._pre_loop_hook(reader)
+        self.i += 1
+        self._native_hdf5_active = self.cache_with_hdf5
+
+    def _check_recording_session(self):
+        if self._hdf5_session is not None:
+            raise RuntimeError("Recorder already has an active HDF5 recording session.")
+
+    def _bind_region_reader(self, model):
+        if self.region is None:
+            return model
+        from .slice import Slice
+
+        if not isinstance(self.region, Slice):
+            raise ValueError("Recorder region must be a physical Population Slice.")
+        if object.__getattribute__(self.region, "root_model") is not model:
+            raise ValueError(
+                "Recorder region must belong to the exact source Population."
+            )
+        if object.__getattribute__(self.region, "module_path"):
+            raise ValueError(
+                "Recorder region must select physical Population coordinates."
+            )
+        if self.max_only or self.node_indices is not None or self.partition is not None:
+            raise ValueError(
+                "Recorder region cannot be combined with node_indices, max_only, or partition."
+            )
+        if any(state not in {"v", "vc", "i_membrane", "t"} for state in self.states):
+            raise ValueError(
+                "Recorder region only selects physical v, vc, or i_membrane state and clock t."
+            )
+        return _RecorderRegionView(model, self.region)
 
     def cache_hdf5(self):
         populated = [bool(self.rec[s]) for s in self.states]
@@ -604,9 +677,14 @@ class Recorder(Callback):
                 f"for state(s): {', '.join(missing)}."
             )
 
+        self._check_recording_session()
+        self._write_hdf5_frame({state: self.stack(state) for state in self.states})
+
+    def _write_hdf5_frame(self, values):
+        """Stage an owned detached frame for the shared native/functional writer."""
         streams_used = {}
         for s in self.states:
-            data = self.stack(s)
+            data = values[s].detach()
             cuda_source = data.device.type == "cuda"
             transfer_stream = None
             transfer_context = nullcontext()
@@ -636,14 +714,35 @@ class Recorder(Callback):
         for stream in streams_used.values():  # pragma: no cover - CUDA lane
             stream.synchronize()
 
-        self.queue.put("flush")
+        self._enqueue_hdf5("flush")
         for s in self.states:
             data = self.data_pinned[s]
             chunks = list(data.shape)
             if data.ndim > 1:
                 chunks[1] = 1
-            self.queue.put((s, self.run_number, self.save_count, data, tuple(chunks)))
+            self._enqueue_hdf5(
+                (s, self.run_number, self.save_count, data, tuple(chunks))
+            )
         self.save_count += 1
+
+    def _enqueue_hdf5(self, item):
+        writer = self.writer_thread
+        # Synchronous test/third-party queues do not expose process state.
+        if writer is None or not hasattr(writer, "exitcode"):
+            self.queue.put(item)
+            return
+        while True:
+            if writer.exitcode is not None:
+                raise RuntimeError(
+                    f"Recorder HDF5 writer stopped with exit code {writer.exitcode}."
+                )
+            try:
+                self.queue.put(item, timeout=0.1)
+                return
+            except Full:
+                # A bounded queue applies backpressure, while checking process
+                # state ensures a failed writer cannot leave the producer stuck.
+                continue
 
     def _transfer_stream_for(self, device):  # pragma: no cover - CUDA lane
         """Return a lazily-created transfer stream on ``device``."""
@@ -686,7 +785,8 @@ class Recorder(Callback):
         (optionally via a CUDA stream) to the writer process and the in-memory
         lists are cleared.
         """
-        self._post_step_hook(model)
+        self._check_recording_session()
+        self._post_step_hook(model if self.region is None else self._region_reader)
         self.i += 1
         if self.cache_with_hdf5:
             if self.i % self.cache_every == 0:
@@ -700,12 +800,16 @@ class Recorder(Callback):
         Flush any remaining buffered data to HDF5, then reset the per-run cache
         counters so the recorder can be reused for subsequent runs.
         """
-        if self.cache_with_hdf5:
-            self.cache_hdf5()
-            self.rec = {s: [] for s in self.states}
+        self._check_recording_session()
+        try:
+            if self.cache_with_hdf5:
+                self.cache_hdf5()
+                self.rec = {s: [] for s in self.states}
             self.i = 0
-        self.save_count = 0
-        self.run_number += 1
+            self.save_count = 0
+            self.run_number += 1
+        finally:
+            self._native_hdf5_active = False
 
     def reset(self):
         """
@@ -739,8 +843,10 @@ class Recorder(Callback):
         >>> # Get data only from second run
         >>> second_run_data = recorder.numpy()
         """
+        self._check_recording_session()
         self.rec = {s: [] for s in self.states}
         self.i = 0
+        self._native_hdf5_active = False
 
     def close(self) -> None:
         """
@@ -759,12 +865,23 @@ class Recorder(Callback):
         reset : Reset the recorder's state
         set_hdf5 : Enable HDF5 caching for recorded data
         """
+        self._check_recording_session()
         if self.cache_with_hdf5:
-            self.queue.put(None)
-            self.writer_thread.join()
-            if self.manager is not None:
-                self.manager.shutdown()
-            self.cache_with_hdf5 = False
+            try:
+                self._enqueue_hdf5(None)
+            finally:
+                try:
+                    self.writer_thread.join()
+                    code = getattr(self.writer_thread, "exitcode", None)
+                    if code not in (None, 0):
+                        raise RuntimeError(
+                            f"Recorder HDF5 writer stopped with exit code {code}."
+                        )
+                finally:
+                    if self.manager is not None:
+                        self.manager.shutdown()
+                    self.cache_with_hdf5 = False
+                    self._native_hdf5_active = False
 
     def stack(self, var: str = None) -> torch.Tensor:
         """

@@ -17660,7 +17660,9 @@ class FunctionalPopulation:
 
         from ._callback_recurrence import _execute_callback_steps
         from ._callbacks import _complete_callback_results, _setup_callback_state
+        from ._recording import _require_recording_host
 
+        _require_recording_host(callbacks)
         callbacks._validate_owner(self)
         callbacks._validate_runtime_dt_tensor(prepared["integrator"]["dt"])
         callback_state, parts = _setup_callback_state(callbacks, callback_state, state)

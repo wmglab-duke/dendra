@@ -4,7 +4,7 @@ from collections.abc import Mapping
 
 import torch
 
-from ._callbacks import FunctionalCallback
+from ._callbacks import _is_callback_configuration
 from ._types import FunctionalizationError
 
 _DEFAULT_RUNTIME_EXTRA_CHUNK_STEPS = 64
@@ -75,9 +75,9 @@ def _configured_callbacks(callbacks):
     for name, callback in configured.items():
         if not isinstance(name, str) or not name:
             raise ValueError("functional callback names must be non-empty strings")
-        if not isinstance(callback, FunctionalCallback):
+        if not _is_callback_configuration(callback):
             raise TypeError(
-                "callback values must be FunctionalCallback configurations, not imperative callbacks"
+                "callback values must be FunctionalCallback configurations or built-in dn.Recorder configurations"
             )
     return configured
 

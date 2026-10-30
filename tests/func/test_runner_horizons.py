@@ -186,7 +186,7 @@ def test_duration_defaults_accumulate_fractional_time_and_resume_callback_phase(
         expected = _reference(program, expected[1]["continuation"], duration=0.6 * DT)
         _same(second, expected)
         assert _pending(second[0], network) == pytest.approx(0.2 * DT)
-        assert second[1]["callbacks"]["trace"]["t"].shape == (1,)
+        assert second[1]["callbacks"]["trace"]["t"].shape == (0,)
         third = program(second[1]["continuation"], steps=7)
         expected = _reference(program, expected[1]["continuation"], steps=7)
         _same(third, expected)

@@ -15,6 +15,7 @@ from ._callbacks import (
     AnomalyDetector,
     FunctionalCallbacks,
     Recorder,
+    _coerce_callback_configuration,
     _is_prepared_callback,
     _ThresholdCallback,
 )
@@ -137,6 +138,7 @@ def make_network_callbacks(functional, callbacks):
     adapted = {}
     layout = None
     for name, callback in callbacks.items():
+        callback = _coerce_callback_configuration(callback)
         if isinstance(callback, Recorder) and _is_prepared_callback(callback):
             adapted[name] = callback
         elif isinstance(callback, Recorder):

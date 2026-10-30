@@ -94,8 +94,8 @@ def test_host_retention_matches_atomic_results_gradients_and_offphase_continuati
     _close(actual, expected)
     _close(result["callbacks"], reference["callbacks"])
     assert result["callbacks"]["dense"]["t"].shape == (10,)
-    assert result["callbacks"]["slow"]["t"].shape == (6,)
-    assert result["callbacks"]["sparse"]["t"].shape == (3,)
+    assert result["callbacks"]["slow"]["t"].shape == (5,)
+    assert result["callbacks"]["sparse"]["t"].shape == (2,)
     assert result["callbacks"]["every"]["samples"].shape == (9,)
     if execution == "scan":
         targets = (_target(tensors.parameters, network), tape)
@@ -234,7 +234,7 @@ def test_host_retention_owns_only_selected_payload_and_releases_dense_chunks(
         callbacks.export_state(result["callbacks"].state),
         callbacks.export_state(reference["callbacks"].state),
     )
-    assert result["callbacks"]["trace"]["t"].shape == (4,)
+    assert result["callbacks"]["trace"]["t"].shape == (3,)
     assert events and any(
         not retained and rows == 4 for _, retained, rows, _, _ in events
     )
@@ -246,7 +246,7 @@ def test_host_retention_owns_only_selected_payload_and_releases_dense_chunks(
             assert actual_bytes == payload_bytes
             if not retained and kept < rows:
                 assert not shares_dense_storage
-    assert max(retained_rows.values()) == 4
+    assert max(retained_rows.values()) == 3
     gc.collect()
     assert raw_references and all(reference() is None for reference in raw_references)
 
@@ -432,6 +432,6 @@ def test_mps_host_retention_preserves_cadence_and_continuation():
             for name, value in suffix["callbacks"]["trace"].items()
         }
         _close(observed, reference["callbacks"]["trace"])
-        assert prefix["callbacks"]["trace"]["t"].shape == (3,)
-        assert suffix["callbacks"]["trace"]["t"].shape == (1,)
+        assert prefix["callbacks"]["trace"]["t"].shape == (2,)
+        assert suffix["callbacks"]["trace"]["t"].shape == (2,)
         assert all(value.device.type == "mps" for value in observed.values())

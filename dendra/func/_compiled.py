@@ -526,6 +526,9 @@ class CompiledPopulationChunk:
             self._steps,
         )
         if callbacks is not None:
+            from ._recording import _require_recording_host
+
+            _require_recording_host(callbacks)
             from ._callbacks import FunctionalCallbacks, _setup_callback_state
             from ._runners import _attach_callback_results
 

@@ -29,6 +29,7 @@ from ._netstim import NetStimDraw, NetStimOutputs
 from ._network import _schema, _tensor_paths, _validate_tree
 from ._network_bindings import _canonicalize_mapping_tree
 from ._network_draws import _legacy_population_noise
+from ._recording import _host_recording, _recording_span, _require_recording_host
 from ._runners import (
     _assemble_extra_chunk,
     _attach_callback_results,
@@ -292,6 +293,7 @@ def rollout(
 ):
     from ._network_draws import _with_network_runtime_draws
 
+    _require_recording_host(callbacks)
     inputs, draws = _with_network_runtime_draws(inputs, draws)
     (parameters, prepared, state, inputs, constants, draws), _ = (
         _canonicalize_mapping_tree(
@@ -629,6 +631,7 @@ class CompiledNetworkChunk:
         callback_state=None,
         draws=None,
     ):
+        _require_recording_host(callbacks)
         previous = self._report_state.report
         try:
             # Mapping accessors may execute external Python. Finish all public
@@ -670,6 +673,7 @@ def _restore_report_on_error(chunk):
         raise
 
 
+@_host_recording
 def run(
     functional,
     parameters,
@@ -685,6 +689,7 @@ def run(
     compiled_chunk=None,
     _runtime_extra=None,
     draws=None,
+    _recording_sessions=None,
 ):
     """Host scheduling with shared exact spans and non-reentrant checkpoints.
 
@@ -708,11 +713,15 @@ def run(
         functional, parameters, state, callbacks, callback_state
     )
     if callbacks is not None:
-        parts = _host_callback_parts(callbacks, callback_state, parts)
+        parts = _host_callback_parts(
+            callbacks, callback_state, parts, storage=_recording_sessions
+        )
     _validate_tree(constants, functional._constant_schema, "constants")
     tape, steps = _resolve_inputs(
         functional, inputs, steps, allow_missing_draws=True, draws=draws
     )
+    if checkpoint_every is None:
+        chunklength = _recording_span(callbacks, chunklength)
     automatic_draws = (
         draws is None
         and (
@@ -1020,7 +1029,12 @@ def run(
                 )
             if callbacks is not None:
                 _collect_callback_emissions(
-                    callbacks, callback_state, parts, emitted, retained=True
+                    callbacks,
+                    callback_state,
+                    parts,
+                    emitted,
+                    retained=True,
+                    steps=stop - start,
                 )
         return state, _attach_callback_results(
             auxiliary, callbacks, callback_state, parts

@@ -409,6 +409,9 @@ class CompiledRunner:
         functional._validate_state(state)
         values = functional._validate_prepared(prepared, parameters)
         steps = min(self._kernel.steps, horizon)
+        from ._recording import _recording_span
+
+        steps = _recording_span(self._callbacks, steps)
         if steps < 4:
             # These calls execute only the bounded tail; there is no structured
             # loop body to capture or reject.
@@ -670,7 +673,11 @@ def _execute_population_runner(
                 name="duration",
             )
         inputs = _population_inputs(inputs)
-        bounded_while = self._runtime_extra or self._chunk_steps < selected_steps
+        bounded_while = (
+            self._runtime_extra
+            or self._chunk_steps < selected_steps
+            or bool(getattr(self._callbacks, "_storage", None))
+        )
         if self._runtime_extra and inputs.ve is not None:
             raise ValueError("explicit ve cannot be combined with runtime extra")
         if inputs.draws is not None:

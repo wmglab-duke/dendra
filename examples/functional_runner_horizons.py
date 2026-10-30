@@ -77,7 +77,7 @@ def run_demo(*, network, backend):
     torch.testing.assert_close(joined, reference["callbacks"]["trace"])
     torch.testing.assert_close(
         joined["t"],
-        torch.tensor((0.0, DT, 3 * DT, 5 * DT), dtype=torch.float64),
+        torch.tensor((0.0, 2 * DT, 4 * DT), dtype=torch.float64),
     )
 
     # region overrides

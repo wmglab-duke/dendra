@@ -264,16 +264,29 @@ also accept it as part of a shared continuation packet. See
 :doc:`../advanced/A58_functional_callback_checkpoints` for complete Population
 and Network examples, ownership, and compatibility rules.
 
-Recorder, LFP and threshold configurations prepare separate immutable instances
-of their public callback classes. ``Recorder`` resolves paths, regions and
+``dn.Recorder`` configures native and functional recording;
+``dn.func.Recorder`` remains supported. Functional binding captures observation
+configuration into an independent immutable pure Recorder and retains native
+recording history separately. LFP and threshold configurations likewise prepare
+independent immutable implementations. ``Recorder`` resolves paths, regions and
 selections; ``LFP`` retains raw field Tensor references and projection metadata;
-threshold callbacks resolve indices, windows and timestep metadata. These public classes
+threshold callbacks resolve indices, windows and timestep metadata. These
+public classes
 implement the pure hooks directly. ``Active`` uses the ``ActiveAL(at_least=1)``
 rule. Changing analysis state belongs to explicit carry, and supplied
 configuration objects remain unchanged. Each fresh LFP initialization builds a
 new differentiable field stack; preparation retains no autograd graph. See
 :doc:`../advanced/A27_functional_network_callbacks` for timing, result shapes
 and Population scopes.
+
+Recorder cadence selects the initial boundary and accepted-step multiples of
+``int(record_dt / solver_dt)`` for both in-memory and HDF5 output. Configure
+HDF5 with ``dn.Recorder(...).set_hdf5(path, cache_every=...)``. Host runners
+stream its detached samples, omit that trajectory from callback outputs, and
+retain numerical sampling carry in the continuation. Paths, writer sessions
+and queued samples are excluded from portable checkpoints. Existing HDF5
+layout and ``H5Reader`` access apply. See :ref:`functional-recorder-storage` for
+timing, storage bounds, gradients and file-session continuation.
 
 Custom ``FunctionalCallback`` implementations support portable continuation with
 the optional ``checkpoint_configuration()`` hook. It returns a plain dictionary

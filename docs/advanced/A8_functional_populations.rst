@@ -42,7 +42,7 @@ initialized, functionally supported Population:
        steps=800,
        chunk_steps=128,
        execution="scan",
-       callbacks={"trace": dn.func.Recorder(("v",))},
+       callbacks={"trace": dn.Recorder(("v",))},
    )
    final_state, auxiliary = runner()
    voltage = auxiliary["callbacks"]["trace"]["v"]
@@ -85,11 +85,11 @@ the common calling contract.
 Recording is configured only through the named ``callbacks`` mapping; no
 recorder is added implicitly. ``Recorder`` includes the initial frame, so
 ``voltage`` has 801 frames in this example. Use
-``dn.func.Recorder(("v", "t"))`` to select fields. To record voltage from selected
-compartments, use ``dn.func.Recorder(("v",), node_indices=[3])``; voltage node
+``dn.Recorder(("v", "t"))`` to select fields. To record voltage from selected
+compartments, use ``dn.Recorder(("v",), node_indices=[3])``; voltage node
 indices must be nonnegative. Node selection cannot be combined with scalar
 fields such as ``t``. For a named cell or physical subregion, use
-``dn.func.Recorder(("v",), region=model.cell_a.soma)`` instead; see
+``dn.Recorder(("v",), region=model.cell_a.soma)`` instead; see
 the named-region example below. The mapping also configures threshold reducers for either
 execution mode:
 
@@ -276,7 +276,7 @@ expressions. It uses the same selectors as
        execution="scan",
        inference=False,
        trainable=("gnabar",),
-       callbacks={"trace": dn.func.Recorder(("v",))},
+       callbacks={"trace": dn.Recorder(("v",))},
    )
    trainable = list(train_runner.trainable_parameters.values())
    optimizer = torch.optim.Adam(trainable, lr=1e-4)
@@ -342,7 +342,7 @@ invocation-local, and no training graph is retained between calls.
        initialization="fresh",
        inference=False,
        trainable=("gnabar",),
-       callbacks={"trace": dn.func.Recorder(("v",))},
+       callbacks={"trace": dn.Recorder(("v",))},
    )
    initial = fresh_runner.initialization_inputs
    initial.v_init.requires_grad_()
@@ -436,7 +436,7 @@ scan configuration:
        inference=False,
        checkpoint_every=256,
        trainable=("gnabar",),
-       callbacks={"trace": dn.func.Recorder(("v",), node_indices=[0])},
+       callbacks={"trace": dn.Recorder(("v",), node_indices=[0])},
        options={"cpp_wrapper": True},
    )
    final_state, auxiliary = train_runner()
@@ -653,7 +653,7 @@ mechanisms before initialization:
        model, dt=0.025, steps=800,
        initialization="fresh", inference=False,
        trainable=("threshold", "rest"),
-       callbacks={"trace": dn.func.Recorder(("v", "fire_r_d.time_refractory"))},
+       callbacks={"trace": dn.Recorder(("v", "fire_r_d.time_refractory"))},
    )
    final_state, auxiliary = runner()
    continued_state, continued = runner(
@@ -934,7 +934,7 @@ explicitly:
    runner = dn.compile(
        model, dt=0.025, steps=40, initialization="fresh", inference=False,
        trainable=("rate",),
-       callbacks={"trace": dn.func.Recorder(("v", "voltage_ramp.voltage", "i_membrane"))},
+       callbacks={"trace": dn.Recorder(("v", "voltage_ramp.voltage", "i_membrane"))},
    )
    final_state, auxiliary = runner()
 
@@ -1007,7 +1007,7 @@ or ``BATCH`` and reference their names from ``CLEAR``:
        model, dt=0.025, steps=8,
        execution="scan", initialization="fresh", inference=False,
        trainable=("kclear", "bath"),
-       callbacks={"trace": dn.func.Recorder(("v", "solute_material.c"))},
+       callbacks={"trace": dn.Recorder(("v", "solute_material.c"))},
    )
    final_state, auxiliary = runner()
    continued_state, continued = runner(
@@ -1293,7 +1293,7 @@ inner-shell, and outer-shell potentials, with
 components and their neuron replicas as a disconnected forest: concatenation
 does not add axial connections between models or merge their extracellular
 layers. Public membrane voltage and all three circuit potentials can be
-recorded through ``dn.func.Recorder(("v", "vc"))``.
+recorded through ``dn.Recorder(("v", "vc"))``.
 
 Component physical parameters keep names such as
 ``populations.<component>.*``. Packed mechanism parameters retain their normal
@@ -1335,7 +1335,7 @@ automatically selects ``dhs_bt_multi``:
    packed.initialize()
    runner = dn.func.compile(
        packed, dt=0.01, steps=100, execution="scan",
-       callbacks={"trace": dn.func.Recorder(("v", "vc"))},
+       callbacks={"trace": dn.Recorder(("v", "vc"))},
    )
    final_state, auxiliary = runner()
 
@@ -1724,7 +1724,7 @@ runner is constructed:
            "stimulation.extra.waveforms.0.freq",
            "stimulation.extra.waveforms.0.phase",
        ),
-       callbacks={"trace": dn.func.Recorder(("v",))},
+       callbacks={"trace": dn.Recorder(("v",))},
    )
    optimizer = torch.optim.Adam(
        [p for p in runner.parameters.values() if p.requires_grad],
@@ -1789,7 +1789,7 @@ or a list of contact pairs through ``runner(extra=...)``:
        chunk_steps=64,
        execution="scan",
        inference=False,
-       callbacks={"trace": dn.func.Recorder(("v",))},
+       callbacks={"trace": dn.Recorder(("v",))},
    )
    first_state, first_aux = runner(extra=(field_a, dn.sin(amp=0.2, freq=0.5)))
    second_state, second_aux = runner(
@@ -2256,17 +2256,19 @@ duration, and host/checkpoint spans through the common interface.
 Functional callbacks
 ~~~~~~~~~~~~~~~~~~~~
 
-Functional callbacks are a separate, pure API; they do not run or translate
-the hooks on an imperative ``Callback`` object. Give each callback a stable
-result name and bind the collection once, outside repeated simulations. The
-functional ``Recorder`` deliberately keeps the familiar state-selection
-arguments of the ordinary recorder:
+Use ``dn.Recorder`` to configure recording for native models, ``dn.compile``
+runners, and functional callback collections. ``dn.func.Recorder`` remains a
+supported entry point for pure recording. Functional execution prepares the
+selected observations without invoking an imperative callback's hooks or
+reading changing values from the source model. Other functional callbacks use
+the pure ``FunctionalCallback`` API. Give each callback a stable result name
+and bind the collection once, outside repeated simulations:
 
 .. code-block:: python
 
    callbacks = fmodel.make_callbacks(
        {
-           "trace": dn.func.Recorder(["v"]),
+           "trace": dn.Recorder(["v"]),
            "anomalies": dn.func.AnomalyDetector(),
            "raster": dn.func.Raster(node_check=[0, -1]),
            "spike_count": dn.func.APCount(node_check=[0, -1]),
@@ -2286,9 +2288,11 @@ arguments of the ordinary recorder:
    spike_count = auxiliary["callbacks"]["spike_count"]
    active = auxiliary["callbacks"]["active"]
 
-Binding a Recorder, LFP or threshold callback prepares an independent immutable
-instance of its public class and leaves the supplied configuration unchanged.
-A prepared ``Recorder`` holds resolved paths, regions and selections; an
+Binding a Recorder captures its configuration and prepares an independent
+immutable pure Recorder. Native recording history and phase are not imported
+into that preparation. LFP and threshold binding likewise prepare independent
+immutable implementations. A prepared ``Recorder`` holds resolved paths,
+regions and selections; an
 ``LFP`` holds field references and projection metadata. Evolving reduction state,
 field carry and sampling phase remain explicit callback carry. Configure selections
 before binding, and bind a new collection to change them.
@@ -2332,7 +2336,7 @@ For a fresh run, ``Recorder`` returns the initial value followed by one value
 after every step. This includes one initial sample for a zero-step run. Its
 recording remains connected to autograd. ``AnomalyDetector`` instead emits no
 trajectory: it keeps and returns a cumulative Boolean mask using constant
-callback memory. Callback objects are immutable configuration. Functional
+callback memory. Prepared callbacks contain immutable execution metadata. Functional
 callbacks work with eager bindings, bound compiled chunks, and the compatibility
 runners. Use ``checkpoint_every`` on ``dn.func.run`` for activation checkpointing.
 With a bound compiled chunk, the runner compiles
@@ -2361,7 +2365,7 @@ finite-extracellular topologies, including ``MultiPopulation``. Select
        model,
        dt=0.025,
        steps=800,
-       callbacks={"trace": dn.func.Recorder(("v", "i_membrane"))},
+       callbacks={"trace": dn.Recorder(("v", "i_membrane"))},
    )
    final_state, auxiliary = runner()
    current_mA = auxiliary["callbacks"]["trace"]["i_membrane"]
@@ -2426,8 +2430,8 @@ Population Slice labels to select a component explicitly:
        dt=0.025,
        steps=800,
        callbacks={
-           "cell_a": dn.func.Recorder(("v", "i_membrane"), region=packed.cell_a),
-           "cell_b_soma": dn.func.Recorder(
+           "cell_a": dn.Recorder(("v", "i_membrane"), region=packed.cell_a),
+           "cell_b_soma": dn.Recorder(
                ("v", "i_membrane"), region=packed.cell_b.soma
            ),
        },
@@ -2658,22 +2662,30 @@ configuration and are shared across ``vmap`` lanes. Trainable, lane-specific,
 or per-call data should instead be represented by an explicit tensor input;
 do not hide evolving values on the callback object.
 
-The functional ``Recorder`` currently supports explicit transition-state
-names such as ``"v"``, ``"vc"``, ``"i_membrane"``, ``"t"``, and ``"hh.m"``,
-plus ``node_indices``, ``max_only``, and ``partition`` for non-scalar states,
-or physical Slice selection through ``region``. ``Recorder(dt=...)`` selects
-the recording cadence described below. Sliding-window postprocessing and HDF5
-storage are currently unsupported by the pure Recorder; apply tensor reductions
-or storage after the run instead.
+Functional recording supports explicit transition-state names such as
+``"v"``, ``"vc"``, ``"i_membrane"``, ``"t"``, and ``"hh.m"``, plus
+``node_indices``, ``max_only``, and ``partition`` for non-scalar states, or
+physical Slice selection through ``region``. Declared mechanism State and
+``CARRY`` values, saved fields, and represented Ion/Material fields resolve
+through the explicit state inventory. Arbitrary native properties and
+unrepresented scratch fields are unsupported selections. Mechanism observations
+retain their support-local shape; their local slots need not correspond to
+physical compartments.
+
+``Recorder(dt=...)`` selects the cadence described below. Host runners support
+HDF5 output through ``dn.Recorder(...).set_hdf5(...)``; see
+:ref:`functional-recorder-storage`. Sliding-window postprocessing is currently
+unsupported in functional execution; apply a pure tensor reduction to an
+in-memory recording.
 
 .. _functional-recorder-cadence:
 
 Recorder sampling cadence
 ~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``dn.func.Recorder(("v", "t"), dt=record_dt)`` uses the same sampling rule as
-the native in-memory Recorder. The solver still advances at its configured
-timestep. The recording stride is ``int(record_dt / solver_dt)``: a positive
+``dn.Recorder(("v", "t"), dt=record_dt)`` uses the same sampling rule for
+native and functional execution, with either in-memory or HDF5 storage. The
+solver still advances at its configured timestep. The recording stride is ``int(record_dt / solver_dt)``: a positive
 noninteger ratio rounds down. ``record_dt`` must be finite and positive, and
 must span at least one solver step. Omitting ``dt`` records every step and
 retains the ordinary empty Recorder carry.
@@ -2681,12 +2693,11 @@ retains the ordinary empty Recorder carry.
 Cadence is bound to the functional plan's solver timestep. A different runtime
 or prepared timestep raises; create matching callbacks when changing it.
 
-A fresh recording includes the initial boundary. Its post-step counter starts
-at zero and is tested before incrementing, so a stride of two selects the
-initial boundary and accepted steps 1, 3, 5, and so on. With a solver timestep
-of 0.1 ms and ``dt=0.2``, the selected times are 0, 0.1, 0.3, 0.5 ms, and so
-on, relative to the starting clock. This matches native in-memory timing;
-it is not a separate interpolation grid.
+A fresh recording includes the initial boundary, then accepted steps that
+are multiples of the stride. A stride of two selects steps 0, 2, 4, 6, and so
+on. With a solver timestep of 0.1 ms and ``dt=0.2``, the selected times are
+0, 0.2, 0.4, 0.6 ms, and so on, relative to the starting clock. Sampling uses
+accepted solver states; it does not introduce an interpolation grid.
 
 Each Recorder owns its phase in explicit callback carry. Different Recorders
 may use different cadences in the same collection, including regional and
@@ -2721,6 +2732,78 @@ execution. The
 :download:`functional_callback_checkpoints.py <../../examples/functional_callback_checkpoints.py>`
 example checks its sampling phase after portable checkpoint restoration.
 
+.. _functional-recorder-storage:
+
+Stream Recorder samples to HDF5
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Configure HDF5 storage on the same Recorder used by native execution:
+
+.. code-block:: python
+
+   disk = dn.Recorder(["v", "hh.m", "t"], dt=0.1)
+   disk.set_hdf5("trace.h5", cache_every=4096)
+   program = dn.compile(
+       model, dt=0.025, steps=100_000, chunk_steps=1024,
+       callbacks={"disk": disk},
+   )
+   try:
+       state, auxiliary = program()
+   finally:
+       disk.close()
+
+The compiled numerical loop emits selected observations as tensors. The host
+runner stages completed sample batches in owned CPU storage and writes them
+through a bounded queue. File handles, processes and file counters stay outside
+scan, while, pure callback carry and activation-checkpoint replay. Backward
+recomputation therefore does not write the samples again. ``dn.func.run`` host
+schedules use the same storage path; direct tensor kernels perform no file I/O.
+
+An HDF5-only Recorder's trajectory is omitted from
+``auxiliary["callbacks"]``. Its sampling carry remains in that collection's
+``state`` and in ``auxiliary["continuation"]``. In-memory Recorders keep their
+ordinary tensor results and gradients. To use a trace loss while saving the
+same fields to disk, configure two named Recorders, one in memory and one with
+``set_hdf5``. Persisted copies are detached values.
+
+``cache_every`` counts simulation iterations, including a fresh recording's
+initial boundary, rather than recorded rows. It controls buffered writes;
+``Recorder(dt=...)`` independently controls which solver states are sampled.
+``chunk_steps`` controls compiled kernel width. Recording memory depends on the
+bounded host or checkpoint span, the pending storage buffer and the bounded
+writer queue. A checkpoint span can be wider than a compiled kernel. Input
+tapes, preparation and autograd have their own storage requirements.
+
+Each top-level host call with samples writes one ``run_N`` segment under each
+selected variable, using the existing ``/variable/run_N/chunk`` layout. A
+continuation keeps sampling phase and contributes only new frames to its next
+segment. Calls without samples create no datasets and consume no run number.
+``close()`` waits for queued data before the file is read:
+
+.. code-block:: python
+
+   from dendra.data import H5Reader
+
+   with H5Reader("trace.h5") as recording:
+       first_segment = recording["hh.m"][0].data.compute()
+
+A numerical checkpoint saves simulation state and sampling phase, not the file
+path, writer process or file position. Construct the receiving Recorder and
+storage destination explicitly. After restarting the process, restored
+continuation can write to a new file. Appending to an existing file across
+process restarts is currently unsupported; ``set_hdf5`` creates its file for a
+new writer session.
+
+The complete
+:download:`functional_recorder_storage.py <../../examples/functional_recorder_storage.py>`
+example checks HH mechanism-state recording, cadence, prefix/suffix
+continuation, HDF5 readback, scan input gradients and inference while execution:
+
+.. code-block:: bash
+
+   python examples/functional_recorder_storage.py
+   python examples/functional_recorder_storage.py --backend aot_eager
+
 Functional optimization
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -2752,7 +2835,7 @@ transform. This avoids asking ``torch.func`` to differentiate unrelated leaves:
        selected.values(),
        lr=5e-3,
    )
-   callbacks = fmodel.make_callbacks({"trace": dn.func.Recorder(["v"])})
+   callbacks = fmodel.make_callbacks({"trace": dn.Recorder(["v"])})
 
    def objective(local_selected):
        local_parameters = {**fixed, **local_selected}
@@ -3050,7 +3133,7 @@ sample followed by one sample per accepted timestep:
 .. code-block:: python
 
    callbacks = fmodel.make_callbacks(
-       {"trace": dn.func.Recorder(["v", "hh.m", "t"])}
+       {"trace": dn.Recorder(["v", "hh.m", "t"])}
    )
    kernel = fmodel.compile_rollout_chunk(100)
    with torch.no_grad():
@@ -3231,7 +3314,7 @@ its CPU float64 representation. The same ``dn.func`` calls apply, for example:
    model.initialize()
    runner = dn.func.compile(
        model, dt=0.025, steps=800, execution="scan",
-       callbacks={"trace": dn.func.Recorder(("v",))},
+       callbacks={"trace": dn.Recorder(("v",))},
    )
    final_state, auxiliary = runner()
 

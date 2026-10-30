@@ -156,6 +156,17 @@ preparation retains the raw field references without caching that graph.
 Portable continuation saves the detached stack as callback carry, alongside
 the checked metadata.
 
+`dn.Recorder` supplies the same observation configuration to native and
+functional execution. HDF5 storage is a separate host session: portable
+continuation includes the Recorder's numerical sampling phase, but excludes
+its file path, writer process, queued samples and file counters. Construct the
+receiving Recorder and destination explicitly. Restoring into a new file is
+supported; reopening an existing file for cross-process append is currently
+unsupported. Each host call with samples writes a separate `run_N` file segment,
+and resumed callbacks emit only new samples. Calls without samples create no
+datasets and consume no run number. See {ref}`functional-recorder-storage` for the
+storage and result contract.
+
 The example configures full-rate and cadenced Recorders, Raster, APCount and AnomalyDetector. Its
 Network has two Populations linked continuously and an event synapse driven by
 a noisy NetStim. Network callback scopes select the Population whose voltages
@@ -324,8 +335,8 @@ The example compares the reconstructed runner's complete state and joined
 recordings with one uninterrupted run. A resumed Recorder returns only new
 selected post-step samples, so joining the prefix and suffix has one initial frame.
 Cadenced Recorders preserve their post-step counter. The example's `dt=3 * DT`
-stream selects frames 0, 1, 4, and 7 of an eight-step run; restoring after step
-four retains that phase and selects only frame 7 from the suffix. Cadence-free
+stream selects frames 0, 3, and 6 of an eight-step run; restoring after step
+four retains that phase and selects only frame 6 from the suffix. Cadence-free
 Recorder configuration and carry retain their existing checkpoint form.
 Raster emissions preserve their step phase; APCount and anomaly results retain
 their cumulative carry. Comparing complete Network state also checks pending

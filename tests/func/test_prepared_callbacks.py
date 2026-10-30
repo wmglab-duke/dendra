@@ -382,8 +382,7 @@ def test_prepared_cadence_recorder_continues_phase_without_duplicate_boundaries(
     )
     _close(actual, expected)
     selected = {
-        name: value[[0, 1, 3, 5, 7]]
-        for name, value in full["callbacks"]["trace"].items()
+        name: value[[0, 2, 4, 6]] for name, value in full["callbacks"]["trace"].items()
     }
     _close(_join(first, last, "trace"), selected)
     assert last["callbacks"].state["trace"].item() == 7

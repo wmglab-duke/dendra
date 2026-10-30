@@ -181,16 +181,24 @@ The complete
 example checks step and duration defaults, per-call overrides, fractional
 continuation and Recorder phase for both model families.
 
-Recording is an explicit named callback. By default a fresh Recorder includes
-the initial sample, followed by every accepted step. `Recorder(dt=record_dt)`
-selects a cadence with the native in-memory sampling rule; its phase is explicit
-carry and survives chunks and continuation. Different Recorders can use different
+Recording is an explicit named callback. `dn.Recorder` configures recording
+for native models and functional runners; `dn.func.Recorder` remains supported.
+By default a fresh Recorder includes the initial sample, followed by every
+accepted step. `Recorder(dt=record_dt)` selects the initial boundary and accepted
+steps that are multiples of `int(record_dt / solver_dt)`, using the same rule
+for in-memory and HDF5 storage. Its phase is explicit carry and survives chunks
+and continuation. Different Recorders can use different
 cadences. Host schedules retain selected frames between emission segments.
 With bounded chunks or host/checkpoint spans, that Recorder's payload scales
 with selected history plus bounded dense segments. Each compiled invocation still
 emits dense data; full-rate/custom streams, autograd and input tapes have
 separate storage requirements. Atomic rollouts retain dense finalization; see
 {ref}`functional-recorder-cadence` for timing and compilation details.
+`Recorder.set_hdf5(path, cache_every=...)` routes its sampled trajectory to the
+host HDF5 writer instead of returned callback history. Its sampling carry
+remains available for continuation. In-memory recordings retain gradients;
+persisted samples are detached. See {ref}`functional-recorder-storage` for file
+segments, bounded storage and the complete runnable example.
 `auxiliary["continuation"]` carries
 the returned simulation state, effective bindings and callback state together.
 Pass it to the next call to continue without recording the shared boundary twice:
@@ -696,7 +704,7 @@ matching tensor bundle and returns a `dn.func.Continuation`:
 ```python
 functional, tensors = dn.func.make_functional(model, dt=DT)
 initial = dn.func.initialize(functional, tensors)
-callbacks = functional.make_callbacks({"trace": dn.func.Recorder(("v", "t"))})
+callbacks = functional.make_callbacks({"trace": dn.Recorder(("v", "t"))})
 state, auxiliary = dn.func.run(functional, initial, steps=100, callbacks=callbacks)
 ```
 
@@ -760,7 +768,7 @@ initialization replacements, with its simulation state and callback carry:
 ```python
 fresh_runner = dn.compile(
     make_cable(), dt=DT, steps=STEPS, initialization="fresh",
-    callbacks={"trace": dn.func.Recorder(("v", "t"))},
+    callbacks={"trace": dn.Recorder(("v", "t"))},
 )
 state, auxiliary = fresh_runner()
 continued, next_auxiliary = fresh_runner(auxiliary["continuation"])
