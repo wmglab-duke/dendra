@@ -455,11 +455,11 @@ def test_fused_callbacks_discover_post_step_emission_schema_and_resume_it():
     actual_raster = torch.cat(
         (first_aux["callbacks"]["raster"], final_aux["callbacks"]["raster"])
     )
-    assert actual_raster.shape[0] == 7
+    assert actual_raster.shape[0] == int(5 * DT / DT)
     assert actual_raster[0].all()
     torch.testing.assert_close(actual_raster, expected_aux["callbacks"]["raster"])
     torch.testing.assert_close(
-        final_aux["callbacks"]["count"], actual_raster.sum(dim=0)
+        final_aux["callbacks"]["count"], actual_raster.sum(dim=0, dtype=torch.int32)
     )
     _assert_tree_close(final_aux["callbacks"].state, expected_aux["callbacks"].state)
 

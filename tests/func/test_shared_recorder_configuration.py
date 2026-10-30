@@ -323,6 +323,12 @@ def test_hdf5_streaming_matches_memory_across_compiled_spans_and_continuation_wi
         str(path), cache_every=cache_interval
     )
     memory = dn.Recorder(fields, dt=2 * DT)
+    raster = dn.callbacks.Raster(
+        threshold=-100.0, node_check=[0, -1], t_start_check=2 * DT, t_end_check=6 * DT
+    )
+    raster_configuration = (
+        dn.func.PopulationCallback("cell", raster) if network else raster
+    )
     frames = []
     write = disk._write_hdf5_frame
 
@@ -336,7 +342,7 @@ def test_hdf5_streaming_matches_memory_across_compiled_spans_and_continuation_wi
         dt=DT,
         steps=STEPS,
         chunk_steps=4,
-        callbacks={"disk": disk, "memory": memory},
+        callbacks={"disk": disk, "memory": memory, "raster": raster_configuration},
         inference=execution == "while",
         execution=execution,
         checkpoint_every=3 if execution == "scan" else None,
@@ -346,6 +352,7 @@ def test_hdf5_streaming_matches_memory_across_compiled_spans_and_continuation_wi
     reference_callbacks = program.functional.make_callbacks(
         {
             "memory": dn.func.Recorder(fields, dt=2 * DT),
+            "raster": raster_configuration,
         }
     )
     initial = dn.func.Continuation(
@@ -360,15 +367,39 @@ def test_hdf5_streaming_matches_memory_across_compiled_spans_and_continuation_wi
                 callbacks=reference_callbacks,
             )
             _, first = program(steps=3)
-            actual, last = program(first["continuation"], steps=4)
+            queued_before_empty = len(local_hdf5_writer.queue.items)
+            counters_before_empty = disk.run_number, disk.save_count
+            _, empty = program(first["continuation"], steps=0)
+            assert empty["callbacks"]["raster"].shape == (0, 1, 2)
+            _close(
+                empty["callbacks"].state["raster"], first["callbacks"].state["raster"]
+            )
+            assert len(local_hdf5_writer.queue.items) == queued_before_empty
+            assert (disk.run_number, disk.save_count) == counters_before_empty
+            actual, last = program(empty["continuation"], steps=4)
         if execution == "while":
             assert program.execution_report().strategy == "compiled_while_loop"
         _close(actual, expected)
-        assert tuple(first["callbacks"]) == tuple(last["callbacks"]) == ("memory",)
+        assert (
+            tuple(first["callbacks"])
+            == tuple(last["callbacks"])
+            == ("memory", "raster")
+        )
         assert first["callbacks"].state["disk"].item() == 3
         assert last["callbacks"].state["disk"].item() == STEPS
         observed = _join(first, last)
         _close(observed, reference["callbacks"]["memory"])
+        assert first["callbacks"]["raster"].shape == (1, 1, 2)
+        assert last["callbacks"]["raster"].shape == (3, 1, 2)
+        joined_raster = torch.cat(
+            tuple(part["callbacks"]["raster"] for part in (first, empty, last))
+        )
+        _close(joined_raster, reference["callbacks"]["raster"])
+        assert joined_raster.shape == (4, 1, 2)
+        assert joined_raster.dtype == torch.bool and not joined_raster.requires_grad
+        assert joined_raster[0].all() and not joined_raster[1:].any()
+        assert last["callbacks"].state["raster"][-1].item() == STEPS
+        assert raster.record is raster.state_cache is None and raster.i == 0
         assert local_hdf5_writer.maxsize > 0
         writes = [
             item for item in local_hdf5_writer.queue.items if isinstance(item, tuple)

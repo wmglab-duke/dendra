@@ -148,6 +148,27 @@ step phase with the per-callback carry schemas. Restoring this data
 resumes the receiving callback's pure hooks without serializing a Python
 callback instance.
 
+Native `dn.callbacks.APCount`, `Raster` and `AnomalyDetector` configurations
+bind to independent pure implementations for functional execution. Exported
+callback carry describes that functional execution's detection history; it does
+not copy the supplied native object's `record`, crossing cache or run counter.
+Construct and bind receiving configurations explicitly, then restore their
+matching callback carry. Constructor namespace does not replace the resolved
+configuration and schema checks. Raster configurations share the same
+compact-window result and checkpoint contract when their resolved indices,
+window and timestep match.
+
+Native and functional APCount use `torch.int32` counts. Portable restoration
+also accepts legacy `int64` and `float32` count carry when every value is a
+finite, nonnegative integer within the signed 32-bit range. Restoration checks
+these values before conversion and rejects unsafe values. Restored counts use
+the same four-byte integer representation as fresh counts.
+
+Both native and functional Raster return only checked post-step samples. A
+restored suffix contains the remaining checked samples, or an empty sample axis
+if its callback phase is outside the window. Concatenating prefix and suffix
+rasters reconstructs the uninterrupted window without padding unchecked steps.
+
 Recorder and LFP preparation follows the same separation. Recorder metadata
 describes resolved paths, physical selections and cadence. LFP metadata
 describes field values, projection rule, shape padding, dtype and device. A
@@ -263,7 +284,8 @@ that the receiving implementation gives those values the same meaning.
 Custom callbacks without this hook retain ordinary execution and live in-memory
 continuation. Portable callback export requires the hook when the bound
 implementation does not use a supported built-in checkpoint contract.
-Built-in callbacks retain their existing checkpoint formats.
+Existing built-in checkpoint formats remain supported, including checked
+conversion of legacy APCount count carry to `torch.int32`.
 
 The complete
 {download}`functional_callback_checkpoint_protocol.py <../../examples/functional_callback_checkpoint_protocol.py>`
@@ -338,8 +360,8 @@ Cadenced Recorders preserve their post-step counter. The example's `dt=3 * DT`
 stream selects frames 0, 3, and 6 of an eight-step run; restoring after step
 four retains that phase and selects only frame 6 from the suffix. Cadence-free
 Recorder configuration and carry retain their existing checkpoint form.
-Raster emissions preserve their step phase; APCount and anomaly results retain
-their cumulative carry. Comparing complete Network state also checks pending
+Raster samples preserve their checked-window phase; APCount and anomaly results
+retain their cumulative carry. Comparing complete Network state also checks pending
 delivery and RNG continuation.
 
 ```{literalinclude} ../../examples/functional_callback_checkpoints.py
@@ -514,7 +536,8 @@ checkpoint contract. Custom bound callbacks describe their configuration through
 restoration bridge. See {ref}`functional-callback-checkpoint-protocol`.
 Their ordinary execution and in-memory continuation support both scan and
 inference-only while using the same bound callback collection, including when
-the optional checkpoint hook is absent.
+the optional checkpoint hook is absent. Native and pure Raster configurations
+share a checkpoint contract when their resolved observation settings match.
 
 For LFP, restored lead-field carry is detached. It does not acquire a gradient
 connection to the receiving collection's lead-field Tensors. Use direct

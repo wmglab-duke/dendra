@@ -9,6 +9,8 @@ from numbers import Integral
 import torch
 from torch.utils import _pytree as pytree
 
+from dendra.models._threshold_callbacks import _restore_count
+
 from ._callbacks import (
     LFP,
     ActiveAL,
@@ -21,6 +23,7 @@ from ._callbacks import (
     Recorder,
     _BoundCadencedRecorder,
     _BoundPopulationCallback,
+    _callback_implementation,
     _is_prepared_callback,
     _is_prepared_lfp,
     _TensorLeafSchema,
@@ -546,11 +549,48 @@ def restore_state(callbacks, packet):
             [plan.name for plan in callbacks._plans],
             label="callback checkpoint carries",
         )
+        carries = dict(carries)
         for plan in callbacks._plans:
+            carry = carries[plan.name]
+            label = f"callback checkpoint carry {plan.name!r}"
+            implementation = _callback_implementation(plan.callback)
+            if (
+                any(
+                    type(implementation) is cls
+                    for cls in (APCount, ActiveAL, ActiveALCount)
+                )
+                and type(carry) is tuple
+                and len(carry) == 3
+                and isinstance(carry[1], torch.Tensor)
+                and carry[1].dtype in (torch.int64, torch.float32)
+            ):
+                # Earlier checkpoints used int64 functional counts or float32
+                # native counts. Validate the complete carry before converting
+                # only this trusted built-in leaf, without changing the packet.
+                count_schema = plan.carry_schema.leaves[1]
+                legacy_schema = _TensorTreeSchema(
+                    spec=plan.carry_schema.spec,
+                    leaves=(
+                        plan.carry_schema.leaves[0],
+                        _TensorLeafSchema(
+                            shape=count_schema.shape,
+                            dtype=carry[1].dtype,
+                            device=count_schema.device,
+                        ),
+                        plan.carry_schema.leaves[2],
+                    ),
+                )
+                _validate_tree(carry, legacy_schema, label=label)
+                carry = (
+                    carry[0],
+                    _restore_count(carry[1], label=f"{label} counts"),
+                    carry[2],
+                )
+                carries[plan.name] = carry
             _validate_tree(
-                carries[plan.name],
+                carry,
                 plan.carry_schema,
-                label=f"callback checkpoint carry {plan.name!r}",
+                label=label,
             )
         _validate_invariants(callbacks, carries)
         state = FunctionalCallbackState(

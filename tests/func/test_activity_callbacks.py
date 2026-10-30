@@ -61,7 +61,7 @@ def test_activity_matches_imperative_crossings(
     assert actual.shape == source.shape[:-1]
     torch.testing.assert_close(actual, expected)
     torch.testing.assert_close(
-        auxiliary["callbacks"].state["active"][1], counts.to(torch.int64)
+        auxiliary["callbacks"].state["active"][1], counts.to(torch.int32)
     )
 
 

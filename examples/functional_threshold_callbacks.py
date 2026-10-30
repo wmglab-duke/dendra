@@ -61,10 +61,10 @@ def main():
         "site_quorum": dn.func.ActiveAL(**selected, at_least=2),
         "event_quorum": dn.func.ActiveALCount(**selected, at_least=2),
         "by_site": dn.func.Active(**selected, partition=(1, 1)),
-        "counts": dn.func.APCount(**selected),
+        "counts": dn.callbacks.APCount(**selected),
     }
     if args.record:
-        callbacks["trace"] = dn.func.Recorder(("v",))
+        callbacks["trace"] = dn.Recorder(("v",))
     runner = dn.func.compile(
         model,
         dt=0.01,
@@ -80,7 +80,8 @@ def main():
     assert results["by_site"].shape == (2, 2)
     assert results["counts"].shape == (2, 2)
     assert results["active"].dtype == torch.bool
-    assert results["counts"].dtype == torch.int64
+    assert results["counts"].dtype == torch.int32
+    assert not results["counts"].requires_grad
     if args.record:
         assert results["trace"]["v"].shape[0] == 9  # Initial frame plus eight steps.
     else:

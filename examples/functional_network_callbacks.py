@@ -154,7 +154,7 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         )
     # region results
     assert lfp.shape == (2 * STEPS + 1, 2, 2)  # Frames, batch, contacts.
-    assert raster.shape == (2 * STEPS, 2, 2, 2)  # Steps, batch, cells, sites.
+    assert raster.shape == (4, 2, 2, 2)  # Checked indices 2:6, batch, cells, sites.
     assert soma.shape == (2 * STEPS + 1, 2, 2)
     # Recording includes the initial boundary and accepted multiples of the stride.
     selected_frames = torch.tensor([0, 2, 4, 6, 8])
@@ -163,8 +163,9 @@ def run_demo(*, execution="scan", backend="aot_eager"):
             values, trace[field].index_select(0, selected_frames)
         )
     assert second["counts"].shape == (2, 2, 2)
+    assert second["counts"].dtype == torch.int32
     assert second["anomaly"].shape == (2, 2)
-    torch.testing.assert_close(second["counts"], raster.sum(dim=0))
+    torch.testing.assert_close(second["counts"], raster.sum(dim=0, dtype=torch.int32))
     torch.testing.assert_close(second["active"], (second["counts"] > 0).any(dim=-1))
     torch.testing.assert_close(
         second["site_quorum"], (second["counts"] > 0).sum(dim=-1) >= 2
@@ -173,7 +174,7 @@ def run_demo(*, execution="scan", backend="aot_eager"):
         second["event_quorum"], second["counts"].sum(dim=-1) >= 2
     )
     # This low threshold illustrates callback phase, not physiological spikes.
-    assert not raster[:2].any() and raster[2].all() and not raster[3:].any()
+    assert raster[0].all() and not raster[1:].any()
     assert not second["anomaly"].any()
     voltage = trace["left.v"]
     torch.testing.assert_close(mean_voltage, voltage.flatten(start_dim=1).mean(dim=1))

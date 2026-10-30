@@ -102,15 +102,17 @@ execution mode:
        execution="while",
        callbacks={
            "active": dn.func.Active(node_check=[0, -1]),
-           "counts": dn.func.APCount(node_check=[0, -1]),
+           "counts": dn.callbacks.APCount(node_check=[0, -1]),
        },
    )
    final_state, auxiliary = runner()
    active = auxiliary["callbacks"]["active"]
    counts = auxiliary["callbacks"]["counts"]
 
-The mapping accepts ``dn.func.FunctionalCallback`` configurations, not mutable
-``dn.callbacks`` objects or an already-bound collection. Names such as
+The mapping accepts ``dn.func.FunctionalCallback`` configurations and the
+built-in ``dn.Recorder``, ``dn.callbacks.APCount``, ``Raster`` and
+``AnomalyDetector`` configurations. Pass configurations rather than an
+already-bound collection. Names such as
 ``"trace"`` are user-defined and have no special meaning. Threshold-only reducers
 need no voltage trajectory, so the example above allocates no full-trace
 storage. Omitting ``callbacks`` or passing ``callbacks={}`` selects no callbacks;
@@ -2260,18 +2262,20 @@ Use ``dn.Recorder`` to configure recording for native models, ``dn.compile``
 runners, and functional callback collections. ``dn.func.Recorder`` remains a
 supported entry point for pure recording. Functional execution prepares the
 selected observations without invoking an imperative callback's hooks or
-reading changing values from the source model. Other functional callbacks use
-the pure ``FunctionalCallback`` API. Give each callback a stable result name
-and bind the collection once, outside repeated simulations:
+reading changing values from the source model. Native ``dn.callbacks.APCount``,
+``Raster`` and ``AnomalyDetector`` configurations also bind to functional
+execution; the corresponding ``dn.func`` constructors remain supported. Other
+functional callbacks use the pure ``FunctionalCallback`` API. Give each callback
+a stable result name and bind the collection once, outside repeated simulations:
 
 .. code-block:: python
 
    callbacks = fmodel.make_callbacks(
        {
            "trace": dn.Recorder(["v"]),
-           "anomalies": dn.func.AnomalyDetector(),
-           "raster": dn.func.Raster(node_check=[0, -1]),
-           "spike_count": dn.func.APCount(node_check=[0, -1]),
+           "anomalies": dn.callbacks.AnomalyDetector(),
+           "raster": dn.callbacks.Raster(node_check=[0, -1]),
+           "spike_count": dn.callbacks.APCount(node_check=[0, -1]),
            "active": dn.func.Active(node_check=[0, -1]),
        }
    )
@@ -2296,6 +2300,17 @@ regions and selections; an
 ``LFP`` holds field references and projection metadata. Evolving reduction state,
 field carry and sampling phase remain explicit callback carry. Configure selections
 before binding, and bind a new collection to change them.
+
+Native APCount and Raster configuration retains the authored compartment
+selectors and timestep choice separately from native execution's normalized
+indices and effective timestep. Negative indices resolve against the Population
+being bound. Omitting ``dt`` uses that functional Population's timestep; an
+explicit ``dt`` must match it. Binding captures configuration without importing
+or updating native ``record``, ``state_cache`` or step counters. AnomalyDetector
+likewise starts from fresh explicit carry. Continue detection with the returned
+``Continuation`` or callback state, rather than a mutable native callback's
+history. Native LFP and Active-family configurations are currently unsupported;
+use their ``dn.func`` constructors.
 
 For ``torch.func`` transforms, keep host-duration scheduling outside the
 transformed function and use the fixed-step tensor operation directly:
@@ -2485,10 +2500,13 @@ initial model frame is not inspected. The first checked post-step sample is
 armed even if it is already above threshold; a subsequent below-threshold
 checked sample rearms that site. The first post-step sample has callback index
 zero, and the checked window uses
-``int(t_start_check / dt) <= index < int(t_end_check / dt)``. Omitting
-``t_end_check`` leaves the window open. These bounds use callback sample indices,
-not a comparison against the state's post-step clock. ``dt`` defaults to the
-functional timestep and must match it when supplied explicitly.
+``int(t_start_check / dt) <= index < int(t_end_check / dt)``. Native APCount and
+Raster configurations retain their default ``t_end_check=1e9`` ms when the
+constructor argument is omitted. The ``dn.func`` constructors use an open-ended
+window for an omitted end. Supply an explicit end to define the same finite
+window with either constructor. These bounds use callback sample indices, not a
+comparison against the state's post-step clock. ``dt`` defaults to the functional
+timestep and must match it when supplied explicitly.
 
 For ``K`` selected slots in ``node_check``, the finalized results are:
 
@@ -2510,10 +2528,10 @@ For ``K`` selected slots in ``node_check``, the finalized results are:
      - ``(*batch, N)`` Boolean
    * - ``APCount``
      - Cumulative upward-crossing counts for each checked slot.
-     - ``(*batch, N, K)`` int64
+     - ``(*batch, N, K)`` ``torch.int32`` counts
    * - ``Raster``
-     - Post-step crossing events, with ``False`` outside the checked window.
-     - ``(steps, *batch, N, K)`` Boolean
+     - Post-step crossing events inside the checked window.
+     - ``(samples, *batch, N, K)`` Boolean
 
 ``ActiveAL`` counts sites, not repeated spikes at one site. In contrast,
 ``ActiveALCount`` sums all events, including repeated spikes. This distinction
@@ -2530,20 +2548,38 @@ The selected-slot order follows ``node_check``; repeated node indices retain
 their multiplicity rather than being deduplicated.
 
 ``Active``, ``ActiveAL``, ``ActiveALCount``, and ``APCount`` emit no trajectory
-and use callback memory independent of the timestep count. ``Raster`` retains
-the full simulation timeline, unlike imperative Raster, which omits frames
-outside its checked window. All threshold callbacks preserve their crossing
-latches, accumulated results, and timing phase in explicit callback carry, so
-continuation does not reset the detection window or double-count a crossing.
+and use callback memory independent of the timestep count. Native and functional
+``APCount`` use exact signed 32-bit integer counts, with four bytes per checked
+slot. Threshold detection and count updates are nondifferentiable.
+
+Both native and functional ``Raster`` results contain only checked post-step
+samples. ``False`` means the site was checked and did not cross threshold.
+A call outside the observation window returns a Boolean tensor with a zero-length
+sample axis. The initial model frame has no Raster row. Continuing a run
+contributes only the checked samples in that segment, so concatenating prefix
+and suffix rasters gives the uninterrupted window.
+
+Scan and while kernels keep fixed-shape per-step emissions. Host scheduling
+selects the window before retaining or returning Raster history. Direct
+``torch.compile`` capture of an atomic rollout that includes Raster finalization
+requires backend support for dynamic output shapes, as does cadenced Recorder
+finalization. Use ``dn.func.run`` to keep this selection at the host boundary.
+
+All threshold callbacks preserve their crossing latches, accumulated results,
+and timing phase in explicit callback carry, so continuation does not reset
+the detection window or double-count a crossing.
 ``runner()`` starts a fresh detection history; continue with both returned
 simulation state and ``callback_state=auxiliary["callbacks"].state``.
 
 These are observation/reduction callbacks: they do not stop the simulation
-early, execute imperative hooks, or convert an existing mutable callback.
-Boolean masks and integer crossing counts are hard, nondifferentiable results.
+early or execute imperative hooks. Native configuration binding captures settings
+into a pure implementation with independent explicit carry.
+Boolean masks and crossing counts are hard, nondifferentiable results.
 They do not interfere with gradients through recorded floating-point traces or
 the final simulation state, but do not provide gradients of threshold decisions.
-See ``examples/functional_threshold_callbacks.py`` for the convenience runner.
+See ``examples/functional_threshold_callbacks.py`` for the convenience runner,
+and :ref:`functional-shared-threshold-configuration` for a complete shared
+configuration example with scan, while, gradients and portable continuation.
 
 The same callback plan can observe its source model through the ordinary
 ``Population.longrun_checkpointed`` API. This is useful when an existing

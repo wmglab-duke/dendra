@@ -18,6 +18,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from dendra.models._threshold_callbacks import (
+    _COUNT_DTYPE,
+    _anomaly_flags,
     accumulate_count,
     activity_from_counts,
     threshold_crossing,
@@ -137,22 +139,45 @@ def _is_prepared_callback(callback):
     return issubclass(type(callback), _PreparedCallback) and callback._prepared
 
 
-def _is_callback_configuration(callback):
-    from dendra.models.callbacks import Recorder as NativeRecorder
+def _native_callback_implementations():
+    from dendra.models import callbacks as native
 
-    return isinstance(callback, FunctionalCallback) or type(callback) is NativeRecorder
+    return (
+        (native.Recorder, Recorder),
+        (native.APCount, APCount),
+        (native.Raster, Raster),
+        (native.AnomalyDetector, AnomalyDetector),
+    )
+
+
+def _native_callback_implementation(callback):
+    return next(
+        (
+            implementation
+            for source, implementation in _native_callback_implementations()
+            if type(callback) is source
+        ),
+        None,
+    )
+
+
+def _is_callback_configuration(callback):
+    return (
+        isinstance(callback, FunctionalCallback)
+        or _native_callback_implementation(callback) is not None
+    )
 
 
 def _coerce_callback_configuration(callback):
-    """Snapshot a canonical Recorder without importing its mutable history."""
-    from dendra.models.callbacks import Callback
+    """Capture authored native settings without importing runtime history."""
     from dendra.models.callbacks import Recorder as NativeRecorder
 
     if isinstance(callback, FunctionalCallback):
         return callback
-    if type(callback) is not NativeRecorder:
+    implementation = _native_callback_implementation(callback)
+    if implementation is None:
         raise TypeError(
-            "functional callback values must be FunctionalCallback objects or dn.Recorder configurations"
+            "functional callback values must be FunctionalCallback objects or supported built-in Dendra callback configurations"
         )
     for name in (
         "pre_loop_hook",
@@ -162,11 +187,16 @@ def _coerce_callback_configuration(callback):
         "pre_chunk_hook",
         "post_chunk_hook",
     ):
-        expected = getattr(NativeRecorder, name, getattr(Callback, name, None))
-        if getattr(getattr(callback, name), "__func__", None) is not expected:
+        if getattr(getattr(callback, name), "__func__", None) is not getattr(
+            type(callback), name
+        ):
             raise FunctionalizationError(
-                "custom imperative Recorder hooks cannot be lowered; implement a FunctionalCallback"
+                f"custom imperative {type(callback).__name__} hooks cannot be lowered; implement a FunctionalCallback"
             )
+    if type(callback) is not NativeRecorder:
+        if implementation is AnomalyDetector:
+            return implementation()
+        return implementation(**callback._functional_threshold_configuration())
     generated = getattr(callback, "_recorder_generated_hooks", ())
     if (
         tuple(
@@ -225,7 +255,7 @@ class PopulationCallback(FunctionalCallback):
             raise ValueError("PopulationCallback population must not be empty")
         if not _is_callback_configuration(self.callback):
             raise TypeError(
-                "PopulationCallback requires a pure FunctionalCallback or dn.Recorder"
+                "PopulationCallback requires a pure FunctionalCallback or supported built-in Dendra callback configuration"
             )
         if isinstance(self.callback, PopulationCallback):
             raise ValueError("PopulationCallback scopes cannot be nested")
@@ -723,7 +753,7 @@ class AnomalyDetector(FunctionalCallback):
     def update(self, carry, state, auxiliary):
         del auxiliary
         voltage = self._voltage(state)
-        return carry | ~torch.isfinite(voltage).all(dim=-1), None
+        return _anomaly_flags(carry, voltage), None
 
     def finalize(self, carry, emissions):
         if emissions is not None:  # pragma: no cover - collection owns schema
@@ -901,10 +931,10 @@ class Raster(_ThresholdCallback):
     """Record post-step upward threshold crossings as a Boolean trajectory.
 
     The constructor mirrors :class:`dendra.callbacks.Raster`. The result has
-    shape ``(steps, *batch, N, K)`` for ``K`` selected compartments. Unlike the
-    mutable callback, the functional result retains every simulated step and
-    masks events outside ``[t_start_check, t_end_check)`` to preserve a static,
-    transform-friendly time axis.
+    shape ``(samples, *batch, N, K)`` for ``K`` selected compartments. Only
+    accepted post-step samples inside the checked window are returned. Initial
+    model state is not sampled. Numerical loop emissions keep a fixed shape;
+    host collection and finalization select the checked rows.
     """
 
     def initialize(self, state, auxiliary):
@@ -913,7 +943,7 @@ class Raster(_ThresholdCallback):
         selected = _selected_voltage(state, self.node_indices)
         carry = (
             torch.ones_like(selected, dtype=torch.bool),
-            selected.new_zeros((), dtype=torch.int64),
+            torch.zeros((), device=selected.device, dtype=torch.int64),
         )
         return carry, None
 
@@ -932,18 +962,26 @@ class Raster(_ThresholdCallback):
         )
         return (next_below, step + 1), spikes
 
-    def finalize(self, carry, emissions):
-        self._require_prepared()
-        below, _step = carry
+    def _select_emissions(self, carry, emissions):
+        below, step = carry
         if emissions is None:
             return below.new_empty((0, *below.shape))
-        return emissions
+        if self.start_step <= 0 and self.end_step == torch.iinfo(torch.int64).max:
+            return emissions
+        indices = torch.arange(emissions.shape[0], device=step.device, dtype=torch.long)
+        positions = indices + step - emissions.shape[0]
+        indices = indices[(positions >= self.start_step) & (positions < self.end_step)]
+        return emissions.index_select(0, indices.to(device=emissions.device))
+
+    def finalize(self, carry, emissions):
+        self._require_prepared()
+        return self._select_emissions(carry, emissions)
 
 
 class APCount(_ThresholdCallback):
     """Count upward voltage-threshold crossings in constant callback memory.
 
-    The returned integer tensor has shape ``(*batch, N, K)`` for ``K``
+    The returned int32 tensor has shape ``(*batch, N, K)`` for ``K``
     selected compartments. Crossing state, counts, and timestep phase all live
     in explicit carry, so segmented and checkpointed execution resume exactly.
     """
@@ -954,7 +992,7 @@ class APCount(_ThresholdCallback):
         selected = _selected_voltage(state, self.node_indices)
         carry = (
             torch.ones_like(selected, dtype=torch.bool),
-            torch.zeros_like(selected, dtype=torch.int64),
+            torch.zeros_like(selected, dtype=_COUNT_DTYPE),
             selected.new_zeros((), dtype=torch.int64),
         )
         return carry, None
@@ -1522,18 +1560,19 @@ def _setup_callback_state(callbacks, callback_state, state):
 class _CallbackCollector:
     """Invocation-local sampled history outside the numerical loop boundary."""
 
-    def __init__(self, callbacks, cadences):
+    def __init__(self, callbacks, selections):
         self._callbacks = callbacks
-        self._cadences = cadences
+        self._selections = selections
         self.parts = []
 
     def append(self, callback_state, emitted, *, retained=False):
         if not retained:
             emitted = dict(emitted)
-            for name, recorder in self._cadences:
-                emitted[name] = recorder._select_emissions(
-                    callback_state[name], emitted[name]
-                )
+            for name, selector in self._selections:
+                if emitted[name] is not None:
+                    emitted[name] = selector._select_emissions(
+                        callback_state[name], emitted[name]
+                    )
         # Empty selections still own a connected zero VJP. Retain their tensor
         # parts instead of synthesizing detached empties during completion.
         self.parts.append(emitted)
@@ -1558,20 +1597,20 @@ def _host_callback_parts(callbacks, callback_state, parts, *, storage=None):
                     "HDF5 recording requires the standard host callback collector"
                 )
             return parts
-    cadences = []
+    selections = []
     for plan in callbacks._plans:
         implementation = _callback_implementation(plan.callback)
-        if type(implementation) is _BoundCadencedRecorder:
-            cadences.append((plan.name, implementation))
+        if type(implementation) in (_BoundCadencedRecorder, Raster):
+            selections.append((plan.name, implementation))
     if storage and callbacks._storage:
         from ._recording import _recording_collector
 
         return _recording_collector(
-            callbacks, callback_state, tuple(cadences), parts, storage
+            callbacks, callback_state, tuple(selections), parts, storage
         )
-    if not cadences:
+    if not selections:
         return parts
-    collector = _CallbackCollector(callbacks, tuple(cadences))
+    collector = _CallbackCollector(callbacks, tuple(selections))
     for part in parts:
         collector.append(callback_state, part)
     return collector
@@ -2066,6 +2105,12 @@ class FunctionalCallbacks:
                     outputs[plan.name] = implementation.recorder.finalize(
                         (), emissions[plan.name]
                     )
+                    continue
+                if type(implementation) is Raster and emissions[plan.name] is not None:
+                    # Owned host collectors already selected this segment's
+                    # window. Selecting compact rows a second time would
+                    # reinterpret their timeline using the final step count.
+                    outputs[plan.name] = emissions[plan.name]
                     continue
             outputs[plan.name] = plan.callback.finalize(
                 callback_state[plan.name], emissions[plan.name]

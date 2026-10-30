@@ -370,7 +370,9 @@ def test_threshold_callback_bridge_preserves_raster_and_count_carry():
     resumed_raster = torch.cat((first["raster"], second["raster"]))
     torch.testing.assert_close(resumed_raster, expected["raster"])
     torch.testing.assert_close(second["count"], expected["count"])
-    torch.testing.assert_close(expected["count"], expected["raster"].sum(dim=0))
+    torch.testing.assert_close(
+        expected["count"], expected["raster"].sum(dim=0, dtype=torch.int32)
+    )
     assert torch.all(expected["raster"][0])
     assert not torch.any(expected["raster"][1:])
 

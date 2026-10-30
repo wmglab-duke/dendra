@@ -199,6 +199,21 @@ host HDF5 writer instead of returned callback history. Its sampling carry
 remains available for continuation. In-memory recordings retain gradients;
 persisted samples are detached. See {ref}`functional-recorder-storage` for file
 segments, bounded storage and the complete runnable example.
+
+Use `dn.callbacks.APCount`, `Raster` and `AnomalyDetector` to configure native
+or functional spike analysis and anomaly detection. Functional binding captures
+these settings into independent pure callbacks; native histories and counters
+remain separate. The corresponding `dn.func` constructors are also supported.
+For a Network, select the observed Population with
+`dn.func.PopulationCallback(name, callback)`. See
+{doc}`A27_functional_network_callbacks` for scopes and configuration ownership.
+Both Raster entry points return only checked post-step samples in the
+observation window, with an empty sample axis when none are checked. Their
+crossing latches and window phase remain explicit carry.
+Both APCount entry points return `torch.int32` counts, with four bytes per
+checked slot. These exact integer observations do not require gradients;
+gradients through model state and floating-point recordings remain available.
+
 `auxiliary["continuation"]` carries
 the returned simulation state, effective bindings and callback state together.
 Pass it to the next call to continue without recording the shared boundary twice:

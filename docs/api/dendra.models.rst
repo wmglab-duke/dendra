@@ -279,6 +279,23 @@ new differentiable field stack; preparation retains no autograd graph. See
 :doc:`../advanced/A27_functional_network_callbacks` for timing, result shapes
 and Population scopes.
 
+Native ``dn.callbacks.APCount``, ``Raster`` and ``AnomalyDetector``
+configurations are accepted by functional callback collections and ``dn.compile``.
+Their ``dn.func`` entry points remain supported. Population-scoped Network
+bindings use ``dn.func.PopulationCallback(name, callback)``. Configuration
+capture excludes native history and counters. Authored negative compartment
+indices resolve against the receiving Population; an omitted threshold
+``dt`` uses its functional timestep, while an explicit value must match.
+Both native and functional Raster return only checked post-step samples inside
+their window, including a correctly shaped empty result when none are checked.
+Raster configuration and carry use the same checkpoint contract for either
+constructor.
+Native and functional APCount return exact ``torch.int32`` counts, with four
+bytes per checked slot. Threshold detection and count updates are
+nondifferentiable. Portable restoration accepts valid legacy ``int64`` and
+``float32`` count carry after checking that its values are finite, nonnegative
+integers within the ``int32`` range; unsafe values are rejected.
+
 Recorder cadence selects the initial boundary and accepted-step multiples of
 ``int(record_dt / solver_dt)`` for both in-memory and HDF5 output. Configure
 HDF5 with ``dn.Recorder(...).set_hdf5(path, cache_every=...)``. Host runners
@@ -297,7 +314,7 @@ Explicit receiving callbacks must have matching metadata, carry and emission
 schemas. Restoration does not import or reconstruct callback code. The hook is
 called only during cold checkpoint export/restore; callbacks without it retain
 ordinary execution and in-memory continuation. Existing built-in checkpoint
-formats remain unchanged. See :ref:`functional-callback-checkpoint-protocol`
+formats remain supported. See :ref:`functional-callback-checkpoint-protocol`
 for the full contract and runnable custom reducer/emitter example.
 
 .. autoclass:: dendra.func.FunctionalCallback

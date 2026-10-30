@@ -16,7 +16,7 @@ from test_recorder_while_loop import _case
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
-from dendra.models.callbacks import Recorder as ImperativeRecorder
+from dendra.models.callbacks import Callback as ImperativeCallback
 from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE
 
 pytestmark = [
@@ -114,9 +114,9 @@ def _close_result(actual, expected):
 
 def _assert_reductions(outputs):
     counts = outputs["count"]
-    assert counts.dtype == torch.int64
+    assert counts.dtype == torch.int32
     assert outputs["raster"].dtype == torch.bool
-    torch.testing.assert_close(counts, outputs["raster"].sum(0))
+    torch.testing.assert_close(counts, outputs["raster"].sum(0, dtype=torch.int32))
     torch.testing.assert_close(outputs["active"], (counts != 0).any(-1))
     torch.testing.assert_close(outputs["inactive"], ~outputs["active"])
     torch.testing.assert_close(outputs["active_nodes"], (counts != 0).sum(-1) >= 2)
@@ -275,7 +275,9 @@ def test_threshold_callback_resume_keeps_window_phase_and_bounded_tail(
         _ordered(expected[1]["callbacks"].state.carries),
     )
     assert outputs["trace"]["v"].shape[0] == 2 * width + 1
-    assert outputs["raster"].shape[0] == 2 * width
+    assert outputs["raster"].shape[0] == len(
+        range(2 * width)[int(2 * DT / DT) : int(12 * DT / DT)]
+    )
     assert second[1]["callbacks"].state["count"][2].item() == 2 * width
     _assert_reductions(outputs)
 
@@ -406,7 +408,7 @@ def test_callback_mapping_validation_and_trace_name_is_ordinary():
             model,
             dt=DT,
             steps=4,
-            callbacks={"imperative": ImperativeRecorder(("v",))},
+            callbacks={"imperative": ImperativeCallback()},
             backend="eager",
         )
     foreign, _ = dn.func.make_functional(model, dt=DT)
@@ -436,7 +438,7 @@ def test_callback_mapping_validation_and_trace_name_is_ordinary():
         callbacks={"trace": dn.func.APCount(node_check=(0,))},
         backend="eager",
     )()
-    assert trace_count[1]["callbacks"]["trace"].dtype == torch.int64
+    assert trace_count[1]["callbacks"]["trace"].dtype == torch.int32
     unrecorded_while = dn.func.compile(
         model,
         dt=DT,

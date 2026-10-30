@@ -66,6 +66,7 @@ from dendra.models.callbacks import (
     _append_tensor,
     _append_tensor_indexed,
     _append_tensor_max,
+    _bind_callback_dt,
 )
 from dendra.models.graph import get_area_from_graph
 from dendra.models.initialization import (
@@ -3869,7 +3870,7 @@ class Population(P, Sliceable):
             callbacks = CallbackList(callbacks)
         if callbacks:
             for c in callbacks:
-                c.dt = dt_f
+                _bind_callback_dt(c, dt_f)
 
         ctx = nullcontext() if self.training else torch.no_grad()
         with ctx:
@@ -4092,7 +4093,7 @@ class Population(P, Sliceable):
 
             if callbacks:
                 for c in callbacks:
-                    c.dt = dt_f
+                    _bind_callback_dt(c, dt_f)
 
             pre_loop_hook(callbacks, self)
             self.integrator._initialize(
@@ -4365,7 +4366,7 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 if callbacks:
                     for c in callbacks:
-                        c.dt = dt_f
+                        _bind_callback_dt(c, dt_f)
 
                 callbacks = CallbackList(callbacks)
 
@@ -7270,7 +7271,7 @@ class Population(P, Sliceable):
 
         if callbacks:
             for c in callbacks:
-                c.dt = dt_f
+                _bind_callback_dt(c, dt_f)
 
         def _as_loss_tensor(x):
             if x is None:

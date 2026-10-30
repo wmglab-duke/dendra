@@ -14,6 +14,7 @@ from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ..helpers import nojit
 from ._recorder_cadence import _recorder_should_save, _recorder_stride
+from ._threshold_callbacks import _COUNT_DTYPE, _anomaly_flags, _restore_count
 from ._threshold_callbacks import accumulate_count as _accumulate_count
 from ._threshold_callbacks import activity_from_counts as _activity_from_counts
 from ._threshold_callbacks import threshold_crossing as _threshold_crossing
@@ -359,9 +360,7 @@ def _atleast_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 def _detect_anomalies(x: torch.Tensor, prev) -> torch.Tensor:
-    anomalous = (torch.isnan(x) | torch.isinf(x)).squeeze().any(-1)
-    anomalous = torch.logical_or(anomalous, prev)
-    return anomalous
+    return _anomaly_flags(prev, x)
 
 
 class AnomalyDetector(Callback):
@@ -379,7 +378,7 @@ class AnomalyDetector(Callback):
 
     def pre_loop_hook(self, model):
         """Allocate a boolean flag per axon on the model's device."""
-        self.rec = torch.zeros(model.n_ax, dtype=torch.bool, device=model.device())
+        self.rec = torch.zeros_like(model.v[..., 0], dtype=torch.bool)
 
     def post_step_hook(self, model):
         """Update the anomaly mask after each step using :func:`_detect_anomalies`."""
@@ -1202,6 +1201,68 @@ class ThresholdCallback(Callback):
 
     """
 
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name == "node_check" and not self.__dict__.get("_binding_node_check", False):
+            # These are source references, not additional registered tensors.
+            object.__setattr__(self, "_configured_node_check", value)
+            object.__setattr__(self, "_normalized_node_check", None)
+
+    def _publish_node_check(self, value):
+        # Keep authored subclass setters authoritative during native binding.
+        previous = self.__dict__.get("_binding_node_check", False)
+        object.__setattr__(self, "_binding_node_check", True)
+        try:
+            self.node_check = value
+        finally:
+            object.__setattr__(self, "_binding_node_check", previous)
+
+    def _node_check_configuration(self):
+        current = self.node_check
+        published = self.__dict__.get("_normalized_node_check")
+        if published is None or published is not current:
+            return current
+        version = self._normalized_node_check_version
+        unchanged = (
+            version is not None and current._version == version
+        ) or torch.equal(current, self._normalized_node_check_snapshot)
+        return self._configured_node_check if unchanged else current
+
+    def _capture_normalized_node_check(self, source):
+        current = self.node_check
+        version = None
+        if type(current) in (torch.Tensor, torch.nn.Parameter):
+            try:
+                version = current._version
+            except RuntimeError:
+                pass  # Inference tensors have no mutation version.
+        # A content baseline also survives deepcopy/device publication that
+        # can recreate mutation versions without changing selector values.
+        snapshot = current.detach().clone()
+        object.__setattr__(self, "_configured_node_check", source)
+        object.__setattr__(self, "_normalized_node_check", current)
+        object.__setattr__(self, "_normalized_node_check_version", version)
+        object.__setattr__(self, "_normalized_node_check_snapshot", snapshot)
+
+    def _functional_threshold_configuration(self):
+        """Project authored settings independently of native execution history."""
+        return {
+            "threshold": self.threshold,
+            "t_start_check": self.t_start_check,
+            # Native omission means this existing finite sentinel, not the
+            # pure callback's unbounded end-window spelling.
+            "t_end_check": self.t_end_check,
+            "node_check": self._node_check_configuration(),
+            "dt": self.__dict__.get("_configured_dt", self._dt),
+        }
+
+    def _bind_runtime_dt(self, value):
+        configured = self.__dict__.get("_configured_dt", self._dt)
+        try:
+            self.dt = value
+        finally:
+            object.__setattr__(self, "_configured_dt", configured)
+
     def __init__(
         self,
         threshold=0.0,
@@ -1220,6 +1281,7 @@ class ThresholdCallback(Callback):
 
         self.i: int = 0
         self._dt: float = dt if dt is not None else A.dt
+        object.__setattr__(self, "_configured_dt", dt)
         self.ind_start = int(self.t_start_check / self._dt)
         self.ind_end = int(self.t_end_check / self._dt)
 
@@ -1230,9 +1292,12 @@ class ThresholdCallback(Callback):
         Negative indices use normal Python indexing semantics. Indices outside
         ``[-model.nc, model.nc - 1]`` are rejected rather than silently wrapped.
         """
-        self.node_check = torch.as_tensor(
-            self.node_check, dtype=torch.long, device=model.device()
-        ).reshape(-1)
+        configured = self._node_check_configuration()
+        self._publish_node_check(
+            torch.as_tensor(
+                self.node_check, dtype=torch.long, device=model.device()
+            ).reshape(-1)
+        )
 
         nc = int(model.nc)
         invalid = (self.node_check < -nc) | (self.node_check >= nc)
@@ -1242,9 +1307,10 @@ class ThresholdCallback(Callback):
                 "node_check entries must be valid compartment indices in "
                 f"[-{nc}, {nc - 1}]; got {invalid_values}."
             )
-        self.node_check = torch.where(
-            self.node_check < 0, self.node_check + nc, self.node_check
+        self._publish_node_check(
+            torch.where(self.node_check < 0, self.node_check + nc, self.node_check)
         )
+        self._capture_normalized_node_check(configured)
 
     @property
     def dt(self):
@@ -1253,6 +1319,7 @@ class ThresholdCallback(Callback):
 
     @dt.setter
     def dt(self, value):
+        object.__setattr__(self, "_configured_dt", value)
         self._dt = value
         self.ind_start = int(self.t_start_check / self._dt)
         self.ind_end = int(self.t_end_check / self._dt)
@@ -1300,6 +1367,14 @@ class ThresholdCallback(Callback):
         return self.record
 
 
+def _bind_callback_dt(callback, value):
+    """Bind native solver timing without replacing threshold configuration."""
+    if isinstance(callback, ThresholdCallback):
+        callback._bind_runtime_dt(value)
+    else:
+        callback.dt = value
+
+
 class APCount(ThresholdCallback):
     """
     Callback for counting action potentials during axon model simulation.
@@ -1335,7 +1410,7 @@ class APCount(ThresholdCallback):
     Attributes
     ----------
     record : torch.Tensor
-        Tensor of shape ``(*batch, N, n_check_nodes)`` storing AP counts.
+        Int32 tensor of shape ``(*batch, N, n_check_nodes)`` storing AP counts.
     state_cache : torch.Tensor
         Boolean tensor tracking membrane potential state relative to threshold.
     """
@@ -1344,7 +1419,7 @@ class APCount(ThresholdCallback):
         """
         Allocate per-axon spike counters and state cache.
 
-        ``record`` is created as a ``(*batch, N, n_nodes_checked)`` float
+        ``record`` is created as a ``(*batch, N, n_nodes_checked)`` int32
         tensor and ``state_cache`` starts as ``True`` so the first upward
         crossing is counted. Negative indices in ``node_check`` have already
         been resolved by :meth:`ThresholdCallback.pre_loop_hook`.
@@ -1354,9 +1429,11 @@ class APCount(ThresholdCallback):
         if self.record is None:
             self.record = torch.zeros(
                 _threshold_record_shape(model, self.node_check),
-                dtype=torch.float,
+                dtype=_COUNT_DTYPE,
                 device=model.device(),
             )
+        else:
+            self.record = _restore_count(self.record, label="APCount record")
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 _threshold_record_shape(model, self.node_check),
@@ -1383,15 +1460,8 @@ class APCount(ThresholdCallback):
 
     @property
     def n(self):
-        """
-        Return the number of axons being monitored.
-
-        Returns
-        -------
-        int
-            Number of axons in the model.
-        """
-        return self.record.int()
+        """Return an owned int32 Tensor of per-node spike counts."""
+        return self.record.to(dtype=_COUNT_DTYPE, copy=True)
 
 
 class ActiveAL(APCount):
@@ -1614,7 +1684,7 @@ class Active(ActiveAL):
     Attributes
     ----------
     record : torch.Tensor
-        Float32 per-slot spike counters of shape ``(*batch, N, K)``, inherited
+        Int32 per-slot spike counters of shape ``(*batch, N, K)``, inherited
         from APCount. ``is_active()`` returns the Boolean activity mask shaped
         ``(*batch, N)``.
     state_cache : torch.Tensor
@@ -1823,6 +1893,14 @@ class Raster(ThresholdCallback):
         self.i += 1
 
     def stack(self):
+        if (
+            isinstance(self.record, list)
+            and not self.record
+            and self.state_cache is not None
+        ):
+            return self.state_cache.new_empty(
+                (0, *self.state_cache.shape), dtype=torch.bool
+            )
         return torch.stack(self.record)
 
     def numpy(self):

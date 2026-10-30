@@ -456,6 +456,79 @@ def _packet():
 
 
 @pytest.mark.parametrize(
+    "dtype,value", ((torch.int64, 2**31 - 1), (torch.float32, float(2**24)))
+)
+def test_legacy_count_restoration_accepts_exact_representable_boundaries(dtype, value):
+    callbacks, packet = _packet()
+    below, count, step = packet["carries"]["count"]
+    packet["carries"]["count"] = (
+        below,
+        torch.full_like(count, value, dtype=dtype),
+        step,
+    )
+    frozen = _clone(packet)
+    restored = callbacks.restore_state(packet)
+    actual = restored.carries["count"]
+    assert actual[1].dtype == torch.int32
+    torch.testing.assert_close(actual[1], torch.full_like(count, value))
+    torch.testing.assert_close((actual[0], actual[2]), (below, step))
+    assert actual[1].data_ptr() != packet["carries"]["count"][1].data_ptr()
+    _assert_packet_equal(packet, frozen)
+
+
+@pytest.mark.parametrize(
+    "dtype,value",
+    (
+        (torch.int64, -1),
+        (torch.int64, 2**31),
+        (torch.float32, -1.0),
+        (torch.float32, 0.5),
+        (torch.float32, float("nan")),
+        (torch.float32, float("inf")),
+        (torch.float32, float(2**31)),
+    ),
+)
+def test_legacy_count_restoration_rejects_unsafe_values_without_mutating_input(
+    dtype, value
+):
+    callbacks, packet = _packet()
+    valid = _clone(packet)
+    below, count, step = packet["carries"]["count"]
+    packet["carries"]["count"] = (
+        below,
+        torch.full_like(count, value, dtype=dtype),
+        step,
+    )
+    frozen = _clone(packet)
+    with pytest.raises(ValueError, match="count.*integral|count.*int32"):
+        callbacks.restore_state(packet)
+    _assert_packet_equal(packet, frozen)
+    restored = callbacks.restore_state(valid)
+    torch.testing.assert_close(dict(restored.carries), valid["carries"])
+
+
+@pytest.mark.parametrize("leaf,dtype", ((0, torch.int64), (2, torch.int32)))
+def test_legacy_count_restoration_keeps_latch_and_phase_dtype_validation(leaf, dtype):
+    callbacks, packet = _packet()
+    carry = list(packet["carries"]["count"])
+    carry[1] = carry[1].to(torch.int64)
+    carry[leaf] = carry[leaf].to(dtype)
+    packet["carries"]["count"] = tuple(carry)
+    frozen = _clone(packet)
+    with pytest.raises(dn.func.FunctionalizationError, match="must use"):
+        callbacks.restore_state(packet)
+    _assert_packet_equal(packet, frozen)
+
+
+def test_count_restoration_rejects_unrecognized_legacy_dtype():
+    callbacks, packet = _packet()
+    below, count, step = packet["carries"]["count"]
+    packet["carries"]["count"] = (below, count.to(torch.float64), step)
+    with pytest.raises(dn.func.FunctionalizationError, match="must use"):
+        callbacks.restore_state(packet)
+
+
+@pytest.mark.parametrize(
     "kind",
     ("type", "format", "missing", "extra", "version", "boolean_version", "schemas"),
 )

@@ -208,15 +208,17 @@ def test_scan_checkpoint_callbacks_preserve_discrete_state_and_gradients():
     assert result.state["mse"]["frames"].dtype == torch.int64
     assert result.state["mse"]["frames"].item() == steps + 1
     assert result["raster"].dtype == torch.bool
-    assert result["raster"].shape[0] == steps
-    assert result["count"].dtype == torch.int64
+    assert result["raster"].shape[0] == steps - 2
+    assert result["count"].dtype == torch.int32
     assert bool((result["count"] >= 2).all())
-    torch.testing.assert_close(result["count"], result["raster"].sum(0))
+    torch.testing.assert_close(
+        result["count"], result["raster"].sum(0, dtype=torch.int32)
+    )
     assert result.state["count"][2].item() == steps
     assert result["anomaly"].dtype == torch.bool
     assert not result["anomaly"].any()
     for value in torch.utils._pytree.tree_leaves(result):
-        if value.dtype in (torch.bool, torch.int64):
+        if value.dtype in (torch.bool, torch.int32, torch.int64):
             assert not value.requires_grad
 
 

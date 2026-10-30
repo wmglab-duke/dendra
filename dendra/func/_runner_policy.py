@@ -77,7 +77,7 @@ def _configured_callbacks(callbacks):
             raise ValueError("functional callback names must be non-empty strings")
         if not _is_callback_configuration(callback):
             raise TypeError(
-                "callback values must be FunctionalCallback configurations or built-in dn.Recorder configurations"
+                "callback values must be FunctionalCallback configurations or supported built-in Dendra callback configurations"
             )
     return configured
 

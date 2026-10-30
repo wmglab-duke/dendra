@@ -17,9 +17,9 @@ Population name in the Network passed to `dn.compile` or
 ```python
 callbacks = {
     "counts": dn.func.PopulationCallback(
-        "left", dn.func.APCount(threshold=-20.0, node_check=[0, -1])
+        "left", dn.callbacks.APCount(threshold=-20.0, node_check=[0, -1])
     ),
-    "anomaly": dn.func.PopulationCallback("right", dn.func.AnomalyDetector()),
+    "anomaly": dn.func.PopulationCallback("right", dn.callbacks.AnomalyDetector()),
 }
 ```
 
@@ -83,6 +83,17 @@ values and recording phase
 belong to explicit carry. Prepared Network Recorder paths and regions keep
 their resolved meaning when used by the collection.
 
+`dn.callbacks.APCount`, `Raster` and `AnomalyDetector` configurations can also
+be supplied to functional binding and `dn.compile`; their `dn.func` counterparts
+remain supported. Wrap them in `PopulationCallback` for a Network. APCount and
+Raster use authored selectors and timing settings, rather than importing native
+counts, crossing latches, normalized indices or run counters. Negative selectors
+resolve against the selected Population. An omitted `dt` uses its functional
+timestep; an explicit value must match. Bind a new collection after editing
+configuration. Native execution retains ownership of its callback histories.
+Use the `dn.func` constructors for LFP and Active-family callbacks; their native
+configurations are currently unsupported in functional binding.
+
 Record mechanism state with qualified names such as `"left.hh.m"`, or relative
 names such as `"hh.m"` inside a Population-scoped Recorder. The result keeps the
 supplied name and the mechanism's local tensor shape. Physical `region=`
@@ -130,6 +141,32 @@ autograd graph. Each fresh callback initialization constructs its own
 differentiable field stack, so a later fresh run supports an independent
 backward pass. Continuation retains the initialized stack in explicit carry.
 
+(functional-shared-threshold-configuration)=
+## Share spike-analysis configuration
+
+`dn.callbacks.APCount`, `Raster` and `AnomalyDetector` configurations can be
+used by native runs and functional simulations. The complete
+{download}`functional_threshold_configuration.py <../../examples/functional_threshold_configuration.py>`
+example covers a Population and a Network, scan gradients, while inference,
+configuration ownership and portable continuation:
+
+```bash
+python examples/functional_threshold_configuration.py
+python examples/functional_threshold_configuration.py --backend aot_eager
+python examples/functional_threshold_configuration.py --section network --execution while
+```
+
+Its configuration selects the first and last compartments and an explicit
+finite observation window. Network callbacks use the same local configuration
+inside `PopulationCallback`:
+
+```{literalinclude} ../../examples/functional_threshold_configuration.py
+:language: python
+:start-after: "# region configuration"
+:end-before: "# endregion configuration"
+:dedent: 4
+```
+
 ## Threshold windows and result memory
 
 Threshold preparation resolves compartment indices, timestep and window bounds.
@@ -144,10 +181,12 @@ rearms that site. This is a hard observation rule and does not supply gradients
 of threshold decisions.
 
 The first post-step sample has callback index zero. A window checks
-`int(t_start_check / dt) <= index < int(t_end_check / dt)`; omitting
-`t_end_check` leaves it open. These bounds follow the callback's phase rather
-than the Network's absolute clock. Starting a new collection at a nonzero
-simulation time starts callback index zero at its next step. Continuing with
+`int(t_start_check / dt) <= index < int(t_end_check / dt)`. Native APCount and
+Raster configurations use their `1e9` ms default end when it is omitted;
+`dn.func` constructors leave an omitted end open. An explicit finite end gives
+the same window with either constructor. These bounds follow the callback's
+phase rather than the Network's absolute clock. Starting a new collection at a
+nonzero simulation time starts callback index zero at its next step. Continuing with
 callback state preserves that index, the crossing latches, and accumulated
 results.
 
@@ -155,12 +194,12 @@ For `K` checked slots in a selected Population with shape `(*batch, N, C)`:
 
 | Callback | Result | Storage as the horizon grows |
 | --- | --- | --- |
-| `APCount` | `(*batch, N, K)` integer counts | Constant callback carry |
+| `APCount` | `(*batch, N, K)` cumulative `torch.int32` counts | Constant callback carry |
 | `Active` | `(*batch, N)` Boolean: any checked site fired | Constant callback carry |
 | `ActiveAL(at_least=k)` | `(*batch, N)` Boolean: at least `k` selected slots fired | Constant callback carry |
 | `ActiveALCount(at_least=k)` | `(*batch, N)` Boolean: at least `k` total events | Constant callback carry |
 | `AnomalyDetector` | `(*batch, N)` Boolean: any nonfinite post-step voltage | Constant callback carry |
-| `Raster` | `(steps, *batch, N, K)` Boolean events | One frame per post-step sample |
+| `Raster` | `(samples, *batch, N, K)` Boolean events | One frame per checked post-step sample |
 | `LFP` | `(steps + 1, *batch, contacts)` on a fresh run | One frame per recorded boundary |
 | `Recorder` | Selected state trajectory | One frame per recorded boundary |
 
@@ -171,13 +210,24 @@ indices retain their multiplicity. These settings follow the full
 {doc}`A8_functional_populations` callback contract.
 
 Native and functional threshold analyses share their numerical crossing,
-counting and activity reductions. Each execution API retains its observation
-window, counter and recording policies; the functional shapes and timing are
-specified here.
+counting and activity reductions. Functional execution keeps crossing latches
+and phase in explicit carry; native execution owns its mutable history.
+Configuration binding captures only the supplied static settings. Both APCount
+entry points use exact signed 32-bit integer counts, with four bytes per checked
+slot. Threshold decisions and count updates are nondifferentiable.
 
-`Raster` retains every accepted timestep, with `False` outside its checked
-window. Reducers and anomaly detection emit no trajectory, so their callback
-memory does not grow with the step count. This describes callback storage;
+Both native and functional `Raster` return only checked post-step samples.
+`False` denotes a checked sample without a crossing. Calls outside the window
+return a zero-length sample axis, and the initial model frame contributes no
+Raster row. Crossing counts and Boolean events are hard observations without
+gradients of their threshold decisions.
+
+The scan and while bodies emit fixed-size tensors. Host collection selects
+Raster's checked window before retaining its history. Capturing atomic
+finalization itself with `torch.compile` requires dynamic output shape support;
+host `dn.func.run` keeps that selection outside compiled numerical kernels.
+Reducers and anomaly detection emit no trajectory, so their callback memory
+does not grow with the step count. This describes callback storage;
 training may retain transition activations independently. Checkpointing reduces
 saved activations, rather than the returned recording arrays.
 
@@ -208,11 +258,15 @@ Continue with both returned simulation state and callback state:
 
 Fresh LFP and Recorder results include the initial boundary. A continued call
 emits only its new boundaries, so concatenating those results does not duplicate
-the shared frame. Raster emits post-step samples only. Reducer results returned
+the shared frame. Raster emits checked post-step samples only. Reducer results returned
 after continuation are cumulative; use the suffix result rather than adding
 the prefix and suffix counts. `runner()` without state starts a fresh simulation
 and callback history. Passing simulation state without callback state starts a
 fresh callback history at that boundary.
+
+The example's Raster window covers callback indices 2 through 5. Its returned
+four rows correspond to those checked samples; samples before or after that
+window are absent. The first checked row contains the armed crossing.
 
 The example verifies the output shapes and reduction relationships:
 

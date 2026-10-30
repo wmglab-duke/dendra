@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from functools import wraps
 
-from ._callbacks import FunctionalCallbacks, _CallbackCollector
+from ._callbacks import FunctionalCallbacks, _BoundCadencedRecorder, _CallbackCollector
 from ._types import FunctionalizationError
 
 
@@ -64,11 +64,15 @@ def _recording_span(callbacks, span):
 
 
 class _RecordingCollector(_CallbackCollector):
-    def __init__(self, callbacks, callback_state, cadences, sessions):
-        super().__init__(callbacks, cadences)
+    def __init__(self, callbacks, callback_state, selections, sessions):
+        super().__init__(callbacks, selections)
         self._sessions = sessions
         self.storage_names = frozenset(sessions)
-        self._strides = {name: recorder.save_every for name, recorder in cadences}
+        self._strides = {
+            name: recorder.save_every
+            for name, recorder in selections
+            if type(recorder) is _BoundCadencedRecorder
+        }
         self._phases = {
             name: int(callback_state[name].item()) if name in self._strides else 0
             for name in sessions
@@ -114,8 +118,8 @@ class _RecordingCollector(_CallbackCollector):
             self.parts.append(emitted)
 
 
-def _recording_collector(callbacks, callback_state, cadences, parts, sessions):
-    collector = _RecordingCollector(callbacks, callback_state, cadences, sessions)
+def _recording_collector(callbacks, callback_state, selections, parts, sessions):
+    collector = _RecordingCollector(callbacks, callback_state, selections, sessions)
     for part in parts:
         collector.append(callback_state, part, steps=0)
     return collector

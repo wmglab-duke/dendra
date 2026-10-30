@@ -170,6 +170,8 @@ def verify_continuation(first, resumed, expected):
         (first["callbacks"]["raster"], resumed_auxiliary["callbacks"]["raster"])
     )
     torch.testing.assert_close(raster, expected_auxiliary["callbacks"]["raster"])
+    # This window checks callback indices 0 through 2 * STEPS - 1.
+    assert raster.shape[0] == 2 * STEPS
     for name in ("counts", "anomalies"):
         torch.testing.assert_close(
             resumed_auxiliary["callbacks"][name], expected_auxiliary["callbacks"][name]

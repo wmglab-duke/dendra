@@ -24,7 +24,7 @@ from dendra.helpers import (
     jit_enabled_for_scope,
 )
 
-from ..callbacks import CallbackList
+from ..callbacks import CallbackList, _bind_callback_dt
 from ..core import (
     Population,
     _duration_step_budget,
@@ -3650,7 +3650,7 @@ class Network(RNGMixin):
         if not isinstance(callbacks, CallbackList):
             callbacks = CallbackList(callbacks)
         for c in callbacks:
-            c.dt = self.dt
+            _bind_callback_dt(c, self.dt)
 
         with ctx:
             if with_intra:
@@ -3785,7 +3785,7 @@ class Network(RNGMixin):
             if callbacks is None:
                 callbacks = []
             for c in callbacks:
-                c.dt = self.dt
+                _bind_callback_dt(c, self.dt)
             callbacks = CallbackList(callbacks)
             pre_loop_hook(callbacks, self)
 
@@ -3919,7 +3919,7 @@ class Network(RNGMixin):
         if not isinstance(callbacks, CallbackList):
             callbacks = CallbackList(callbacks)
         for callback in callbacks:
-            callback.dt = self.dt
+            _bind_callback_dt(callback, self.dt)
 
         n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         initial_time = self.t.double().detach().clone()
@@ -5178,7 +5178,7 @@ class Network(RNGMixin):
         if not isinstance(callbacks, CallbackList):
             callbacks = CallbackList(callbacks)
         for c in callbacks:
-            c.dt = self.dt
+            _bind_callback_dt(c, self.dt)
 
         # Use the same retained-duration budget as run()/longrun(). Exact
         # decimal-form arithmetic keeps common decimal multiples composable

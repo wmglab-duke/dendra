@@ -82,7 +82,7 @@ def _voltage_sequence(shape):
 def _manual(voltage, indices, start=1, end=6):
     selected = voltage.index_select(-1, indices)
     below = torch.ones_like(selected[0], dtype=torch.bool)
-    counts = torch.zeros_like(selected[0], dtype=torch.int64)
+    counts = torch.zeros_like(selected[0], dtype=torch.int32)
     events = []
     for step, frame in enumerate(selected):
         event = torch.zeros_like(below)
@@ -127,10 +127,10 @@ def test_prepared_public_families_match_native_nan_equality_windows_and_duplicat
     assert carry[-1].item() == 7
     if kind == "Raster":
         assert len(carry) == 2 and result.dtype == torch.bool
-        torch.testing.assert_close(result, raster)
-        assert not result[0].any() and not result[-1].any()
+        torch.testing.assert_close(result, raster[1:6])
+        assert result.shape[0] == 5
     else:
-        assert len(carry) == 3 and carry[1].dtype == torch.int64
+        assert len(carry) == 3 and carry[1].dtype == torch.int32
         torch.testing.assert_close(carry[1], counts)
         assert not result.requires_grad
     native = native_type(**_configuration(), **options)
@@ -144,13 +144,11 @@ def test_prepared_public_families_match_native_nan_equality_windows_and_duplicat
     torch.testing.assert_close(native.state_cache, below)
     if kind == "Raster":
         assert len(native.record) == 5
-        torch.testing.assert_close(native.stack(), result[1:6])
+        torch.testing.assert_close(native.stack(), result)
     else:
-        assert native.record.dtype == torch.float32
-        torch.testing.assert_close(native.record.to(torch.int64), counts)
-        expected = (
-            native.is_active(partition) if activity else native.record.to(torch.int64)
-        )
+        assert native.record.dtype == torch.int32
+        torch.testing.assert_close(native.record, counts)
+        expected = native.is_active(partition) if activity else native.record
         torch.testing.assert_close(result, expected)
 
 
