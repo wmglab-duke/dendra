@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Literal
 
 import torch
 
 from ._network_parameters import named_parameters
+from ._parameter_queries import ParameterQuery, select_names
 from ._types import FunctionalizationError
 
 
@@ -44,6 +46,8 @@ class SourceReport:
     identity once, at its first path, when both captured flags are true. This
     tuple can be supplied explicitly to a PyTorch optimizer. Flagged nonleaf
     values remain visible in ``entries`` but are omitted from this leaf view.
+    ``select(...)`` returns a filtered report while retaining full identity
+    alias groups and the captured optimizer-leaf membership.
 
     Reinspect after replacing bindings or changing flags. A report does not
     prove that a Tensor influences an output or recover external upstream
@@ -63,6 +67,52 @@ class SourceReport:
         return _format_report(self)
 
     __str__ = __repr__
+
+    def select(
+        self, queries: ParameterQuery | Iterable[ParameterQuery]
+    ) -> SourceReport:
+        """Return a source view selected by full-path parameter-query syntax.
+
+        Accept an exact path, unique partial name, glob, ``glob:`` expression,
+        ``re:`` expression, compiled string regex or iterable of selectors.
+        Each selector must match; ambiguous partial names raise. An empty
+        iterable returns an empty report. Matching uses the current report's
+        ``parameters.``/``constants.`` paths, in their original order.
+
+        Selecting any path retains every entry for that Tensor identity,
+        including aliases in the other domain. Entries and captured flags are
+        reused. The returned ``trainable_leaves`` filters this report's captured
+        leaf view, once per identity and in its original order. Selection never
+        reads current Tensor flags, clones sources or traverses their graphs.
+        Reinspect after changing source bindings or gradient flags.
+
+        These leaf tuples can define optimizer groups or separate optimizers.
+        Deduplication applies within each selection; overlapping selections can
+        contain the same Tensor. Parameter groups in one PyTorch optimizer must
+        be disjoint by Tensor identity. Selection is a host inspection operation
+        outside ``torch.compile`` and does not alter trainability.
+        """
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError(
+                "SourceReport.select is a host inspection API; "
+                "call it outside torch.compile"
+            )
+        entries, leaves = self.entries, self.trainable_leaves
+        paths = set(
+            select_names((entry.path for entry in entries), queries, label="source")
+        )
+        identities = {id(entry.tensor) for entry in entries if entry.path in paths}
+        selected_entries = tuple(
+            entry for entry in entries if id(entry.tensor) in identities
+        )
+        selected_leaves = []
+        seen = set()
+        for tensor in leaves:
+            identity = id(tensor)
+            if identity in identities and identity not in seen:
+                selected_leaves.append(tensor)
+                seen.add(identity)
+        return SourceReport(selected_entries, tuple(selected_leaves))
 
 
 def _count(value, singular, plural=None):

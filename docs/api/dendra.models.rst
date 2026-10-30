@@ -88,6 +88,13 @@ the execution projection. Authored maps remain unchanged. Prepared Population
 bindings do not own raw constants and are currently unsupported. Ordered
 entries expose live Tensor references, aliases and captured gradient/leaf flags.
 ``report.trainable_leaves`` contains each qualifying leaf once by identity.
+``report.select(queries)`` filters full report paths with exact/unique partial,
+glob and regex selectors, retaining complete identity-alias groups, captured
+flags and source order. It returns another report with deduplicated optimizer
+leaves and performs no Tensor cloning or trainability changes. Use disjoint
+selections for independent optimizer groups; separate selections can contain
+the same shared Tensor. See :ref:`functional-source-selection` for selector
+semantics, multiple optimizers and a runnable example.
 State and callback carry are outside this inventory. Inspection neither executes
 the model nor proves that a source affects a particular output. See
 :ref:`functional-source-inspection` for metadata ownership and runnable examples.
@@ -95,7 +102,7 @@ the model nor proves that a source affects a particular output. See
 .. autofunction:: dendra.func.inspect_sources
 
 .. autoclass:: dendra.func.SourceReport
-   :members: entries, trainable_leaves
+   :members: entries, trainable_leaves, select
 
 .. autoclass:: dendra.func.SourceEntry
    :members: path, domain, tensor, aliases, requires_grad, is_leaf

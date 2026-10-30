@@ -375,6 +375,74 @@ binding sources:
 :dedent: 4
 ```
 
+(functional-source-selection)=
+### Select sources for optimizer groups
+
+`report.select(queries)` returns another `SourceReport` over the captured
+inventory. Queries use full report paths, including their `parameters.` or
+`constants.` prefix. They accept exact names, unique partial names, glob
+patterns (including `"glob:..."`), `"re:..."` expressions and compiled string
+regular expressions. An iterable takes the union of its queries. A query that
+matches nothing, or a plain partial name that matches several paths, raises
+`KeyError`; `report.select([])` returns an empty report.
+
+Selecting any name includes every path in the report that refers to the same
+Tensor object, even across parameter and constant domains. Entries, aliases
+and trainable leaves retain their original order, independent of query order.
+Chaining `select` searches the current view and cannot recover groups excluded
+by an earlier selection. Values and Tensor identities remain live; selection
+retains the inspection's captured gradient/leaf flags and performs no cloning,
+flag changes or graph traversal. Inspect again after changing bindings or flags.
+Use inspection and selection on the host, outside `torch.compile`.
+
+Different selections can supply different optimizers or parameter groups. For
+a model with trainable `leak` and `other` mechanisms, as in the runnable example:
+
+```python
+report = dn.func.inspect_sources(program)
+leak = report.select("parameters.*.leak.g_param")
+other = report.select("parameters.*.other.g_param")
+print(leak)
+
+optimizer = torch.optim.Adam([
+    {"params": leak.trainable_leaves, "lr": 1e-4},
+    {"params": other.trainable_leaves, "lr": 1e-5},
+])
+```
+
+Use `dn.func.inspect_sources(auxiliary["continuation"])` when selecting the
+effective parameter/constant sources from a particular call, including its
+replacements. Selection filters the existing trainable-leaf view: matching a
+Tensor with `requires_grad=False` does not make it trainable, and captured
+nonleaf sources remain excluded from optimizer leaves. State, callback carry
+and call-local inputs, draws and `extra` retain their separate ownership.
+
+Each selection deduplicates its own trainable leaves by identity. Different
+selections can overlap because several names refer to a shared Tensor. Check
+identity sets when independent groups are intended:
+
+```python
+assert {id(p) for p in leak.trainable_leaves}.isdisjoint(
+    id(p) for p in other.trainable_leaves
+)
+
+leak_optimizer = torch.optim.Adam(leak.trainable_leaves, lr=1e-4)
+other_optimizer = torch.optim.SGD(other.trainable_leaves, lr=1e-5)
+```
+
+PyTorch requires parameter groups within one optimizer to be identity-disjoint.
+Separate optimizers can reference the same Tensor; stepping both applies both
+optimizers' updates to that shared source. Selecting an alias does not create
+an independent parameter. The complete
+{download}`functional_source_selection.py <../../examples/functional_source_selection.py>`
+example checks Population and Network groups, shared aliases, effective-frame
+selection, gradients and updates with both optimizer arrangements:
+
+```console
+python examples/functional_source_selection.py
+python examples/functional_source_selection.py --backend aot_eager
+```
+
 ## Deterministic drives and runtime draws are separate inputs
 
 Use one deterministic packet for a Population:
