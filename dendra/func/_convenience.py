@@ -509,260 +509,277 @@ class CompiledRunner:
         extra=_MISSING_RUNTIME_EXTRA,
         draws=None,
     ):
-        _validate_host_call()
-        selected_steps, selected_duration = _runner_call_horizon(
-            self._steps, self._duration, steps, duration
+        return _execute_population_runner(
+            self,
+            state,
+            steps=steps,
+            duration=duration,
+            parameters=parameters,
+            constants=constants,
+            inputs=inputs,
+            callback_state=callback_state,
+            initialization=initialization,
+            extra=extra,
+            draws=draws,
         )
-        if draws is not None:
-            inputs = _with_runtime_draws(inputs, draws)
-        if self._runtime_extra:
-            if extra is _MISSING_RUNTIME_EXTRA:
-                raise TypeError("extra must be supplied for extra=VarInput()")
-        elif extra is not _MISSING_RUNTIME_EXTRA:
-            raise TypeError("runtime extra requires compile(..., extra=VarInput())")
-        state, parameters, constants, callback_state = _resolve_continuation(
-            state, parameters, constants, callback_state, initialization
+
+
+def _execute_population_runner(
+    self,
+    state=None,
+    *,
+    steps=None,
+    duration=None,
+    parameters=None,
+    constants=None,
+    inputs=None,
+    callback_state=None,
+    initialization=None,
+    extra=_MISSING_RUNTIME_EXTRA,
+    draws=None,
+):
+    _validate_host_call()
+    selected_steps, selected_duration = _runner_call_horizon(
+        self._steps, self._duration, steps, duration
+    )
+    if draws is not None:
+        inputs = _with_runtime_draws(inputs, draws)
+    if self._runtime_extra:
+        if extra is _MISSING_RUNTIME_EXTRA:
+            raise TypeError("extra must be supplied for extra=VarInput()")
+    elif extra is not _MISSING_RUNTIME_EXTRA:
+        raise TypeError("runtime extra requires compile(..., extra=VarInput())")
+    state, parameters, constants, callback_state = _resolve_continuation(
+        state, parameters, constants, callback_state, initialization
+    )
+    fresh_policy = self._initialization == "fresh"
+    if initialization is not None:
+        if not fresh_policy:
+            raise ValueError("initialization overrides require initialization='fresh'")
+        if state is not None:
+            raise ValueError("initialization cannot be combined with explicit state")
+    fresh = fresh_policy and state is None
+    if fresh and callback_state is not None:
+        raise ValueError(
+            "fresh initialization cannot continue callback_state without state"
         )
-        fresh_policy = self._initialization == "fresh"
-        if initialization is not None:
-            if not fresh_policy:
-                raise ValueError(
-                    "initialization overrides require initialization='fresh'"
+    if (
+        fresh_policy
+        and state is not None
+        and parameters is None
+        and self._initialization_writes_parameters
+    ):
+        raise ValueError(
+            "initialization writes parameters; continue with "
+            "parameters=aux['parameters'] from the preceding call"
+        )
+    if (
+        fresh_policy
+        and state is not None
+        and constants is None
+        and self._initialization_writes_constants
+    ):
+        raise ValueError(
+            "cached initialization changes constants; continue with constants=aux['constants'] from the preceding call"
+        )
+    selected_state = self._initial_state if state is None else state
+    # An external Mapping can execute arbitrary Python while materializing
+    # its entries. Snapshot it before checking source structure, rather than
+    # letting iteration invalidate that check between owned boundaries.
+    selected_parameters, selected_constants, selected_initialization, _ = (
+        _runner_sources(self, parameters, constants, initialization, fresh=fresh)
+    )
+    if fresh:
+        # Physical preparation requires ordinary, versioned tensors even
+        # for inference. Respect the caller's grad context and never retain
+        # this initialization graph or its parameter replacements.
+        initialized = _initialize_fresh(
+            self._functional,
+            selected_parameters,
+            selected_constants,
+            selected_state,
+            selected_initialization,
+            gradient=torch.is_grad_enabled() and not self._inference,
+        )
+        selected_state = initialized.state
+        selected_parameters = initialized.parameters
+        selected_constants = initialized.constants
+    owned_boundaries = (
+        type(self._functional) is FunctionalPopulation
+        and type(self._kernel) is CompiledPopulationChunk
+        and getattr(self._functional.prepare, "__self__", None) is self._functional
+        and getattr(self._functional.prepare, "__func__", None) is _OWNED_PREPARE
+        and getattr(self._kernel.bind, "__self__", None) is self._kernel
+        and getattr(self._kernel.bind, "__func__", None) is _OWNED_BIND
+        and run is _OWNED_RUN
+        and (
+            self._execution != "while"
+            or all(
+                getattr(sampler, "__self__", None) is self._functional
+                and getattr(sampler, "__func__", None) is original
+                for sampler, original in (
+                    (
+                        self._functional.sample_noise_draw_tape,
+                        _OWNED_NOISE_TAPE,
+                    ),
+                    (
+                        self._functional.sample_stimulation_draw_tape,
+                        _OWNED_STIMULATION_TAPE,
+                    ),
+                    (
+                        self._functional._sample_missing_runtime_draws,
+                        _OWNED_MISSING_DRAWS,
+                    ),
+                    (
+                        self._functional.sample_runtime_draws,
+                        _OWNED_RUNTIME_DRAW_SAMPLER,
+                    ),
                 )
-            if state is not None:
-                raise ValueError(
-                    "initialization cannot be combined with explicit state"
-                )
-        fresh = fresh_policy and state is None
-        if fresh and callback_state is not None:
-            raise ValueError(
-                "fresh initialization cannot continue callback_state without state"
             )
-        if (
-            fresh_policy
-            and state is not None
+        )
+    )
+    context = torch.inference_mode() if self._inference else nullcontext()
+    with context:
+        if owned_boundaries:
+            self._functional._validate_source()
+        prepare = self._prepare_source_validated if owned_boundaries else self._prepare
+        prepared = prepare(
+            selected_parameters,
+            cache=self._inference
             and parameters is None
-            and self._initialization_writes_parameters
-        ):
-            raise ValueError(
-                "initialization writes parameters; continue with "
-                "parameters=aux['parameters'] from the preceding call"
-            )
-        if (
-            fresh_policy
-            and state is not None
             and constants is None
-            and self._initialization_writes_constants
-        ):
-            raise ValueError(
-                "cached initialization changes constants; continue with constants=aux['constants'] from the preceding call"
-            )
-        selected_state = self._initial_state if state is None else state
-        # An external Mapping can execute arbitrary Python while materializing
-        # its entries. Snapshot it before checking source structure, rather than
-        # letting iteration invalidate that check between owned boundaries.
-        selected_parameters, selected_constants, selected_initialization, _ = (
-            _runner_sources(self, parameters, constants, initialization, fresh=fresh)
+            and not fresh_policy,
+            constants=selected_constants,
         )
-        if fresh:
-            # Physical preparation requires ordinary, versioned tensors even
-            # for inference. Respect the caller's grad context and never retain
-            # this initialization graph or its parameter replacements.
-            initialized = _initialize_fresh(
+        bound = (
+            BoundPopulation._from_source_validated(
                 self._functional,
                 selected_parameters,
-                selected_constants,
-                selected_state,
-                selected_initialization,
-                gradient=torch.is_grad_enabled() and not self._inference,
+                prepared,
+                compiled_chunk=self._kernel,
             )
-            selected_state = initialized.state
-            selected_parameters = initialized.parameters
-            selected_constants = initialized.constants
-        owned_boundaries = (
-            type(self._functional) is FunctionalPopulation
-            and type(self._kernel) is CompiledPopulationChunk
-            and getattr(self._functional.prepare, "__self__", None) is self._functional
-            and getattr(self._functional.prepare, "__func__", None) is _OWNED_PREPARE
-            and getattr(self._kernel.bind, "__self__", None) is self._kernel
-            and getattr(self._kernel.bind, "__func__", None) is _OWNED_BIND
-            and run is _OWNED_RUN
-            and (
-                self._execution != "while"
-                or all(
-                    getattr(sampler, "__self__", None) is self._functional
-                    and getattr(sampler, "__func__", None) is original
-                    for sampler, original in (
-                        (
-                            self._functional.sample_noise_draw_tape,
-                            _OWNED_NOISE_TAPE,
-                        ),
-                        (
-                            self._functional.sample_stimulation_draw_tape,
-                            _OWNED_STIMULATION_TAPE,
-                        ),
-                        (
-                            self._functional._sample_missing_runtime_draws,
-                            _OWNED_MISSING_DRAWS,
-                        ),
-                        (
-                            self._functional.sample_runtime_draws,
-                            _OWNED_RUNTIME_DRAW_SAMPLER,
-                        ),
-                    )
-                )
-            )
+            if owned_boundaries
+            else self._kernel.bind(selected_parameters, prepared)
         )
-        context = torch.inference_mode() if self._inference else nullcontext()
-        with context:
-            if owned_boundaries:
-                self._functional._validate_source()
-            prepare = (
-                self._prepare_source_validated if owned_boundaries else self._prepare
+        if selected_duration is not None:
+            _validate_duration_remainder(selected_state)
+            selected_state, selected_steps = _stage_duration(
+                selected_state,
+                selected_duration,
+                _bound_runner_dt(self._functional, prepared.values),
+                name="duration",
             )
-            prepared = prepare(
-                selected_parameters,
-                cache=self._inference
-                and parameters is None
-                and constants is None
-                and not fresh_policy,
-                constants=selected_constants,
+        inputs = _population_inputs(inputs)
+        bounded_while = self._runtime_extra or self._chunk_steps < selected_steps
+        if self._runtime_extra and inputs.ve is not None:
+            raise ValueError("explicit ve cannot be combined with runtime extra")
+        if inputs.draws is not None:
+            self._functional._runtime_draw_plan.validate(
+                inputs.draws, steps=selected_steps
             )
-            bound = (
-                BoundPopulation._from_source_validated(
-                    self._functional,
-                    selected_parameters,
-                    prepared,
-                    compiled_chunk=self._kernel,
-                )
+        if (
+            self._execution == "while"
+            and not bounded_while
+            and _canonical_runtime_sampling_available(self._functional, inputs)
+        ):
+            inputs = _prepare_chunk_inputs(
+                self._functional,
+                selected_state,
+                inputs,
+                0,
+                selected_steps,
+                canonical=True,
+            )
+        if self._execution == "while" and not bounded_while and inputs.draws is None:
+            inputs = self._functional._sample_missing_runtime_draws(
+                selected_state, inputs, selected_steps
+            )
+        if (
+            self._execution == "while"
+            and not bounded_while
+            and getattr(inputs, "draws", None) is None
+            and inputs.noise is None
+        ):
+            sample_noise = (
+                self._functional._sample_noise_draw_tape_source_validated
                 if owned_boundaries
-                else self._kernel.bind(selected_parameters, prepared)
+                else self._functional.sample_noise_draw_tape
             )
-            if selected_duration is not None:
-                _validate_duration_remainder(selected_state)
-                selected_state, selected_steps = _stage_duration(
-                    selected_state,
-                    selected_duration,
-                    _bound_runner_dt(self._functional, prepared.values),
-                    name="duration",
-                )
-            inputs = _population_inputs(inputs)
-            bounded_while = self._runtime_extra or self._chunk_steps < selected_steps
-            if self._runtime_extra and inputs.ve is not None:
-                raise ValueError("explicit ve cannot be combined with runtime extra")
-            if inputs.draws is not None:
-                self._functional._runtime_draw_plan.validate(
-                    inputs.draws, steps=selected_steps
-                )
-            if (
-                self._execution == "while"
-                and not bounded_while
-                and _canonical_runtime_sampling_available(self._functional, inputs)
-            ):
-                inputs = _prepare_chunk_inputs(
+            inputs = inputs._replace(noise=sample_noise(selected_state, selected_steps))
+        if (
+            self._execution == "while"
+            and not bounded_while
+            and getattr(inputs, "draws", None) is None
+            and inputs.stimulation is None
+            and getattr(self._functional, "_poisson_plan", None) is not None
+        ):
+            sample_stimulation = (
+                self._functional._sample_stimulation_draw_tape_source_validated
+                if owned_boundaries
+                else self._functional.sample_stimulation_draw_tape
+            )
+            inputs = inputs._replace(
+                stimulation=sample_stimulation(selected_state, selected_steps)
+            )
+        if self._execution == "while":
+            if not bounded_while:
+                inputs = _normalize_sampled_inputs(
                     self._functional,
+                    inputs,
+                    selected_steps,
+                    qualify_draws=not owned_boundaries,
+                )
+            if not owned_boundaries:
+                # A replaced public sampler can run user code after its
+                # own check. Recheck before preflight captures a step.
+                self._functional._validate_source()
+            if selected_steps:
+                self._require_while(
+                    bound._parameters,
+                    prepared,
                     selected_state,
                     inputs,
-                    0,
+                    callback_state,
                     selected_steps,
-                    canonical=True,
                 )
-            if (
-                self._execution == "while"
-                and not bounded_while
-                and inputs.draws is None
-            ):
-                inputs = self._functional._sample_missing_runtime_draws(
-                    selected_state, inputs, selected_steps
-                )
-            if (
-                self._execution == "while"
-                and not bounded_while
-                and getattr(inputs, "draws", None) is None
-                and inputs.noise is None
-            ):
-                sample_noise = (
-                    self._functional._sample_noise_draw_tape_source_validated
-                    if owned_boundaries
-                    else self._functional.sample_noise_draw_tape
-                )
-                inputs = inputs._replace(
-                    noise=sample_noise(selected_state, selected_steps)
-                )
-            if (
-                self._execution == "while"
-                and not bounded_while
-                and getattr(inputs, "draws", None) is None
-                and inputs.stimulation is None
-                and getattr(self._functional, "_poisson_plan", None) is not None
-            ):
-                sample_stimulation = (
-                    self._functional._sample_stimulation_draw_tape_source_validated
-                    if owned_boundaries
-                    else self._functional.sample_stimulation_draw_tape
-                )
-                inputs = inputs._replace(
-                    stimulation=sample_stimulation(selected_state, selected_steps)
-                )
-            if self._execution == "while":
-                if not bounded_while:
-                    inputs = _normalize_sampled_inputs(
-                        self._functional,
-                        inputs,
-                        selected_steps,
-                        qualify_draws=not owned_boundaries,
-                    )
-                if not owned_boundaries:
-                    # A replaced public sampler can run user code after its
-                    # own check. Recheck before preflight captures a step.
-                    self._functional._validate_source()
-                if selected_steps:
-                    self._require_while(
-                        bound._parameters,
-                        prepared,
-                        selected_state,
-                        inputs,
-                        callback_state,
-                        selected_steps,
-                    )
-            schedule = _run_source_validated if owned_boundaries else run
-            schedule_options = (
-                {}
-                if self._checkpoint_every is None
-                else {"checkpoint_every": self._checkpoint_every}
+        schedule = _run_source_validated if owned_boundaries else run
+        schedule_options = (
+            {}
+            if self._checkpoint_every is None
+            else {"checkpoint_every": self._checkpoint_every}
+        )
+        if self._runtime_extra:
+            schedule_options.update(extra=extra, _runtime_extra_slot=True)
+        if self._checkpoint_every is None:
+            if self._runtime_extra or self._chunk_steps < selected_steps:
+                schedule_options["host_span_steps"] = self._chunk_steps
+        elif self._runtime_extra:
+            schedule_options["checkpoint_every"] = min(
+                self._checkpoint_every, self._chunk_steps
             )
-            if self._runtime_extra:
-                schedule_options.update(extra=extra, _runtime_extra_slot=True)
-            if self._checkpoint_every is None:
-                if self._runtime_extra or self._chunk_steps < selected_steps:
-                    schedule_options["host_span_steps"] = self._chunk_steps
-            elif self._runtime_extra:
-                schedule_options["checkpoint_every"] = min(
-                    self._checkpoint_every, self._chunk_steps
-                )
-            previous_report = self._kernel.execution_report()
-            final, auxiliary = schedule(
-                bound,
-                selected_state,
-                inputs=inputs,
-                steps=selected_steps,
-                callbacks=self._callbacks,
-                callback_state=callback_state,
-                **schedule_options,
+        previous_report = self._kernel.execution_report()
+        final, auxiliary = schedule(
+            bound,
+            selected_state,
+            inputs=inputs,
+            steps=selected_steps,
+            callbacks=self._callbacks,
+            callback_state=callback_state,
+            **schedule_options,
+        )
+        if auxiliary is None:
+            auxiliary = {}
+        if fresh_policy:
+            auxiliary = dict(auxiliary)
+            auxiliary["parameters"] = dict(selected_parameters)
+            auxiliary["constants"] = dict(selected_constants)
+        try:
+            return _complete_continuation(
+                final, auxiliary, selected_parameters, selected_constants
             )
-            if auxiliary is None:
-                auxiliary = {}
-            if fresh_policy:
-                auxiliary = dict(auxiliary)
-                auxiliary["parameters"] = dict(selected_parameters)
-                auxiliary["constants"] = dict(selected_constants)
-            try:
-                return _complete_continuation(
-                    final, auxiliary, selected_parameters, selected_constants
-                )
-            except Exception:
-                self._kernel._report_state.report = previous_report
-                raise
+        except Exception:
+            self._kernel._report_state.report = previous_report
+            raise
 
 
 def compile(

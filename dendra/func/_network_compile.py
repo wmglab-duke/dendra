@@ -383,150 +383,169 @@ class CompiledNetworkRunner:
         extra=_MISSING_RUNTIME_EXTRA,
         draws=None,
     ):
-        _validate_host_call()
-        steps, duration = _runner_call_horizon(
-            self._steps, self._duration, steps, duration
+        return _execute_network_runner(
+            self,
+            state,
+            steps=steps,
+            duration=duration,
+            parameters=parameters,
+            constants=constants,
+            inputs=inputs,
+            callback_state=callback_state,
+            initialization=initialization,
+            extra=extra,
+            draws=draws,
         )
-        if draws is not None:
-            draws = _normalize_runtime_draws(draws)
-        if self._runtime_extra_names:
-            if extra is _MISSING_RUNTIME_EXTRA:
-                raise TypeError(
-                    "extra is required for runtime extra slots declared with VarInput()"
-                )
-            if extra is not None and not isinstance(extra, Mapping):
-                raise TypeError("extra must map declared Population names to bindings")
-            selected_extra = {} if extra is None else dict(extra)
-            unknown = selected_extra.keys() - set(self._runtime_extra_names)
-            if unknown:
-                raise ValueError(
-                    "extra names Populations without runtime slots: "
-                    f"{sorted(unknown, key=str)!r}"
-                )
-            selected_extra = {
-                name: _map_containers(selected_extra.get(name), dict)
-                for name in self._runtime_extra_names
-            }
-        else:
-            if extra is not _MISSING_RUNTIME_EXTRA:
-                raise TypeError(
-                    "call-time extra requires slots declared with extra=VarInput()"
-                )
-            selected_extra = None
-        state, parameters, constants, callback_state = _resolve_continuation(
-            state, parameters, constants, callback_state, initialization
-        )
-        fresh_policy = self._initialization == "fresh"
-        if initialization is not None:
-            if not fresh_policy:
-                raise ValueError(
-                    "initialization overrides require initialization='fresh'"
-                )
-            if state is not None:
-                raise ValueError(
-                    "initialization cannot be combined with explicit state"
-                )
-        if callback_state is not None and state is None:
-            raise ValueError(
-                "callback_state continuation requires explicit Network state"
-            )
-        if (
-            fresh_policy
-            and state is not None
-            and parameters is None
-            and self._initialization_writes_parameters
-        ):
-            raise ValueError(
-                "initialization writes parameters; continue with "
-                "parameters=aux['parameters'] from the preceding call"
-            )
-        if (
-            fresh_policy
-            and state is not None
-            and constants is None
-            and self._initialization_writes_constants
-        ):
-            raise ValueError(
-                "initialization writes constants; continue with "
-                "constants=aux['constants'] from the preceding call"
-            )
-        fresh = fresh_policy and state is None
-        selected_state = self._initial_state if state is None else state
-        # Materialize external container code before the plan validates native
-        # source structure. Tensor identities/history, including ties, survive.
-        (
-            selected_parameters,
-            selected_constants,
-            selected_initialization,
-            selected_inputs,
-        ) = _runner_sources(
-            self, parameters, constants, initialization, fresh=fresh, inputs=inputs
-        )
-        previous = self._kernel.execution_report()
-        try:
-            if fresh:
-                if not isinstance(selected_initialization, NetworkInitializationInput):
-                    raise TypeError(
-                        "initialization must be a NetworkInitializationInput"
-                    )
-                initialized = _initialize_fresh(
-                    self._functional,
-                    selected_parameters,
-                    selected_constants,
-                    selected_state,
-                    selected_initialization,
-                    gradient=torch.is_grad_enabled() and not self._inference,
-                )
-                selected_parameters = initialized.parameters
-                selected_constants = initialized.constants
-                selected_state = initialized.state
-            selected_constants = self._functional._bind_parameter_constants(
-                selected_parameters, selected_constants
-            )
-            with torch.inference_mode() if self._inference else nullcontext():
-                if duration is not None:
-                    from ._runners import _stage_network_duration
 
-                    selected_state, steps = _stage_network_duration(
-                        self._functional, selected_state, duration
-                    )
-                schedule_args = (
-                    selected_parameters,
-                    selected_constants,
-                    selected_state,
-                    selected_inputs,
-                )
-                if selected_extra is None:
-                    schedule = self._functional.run
-                    schedule_options = {}
-                else:
-                    from ._network_rollout import run
 
-                    schedule = run
-                    schedule_args = (self._functional, *schedule_args)
-                    schedule_options = {"_runtime_extra": selected_extra}
-                if draws is not None:
-                    schedule_options["draws"] = draws
-                final, auxiliary = schedule(
-                    *schedule_args,
-                    steps=steps,
-                    callbacks=self._callbacks,
-                    callback_state=callback_state,
-                    checkpoint_every=self._checkpoint_every,
-                    compiled_chunk=self._kernel,
-                    chunklength=self._chunk_steps,
-                    **schedule_options,
+def _execute_network_runner(
+    self,
+    state=None,
+    *,
+    steps=None,
+    duration=None,
+    parameters=None,
+    constants=None,
+    inputs=None,
+    callback_state=None,
+    initialization=None,
+    extra=_MISSING_RUNTIME_EXTRA,
+    draws=None,
+):
+    _validate_host_call()
+    steps, duration = _runner_call_horizon(self._steps, self._duration, steps, duration)
+    if draws is not None:
+        draws = _normalize_runtime_draws(draws)
+    if self._runtime_extra_names:
+        if extra is _MISSING_RUNTIME_EXTRA:
+            raise TypeError(
+                "extra is required for runtime extra slots declared with VarInput()"
+            )
+        if extra is not None and not isinstance(extra, Mapping):
+            raise TypeError("extra must map declared Population names to bindings")
+        selected_extra = {} if extra is None else dict(extra)
+        unknown = selected_extra.keys() - set(self._runtime_extra_names)
+        if unknown:
+            raise ValueError(
+                "extra names Populations without runtime slots: "
+                f"{sorted(unknown, key=str)!r}"
+            )
+        selected_extra = {
+            name: _map_containers(selected_extra.get(name), dict)
+            for name in self._runtime_extra_names
+        }
+    else:
+        if extra is not _MISSING_RUNTIME_EXTRA:
+            raise TypeError(
+                "call-time extra requires slots declared with extra=VarInput()"
+            )
+        selected_extra = None
+    state, parameters, constants, callback_state = _resolve_continuation(
+        state, parameters, constants, callback_state, initialization
+    )
+    fresh_policy = self._initialization == "fresh"
+    if initialization is not None:
+        if not fresh_policy:
+            raise ValueError("initialization overrides require initialization='fresh'")
+        if state is not None:
+            raise ValueError("initialization cannot be combined with explicit state")
+    if callback_state is not None and state is None:
+        raise ValueError("callback_state continuation requires explicit Network state")
+    if (
+        fresh_policy
+        and state is not None
+        and parameters is None
+        and self._initialization_writes_parameters
+    ):
+        raise ValueError(
+            "initialization writes parameters; continue with "
+            "parameters=aux['parameters'] from the preceding call"
+        )
+    if (
+        fresh_policy
+        and state is not None
+        and constants is None
+        and self._initialization_writes_constants
+    ):
+        raise ValueError(
+            "initialization writes constants; continue with "
+            "constants=aux['constants'] from the preceding call"
+        )
+    fresh = fresh_policy and state is None
+    selected_state = self._initial_state if state is None else state
+    # Materialize external container code before the plan validates native
+    # source structure. Tensor identities/history, including ties, survive.
+    (
+        selected_parameters,
+        selected_constants,
+        selected_initialization,
+        selected_inputs,
+    ) = _runner_sources(
+        self, parameters, constants, initialization, fresh=fresh, inputs=inputs
+    )
+    previous = self._kernel.execution_report()
+    try:
+        if fresh:
+            if not isinstance(selected_initialization, NetworkInitializationInput):
+                raise TypeError("initialization must be a NetworkInitializationInput")
+            initialized = _initialize_fresh(
+                self._functional,
+                selected_parameters,
+                selected_constants,
+                selected_state,
+                selected_initialization,
+                gradient=torch.is_grad_enabled() and not self._inference,
+            )
+            selected_parameters = initialized.parameters
+            selected_constants = initialized.constants
+            selected_state = initialized.state
+        selected_constants = self._functional._bind_parameter_constants(
+            selected_parameters, selected_constants
+        )
+        with torch.inference_mode() if self._inference else nullcontext():
+            if duration is not None:
+                from ._runners import _stage_network_duration
+
+                selected_state, steps = _stage_network_duration(
+                    self._functional, selected_state, duration
                 )
-                if fresh_policy:
-                    auxiliary = dict(auxiliary)
-                    auxiliary["parameters"] = _map_containers(selected_parameters, dict)
-                    auxiliary["constants"] = _map_containers(selected_constants, dict)
-                return _complete_continuation(
-                    final, auxiliary, selected_parameters, selected_constants
-                )
-        except Exception:
-            self._kernel._report_state.report = previous
-            raise
+            schedule_args = (
+                selected_parameters,
+                selected_constants,
+                selected_state,
+                selected_inputs,
+            )
+            if selected_extra is None:
+                schedule = self._functional.run
+                schedule_options = {}
+            else:
+                from ._network_rollout import run
+
+                schedule = run
+                schedule_args = (self._functional, *schedule_args)
+                schedule_options = {"_runtime_extra": selected_extra}
+            if draws is not None:
+                schedule_options["draws"] = draws
+            final, auxiliary = schedule(
+                *schedule_args,
+                steps=steps,
+                callbacks=self._callbacks,
+                callback_state=callback_state,
+                checkpoint_every=self._checkpoint_every,
+                compiled_chunk=self._kernel,
+                chunklength=self._chunk_steps,
+                **schedule_options,
+            )
+            if fresh_policy:
+                auxiliary = dict(auxiliary)
+                auxiliary["parameters"] = _map_containers(selected_parameters, dict)
+                auxiliary["constants"] = _map_containers(selected_constants, dict)
+            return _complete_continuation(
+                final, auxiliary, selected_parameters, selected_constants
+            )
+    except Exception:
+        self._kernel._report_state.report = previous
+        raise
 
 
 __all__ = ["CompiledNetworkRunner"]

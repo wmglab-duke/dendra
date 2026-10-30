@@ -109,7 +109,8 @@ Functional continuation
 ``CompiledNetworkRunner`` that coordinates its Populations, connections,
 optional NetStim and shared clock/RNG scheduling. Both return
 ``(state, auxiliary)`` and publish ``auxiliary["continuation"]`` for the same
-in-memory resume call: ``state, auxiliary = runner(packet)``.
+in-memory resume call: ``state, auxiliary = dn.func.run(runner, packet)``.
+The direct ``runner(packet)`` form is equivalent.
 
 The packet captures effective raw parameter/constant bindings, including call
 overrides and fresh/cache replacements, with complete simulation state and
@@ -166,7 +167,16 @@ for disk checkpoints.
 Functional host scheduling
 --------------------------
 
-``dn.func.run`` schedules Population and Network bindings with explicit steps
+``dn.func.run(program, ...)`` executes either compiled Population or Network
+runner with the same call-level state/continuation, horizon, source, input, draw
+and runtime-extra arguments as ``program(...)``. With no state, it applies the
+configured snapshot/fresh restart policy. The runner owns callbacks, inference,
+initialization, chunk width, checkpoint span and preparation caching; select
+these with ``dn.compile``. The separate binding-only scheduling overrides are
+not supported for runner targets. See :ref:`functional-runner-execution` for
+the complete lifecycle and runnable example.
+
+``dn.func.run`` also schedules Population and Network bindings with explicit steps
 or duration, host spans, activation checkpointing, and callback continuation.
 Both use ``functional.bind(tensors)`` or ``functional.bind(continuation)``, or
 the same form on a compiled chunk. The bundle must match the plan's model

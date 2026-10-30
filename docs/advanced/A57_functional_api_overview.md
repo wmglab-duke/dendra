@@ -12,7 +12,8 @@ kernelspec:
 Use `dn.compile(model, ...)` for an ordinary simulation or training loop built
 from a supported, initialized Population or Network. It owns independent default
 parameter tensors, manages preparation and optional runtime sampling, and
-returns explicit simulation state. Use `make_functional(model, dt=...)`
+returns explicit simulation state. Execute the returned program with
+`dn.func.run(program, ...)` or `program(...)`. Use `make_functional(model, dt=...)`
 for either kind of model when an application needs to control bindings, chunk
 scheduling, explicit draws, or PyTorch function transforms.
 
@@ -85,7 +86,50 @@ modules with trainable parameters. Their tensor state must obey the functional
 contract. Optional purity diagnostics are controlled through `dn.ctx`'s
 `CHECK_PURITY` setting; normal execution trusts authored implementations.
 
-## Inference: compile, call, retain state explicitly
+(functional-runner-execution)=
+## Run a compiled program
+
+`dn.func.run` accepts compiled Population and Network programs as well as
+explicit bindings. For a compiled program, it uses the same defaults, source
+ownership and execution policy as calling the program directly:
+
+```python
+program = dn.compile(model, dt=DT, steps=100, chunk_steps=16)
+state, auxiliary = dn.func.run(program)
+state, auxiliary = dn.func.run(
+    program, auxiliary["continuation"], duration=25.0,
+)
+```
+
+Supply an ordinary state or a `Continuation` as the second positional argument,
+or through `state=`. Omitted state applies the program's configured snapshot or
+fresh restart policy. A continuation supplies its effective parameters,
+constants and callback carry. Both forms return `(state, auxiliary)` and publish
+the next packet at `auxiliary["continuation"]`.
+
+The call accepts the same runner keywords as `program(...)`: `steps`, `duration`,
+`parameters`, `constants`, `inputs`, `draws`, `callback_state`, `initialization`
+and declared runtime `extra`. The configured horizon applies unless `steps=` or
+`duration=` replaces it; input tapes alone do not replace a runner's horizon.
+Configure the timestep, callbacks, inference policy, initialization policy,
+compiled chunk width and activation checkpoint span with `dn.compile`.
+Non-`None` call-time `callbacks=`, `dt=`, `tstop=`, `checkpoint_every=` and
+`host_span_steps=` overrides are not supported for program targets. Explicit
+binding and legacy callable forms retain their separate scheduling arguments.
+Runner preparation caches, automatic sampling, callback phase and gradients
+follow the same rules through either spelling.
+
+The complete
+{download}`functional_runner_execution.py <../../examples/functional_runner_execution.py>`
+example checks Population and Network restart, direct/canonical equivalence,
+initialized and portable continuation, shared aliases and live gradients:
+
+```console
+python examples/functional_runner_execution.py
+python examples/functional_runner_execution.py --backend aot_eager
+```
+
+## Inference: compile, run, retain state explicitly
 
 `dn.compile` defaults to `inference=True` and `initialization="snapshot"`.
 It enters inference mode during execution. Every no-state call restarts from
@@ -97,9 +141,10 @@ selects the compiled width for both Populations and Networks:
 
 ```python
 runner = dn.compile(model, dt=DT, steps=1_000, chunk_steps=128)
-state, auxiliary = runner()  # All 1,000 steps, including the shorter tail.
-state, auxiliary = runner(steps=250)  # Restart with a different horizon.
-state, auxiliary = runner(auxiliary["continuation"], duration=25.0)
+# All 1,000 steps, including the shorter tail.
+state, auxiliary = dn.func.run(runner)
+state, auxiliary = dn.func.run(runner, steps=250)  # Restart with another horizon.
+state, auxiliary = dn.func.run(runner, auxiliary["continuation"], duration=25.0)
 ```
 
 `duration` is elapsed simulation time in ms. It is finite and nonnegative;
@@ -512,7 +557,7 @@ kind of compiled runner:
 ```python
 initial = dn.func.initialize(program)
 print(dn.func.inspect_sources(initial))
-state, auxiliary = program(initial, duration=25.0)
+state, auxiliary = dn.func.run(program, initial, duration=25.0)
 ```
 
 This explicit operation always follows the fresh initialization protocol,
@@ -534,7 +579,8 @@ recipe for this initialization call.
 
 Explicit initialization follows the caller's gradient mode and native model
 policy. The runner's `inference` setting governs execution when the packet is
-passed to `program(...)`. Inspect, bind or export the initialized continuation
+passed to `dn.func.run(program, ...)` or `program(...)`. Inspect, bind or export
+the initialized continuation
 through the existing APIs. The first execution starts the configured callbacks
 and records their initial boundary once; subsequent continuation calls retain
 their carry and sampling phase.
@@ -545,7 +591,7 @@ has configured callbacks:
 ```python
 saved = dn.func.export_continuation(program, initial)
 restored = dn.func.restore_continuation(program, saved)
-state, auxiliary = program(restored)
+state, auxiliary = dn.func.run(program, restored)
 ```
 
 Restoration creates detached source leaves, following the checkpoint contract
@@ -679,8 +725,9 @@ binds restored sources. Run
 `dn.func.run(bound, continuation, ...)` accepts a raw `BoundPopulation` or
 `BoundNetwork`. Successful raw-bound host runs publish
 `auxiliary["continuation"]` whether their input is an ordinary state or a packet.
-An eager plan and a compiled chunk expose the same raw `bind` form. To execute
-a runner's continuation through its compiled kernel, use
+An eager plan and a compiled chunk expose the same raw `bind` form.
+`dn.func.run(runner, continuation)` retains the runner's configured policies.
+For explicit binding and scheduling ownership, use
 `bound = runner.kernel.bind(continuation)` and pass that continuation separately
 to `dn.func.run`. The equivalent explicit mapping form is:
 
@@ -811,7 +858,7 @@ its initial boundary sample. Native state is published only through an explicit
 
 | Need | Entry point | Important boundary |
 | --- | --- | --- |
-| A reusable ordinary simulation or optimizer loop | `dn.compile` | Default or per-call horizon; no-state calls restart |
+| A reusable ordinary simulation or optimizer loop | `dn.compile`, then `dn.func.run(program, ...)` or `program(...)` | Default or per-call horizon; no-state calls restart |
 | Explicit binding and scheduling ownership | `dn.func.run` with a raw bound step/chunk | Host operation; handles sampling, spans and tails |
 | Exactly one step or a fixed width | Eager binding or compiled chunk | Caller supplies the frame/tape and stochastic packet |
 | `torch.func` transforms or an outer `torch.compile` | Pure `prepare_and_step` / `prepare_and_rollout` | Keep host scheduling and sampling outside the transform |

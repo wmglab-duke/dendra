@@ -11,6 +11,7 @@ import torch
 from torch.utils import _pytree as pytree
 from torch.utils.checkpoint import checkpoint
 
+import dendra
 from dendra.models.core import _duration_step_budget, _validate_time_scalar
 
 from ._binding import BoundPopulation
@@ -1493,7 +1494,13 @@ def _run_bound_network(
 
 
 def run(
-    functional: FunctionalPopulation | BoundPopulation | BoundNetwork,
+    functional: (
+        FunctionalPopulation
+        | BoundPopulation
+        | BoundNetwork
+        | dendra.func.CompiledRunner
+        | dendra.func.CompiledNetworkRunner
+    ),
     step=_MISSING,
     state=_MISSING,
     inputs: Inputs | RolloutInput | None = None,
@@ -1504,15 +1511,34 @@ def run(
     host_span_steps: int | None = None,
     tstop: float | None = None,
     dt: float | None = None,
-    extra=None,
+    extra=_MISSING,
     _runtime_extra_slot=False,
     callbacks: FunctionalCallbacks | None = None,
     callback_state=None,
     draws=None,
+    parameters=_MISSING,
+    constants=_MISSING,
+    initialization=_MISSING,
 ):
-    """Schedule explicit functional execution, optionally with checkpointing.
+    """Execute a compiled runner or schedule explicit bound transitions.
 
-    Preferred form: ``run(bound, state, inputs=..., steps=N)`` or
+    ``run(program)`` and ``run(program, state_or_continuation, ...)`` use a
+    compiled Population or Network runner's existing execution policy, just
+    like ``program(...)``. ``state=`` is also supported. Omission or ``None``
+    restarts according to its snapshot/fresh policy. ``steps``, ``duration``,
+    ``parameters``, ``constants``, ``inputs``, ``draws``, ``initialization``,
+    ``callback_state`` and runtime ``extra`` have the same meaning as on the
+    runner. Its configured horizon remains the default even when input tapes
+    are supplied. A ``VarInput`` slot requires an explicit ``extra`` argument;
+    ``extra=None`` supplies zero stimulation.
+
+    Runners own their callbacks, inference mode, timestep, kernel width and
+    activation checkpoint policy. Non-None ``callbacks``, ``dt``, ``tstop``,
+    ``host_span_steps`` and ``checkpoint_every`` overrides require the explicit
+    binding form below. ``parameters``, ``constants`` and ``initialization``
+    arguments are only available for runner targets.
+
+    For explicit bindings, use ``run(bound, state, inputs=..., steps=N)`` or
     ``run(bound, state, duration=..., checkpoint_every=H)``. Create ``bound``
     with ``functional.bind(parameters, constants=constants)`` for either model.
     Population ``bind(parameters, prepared)`` remains available for explicit
@@ -1543,14 +1569,69 @@ def run(
     Callbacks observe every accepted state, including within compiled chunks.
     Results are returned under ``auxiliary["callbacks"]``; pass their explicit
     ``state`` as ``callback_state`` when resuming to avoid duplicate frames.
-    Raw bindings also return ``auxiliary['continuation']``. Pass it as
-    ``run(bound, packet, ...)`` to continue state and callback carry together.
-    The packet must reference the binding's parameter/constant Tensor objects;
-    different sources require an explicit new raw binding. A packet cannot be
-    combined with non-None ``callback_state``. Prepared Population bindings and
+    Runners and raw bindings return ``auxiliary['continuation']``. Pass it as
+    ``run(program_or_bound, packet, ...)`` to continue state and callback carry
+    together.
+    For raw bindings, the packet must reference the binding's parameter/constant
+    Tensor objects; different sources require an explicit new raw binding. A
+    packet cannot be combined with non-None ``callback_state``. Prepared Population bindings and
     the legacy form keep their explicit state/carry contract.
     This host scheduler stays outside torch.compile and torch.func boundaries.
     """
+    from ._convenience import CompiledRunner, _execute_population_runner
+    from ._network_compile import CompiledNetworkRunner, _execute_network_runner
+
+    runner_type = type(functional)
+    if runner_type is CompiledRunner or runner_type is CompiledNetworkRunner:
+        if step is not _MISSING and state is not _MISSING:
+            raise TypeError("state was supplied more than once")
+        selected_state = state if step is _MISSING else step
+        if selected_state is _MISSING:
+            selected_state = None
+        for name, value in (
+            ("checkpoint_every", checkpoint_every),
+            ("host_span_steps", host_span_steps),
+            ("tstop", tstop),
+            ("dt", dt),
+            ("callbacks", callbacks),
+        ):
+            if value is not None:
+                raise TypeError(f"{name} cannot be supplied to run(program, ...)")
+        if _runtime_extra_slot is not False:
+            raise TypeError(
+                "_runtime_extra_slot cannot be supplied to run(program, ...)"
+            )
+        options = {} if extra is _MISSING else {"extra": extra}
+        execute = (
+            _execute_population_runner
+            if runner_type is CompiledRunner
+            else _execute_network_runner
+        )
+        return execute(
+            functional,
+            selected_state,
+            steps=steps,
+            duration=duration,
+            parameters=None if parameters is _MISSING else parameters,
+            constants=None if constants is _MISSING else constants,
+            inputs=inputs,
+            callback_state=callback_state,
+            initialization=None if initialization is _MISSING else initialization,
+            draws=draws,
+            **options,
+        )
+    if issubclass(runner_type, (CompiledRunner, CompiledNetworkRunner)):
+        raise TypeError("run requires an exact CompiledRunner or CompiledNetworkRunner")
+    for name, value in (
+        ("parameters", parameters),
+        ("constants", constants),
+        ("initialization", initialization),
+    ):
+        if value is not _MISSING:
+            raise TypeError(f"run() got an unexpected keyword argument {name!r}")
+    if extra is _MISSING:
+        extra = None
+
     from ._network_rollout import NetworkRolloutInput
 
     if isinstance(functional, (BoundPopulation, BoundNetwork)):

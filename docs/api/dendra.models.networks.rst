@@ -55,6 +55,14 @@ recordings, and checkpointed host execution are described in
 ``dn.compile(Network)`` dispatch, snapshot and fresh initialization, shared
 trainable parameter selection, restart, and explicit continuation are described in
 :doc:`../advanced/A21_functional_network_compile`.
+Execute the returned program with ``dn.func.run(program, ...)`` or the equivalent
+``program(...)`` form. Both retain the configured callbacks, inference and
+initialization policies, source ownership and caching rules, and accept the same
+per-call state/continuation, horizon, source, input, draw and runtime-extra
+arguments. Input tapes do not replace the runner's configured default horizon.
+Runner targets retain their compiled timestep, chunk width and checkpoint span;
+explicit bindings retain their separate scheduling options. See
+:ref:`functional-runner-execution` for the shared Population/Network contract.
 Inference-only ``execution="while"`` reuses Population's packed loop and
 recording engine; see :doc:`../advanced/A25_functional_network_while`.
 Qualified physical Recorders accept Population Slice regions, including named
@@ -113,7 +121,8 @@ pass ``initial`` separately to ``dn.func.run`` with the intended callback
 collection. The same facade
 supports Population bundles; see :ref:`functional-explicit-initialization`.
 
-Each successful convenience-runner call publishes an in-memory
+Each successful ``dn.func.run(program, ...)`` or direct runner call publishes an
+in-memory
 ``dn.func.Continuation`` at ``auxiliary["continuation"]``. Pass that packet as
 the next call's state argument to retain complete Network state, effective
 parameters/constants and callback carry together. Per-call parameter overrides
