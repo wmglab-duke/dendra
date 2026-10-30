@@ -1496,6 +1496,9 @@ def _run_bound_network(
 def run(
     functional: (
         FunctionalPopulation
+        | dendra.func.FunctionalNetwork
+        | dendra.func.CompiledPopulationChunk
+        | dendra.func.CompiledNetworkChunk
         | BoundPopulation
         | BoundNetwork
         | dendra.func.CompiledRunner
@@ -1520,7 +1523,7 @@ def run(
     constants=_MISSING,
     initialization=_MISSING,
 ):
-    """Execute a compiled runner or schedule explicit bound transitions.
+    """Execute a runner, a packet-bound plan/kernel, or explicit transitions.
 
     ``run(program)`` and ``run(program, state_or_continuation, ...)`` use a
     compiled Population or Network runner's existing execution policy, just
@@ -1537,6 +1540,17 @@ def run(
     ``host_span_steps`` and ``checkpoint_every`` overrides require the explicit
     binding form below. ``parameters``, ``constants`` and ``initialization``
     arguments are only available for runner targets.
+
+    ``run(functional_or_kernel, continuation, ...)`` binds an exact lowered
+    Population/Network plan or compiled chunk to the packet's effective raw
+    sources for this invocation. ``state=continuation`` is also supported.
+    The packet supplies simulation state and callback carry; initialization
+    remains explicit through ``initialize``. Tensor bundles and omitted state
+    do not imply initialization. Horizons, callbacks, inputs/draws and span
+    options follow the explicit binding contract below. Sources and gradient
+    history are not cloned or detached. No binding, packet or preparation
+    graph is retained in the plan/kernel. Use a persistent raw Population
+    binding to retain safe inference preparation across separate calls.
 
     For explicit bindings, use ``run(bound, state, inputs=..., steps=N)`` or
     ``run(bound, state, duration=..., checkpoint_every=H)``. Create ``bound``
@@ -1569,9 +1583,9 @@ def run(
     Callbacks observe every accepted state, including within compiled chunks.
     Results are returned under ``auxiliary["callbacks"]``; pass their explicit
     ``state`` as ``callback_state`` when resuming to avoid duplicate frames.
-    Runners and raw bindings return ``auxiliary['continuation']``. Pass it as
-    ``run(program_or_bound, packet, ...)`` to continue state and callback carry
-    together.
+    Runners, packet execution and raw bindings return
+    ``auxiliary['continuation']``. Pass it to the corresponding ``run`` form
+    to continue state and callback carry together.
     For raw bindings, the packet must reference the binding's parameter/constant
     Tensor objects; different sources require an explicit new raw binding. A
     packet cannot be combined with non-None ``callback_state``. Prepared Population bindings and
@@ -1632,14 +1646,36 @@ def run(
     if extra is _MISSING:
         extra = None
 
-    from ._network_rollout import NetworkRolloutInput
+    from ._compiled import CompiledPopulationChunk
+    from ._continuation import Continuation
+    from ._network import FunctionalNetwork
+    from ._network_rollout import CompiledNetworkChunk, NetworkRolloutInput
 
-    if isinstance(functional, (BoundPopulation, BoundNetwork)):
-        if type(functional) not in (BoundPopulation, BoundNetwork):
+    packet_targets = (
+        FunctionalPopulation,
+        FunctionalNetwork,
+        CompiledPopulationChunk,
+        CompiledNetworkChunk,
+    )
+    packet = state if step is _MISSING else step
+    packet_execution = (
+        issubclass(runner_type, packet_targets)
+        and issubclass(type(packet), Continuation)
+        and not (step is not _MISSING and state is not _MISSING and callable(step))
+    )
+    if packet_execution or isinstance(functional, (BoundPopulation, BoundNetwork)):
+        if packet_execution:
+            if not any(runner_type is target for target in packet_targets):
+                raise TypeError(
+                    "packet execution requires an exact FunctionalPopulation, "
+                    "FunctionalNetwork, CompiledPopulationChunk or CompiledNetworkChunk"
+                )
+            if type(packet) is not Continuation:
+                raise TypeError("packet execution requires an exact Continuation")
+        elif type(functional) not in (BoundPopulation, BoundNetwork):
             raise TypeError(
                 "run requires an exact BoundPopulation or BoundNetwork binding"
             )
-        bound = functional
         if step is not _MISSING:
             if state is _MISSING:
                 state = step
@@ -1654,6 +1690,7 @@ def run(
                 raise TypeError("state was supplied more than once")
         if state is _MISSING:
             raise TypeError("run requires state")
+        bound = functional.bind(state) if packet_execution else functional
         if tstop is not None:
             raise ValueError(
                 f"use duration instead of tstop with a {type(bound).__name__}"

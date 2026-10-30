@@ -506,7 +506,7 @@ stochastic subsystem. Do not supply the same stochastic family through both
 `draws=` and a legacy packet. See {ref}`functional-runtime-draws` and
 {ref}`functional-runtime-inputs` for their complete contracts.
 
-## Explicit bindings and direct chunks
+## Explicit plans, bindings and chunks
 
 `make_functional(model, dt=...)` returns a plan and explicit tensor bundle for
 an initialized Population or Network. A Network's supplied `dt` must match its
@@ -514,17 +514,23 @@ initialized timestep. The factory returns the concrete `FunctionalPopulation` /
 `PopulationTensors` or `FunctionalNetwork` / `NetworkTensors` types; it preserves
 their distinct state layouts and extraction ownership. The existing
 `make_functional_network(network, ...)` spelling remains available and uses the
-initialized Network timestep implicitly. Use the same raw binding spelling for
-eager and compiled execution:
+initialized Network timestep implicitly. Initialize an explicit continuation,
+then run the plan eagerly or run a reusable compiled chunk:
 
 ```python
-eager = functional.bind(tensors)
+initial = dn.func.initialize(functional, tensors)
+state, auxiliary = dn.func.run(functional, initial, steps=100, callbacks=callbacks)
 kernel = functional.compile_rollout_chunk(2, backend="aot_eager")
-bound = kernel.bind(tensors)
+state, auxiliary = dn.func.run(kernel, initial, steps=100, callbacks=callbacks)
 ```
 
-`bind` accepts the matching `PopulationTensors` or `NetworkTensors` bundle, or
-a `Continuation` from initialization, execution or portable restoration:
+The plan or chunk selects execution; the continuation supplies its effective
+parameters, constants, state and callback carry. See
+{ref}`functional-packet-execution` for continuation and checkpoint examples.
+Explicit bindings remain useful when sources have a longer lifetime than one
+invocation. `bind` accepts the matching `PopulationTensors` or `NetworkTensors`
+bundle, or a `Continuation` from initialization, execution or portable
+restoration:
 
 ```python
 initial = dn.func.initialize(functional, tensors)
@@ -575,9 +581,12 @@ the same source binding. See {ref}`functional-bound-continuation`.
 A raw binding snapshots mapping containers and retains their Tensor leaves.
 In-place optimizer changes to those leaves remain visible. Replacing a mapping
 entry requires a new binding. Raw bindings manage invocation-local preparation;
-Population raw bindings also reuse safe inference preparation. Compiled kernels
-can be reused with other valid
-bindings; they do not own optimization leaves or an autograd graph.
+Population raw bindings also reuse safe inference preparation across calls.
+Direct `run(plan_or_kernel, continuation, ...)` constructs an invocation-local
+binding and does not retain that preparation for the next call. Keep an explicit
+binding for repeated Population inference when this reuse matters. Compiled
+kernels can be reused with other valid bindings; they do not own optimization
+leaves or an autograd graph.
 
 Population `bind(parameters, prepared=prepared)` remains available for applications that
 explicitly own `functional.prepare(parameters, constants)`. Its second positional
@@ -688,13 +697,12 @@ matching tensor bundle and returns a `dn.func.Continuation`:
 functional, tensors = dn.func.make_functional(model, dt=DT)
 initial = dn.func.initialize(functional, tensors)
 callbacks = functional.make_callbacks({"trace": dn.func.Recorder(("v", "t"))})
-bound = functional.bind(initial)
-state, auxiliary = dn.func.run(bound, initial, steps=100, callbacks=callbacks)
+state, auxiliary = dn.func.run(functional, initial, steps=100, callbacks=callbacks)
 ```
 
-For a Network, use qualified Recorder paths such as `"left.v"`. Bind the
-returned parameter and constant objects: initialization transforms and caches
-can replace the incoming sources. Their effective identities, aliases and
+For a Network, use qualified Recorder paths such as `"left.v"`. Run with the
+returned continuation: initialization transforms and caches can replace the
+incoming sources. Their effective identities, aliases and
 gradients travel with the returned state. The packet has `callback_state=None`;
 the first `run` initializes the supplied callbacks once, including their
 initial boundary sample. Subsequent calls with `auxiliary["continuation"]`
@@ -787,6 +795,72 @@ fresh effective bindings. It also checks raw-bound continuation and explicitly
 binds restored sources. Run
 `python examples/functional_continuation.py --backend aot_eager`.
 
+(functional-packet-execution)=
+### Execute an explicit continuation
+
+`dn.func.run(functional, continuation, ...)` executes a lowered Population or
+Network eagerly. Supply its compiled chunk instead to use the same host
+scheduler with compiled execution:
+
+```{literalinclude} ../../examples/functional_packet_execution.py
+:language: python
+:start-after: "# region packet_run"
+:end-before: "# endregion packet_run"
+:dedent: 4
+```
+
+The supported targets are exact `FunctionalPopulation`, `FunctionalNetwork`,
+`CompiledPopulationChunk` and `CompiledNetworkChunk` objects. Supply the packet
+as the second argument or as `state=`, once. This form requires a
+`Continuation`; a tensor bundle or an ordinary state is not a complete source
+and continuation frame. Use `dn.func.initialize(functional, tensors)` explicitly
+to create a fresh packet. Execution does not initialize the model or apply a
+runner's restart policy.
+
+The packet owns the effective parameter and constant Tensor objects. Each call
+binds those sources for that invocation without cloning, detaching or retaining
+a new persistent source/preparation cache. Returned continuations retain live
+aliases and gradients. A compiled chunk retains its kernel specializations,
+including tails, and can execute another compatible packet with different
+source objects.
+
+Supply `steps=` or `duration=`, or input/draw tapes that determine the horizon.
+The chunk width does not set a default run length. `host_span_steps` bounds
+ordinary host work; `checkpoint_every` requests activation checkpointing, and
+the two are mutually exclusive. Inputs, draws and extracellular recipes follow
+the explicit bound scheduler's per-call semantics. Supply the callback
+collection with `callbacks=`; it must belong to the target's functional plan and
+match any retained callback carry. The first run of an initialized packet
+starts callbacks, and resumed runs emit only the suffix's samples.
+Source and initialization overrides are not accepted in this form, and a
+non-`None` `callback_state=` cannot compete with the packet's carry.
+
+Portable restoration also returns a packet that can be executed directly:
+
+```{literalinclude} ../../examples/functional_packet_execution.py
+:language: python
+:start-after: "# region packet_restore"
+:end-before: "# endregion packet_restore"
+:dedent: 4
+```
+
+Inspect the restored packet with `dn.func.inspect_sources(restored)` to select
+its effective optimizer leaves. Detached retained materializations can be
+independent trainable sources after restoration; a suffix gradient need not
+flow through their raw parameter. Live in-memory continuations preserve the
+earlier gradient graph.
+
+The complete
+{download}`functional_packet_execution.py <../../examples/functional_packet_execution.py>`
+example runs both a Population and a connected Network, preserving shared
+sources, recording phase and nonzero gradients through live continuation and
+a detached checkpoint boundary:
+
+```console
+python examples/functional_packet_execution.py
+python examples/functional_packet_execution.py --backend aot_eager
+```
+
 (functional-bound-continuation)=
 ### Continue through a raw binding
 
@@ -795,7 +869,7 @@ binds restored sources. Run
 `auxiliary["continuation"]` whether their input is an ordinary state or a packet.
 An eager plan and a compiled chunk expose the same raw `bind` form.
 `dn.func.run(runner, continuation)` retains the runner's configured policies.
-For explicit binding and scheduling ownership, use
+For persistent source binding and explicit scheduling ownership, use
 `bound = runner.kernel.bind(continuation)` and pass that continuation separately
 to `dn.func.run`. The equivalent explicit mapping form is:
 
@@ -833,9 +907,10 @@ not own raw constants and use their existing explicit state/callback-state
 contract. Direct binding calls, direct chunks and the legacy
 `run(functional, step, state, ...)` form retain their explicit contracts.
 
-Different sources, including the owned leaves from portable restoration,
-require an explicit new raw binding. The reusable kernel and receiving
-callback collection can still be used:
+When retaining a binding, different sources, including the owned leaves from
+portable restoration, require a new raw binding. Alternatively, use
+`dn.func.run(kernel, restored, ...)` to bind the restored sources for that call.
+The explicit binding form is:
 
 ```{literalinclude} ../../examples/functional_continuation.py
 :language: python
@@ -859,15 +934,15 @@ torch.save(saved, path)
 restored = dn.func.restore_continuation(
     receiving, torch.load(path, weights_only=True), callbacks=receiving_callbacks,
 )
-bound = receiving_kernel.bind(restored)
 state, auxiliary = dn.func.run(
-    bound, restored, steps=100, callbacks=receiving_callbacks,
+    receiving_kernel, restored, steps=100, callbacks=receiving_callbacks,
 )
 ```
 
 Each supplied callback collection must belong to its corresponding functional
 plan. Omit it when callbacks are not used. Restoration creates new owned
-source leaves; bind those exact restored objects before resuming. The complete
+source leaves; passing the restored packet selects those objects for execution.
+The complete
 {download}`functional_explicit_continuation_checkpoints.py <../../examples/functional_explicit_continuation_checkpoints.py>`
 example checks both model kinds, disk restoration, aliases, recording and
 suffix gradients.
@@ -927,7 +1002,7 @@ its initial boundary sample. Native state is published only through an explicit
 | Need | Entry point | Important boundary |
 | --- | --- | --- |
 | A reusable ordinary simulation or optimizer loop | `dn.compile`, then `dn.func.run(program, ...)` or `program(...)` | Default or per-call horizon; no-state calls restart |
-| Explicit binding and scheduling ownership | `dn.func.run` with a raw bound step/chunk | Host operation; handles sampling, spans and tails |
+| Explicit sources and scheduling ownership | `dn.func.run(plan_or_kernel, continuation, ...)`, or a raw bound step/chunk | Host operation; handles sampling, spans and tails |
 | Exactly one step or a fixed width | Eager binding or compiled chunk | Caller supplies the frame/tape and stochastic packet |
 | `torch.func` transforms or an outer `torch.compile` | Pure `prepare_and_step` / `prepare_and_rollout` | Keep host scheduling and sampling outside the transform |
 

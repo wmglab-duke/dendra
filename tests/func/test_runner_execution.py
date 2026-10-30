@@ -39,6 +39,9 @@ def test_run_annotations_resolve_for_existing_bindings_and_compiled_programs():
     hints = typing.get_type_hints(dn.func.run)
     assert set(typing.get_args(hints["functional"])) == {
         dn.func.FunctionalPopulation,
+        dn.func.FunctionalNetwork,
+        dn.func.CompiledPopulationChunk,
+        dn.func.CompiledNetworkChunk,
         dn.func.BoundPopulation,
         dn.func.BoundNetwork,
         dn.func.CompiledRunner,

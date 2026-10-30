@@ -39,8 +39,10 @@ class Continuation:
     binding. Prepared Population bindings retain explicit state/carry calls.
 
     ``dn.func.initialize(functional, tensors)`` returns the same packet with
-    effective initialized sources and no callback carry. Bind its sources and
-    pass callbacks to the first run to begin fresh recording and reductions.
+    effective initialized sources and no callback carry. Pass it directly to
+    ``run(functional_or_kernel, packet, ...)`` and supply callbacks to begin
+    fresh recording and reductions. This host form creates a raw binding for
+    the invocation without retaining sources or preparation in the plan/kernel.
 
     Eager plans and compiled chunks accept ``bind(packet)`` to select its raw
     parameter/constant sources. Binding does not retain the packet or adopt

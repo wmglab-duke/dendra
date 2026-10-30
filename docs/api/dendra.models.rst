@@ -25,8 +25,8 @@ binding flow and the compatible ``make_functional_network`` form.
 
 ``dn.func.initialize(functional, tensors, initialization=...)`` initializes the
 matching ``PopulationTensors`` or ``NetworkTensors`` bundle and returns a shared
-``Continuation``. Use ``bound = functional.bind(initial)`` to bind its effective
-sources, then pass ``initial`` explicitly to ``dn.func.run``. The default recipe
+``Continuation``. Use ``dn.func.run(functional, initial, steps=...)`` to execute
+it eagerly, or supply a compiled chunk as the target. The default recipe
 is ``tensors.initialization`` for a Population and
 ``functional.initialization_inputs`` for a Network. Explicit
 draw packets are replayed; missing packets are sampled from explicit RNG carry
@@ -144,8 +144,9 @@ Save portable detached checkpoints against a lowered Population or Network with
 against a compatible receiving plan with
 ``dn.func.restore_continuation(receiving, saved, callbacks=receiving_callbacks)``.
 Each explicitly supplied callback collection must belong to its respective
-plan; omit it for callback-free continuation. Bind the returned sources with
-``receiving_kernel.bind(restored)`` before using ``dn.func.run``. For compiled
+plan; omit it for callback-free continuation. Use
+``dn.func.run(receiving_kernel, restored, steps=..., callbacks=receiving_callbacks)``
+to execute its restored sources and state. For compiled
 Population and Network runners, use ``dn.func.export_continuation(runner, packet)``
 and ``dn.func.restore_continuation(receiver, saved)``; they select the runners'
 configured callbacks. ``runner.export_continuation(packet)`` and
@@ -179,12 +180,30 @@ runner with the same call-level state/continuation, horizon, source, input, draw
 and runtime-extra arguments as ``program(...)``. With no state, it applies the
 configured snapshot/fresh restart policy. The runner owns callbacks, inference,
 initialization, chunk width, checkpoint span and preparation caching; select
-these with ``dn.compile``. The separate binding-only scheduling overrides are
+these with ``dn.compile``. The explicit scheduling overrides are
 not supported for runner targets. See :ref:`functional-runner-execution` for
 the complete lifecycle and runnable example.
 
-``dn.func.run`` also schedules Population and Network bindings with explicit steps
-or duration, host spans, activation checkpointing, and callback continuation.
+``dn.func.run(functional_or_kernel, continuation, ...)`` executes exact
+``FunctionalPopulation``, ``FunctionalNetwork``, ``CompiledPopulationChunk`` and
+``CompiledNetworkChunk`` targets with explicit packet ownership. ``state=packet``
+is equivalent to the second positional argument; supply it once. The packet
+provides effective parameters, constants, simulation state and callback carry.
+Create a fresh packet with ``dn.func.initialize(functional, tensors)`` explicitly.
+Ordinary states and tensor bundles are not accepted by this form. It uses the
+existing raw binding and scheduler for that invocation, without cloning or
+detaching Tensor objects, initializing the model, or retaining a new persistent
+source/preparation cache. Source and initialization overrides are not accepted.
+Pass ``callbacks=`` explicitly and omit a competing non-``None``
+``callback_state=``. Provide steps/duration or tapes determining the horizon;
+chunk width does not supply a default horizon. Host spans, checkpoint spans,
+inputs, draws and runtime extracellular recipes use the same explicit scheduler
+contract as bindings. See :ref:`functional-packet-execution` and the complete
+:download:`functional_packet_execution.py <../../examples/functional_packet_execution.py>`
+example for initialization, live continuation and portable restoration.
+
+``dn.func.run`` also schedules Population and Network bindings with explicit
+steps or duration, host spans, activation checkpointing, and callback continuation.
 Both use ``functional.bind(tensors)`` or ``functional.bind(continuation)``, or
 the same form on a compiled chunk. The bundle must match the plan's model
 family. These forms read only parameter/constant sources; state, callback carry
@@ -199,6 +218,9 @@ and expose read-only ``parameters`` and ``constants``.
 Independent runs derive fresh training preparation; safe Population inference
 preparation is reused until its inputs change. In-place optimizer updates are
 visible on the next run. Replacing a mapping entry requires a new binding.
+Keep a persistent Population binding when preparation reuse across invocations
+matters; direct packet execution binds separately on each call. Compiled kernels
+retain no source leaves or preparation graphs in either form.
 Constructing a raw binding does not clone or detach Tensors, initialize, sample
 or prepare the model. Bindings do not own simulation state. Population's explicit
 ``bind(parameters, prepared)`` form remains available for graph-local control.
