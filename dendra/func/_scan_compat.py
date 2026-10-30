@@ -327,6 +327,15 @@ def validate_inductor_scan_contract():
             for module, owner, name, args in methods:
                 function = _owned_callable(module, owner, name, args=args)
                 references.append((owner, name, function))
+            can_reuse = wrapper.PythonWrapperCodegen.can_reuse
+            if "can_free" in can_reuse.__code__.co_names:
+                can_free = _owned_callable(
+                    wrapper,
+                    wrapper.PythonWrapperCodegen,
+                    "can_free",
+                    args=(placeholder, placeholder),
+                )
+                references.append((wrapper.PythonWrapperCodegen, "can_free", can_free))
             if (
                 "can_reuse"
                 not in scheduler.BaseSchedulerNode.decide_inplace_update.__code__.co_names
@@ -340,6 +349,7 @@ def validate_inductor_scan_contract():
                 constants={},
                 torchbind_constants={},
                 never_reuse_buffers=set(),
+                never_reuse_but_free_buffers=set(),
             )
             test_wrapper = object.__new__(wrapper.PythonWrapperCodegen)
             test_wrapper.freed = set()

@@ -421,6 +421,104 @@ def test_failed_reuse_behavior_probe_is_rejected_without_global_patch(
     assert config._pre_fusion_custom_pass is before
 
 
+def test_reuse_probe_supports_separate_freeable_non_reusable_buffers(monkeypatch):
+    global_policy = (
+        config._pre_fusion_custom_pass,
+        config.inplace_buffers,
+        config.allow_buffer_reuse,
+        aot_config.donated_buffer,
+    )
+    monkeypatch.setattr(_scan_compat, "_INDUCTOR_CONTRACT", None)
+
+    def can_reuse(self, node):
+        return (
+            node.get_name() not in V.graph.never_reuse_buffers
+            and node.get_name() not in V.graph.never_reuse_but_free_buffers
+        )
+
+    replacement = FunctionType(can_reuse.__code__, wrapper_module.__dict__, "can_reuse")
+    monkeypatch.setattr(wrapper_module.PythonWrapperCodegen, "can_reuse", replacement)
+    guard = donation._scan_donation_pass()
+    assert _scan_compat._INDUCTOR_CONTRACT is not None
+    graph = _graph()
+    graph.never_reuse_but_free_buffers = set()
+    buffer = SimpleNamespace(get_name=lambda: "carry")
+    nodes = [object()]
+    with V.set_graph_handler(graph):
+        assert replacement(None, buffer)
+        assert guard(nodes) is nodes
+        assert not replacement(None, buffer)
+    assert graph.never_reuse_buffers == {"existing", "shared", "carry"}
+    assert graph.never_reuse_but_free_buffers == set()
+    assert (
+        config._pre_fusion_custom_pass,
+        config.inplace_buffers,
+        config.allow_buffer_reuse,
+        aot_config.donated_buffer,
+    ) == global_policy
+
+
+@pytest.mark.parametrize("delegates", (False, True), ids=("direct", "delegated"))
+def test_reuse_probe_tracks_only_delegated_freeability_helper(monkeypatch, delegates):
+    global_policy = (
+        config._pre_fusion_custom_pass,
+        config.inplace_buffers,
+        config.allow_buffer_reuse,
+        aot_config.donated_buffer,
+    )
+    monkeypatch.setattr(_scan_compat, "_INDUCTOR_CONTRACT", None)
+
+    def can_free(self, node):
+        return node.get_name() not in V.graph.never_reuse_buffers
+
+    def direct(self, node):
+        return node.get_name() not in V.graph.never_reuse_buffers
+
+    def delegated(self, node):
+        return self.can_free(node) and (
+            node.get_name() not in V.graph.never_reuse_but_free_buffers
+        )
+
+    owner = wrapper_module.PythonWrapperCodegen
+    for name, function in (
+        ("can_free", can_free),
+        ("can_reuse", delegated if delegates else direct),
+    ):
+        replacement = FunctionType(function.__code__, wrapper_module.__dict__, name)
+        monkeypatch.setattr(owner, name, replacement, raising=False)
+    guard = donation._scan_donation_pass()
+    can_reuse = owner.can_reuse
+    monkeypatch.setattr(owner, "can_free", lambda self, node: True)
+    assert owner.can_reuse is can_reuse
+    graph = _graph()
+    graph.never_reuse_but_free_buffers = set()
+    protected = set(graph.never_reuse_buffers)
+    nodes = [object()]
+    if delegates:
+        with pytest.raises(
+            FunctionalizationError, match=r"PythonWrapperCodegen\.can_free"
+        ):
+            donation._scan_donation_pass()
+        with V.set_graph_handler(graph):
+            with pytest.raises(
+                FunctionalizationError, match=r"PythonWrapperCodegen\.can_free"
+            ):
+                guard(nodes)
+        assert graph.never_reuse_buffers == protected
+    else:
+        assert donation._scan_donation_pass() is not None
+        with V.set_graph_handler(graph):
+            assert guard(nodes) is nodes
+        assert graph.never_reuse_buffers == protected | {"carry"}
+    assert graph.never_reuse_but_free_buffers == set()
+    assert (
+        config._pre_fusion_custom_pass,
+        config.inplace_buffers,
+        config.allow_buffer_reuse,
+        aot_config.donated_buffer,
+    ) == global_policy
+
+
 def test_compile_options_are_not_mutated_by_donation_compatibility(monkeypatch):
     captured = {}
 
