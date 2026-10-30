@@ -11,7 +11,7 @@ import torch
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.func._callback_carry import _CallbackCarryPartition
-from dendra.func._callbacks import _BoundLFP
+from dendra.func._callbacks import _prepare_callback
 from dendra.func._carry_packing import _PackedCarryLayout
 from dendra.models.mod import hh
 
@@ -260,7 +260,7 @@ def test_lfp_requires_current_and_valid_default_broadcast():
 
 
 def test_only_exact_builtin_lfp_fields_are_excluded_from_recurrent_packing():
-    class DerivedLFP(_BoundLFP):
+    class DerivedLFP(dn.func.LFP):
         pass
 
     options = dict(
@@ -269,8 +269,8 @@ def test_only_exact_builtin_lfp_fields_are_excluded_from_recurrent_packing():
     fields = torch.zeros(64, 1024, 2).transpose(-1, -2)
     carries = {"lfp": fields, "custom": fields[:1], "reducer": torch.ones(3)}
     plans = (
-        SimpleNamespace(name="lfp", callback=_BoundLFP(**options)),
-        SimpleNamespace(name="custom", callback=DerivedLFP(**options)),
+        SimpleNamespace(name="lfp", callback=_prepare_callback(dn.func.LFP, options)),
+        SimpleNamespace(name="custom", callback=_prepare_callback(DerivedLFP, options)),
         SimpleNamespace(name="reducer", callback=dn.func.AnomalyDetector()),
     )
     partition = _CallbackCarryPartition.from_plans(plans)

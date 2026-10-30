@@ -10,6 +10,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from ._callbacks import (
+    LFP,
     ActiveAL,
     ActiveALCount,
     AnomalyDetector,
@@ -17,11 +18,11 @@ from ._callbacks import (
     FunctionalCallback,
     FunctionalCallbackState,
     Raster,
+    Recorder,
     _BoundCadencedRecorder,
-    _BoundLFP,
     _BoundPopulationCallback,
-    _BoundRecorder,
-    _is_prepared_threshold_callback,
+    _is_prepared_callback,
+    _is_prepared_lfp,
     _TensorLeafSchema,
     _TensorTreeSchema,
     _validate_tree,
@@ -33,9 +34,9 @@ _FORMAT = "dendra.func.callback_state"
 _VERSION = 1
 # Historical wire names for default adapters; custom hooks need no registration.
 _KINDS = {
-    _BoundRecorder: "Recorder",
+    Recorder: "Recorder",
     _BoundCadencedRecorder: "CadencedRecorder",
-    _BoundLFP: "LFP",
+    LFP: "LFP",
     Raster: "Raster",
     APCount: "APCount",
     ActiveAL: "ActiveAL",
@@ -143,8 +144,11 @@ def _legacy_configuration_value(value):
 def _builtin_kind(value):
     if type(value) is AnomalyDetector:
         return "AnomalyDetector"
-    if any(type(value) is cls for cls in (Raster, APCount, ActiveAL, ActiveALCount)):
-        if not _is_prepared_threshold_callback(value):
+    if any(
+        type(value) is cls
+        for cls in (Recorder, LFP, Raster, APCount, ActiveAL, ActiveALCount)
+    ):
+        if not _is_prepared_callback(value):
             return None
     return next(
         (
@@ -168,7 +172,7 @@ def _builtin_callback_configuration(callback):
         ()
         if type(callback) is AnomalyDetector
         else callback._checkpoint_fields
-        if _is_prepared_threshold_callback(callback)
+        if _is_prepared_callback(callback)
         else tuple(field.name for field in fields(callback))
     )
     values = {
@@ -476,7 +480,7 @@ def _validate_invariants(callbacks, carries):
         implementation = plan.callback
         if type(implementation) is _BoundPopulationCallback:
             implementation = implementation.callback
-        if type(implementation) is not _BoundLFP:
+        if not _is_prepared_lfp(implementation):
             continue
         expected = torch.stack(
             [

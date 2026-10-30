@@ -71,6 +71,14 @@ Population scope is fixed when callbacks bind. An unknown name or a nested
 collections; use the underlying callback directly for a standalone Population.
 Configure and bind a new collection to change a scope or selection.
 
+Binding a Recorder, LFP or threshold callback prepares a separate immutable
+instance of its public callback class. A Recorder retains resolved state paths,
+physical regions and index or partition selections; an LFP retains its field
+references and projection metadata. The supplied configuration objects remain
+unchanged. These public classes implement the pure callback hooks; evolving values and recording phase
+belong to explicit carry. Prepared Network Recorder paths and regions keep
+their resolved meaning when used by the collection.
+
 ## LFP shape, units, and gradients
 
 LFP reads `i_membrane`, the total membrane current in mA at each physical
@@ -100,15 +108,17 @@ membrane-current history is stored only if a Recorder also selects it. The
 example records that history to verify the projection and its lead-field
 gradient. Omit that Recorder when only electrode signals are needed.
 
+LFP preparation retains the original lead-field Tensor objects and builds no
+autograd graph. Each fresh callback initialization constructs its own
+differentiable field stack, so a later fresh run supports an independent
+backward pass. Continuation retains the initialized stack in explicit carry.
+
 ## Threshold windows and result memory
 
-`Raster`, `APCount`, `ActiveAL` and `ActiveALCount` implement the pure callback
-hooks directly. Binding prepares a separate immutable instance with resolved
-compartment indices, timestep and window bounds; the supplied configuration
-object remains unchanged. `Active` uses the `ActiveAL(at_least=1)` rule. Configure
-the supplied object before binding, and bind a new collection when changing its
-settings. Prepared metadata contains no evolving analysis state: crossing
-latches, counts and step phase travel in explicit carry.
+Threshold preparation resolves compartment indices, timestep and window bounds.
+`Active` uses the `ActiveAL(at_least=1)` rule. Configure the supplied object before
+binding, and bind a new collection when changing its settings. Crossing latches,
+counts and step phase travel in explicit carry.
 
 Threshold callbacks inspect accepted post-step voltages. The initial model frame
 does not trigger a crossing. The first checked sample is armed, including when

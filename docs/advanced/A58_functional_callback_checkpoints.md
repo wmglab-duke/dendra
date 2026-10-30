@@ -148,6 +148,14 @@ step phase with the per-callback carry schemas. Restoring this data
 resumes the receiving callback's pure hooks without serializing a Python
 callback instance.
 
+Recorder and LFP preparation follows the same separation. Recorder metadata
+describes resolved paths, physical selections and cadence. LFP metadata
+describes field values, projection rule, shape padding, dtype and device. A
+fresh LFP run builds its differentiable field stack during initialization;
+preparation retains the raw field references without caching that graph.
+Portable continuation saves the detached stack as callback carry, alongside
+the checked metadata.
+
 The example configures full-rate and cadenced Recorders, Raster, APCount and AnomalyDetector. Its
 Network has two Populations linked continuously and an event synapse driven by
 a noisy NetStim. Network callback scopes select the Population whose voltages

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ._callbacks import _BoundLFP, _callback_implementation
+from ._callbacks import _callback_implementation, _is_prepared_lfp
 
 
 @dataclass(frozen=True)
@@ -26,7 +26,7 @@ class _CallbackCarryPartition:
             tuple(
                 plan.name
                 for plan in plans
-                if type(_callback_implementation(plan.callback)) is _BoundLFP
+                if _is_prepared_lfp(_callback_implementation(plan.callback))
             ),
         )
 

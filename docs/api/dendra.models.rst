@@ -264,12 +264,14 @@ also accept it as part of a shared continuation packet. See
 :doc:`../advanced/A58_functional_callback_checkpoints` for complete Population
 and Network examples, ownership, and compatibility rules.
 
-Threshold callback configurations prepare independent immutable instances with
-resolved indices, windows and timestep metadata. ``Raster``, ``APCount``,
-``ActiveAL`` and ``ActiveALCount`` implement the pure hooks directly;
-``Active`` uses the ``ActiveAL(at_least=1)`` rule. Evolving crossing latches,
-counts and phase belong to explicit carry, rather than the prepared callback.
-Supplied configuration objects remain unchanged. See
+Recorder, LFP and threshold configurations prepare separate immutable instances
+of their public callback classes. ``Recorder`` resolves paths, regions and
+selections; ``LFP`` retains raw field Tensor references and projection metadata;
+threshold callbacks resolve indices, windows and timestep metadata. These public classes
+implement the pure hooks directly. ``Active`` uses the ``ActiveAL(at_least=1)``
+rule. Changing analysis state belongs to explicit carry, and supplied
+configuration objects remain unchanged. Each fresh LFP initialization builds a
+new differentiable field stack; preparation retains no autograd graph. See
 :doc:`../advanced/A27_functional_network_callbacks` for timing, result shapes
 and Population scopes.
 

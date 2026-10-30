@@ -514,7 +514,11 @@ def test_atomic_recorder_cadence_compiles_with_dynamic_output_capture():
 
 @pytest.mark.mps
 def test_mps_while_recorder_cadence_matches_selected_dense_samples():
-    from dendra.func._callbacks import _BoundCadencedRecorder, _BoundRecorder
+    from dendra.func._callbacks import (
+        Recorder,
+        _BoundCadencedRecorder,
+        _prepare_callback,
+    )
 
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         pytest.skip("MPS hardware is unavailable")
@@ -523,12 +527,16 @@ def test_mps_while_recorder_cadence_matches_selected_dense_samples():
     # Exercise both devices as the phase owner without another compiler case.
     for states in (("gpu", "cpu"), ("cpu", "gpu")):
         recorder = _BoundCadencedRecorder(
-            recorder=_BoundRecorder(
-                states=states,
-                paths=tuple((name,) for name in states),
-                max_only=False,
-                node_indices=None,
-                partition=None,
+            recorder=_prepare_callback(
+                Recorder,
+                {
+                    "states": states,
+                    "paths": tuple((name,) for name in states),
+                    "max_only": False,
+                    "node_indices": None,
+                    "partition": None,
+                    "region": None,
+                },
             ),
             save_every=2,
             callback_dt=DT,

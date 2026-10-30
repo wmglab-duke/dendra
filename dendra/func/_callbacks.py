@@ -103,6 +103,40 @@ class FunctionalCallback(ABC):
         return self
 
 
+class _PreparedCallback(FunctionalCallback):
+    """Separate authored configuration from immutable resolved execution data."""
+
+    _prepared = False
+    _checkpoint_fields = ()
+    _preparation_error = (
+        "functional callbacks must be bound with functional.make_callbacks(...)"
+    )
+
+    def _require_prepared(self):
+        if not self._prepared:
+            raise FunctionalizationError(self._preparation_error)
+
+    def __setattr__(self, name, value):
+        if object.__getattribute__(self, "__dict__").get("_prepared", False):
+            raise FrozenInstanceError(f"cannot assign to field {name!r}")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        if object.__getattribute__(self, "__dict__").get("_prepared", False):
+            raise FrozenInstanceError(f"cannot delete field {name!r}")
+        object.__delattr__(self, name)
+
+
+def _prepare_callback(cls, values):
+    prepared = object.__new__(cls)
+    object.__getattribute__(prepared, "__dict__").update(values, _prepared=True)
+    return prepared
+
+
+def _is_prepared_callback(callback):
+    return issubclass(type(callback), _PreparedCallback) and callback._prepared
+
+
 @dataclass(frozen=True)
 class PopulationCallback(FunctionalCallback):
     """Apply an existing pure callback to one Population in a Network.
@@ -198,7 +232,7 @@ class _BoundPopulationCallback(FunctionalCallback):
         return self.callback.finalize(carry, emissions)
 
 
-class Recorder(FunctionalCallback):
+class Recorder(_PreparedCallback):
     """Record explicit functional state with optional native sampling cadence.
 
     The constructor mirrors the ordinary :class:`dendra.callbacks.Recorder`
@@ -230,6 +264,18 @@ class Recorder(FunctionalCallback):
     may be recorded alongside physical fields.
     """
 
+    _preparation_error = (
+        "dn.func.Recorder must be bound with functional.make_callbacks(...)"
+    )
+    _checkpoint_fields = (
+        "states",
+        "paths",
+        "max_only",
+        "node_indices",
+        "partition",
+        "region",
+    )
+
     def __init__(
         self,
         states,
@@ -260,6 +306,8 @@ class Recorder(FunctionalCallback):
         self.region = region
 
     def _bind(self, functional: FunctionalPopulation):
+        if self._prepared:
+            return self
         paths = self._resolve_paths(functional)
         region = self._bind_region(functional, paths)
         return self._bind_paths(functional, paths, region)
@@ -379,45 +427,20 @@ class Recorder(FunctionalCallback):
                         f"and {schema.shape[-1]}"
                     )
 
-        recorder = _BoundRecorder(
-            states=self.states,
-            paths=paths,
-            max_only=self.max_only,
-            node_indices=node_indices,
-            partition=partition,
-            region=region,
+        recorder = _prepare_callback(
+            Recorder,
+            {
+                "states": self.states,
+                "paths": paths,
+                "max_only": self.max_only,
+                "node_indices": node_indices,
+                "partition": partition,
+                "region": region,
+            },
         )
         if save_every is None:
             return recorder
         return _BoundCadencedRecorder(recorder, save_every, functional.dt)
-
-    def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
-        del state, auxiliary
-        raise FunctionalizationError(
-            "dn.func.Recorder must be bound with functional.make_callbacks(...)"
-        )
-
-    def update(self, carry, state, auxiliary):  # pragma: no cover - guarded
-        del carry, state, auxiliary
-        raise FunctionalizationError(
-            "dn.func.Recorder must be bound with functional.make_callbacks(...)"
-        )
-
-    def finalize(self, carry, emissions):  # pragma: no cover - guarded by bind
-        del carry, emissions
-        raise FunctionalizationError(
-            "dn.func.Recorder must be bound with functional.make_callbacks(...)"
-        )
-
-
-@dataclass(frozen=True)
-class _BoundRecorder(FunctionalCallback):
-    states: tuple[str, ...]
-    paths: tuple[tuple[str, ...], ...]
-    max_only: bool
-    node_indices: torch.Tensor | None
-    partition: tuple[int, ...] | None
-    region: object | None = None
 
     def _observe(self, state: Mapping[str, object]) -> dict[str, torch.Tensor]:
         output = {}
@@ -446,22 +469,25 @@ class _BoundRecorder(FunctionalCallback):
         return output
 
     def initialize(self, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         observed = self._observe(state)
         return (), observed
 
     def update(self, carry, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         return carry, self._observe(state)
 
     def finalize(self, carry, emissions):
+        self._require_prepared()
         del carry
         return emissions
 
 
 @dataclass(frozen=True)
 class _BoundCadencedRecorder(FunctionalCallback):
-    recorder: _BoundRecorder
+    recorder: Recorder
     save_every: int
     callback_dt: float
 
@@ -491,7 +517,7 @@ class _BoundCadencedRecorder(FunctionalCallback):
         }
 
 
-class LFP(FunctionalCallback):
+class LFP(_PreparedCallback):
     """Record lead-field projections of absolute membrane current.
 
     ``v_unit`` is a non-empty list of equally shaped reciprocal lead-field
@@ -520,6 +546,9 @@ class LFP(FunctionalCallback):
     lift those fields as invariant operands instead of copying them each step.
     """
 
+    _preparation_error = "dn.func.LFP must be bound with functional.make_callbacks(...)"
+    _checkpoint_fields = ("fields", "rule", "padding", "device", "dtype")
+
     def __init__(self, v_unit: list[torch.Tensor], rule=None):
         if not isinstance(v_unit, list):
             raise TypeError(
@@ -539,6 +568,8 @@ class LFP(FunctionalCallback):
         self.rule = rule
 
     def _bind(self, functional: FunctionalPopulation):
+        if self._prepared:
+            return self
         path = ("integrator", "i_membrane")
         if not any(leaf.public_path == path for leaf in functional._state_layout):
             raise FunctionalizationError(
@@ -560,40 +591,16 @@ class LFP(FunctionalCallback):
                     f"shape {functional.shape}; got {tuple(self.v_unit[0].shape)}"
                 )
             padding = len(functional.shape) - self.v_unit[0].ndim
-        return _BoundLFP(
-            fields=self.v_unit,
-            rule=self.rule,
-            padding=padding,
-            device=functional.device,
-            dtype=functional.dtype,
+        return _prepare_callback(
+            LFP,
+            {
+                "fields": self.v_unit,
+                "rule": self.rule,
+                "padding": padding,
+                "device": functional.device,
+                "dtype": functional.dtype,
+            },
         )
-
-    def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
-        del state, auxiliary
-        raise FunctionalizationError(
-            "dn.func.LFP must be bound with functional.make_callbacks(...)"
-        )
-
-    def update(self, carry, state, auxiliary):  # pragma: no cover - guarded
-        del carry, state, auxiliary
-        raise FunctionalizationError(
-            "dn.func.LFP must be bound with functional.make_callbacks(...)"
-        )
-
-    def finalize(self, carry, emissions):  # pragma: no cover - guarded by bind
-        del carry, emissions
-        raise FunctionalizationError(
-            "dn.func.LFP must be bound with functional.make_callbacks(...)"
-        )
-
-
-@dataclass(frozen=True)
-class _BoundLFP(FunctionalCallback):
-    fields: tuple[torch.Tensor, ...]
-    rule: str | None
-    padding: int
-    device: torch.device
-    dtype: torch.dtype
 
     def _observe(self, state, fields):
         current = state["integrator"]["i_membrane"]
@@ -602,6 +609,7 @@ class _BoundLFP(FunctionalCallback):
         return (current.unsqueeze(0) * fields).sum(dim=(-1, -2)).movedim(0, -1)
 
     def initialize(self, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         # Build this at execution, not binding/probing: each fresh run needs
         # its own differentiable stack even after an earlier backward freed AD.
@@ -615,10 +623,12 @@ class _BoundLFP(FunctionalCallback):
         return fields, self._observe(state, fields)
 
     def update(self, carry, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         return carry, self._observe(state, carry)
 
     def finalize(self, carry, emissions):
+        self._require_prepared()
         del carry
         return emissions
 
@@ -738,11 +748,11 @@ def _bind_threshold_configuration(
     return node_indices, threshold, start_step, end_step, callback_dt
 
 
-class _ThresholdCallback(FunctionalCallback):
+class _ThresholdCallback(_PreparedCallback):
     """Static user-facing configuration shared by threshold built-ins."""
 
     _bound_type = None
-    _prepared = False
+    _preparation_error = "functional threshold callbacks must be bound with functional.make_callbacks(...)"
     _checkpoint_fields = (
         "node_indices",
         "threshold",
@@ -778,37 +788,17 @@ class _ThresholdCallback(FunctionalCallback):
         )
         return _prepare_threshold_callback(self._bound_type, configuration)
 
-    def _require_prepared(self):
-        if not self._prepared:
-            raise FunctionalizationError(
-                "functional threshold callbacks must be bound with "
-                "functional.make_callbacks(...)"
-            )
-
-    def __setattr__(self, name, value):
-        if object.__getattribute__(self, "__dict__").get("_prepared", False):
-            raise FrozenInstanceError(f"cannot assign to field {name!r}")
-        object.__setattr__(self, name, value)
-
-    def __delattr__(self, name):
-        if object.__getattribute__(self, "__dict__").get("_prepared", False):
-            raise FrozenInstanceError(f"cannot delete field {name!r}")
-        object.__delattr__(self, name)
-
 
 def _prepare_threshold_callback(factory, configuration, activity=()):
     # Custom factories retain the normalized positional argument contract.
     if not any(factory is cls for cls in (Raster, APCount, ActiveAL, ActiveALCount)):
         return factory(*configuration, *activity)
-    prepared = object.__new__(factory)
     values = dict(
         zip(_ThresholdCallback._checkpoint_fields, configuration, strict=True)
     )
     if activity:
         values.update(zip(("at_least", "inv", "partition"), activity, strict=True))
-    values["_prepared"] = True
-    object.__getattribute__(prepared, "__dict__").update(values)
-    return prepared
+    return _prepare_callback(factory, values)
 
 
 def _is_prepared_threshold_callback(callback):
@@ -1081,16 +1071,19 @@ def _callback_implementation(callback):
     return callback.callback if type(callback) is _BoundPopulationCallback else callback
 
 
+def _is_prepared_lfp(callback):
+    return type(callback) is LFP and _is_prepared_callback(callback)
+
+
 def _is_builtin_callback(callback):
     callback = _callback_implementation(callback)
-    if _is_prepared_threshold_callback(callback):
+    if _is_prepared_callback(callback):
         return any(
-            type(callback) is cls for cls in (Raster, APCount, ActiveAL, ActiveALCount)
+            type(callback) is cls
+            for cls in (Recorder, LFP, Raster, APCount, ActiveAL, ActiveALCount)
         )
     return type(callback) in {
-        _BoundRecorder,
         _BoundCadencedRecorder,
-        _BoundLFP,
         AnomalyDetector,
     }
 

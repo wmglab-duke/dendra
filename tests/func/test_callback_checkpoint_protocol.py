@@ -711,9 +711,9 @@ def _legacy_configuration_value(value):
     if type(value) is dn.func.AnomalyDetector:
         return {"kind": "AnomalyDetector"}
     kinds = {
-        "_BoundRecorder": "Recorder",
+        "Recorder": "Recorder",
         "_BoundCadencedRecorder": "CadencedRecorder",
-        "_BoundLFP": "LFP",
+        "LFP": "LFP",
         "Raster": "Raster",
         "APCount": "APCount",
         "ActiveAL": "ActiveAL",
@@ -726,6 +726,10 @@ def _legacy_configuration_value(value):
         names = ("node_indices", "threshold", "start_step", "end_step", "callback_dt")
         if kind in ("ActiveAL", "ActiveALCount"):
             names += ("at_least", "inv", "partition")
+    elif kind == "Recorder":
+        names = ("states", "paths", "max_only", "node_indices", "partition", "region")
+    elif kind == "LFP":
+        names = ("fields", "rule", "padding", "device", "dtype")
     else:
         names = tuple(field.name for field in fields(value))
     return {

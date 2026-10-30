@@ -10,7 +10,8 @@ from dendra._bootstrap import torch_compiler_warning_context
 from dendra.func import StepInput, _population_while
 from dendra.func._callbacks import (
     AnomalyDetector,
-    _BoundRecorder,
+    Recorder,
+    _prepare_callback,
     _update_callback_values,
 )
 
@@ -118,16 +119,20 @@ def _case(steps=9):
     }
 
     def recorder(*, selected=False, maximum=False, clock=False):
-        return _BoundRecorder(
-            states=("t",) if clock else ("v", "view", "fixed"),
-            paths=(("clock", "t"),)
-            if clock
-            # The duplicate Recorder path deliberately emits the same state
-            # storage twice. Invocation-local history buffers must own both.
-            else (("integrator", "v"), ("integrator", "v"), ("fixed",)),
-            max_only=maximum,
-            node_indices=torch.tensor([0, nodes - 1, 0]) if selected else None,
-            partition=None,
+        return _prepare_callback(
+            Recorder,
+            {
+                "states": ("t",) if clock else ("v", "view", "fixed"),
+                "paths": (("clock", "t"),)
+                if clock
+                # The duplicate Recorder path deliberately emits the same state
+                # storage twice. Invocation-local history buffers must own both.
+                else (("integrator", "v"), ("integrator", "v"), ("fixed",)),
+                "max_only": maximum,
+                "node_indices": torch.tensor([0, nodes - 1, 0]) if selected else None,
+                "partition": None,
+                "region": None,
+            },
         )
 
     # Exercise the private executor's carry-ownership contract with an admitted

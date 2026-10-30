@@ -15,6 +15,7 @@ from ._callbacks import (
     AnomalyDetector,
     FunctionalCallbacks,
     Recorder,
+    _is_prepared_callback,
     _ThresholdCallback,
 )
 from ._types import FunctionalizationError
@@ -136,7 +137,9 @@ def make_network_callbacks(functional, callbacks):
     adapted = {}
     layout = None
     for name, callback in callbacks.items():
-        if isinstance(callback, Recorder):
+        if isinstance(callback, Recorder) and _is_prepared_callback(callback):
+            adapted[name] = callback
+        elif isinstance(callback, Recorder):
             if layout is None:
                 layout = _NetworkRecorderLayout(functional)
             ambiguous = layout.ambiguous.intersection(callback.states)

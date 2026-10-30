@@ -2286,6 +2286,13 @@ arguments of the ordinary recorder:
    spike_count = auxiliary["callbacks"]["spike_count"]
    active = auxiliary["callbacks"]["active"]
 
+Binding a Recorder, LFP or threshold callback prepares an independent immutable
+instance of its public class and leaves the supplied configuration unchanged.
+A prepared ``Recorder`` holds resolved paths, regions and selections; an
+``LFP`` holds field references and projection metadata. Evolving reduction state,
+field carry and sampling phase remain explicit callback carry. Configure selections
+before binding, and bind a new collection to change them.
+
 For ``torch.func`` transforms, keep host-duration scheduling outside the
 transformed function and use the fixed-step tensor operation directly:
 
@@ -2389,6 +2396,11 @@ imperative LFP callback. Both LFP and Recorder include the initial boundary
 and accepted post-step values, support callback continuation, and work with
 scan, checkpointed scan, and inference-only while execution. Lead fields can
 be differentiated through scan and checkpoint replay.
+
+LFP preparation retains the original field Tensor references without building
+an autograd graph. Each fresh initialization creates a differentiable field
+stack for that run; subsequent fresh runs can therefore backpropagate
+independently. Resumed callback state retains its initialized field stack.
 
 Named cells and regions in a MultiPopulation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
