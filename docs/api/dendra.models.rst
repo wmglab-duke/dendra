@@ -275,11 +275,11 @@ public classes
 implement the pure hooks directly. ``Active`` uses the ``ActiveAL(at_least=1)``
 rule. Changing analysis state belongs to explicit carry, and supplied
 configuration objects remain unchanged. Each fresh LFP initialization builds a
-new differentiable field stack; preparation retains no autograd graph. See
+new differentiable field stack from its bound Tensor sources. See
 :doc:`../advanced/A27_functional_network_callbacks` for timing, result shapes
 and Population scopes.
 
-Native ``dn.callbacks.APCount``, ``Raster`` and ``AnomalyDetector``
+Native ``dn.callbacks.LFP``, ``APCount``, ``Raster`` and ``AnomalyDetector``
 configurations are accepted by functional callback collections and ``dn.compile``.
 Their ``dn.func`` entry points remain supported. Population-scoped Network
 bindings use ``dn.func.PopulationCallback(name, callback)``. Configuration
@@ -295,6 +295,17 @@ bytes per checked slot. Threshold detection and count updates are
 nondifferentiable. Portable restoration accepts valid legacy ``int64`` and
 ``float32`` count carry after checking that its values are finite, nonnegative
 integers within the ``int32`` range; unsafe values are rejected.
+
+Native and functional LFP share a batch-preserving default projection, summing
+cell and compartment axes. Explicit ``rule`` strings select exactly that
+``torch.einsum`` reduction, including rules that sum batch lanes. Lead fields
+are prepared in the observed Population's dtype and device without detaching
+their gradients. Authored field aliases remain shared, and public native
+``v_unit`` buffer edits made before binding are respected. Functional binding
+does not import native recording history. Bind a new collection after changing
+the native buffer selection or projection rule. Live continuation retains field
+gradients; portable restoration retains detached field carry. See
+:ref:`functional-shared-lfp-configuration` for the runnable example.
 
 Recorder cadence selects the initial boundary and accepted-step multiples of
 ``int(record_dt / solver_dt)`` for both in-memory and HDF5 output. Configure

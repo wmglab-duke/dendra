@@ -110,7 +110,7 @@ execution mode:
    counts = auxiliary["callbacks"]["counts"]
 
 The mapping accepts ``dn.func.FunctionalCallback`` configurations and the
-built-in ``dn.Recorder``, ``dn.callbacks.APCount``, ``Raster`` and
+built-in ``dn.Recorder``, ``dn.callbacks.LFP``, ``APCount``, ``Raster`` and
 ``AnomalyDetector`` configurations. Pass configurations rather than an
 already-bound collection. Names such as
 ``"trace"`` are user-defined and have no special meaning. Threshold-only reducers
@@ -2262,8 +2262,8 @@ Use ``dn.Recorder`` to configure recording for native models, ``dn.compile``
 runners, and functional callback collections. ``dn.func.Recorder`` remains a
 supported entry point for pure recording. Functional execution prepares the
 selected observations without invoking an imperative callback's hooks or
-reading changing values from the source model. Native ``dn.callbacks.APCount``,
-``Raster`` and ``AnomalyDetector`` configurations also bind to functional
+reading changing values from the source model. Native ``dn.callbacks.LFP``,
+``APCount``, ``Raster`` and ``AnomalyDetector`` configurations also bind to functional
 execution; the corresponding ``dn.func`` constructors remain supported. Other
 functional callbacks use the pure ``FunctionalCallback`` API. Give each callback
 a stable result name and bind the collection once, outside repeated simulations:
@@ -2309,8 +2309,10 @@ explicit ``dt`` must match it. Binding captures configuration without importing
 or updating native ``record``, ``state_cache`` or step counters. AnomalyDetector
 likewise starts from fresh explicit carry. Continue detection with the returned
 ``Continuation`` or callback state, rather than a mutable native callback's
-history. Native LFP and Active-family configurations are currently unsupported;
-use their ``dn.func`` constructors.
+history. Native Active-family configurations are currently unsupported;
+use their ``dn.func`` constructors. Native ``dn.callbacks.LFP`` captures its
+projection configuration and lead-field sources without importing or updating
+native recording history.
 
 For ``torch.func`` transforms, keep host-duration scheduling outside the
 transformed function and use the fixed-step tensor operation directly:
@@ -2385,15 +2387,17 @@ finite-extracellular topologies, including ``MultiPopulation``. Select
    final_state, auxiliary = runner()
    current_mA = auxiliary["callbacks"]["trace"]["i_membrane"]
 
-``dn.func.LFP(lead_fields)`` records the lead-field projection directly, without
+``dn.callbacks.LFP(lead_fields)`` configures native and functional lead-field
+recording; ``dn.func.LFP`` remains supported. It records the projection directly, without
 emitting a full membrane-current history. ``lead_fields`` is a nonempty list
 of equally shaped tensors, one per recording contact. Fields in mV/mA
 (numerically ohms) multiplied by membrane current in mA give recorded mV.
 The default projection sums physical cell and compartment axes, preserving
 explicit batch axes. Its output has shape ``(samples, *batch, contacts)``.
 Each field must broadcast to the model voltage shape; an unbatched field can
-therefore be shared across batches. Fields are moved to the functional plan's
-device and dtype without detaching their gradients.
+therefore be shared across batches. Native and functional preparation move
+fields to the observed Population's device and dtype without detaching their
+gradients.
 
 .. code-block:: python
 
@@ -2402,24 +2406,33 @@ device and dtype without detaching their gradients.
        dt=0.025,
        steps=800,
        inference=False,  # Differentiable scan; omit for inference-only use.
-       callbacks={"lfp": dn.func.LFP(lead_fields)},
+       callbacks={"lfp": dn.callbacks.LFP(lead_fields)},
    )
    final_state, auxiliary = runner()
    potential_mV = auxiliary["callbacks"]["lfp"]
 
 For a custom projection, ``LFP(lead_fields, rule=...)`` uses
 ``torch.einsum(rule, current, torch.stack(lead_fields))`` exactly. The contact
-axis is first in the stacked fields. Unlike this explicit rule, the default
-never sums explicit batch lanes. For unbatched models it matches the ordinary
-imperative LFP callback. Both LFP and Recorder include the initial boundary
-and accepted post-step values, support callback continuation, and work with
-scan, checkpointed scan, and inference-only while execution. Lead fields can
-be differentiated through scan and checkpoint replay.
+axis is first in the stacked fields. Omitting ``rule`` selects the same
+batch-preserving default in native and functional execution. Supplying a rule
+selects that exact reduction, including ``rule="...,n...->n"``, which sums
+batch lanes. Functional LFP and Recorder include the initial boundary on fresh
+runs and accepted post-step values; continuation omits the shared boundary.
+They work with scan, checkpointed scan, and inference-only while execution.
+Lead fields can be differentiated through scan and checkpoint replay.
 
-LFP preparation retains the original field Tensor references without building
-an autograd graph. Each fresh initialization creates a differentiable field
+LFP binding retains field Tensor sources and projection metadata.
+Each fresh initialization creates a differentiable field
 stack for that run; subsequent fresh runs can therefore backpropagate
 independently. Resumed callback state retains its initialized field stack.
+Authored field Tensor aliases remain shared. Edits or replacements of a native
+configuration's public ``v_unit`` buffer made before binding are respected.
+Bind a new collection after changing its buffer selection or projection rule.
+Portable continuation restores detached field carry, without a gradient
+connection to the receiving configuration's fields. Use live continuation to
+retain gradients across the boundary. The complete
+:ref:`shared LFP configuration example <functional-shared-lfp-configuration>`
+covers a batched Population and Network.
 
 Named cells and regions in a MultiPopulation
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

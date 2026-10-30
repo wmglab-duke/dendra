@@ -13,6 +13,11 @@ from h5py import File
 from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ..helpers import nojit
+from ._lfp_callbacks import (
+    _materialize_lfp_fields,
+    _project_lfp,
+    _validate_lfp_fields,
+)
 from ._recorder_cadence import _recorder_should_save, _recorder_stride
 from ._threshold_callbacks import _COUNT_DTYPE, _anomaly_flags, _restore_count
 from ._threshold_callbacks import accumulate_count as _accumulate_count
@@ -1055,9 +1060,10 @@ class LFP(Callback):
         stacks the list along a leading contact dimension. Pass ``[lead_field]``
         for one contact.
     rule : str, optional
-        Einstein summation rule for computing the dot product. Default is None,
-        which uses the rule ``"...,n...->n"`` and sums over all dimensions except
-        the field index.
+        Explicit Einstein summation rule for computing the dot product. The
+        default sums the physical cell and compartment axes, preserving batch
+        axes, and produces ``(*batch, contacts)`` per sample. An explicit rule
+        is passed to ``torch.einsum`` without changing its reductions.
 
     Notes
     -----
@@ -1097,45 +1103,229 @@ class LFP(Callback):
 
     def __init__(self, v_unit: list[torch.Tensor], rule=None):
         super().__init__()
-        if not isinstance(v_unit, list):
-            raise TypeError(
-                "v_unit must be a non-empty list of lead-field tensors; "
-                "pass [lead_field] for one recording contact."
-            )
-        if not v_unit:
-            raise ValueError("v_unit must contain at least one lead-field tensor.")
-        if not all(isinstance(field, torch.Tensor) for field in v_unit):
-            raise TypeError("Every v_unit entry must be a torch.Tensor.")
-        field_shape = v_unit[0].shape
-        if any(field.shape != field_shape for field in v_unit[1:]):
-            raise ValueError("All v_unit lead-field tensors must have the same shape.")
+        fields = _validate_lfp_fields(v_unit)
         self._lfp = []
         self._t = []
-        self.register_buffer("v_unit", torch.stack(v_unit))
-        if rule is None:
-            rule = "...,n...->n"
-        self.rule = rule
+        self.register_buffer("v_unit", torch.stack(fields))
+        self._capture_lfp_fields(fields)
+        # Retain the public default spelling while distinguishing it from the
+        # same string supplied explicitly as a custom all-axis reduction.
+        self.rule = "...,n...->n" if rule is None else rule
+        object.__setattr__(self, "_configured_lfp_rule", rule)
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name == "v_unit" and not self.__dict__.get("_binding_lfp_fields", False):
+            self._retire_lfp_fields()
+        elif name == "rule":
+            object.__setattr__(self, "_configured_lfp_rule", value)
+
+    @staticmethod
+    def _lfp_tensor_version(value):
+        if type(value) in (torch.Tensor, torch.nn.Parameter):
+            try:
+                return value._version
+            except RuntimeError:
+                pass  # Inference tensors have no mutation version.
+        return None
+
+    def _capture_lfp_fields(self, fields, *, stacked_source=None):
+        current = self.v_unit
+        object.__setattr__(self, "_configured_lfp_fields", fields)
+        object.__setattr__(self, "_configured_lfp_stacked_source", stacked_source)
+        object.__setattr__(self, "_published_lfp_fields", current)
+        object.__setattr__(
+            self, "_published_lfp_fields_version", self._lfp_tensor_version(current)
+        )
+        object.__setattr__(
+            self, "_published_lfp_fields_snapshot", current.detach().clone()
+        )
+
+    def _retire_lfp_fields(self):
+        for name in (
+            "_configured_lfp_fields",
+            "_configured_lfp_stacked_source",
+            "_published_lfp_fields",
+            "_published_lfp_fields_version",
+            "_published_lfp_fields_snapshot",
+        ):
+            object.__setattr__(self, name, None)
+
+    def _lfp_fields_unchanged(self):
+        current = self.v_unit
+        if (
+            self.__dict__.get("_configured_lfp_fields") is not None
+            and self.__dict__.get("_published_lfp_fields") is current
+        ):
+            snapshot = self._published_lfp_fields_snapshot
+            if (
+                current.shape != snapshot.shape
+                or current.dtype != snapshot.dtype
+                or current.device != snapshot.device
+            ):
+                return False
+            version = self._published_lfp_fields_version
+            if version is not None:
+                return self._lfp_tensor_version(current) == version
+            if torch.is_complex(current):
+                current, snapshot = (
+                    torch.view_as_real(current),
+                    torch.view_as_real(snapshot),
+                )
+            if torch.is_floating_point(current):
+                return bool(
+                    torch.all(
+                        (current == snapshot)
+                        | (torch.isnan(current) & torch.isnan(snapshot))
+                    )
+                )
+            return torch.equal(current, snapshot)
+        return False
+
+    def _lfp_stacked_source(self):
+        if self._lfp_fields_unchanged():
+            return self.__dict__.get("_configured_lfp_stacked_source")
+        return self.v_unit
+
+    def _lfp_field_configuration(self):
+        source = self._lfp_stacked_source()
+        if source is None:
+            return self._configured_lfp_fields
+        if not torch.is_inference(source):
+            # Rebuild views from their authoritative owner for every fresh
+            # capture, retaining gradients after optimizer updates to a leaf
+            # Tensor that is itself a view of a non-trainable base.
+            with torch.inference_mode(False), torch.enable_grad():
+                return tuple(source[index] for index in range(source.shape[0]))
+        return tuple(source.unbind(0))
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        unchanged = self._lfp_fields_unchanged()
+        state["_lfp_serialized_sources_unchanged"] = unchanged
+        if not unchanged:
+            state["_configured_lfp_fields"] = None
+            state["_configured_lfp_stacked_source"] = None
+        return state
+
+    def __setstate__(self, state):
+        unchanged = state.pop("_lfp_serialized_sources_unchanged", False)
+        super().__setstate__(state)
+        if unchanged:
+            # Tensor copies may reset mutation versions. Rebase only when
+            # serialization recorded that no public-buffer edit had occurred.
+            object.__setattr__(self, "_published_lfp_fields", self.v_unit)
+            object.__setattr__(
+                self,
+                "_published_lfp_fields_version",
+                self._lfp_tensor_version(self.v_unit),
+            )
+        else:
+            self._retire_lfp_fields()
+
+    def _lfp_rule_configuration(self):
+        public = self.rule
+        if (
+            self.__dict__.get("_configured_lfp_rule", public) is None
+            and isinstance(public, str)
+            and str.__eq__(public, "...,n...->n")
+        ):
+            return None
+        return public
+
+    def _functional_lfp_configuration(self):
+        """Project field sources and reductions without native recording history."""
+        return {
+            "v_unit": list(self._lfp_field_configuration()),
+            "rule": self._lfp_rule_configuration(),
+        }
+
+    def _publish_lfp_fields(self, value, fields, *, stacked_source=None):
+        previous = self.__dict__.get("_binding_lfp_fields", False)
+        object.__setattr__(self, "_binding_lfp_fields", True)
+        try:
+            self.v_unit = value
+        finally:
+            object.__setattr__(self, "_binding_lfp_fields", previous)
+        self._capture_lfp_fields(fields, stacked_source=stacked_source)
+
+    def _apply(self, fn, recurse=True):
+        previous = self.v_unit
+        result = super()._apply(fn, recurse=recurse)
+        if self.v_unit is not previous:
+            self._retire_lfp_fields()
+        return result
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        errors = len(error_msgs)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if prefix + "v_unit" in state_dict and len(error_msgs) == errors:
+            # Loading the public buffer is authoritative even when its values
+            # happen to match an earlier publication of mutable raw sources.
+            self._retire_lfp_fields()
+
+    def _observe_lfp(self, current):
+        rule = self._lfp_rule_configuration()
+        fields = self.v_unit
+        if isinstance(fields, torch.nn.Parameter):
+            fields = fields.to(device=current.device, dtype=current.dtype)
+        padding = current.ndim - fields.ndim + 1 if rule is None else 0
+        return _project_lfp(current, fields, rule=rule, padding=padding)
 
     def pre_loop_hook(self, model):
         """
         Validate IMEM availability and record the baseline LFP.
 
-        Moves ``v_unit`` to the model device, raises if the model was not
-        compiled with membrane current output, and stores the t=0 dot product
-        between ``model.i_membrane`` and ``v_unit``.
+        Materializes lead fields at the membrane current's dtype and device,
+        raises if the model lacks membrane-current output, and records the
+        initial lead-field projection. Raw sources retain their aliases across
+        fresh native runs until the public ``v_unit`` buffer is overridden.
         """
         if not model.integrator.imem:
             raise RuntimeError(
                 "Model must be compiled with IMEM=1. Use with dn.ctx(IMEM=1): model = ..."
             )
-        self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
-        self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
+        current = model.i_membrane
+        stacked_source = self._lfp_stacked_source()
+        fields = self._lfp_field_configuration()
+        if self._lfp_rule_configuration() is None:
+            shape = torch.broadcast_shapes(fields[0].shape, current.shape)
+            if tuple(shape) != tuple(current.shape):
+                raise ValueError(
+                    "LFP lead fields must broadcast to the Population shape "
+                    f"{tuple(current.shape)}; got {tuple(fields[0].shape)}"
+                )
+        if not isinstance(self.v_unit, torch.nn.Parameter):
+            materialized = _materialize_lfp_fields(
+                fields, device=current.device, dtype=current.dtype
+            )
+            self._publish_lfp_fields(
+                materialized, fields, stacked_source=stacked_source
+            )
+        self._lfp.append(self._observe_lfp(current))
         return super().pre_loop_hook(model)
 
     @nojit
     def post_step_hook(self, model):
-        """Append the LFP after each step via ``torch.einsum`` with ``v_unit``."""
-        self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
+        """Append the shared lead-field projection after each accepted step."""
+        self._lfp.append(self._observe_lfp(model.i_membrane))
 
     @property
     def lfp(self):

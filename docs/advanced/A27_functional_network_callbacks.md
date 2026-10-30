@@ -83,7 +83,7 @@ values and recording phase
 belong to explicit carry. Prepared Network Recorder paths and regions keep
 their resolved meaning when used by the collection.
 
-`dn.callbacks.APCount`, `Raster` and `AnomalyDetector` configurations can also
+`dn.callbacks.LFP`, `APCount`, `Raster` and `AnomalyDetector` configurations can also
 be supplied to functional binding and `dn.compile`; their `dn.func` counterparts
 remain supported. Wrap them in `PopulationCallback` for a Network. APCount and
 Raster use authored selectors and timing settings, rather than importing native
@@ -91,8 +91,10 @@ counts, crossing latches, normalized indices or run counters. Negative selectors
 resolve against the selected Population. An omitted `dt` uses its functional
 timestep; an explicit value must match. Bind a new collection after editing
 configuration. Native execution retains ownership of its callback histories.
-Use the `dn.func` constructors for LFP and Active-family callbacks; their native
-configurations are currently unsupported in functional binding.
+Use the `dn.func` constructors for Active-family callbacks; their native
+configurations are currently unsupported in functional binding. Native LFP
+configuration supplies lead-field sources and projection settings without
+importing or updating its recording history.
 
 Record mechanism state with qualified names such as `"left.hh.m"`, or relative
 names such as `"hh.m"` inside a Population-scoped Recorder. The result keeps the
@@ -122,6 +124,13 @@ projection sums the cell and compartment axes. Its result has shape
 current has shape `(2, 2, 3)`, each lead field has shape `(2, 3)`, and two
 contacts produce `(frames, 2, 2)`.
 
+This default applies to native and functional LFP. Supplying `rule=...` uses
+`torch.einsum(rule, current, stacked_fields)` exactly, with the contact axis
+first in the stacked fields. In particular, explicitly passing
+`rule="...,n...->n"` sums batch axes; omitting `rule` preserves them. Fields
+are prepared in the observed Population's dtype and device without detaching
+gradients.
+
 ```{literalinclude} ../../examples/functional_network_callbacks.py
 :language: python
 :start-after: "# region gradients"
@@ -136,10 +145,48 @@ membrane-current history is stored only if a Recorder also selects it. The
 example records that history to verify the projection and its lead-field
 gradient. Omit that Recorder when only electrode signals are needed.
 
-LFP preparation retains the original lead-field Tensor objects and builds no
-autograd graph. Each fresh callback initialization constructs its own
+LFP binding retains lead-field Tensor sources and projection metadata.
+Each fresh callback initialization constructs its own
 differentiable field stack, so a later fresh run supports an independent
 backward pass. Continuation retains the initialized stack in explicit carry.
+Authored field aliases remain shared. Changes to a native configuration's
+public `v_unit` buffer made before binding are respected. Bind a new collection
+after changing its buffer selection or projection rule.
+
+(functional-shared-lfp-configuration)=
+## Share LFP configuration
+
+Use `dn.callbacks.LFP(fields)` for native runs and functional simulations;
+`dn.func.LFP(fields)` remains supported. For a Network, wrap it in
+`PopulationCallback(name, callback)` to select the observed Population.
+Construct that Population with `IMEM=True` and an integrator that exposes
+membrane-current output.
+
+The complete
+{download}`functional_lfp_configuration.py <../../examples/functional_lfp_configuration.py>`
+example checks the default projection for a batched Population and Network,
+independent fresh backward passes through trainable fields, live continuation,
+and portable checkpoint restoration:
+
+```bash
+python examples/functional_lfp_configuration.py
+python examples/functional_lfp_configuration.py --backend aot_eager
+python examples/functional_lfp_configuration.py --section network --execution while
+```
+
+```{literalinclude} ../../examples/functional_lfp_configuration.py
+:language: python
+:start-after: "# region configuration"
+:end-before: "# endregion configuration"
+:dedent: 4
+```
+
+Fresh functional output includes the initial boundary. A continued call emits
+only new accepted-step samples, so concatenating the segments reproduces an
+uninterrupted result. Live continuation preserves the initialized field graph.
+Portable continuation restores detached field carry; it does not connect to
+the receiving configuration's field gradients. Native recording history is
+separate from this functional carry.
 
 (functional-shared-threshold-configuration)=
 ## Share spike-analysis configuration

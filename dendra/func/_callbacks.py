@@ -17,6 +17,11 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dendra.models._lfp_callbacks import (
+    _materialize_lfp_fields,
+    _project_lfp,
+    _validate_lfp_fields,
+)
 from dendra.models._threshold_callbacks import (
     _COUNT_DTYPE,
     _anomaly_flags,
@@ -144,6 +149,7 @@ def _native_callback_implementations():
 
     return (
         (native.Recorder, Recorder),
+        (native.LFP, LFP),
         (native.APCount, APCount),
         (native.Raster, Raster),
         (native.AnomalyDetector, AnomalyDetector),
@@ -196,6 +202,10 @@ def _coerce_callback_configuration(callback):
     if type(callback) is not NativeRecorder:
         if implementation is AnomalyDetector:
             return implementation()
+        if implementation is LFP:
+            configured = implementation(**callback._functional_lfp_configuration())
+            configured._stacked_source = callback._lfp_stacked_source()
+            return configured
         return implementation(**callback._functional_threshold_configuration())
     generated = getattr(callback, "_recorder_generated_hooks", ())
     if (
@@ -626,9 +636,8 @@ class LFP(_PreparedCallback):
     By default each field must broadcast to the Population voltage shape.
     The projection sums its physical cell and compartment axes, preserving
     any explicit batch axes: results have shape ``(samples, *batch, contacts)``.
-    For an unbatched Population this matches the ordinary :class:`dendra.callbacks.LFP`
-    convention. Unlike the ordinary default, explicit batch lanes are never
-    silently summed. An explicit ``rule`` uses ``torch.einsum(rule, current,
+    Native and functional execution use this same default projection. An
+    explicit ``rule`` uses ``torch.einsum(rule, current,
     stacked_fields)`` exactly, with fields stacked on their leading contact
     axis, and permits custom reductions.
 
@@ -645,23 +654,13 @@ class LFP(_PreparedCallback):
 
     _preparation_error = "dn.func.LFP must be bound with functional.make_callbacks(...)"
     _checkpoint_fields = ("fields", "rule", "padding", "device", "dtype")
+    _stacked_source = None
 
     def __init__(self, v_unit: list[torch.Tensor], rule=None):
-        if not isinstance(v_unit, list):
-            raise TypeError(
-                "v_unit must be a non-empty list of lead-field tensors; "
-                "pass [lead_field] for one recording contact."
-            )
-        if not v_unit:
-            raise ValueError("v_unit must contain at least one lead-field tensor.")
-        if not all(isinstance(field, torch.Tensor) for field in v_unit):
-            raise TypeError("Every v_unit entry must be a torch.Tensor.")
-        shape = v_unit[0].shape
-        if any(field.shape != shape for field in v_unit[1:]):
-            raise ValueError("All v_unit lead-field tensors must have the same shape.")
+        fields = _validate_lfp_fields(v_unit)
         if rule is not None and not isinstance(rule, str):
             raise TypeError("functional LFP rule must be a string or None")
-        self.v_unit = tuple(v_unit)
+        self.v_unit = fields
         self.rule = rule
 
     def _bind(self, functional: FunctionalPopulation):
@@ -696,27 +695,32 @@ class LFP(_PreparedCallback):
                 "padding": padding,
                 "device": functional.device,
                 "dtype": functional.dtype,
+                "_stacked_source": self._stacked_source,
             },
         )
 
+    def _materialization_fields(self):
+        source = self._stacked_source
+        if source is None:
+            return self.fields
+        # Read a public stacked source afresh: cached views of a leaf view can
+        # lose their AD connection when its owner is updated between runs.
+        return tuple(source[index] for index in range(source.shape[0]))
+
     def _observe(self, state, fields):
-        current = state["integrator"]["i_membrane"]
-        if self.rule is not None:
-            return torch.einsum(self.rule, current, fields)
-        return (current.unsqueeze(0) * fields).sum(dim=(-1, -2)).movedim(0, -1)
+        return _project_lfp(state["integrator"]["i_membrane"], fields, rule=self.rule)
 
     def initialize(self, state, auxiliary):
         self._require_prepared()
         del auxiliary
         # Build this at execution, not binding/probing: each fresh run needs
         # its own differentiable stack even after an earlier backward freed AD.
-        fields = torch.stack(
-            [field.to(device=self.device, dtype=self.dtype) for field in self.fields]
+        fields = _materialize_lfp_fields(
+            self._materialization_fields(),
+            device=self.device,
+            dtype=self.dtype,
+            padding=self.padding if self.rule is None else None,
         )
-        if self.rule is None:
-            fields = fields.reshape(
-                fields.shape[0], *((1,) * self.padding), *fields.shape[1:]
-            )
         return fields, self._observe(state, fields)
 
     def update(self, carry, state, auxiliary):

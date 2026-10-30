@@ -177,6 +177,14 @@ preparation retains the raw field references without caching that graph.
 Portable continuation saves the detached stack as callback carry, alongside
 the checked metadata.
 
+Both `dn.callbacks.LFP` and `dn.func.LFP` bind to this same functional
+configuration and carry contract. Native recording history is not imported.
+The default rule preserves explicit batch lanes; a supplied einsum rule keeps
+its exact reduction. Construct equivalent receiving fields and projection
+settings before restoration. The
+{ref}`shared LFP configuration example <functional-shared-lfp-configuration>`
+checks live and portable continuation for a batched Population and Network.
+
 `dn.Recorder` supplies the same observation configuration to native and
 functional execution. HDF5 storage is a separate host session: portable
 continuation includes the Recorder's numerical sampling phase, but excludes

@@ -214,6 +214,17 @@ Both APCount entry points return `torch.int32` counts, with four bytes per
 checked slot. These exact integer observations do not require gradients;
 gradients through model state and floating-point recordings remain available.
 
+`dn.callbacks.LFP(fields)` configures native and functional extracellular
+recording; `dn.func.LFP` remains supported. Wrap it in `PopulationCallback` for
+a Network and enable membrane-current output on the observed Population.
+The default projection sums cell and compartment axes, preserving batch lanes;
+an explicit `rule` is applied exactly. Fields in mV/mA multiplied by membrane
+current in mA produce mV. Each fresh functional run builds its own
+differentiable field stack. Live continuation retains that graph; portable
+restoration uses detached field carry. See the
+{ref}`complete LFP example <functional-shared-lfp-configuration>` for both
+Population and Network execution.
+
 `auxiliary["continuation"]` carries
 the returned simulation state, effective bindings and callback state together.
 Pass it to the next call to continue without recording the shared boundary twice:
