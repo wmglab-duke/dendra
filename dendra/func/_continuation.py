@@ -99,6 +99,16 @@ class Continuation:
             )
         )
         object.__setattr__(self, "callback_state", carry)
+        # Manual packets retain conservative portable-checkpoint behavior.
+        # Producer provenance stays outside the public dataclass fields.
+        object.__setattr__(self, "_lifecycle", "unspecified")
+
+
+def _make_continuation(state, parameters, constants, callback_state=None, *, lifecycle):
+    """Preserve ordinary construction before attaching producer provenance."""
+    continuation = Continuation(state, parameters, constants, callback_state)
+    object.__setattr__(continuation, "_lifecycle", lifecycle)
+    return continuation
 
 
 def _resolve_continuation(state, parameters, constants, callback_state, initialization):
@@ -122,11 +132,12 @@ def _resolve_continuation(state, parameters, constants, callback_state, initiali
 def _complete_continuation(state, auxiliary, parameters, constants):
     result = dict(auxiliary)
     callbacks = result.get("callbacks")
-    result["continuation"] = Continuation(
+    result["continuation"] = _make_continuation(
         state,
         parameters,
         constants,
         None if callbacks is None else callbacks.state,
+        lifecycle="active",
     )
     return state, result
 

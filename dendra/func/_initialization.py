@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 import torch
 
-from ._continuation import Continuation
+from ._continuation import _make_continuation
 from ._network_bindings import _map_containers
 from ._types import FunctionalizationError, InitializationInput, PopulationTensors
 
@@ -132,7 +132,9 @@ def _initialize_continuation(functional, parameters, constants, state, selected)
         parameters, constants = initialized.parameters, initialized.constants
         if isinstance(functional, FunctionalNetwork):
             constants = functional._bind_parameter_constants(parameters, constants)
-        return Continuation(initialized.state, parameters, constants)
+        return _make_continuation(
+            initialized.state, parameters, constants, lifecycle="unstarted"
+        )
 
 
 def initialize(

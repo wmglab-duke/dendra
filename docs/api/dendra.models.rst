@@ -137,14 +137,20 @@ against a compatible receiving plan with
 ``dn.func.restore_continuation(receiving, saved, callbacks=receiving_callbacks)``.
 Each explicitly supplied callback collection must belong to its respective
 plan; omit it for callback-free continuation. Bind the returned sources with
-``receiving_kernel.bind(restored)`` before using ``dn.func.run``. The same format is supported by
-``runner.export_continuation(packet)`` and
-``receiver.restore_continuation(saved)``. The versioned plain data/Tensor format
+``receiving_kernel.bind(restored)`` before using ``dn.func.run``. For compiled
+Population and Network runners, use ``dn.func.export_continuation(runner, packet)``
+and ``dn.func.restore_continuation(receiver, saved)``; they select the runners'
+configured callbacks. ``runner.export_continuation(packet)`` and
+``receiver.restore_continuation(saved)`` are equivalent methods.
+The versioned plain data/Tensor format
 preserves effective raw sources, tied Tensor identities and trainability.
 Restored sources are independent leaves; receiver defaults and RNG are
 unchanged, and restoration does not extract native state, initialize, prepare,
-sample or execute a model. Same dtype/device, source/state schemas and callback
-compatibility are required. The functions and methods reuse the callback
+sample or execute a model. Same dtype/device and source/state schemas are
+required. Packets returned by ``dn.func.initialize`` can be saved before
+recording begins; restored packets start the configured callbacks on first
+execution. Executed packets require matching callback configuration, including
+zero-step calls. The functions and methods reuse the callback
 export/restore bridge; the in-memory
 ``Continuation`` object itself is not the portable format. See
 :doc:`../advanced/A57_functional_api_overview` and the complete

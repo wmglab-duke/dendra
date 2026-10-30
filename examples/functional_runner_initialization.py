@@ -7,12 +7,15 @@ Run from the repository root::
     python examples/functional_runner_initialization.py --backend aot_eager
 
 The short CPU Population and Network examples check effective sources, aliases,
-initialization gradients and recording continuation. They do not time execution.
+initialization gradients, recording continuation and portable initialization
+checkpoints. They do not time execution.
 """
 
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import torch
 
@@ -134,9 +137,30 @@ def run_demo(network, backend):
         torch.isfinite(value).all() and value.abs().sum() > 0 for value in gradients
     )
     # endregion run
+
+    # region initial_checkpoint
+    with TemporaryDirectory() as directory:
+        path = Path(directory) / "initial.pt"
+        saved = dn.func.export_continuation(program, initial)
+        assert saved["callbacks"] is None
+        torch.save(saved, path)
+        restored = dn.func.restore_continuation(
+            program, torch.load(path, weights_only=True)
+        )
+    assert restored.callback_state is None
+    restored_final, recorded = program(restored, steps=5)
+    torch.testing.assert_close(restored_final, expected)
+    torch.testing.assert_close(
+        recorded["callbacks"]["trace"], whole["callbacks"]["trace"]
+    )
+    assert recorded["callbacks"]["trace"]["t"].shape == (6,)
+    assert recorded["continuation"].callback_state is not None
+    _, continued = program(recorded["continuation"], steps=0)
+    assert continued["callbacks"]["trace"]["t"].numel() == 0
+    # endregion initial_checkpoint
     print(
         f"{'Network' if network else 'Population'}: runner initialization, "
-        "effective aliases, live gradients and recording continuation passed"
+        "effective aliases, live gradients, recording and disk continuation passed"
     )
 
 

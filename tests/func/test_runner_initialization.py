@@ -437,10 +437,10 @@ def test_initialized_runner_checkpoint_starts_callbacks_once_and_resumes_recorde
     monkeypatch.setattr(program.callbacks, "_initialize", counted)
     initial = dn.func.initialize(program)
     assert calls == [] and initial.callback_state is None
-    saved = dn.func.export_continuation(program.functional, initial)
+    saved = dn.func.export_continuation(program, initial)
     torch.save(saved, tmp_path / "initial.pt")
     restored = dn.func.restore_continuation(
-        program.functional, torch.load(tmp_path / "initial.pt", weights_only=True)
+        program, torch.load(tmp_path / "initial.pt", weights_only=True)
     )
     assert restored.callback_state is None and calls == []
     if network:
@@ -627,7 +627,9 @@ def test_runner_initializer_does_not_require_runtime_extra_bindings(network):
 
 
 @pytest.mark.mps
-def test_mps_runner_initialization_preserves_caller_gradients_and_while_continuation():
+def test_mps_runner_initialization_preserves_caller_gradients_and_while_continuation(
+    tmp_path,
+):
     if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
         pytest.skip("MPS hardware is unavailable")
     assert os.environ.get("PYTORCH_ENABLE_MPS_FALLBACK", "0") == "0"
@@ -666,3 +668,12 @@ def test_mps_runner_initialization_preserves_caller_gradients_and_while_continua
         final, auxiliary = program(actual)
         _close(final, reference)
         _close(auxiliary["callbacks"], outputs["callbacks"])
+        saved = dn.func.export_continuation(program, actual)
+        torch.save(saved, tmp_path / "initial.pt")
+        restored = dn.func.restore_continuation(
+            program, torch.load(tmp_path / "initial.pt", weights_only=True)
+        )
+        assert restored.callback_state is None
+        resumed_final, resumed = program(restored)
+        _close(resumed_final, reference)
+        _close(resumed["callbacks"], outputs["callbacks"])

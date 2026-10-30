@@ -539,23 +539,25 @@ through the existing APIs. The first execution starts the configured callbacks
 and records their initial boundary once; subsequent continuation calls retain
 their carry and sampling phase.
 
-To export an initialized packet before callbacks begin, use the shared checkpoint
-functions with callbacks omitted:
+The shared checkpoint functions accept the runner directly, including when it
+has configured callbacks:
 
 ```python
-saved = dn.func.export_continuation(program.functional, initial)
-restored = dn.func.restore_continuation(program.functional, saved)
+saved = dn.func.export_continuation(program, initial)
+restored = dn.func.restore_continuation(program, saved)
 state, auxiliary = program(restored)
 ```
 
 Restoration creates detached source leaves, following the checkpoint contract
 below. The runner starts its configured callbacks on the restored initial state.
+`program.export_continuation(initial)` and `program.restore_continuation(saved)`
+provide equivalent method forms.
 
 The complete
 {download}`functional_runner_initialization.py <../../examples/functional_runner_initialization.py>`
 example initializes snapshot-policy Population and Network runners with raw
 parameter and voltage overrides. It checks effective shared sources, live
-gradients and joined recordings:
+gradients, joined recordings and disk restoration before recording begins:
 
 ```console
 python examples/functional_runner_initialization.py
@@ -749,25 +751,32 @@ state, auxiliary = dn.func.run(
 ```
 
 Each supplied callback collection must belong to its corresponding functional
-plan. Omit it for callback-free continuation. Restoration creates new owned
+plan. Omit it when callbacks are not used. Restoration creates new owned
 source leaves; bind those exact restored objects before resuming. The complete
 {download}`functional_explicit_continuation_checkpoints.py <../../examples/functional_explicit_continuation_checkpoints.py>`
 example checks both model kinds, disk restoration, aliases, recording and
 suffix gradients.
 
-Both convenience runners provide the same operations as methods:
+The same functions accept compiled Population and Network runners and select
+their configured callbacks; omit `callbacks=` for runner targets:
 
 ```python
-saved = runner.export_continuation(auxiliary["continuation"])
+saved = dn.func.export_continuation(runner, auxiliary["continuation"])
 torch.save(saved, path)
 
 # Construct and initialize a compatible model and runner explicitly.
-restored = receiver.restore_continuation(torch.load(path, weights_only=True))
+restored = dn.func.restore_continuation(
+    receiver, torch.load(path, weights_only=True),
+)
 state, auxiliary = receiver(restored)
 ```
 
-The functions and methods use the same versioned packet format and accept
-compatible checkpoints from one another.
+`runner.export_continuation(auxiliary["continuation"])` and
+`receiver.restore_continuation(saved)`
+are equivalent methods. The functions and methods use the same versioned packet
+format and accept compatible checkpoints from one another. Initialized packets
+begin callbacks on first execution; checkpoints from executed calls retain their
+callback configuration, including when a call has zero steps.
 
 The versioned data/Tensor packet owns detached ordinary storage and preserves
 raw parameter/constant aliases and trainability flags. Restored trainable

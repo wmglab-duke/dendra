@@ -340,23 +340,25 @@ class CompiledRunner:
         Effective raw sources retain their Tensor ties and trainability as new
         leaves. Save the versioned packet with ``torch.save``. Export runs
         outside compilation and function transforms; prior graphs and recording
-        history are excluded.
+        history are excluded. Packets from ``dn.func.initialize`` begin callbacks
+        on their first execution.
         """
-        from ._continuation_checkpoints import _export_runner_continuation
+        from ._continuation_checkpoints import export_continuation
 
-        return _export_runner_continuation(self, continuation)
+        return export_continuation(self, continuation)
 
     def restore_continuation(self, packet):
         """Restore a plain checkpoint against this compatible initialized runner.
 
-        The receiving model/schema, dtype/device and callback configuration
-        must match. Returns independent ordinary Tensor leaves in a
+        The receiving model/schema, dtype/device and active callback carry
+        must match. Initialized packets begin callbacks on their first execution.
+        Returns independent ordinary Tensor leaves in a
         ``Continuation`` without initialization, preparation, sampling or
         execution. Runner defaults are unchanged.
         """
-        from ._continuation_checkpoints import _restore_runner_continuation
+        from ._continuation_checkpoints import restore_continuation
 
-        return _restore_runner_continuation(self, packet)
+        return restore_continuation(self, packet)
 
     @property
     def kernel(self):

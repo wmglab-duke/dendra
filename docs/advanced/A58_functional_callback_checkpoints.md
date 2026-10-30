@@ -32,21 +32,28 @@ state, auxiliary = dn.func.run(
 
 Here `functional` and `receiving` are plans returned by
 `dn.func.make_functional`, and each callback collection belongs to its respective
-plan. Both `dn.compile` runners also provide the bridge as methods:
+plan. The same functions accept compiled Population and Network runners and select
+their configured callbacks; omit `callbacks=` for runner targets:
 
 ```python
-packet = program.export_continuation(auxiliary["continuation"])
+packet = dn.func.export_continuation(program, auxiliary["continuation"])
 torch.save(packet, path)
 
-restored = receiver.restore_continuation(torch.load(path, weights_only=True))
+restored = dn.func.restore_continuation(
+    receiver, torch.load(path, weights_only=True),
+)
 state, auxiliary = receiver(restored)
 ```
+
+`program.export_continuation(auxiliary["continuation"])` and
+`receiver.restore_continuation(packet)`
+provide equivalent method forms.
 
 Construct and initialize the receiving model, then lower or compile it
 explicitly. The file contains versioned data and Tensors, rather than executable
 model configuration.
 The restored `dn.func.Continuation` supplies state, parameters, constants and
-callback carry to the resume call. In the method example, both `program` and
+callback carry to the resume call. In the runner example, both `program` and
 `receiver` are constructed with `dn.compile`. The receiving plan or runner can
 belong to another Python process. The original plan or runner can also restore
 a checkpoint. The functions and runner methods share one packet format, so
@@ -63,16 +70,24 @@ directly to the next call. Portable export is a separate operation with an
 explicit autograd boundary. Save the result of `export_continuation`, rather
 than pickling the in-memory `Continuation` object.
 
-`dn.func.initialize(functional, tensors)` supplies a fresh initialized packet
-for explicit execution; see {ref}`functional-explicit-initialization`. Its
-callback carry is `None`. Export that initial boundary without `callbacks=`,
-or first run with the intended callbacks and export the returned continuation
-with that collection. Restore resumes the saved initialization and does not
-reapply initialization transforms or resample its selected realization. The
-complete
+`dn.func.initialize(program)` and `dn.func.initialize(functional, tensors)`
+supply fresh initialized packets with no callback carry; see
+{ref}`functional-runner-initialization` and
+{ref}`functional-explicit-initialization`. Save and restore these packets against
+a runner with configured callbacks, or supply a lowered plan's callback
+collection explicitly. Neither operation starts recording. The first execution
+starts those callbacks and records the initial boundary once. Restore resumes
+the saved initialization without reapplying initialization transforms or
+resampling its selected realization. The complete
 {download}`functional_explicit_initialization.py <../../examples/functional_explicit_initialization.py>`
 example checks initialization gradients before this boundary and trainable
 effective sources after restoration.
+
+Checkpoints from executed calls require matching callback configuration,
+including zero-step calls. A checkpoint from a callback-free run cannot begin
+recording when restored into a runner with callbacks. Manually constructed
+continuations and version-1 checkpoints also require matching callback presence;
+missing carry does not identify them as initialized packets.
 
 The complete inference
 {download}`functional_callback_checkpoints.py <../../examples/functional_callback_checkpoints.py>`
@@ -120,8 +135,9 @@ the intended callback configurations, or construct a `dn.compile` runner with
 those configurations. Restore against that receiving plan or runner. Owner kind,
 timestep, native mode, component layouts and the parameter/constant/state
 schemas must be compatible. Saved parameter and constant values can differ
-from the receiving model or runner's defaults. Callback names and their bound
-configurations must match: this includes observation paths and indices,
+from the receiving model or runner's defaults. When callback carry is saved,
+callback names and their bound configurations must match: this includes
+observation paths and indices,
 physical regions, Population scopes,
 timestep, Recorder cadence, threshold windows, activity rules and LFP lead fields.
 
@@ -142,7 +158,7 @@ the examples use CPU float64 and a fixed timestep of 0.025 ms.
 
 ## Export and save a checkpoint
 
-`dn.func.export_continuation(functional, auxiliary["continuation"], callbacks=callbacks)`
+`dn.func.export_continuation(program, auxiliary["continuation"])`
 and `program.export_continuation(auxiliary["continuation"])` return the same
 versioned packet of ordinary data and Tensors. It includes complete simulation
 state, the effective raw parameters/constants and checked callback carry with its
@@ -152,7 +168,7 @@ finalized results. Save earlier recordings separately when they are needed.
 
 Export owns detached ordinary Tensor storage, including when invoked in
 inference mode. It does not mutate the supplied continuation or retain its
-autograd graph. Callback configuration is part of the compatibility metadata;
+autograd graph. Saved callback configuration is part of the compatibility metadata;
 matching shapes alone is insufficient to establish that two reducers mean the
 same thing.
 
@@ -183,8 +199,9 @@ the declarations that created them.
 `dn.func.restore_continuation(receiving, packet, callbacks=receiving_callbacks)`
 and `receiver.restore_continuation(packet)` validate the checkpoint against the
 receiving source plan and callback collection. They return independently owned,
-detached ordinary Tensor trees in a `Continuation`, with the receiving callback
-collection's identity. Resume with a new raw binding or `receiver(restored)`.
+detached ordinary Tensor trees in a `Continuation`. Saved callback carry uses
+the receiving collection's identity. Resume with a new raw binding or
+`receiver(restored)`.
 
 Restoration does not initialize, prepare, sample or execute the model, advance
 its clock/RNG, or replace runner defaults. Existing source, schema and required
@@ -209,8 +226,8 @@ delivery and RNG continuation.
 :end-before: "# endregion demo"
 ```
 
-A different threshold, selection, scope, timestep or lead field rejects
-restoration even if callback carry has the same Tensor shapes.
+When callback carry is saved, a different threshold, selection, scope, timestep
+or lead field rejects restoration even if that carry has the same Tensor shapes.
 
 ### Resume through an explicit raw binding
 
@@ -219,7 +236,9 @@ receiving frame values. Restoration checks the saved values against its trusted
 metadata without extracting live native state, initializing, preparing or
 sampling the model. Declare the receiving callbacks explicitly; a collection
 from a different functional plan rejects even when its configuration matches.
-Omit `callbacks=` only when the checkpoint has no callback carry.
+Supply the matching collection when callback carry is saved. Initialized packets
+also accept that collection before their first execution; omit it when callbacks
+are not used.
 
 ```{literalinclude} ../../examples/functional_explicit_continuation_checkpoints.py
 :language: python
@@ -368,8 +387,8 @@ Supported callbacks are Recorder, LFP, AnomalyDetector, Raster, APCount,
 Active, ActiveAL and ActiveALCount, including supported Population scopes and
 physical Recorder regions. Eligibility follows the bound implementation:
 authored subclasses that bind to a supported built-in implementation use its
-checkpoint contract. Checkpoint export/restoration for custom bound callback
-implementations is currently unsupported. Their ordinary execution and
+checkpoint contract. Portable export/restoration of custom bound callback carry
+is currently unsupported. Their ordinary execution and
 in-memory continuation support both scan and inference-only while using the
 same bound callback collection; that execution support does not serialize the
 custom configuration.

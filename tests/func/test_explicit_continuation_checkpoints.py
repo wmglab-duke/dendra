@@ -160,7 +160,7 @@ def test_runner_and_explicit_portable_formats_are_interoperable(
         actual, last = receiver(restored)
     _close(actual, expected)
     _close(last["callbacks"].outputs, reference["callbacks"].outputs)
-    assert packet["format"] == "dendra.func.continuation" and packet["version"] == 1
+    assert packet["format"] == "dendra.func.continuation" and packet["version"] == 2
 
 
 @pytest.mark.parametrize("network", (False, True))
@@ -512,13 +512,15 @@ def test_explicit_callback_carry_cannot_be_omitted_or_replaced_by_authored_speci
         function(callbacks=_callbacks(False))
 
 
-def test_explicit_checkpoint_entry_points_accept_only_lowered_plans_and_validate_headers_first():
+def test_explicit_checkpoint_entry_points_accept_plans_and_runners_and_validate_headers_first():
     functional, tensors, _, _, bound, _ = _case(False, compiled=True)
     current = dn.func.Continuation(tensors.state, tensors.parameters, tensors.constants)
     saved = dn.func.export_continuation(functional, current)
     runner = _runner(False, callbacks=False)
+    restored = dn.func.restore_continuation(runner, saved)
+    _close(restored.state, current.state)
+    assert dn.func.export_continuation(runner, restored)["version"] == 2
     for invalid in (
-        runner,
         bound,
         bound.compiled_chunk,
         functional._population,

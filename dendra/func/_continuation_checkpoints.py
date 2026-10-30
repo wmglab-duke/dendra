@@ -9,7 +9,7 @@ from numbers import Integral, Real
 import torch
 
 from ._callback_checkpoints import _keys, _same
-from ._continuation import Continuation
+from ._continuation import Continuation, _make_continuation
 from ._continuation_codec import decode_frames, encode_frames
 from ._module_traversal import _registered_modules
 from ._network import FunctionalNetwork, _validate_tree
@@ -18,7 +18,9 @@ from ._tree_paths import _get_path
 from ._types import FunctionalizationError
 
 _FORMAT = "dendra.func.continuation"
-_VERSION = 1
+_VERSION = 2
+_PACKET_KEYS = ("format", "version", "owner", "frames", "callbacks")
+_LIFECYCLES = ("unspecified", "unstarted", "active")
 
 
 def _cold_boundary():
@@ -290,7 +292,13 @@ def _validate_frames(functional, continuation):
     functional._validate_state(continuation.state)
 
 
-def _callback_packet(callbacks, state, *, owner="this runner"):
+def _callback_packet(callbacks, state, *, lifecycle, owner):
+    if lifecycle == "unstarted":
+        if state is not None:
+            raise FunctionalizationError(
+                "unstarted continuation must not contain callback state"
+            )
+        return None
     if callbacks is None:
         if state is not None:
             raise FunctionalizationError(
@@ -304,7 +312,7 @@ def _callback_packet(callbacks, state, *, owner="this runner"):
     return callbacks.export_state(state)
 
 
-def _encode_continuation(functional, continuation, callbacks):
+def _encode_continuation(functional, continuation, callbacks, lifecycle):
     return {
         "format": _FORMAT,
         "version": _VERSION,
@@ -317,19 +325,46 @@ def _encode_continuation(functional, continuation, callbacks):
             }
         ),
         "callbacks": callbacks,
+        "lifecycle": lifecycle,
     }
 
 
 def _validate_packet(packet):
-    _keys(
-        packet,
-        ("format", "version", "owner", "frames", "callbacks"),
-        label="continuation checkpoint",
-    )
+    # Keep v1's exact key checks while recognizing v2-shaped invalid headers.
+    keys = _PACKET_KEYS
+    if (
+        type(packet) is dict
+        and "lifecycle" in packet
+        and not (type(packet.get("version")) is int and packet["version"] == 1)
+    ):
+        keys += ("lifecycle",)
+    _keys(packet, keys, label="continuation checkpoint")
     if type(packet["format"]) is not str or packet["format"] != _FORMAT:
         raise ValueError("unsupported continuation checkpoint format")
-    if type(packet["version"]) is not int or packet["version"] != _VERSION:
+    if type(packet["version"]) is not int or packet["version"] not in (1, _VERSION):
         raise ValueError("unsupported continuation checkpoint version")
+    if packet["version"] == 1:
+        return "unspecified"
+    _keys(
+        packet,
+        (*_PACKET_KEYS, "lifecycle"),
+        label="continuation checkpoint",
+    )
+    lifecycle = packet["lifecycle"]
+    if type(lifecycle) is not str or lifecycle not in _LIFECYCLES:
+        raise ValueError("unsupported continuation checkpoint lifecycle")
+    if lifecycle == "unstarted" and packet["callbacks"] is not None:
+        raise FunctionalizationError(
+            "unstarted continuation checkpoint must not contain callback state"
+        )
+    return lifecycle
+
+
+def _continuation_lifecycle(continuation):
+    lifecycle = getattr(continuation, "_lifecycle", "unspecified")
+    if type(lifecycle) is not str or lifecycle not in _LIFECYCLES:
+        raise ValueError("unsupported continuation lifecycle")
+    return lifecycle
 
 
 def _validate_owner(functional, packet, *, owner):
@@ -340,28 +375,44 @@ def _validate_owner(functional, packet, *, owner):
         )
 
 
-def _validate_callback_presence(callbacks, packet, *, owner):
+def _validate_callback_presence(callbacks, packet, *, lifecycle, owner):
+    if lifecycle == "unstarted":
+        return
     if (callbacks is None) != (packet["callbacks"] is None):
         raise FunctionalizationError(
             f"continuation checkpoint callbacks do not match {owner}"
         )
 
 
-def _decode_continuation(functional, packet, callbacks, templates):
+def _decode_continuation(functional, packet, callbacks, templates, lifecycle):
     frames = decode_frames(packet["frames"], templates)
     callback_state = (
-        None if callbacks is None else callbacks.restore_state(packet["callbacks"])
+        None
+        if callbacks is None or lifecycle == "unstarted"
+        else callbacks.restore_state(packet["callbacks"])
     )
-    continuation = Continuation(callback_state=callback_state, **frames)
+    continuation = _make_continuation(
+        callback_state=callback_state, lifecycle=lifecycle, **frames
+    )
     _validate_frames(functional, continuation)
     return continuation
 
 
-def _validate_functional(functional):
-    if type(functional) not in (FunctionalPopulation, FunctionalNetwork):
-        raise TypeError(
-            "functional must be a FunctionalPopulation or FunctionalNetwork"
-        )
+def _is_runner_target(functional, callbacks):
+    from ._convenience import CompiledRunner
+    from ._network_compile import CompiledNetworkRunner
+
+    if type(functional) in (CompiledRunner, CompiledNetworkRunner):
+        if callbacks is not None:
+            raise TypeError("callbacks must be omitted for compiled runner targets")
+        return True
+    if type(functional) in (FunctionalPopulation, FunctionalNetwork):
+        _validate_callbacks(functional, callbacks)
+        return False
+    raise TypeError(
+        "functional must be a FunctionalPopulation or FunctionalNetwork "
+        "or a compiled Population or Network runner"
+    )
 
 
 def _validate_callbacks(functional, callbacks):
@@ -376,12 +427,17 @@ def _validate_callbacks(functional, callbacks):
 
 
 def export_continuation(functional, continuation, *, callbacks=None):
-    """Export a portable continuation for a lowered Population or Network.
+    """Export a portable continuation for a lowered plan or compiled runner.
 
-    ``functional`` is the lowered plan returned by ``make_functional``.
-    Supply its bound ``FunctionalCallbacks`` collection when callback carry is
-    present. The versioned plain data/Tensor packet supports ``torch.save`` and
-    ``torch.load(..., weights_only=True)`` and the existing runner methods.
+    ``functional`` is a lowered Population/Network plan or a ``dn.compile``
+    runner. Supply a lowered plan's bound ``FunctionalCallbacks`` collection
+    when carry is present; runners select their configured callbacks and do not
+    accept a non-None ``callbacks`` argument. Packets from ``initialize`` have
+    no callback carry and begin callbacks on their first execution. Executed
+    packets require matching callback configuration.
+
+    The versioned plain data/Tensor packet supports ``torch.save`` and
+    ``torch.load(..., weights_only=True)`` and the runner methods.
 
     Tensor identity ties and trainability are preserved as owned detached leaves;
     upstream graphs, recording history, input/draw tapes and optimizer state are
@@ -391,24 +447,36 @@ def export_continuation(functional, continuation, *, callbacks=None):
     _cold_boundary()
     if not isinstance(continuation, Continuation):
         raise TypeError("export_continuation requires a Continuation")
-    _validate_functional(functional)
-    _validate_callbacks(functional, callbacks)
+    runner = functional if _is_runner_target(functional, callbacks) else None
+    owner = "this functional plan" if runner is None else "this runner"
     with torch.inference_mode(False), torch.no_grad():
+        if runner is not None:
+            functional = runner.functional
         functional._validate_source()
         _validate_frames(functional, continuation)
+        if runner is not None:
+            callbacks = runner.callbacks
+        callback_state = continuation.callback_state
+        lifecycle = _continuation_lifecycle(continuation)
         callback_packet = _callback_packet(
-            callbacks, continuation.callback_state, owner="this functional plan"
+            callbacks, callback_state, lifecycle=lifecycle, owner=owner
         )
-        return _encode_continuation(functional, continuation, callback_packet)
+        return _encode_continuation(
+            functional, continuation, callback_packet, lifecycle
+        )
 
 
 def restore_continuation(functional, packet, *, callbacks=None):
-    """Restore portable data against a compatible lowered Population or Network.
+    """Restore portable data against a compatible lowered plan or runner.
 
     The existing receiving plan supplies trusted shape, dtype, device and
-    container metadata. Its model configuration and explicitly supplied callbacks
-    must match the checkpoint. Restore does not extract native values, initialize,
-    prepare, sample, execute or change plan defaults.
+    container metadata. Lowered plans accept their bound ``callbacks`` collection;
+    compiled runners select their configured callbacks. Model configuration and
+    active callback carry must match the checkpoint. Packets exported before
+    execution begin callbacks on their first run. Version-1 and manually
+    constructed packets retain strict callback matching when carry is absent.
+    Restore does not extract native values, initialize, prepare, sample, execute
+    or change plan defaults.
 
     The returned ``Continuation`` owns detached ordinary Tensor leaves with saved
     identity ties and trainability. Bind those leaves before resuming with
@@ -422,47 +490,27 @@ def restore_continuation(functional, packet, *, callbacks=None):
     """
     _cold_boundary()
     with torch.inference_mode(False), torch.no_grad():
-        _validate_packet(packet)
-        _validate_functional(functional)
-        _validate_callbacks(functional, callbacks)
-        _validate_owner(functional, packet, owner="this functional plan")
-        _validate_callback_presence(callbacks, packet, owner="this functional plan")
-        from ._continuation_schema import _receiving_frames
+        lifecycle = _validate_packet(packet)
+        runner = functional if _is_runner_target(functional, callbacks) else None
+        owner = "this functional plan" if runner is None else "this runner"
+        if runner is not None:
+            functional = runner.functional
+        _validate_owner(functional, packet, owner=owner)
+        if runner is not None:
+            callbacks = runner.callbacks
+        _validate_callback_presence(callbacks, packet, lifecycle=lifecycle, owner=owner)
+        if runner is None:
+            from ._continuation_schema import _receiving_frames
 
-        return _decode_continuation(
-            functional, packet, callbacks, _receiving_frames(functional)
-        )
-
-
-def _export_runner_continuation(runner, continuation):
-    _cold_boundary()
-    if not isinstance(continuation, Continuation):
-        raise TypeError("export_continuation requires a Continuation")
-    with torch.inference_mode(False), torch.no_grad():
-        functional = runner.functional
-        functional._validate_source()
-        _validate_frames(functional, continuation)
-        callbacks = _callback_packet(runner.callbacks, continuation.callback_state)
-        return _encode_continuation(functional, continuation, callbacks)
-
-
-def _restore_runner_continuation(runner, packet):
-    _cold_boundary()
-    with torch.inference_mode(False), torch.no_grad():
-        _validate_packet(packet)
-        functional = runner.functional
-        _validate_owner(functional, packet, owner="this runner")
-        _validate_callback_presence(runner.callbacks, packet, owner="this runner")
-        return _decode_continuation(
-            functional,
-            packet,
-            runner.callbacks,
-            {
+            templates = _receiving_frames(functional)
+        else:
+            callbacks = runner.callbacks
+            templates = {
                 "state": runner.initial_state,
                 "parameters": runner.parameters,
                 "constants": runner.constants,
-            },
-        )
+            }
+        return _decode_continuation(functional, packet, callbacks, templates, lifecycle)
 
 
 __all__ = ["export_continuation", "restore_continuation"]

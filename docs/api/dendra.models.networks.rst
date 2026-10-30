@@ -140,14 +140,20 @@ detached ordinary storage for a lowered Population or Network. Restore with
 ``dn.func.restore_continuation(receiving, saved, callbacks=receiving_callbacks)``
 against a compatible receiving plan, then bind the restored source leaves
 explicitly before calling ``dn.func.run``. Supplied callback collections belong
-to their respective plans. The same versioned plain data/Tensor format is
-supported by ``runner.export_continuation(packet)`` and a compatible
-reconstructed runner's ``restore_continuation(saved)``. These restore effective
+to their respective plans. The functions also accept compiled Population and
+Network runners: ``dn.func.export_continuation(runner, packet)`` and
+``dn.func.restore_continuation(receiver, saved)`` select their configured
+callbacks. ``runner.export_continuation(packet)`` and
+``receiver.restore_continuation(saved)`` are equivalent methods.
+These restore effective
 sources, raw parameter/constant aliases, trainability and checked callback carry. Restore
-validates source/state schemas, timestep, native mode and callback settings;
+validates source/state schemas, timestep, native mode and saved callback settings;
 it does not initialize, prepare, sample, run or mutate runner defaults. The
 checkpoint uses the same dtype/device, while model declarations, runtime tapes,
-optimizer state and recording history remain separate. See
+optimizer state and recording history remain separate. Packets returned by
+``dn.func.initialize`` can be saved before recording begins; restored packets
+start the configured callbacks on first execution. Executed packets require
+matching callback configuration, including zero-step calls. See
 :doc:`../advanced/A58_functional_callback_checkpoints` for complete examples.
 
 .. autoclass:: dendra.func.CompiledNetworkRunner

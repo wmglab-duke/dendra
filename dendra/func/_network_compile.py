@@ -329,23 +329,25 @@ class CompiledNetworkRunner:
 
         The versioned plain data/Tensor packet supports ``torch.save`` and
         ``torch.load(..., weights_only=True)``. It excludes upstream graphs,
-        recording history, input/draw tapes and optimizer state.
+        recording history, input/draw tapes and optimizer state. Packets from
+        ``dn.func.initialize`` begin callbacks on their first execution.
         """
-        from ._continuation_checkpoints import _export_runner_continuation
+        from ._continuation_checkpoints import export_continuation
 
-        return _export_runner_continuation(self, continuation)
+        return export_continuation(self, continuation)
 
     def restore_continuation(self, packet):
         """Restore a checkpoint into this compatible initialized Network runner.
 
-        Owner/schema, dtype/device, shared source ties and callbacks are
+        Owner/schema, dtype/device, shared source ties and active callback carry are
         validated before returning owned ordinary Tensor leaves in a
-        ``Continuation``. No initialization, preparation, RNG sampling or
-        execution runs, and runner defaults retain their values.
+        ``Continuation``. Initialized packets begin callbacks on their first
+        execution. No initialization, preparation, RNG sampling or execution runs,
+        and runner defaults retain their values.
         """
-        from ._continuation_checkpoints import _restore_runner_continuation
+        from ._continuation_checkpoints import restore_continuation
 
-        return _restore_runner_continuation(self, packet)
+        return restore_continuation(self, packet)
 
     @property
     def kernel(self):
