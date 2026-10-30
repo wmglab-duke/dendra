@@ -92,18 +92,49 @@ It enters inference mode during execution. Every no-state call restarts from
 the initialized snapshot; an explicit state continues that simulation. It does
 not advance the native model or overwrite its snapshot.
 
-`steps` fixes each call's horizon; `chunk_steps` selects the compiled width for
-both Populations and Networks:
+Choose a default horizon with either `steps` or `duration`; `chunk_steps`
+selects the compiled width for both Populations and Networks:
 
 ```python
 runner = dn.compile(model, dt=DT, steps=1_000, chunk_steps=128)
 state, auxiliary = runner()  # All 1,000 steps, including the shorter tail.
+state, auxiliary = runner(steps=250)  # Restart with a different horizon.
+state, auxiliary = runner(auxiliary["continuation"], duration=25.0)
 ```
 
-The positive chunk width is capped at `steps` and need not divide it. Omission
-uses the full horizon for ordinary runners, or at most 64 steps for runtime
-`extra=dn.VarInput()` slots. Registered and compile-time bound stimulation use
-the ordinary setting. Chunking does not remove requested recording storage.
+`duration` is elapsed simulation time in ms. It is finite and nonnegative;
+compile-time `steps` is a positive integer, and a per-call step override may
+also be zero. `steps` and `duration` are mutually exclusive at construction and
+at invocation. Supplying either per call replaces the default horizon:
+
+```python
+runner = dn.compile(model, dt=DT, duration=100.0, chunk_steps=128)
+state, auxiliary = runner()  # Advance the default duration from the snapshot.
+state, auxiliary = runner(auxiliary["continuation"], steps=250)
+```
+
+Duration calls carry fractional-step remainder in the returned continuation.
+For example, with `dt=0.1`, two continued `duration=0.25` calls accept two and
+three steps respectively. Explicit step calls leave that remainder unchanged.
+A no-state call restarts its default initialization policy and recording phase;
+zero-step continuation retains its phase without adding a boundary sample.
+Input and draw tapes must match the selected call's accepted step count.
+
+The positive compiled width need not divide a call's horizon. A step default
+caps it at `steps`; a duration default uses its nominal accepted step count,
+with a minimum width of one for scan or four for Population while execution.
+These minimum widths do not force a short call to advance a full chunk.
+Omission uses the ordinary default horizon, or at most 64 steps for runtime
+`extra=dn.VarInput()` slots. Registered and compile-time
+bound stimulation use the ordinary setting. Changing the call's horizon leaves
+the compiled width unchanged and reuses cached tails; a previously unseen tail
+width may require compilation. Chunking does not remove requested recording
+storage.
+
+The complete
+{download}`functional_runner_horizons.py <../../examples/functional_runner_horizons.py>`
+example checks step and duration defaults, per-call overrides, fractional
+continuation and Recorder phase for both model families.
 
 Recording is an explicit named callback. By default a fresh Recorder includes
 the initial sample, followed by every accepted step. `Recorder(dt=record_dt)`
@@ -712,8 +743,8 @@ its initial boundary sample. Native state is published only through an explicit
 
 | Need | Entry point | Important boundary |
 | --- | --- | --- |
-| A reusable ordinary simulation or optimizer loop | `dn.compile` | Fixed configured horizon; no-state calls restart |
-| An explicit scheduler for variable horizons | `dn.func.run` with a raw bound step/chunk | Host operation; handles sampling, spans and tails |
+| A reusable ordinary simulation or optimizer loop | `dn.compile` | Default or per-call horizon; no-state calls restart |
+| Explicit binding and scheduling ownership | `dn.func.run` with a raw bound step/chunk | Host operation; handles sampling, spans and tails |
 | Exactly one step or a fixed width | Eager binding or compiled chunk | Caller supplies the frame/tape and stochastic packet |
 | `torch.func` transforms or an outer `torch.compile` | Pure `prepare_and_step` / `prepare_and_rollout` | Keep host scheduling and sampling outside the transform |
 

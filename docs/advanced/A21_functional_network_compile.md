@@ -55,21 +55,45 @@ initialization, and synaptic differentiation setup:
 :dedent: 4
 ```
 
-`dt` must equal the initialized Network timestep. `steps` is the fixed positive
-number of accepted timesteps per runner call. The default `inference=True`
+`dt` must equal the initialized Network timestep. Supply either a positive
+`steps` count or a finite nonnegative `duration` in ms as the default horizon.
+The default `inference=True`
 disables gradient recording; select `inference=False` for differentiable
 execution, using a Network initialized in training mode. Training mode,
 topology, component schemas, and timestep are fixed by the compiled plan.
 Changing them requires a new runner; initialize the Network again when its
 configuration requires it, including after changing the timestep.
 
-`chunk_steps=C` selects a positive compiled width capped at `steps`. Each call
-still advances the complete horizon, using cached shorter tails when needed;
+`chunk_steps=C` selects a positive compiled width capped at the default horizon's
+nominal step count, with a minimum of one for duration defaults. Each call
+advances its complete selected horizon, using cached shorter tails when needed;
 there is no divisibility requirement. Without activation checkpointing, C also
-sets the host span width. Omitting it uses the full horizon for an
+sets the host span width. Omitting it uses the default horizon for an
 ordinary runner, or at most 64 steps with runtime `extra=dn.VarInput()` slots.
 Registered stimulation and compile-time bound `extra` use the same ordinary
 chunk selection. This width does not bound requested recording storage.
+
+Per-call `steps=` or `duration=` replaces the default for that invocation.
+The two options are mutually exclusive at both construction and invocation:
+
+```python
+runner = dn.compile(network, dt=DT, duration=100.0, chunk_steps=128)
+state, auxiliary = runner()
+state, auxiliary = runner(auxiliary["continuation"], steps=250)
+state, auxiliary = runner(auxiliary["continuation"], duration=25.0)
+```
+
+Durations are amounts of simulation time to advance. Fractional-step remainder
+travels with the returned continuation; repeated durations preserve elapsed
+time across solver-step boundaries. Explicit step calls preserve any existing
+remainder. A per-call step count may be zero. Resuming for zero steps leaves
+callback phase unchanged and adds no duplicate boundary sample. Supplied input
+and draw tapes must match the selected accepted step count. The configured
+kernel width remains unchanged across horizons. Cached tails are reused, and
+an unseen tail width may require compilation. See
+{doc}`A57_functional_api_overview` and the complete
+{download}`functional_runner_horizons.py <../../examples/functional_runner_horizons.py>`
+example for Population and Network calls.
 
 Network runners support `initialization="snapshot"` (the default),
 `initialization="fresh"`, and `execution="scan"` or inference-only

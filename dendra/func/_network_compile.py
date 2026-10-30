@@ -26,7 +26,9 @@ from ._network_parameters import (
 from ._runner_policy import (
     _configured_callbacks,
     _inference_compile_options,
+    _runner_call_horizon,
     _runner_chunk_steps,
+    _runner_default_horizon,
     _validate_host_call,
     _validate_host_construction,
 )
@@ -38,7 +40,13 @@ from ._types import FunctionalizationError
 
 
 class CompiledNetworkRunner:
-    """Fixed-horizon ``dn.compile(Network)`` execution with explicit restart policy.
+    """``dn.compile(Network)`` execution with explicit restart and horizon defaults.
+
+    Construct with either ``steps`` or ``duration``. Calls use that default
+    unless ``steps=`` or ``duration=`` selects another horizon; the two options
+    are mutually exclusive at each boundary. Durations are elapsed simulation
+    time in ms, and fractional-step remainder travels in the simulation state.
+    Per-call horizons reuse the configured compiled width and cached tails.
 
     No-state calls restart :attr:`initial_state`, including delivery queues and
     NetStim clock/RNG carry. ``initialization='fresh'`` instead constructs state
@@ -66,9 +74,11 @@ class CompiledNetworkRunner:
     pure callback reducers use the existing Network callback binding.
 
     Preparation and output graphs are invocation-local; only compiled kernels
-    are cached. ``chunk_steps`` selects the compiled kernel width capped to the
-    complete ``steps`` horizon; omission uses that horizon, or at most 64 steps
-    with runtime ``extra`` slots. ``checkpoint_every`` preserves gradients
+    are cached. ``chunk_steps`` selects the compiled kernel width using the
+    default horizon; omission uses its nominal step count, or at most 64 steps
+    with runtime ``extra`` slots. Per-call horizons leave that width unchanged;
+    a previously unseen tail width may require compilation.
+    ``checkpoint_every`` preserves gradients
     across independent activation-checkpoint spans. Each span executes compiled
     scan/while chunks and cached shorter tails, without a divisibility
     requirement. Requested recordings remain retained across the complete run.
@@ -114,7 +124,8 @@ class CompiledNetworkRunner:
         network,
         *,
         dt,
-        steps,
+        steps=None,
+        duration=None,
         extra=None,
         chunk_steps=None,
         execution="scan",
@@ -129,8 +140,7 @@ class CompiledNetworkRunner:
         **compile_options,
     ):
         _validate_host_construction(compile_options)
-        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
-            raise ValueError("steps must be a positive integer")
+        steps, duration, nominal_steps = _runner_default_horizon(steps, duration, dt)
         if execution not in {"scan", "while"}:
             raise ValueError("execution must be 'scan' or 'while'")
         if not isinstance(inference, bool):
@@ -179,7 +189,7 @@ class CompiledNetworkRunner:
             runtime_extra_names, bound_extra = (), extra
         self._runtime_extra_names = runtime_extra_names
         self._chunk_steps = _runner_chunk_steps(
-            chunk_steps, steps=steps, runtime_extra=bool(runtime_extra_names)
+            chunk_steps, steps=nominal_steps, runtime_extra=bool(runtime_extra_names)
         )
         with torch.inference_mode(False), torch.no_grad():
             self._functional, tensors = _lower_network(
@@ -239,6 +249,7 @@ class CompiledNetworkRunner:
         self._execution = execution
         self._initialization = initialization
         self._steps = steps
+        self._duration = duration
         self._checkpoint_every = (
             min(checkpoint_every, self._chunk_steps)
             if checkpoint_every is not None and runtime_extra_names
@@ -360,6 +371,8 @@ class CompiledNetworkRunner:
         self,
         state=None,
         *,
+        steps=None,
+        duration=None,
         parameters=None,
         constants=None,
         inputs=None,
@@ -369,6 +382,9 @@ class CompiledNetworkRunner:
         draws=None,
     ):
         _validate_host_call()
+        steps, duration = _runner_call_horizon(
+            self._steps, self._duration, steps, duration
+        )
         if draws is not None:
             draws = _normalize_runtime_draws(draws)
         if self._runtime_extra_names:
@@ -486,6 +502,12 @@ class CompiledNetworkRunner:
                 selected_parameters, selected_constants
             )
             with torch.inference_mode() if self._inference else nullcontext():
+                if duration is not None:
+                    from ._runners import _stage_network_duration
+
+                    selected_state, steps = _stage_network_duration(
+                        self._functional, selected_state, duration
+                    )
                 schedule_args = (
                     selected_parameters,
                     selected_constants,
@@ -505,7 +527,7 @@ class CompiledNetworkRunner:
                     schedule_options["draws"] = draws
                 final, auxiliary = schedule(
                     *schedule_args,
-                    steps=self._steps,
+                    steps=steps,
                     callbacks=self._callbacks,
                     callback_state=callback_state,
                     checkpoint_every=self._checkpoint_every,

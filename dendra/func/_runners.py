@@ -1397,6 +1397,41 @@ def _execute_schedule(
     )
 
 
+def _network_duration_horizon(state, steps, duration, dt):
+    """Resolve Network duration carry for both host execution interfaces."""
+    remainder = state["clock"]["duration_remainder"]
+    if remainder.requires_grad:
+        raise FunctionalizationError(
+            "Network duration_remainder must not require gradients"
+        )
+    _, tangent = torch.autograd.forward_ad.unpack_dual(remainder)
+    if tangent is not None:
+        raise FunctionalizationError(
+            "Network duration_remainder must not carry a forward-AD tangent"
+        )
+    pending = float(remainder.detach().cpu().item())
+    if not math.isfinite(pending) or pending < 0:
+        raise ValueError("Network duration_remainder must be finite and non-negative")
+    if duration is not None:
+        duration = _validate_time_scalar(duration, name="duration", positive=False)
+        steps, pending = _duration_step_budget(duration, dt, pending)
+        state = {
+            **state,
+            "clock": {
+                **state["clock"],
+                "duration_remainder": remainder.new_tensor(pending),
+            },
+        }
+    return state, steps
+
+
+def _stage_network_duration(functional, state, duration):
+    """Stage a convenience call through the canonical Network horizon rule."""
+    functional._validate_source()
+    functional._validate_state(state)
+    return _network_duration_horizon(state, None, duration, functional.dt)
+
+
 def _run_bound_network(
     bound,
     state,
@@ -1438,29 +1473,7 @@ def _run_bound_network(
     )
     if runner_dt != functional.dt:
         raise FunctionalizationError("runner dt must match the bound Network timestep")
-    remainder = state["clock"]["duration_remainder"]
-    if remainder.requires_grad:
-        raise FunctionalizationError(
-            "Network duration_remainder must not require gradients"
-        )
-    _, tangent = torch.autograd.forward_ad.unpack_dual(remainder)
-    if tangent is not None:
-        raise FunctionalizationError(
-            "Network duration_remainder must not carry a forward-AD tangent"
-        )
-    pending = float(remainder.detach().cpu().item())
-    if not math.isfinite(pending) or pending < 0:
-        raise ValueError("Network duration_remainder must be finite and non-negative")
-    if duration is not None:
-        duration = _validate_time_scalar(duration, name="duration", positive=False)
-        steps, pending = _duration_step_budget(duration, runner_dt, pending)
-        state = {
-            **state,
-            "clock": {
-                **state["clock"],
-                "duration_remainder": remainder.new_tensor(pending),
-            },
-        }
+    state, steps = _network_duration_horizon(state, steps, duration, runner_dt)
     options = {} if draws is None else {"draws": draws}
     return run_network(
         functional,

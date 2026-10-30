@@ -47,15 +47,40 @@ initialized, functionally supported Population:
    final_state, auxiliary = runner()
    voltage = auxiliary["callbacks"]["trace"]["v"]
 
-``steps`` is the fixed number of accepted timesteps per call.
-``chunk_steps=C`` selects a positive compiled chunk width, capped at ``steps``;
-it need not divide the horizon. The scheduler uses cached shorter tails where
-needed. Without activation checkpointing, it also groups host work into spans
-of this width. With ``chunk_steps=None``, an ordinary runner uses the full
-horizon. A runner with ``extra=dn.VarInput()`` defaults to at most 64 steps
-per chunk.
+Supply either a positive ``steps`` count or a finite nonnegative ``duration``
+in ms as the runner's default horizon. Per-call ``steps=`` or ``duration=``
+replaces that default; the two options are mutually exclusive at construction
+and invocation. Per-call step counts may also be zero:
+
+.. code-block:: python
+
+   by_duration = dn.compile(model, dt=0.025, duration=20.0, chunk_steps=128)
+   state, auxiliary = by_duration()
+   state, auxiliary = by_duration(auxiliary["continuation"], steps=200)
+   state, auxiliary = by_duration(auxiliary["continuation"], duration=5.0)
+
+Durations are amounts of simulation time to advance. Fractional-step remainder
+is carried by the returned continuation, so repeated calls cross solver-step
+boundaries without losing that time. Explicit step calls preserve any pending
+remainder. A no-state call restarts its initialization and callback phase;
+zero-step continuation adds no duplicate boundary sample. Input and draw tapes
+must match the selected accepted step count.
+
+``chunk_steps=C`` selects a positive compiled chunk width, capped at the default
+horizon's nominal step count. Duration defaults plan at least one compiled
+step for scan or four for Population while execution, without forcing a short
+call to advance a full chunk. The width need not divide a call's horizon. The
+scheduler uses cached shorter tails where needed. A previously unseen tail width may
+require compilation. Changing the call's horizon leaves this width unchanged.
+Without activation checkpointing, it also groups host work into spans of this
+width. With ``chunk_steps=None``, an ordinary runner uses the default horizon.
+A runner with ``extra=dn.VarInput()`` defaults to at most 64 steps per chunk.
 Registered stimulation and compile-time bound ``extra`` use the ordinary
 runner default. Requested recordings retain the complete selected trajectory.
+The complete
+:download:`functional_runner_horizons.py <../../examples/functional_runner_horizons.py>`
+example checks both model families; see :doc:`A57_functional_api_overview` for
+the common calling contract.
 
 Recording is configured only through the named ``callbacks`` mapping; no
 recorder is added implicitly. ``Recorder`` includes the initial frame, so

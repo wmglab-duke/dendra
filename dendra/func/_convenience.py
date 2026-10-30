@@ -24,16 +24,21 @@ from ._population import (
 from ._runner_policy import (
     _configured_callbacks,
     _inference_compile_options,
+    _runner_call_horizon,
     _runner_chunk_steps,
+    _runner_default_horizon,
     _validate_host_call,
     _validate_host_construction,
 )
 from ._runners import (
+    _bound_runner_dt,
     _canonical_runtime_sampling_available,
     _normalize_sampled_inputs,
     _prepare_chunk_inputs,
     _run_source_validated,
     _slice_inputs,
+    _stage_duration,
+    _validate_duration_remainder,
     run,
 )
 from ._runtime_extra import (
@@ -63,7 +68,12 @@ def _initialization_writes_parameters(functional):
 
 
 class CompiledRunner:
-    """Reusable, fixed-horizon scan or inference-only while-loop execution.
+    """Reusable scan or inference-only while execution with horizon defaults.
+
+    Construct with ``steps`` or ``duration``. A call uses that default unless
+    ``steps=`` or ``duration=`` selects another horizon. Durations are elapsed
+    simulation time in ms; fractional-step remainder travels in explicit state.
+    The two horizon options are mutually exclusive at each boundary.
 
     Construct with :func:`dendra.func.compile`. A call returns ``(state, aux)``
     and never commits state or parameters to the source Population. With no
@@ -101,10 +111,12 @@ class CompiledRunner:
     This is a host-side convenience object, not a torch.compile/torch.func
     transform target; those uses retain the lower-level functional API.
 
-    ``chunk_steps`` selects a compiled kernel width capped to ``steps``. The
-    default width is the complete horizon, or at most 64 steps for runtime
-    ``extra`` slots. Ordinary calls group execution by that width; training
-    checkpoints retain their separate ``checkpoint_every`` boundaries. Compiled
+    ``chunk_steps`` selects a compiled width from the default horizon's nominal
+    step count. Duration defaults plan at least one step for scan or four for
+    Population while execution. The default width is that nominal horizon, or
+    at most 64 steps for runtime ``extra`` slots. Per-call horizons reuse this
+    width and cached shorter tails. Ordinary calls group execution by that
+    width; training checkpoints retain their separate ``checkpoint_every`` boundaries. Compiled
     scan/while kernels execute within each span, with cached shorter tails.
     Neither span has to divide the other. Recording retains the full requested
     trajectory, regardless of kernel width.
@@ -140,7 +152,8 @@ class CompiledRunner:
         population,
         *,
         dt,
-        steps,
+        steps=None,
+        duration=None,
         extra=None,
         chunk_steps=None,
         execution="scan",
@@ -154,8 +167,7 @@ class CompiledRunner:
         **compile_options,
     ):
         _validate_host_construction(compile_options)
-        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
-            raise ValueError("steps must be a positive integer")
+        steps, duration, nominal_steps = _runner_default_horizon(steps, duration, dt)
         if execution not in ("scan", "while"):
             raise ValueError("execution must be 'scan' or 'while'")
         if not isinstance(inference, bool):
@@ -179,7 +191,7 @@ class CompiledRunner:
                 raise ValueError(
                     "execution='while' is inference-only; use scan for gradients"
                 )
-            if steps < 4:
+            if duration is None and steps < 4:
                 raise ValueError("execution='while' requires at least four steps")
             if compile_options.get("disable", False):
                 raise ValueError("execution='while' requires compilation to be enabled")
@@ -187,10 +199,13 @@ class CompiledRunner:
         self._initialization = initialization
         self._execution = execution
         self._steps = steps
+        self._duration = duration
         self._checkpoint_every = checkpoint_every
         self._runtime_extra = isinstance(extra, VarInput)
         self._chunk_steps = _runner_chunk_steps(
-            chunk_steps, steps=steps, runtime_extra=self._runtime_extra
+            chunk_steps,
+            steps=max(nominal_steps, 4) if execution == "while" else nominal_steps,
+            runtime_extra=self._runtime_extra,
         )
         if execution == "while" and self._chunk_steps < 4:
             raise ValueError(
@@ -382,19 +397,27 @@ class CompiledRunner:
             self._prepared = prepared
         return prepared
 
-    def _require_while(self, parameters, prepared, state, inputs, callback_state):
+    def _require_while(
+        self, parameters, prepared, state, inputs, callback_state, horizon
+    ):
         """Fail before a rejected structured loop could compile an unrolled horizon."""
         if self._callbacks is None and callback_state is not None:
             raise ValueError("callback_state requires callbacks")
         functional = self._functional
         functional._validate_state(state)
         values = functional._validate_prepared(prepared, parameters)
-        steps = self._kernel.steps
-        if self._runtime_extra or steps < self._steps:
+        steps = min(self._kernel.steps, horizon)
+        if steps < 4:
+            # These calls execute only the bounded tail; there is no structured
+            # loop body to capture or reject.
+            if self._callbacks is None:
+                self._kernel._enable_model_while()
+            return
+        if self._runtime_extra or steps < horizon:
             if not self._runtime_extra:
                 # Qualify the full call before a shorter preflight could hide
                 # an invalid time axis. Missing drives remain unmaterialized.
-                functional._resolve_rollout_inputs(inputs, self._steps)
+                functional._resolve_rollout_inputs(inputs, horizon)
             # Only inspect one bounded loop signature. The actual schedule
             # samples draw packets and assembles stimulation span by span.
             inputs = _slice_inputs(inputs, 0, steps)
@@ -474,6 +497,8 @@ class CompiledRunner:
         self,
         state=None,
         *,
+        steps=None,
+        duration=None,
         parameters=None,
         constants=None,
         inputs=None,
@@ -483,6 +508,9 @@ class CompiledRunner:
         draws=None,
     ):
         _validate_host_call()
+        selected_steps, selected_duration = _runner_call_horizon(
+            self._steps, self._duration, steps, duration
+        )
         if draws is not None:
             inputs = _with_runtime_draws(inputs, draws)
         if self._runtime_extra:
@@ -622,13 +650,21 @@ class CompiledRunner:
                 if owned_boundaries
                 else self._kernel.bind(selected_parameters, prepared)
             )
+            if selected_duration is not None:
+                _validate_duration_remainder(selected_state)
+                selected_state, selected_steps = _stage_duration(
+                    selected_state,
+                    selected_duration,
+                    _bound_runner_dt(self._functional, prepared.values),
+                    name="duration",
+                )
             inputs = _population_inputs(inputs)
-            bounded_while = self._runtime_extra or self._chunk_steps < self._steps
+            bounded_while = self._runtime_extra or self._chunk_steps < selected_steps
             if self._runtime_extra and inputs.ve is not None:
                 raise ValueError("explicit ve cannot be combined with runtime extra")
             if inputs.draws is not None:
                 self._functional._runtime_draw_plan.validate(
-                    inputs.draws, steps=self._steps
+                    inputs.draws, steps=selected_steps
                 )
             if (
                 self._execution == "while"
@@ -640,7 +676,7 @@ class CompiledRunner:
                     selected_state,
                     inputs,
                     0,
-                    self._steps,
+                    selected_steps,
                     canonical=True,
                 )
             if (
@@ -649,7 +685,7 @@ class CompiledRunner:
                 and inputs.draws is None
             ):
                 inputs = self._functional._sample_missing_runtime_draws(
-                    selected_state, inputs, self._steps
+                    selected_state, inputs, selected_steps
                 )
             if (
                 self._execution == "while"
@@ -663,7 +699,7 @@ class CompiledRunner:
                     else self._functional.sample_noise_draw_tape
                 )
                 inputs = inputs._replace(
-                    noise=sample_noise(selected_state, self._steps)
+                    noise=sample_noise(selected_state, selected_steps)
                 )
             if (
                 self._execution == "while"
@@ -678,23 +714,29 @@ class CompiledRunner:
                     else self._functional.sample_stimulation_draw_tape
                 )
                 inputs = inputs._replace(
-                    stimulation=sample_stimulation(selected_state, self._steps)
+                    stimulation=sample_stimulation(selected_state, selected_steps)
                 )
             if self._execution == "while":
                 if not bounded_while:
                     inputs = _normalize_sampled_inputs(
                         self._functional,
                         inputs,
-                        self._steps,
+                        selected_steps,
                         qualify_draws=not owned_boundaries,
                     )
                 if not owned_boundaries:
                     # A replaced public sampler can run user code after its
                     # own check. Recheck before preflight captures a step.
                     self._functional._validate_source()
-                self._require_while(
-                    bound._parameters, prepared, selected_state, inputs, callback_state
-                )
+                if selected_steps:
+                    self._require_while(
+                        bound._parameters,
+                        prepared,
+                        selected_state,
+                        inputs,
+                        callback_state,
+                        selected_steps,
+                    )
             schedule = _run_source_validated if owned_boundaries else run
             schedule_options = (
                 {}
@@ -704,7 +746,7 @@ class CompiledRunner:
             if self._runtime_extra:
                 schedule_options.update(extra=extra, _runtime_extra_slot=True)
             if self._checkpoint_every is None:
-                if self._runtime_extra or self._chunk_steps < self._steps:
+                if self._runtime_extra or self._chunk_steps < selected_steps:
                     schedule_options["host_span_steps"] = self._chunk_steps
             elif self._runtime_extra:
                 schedule_options["checkpoint_every"] = min(
@@ -715,11 +757,13 @@ class CompiledRunner:
                 bound,
                 selected_state,
                 inputs=inputs,
-                steps=self._steps,
+                steps=selected_steps,
                 callbacks=self._callbacks,
                 callback_state=callback_state,
                 **schedule_options,
             )
+            if auxiliary is None:
+                auxiliary = {}
             if fresh_policy:
                 auxiliary = dict(auxiliary)
                 auxiliary["parameters"] = dict(selected_parameters)
@@ -737,7 +781,8 @@ def compile(
     population,
     *,
     dt,
-    steps,
+    steps=None,
+    duration=None,
     extra=None,
     chunk_steps=None,
     execution="scan",
@@ -752,6 +797,12 @@ def compile(
     **compile_options,
 ):
     """Create a reusable Population or Network runner (scan by default).
+
+    Supply ``steps`` or ``duration`` for the default horizon. Calls may override
+    it with ``steps=`` or ``duration=`` without changing the compiled width.
+    Durations are elapsed time in ms and retain fractional-step remainder in
+    the returned continuation. The two options are mutually exclusive at each
+    boundary; per-call step counts and durations may be zero.
 
     Initialized canonical Networks return :class:`CompiledNetworkRunner` with
     their existing timestep/mode. Their inputs map Population names to
@@ -805,8 +856,9 @@ def compile(
     ``extra=VarInput()`` declares call-local deterministic stimulation instead
     of binding a concrete recipe. Calls require an ``extra=`` specification;
     use ``None`` for zero drive. Waveform types and contact counts may differ
-    between calls. ``chunk_steps`` selects a compiled width capped to ``steps``
-    for either runner. Its default is the full horizon for ordinary runners,
+    between calls. ``chunk_steps`` selects a compiled width from the default
+    horizon's nominal step count for either runner. Its default is that horizon
+    for ordinary runners,
     or at most 64 steps with runtime-extra slots, where it also bounds
     stimulation assembly. Ordinary activation-checkpoint spans remain
     independent of the kernel width; runtime-extra spans retain the additional
@@ -832,6 +884,7 @@ def compile(
         population,
         dt=dt,
         steps=steps,
+        duration=duration,
         extra=extra,
         chunk_steps=chunk_steps,
         execution=execution,
