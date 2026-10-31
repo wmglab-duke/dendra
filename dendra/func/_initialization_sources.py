@@ -29,6 +29,7 @@ from ._continuous_transform import (
 )
 from ._mechanism_injections import _binding, _literal
 from ._module_traversal import _registered_modules as _walk_registered_modules
+from ._raw_source_discovery import registered_source_slots
 from ._stimuli import _is_internal_module_state
 from ._types import FunctionalizationError
 
@@ -78,11 +79,10 @@ def _registered_modules(module, *, duplicates=False):
 
 
 def _registered_tensor_slots(module, *, duplicates=False):
-    for path, child in _registered_modules(module, duplicates=duplicates):
-        for collection in ("_parameters", "_buffers"):
-            for name, value in vars(child)[collection].items():
-                if value is not None:
-                    yield f"{path}.{name}" if path else name, value
+    for path, value, _registry in registered_source_slots(
+        _registered_modules(module, duplicates=duplicates), namespace=vars
+    ):
+        yield path, value
 
 
 def _initial_source_entries(population, *, include_tensors=False):

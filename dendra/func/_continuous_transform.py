@@ -20,6 +20,7 @@ from dendra.helpers import current_check_purity
 
 from ._module_traversal import _registered_modules
 from ._netcon import _snapshot
+from ._raw_source_discovery import registered_source_slots
 from ._types import FunctionalizationError
 
 _CALL_METHODS = {
@@ -106,15 +107,16 @@ def _named_tensors(module):
     # Canonical deduplicated keys preserve tied aliases through functional_call.
     result, seen = {}, set()
     for collection in ("_parameters", "_buffers"):
-        for path, child in _safe_modules(module):
-            for name, value in vars(child)[collection].items():
-                if value is not None and id(value) not in seen:
-                    if type(value) not in (torch.Tensor, torch.nn.Parameter):
-                        raise FunctionalizationError(
-                            "Continuous transform tensor subclasses need an explicit lowering."
-                        )
-                    seen.add(id(value))
-                    result[f"{path}.{name}" if path else name] = value
+        for path, value, _registry in registered_source_slots(
+            _safe_modules(module), collections=(collection,), namespace=vars
+        ):
+            if id(value) not in seen:
+                if type(value) not in (torch.Tensor, torch.nn.Parameter):
+                    raise FunctionalizationError(
+                        "Continuous transform tensor subclasses need an explicit lowering."
+                    )
+                seen.add(id(value))
+                result[path] = value
     return result
 
 

@@ -29,6 +29,7 @@ from ._prepared_values import (
     _validate_prepared_freshness,
     _validate_prepared_owner,
 )
+from ._raw_source_discovery import registered_source_slots
 from ._raw_sources import _RawSourceInventory
 from ._types import FunctionalizationError
 
@@ -50,11 +51,7 @@ def _registered(module):
     """Read canonical registered slots without invoking numerical properties."""
     from ._continuous_transform import _safe_modules
 
-    for path, child in _safe_modules(module):
-        for kind in ("_parameters", "_buffers"):
-            for name, value in getattr(child, kind).items():
-                if value is not None:
-                    yield f"{path + '.' if path else ''}{name}", value, kind
+    yield from registered_source_slots(_safe_modules(module), namespace=vars)
 
 
 def _callable_binding(value):

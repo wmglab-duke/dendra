@@ -39,6 +39,10 @@ from ._initialization_sources import (
     _member_binding,
 )
 from ._mechanism_injections import _binding, _literal
+from ._raw_source_discovery import (
+    CUSTOM_MATERIAL_CONTEXT_NAMES,
+    registered_source_slots,
+)
 from ._types import FunctionalizationError
 
 _PURE_HOOKS = ("material_fields", "prepare_materials", "material_updates")
@@ -455,26 +459,17 @@ def custom_material_constant_slots(process):
         return
     p = _helpers()
     excluded = {
-        "celsius",
-        "diam",
-        "diameters",
-        "diam_original",
-        "dx",
-        "area",
-        "canonical_area_cm2",
-        "component_area",
-        "dt",
+        *CUSTOM_MATERIAL_CONTEXT_NAMES,
         *p._parameter_materialization_output_names(process),
         *process.random_parameters,
         *process.runtime_noises,
         *getattr(process, "_functional_material_slots", ()),
     }
-    for path, child in _safe_modules(process):
-        for name, value in child._buffers.items():
-            if value is not None and (
-                path or (name not in excluded and not name.startswith("_mp_"))
-            ):
-                yield f"{path}.{name}" if path else name, value
+    for path, value, _registry in registered_source_slots(
+        _safe_modules(process), collections=("_buffers",), namespace=vars
+    ):
+        if "." in path or (path not in excluded and not path.startswith("_mp_")):
+            yield path, value
 
 
 class _MetadataFields(TorchDispatchMode):

@@ -541,17 +541,23 @@ parameter tensors; Network extraction returns independent detached snapshots.
 leaves while preserving their aliases in either case.
 
 (functional-source-inspection)=
-## Inspect explicit sources and runner defaults
+## Inspect native sources, explicit frames and runner defaults
 
-`dn.func.inspect_sources` uses the same report throughout lowering, binding
-and execution:
+`dn.func.inspect_sources` uses the same report for native models, lowering,
+binding and execution:
 
 | Subject | Parameter and constant frames reported |
 | --- | --- |
+| Native `Population`, `Network` | Live raw parameters and supported configuration sources, using native paths |
 | `PopulationTensors`, `NetworkTensors` | Exactly the frames stored in the bundle |
 | Raw `BoundPopulation`, `BoundNetwork` | The binding's sources, with canonical shared readers for a Network |
 | Either `dn.compile(...)` runner | The runner's defaults |
 | `Continuation` | The effective frames captured for that call or checkpoint |
+
+Native inspection does not build, lower or initialize the model. It retains
+registered alias paths, captured flags and deduplicated optimizer leaves while
+excluding runtime state and prepared workspaces from configuration constants.
+See {doc}`A60_native_source_inspection` for native naming and optimizer groups.
 
 The complete
 {download}`functional_lowering_api.py <../../examples/functional_lowering_api.py>`

@@ -261,6 +261,11 @@ The runner exposes ``parameters`` as a read-only mapping of independent tensor
 copies, as well as ``constants``, ``functional``, and the compiled ``kernel``.
 Use ``runner.execution_report()`` after a call to inspect the selected strategy.
 
+``dn.func.inspect_sources(model)`` reports a native Population or Network's
+live raw parameter and configuration sources, using native paths. It does not
+build or lower the model. The same alias-aware reports and selectors apply to
+explicit execution sources; see :doc:`A60_native_source_inspection`.
+
 ``dn.func.inspect_sources(runner)`` reports the runner's default parameter and
 constant frames. To inspect overrides or fresh/cache replacements from a call,
 pass ``auxiliary["continuation"]`` instead. The same function accepts

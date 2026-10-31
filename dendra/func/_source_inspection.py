@@ -51,8 +51,8 @@ class SourceReport:
 
     Reinspect after replacing bindings or changing flags. A report does not
     prove that a Tensor influences an output or recover external upstream
-    optimizer leaves. State, callback carry, initialization-only inputs and
-    call-local stimulation sources are outside this inventory.
+    optimizer leaves. State, callback carry, explicit initialization-input
+    packets and call-local stimulation sources are outside this inventory.
 
     Printing the report shows counts and a compact parameter/constant path
     tree with shapes, dtypes, devices, flags and aliases, without Tensor values.
@@ -214,6 +214,9 @@ def _format_source_tree(tree, canonical, groups, prefix="  "):
 
 def _source_frames(subject):
     """Select stored or bound reader frames without owning an execution lifecycle."""
+    from dendra.models.core import Population
+    from dendra.models.networks.net import Network
+
     from ._binding import BoundPopulation
     from ._continuation import Continuation, _bound_continuation_sources
     from ._convenience import CompiledRunner
@@ -221,6 +224,11 @@ def _source_frames(subject):
     from ._network_binding import BoundNetwork
     from ._network_compile import CompiledNetworkRunner
     from ._types import PopulationTensors
+
+    if issubclass(type(subject), (Population, Network)):
+        from ._native_source_inspection import native_source_frames
+
+        return native_source_frames(subject)
 
     if isinstance(subject, (BoundPopulation, BoundNetwork)):
         if type(subject) not in (BoundPopulation, BoundNetwork):
@@ -246,13 +254,21 @@ def _source_frames(subject):
     ):
         return subject.parameters, subject.constants
     raise TypeError(
-        "inspect_sources requires a compiled Population/Network runner, "
+        "inspect_sources requires a native Population/Network, compiled Population/Network runner, "
         "Continuation, PopulationTensors/NetworkTensors bundle, or raw binding"
     )
 
 
 def inspect_sources(subject) -> SourceReport:
-    """Inspect explicit sources from a runner, tensor bundle, raw binding or packet.
+    """Inspect native sources or explicit runner, binding and packet frames.
+
+    Native Populations and Networks expose their registered raw parameters and
+    known configuration sources using native registration paths. Owned waveform
+    injections also expose their source routes. Aliases retain every path while
+    optimizer leaves are deduplicated by Tensor identity. Runtime state, sampled
+    histories and derived workspaces are excluded from native constant sources.
+    Inspection does not build the model: pending unregistered declarations are
+    visible only after the normal native build lifecycle registers them.
 
     Both Population and Network runners returned by ``dn.compile`` are
     accepted. To inspect overrides or fresh/cache replacements from a particular
@@ -272,7 +288,9 @@ def inspect_sources(subject) -> SourceReport:
     source containers. This is metadata inspection, not execution validation.
 
     Inspection performs no Tensor arithmetic, cloning, graph traversal,
-    initialization, preparation, RNG sampling or source lifecycle validation.
+    model lowering, initialization, preparation, RNG sampling or source lifecycle
+    validation. Native source discovery reads registered slots and declaration
+    metadata without invoking model getters or numerical hooks.
     It is a host operation outside ``torch.compile``. Reports retain Tensor
     references, so discard them when their source graphs are no longer needed.
     """

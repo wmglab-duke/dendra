@@ -11,7 +11,8 @@ from dataclasses import dataclass
 
 import torch
 
-from ._module_traversal import _raw_module_namespace, _registered_modules
+from ._module_traversal import _raw_module_namespace
+from ._raw_source_discovery import raw_registered_parameters
 from ._types import FunctionalizationError
 
 
@@ -48,13 +49,7 @@ def _registered_tensor(root, path, *, registry=None):
 
 def _canonical_parameters(root):
     """Mirror canonical named_parameters without invoking subclass readers."""
-    result, seen = {}, set()
-    for path, owner in _registered_modules(root, namespace=_raw_module_namespace):
-        for name, value in _raw_module_namespace(owner)["_parameters"].items():
-            if value is not None and id(value) not in seen:
-                seen.add(id(value))
-                result[f"{path + '.' if path else ''}{name}"] = value
-    return result
+    return raw_registered_parameters(root, deduplicate=True)
 
 
 def _record_source(result, key, value):
