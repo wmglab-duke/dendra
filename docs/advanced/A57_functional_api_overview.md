@@ -194,6 +194,11 @@ with selected history plus bounded dense segments. Each compiled invocation stil
 emits dense data; full-rate/custom streams, autograd and input tapes have
 separate storage requirements. Atomic rollouts retain dense finalization; see
 {ref}`functional-recorder-cadence` for timing and compilation details.
+
+Recordings retain the selected samples; apply filtering or temporal averaging
+explicitly to the recorded tensors. Differentiable tensor operations preserve
+gradients through in-memory recordings.
+
 `Recorder.set_hdf5(path, cache_every=...)` routes its sampled trajectory to the
 host HDF5 writer instead of returned callback history. Its sampling carry
 remains available for continuation. In-memory recordings retain gradients;

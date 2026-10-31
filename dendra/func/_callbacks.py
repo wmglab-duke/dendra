@@ -242,7 +242,6 @@ def _coerce_callback_configuration(callback):
         max_only=callback.max_only,
         node_indices=callback.node_indices,
         dt=callback.save_dt,
-        sliding_window=callback.sliding_window,
         partition=callback.partition,
         region=callback.region,
     )
@@ -366,7 +365,6 @@ class Recorder(_PreparedCallback):
     ``int(dt / simulation_dt)``. A fresh recording retains its initial frame,
     then accepted steps stride, 2 * stride, and so on. Explicit counter carry keeps
     that phase across chunks and continuation, without another initial sample.
-    ``sliding_window`` is currently unsupported.
 
     Host schedules retain selected frames between chunks; each tensor kernel
     still emits dense data. Atomic rollouts and direct chunk calls select
@@ -408,7 +406,6 @@ class Recorder(_PreparedCallback):
         max_only=False,
         node_indices=None,
         dt=None,
-        sliding_window=None,
         partition=None,
         *,
         region=None,
@@ -427,7 +424,6 @@ class Recorder(_PreparedCallback):
         self.max_only = bool(max_only)
         self.node_indices = node_indices
         self.dt = dt
-        self.sliding_window = sliding_window
         self.partition = partition
         self.region = region
 
@@ -497,12 +493,6 @@ class Recorder(_PreparedCallback):
                 raise FunctionalizationError(
                     "dn.func.Recorder dt must span at least one simulation timestep"
                 )
-        if self.sliding_window is not None:
-            raise FunctionalizationError(
-                "dn.func.Recorder does not yet support sliding_window; apply a "
-                "pure tensor reduction to the finalized recording"
-            )
-
         selected_schemas = []
         for state_name, path in zip(self.states, paths, strict=True):
             schema = functional._state_schema

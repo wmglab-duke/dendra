@@ -1224,10 +1224,6 @@ def test_functional_recorder_fails_closed_on_unsupported_or_stale_configuration(
         callbacks=cadenced,
     )
     assert sampled["callbacks"]["trace"]["v"].shape[0] == 2
-    with pytest.raises(dn.func.FunctionalizationError, match="sliding_window"):
-        functional.make_callbacks(
-            {"trace": FunctionalRecorder(["v"], sliding_window=3)}
-        )
     with pytest.raises(dn.func.FunctionalizationError, match="non-scalar state"):
         functional.make_callbacks({"trace": FunctionalRecorder(["t"], max_only=True)})
 

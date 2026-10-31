@@ -544,9 +544,6 @@ class Recorder(Callback):
         without rounding. Default is None (record every step). A fresh in-memory
         recording retains the initial boundary, then post-step frames stride,
         2 * stride, and so on.
-    sliding_window : int, optional
-        Size of sliding window for temporal averaging of recorded data.
-        Default is None (no averaging).
     partition : sequence of int, optional
         With ``max_only=True``, contiguous segment lengths along the final
         compartment axis. One maximum per segment is appended as the final
@@ -558,6 +555,9 @@ class Recorder(Callback):
 
     Notes
     -----
+    Apply temporal filtering or averaging to the recorded tensors as a separate
+    postprocessing step.
+
     For large-scale simulations, use the set_hdf5 method to enable caching to an
     HDF5 file, which helps manage memory usage.
 
@@ -588,7 +588,6 @@ class Recorder(Callback):
         max_only=False,
         node_indices=None,
         dt=None,
-        sliding_window=None,
         partition=None,
         *,
         region=None,
@@ -609,7 +608,6 @@ class Recorder(Callback):
         if self.indexed:
             self.node_indices = torch.as_tensor(node_indices, dtype=torch.long)
 
-        self.sliding_window = sliding_window
         rfunc = _build_recorder_func(states, self.max_only, self.indexed)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
@@ -999,17 +997,11 @@ class Recorder(Callback):
         -------
         torch.Tensor
             A tensor containing the stacked recorded data. If max_only is True,
-            returns the maximum value along the time dimension. If sliding_window is set,
-            the data is temporally averaged using the specified window size.
+            returns the maximum value along the time dimension.
         """
         if var is not None:
-            vs = torch.stack(self.rec[var])
-            if self.sliding_window is not None:
-                vs = _sliding_window_average(vs, self.sliding_window)
-            return vs
+            return torch.stack(self.rec[var])
         vs = torch.stack([torch.stack(self.rec[s]) for s in self.rec], dim=-2)
-        if self.sliding_window is not None:
-            vs = _sliding_window_average(vs, self.sliding_window)
         if self.max_only:
             return torch.amax(vs, 0)
         return vs
@@ -2347,80 +2339,3 @@ def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
     at_least = _validate_activity_target(at_least)
     partition = _validate_activity_partition(record, at_least, partition)
     return _activity_from_counts(record, at_least, partition, total=True)
-
-
-def _sliding_window_average(x, window_size: int):
-    """
-    Compute the sliding (moving) window average along axis 0 for a tensor,
-    with padding so that the output has the same shape as the input.
-
-    The function pads the input along axis 0 using edge replication and then
-    computes the average over every consecutive window. All remaining dimensions
-    are treated as independent feature channels and the output shape matches the input.
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        A tensor with time or samples along axis 0.
-    window_size : int
-        The size of the sliding window (must be >= 1).
-
-    Returns
-    -------
-    out : torch.Tensor
-        The sliding window averages computed along axis 0 with the same shape as the input.
-
-    Raises
-    ------
-    ValueError
-        If window_size is less than 1.
-    TypeError
-        If x is not a PyTorch tensor.
-    """
-    if window_size < 1:
-        raise ValueError("window_size must be at least 1.")
-
-    # Compute padding sizes so that:
-    #    pad_left + pad_right = window_size - 1
-    if window_size % 2 == 1:
-        pad_left = pad_right = window_size // 2
-    else:
-        pad_left = window_size // 2
-        pad_right = window_size // 2 - 1
-
-    # ---------------------------
-    # PyTorch implementation
-    # ---------------------------
-    if not torch.is_tensor(x):
-        raise TypeError("x must be a PyTorch tensor.")
-    if x.ndim < 1 or x.shape[0] == 0:
-        raise ValueError("x must contain at least one sample along axis 0.")
-
-    # Recorder outputs are commonly 3-D, while other callers may use tensors
-    # of any rank. ``unfold`` appends the window dimension without copying the
-    # individual windows, and a regular reduction avoids backend-specific
-    # convolution primitives that may not be available on every supported CPU.
-    feature_shape = x.shape[1:]
-
-    # Manually pad along axis 0 (the N dimension) using replication.
-    # For pad_left, replicate the first slice; for pad_right, replicate the last slice.
-    left_pad = (
-        x[0:1].expand((pad_left, *feature_shape))
-        if pad_left > 0
-        else torch.empty((0, *feature_shape), device=x.device, dtype=x.dtype)
-    )
-    right_pad = (
-        x[-1:].expand((pad_right, *feature_shape))
-        if pad_right > 0
-        else torch.empty((0, *feature_shape), device=x.device, dtype=x.dtype)
-    )
-    # Concatenate along dimension 0.
-    x_padded = torch.cat([left_pad, x, right_pad], dim=0)
-
-    # Unfolding dimension 0 puts the window dimension last, so reducing it
-    # preserves both the original rank and the ordering of all feature axes.
-    return x_padded.unfold(0, window_size, 1).mean(dim=-1)
-
-
-# Public alias retained for tests and user code; Recorder uses the private name internally.
-sliding_window_average = _sliding_window_average

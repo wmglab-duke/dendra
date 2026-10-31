@@ -178,7 +178,6 @@ def test_network_recorder_continuation_and_empty_segment_do_not_duplicate_initia
         dn.func.Recorder("v"),
         dn.func.Recorder("cell.missing"),
         dn.func.Recorder("t", node_indices=[0]),
-        dn.func.Recorder("cell.v", sliding_window=3),
         dn.func.Recorder("cell.v", region=object()),
         dn.func.LFP([torch.ones(2, 1, dtype=DTYPE)]),
         dn.func.Raster(),

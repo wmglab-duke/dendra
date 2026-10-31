@@ -111,8 +111,8 @@ def _recorder_trace(
 ) -> tuple[torch.Tensor, bool]:
     if "v" not in recorder.states:
         raise ValueError("Recorder must include the full membrane-voltage state 'v'.")
-    if recorder.max_only or recorder.sliding_window is not None:
-        raise ValueError("Recorder voltage must not be reduced or smoothed.")
+    if recorder.max_only:
+        raise ValueError("Recorder voltage must not be reduced.")
     if recorder.save_every not in (None, 1):
         raise ValueError("Recorder must save every solver step.")
     if recorder.cache_with_hdf5:

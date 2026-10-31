@@ -207,14 +207,11 @@ def test_packed_region_requires_parent_root_instead_of_original_child():
         {"node_indices": []},
         {"max_only": True},
         {"partition": [4]},
-        {"sliding_window": 3},
     ),
 )
 def test_network_regions_preserve_shared_recorder_option_restrictions(options):
     functional, sources, _ = _mock_network()
-    with pytest.raises(
-        dn.func.FunctionalizationError, match="combined|dt|sliding_window"
-    ):
+    with pytest.raises(dn.func.FunctionalizationError, match="combined"):
         make_network_callbacks(
             functional,
             {"trace": dn.func.Recorder("left.v", region=sources["left"][:], **options)},
