@@ -419,15 +419,22 @@ for the full contract and runnable custom reducer/emitter example.
    :members: export_state, restore_state
 
 Native ``Population.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
-a bound collection through ``functional_callbacks=`` and explicit continuation
-through ``functional_callback_state=results.state``. The collection must bind
+a prepared ``FunctionalCallbacks`` collection through ``callbacks=`` and explicit
+continuation through ``callback_state=results.state``. The collection must bind
 the exact source Population and matching timestep; prepare it directly with
 ``dn.func.make_callbacks(model, configurations, dt=...)``. Native model state remains
 on the Population. Opted-in ``step``, ``run`` and ``longrun`` return the existing
 ``FunctionalCallbackResults`` mapping. Without a pure collection, ``step``
 returns the model for chaining and ``run``/``longrun`` return ``None``.
 Checkpointed execution retains its loss/result tuples.
-Ordinary ``callbacks=`` can coexist independently. The bridge supplies a
+Ordinary native ``callbacks=[hook, ...]`` lists retain their hook, loss and return
+contracts. To combine a native list with pure observations, pass the collection
+through ``functional_callbacks=`` and its carry through ``callback_state=``.
+``functional_callbacks=`` and ``functional_callback_state=`` remain supported.
+Two non-``None`` pure
+collection arguments or two non-``None`` carry arguments are rejected.
+Native calls accept prepared collections rather than automatically preparing
+configuration mappings. The bridge supplies a
 gradient-preserving state snapshot and auxiliary ``{"v": ...}``, with pure
 updates after clock advancement and before native post-step hooks. HDF5
 Recorders use the shared host collector, outside numerical checkpoint replay.
@@ -438,7 +445,7 @@ the complete
 example.
 
 Native ``Network.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
-the same ``functional_callbacks`` and ``functional_callback_state`` keywords.
+the same ``callbacks`` and ``callback_state`` keywords and compatibility spellings.
 Prepare the collection with ``dn.func.make_callbacks(network, configurations)``
 for the exact initialized source Network; its initialized timestep remains
 authoritative. Qualified Network

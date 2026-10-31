@@ -101,24 +101,24 @@ def run_demo(directory, network):
         for _ in range(MANUAL):
             result = model.step(
                 **clock,
-                functional_callbacks=observations,
-                functional_callback_state=carry,
+                callbacks=observations,
+                callback_state=carry,
             )
             parts.append(result)
             carry = result.state
         result = model.run(
             tstop=RUN * DT,
             **clock,
-            functional_callbacks=observations,
-            functional_callback_state=carry,
+            callbacks=observations,
+            callback_state=carry,
         )
         parts.append(result)
         hook_loss, result = model.longrun_checkpointed(
             tstop=CHECKPOINTED * DT,
             chunklength=2,
             **clock,
-            functional_callbacks=observations,
-            functional_callback_state=result.state,
+            callbacks=observations,
+            callback_state=result.state,
             safe_checkpoint=True,
         )
         assert hook_loss is None
@@ -127,8 +127,8 @@ def run_demo(directory, network):
             tstop=LONG * DT,
             chunklength=2,
             **clock,
-            functional_callbacks=observations,
-            functional_callback_state=result.state,
+            callbacks=observations,
+            callback_state=result.state,
         )
         parts.append(result)
         # endregion continuation

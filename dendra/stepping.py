@@ -15,6 +15,7 @@ def step(
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
     loop_hooks: bool = False,
+    callback_state=None,
     functional_callbacks=None,
     functional_callback_state=None,
 ):
@@ -34,20 +35,25 @@ def step(
         Extracellular stimulation specification. For populations, this has the
         same meaning as ``Population.run(extra=...)``. For networks, this is the
         same population-name mapping accepted by ``Network.run(extra=...)``.
-    callbacks : sequence of Callback, optional
-        Callbacks to execute around the step. By default only per-step hooks are
-        called; set ``loop_hooks=True`` to also call loop setup/finalization
-        hooks around the single step.
+    callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+        Native hook sequence, or a pure collection prepared once with
+        ``dn.func.make_callbacks`` for this exact model and timestep.
+        Pure observations run after clock advancement and before native
+        post-step hooks. Native hooks retain their loop/chunk/step timing.
     loop_hooks : bool, optional
         Whether to call ``pre_loop_hook`` and ``post_loop_hook`` around the
         single step.
+    callback_state : dendra.func.FunctionalCallbackState, optional
+        Carry from the same prepared collection supplied through
+        ``callbacks`` or ``functional_callbacks``. Resumes sampling
+        phase and reducer totals without another initial observation.
     functional_callbacks : dendra.func.FunctionalCallbacks, optional
-        Pure observations bound to this exact model. They observe the accepted
-        state after clock advancement and before native post-step hooks.
+        Compatibility spelling for the prepared pure collection. Use it
+        alongside ``callbacks=[...]`` to combine native hooks and pure
+        observations. Supply the collection through only one argument.
     functional_callback_state : dendra.func.FunctionalCallbackState, optional
-        Carry from the same callback collection. Supply the previous result's
-        ``state`` to continue sampling phase and reducer totals without another
-        initial observation. Native ``loop_hooks`` remain independent.
+        Compatibility spelling for ``callback_state``. Supply carry
+        through only one argument; either collection spelling is accepted.
 
     Returns
     -------
@@ -66,6 +72,8 @@ def step(
             "functional_callbacks": functional_callbacks,
             "functional_callback_state": functional_callback_state,
         }
+    if callback_state is not None:
+        callback_options["callback_state"] = callback_state
 
     if isinstance(model, Population):
         return model.step(
@@ -111,6 +119,7 @@ def step_population(
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
     loop_hooks: bool = False,
+    callback_state=None,
     functional_callbacks=None,
     functional_callback_state=None,
 ):
@@ -127,19 +136,25 @@ def step_population(
     extra : optional
         Extracellular stimulation specification. This has the same meaning as
         ``Population.run(extra=...)``.
-    callbacks : sequence of Callback, optional
-        Callbacks to execute around the step. By default only per-step hooks are
-        called; set ``loop_hooks=True`` to also call loop setup/finalization
-        hooks around the single step.
+    callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+        Native hook sequence, or a pure collection prepared once with
+        ``dn.func.make_callbacks`` for this exact model and timestep.
+        Pure observations run after clock advancement and before native
+        post-step hooks. Native hooks retain their loop/chunk/step timing.
     loop_hooks : bool, optional
         Whether to call ``pre_loop_hook`` and ``post_loop_hook`` around the
         single step.
+    callback_state : dendra.func.FunctionalCallbackState, optional
+        Carry from the same prepared collection supplied through
+        ``callbacks`` or ``functional_callbacks``. Resumes sampling
+        phase and reducer totals without another initial observation.
     functional_callbacks : dendra.func.FunctionalCallbacks, optional
-        Pure observations bound to this exact Population.
+        Compatibility spelling for the prepared pure collection. Use it
+        alongside ``callbacks=[...]`` to combine native hooks and pure
+        observations. Supply the collection through only one argument.
     functional_callback_state : dendra.func.FunctionalCallbackState, optional
-        Carry from the same callback collection. Supply the previous result's
-        ``state`` to continue its sampling phase and reducer totals without
-        another initial observation.
+        Compatibility spelling for ``callback_state``. Supply carry
+        through only one argument; either collection spelling is accepted.
 
     Returns
     -------
@@ -154,6 +169,8 @@ def step_population(
             "functional_callbacks": functional_callbacks,
             "functional_callback_state": functional_callback_state,
         }
+    if callback_state is not None:
+        callback_options["callback_state"] = callback_state
     return population.step(
         dt=dt,
         ve=ve,
@@ -170,6 +187,7 @@ def step_network(
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
     loop_hooks: bool = False,
+    callback_state=None,
     functional_callbacks=None,
     functional_callback_state=None,
 ):
@@ -182,19 +200,25 @@ def step_network(
     extra : optional
         Extracellular stimulation specification. This is the same population-name
         mapping accepted by ``Network.run(extra=...)``.
-    callbacks : sequence of Callback, optional
-        Callbacks to execute around the step. By default only per-step hooks are
-        called; set ``loop_hooks=True`` to also call loop setup/finalization
-        hooks around the single step.
+    callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+        Native hook sequence, or a pure collection prepared once with
+        ``dn.func.make_callbacks`` for this exact model and timestep.
+        Pure observations run after clock advancement and before native
+        post-step hooks. Native hooks retain their loop/chunk/step timing.
     loop_hooks : bool, optional
         Whether to call ``pre_loop_hook`` and ``post_loop_hook`` around the
         single step.
+    callback_state : dendra.func.FunctionalCallbackState, optional
+        Carry from the same prepared collection supplied through
+        ``callbacks`` or ``functional_callbacks``. Resumes sampling
+        phase and reducer totals without another initial observation.
     functional_callbacks : dendra.func.FunctionalCallbacks, optional
-        Pure observations bound to this exact Network.
+        Compatibility spelling for the prepared pure collection. Use it
+        alongside ``callbacks=[...]`` to combine native hooks and pure
+        observations. Supply the collection through only one argument.
     functional_callback_state : dendra.func.FunctionalCallbackState, optional
-        Carry from the same callback collection. Supply the previous result's
-        ``state`` to continue its sampling phase and reducer totals without
-        another initial observation.
+        Compatibility spelling for ``callback_state``. Supply carry
+        through only one argument; either collection spelling is accepted.
 
     Returns
     -------
@@ -209,6 +233,8 @@ def step_network(
             "functional_callbacks": functional_callbacks,
             "functional_callback_state": functional_callback_state,
         }
+    if callback_state is not None:
+        callback_options["callback_state"] = callback_state
     return network.step(
         extra=extra, callbacks=callbacks, loop_hooks=loop_hooks, **callback_options
     )

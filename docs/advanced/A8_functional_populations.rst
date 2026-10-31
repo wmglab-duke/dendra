@@ -2314,10 +2314,10 @@ For native observation, prepare directly from the model:
    observations = dn.func.make_callbacks(
        model, {"trace": dn.Recorder(("v", "t"))}, dt=0.025,
    )
-   first = model.run(tstop=5.0, dt=0.025, functional_callbacks=observations)
+   first = model.run(tstop=5.0, dt=0.025, callbacks=observations)
    second = model.run(
-       tstop=5.0, dt=0.025, functional_callbacks=observations,
-       functional_callback_state=first.state,
+       tstop=5.0, dt=0.025, callbacks=observations,
+       callback_state=first.state,
    )
 
 Native-model preparation uses full functional lowering, with its existing
@@ -2682,10 +2682,10 @@ model state on the Population and returns callback results with explicit carry:
    callbacks = dn.func.make_callbacks(
        model, {"trace": dn.Recorder(("v", "t"))}, dt=0.01,
    )
-   first = model.run(tstop=2.0, dt=0.01, functional_callbacks=callbacks)
+   first = model.run(tstop=2.0, dt=0.01, callbacks=callbacks)
    second = model.longrun(
        tstop=3.0, chunklength=100, dt=0.01,
-       functional_callbacks=callbacks, functional_callback_state=first.state,
+       callbacks=callbacks, callback_state=first.state,
    )
    voltage = torch.cat((first["trace"]["v"], second["trace"]["v"]))
 
@@ -2697,17 +2697,35 @@ the Population itself retains the simulation state. Callback carry does not
 restore or initialize the model.
 
 ``step``, ``run`` and ``longrun`` return the existing ``FunctionalCallbackResults``
-mapping when ``functional_callbacks`` is supplied. Access named observations
-with ``results[name]`` and continue with
-``functional_callback_state=results.state``. Without functional callbacks,
+mapping when ``callbacks`` is a prepared ``FunctionalCallbacks`` collection.
+Access named observations with ``results[name]`` and continue with
+``callback_state=results.state``. Without a pure collection,
 ``step`` returns the model for chaining, while ``run`` and ``longrun`` retain
 their ordinary ``None`` return. ``longrun_checkpointed`` retains
 its loss return contract: ``(loss_or_none, results)``, or
 ``(loss_or_none, final_state, results)`` with ``return_final_state=True``.
 
-Ordinary native ``callbacks=...`` can run alongside the pure collection and
-retain their hook timing and loss behavior. Pure callbacks observe accepted
-post-step state after the clock advances and before native post-step hooks.
+Native ``callbacks=[hook, ...]`` lists retain their existing hook timing,
+loss behavior and return conventions. To run native hooks alongside a prepared
+pure collection, keep the list in ``callbacks`` and pass the collection through
+``functional_callbacks``; ``callback_state`` continues its carry:
+
+.. code-block:: python
+
+   result = model.run(
+       tstop=1.0, dt=0.01,
+       callbacks=[native_hook], functional_callbacks=callbacks,
+       callback_state=second.state,
+   )
+
+``functional_callbacks=`` and ``functional_callback_state=`` remain supported
+compatibility spellings. Supplying non-``None`` pure collections through both
+``callbacks`` and ``functional_callbacks``, or non-``None`` carry through both
+state names, raises an error. Native calls do not prepare named configuration
+mappings; use ``dn.func.make_callbacks`` once before repeated execution.
+
+Pure callbacks observe accepted post-step state after the clock advances and
+before native post-step hooks.
 Each observation receives a gradient-preserving snapshot of the native tensor
 frame, preserving aliases within that frame. Carry can retain a sampled value
 without that value changing when native buffers advance. Callback methods must
@@ -2754,18 +2772,19 @@ cadence and gradients, and checks that checkpoint replay preserves the live mode
 Manually controlled native steps
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-``Population.step`` and ``Network.step`` accept the same bound collection and
-explicit callback carry. With functional callbacks omitted, they return the
-model itself for chaining. Opted-in calls return ``FunctionalCallbackResults``;
-the model remains the owner of its advancing simulation state:
+``Population.step`` and ``Network.step`` accept the same bound collection through
+``callbacks=`` and explicit carry through ``callback_state=``. Without a pure
+collection, they return the model itself for chaining. Opted-in calls return
+``FunctionalCallbackResults``; the model remains the owner of its advancing
+simulation state:
 
 .. code-block:: python
 
    carry = None
    for _ in range(10):
        result = model.step(
-           dt=DT, functional_callbacks=callbacks,
-           functional_callback_state=carry,
+           dt=DT, callbacks=callbacks,
+           callback_state=carry,
        )
        carry = result.state
        voltage = result["trace"]["v"]
@@ -2773,7 +2792,8 @@ the model remains the owner of its advancing simulation state:
 For a Network, omit ``dt``: its initialized timestep is authoritative. The
 collection must bind to the exact source model and matching timestep.
 ``dn.step``, ``dn.step_population`` and ``dn.step_network`` accept the same
-functional callback arguments and preserve these return conventions.
+callback arguments and compatibility spellings, preserving these return
+conventions.
 
 ``loop_hooks`` controls only ordinary native pre/post-loop hooks. Pure callback
 initialization is controlled by callback carry: it runs when carry is omitted,
@@ -2867,8 +2887,10 @@ example combines a custom reducer/emitter with built-ins and checks scan/while
 results and continuation.
 
 Custom callbacks support in-memory continuation with the matching bound
-collection. Portable export and restoration of custom callback configurations
-are currently unsupported; see :doc:`A58_functional_callback_checkpoints`.
+collection. For portable callback carry export and restoration, implement
+``checkpoint_configuration()`` on the bound callback to describe its static
+configuration. The receiving collection must use compatible configuration;
+see :doc:`A58_functional_callback_checkpoints`.
 
 ``initialize`` returns explicit carry and an optional initial emission;
 ``update`` returns the next carry and an optional post-step emission; and
@@ -3062,11 +3084,11 @@ and bind the Recorder once, then pass explicit callback carry between calls:
            {"disk": disk, "memory": dn.Recorder(("v", "t"), dt=0.1)},
            dt=0.025,
        )
-       first = model.step(dt=0.025, functional_callbacks=observations)
+       first = model.step(dt=0.025, callbacks=observations)
        second = model.longrun(
            tstop=10.0, chunklength=256, dt=0.025,
-           functional_callbacks=observations,
-           functional_callback_state=first.state,
+           callbacks=observations,
+           callback_state=first.state,
        )
        voltage = torch.cat((first["memory"]["v"], second["memory"]["v"]))
    finally:

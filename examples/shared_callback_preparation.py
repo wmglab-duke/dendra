@@ -85,13 +85,13 @@ def run_demo(network):
     # Population preparation needs dt; a Network supplies its initialized dt.
     clock = {} if network else {"dt": DT}
     observations = dn.func.make_callbacks(model, specifications(network), **clock)
-    first = model.run(tstop=PREFIX * DT, **clock, functional_callbacks=observations)
+    first = model.run(tstop=PREFIX * DT, **clock, callbacks=observations)
     last = model.longrun(
         tstop=SUFFIX * DT,
         chunklength=2,
         **clock,
-        functional_callbacks=observations,
-        functional_callback_state=first.state,
+        callbacks=observations,
+        callback_state=first.state,
     )
     # endregion native
     samples = {
@@ -149,8 +149,8 @@ def run_demo(network):
         continued = model.run(
             tstop=FOLLOWUP * DT,
             **clock,
-            functional_callbacks=observations,
-            functional_callback_state=last.state,
+            callbacks=observations,
+            callback_state=last.state,
         )
         _, resumed = dn.func.run(
             functional.bind(tensors),

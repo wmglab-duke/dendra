@@ -90,14 +90,14 @@ def main():
         first = model.run(
             tstop=FIRST * DT,
             dt=DT,
-            functional_callbacks=callbacks,
+            callbacks=callbacks,
         )
         second = model.longrun(
             tstop=MIDDLE * DT,
             chunklength=2,
             dt=DT,
-            functional_callbacks=callbacks,
-            functional_callback_state=first.state,
+            callbacks=callbacks,
+            callback_state=first.state,
         )
         # endregion binding
         # region checkpoint
@@ -107,10 +107,11 @@ def main():
             dt=DT,
             callbacks=[NativeVoltageLoss()],
             functional_callbacks=callbacks,
-            functional_callback_state=second.state,
+            callback_state=second.state,
             safe_checkpoint=True,
         )
-        # The native loss and the pure observations have independent outputs.
+        # A native hook list coexists with the prepared pure collection through
+        # functional_callbacks; their loss and observation outputs stay separate.
         energy = last["summary"]["energy"]
         # endregion checkpoint
         assert last["summary"]["steps"].item() == STEPS

@@ -31,8 +31,8 @@ from ..core import (
     _duration_step_budget,
     _load_compatible_state_dict_transactionally,
     _load_population_cache_transactionally,
+    _native_callback_arguments,
     _native_callback_storage,
-    _native_functional_callback_session,
     _time_grid_from_step_count,
     _validate_time_scalar,
     make_intra,
@@ -3577,6 +3577,7 @@ class Network(RNGMixin):
         extra=None,
         callbacks=None,
         loop_hooks: bool = False,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -3597,21 +3598,25 @@ class Network(RNGMixin):
             Waveform output to ``[*batch, np, 1]``. Ordinary trailing
             broadcasting is tried first, followed only on failure by a
             low-rank, right-aligned batch-only fallback.
-        callbacks : sequence of Callback, optional
-            Callbacks to execute around this single step. By default ``step``
-            calls ``pre_step_hook`` and ``post_step_hook`` only.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this exact model and timestep.
+            Pure observations run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         loop_hooks : bool, optional
             If ``True``, also call ``pre_loop_hook`` before the step and
             ``post_loop_hook`` after the step.
-        functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Pure observations bound to this exact Network with
-            ``functional.make_callbacks(...)``. Qualified Recorders and
-            ``PopulationCallback`` scopes retain their functional contract.
-        functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Carry from the same callback collection. Without carry, initialize
-            observations before the step; supplied carry continues sampling
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
             phase and reducer totals without another initial observation.
-            ``loop_hooks`` governs native hooks independently of this carry.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -3632,8 +3637,12 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before step()."
             )
         self._require_mode_runtime_ready()
-        observer = _native_functional_callback_session(
-            self, functional_callbacks, functional_callback_state
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
         )
         self._validate_population_runtime_contracts()
 
@@ -3730,6 +3739,7 @@ class Network(RNGMixin):
         callbacks=None,
         progressbar=False,
         *,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -3751,19 +3761,24 @@ class Network(RNGMixin):
             tried first; only on failure may low-rank value axes use a
             right-aligned batch-only fallback. Explicit singleton axes
             disambiguate equal-size batch and spatial dimensions.
-        callbacks : list[Callback], optional
-            Callbacks invoked each step (wrapped in :class:`CallbackList`).
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this exact model and timestep.
+            Pure observations run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool or tqdm.tqdm, optional
             If truthy, show a progress bar (auto-created if True). Default False.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
         functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Pure observations bound to this exact Network with
-            ``functional.make_callbacks(...)``. Qualified Recorders and
-            ``PopulationCallback`` scopes use the same functional contract.
-            Observations run after each step and clock advance, before native
-            post-step hooks.
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
         functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Carry from a previous result's ``state`` using the same callback
-            collection. Resumes sampling without another initial observation.
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -3790,8 +3805,12 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before run()."
             )
         self._require_mode_runtime_ready()
-        observer = _native_functional_callback_session(
-            self, functional_callbacks, functional_callback_state
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
         )
         self._validate_population_runtime_contracts()
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
@@ -3918,6 +3937,7 @@ class Network(RNGMixin):
         callbacks=None,
         progressbar=False,
         *,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -3942,17 +3962,24 @@ class Network(RNGMixin):
         extra : dict[str, tuple[torch.Tensor, object]], optional
             Population-specific extracellular stimuli with the same public
             ``(v, waveform)`` format and shape contract as :meth:`run`.
-        callbacks : sequence of Callback, optional
-            Callbacks invoked around the complete loop, each chunk, and each
-            timestep.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this exact model and timestep.
+            Pure observations run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool or tqdm.tqdm, optional
             If truthy, display progress over completed timesteps.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
         functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Pure observations bound to this exact Network, with the same
-            contract as :meth:`run`.
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
         functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Explicit carry from the same callback collection. Preserves
-            sampling phase and reducer totals without a duplicate initial sample.
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -3972,8 +3999,12 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before longrun()."
             )
         self._require_mode_runtime_ready()
-        observer = _native_functional_callback_session(
-            self, functional_callbacks, functional_callback_state
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
         )
         self._validate_population_runtime_contracts()
         if not isinstance(chunklength, int) or isinstance(chunklength, bool):
@@ -5209,6 +5240,7 @@ class Network(RNGMixin):
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -5234,8 +5266,11 @@ class Network(RNGMixin):
         extra:
             Optional population-specific ``(v, waveform)`` mapping with the
             same shape and broadcasting contract as :meth:`run`.
-        callbacks:
-            Optional list of callbacks.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this exact model and timestep.
+            Pure observations run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar:
             If ``True``, displays a tqdm progress bar over chunks.
         safe_checkpoint:
@@ -5248,13 +5283,17 @@ class Network(RNGMixin):
             the state visible before replay, including later simulation calls.
         return_final_state:
             If ``True``, return ``(loss, final_state_dict)``.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
         functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Pure observations bound to this exact Network, with the same
-            contract as :meth:`run` and :meth:`longrun`. Carry and emissions
-            pass explicitly through checkpoints; collection runs outside replay.
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
         functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Carry from the same callback collection. Resumes sampling phase
-            and reducer totals without another initial observation.
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -5292,8 +5331,12 @@ class Network(RNGMixin):
                 "longrun_checkpointed()."
             )
         self._require_mode_runtime_ready()
-        observer = _native_functional_callback_session(
-            self, functional_callbacks, functional_callback_state
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
         )
         self._validate_population_runtime_contracts()
         if isinstance(chunklength, bool) or not isinstance(chunklength, int):

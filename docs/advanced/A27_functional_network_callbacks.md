@@ -88,7 +88,8 @@ not make its imperative hooks functionally lowerable.
 ## Use pure callbacks with native Network execution
 
 Native `Network.step`, `run`, `longrun` and `longrun_checkpointed` accept the same
-bound callback collection through `functional_callbacks=`. Build it from the
+bound callback collection through `callbacks=` and explicit carry through
+`callback_state=`. Build it from the
 exact initialized source Network. Its timestep comes from
 `network.initialize(dt)`; native Network execution uses that timestep without
 a per-call `dt` argument:
@@ -100,10 +101,10 @@ observations = dn.func.make_callbacks(network, {
         "right", dn.callbacks.APCount(node_check=[0, -1])
     ),
 })
-first = network.run(10.0, functional_callbacks=observations)
+first = network.run(10.0, callbacks=observations)
 second = network.longrun(
-    10.0, chunklength=100, functional_callbacks=observations,
-    functional_callback_state=first.state,
+    10.0, chunklength=100, callbacks=observations,
+    callback_state=first.state,
 )
 ```
 
@@ -135,8 +136,13 @@ Unscoped custom callbacks receive the complete Network state and auxiliary
 Population state and auxiliary `{"v": ...}`. Pure updates observe accepted
 state after Network clock advancement and before ordinary native post-step
 hooks. Native tensor frames are snapshotted without detaching their gradients.
-Ordinary native `callbacks=` can coexist with the pure collection and keep
-their existing hook behavior.
+Ordinary native `callbacks=[hook, ...]` lists retain their existing hook
+behavior. To combine them with pure observations, supply the prepared collection
+through `functional_callbacks=observations` and its carry through
+`callback_state=`. The `functional_callback_state=` spelling also remains
+supported. Two non-`None` pure collection arguments or two non-`None` carry
+arguments are rejected. Native calls accept prepared collections rather than
+preparing configuration mappings on each invocation.
 
 Fresh Recorder results include the current initial boundary; continued calls
 emit only new accepted samples. Zero-step calls retain the native loop-hook
@@ -171,9 +177,9 @@ example for manual stepping, mixed-method continuation and portable carry.
 ### Checkpointed native observations
 
 Continue the same collection through checkpointed execution using
-`functional_callback_state=previous.state`. Callback carry is threaded through
-each checkpointed chunk; recording collection happens outside replay. Native
-`callbacks=` may contribute an independent scalar hook loss and must retain
+`callbacks=observations, callback_state=previous.state`. Callback carry is
+threaded through each checkpointed chunk; recording collection happens outside
+replay. Native hook lists may contribute an independent scalar loss and retain
 their replay-safe behavior. If no native hook contributes a loss,
 `loss_or_none` is `None`; construct an objective from the pure callback results.
 

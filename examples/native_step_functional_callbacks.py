@@ -113,7 +113,7 @@ def run_demo(network):
     for index in range(MANUAL):
         options = {
             "functional_callbacks": observations,
-            "functional_callback_state": carry,
+            "callback_state": carry,
             "callbacks": [native_hooks],
             "loop_hooks": index == MANUAL - 1,
         }
@@ -123,7 +123,8 @@ def run_demo(network):
             result = dn.step(model, dt=DT, **options)
         carry = result.state
         results.append(result)
-    # Pure callback phase continues even when native loop hooks are requested.
+    # Native hook lists coexist through functional_callbacks; callback_state
+    # keeps pure callback phase independent of the requested native loop hooks.
     assert native_hooks.started == native_hooks.finished == 1
     # endregion manual
     field = "right.v" if network else "v"
@@ -135,16 +136,16 @@ def run_demo(network):
     result = model.run(
         tstop=RUN * DT,
         **clock,
-        functional_callbacks=observations,
-        functional_callback_state=carry,
+        callbacks=observations,
+        callback_state=carry,
     )
     results.append(result)
     hook_loss, result = model.longrun_checkpointed(
         tstop=CHECKPOINTED * DT,
         chunklength=2,
         **clock,
-        functional_callbacks=observations,
-        functional_callback_state=result.state,
+        callbacks=observations,
+        callback_state=result.state,
         safe_checkpoint=True,
     )
     assert hook_loss is None
@@ -153,8 +154,8 @@ def run_demo(network):
         tstop=LONG * DT,
         chunklength=2,
         **clock,
-        functional_callbacks=observations,
-        functional_callback_state=result.state,
+        callbacks=observations,
+        callback_state=result.state,
     )
     results.append(result)
     # endregion continuation
@@ -219,8 +220,8 @@ def run_demo(network):
     with torch.no_grad():
         continued = model.step(
             **clock,
-            functional_callbacks=observations,
-            functional_callback_state=restored,
+            callbacks=observations,
+            callback_state=restored,
         )
     assert continued["summary"]["steps"].item() == STEPS + 1
     assert continued["trace"][field].shape[0] == 1

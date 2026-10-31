@@ -3819,6 +3819,7 @@ class Population(P, Sliceable):
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         loop_hooks: bool = False,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -3839,22 +3840,26 @@ class Population(P, Sliceable):
             Higher-level extracellular stimulation specification with the same
             shape and broadcasting semantics as :meth:`run`. It is evaluated
             at the model's current time and converted to this step's ``ve``.
-        callbacks : sequence of Callback, optional
-            Callbacks to execute around this single step. By default ``step``
-            calls ``pre_step_hook`` and ``post_step_hook`` only.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this exact model and timestep.
+            Pure observations run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         loop_hooks : bool, optional
             If ``True``, also call ``pre_loop_hook`` before the step and
             ``post_loop_hook`` after the step. Leave this ``False`` when
             manually stepping inside an outer user-controlled loop.
-        functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Pure observations bound to this exact Population with
-            ``functional.make_callbacks(...)``. They observe accepted state
-            after clock advancement and before native post-step hooks.
-        functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Carry from the same callback collection. Without carry, initialize
-            observations before the step; supplied carry continues sampling
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
             phase and reducer totals without another initial observation.
-            ``loop_hooks`` governs native hooks independently of this carry.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -3866,8 +3871,12 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before stepping.")
-        observer = _native_functional_callback_session(
-            self, functional_callbacks, functional_callback_state
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
         )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
@@ -3960,6 +3969,7 @@ class Population(P, Sliceable):
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar: bool = False,
         *,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -4020,22 +4030,25 @@ class Population(P, Sliceable):
         dt : float, optional
             Time step size in milliseconds. If ``None``, the default value
             ``A.dt`` from the backend is used.
-        callbacks : sequence of Callback, optional
-            Callback objects to execute during simulation (pre-loop, per-step,
-            post-loop, etc.). If not already a :class:`CallbackList`, it is
-            wrapped into one.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this exact model and timestep.
+            Pure observations run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool or tqdm, optional
             If ``True``, displays a progress bar during simulation. Can also be
             a :class:`tqdm.tqdm` instance for custom progress tracking.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
         functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Pure observations bound to this exact Population with
-            ``functional.make_callbacks(...)``. They run alongside native
-            ``callbacks`` after each accepted step and clock advance, before
-            native post-step hooks.
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
         functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Carry from a previous result's ``state``. Requires the same
-            ``functional_callbacks`` collection and resumes its sampling phase
-            without another initial observation.
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -4064,8 +4077,12 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
-        observer = _native_functional_callback_session(
-            self, functional_callbacks, functional_callback_state
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
         )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
@@ -4312,6 +4329,7 @@ class Population(P, Sliceable):
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar=False,
         *,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -4365,19 +4383,25 @@ class Population(P, Sliceable):
 
             Mixing :class:`Waveform` and tensor time specifications across
             contacts is not supported and will raise a :class:`ValueError`.
-        callbacks : list of Callback, optional
-            A list of callback objects to be executed during simulation, allowing for
-            customized processing at various stages (e.g., pre-loop, post-step,
-            post-loop).
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this exact model and timestep.
+            Pure observations run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool or tqdm, optional
             If ``True`` (or if a :class:`tqdm.tqdm` instance is provided), displays
             a progress bar to track simulation progress across chunks. Default is ``False``.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
         functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Pure observations bound to this exact Population, with the same
-            contract as :meth:`run` and :meth:`longrun_checkpointed`.
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
         functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Explicit callback carry from the same bound collection. Resumes
-            observation without a duplicate initial sample.
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -4398,8 +4422,12 @@ class Population(P, Sliceable):
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
-        observer = _native_functional_callback_session(
-            self, functional_callbacks, functional_callback_state
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
         )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
@@ -7242,6 +7270,7 @@ class Population(P, Sliceable):
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -7268,9 +7297,11 @@ class Population(P, Sliceable):
         extra : ExtraSpec, optional
             Extracellular configuration with the same ``(ve_s, time)`` shape
             and trailing-first broadcasting contract as :meth:`longrun`.
-        callbacks : Sequence[Callback] or CallbackList, optional
-            Sequence of callback hooks to run at various points during the simulation.
-            See :class:`Callback` for details.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this exact model and timestep.
+            Pure observations run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool, optional
             If True, display a progress bar during the run. Default is False.
         safe_checkpoint : bool, optional
@@ -7287,13 +7318,17 @@ class Population(P, Sliceable):
             If True, return a tuple (loss, final_state) where final_state is a
             checkpoint state dictionary suitable for restore_dict_from_checkpoint.
             Default is False.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
         functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Native pure callback plan made from a FunctionalPopulation bound to
-            this exact source model. It runs beside, and does not replace, the
-            imperative hooks in ``callbacks``.
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
         functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Explicit carry returned by a previous native callback execution.
-            Requires ``functional_callbacks`` and resumes without reinitializing.
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -7301,7 +7336,7 @@ class Population(P, Sliceable):
             If return_final_state is False (default): returns the total loss contribution
             from callbacks, or None if no hook returned a non-None value.
             If return_final_state is True: returns (loss_or_none, final_state_dict).
-            When ``functional_callbacks`` is supplied, its result is appended:
+            With a prepared pure collection, its result is appended:
             ``(loss_or_none, callback_results)`` or
             ``(loss_or_none, final_state_dict, callback_results)``.
 
@@ -7337,8 +7372,12 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
-        observer = _native_functional_callback_session(
-            self, functional_callbacks, functional_callback_state
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
         )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
@@ -10437,6 +10476,38 @@ class Myelinated(Axon):
 
 
 # callback helpers
+def _native_callback_arguments(
+    model, callbacks, callback_state, functional_callbacks, functional_callback_state
+):
+    """Resolve shared observation names without consuming native hook lists."""
+    if callbacks is not None:
+        # A prepared collection cannot exist before its defining class is
+        # loaded. Use that class identity without importing functional code
+        # or inspecting authored callback objects on the native-only path.
+        module = sys.modules.get("dendra.func._callbacks")
+        collection_type = (
+            None if module is None else vars(module).get("FunctionalCallbacks")
+        )
+        if collection_type is not None and issubclass(type(callbacks), collection_type):
+            if functional_callbacks is not None:
+                raise ValueError(
+                    "Provide either callbacks or functional_callbacks, not both."
+                )
+            functional_callbacks = callbacks
+            callbacks = None
+    if callback_state is not None:
+        if functional_callback_state is not None:
+            raise ValueError(
+                "Provide either callback_state or functional_callback_state, not both."
+            )
+        if functional_callbacks is None:
+            raise ValueError("callback_state requires a FunctionalCallbacks collection")
+        functional_callback_state = callback_state
+    return callbacks, _native_functional_callback_session(
+        model, functional_callbacks, functional_callback_state
+    )
+
+
 def _native_callback_storage(observer):
     """Own optional host recording without importing on the ordinary path."""
     return nullcontext() if observer is None else observer.recording()

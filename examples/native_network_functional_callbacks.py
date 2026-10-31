@@ -113,13 +113,13 @@ def main():
         network = make_network()
         # region continuation
         callbacks = make_callbacks(network)
-        first = network.run(FIRST * DT, functional_callbacks=callbacks)
+        first = network.run(FIRST * DT, callbacks=callbacks)
         # region checkpoint
         hook_loss, boundary_state, middle = network.longrun_checkpointed(
             CHECKPOINTED * DT,
             chunklength=2,
-            functional_callbacks=callbacks,
-            functional_callback_state=first.state,
+            callbacks=callbacks,
+            callback_state=first.state,
             safe_checkpoint=True,
             return_final_state=True,
         )
@@ -129,8 +129,8 @@ def main():
         last = network.longrun(
             LAST * DT,
             chunklength=2,
-            functional_callbacks=callbacks,
-            functional_callback_state=middle.state,
+            callbacks=callbacks,
+            callback_state=middle.state,
         )
         # endregion continuation
         joined = {
