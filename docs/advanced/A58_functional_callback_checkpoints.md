@@ -140,6 +140,14 @@ observation paths and indices,
 physical regions, Population scopes,
 timestep, Recorder cadence, threshold windows, activity rules and LFP lead fields.
 
+`dn.callbacks.PopulationCallback(name, callback)` and the compatible
+`dn.func.PopulationCallback` entry point bind to the same functional scope
+configuration. Portable carry can move between them when the Population name
+and inner callback configuration match. Native callback histories remain
+separate from exported functional carry. The
+{ref}`shared scope example <shared-population-callback-scopes>` demonstrates
+restoration across the two spellings without changing checkpoint formats.
+
 For threshold callbacks, compatibility checks use prepared compartment indices,
 window bounds, timestep and activity settings. Preparation is separate from the
 authored configuration object and contains no changing analysis state. The

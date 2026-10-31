@@ -16,6 +16,10 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from dendra.models._callback_scopes import (
+    _population_callback_target,
+    _validate_population_callback_name,
+)
 from dendra.models._lfp_callbacks import (
     _materialize_lfp_fields,
     _project_lfp,
@@ -148,6 +152,7 @@ def _native_callback_implementations():
     from dendra.models import callbacks as native
 
     return (
+        (native.PopulationCallback, PopulationCallback),
         (native.Recorder, Recorder),
         (native.LFP, LFP),
         (native.APCount, APCount),
@@ -202,6 +207,8 @@ def _coerce_callback_configuration(callback):
             raise FunctionalizationError(
                 f"custom imperative {type(callback).__name__} hooks cannot be lowered; implement a FunctionalCallback"
             )
+    if implementation is PopulationCallback:
+        return PopulationCallback(callback.population, callback.callback)
     if type(callback) is not NativeRecorder:
         if implementation is AnomalyDetector:
             return implementation()
@@ -265,21 +272,26 @@ class PopulationCallback(FunctionalCallback):
     selections and lead fields, or named Slice regions in a scoped Recorder.
     Pure custom callbacks use the same contract in scan and inference while
     execution, including this Population scope.
+
+    ``dn.callbacks.PopulationCallback`` supplies the shared scope configuration
+    for native and functional Networks. This functional entry point retains its
+    immutable configuration and pure callback contract.
     """
 
     population: str
     callback: FunctionalCallback
 
     def __post_init__(self):
-        if not isinstance(self.population, str):
-            raise TypeError("PopulationCallback population must be a string")
-        if not self.population:
-            raise ValueError("PopulationCallback population must not be empty")
+        from dendra.models.callbacks import (
+            PopulationCallback as NativePopulationCallback,
+        )
+
+        _validate_population_callback_name(self.population)
         if not _is_callback_configuration(self.callback):
             raise TypeError(
                 "PopulationCallback requires a pure FunctionalCallback or supported built-in Dendra callback configuration"
             )
-        if isinstance(self.callback, PopulationCallback):
+        if isinstance(self.callback, (PopulationCallback, NativePopulationCallback)):
             raise ValueError("PopulationCallback scopes cannot be nested")
 
     def _bind(self, functional):
@@ -290,14 +302,10 @@ class PopulationCallback(FunctionalCallback):
                 "PopulationCallback must be bound to a functional Network; "
                 "use the inner callback directly for a Population"
             )
-        if self.population not in functional.populations:
-            raise FunctionalizationError(
-                f"Unknown Network Population {self.population!r}; "
-                f"available names are {tuple(functional.populations)}"
-            )
-        bound = _coerce_callback_configuration(self.callback)._bind(
-            functional.populations[self.population]
+        population = _population_callback_target(
+            functional.populations, self.population, error_type=FunctionalizationError
         )
+        bound = _coerce_callback_configuration(self.callback)._bind(population)
         if not isinstance(bound, FunctionalCallback):
             raise FunctionalizationError(
                 "PopulationCallback inner callback returned an invalid bound object"

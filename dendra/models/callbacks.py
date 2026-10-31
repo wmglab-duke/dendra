@@ -13,6 +13,10 @@ from h5py import File
 from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ..helpers import nojit
+from ._callback_scopes import (
+    _population_callback_target,
+    _validate_population_callback_name,
+)
 from ._lfp_callbacks import (
     _materialize_lfp_fields,
     _project_lfp,
@@ -109,6 +113,90 @@ class Callback(torch.nn.Module):
 
         Override to finalize results or free resources."""
         pass
+
+
+class PopulationCallback(Callback):
+    """Apply a callback to one top-level Population in a Network.
+
+    Parameters
+    ----------
+    population : str
+        Exact Population name in the Network's ``populations`` mapping. A
+        concatenated MultiPopulation is one owner; use its named physical
+        Slices with a Recorder's ``region`` argument to select components.
+    callback : Callback or dendra.func.FunctionalCallback
+        Observation configuration for the selected Population. Native Network
+        execution forwards hooks to a native :class:`Callback`. Functional
+        execution accepts supported native configurations and pure callbacks.
+
+    Notes
+    -----
+    Inspect native results through the supplied inner callback, also available
+    as ``callback``. Functional execution captures the configuration and returns
+    independently owned results without importing the inner callback's native
+    history. Scopes cannot be nested. Use the inner callback directly for a
+    standalone Population.
+
+    Examples
+    --------
+    >>> counts = APCount(node_check=[0, -1])
+    >>> scoped = PopulationCallback("left", counts)
+    >>> network.run(10.0, callbacks=[scoped])
+    >>> native_counts = counts.numpy()
+    """
+
+    def __init__(self, population, callback):
+        super().__init__()
+        from dendra.func._callbacks import FunctionalCallback
+        from dendra.func._callbacks import PopulationCallback as FunctionalScope
+
+        self.population = _validate_population_callback_name(population)
+        if not isinstance(callback, (Callback, FunctionalCallback)):
+            raise TypeError(
+                "PopulationCallback requires a native Callback or pure FunctionalCallback"
+            )
+        if isinstance(callback, (PopulationCallback, FunctionalScope)):
+            raise ValueError("PopulationCallback scopes cannot be nested")
+        self.callback = callback
+
+    def _native_target(self, network):
+        from .networks.net import Network
+
+        if not isinstance(self.callback, Callback):
+            raise TypeError(
+                "PopulationCallback requires a native Callback for native execution; "
+                "pure FunctionalCallback configurations require functional execution"
+            )
+        if not isinstance(network, Network):
+            raise TypeError(
+                "PopulationCallback must be used with a Network; "
+                "use the inner callback directly for a Population"
+            )
+        return _population_callback_target(network.populations, self.population)
+
+    def pre_loop_hook(self, model):
+        target = self._native_target(model)
+        return self.callback.pre_loop_hook(target)
+
+    def post_loop_hook(self, model):
+        target = self._native_target(model)
+        return self.callback.post_loop_hook(target)
+
+    def pre_step_hook(self, model):
+        target = self._native_target(model)
+        return self.callback.pre_step_hook(target)
+
+    def post_step_hook(self, model):
+        target = self._native_target(model)
+        return self.callback.post_step_hook(target)
+
+    def pre_chunk_hook(self, model, timepoints=None):
+        target = self._native_target(model)
+        return self.callback.pre_chunk_hook(target, timepoints)
+
+    def post_chunk_hook(self, model, timepoints=None):
+        target = self._native_target(model)
+        return self.callback.post_chunk_hook(target, timepoints)
 
 
 class CallbackList(torch.nn.Module):
@@ -1564,7 +1652,10 @@ class ThresholdCallback(Callback):
 
 def _bind_callback_dt(callback, value):
     """Bind native solver timing without replacing threshold configuration."""
-    if isinstance(callback, ThresholdCallback):
+    if isinstance(callback, PopulationCallback):
+        if isinstance(callback.callback, Callback):
+            _bind_callback_dt(callback.callback, value)
+    elif isinstance(callback, ThresholdCallback):
         callback._bind_runtime_dt(value)
     else:
         callback.dt = value

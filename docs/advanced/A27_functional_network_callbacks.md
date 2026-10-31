@@ -9,24 +9,78 @@ kernelspec:
 (functional-network-callbacks)=
 # Observe individual Populations in a Network
 
-Use `dn.func.PopulationCallback(name, callback)` to apply a functional Population
-callback to one Population in a functional Network. The name is a top-level
-Population name in the Network passed to `dn.compile` or
-`make_functional_network`:
+Use `dn.callbacks.PopulationCallback(name, callback)` to observe one Population
+in a Network. The same scope configuration works with native Network execution,
+`dn.compile`, and functional callback collections. The name is an exact top-level
+key in the Network's `populations` mapping:
 
 ```python
 callbacks = {
-    "counts": dn.func.PopulationCallback(
+    "counts": dn.callbacks.PopulationCallback(
         "left", dn.callbacks.APCount(threshold=-20.0, node_check=[0, -1])
     ),
-    "anomaly": dn.func.PopulationCallback("right", dn.callbacks.AnomalyDetector()),
+    "anomaly": dn.callbacks.PopulationCallback("right", dn.callbacks.AnomalyDetector()),
 }
 ```
 
-The outer mapping keys name result streams. `"left"` and `"right"` identify
-the observed Populations. The wrapped callback receives that Population's state
-and step auxiliary packet, and uses the same observation, carry, and finalization
-rules as it does with `dn.compile(Population)`.
+For native execution, pass the wrappers in a callback list. Retrieve results
+from the supplied inner callbacks, also available through `scope.callback`.
+For functional execution, pass the named mapping shown above; its keys name
+result streams under `auxiliary["callbacks"]`. Binding captures the supported
+inner configuration without importing or changing its native history. The
+prepared callback receives the selected Population's state and step auxiliary
+packet, using the same observation, carry, and finalization rules as it does
+with `dn.compile(Population)`.
+
+`dn.func.PopulationCallback(name, callback)` remains a compatible functional
+entry point. Both spellings bind to the same scope and portable callback
+checkpoint configuration.
+
+(shared-population-callback-scopes)=
+## Share scopes between native and functional execution
+
+The complete
+{download}`shared_population_callback_scopes.py <../../examples/shared_population_callback_scopes.py>`
+example compares observations from two Populations, Recorder cadence, scan
+gradients and continuation. It also restores a canonical scope's portable
+checkpoint into the compatible `dn.func.PopulationCallback` configuration:
+
+```bash
+python examples/shared_population_callback_scopes.py
+python examples/shared_population_callback_scopes.py --backend aot_eager
+```
+
+```{literalinclude} ../../examples/shared_population_callback_scopes.py
+:language: python
+:start-after: "# region scopes"
+:end-before: "# endregion scopes"
+:dedent: 4
+```
+
+The Recorder selections are relative to their observed Population. Native
+execution stores results in each inner callback:
+
+```{literalinclude} ../../examples/shared_population_callback_scopes.py
+:language: python
+:start-after: "# region native"
+:end-before: "# endregion native"
+:dedent: 4
+```
+
+Native `Network.step`, `run`, `longrun` and `longrun_checkpointed` forward the
+inner native callback's six loop, chunk and step hooks to the selected
+Population, preserving hook return values. `step` retains its `loop_hooks`
+option; scope selection does not initialize or reset callback history itself.
+Native subclasses of `Callback` can use this forwarding. Checkpointed native
+execution retains its replay-safe callback contract: hooks must be pure
+functions of model state, and scalar loss contributions from supported hooks
+are accumulated by the existing executor.
+
+The canonical wrapper can also hold a pure `FunctionalCallback` configuration
+for functional execution. Native execution requires a native `Callback` child
+and rejects a pure-only child. Functional binding accepts supported built-in
+native configurations and pure callbacks; wrapping an arbitrary native callback
+does not make its imperative hooks functionally lowerable.
 
 The complete
 {download}`functional_network_callbacks.py <../../examples/functional_network_callbacks.py>`
@@ -67,7 +121,8 @@ See {doc}`A26_functional_network_regions` for labels, repeated indices, explicit
 batch selection, and supported fields.
 
 Population scope is fixed when callbacks bind. An unknown name or a nested
-`PopulationCallback` is rejected. This wrapper belongs to Network callback
+`PopulationCallback` is rejected, including nesting across the canonical and
+compatible functional spellings. The wrapper belongs to Network callback
 collections; use the underlying callback directly for a standalone Population.
 Configure and bind a new collection to change a scope or selection.
 
@@ -381,7 +436,7 @@ callback scope:
 network = network.concat()
 packed = network.all_populations
 callbacks = {
-    "exc_voltage": dn.func.PopulationCallback(
+    "exc_voltage": dn.callbacks.PopulationCallback(
         "all_populations", dn.Recorder(("v",), region=packed.exc)
     ),
 }
@@ -394,7 +449,7 @@ positions from its physical Slice. For the single-cell-axis packed layout:
 
 ```python
 nodes = packed.exc.flat_index.remainder(packed.shape[-1]).unique()
-callbacks["exc_counts"] = dn.func.PopulationCallback(
+callbacks["exc_counts"] = dn.callbacks.PopulationCallback(
     "all_populations", dn.func.APCount(node_check=nodes, threshold=-20.0)
 )
 ```

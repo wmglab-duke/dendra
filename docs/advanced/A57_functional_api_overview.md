@@ -206,7 +206,16 @@ anomaly detection. Functional binding captures
 these settings into independent pure callbacks; native histories and counters
 remain separate. The corresponding `dn.func` constructors are also supported.
 For a Network, select the observed Population with
-`dn.func.PopulationCallback(name, callback)`. See
+`dn.callbacks.PopulationCallback(name, callback)`. This scope also forwards a
+native callback's hooks to the selected Population in native Network execution.
+Use a callback list for native runs and a named mapping for functional results;
+`dn.func.PopulationCallback` remains a compatible functional entry point.
+Scopes select exact top-level Population names and cannot be nested. A scoped
+Recorder uses local paths such as `"v"` or `"hh.m"`; named Slice regions also
+select components within a concatenated MultiPopulation. Native results belong
+to the inner callback; functional results and continuation use independent
+explicit carry. A pure `FunctionalCallback` child requires functional execution.
+See the {ref}`shared scope example <shared-population-callback-scopes>` and
 {doc}`A27_functional_network_callbacks` for scopes and configuration ownership.
 Both Raster entry points return only checked post-step samples in the
 observation window, with an empty sample axis when none are checked. Their

@@ -283,7 +283,25 @@ Native ``dn.callbacks.LFP``, ``APCount``, ``Raster``, ``Active``, ``ActiveAL``,
 ``ActiveALCount`` and ``AnomalyDetector``
 configurations are accepted by functional callback collections and ``dn.compile``.
 Their ``dn.func`` entry points remain supported. Population-scoped Network
-bindings use ``dn.func.PopulationCallback(name, callback)``. Configuration
+bindings use ``dn.callbacks.PopulationCallback(name, callback)``;
+``dn.func.PopulationCallback`` remains compatible for functional execution.
+The canonical wrapper also forwards all six native callback hooks to one
+Population in ``Network.step``, ``run``, ``longrun`` and
+``longrun_checkpointed``. Native results belong to the supplied inner callback.
+Functional binding captures supported observation configuration into independent
+pure carry, without importing or changing native history. Native execution
+requires a native ``Callback`` child; pure ``FunctionalCallback`` children
+require functional execution. Arbitrary imperative callbacks are not lowered
+by adding a scope.
+
+Scope names are exact top-level Population keys. Scopes cannot be nested,
+including across the two entry points. Recorder selections inside a scope are
+relative to that Population, and ``region=`` can select a named physical Slice
+inside a concatenated MultiPopulation. Both scope spellings share functional
+checkpoint configuration. See :ref:`shared-population-callback-scopes` for the
+complete example.
+
+Configuration
 capture excludes native history and counters. Authored negative compartment
 indices resolve against the receiving Population; an omitted threshold
 ``dt`` uses its functional timestep, while an explicit value must match.
