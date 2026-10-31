@@ -26,6 +26,7 @@ from dendra.helpers import (
 )
 
 from .._checkpoint import _checkpoint_recompute_contexts
+from .._execution_horizons import execution_step_budget, native_horizon_request
 from .._runtime_inputs import (
     native_input_sources,
     normalize_input_frame,
@@ -4035,26 +4036,35 @@ class Network(RNGMixin):
 
     def run(
         self,
-        tstop,
+        tstop=None,
         extra=None,
         callbacks=None,
         progressbar=False,
         *,
+        steps=None,
+        duration=None,
         inputs=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
         """
-        Advance the network for a fixed duration.
+        Advance the network for a timestep count or physical duration.
 
         Parameters
         ----------
-        tstop : float
-            Requested simulation duration in milliseconds. Only complete
+        tstop : float, optional
+            Compatibility spelling for ``duration``. Only complete
             timesteps are executed. Any fractional remainder is retained and
             combined with the next duration-based call, so partitioned calls
             advance the same number of steps as their combined duration.
+        steps : int, optional
+            Exact non-negative timestep count. Leaves any retained fractional
+            duration unchanged. Supply only one of ``steps``, ``duration``, or
+            ``tstop``.
+        duration : float, optional
+            Requested simulation duration in milliseconds, using the same
+            retained-duration budget as ``tstop``.
         extra : dict[str, tuple[torch.Tensor, object]], optional
             Optional mapping of population name to extracellular stimulus tuple
             ``(v, waveform)``. For each population, ``v`` is normalized to
@@ -4065,7 +4075,7 @@ class Network(RNGMixin):
             disambiguate equal-size batch and spatial dimensions.
         inputs : mapping of str to dendra.func.Inputs, optional
             Deterministic time-leading voltage/current tapes keyed by exact
-            Population names. Tape lengths must equal the accepted duration's
+            Population names. Tape lengths must equal the selected horizon's
             timestep count. Fields share the conflict rules of :meth:`step`.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
@@ -4122,11 +4132,15 @@ class Network(RNGMixin):
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         if observer is not None:
             observer.validate_dt(dt_f)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        request_steps, request_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
 
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        n_steps, duration_remainder = execution_step_budget(
+            request_steps, request_duration, dt_f, self._duration_budget
+        )
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -4169,7 +4183,8 @@ class Network(RNGMixin):
         with _native_callback_storage(observer) as observer, ctx:
             if n_steps:
                 self._refresh_detached_materializations(dt_f)
-            self._set_duration_remainder(duration_remainder)
+            if duration_remainder is not None:
+                self._set_duration_remainder(duration_remainder)
 
             if with_intra:
                 intra = {
@@ -4247,12 +4262,14 @@ class Network(RNGMixin):
 
     def longrun(
         self,
-        tstop,
-        chunklength,
+        tstop=None,
+        chunklength=None,
         extra=None,
         callbacks=None,
         progressbar=False,
         *,
+        steps=None,
+        duration=None,
         inputs=None,
         callback_state=None,
         functional_callbacks=None,
@@ -4268,11 +4285,17 @@ class Network(RNGMixin):
 
         Parameters
         ----------
-        tstop : float
-            Requested simulation duration in milliseconds. Only complete
+        tstop : float, optional
+            Compatibility spelling for ``duration``. Only complete
             timesteps are executed; a fractional remainder is retained and
             combined with the next :meth:`run`, :meth:`longrun`, or
             :meth:`longrun_checkpointed` call.
+        steps : int, optional
+            Exact non-negative timestep count, leaving retained fractional
+            duration unchanged. Supply only one horizon argument.
+        duration : float, optional
+            Requested simulation duration in milliseconds, using the same
+            retained-duration budget as ``tstop``.
         chunklength : int
             Positive number of timesteps per chunk. The final chunk may be
             shorter.
@@ -4282,7 +4305,7 @@ class Network(RNGMixin):
         inputs : mapping of str to dendra.func.Inputs, optional
             Deterministic time-leading voltage/current tapes with the same
             contract as :meth:`run`. Chunk boundaries retain tape views and
-            gradients; all tape lengths match the full accepted duration.
+            gradients; all tape lengths match the selected timestep count.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this exact model and timestep.
@@ -4336,7 +4359,9 @@ class Network(RNGMixin):
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         if observer is not None:
             observer.validate_dt(dt_f)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        request_steps, request_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
 
@@ -4351,7 +4376,9 @@ class Network(RNGMixin):
 
         runtime_inputs = None
         if inputs is not None:
-            n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+            n_steps, duration_remainder = execution_step_budget(
+                request_steps, request_duration, dt_f, self._duration_budget
+            )
             with nullcontext() if self.training else torch.no_grad():
                 runtime_inputs = _network_runtime_inputs(
                     self, inputs, extra=extra, intra=intra, steps=n_steps
@@ -4374,14 +4401,17 @@ class Network(RNGMixin):
             _bind_callback_dt(callback, self.dt)
 
         if inputs is None:
-            n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+            n_steps, duration_remainder = execution_step_budget(
+                request_steps, request_duration, dt_f, self._duration_budget
+            )
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
         with _native_callback_storage(observer) as observer, ctx:
             if n_steps:
                 self._refresh_detached_materializations(dt_f)
-            self._set_duration_remainder(duration_remainder)
+            if duration_remainder is not None:
+                self._set_duration_remainder(duration_remainder)
             pre_loop_hook(callbacks, self)
             if observer is not None:
                 observed_state, observed_parts = observer.start()
@@ -5569,12 +5599,14 @@ class Network(RNGMixin):
 
     def longrun_checkpointed(
         self,
-        tstop: float,
-        chunklength: int,
+        tstop: Optional[float] = None,
+        chunklength: Optional[int] = None,
         extra=None,
         callbacks=None,
         progressbar=False,
         *,
+        steps=None,
+        duration=None,
         inputs=None,
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
@@ -5597,9 +5629,15 @@ class Network(RNGMixin):
         Parameters
         ----------
         tstop:
-            Requested simulation duration in milliseconds. Only complete
+            Compatibility spelling for ``duration``. Only complete
             timesteps are executed; fractional time is retained for the next
             duration-based network call.
+        steps:
+            Exact non-negative timestep count, leaving retained fractional
+            duration unchanged. Supply only one horizon argument.
+        duration:
+            Requested simulation duration in milliseconds, using the same
+            retained-duration budget as ``tstop``.
         chunklength:
             Number of time steps per checkpoint chunk.
         extra:
@@ -5689,7 +5727,9 @@ class Network(RNGMixin):
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         if observer is not None:
             observer.validate_dt(dt_f)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+        request_steps, request_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
 
@@ -5704,7 +5744,9 @@ class Network(RNGMixin):
         # Use the same retained-duration budget as run()/longrun(). Exact
         # decimal-form arithmetic keeps common decimal multiples composable
         # without promoting a genuinely just-before-grid duration.
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        n_steps, duration_remainder = execution_step_budget(
+            request_steps, request_duration, dt_f, self._duration_budget
+        )
         initial_time = self.t.double().detach().clone()
         t_grid = initial_time + dt_f * torch.arange(
             n_steps,
@@ -5802,7 +5844,8 @@ class Network(RNGMixin):
                     self._refresh_detached_materializations(
                         dt_f, grad_enabled=ambient_grad_enabled
                     )
-                self._set_duration_remainder(duration_remainder)
+                if duration_remainder is not None:
+                    self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
                 if observer is not None:
                     observed_state, observed_parts = observer.start()

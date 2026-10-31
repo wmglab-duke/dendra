@@ -4,10 +4,13 @@ from collections.abc import Mapping
 
 import torch
 
+from dendra.models._execution_horizons import execution_call_horizon
+
 from ._callbacks import _is_callback_configuration
 from ._types import FunctionalizationError
 
 _DEFAULT_RUNTIME_EXTRA_CHUNK_STEPS = 64
+_runner_call_horizon = execution_call_horizon
 
 
 def _runner_default_horizon(steps, duration, dt):
@@ -24,21 +27,6 @@ def _runner_default_horizon(steps, duration, dt):
     timestep = _validate_time_scalar(dt, name="dt", positive=True)
     nominal_steps, _ = _duration_step_budget(duration, timestep)
     return None, duration, max(nominal_steps, 1)
-
-
-def _runner_call_horizon(default_steps, default_duration, steps, duration):
-    """Select one call's horizon without changing its runner's defaults."""
-    from dendra.models.core import _validate_time_scalar
-
-    if steps is not None and duration is not None:
-        raise ValueError("steps and duration are mutually exclusive")
-    if steps is None and duration is None:
-        return default_steps, default_duration
-    if duration is not None:
-        return None, _validate_time_scalar(duration, name="duration", positive=False)
-    if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
-        raise ValueError("steps must be a non-negative integer")
-    return steps, None
 
 
 def _runner_chunk_steps(chunk_steps, *, steps, runtime_extra):

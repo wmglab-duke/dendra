@@ -48,22 +48,24 @@ Pass `inputs=` to the ordinary native execution method:
 ```python
 model.step(dt, inputs=dn.func.Inputs(ve=voltage_frame, intra=current_frame))
 model.run(dt=dt, inputs=dn.func.Inputs(ve=voltage_tape, intra=current_tape))
-model.longrun(duration, chunklength=100, dt=dt, inputs=inputs)
+model.longrun(duration=duration, chunklength=100, dt=dt, inputs=inputs)
 model.longrun_checkpointed(
-    duration, chunklength=100, dt=dt, inputs=inputs, safe_checkpoint=True
+    steps=100, chunklength=100, dt=dt, inputs=inputs, safe_checkpoint=True
 )
 ```
 
-A Population `run` can infer the number of steps from its tapes when `tstop`
-is omitted. Without legacy `ve=`, an explicit `tstop` requires every tape to
-contain exactly the accepted step count. That count uses the ordinary duration
-budget, including a retained
-fractional duration from previous calls. All supplied tapes must have the same
+A Population `run` can infer the number of steps from its tapes when no horizon
+is supplied. Explicit `steps=` or `duration=` requires every tape to contain
+exactly the accepted step count. The same applies to `tstop` when legacy `ve=`
+is absent. Duration requests include retained fractional duration from previous
+calls. All supplied tapes must have the same
 time length. Empty tapes represent a zero-step call when the accepted duration
 contains no complete step.
 
-`longrun` and `longrun_checkpointed` retain their required duration and
-`chunklength`. Chunking divides solver execution and checkpoint replay; it
+`longrun` and `longrun_checkpointed` require a horizon and `chunklength`.
+Use `steps=`, `duration=` or the existing `tstop` argument; see
+{doc}`A62_shared_execution_horizons` for their timing contract.
+Chunking divides solver execution and checkpoint replay; it
 does not bound the whole input tape, recorded history or autograd graph.
 Broadcast normalization can materialize a contiguous full-horizon tape.
 Partition calls explicitly when supplying inputs in bounded streaming spans.
@@ -80,8 +82,9 @@ Omitted Populations and omitted fields keep their normal drive behavior:
 :dedent: 4
 ```
 
-Native Network `run`, `longrun` and `longrun_checkpointed` require their usual
-duration. Each supplied tape must match that call's accepted step count.
+Native Network `run`, `longrun` and `longrun_checkpointed` require a horizon
+through `steps=`, `duration=` or `tstop`. Each supplied tape must match that
+call's accepted step count.
 `network.step(inputs={"left": dn.func.Inputs(intra=current_frame)})` consumes
 frames without a separate duration. The Network's initialized timestep applies
 to every Population.
@@ -110,11 +113,12 @@ Conflicts and malformed packets reject before waveform evaluation and random
 sampling.
 
 The legacy entry points retain their existing behavior. In particular,
-Population `run(ve=...)` uses the voltage tape's time length as authoritative,
-even when `tstop` is also supplied. This also applies when legacy `ve=` is
+Population `run(ve=...)` uses the voltage tape's time length as authoritative
+when neither `steps` nor `duration` is supplied, even when `tstop` is present.
+This also applies when legacy `ve=` is
 combined with `Inputs(intra=...)`: the current tape must match the voltage
-tape's length, and `tstop` is ignored. Without legacy `ve=`, the canonical
-`inputs=` form checks an explicit duration against its tapes instead.
+tape's length, and `tstop` is ignored. An explicit `steps=` or `duration=`
+checks both legacy and canonical tapes against the selected horizon.
 
 ## Tensor ownership and validation
 

@@ -28,7 +28,7 @@ def population(*, initialize=True):
     model.insert(pas.rename("leak"), g=0.001, e=-70.0)
     model.train()
     if initialize:
-        model.initialize(DT)
+        model.initialize()
     return model
 
 
@@ -107,7 +107,7 @@ def registered_injection_example():
     model = population(initialize=False)
     waveform = dn.mono_rect(amp=0.2 * nA, pw=STEPS * DT)
     model[:, 1].inject(waveform)
-    model.initialize(DT)
+    model.initialize()
     # Omitting intra retains the waveform registered through Slice.inject.
     ve = torch.zeros(STEPS, *model.shape, dtype=model.dtype())
     model.run(dt=DT, inputs=dn.func.Inputs(ve=ve))

@@ -59,6 +59,10 @@ from dendra.helpers import (
     op_sc,
 )
 from dendra.models._checkpoint import _checkpoint_recompute_contexts
+from dendra.models._execution_horizons import (
+    execution_step_budget,
+    native_horizon_request,
+)
 from dendra.models._runtime_inputs import (
     native_input_sources,
     normalize_input_frame,
@@ -4077,6 +4081,8 @@ class Population(P, Sliceable):
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar: bool = False,
         *,
+        steps=None,
+        duration=None,
         inputs=None,
         callback_state=None,
         functional_callbacks=None,
@@ -4142,6 +4148,15 @@ class Population(P, Sliceable):
             :meth:`longrun`, or :meth:`longrun_checkpointed` call. If ``ve`` is
             provided, its leading length is authoritative, ``tstop`` is ignored,
             and the retained duration is left unchanged.
+        steps : int, optional
+            Exact non-negative step count. Mutually exclusive with ``duration``
+            and ``tstop``. Leaves retained fractional duration unchanged. Supplied
+            voltage and input tapes must match this count.
+        duration : float, optional
+            Non-negative elapsed milliseconds, using the same fractional carry
+            as ``tstop``. Mutually exclusive with ``steps`` and ``tstop``. Unlike
+            the legacy ``ve``/``tstop`` combination, a supplied voltage tape must
+            match the accepted complete steps.
         dt : float, optional
             Time step size in milliseconds. If ``None``, the default value
             ``A.dt`` from the backend is used.
@@ -4216,18 +4231,20 @@ class Population(P, Sliceable):
         )
         if ve is not None and extra is not None:
             raise ValueError("Provide either 've' or 'extra', not both.")
-        tstop_f = None
-        duration_steps = None
+        horizon_steps = None
         duration_remainder = None
-        if ve is None:
-            if tstop is None:
-                if packet is None or (packet.ve is None and packet.intra is None):
-                    raise ValueError("tstop must be provided when 've' is not given.")
-            else:
-                tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-                duration_steps, duration_remainder = self._duration_budget(
-                    tstop_f, dt_f
-                )
+        canonical_horizon = steps is not None or duration is not None
+        if canonical_horizon or (ve is None and tstop is not None):
+            requested_steps, requested_duration = native_horizon_request(
+                tstop, steps=steps, duration=duration
+            )
+            horizon_steps, duration_remainder = execution_step_budget(
+                requested_steps, requested_duration, dt_f, self._duration_budget
+            )
+        elif ve is None and (
+            packet is None or (packet.ve is None and packet.intra is None)
+        ):
+            raise ValueError("tstop must be provided when 've' is not given.")
 
         # auto-build intra if missing
         if self.intra is None:
@@ -4243,13 +4260,17 @@ class Population(P, Sliceable):
 
         if ve is not None:
             ve = self._normalize_precomputed_ve(ve).contiguous()
+            if canonical_horizon and int(ve.shape[0]) != horizon_steps:
+                raise ValueError(
+                    f"ve has {int(ve.shape[0])} steps, but the execution expects {horizon_steps}"
+                )
 
         input_intra = None
         if packet is not None:
             with nullcontext() if self.training else torch.no_grad():
                 input_ve, input_intra, input_steps = self._normalize_runtime_inputs(
                     packet,
-                    steps=int(ve.shape[0]) if ve is not None else duration_steps,
+                    steps=int(ve.shape[0]) if ve is not None else horizon_steps,
                 )
             if input_intra is not None and with_intra:
                 raise ValueError(
@@ -4257,7 +4278,7 @@ class Population(P, Sliceable):
                 )
             if input_ve is not None:
                 ve = input_ve
-            duration_steps = input_steps
+            horizon_steps = input_steps
 
         # dt as scalar and tensor
         dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
@@ -4282,7 +4303,7 @@ class Population(P, Sliceable):
                     self.t, n, dt_f, device=device
                 ).to(dtype)
             else:
-                n = duration_steps
+                n = horizon_steps
                 t_global = _time_grid_from_step_count(
                     self.t, n, dt_f, device=device
                 ).to(dtype)
@@ -4465,13 +4486,15 @@ class Population(P, Sliceable):
 
     def longrun(
         self,
-        tstop: float,
-        chunklength: int,
+        tstop: float = None,
+        chunklength: int = None,
         dt: float = None,
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar=False,
         *,
+        steps=None,
+        duration=None,
         inputs=None,
         callback_state=None,
         functional_callbacks=None,
@@ -4492,6 +4515,12 @@ class Population(P, Sliceable):
             model time ``self.t``. Only complete fixed timesteps are executed;
             fractional physical duration is retained and shared with subsequent
             duration-based Population execution calls.
+        steps : int, optional
+            Exact non-negative step count, leaving fractional duration carry
+            unchanged. Mutually exclusive with ``duration`` and ``tstop``.
+        duration : float, optional
+            Non-negative elapsed milliseconds, accumulating the same physical
+            duration carry as ``tstop``. Supply exactly one horizon argument.
         chunklength : int
             The number of time steps to process in each chunk.
         dt : float, optional
@@ -4590,8 +4619,12 @@ class Population(P, Sliceable):
         )
         if observer is not None:
             observer.validate_dt(dt_f)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        requested_steps, requested_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
+        n_steps, duration_remainder = execution_step_budget(
+            requested_steps, requested_duration, dt_f, self._duration_budget
+        )
         self._refresh_compile_config_from_ctx()
 
         # Match step()/run(): injections registered after initialization
@@ -4631,7 +4664,8 @@ class Population(P, Sliceable):
                 ).to(self.dtype())
 
                 if t.numel() == 0:
-                    self._set_duration_remainder(duration_remainder)
+                    if duration_remainder is not None:
+                        self._set_duration_remainder(duration_remainder)
                     if observer is not None:
                         observed_state, observed_parts = observer.start()
                         return observer.finish(observed_state, observed_parts)
@@ -4670,7 +4704,8 @@ class Population(P, Sliceable):
                     compile_scope="population",
                 )
 
-                self._set_duration_remainder(duration_remainder)
+                if duration_remainder is not None:
+                    self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
                 if observer is not None:
                     observed_state, observed_parts = observer.start()
@@ -7461,13 +7496,15 @@ class Population(P, Sliceable):
 
     def longrun_checkpointed(
         self,
-        tstop: float,
-        chunklength: int,
+        tstop: float = None,
+        chunklength: int = None,
         dt: float = None,
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar=False,
         *,
+        steps=None,
+        duration=None,
         inputs=None,
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
@@ -7491,6 +7528,12 @@ class Population(P, Sliceable):
             Simulation duration in milliseconds to advance from the current
             model time ``self.t``. This uses the same cumulative complete-step
             budget and retained physical-duration semantics as :meth:`longrun`.
+        steps : int, optional
+            Exact non-negative step count, preserving fractional-duration carry.
+            Mutually exclusive with ``duration`` and ``tstop``.
+        duration : float, optional
+            Non-negative elapsed milliseconds, using the same physical-duration
+            budget as ``tstop``. Supply exactly one horizon argument.
         chunklength : int
             Number of time steps per checkpointed chunk.
         dt : float, optional
@@ -7598,8 +7641,12 @@ class Population(P, Sliceable):
         )
         if observer is not None:
             observer.validate_dt(dt_f)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        requested_steps, requested_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
+        n_steps, duration_remainder = execution_step_budget(
+            requested_steps, requested_duration, dt_f, self._duration_budget
+        )
         self._refresh_compile_config_from_ctx()
 
         # Match step()/run(): injections registered after initialization
@@ -7673,7 +7720,8 @@ class Population(P, Sliceable):
                 ).to(self.dtype())
 
                 if t.numel() == 0:
-                    self._set_duration_remainder(duration_remainder)
+                    if duration_remainder is not None:
+                        self._set_duration_remainder(duration_remainder)
                     if observer is None:
                         if return_final_state:
                             return None, self.state_dict_for_checkpoint()
@@ -7721,7 +7769,8 @@ class Population(P, Sliceable):
                 # Commit before the first checkpoint boundary is captured so
                 # forward replay and backward restoration observe one coherent
                 # duration budget.
-                self._set_duration_remainder(duration_remainder)
+                if duration_remainder is not None:
+                    self._set_duration_remainder(duration_remainder)
                 # Capture boundary state after initialization
                 state = self.state_dict_for_checkpoint()
 

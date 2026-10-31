@@ -165,6 +165,13 @@ A no-state call restarts its default initialization policy and recording phase;
 zero-step continuation retains its phase without adding a boundary sample.
 Input and draw tapes must match the selected call's accepted step count.
 
+Native Population and Network `run`, `longrun` and `longrun_checkpointed`
+also accept `steps=` or `duration=`. These calls advance their model-owned
+state and share its pending duration across execution methods. The existing
+`tstop` argument remains supported and cannot be combined with either explicit
+horizon. See {doc}`A62_shared_execution_horizons` for native timestep defaults,
+input-tape inference and complete examples.
+
 The positive compiled width need not divide a call's horizon. A step default
 caps it at `steps`; a duration default uses its nominal accepted step count,
 with a minimum width of one for scan or four for Population while execution.

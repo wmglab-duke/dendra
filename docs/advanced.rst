@@ -20,6 +20,7 @@ Advanced
    advanced/A59_functional_native_handoff.md
    advanced/A60_native_source_inspection.md
    advanced/A61_shared_runtime_inputs.md
+   advanced/A62_shared_execution_horizons.md
    advanced/A8_functional_populations.rst
    advanced/A9_macroscopic_descriptor_training.rst
    advanced/A10_hard_transition_scans.rst
