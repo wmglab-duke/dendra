@@ -2781,6 +2781,69 @@ cadence and gradients, and checks that checkpoint replay preserves the live mode
    :end-before: # endregion checkpoint
    :dedent: 8
 
+.. _functional-shared-callback-state-detach:
+
+Truncate callback gradient history
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+When simulation state and callback carry are owned separately, use
+``callbacks.detach_state(state)`` to truncate the callback's recurrent gradient
+history. It preserves numerical carry, reducer totals, sampling phase and the
+same collection's token and emission metadata. Built-in LFP lead fields are
+refreshed from their current bound sources, retaining local field gradients
+when ambient gradients are enabled.
+
+For a native Population training loop, detach its model state separately after
+backward and the optimizer update, then detach the callback carry:
+
+.. code-block:: python
+
+   carry = None
+   for _ in range(3):
+       optimizer.zero_grad()
+       results = model.run(
+           tstop=2.0, dt=DT, callbacks=observations, callback_state=carry,
+       )
+       loss = objective(results)
+       loss.backward()
+       optimizer.step()
+       model.detach()
+       carry = observations.detach_state(results.state)
+
+``Population.detach()`` reconnects deterministic parameter and derived,
+timestep and solver workspace graphs on the next positive-step training call
+with gradients enabled. It preserves simulation state, clocks and RNG
+progression, replaying retained RAND draws without selecting a new realization;
+NOISE remains detached. Zero-step, evaluation, ``no_grad`` and inference-mode
+calls defer this work. Custom reparameterized RAND sources require retained
+draws and pure ``draw_sampler``/``transform`` hooks for replay. Externally
+derived nonleaf source graphs remain the caller's responsibility.
+
+The method detaches custom callback carry and shares its incoming Tensor
+storage, preserving repeated aliases and view strides. It leaves the model,
+its parameters, connections and RNG untouched. Source expressions and earlier
+outputs remain caller-owned. It performs no callback initialization, update or
+finalization, sampling, state reset or recording I/O. Call it on the host,
+outside compilation, tensor transforms and forward AD.
+
+The same method supports Population-scoped Network callback carry. Network
+model and connection-state truncation remain separate caller responsibilities;
+detaching the observations alone does not truncate their simulation history.
+For full functional packets, use ``dn.func.detach_continuation`` to handle model
+state and callback carry together. Both APIs use the same callback detachment
+rules. Use portable export/restore when transferring detached owned carry into
+an equivalent reconstructed collection.
+
+The complete
+:download:`shared_callback_state_detach.py <../../examples/shared_callback_state_detach.py>`
+example trains a native Population across ``run``, ``step``,
+``longrun_checkpointed`` and ``longrun``, checking source identities, local gradients,
+trainable LFP fields, reducer totals and cadence:
+
+.. code-block:: console
+
+   python examples/shared_callback_state_detach.py
+
 .. _functional-native-step-callbacks:
 
 Manually controlled native steps

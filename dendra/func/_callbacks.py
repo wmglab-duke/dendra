@@ -1735,6 +1735,30 @@ class FunctionalCallbacks:
     Callback objects supply static configuration only and are never mutated.
     """
 
+    def detach_state(self, state: FunctionalCallbackState) -> FunctionalCallbackState:
+        """Truncate callback history while retaining its values and sampling phase.
+
+        Recurrent carry tensors detach with shared storage, preserving tensor
+        aliases, views, callback identity, emission metadata, sampling phase and
+        accumulated values. Built-in LFP fields are rematerialized from current
+        bound sources with the caller's gradient mode; keep gradients enabled
+        when training those fields in the next segment.
+
+        Model state, parameters, constants and previous results are untouched.
+        Detach model history separately for native or explicit-state execution;
+        use ``dn.func.detach_continuation`` for a complete functional packet.
+        Custom callback carry is recurrent. Externally computed nonleaf field
+        sources remain caller-owned when their upstream graphs are consumed.
+
+        The state must belong to this collection. No model validation,
+        initialization, sampling, numerical execution, checkpoint configuration
+        hooks or storage I/O runs. This host operation runs outside compilation,
+        function transforms and forward AD. Resume through ``callback_state=``.
+        """
+        from ._callback_detach import _detach_callback_state
+
+        return _detach_callback_state(self, state)
+
     def export_state(self, state: FunctionalCallbackState):
         """Export owned detached carry for equivalent reconstructed callbacks.
 

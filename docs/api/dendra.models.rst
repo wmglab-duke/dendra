@@ -440,7 +440,23 @@ for the full contract and runnable custom reducer/emitter example.
    :members: initialize, update, finalize, checkpoint_configuration
 
 .. autoclass:: dendra.func.FunctionalCallbacks
-   :members: export_state, restore_state
+   :members: detach_state, export_state, restore_state
+
+``callbacks.detach_state(state)`` truncates recurrent callback history for that
+same collection. It preserves carry values, totals, crossing latches, cadence,
+token and emission metadata, and shares custom carry storage/aliases/view
+strides. Built-in LFP carry is refreshed from current bound sources; local field
+gradients follow the ambient gradient mode. No callback initialization, update,
+finalization, sampling, resets or recording I/O are performed. Model state,
+connections, parameters and RNG remain unchanged and separately owned.
+
+For native Population training, call ``model.detach()`` and
+``callbacks.detach_state(results.state)`` after backward and the optimizer
+update. Network model/connection truncation remains the caller's responsibility.
+``dn.func.detach_continuation`` shares these callback rules for full functional
+packets. Source expressions and earlier outputs retain their own graphs. See
+:ref:`functional-shared-callback-state-detach` and
+:download:`shared_callback_state_detach.py <../../examples/shared_callback_state_detach.py>`.
 
 Native ``Population.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
 a prepared ``FunctionalCallbacks`` collection through ``callbacks=`` and explicit

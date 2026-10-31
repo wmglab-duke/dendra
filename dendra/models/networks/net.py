@@ -210,6 +210,26 @@ def advance_populations(populations, dt, extra, intra):
         step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
 
 
+def _refresh_detached_population_materializations(populations, dt):
+    """Reconnect continued training sources without changing recurrent state."""
+    for population in populations.values():
+        if not population._refresh_detached_materializations():
+            continue
+        try:
+            timestep = torch.tensor(
+                dt, device=population.device(), dtype=population.dtype()
+            )
+            population.integrator._initialize(
+                population,
+                timestep,
+                force=True,
+                compile_scope="network_population",
+            )
+        except Exception:
+            population._detached_materializations_pending = True
+            raise
+
+
 def _advance_network_component(component, *, compile_network_ops: bool = False):
     """Advance a network-side component.
 
@@ -3457,6 +3477,7 @@ class Network(RNGMixin):
             )
             _load_population_cache_transactionally(pop, cached)
             pop.detach()
+            pop._detached_materializations_pending = False
             pop.initialized = True
             pop.initializing_from_state_cache = True
             pop._integrator_reinit_pending = True
@@ -3690,6 +3711,7 @@ class Network(RNGMixin):
             _bind_callback_dt(c, self.dt)
 
         with _native_callback_storage(observer) as observer, ctx:
+            _refresh_detached_population_materializations(self.populations, dt_f)
             if with_intra:
                 intra = {
                     n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
@@ -3857,6 +3879,8 @@ class Network(RNGMixin):
         tstart = self.t.item()
 
         with _native_callback_storage(observer) as observer, ctx:
+            if n_steps:
+                _refresh_detached_population_materializations(self.populations, dt_f)
             self._set_duration_remainder(duration_remainder)
 
             if with_intra:
@@ -4050,6 +4074,8 @@ class Network(RNGMixin):
         tstart = self.t.item()
 
         with _native_callback_storage(observer) as observer, ctx:
+            if n_steps:
+                _refresh_detached_population_materializations(self.populations, dt_f)
             self._set_duration_remainder(duration_remainder)
             pre_loop_hook(callbacks, self)
             if observer is not None:
@@ -5449,6 +5475,10 @@ class Network(RNGMixin):
             torch.nn.utils.parametrize.cached(),
         ):
             with torch.set_grad_enabled(self.training):
+                if n_steps:
+                    _refresh_detached_population_materializations(
+                        self.populations, dt_f
+                    )
                 self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
                 if observer is not None:

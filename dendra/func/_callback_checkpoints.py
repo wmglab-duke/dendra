@@ -54,15 +54,14 @@ _DTYPES = {
 }
 
 
-def _cold_boundary():
+def _cold_boundary(operation="callback checkpoint export/restore"):
     if (
         torch.compiler.is_compiling()
         or torch._C._are_functorch_transforms_active()
         or torch.autograd.forward_ad._current_level >= 0
     ):
         raise FunctionalizationError(
-            "callback checkpoint export/restore must run outside torch.compile, "
-            "torch.func and forward AD"
+            f"{operation} must run outside torch.compile, torch.func and forward AD"
         )
 
 

@@ -3,10 +3,8 @@
 from __future__ import annotations
 
 import torch
-from torch.utils import _pytree as pytree
 
-from ._callback_carry import _CallbackCarryPartition
-from ._callbacks import FunctionalCallbackState, _callback_implementation
+from ._callback_detach import _detach_recurrent_values
 from ._continuation import Continuation, _make_continuation
 from ._continuation_checkpoints import (
     _cold_boundary,
@@ -15,38 +13,6 @@ from ._continuation_checkpoints import (
     _validate_callback_state_presence,
     _validate_frames,
 )
-from ._types import FunctionalizationError
-
-
-def _lfp_recipe(callback):
-    source = callback._stacked_source
-    return (
-        ("stacked", id(source))
-        if source is not None
-        else ("fields", *(id(field) for field in callback.fields)),
-        callback.device,
-        callback.dtype,
-        callback.padding if callback.rule is None else None,
-    )
-
-
-def _refresh_invariants(callbacks, state, memo):
-    partition = _CallbackCarryPartition.from_plans(callbacks._plans)
-    recipes = {}
-    for plan in callbacks._plans:
-        if plan.name not in partition.invariant_names:
-            continue
-        implementation = _callback_implementation(plan.callback)
-        key = id(state[plan.name])
-        recipe = _lfp_recipe(implementation)
-        if key in recipes:
-            if recipe != recipes[key]:
-                raise FunctionalizationError(
-                    "aliased LFP carry cannot be refreshed from different field sources"
-                )
-            continue
-        recipes[key] = recipe
-        memo[key] = implementation._materialize_carry()
 
 
 def detach_continuation(functional, continuation, *, callbacks=None):
@@ -104,38 +70,11 @@ def detach_continuation(functional, continuation, *, callbacks=None):
             if has_carry:
                 callbacks._validate_state(continuation.callback_state)
 
-        memo = {}
-        if has_carry:
-            # Seed every invariant before visiting recurrent values: a custom
-            # carry or model state can alias an invariant's old Tensor.
-            _refresh_invariants(callbacks, continuation.callback_state, memo)
-
-        def detach(value):
-            if isinstance(value, torch.Tensor):
-                key = id(value)
-                if key not in memo:
-                    memo[key] = value.detach()
-                return memo[key]
-            return value
-
-        state = pytree.tree_map(
-            detach,
+        state, carry = _detach_recurrent_values(
             continuation.state,
-            is_leaf=lambda value: isinstance(value, torch.Tensor),
+            callbacks,
+            continuation.callback_state,
         )
-        carry = None
-        if has_carry:
-            previous = continuation.callback_state
-            carry = FunctionalCallbackState(
-                carries=pytree.tree_map(
-                    detach,
-                    previous.carries,
-                    is_leaf=lambda value: isinstance(value, torch.Tensor),
-                ),
-                _token=previous.plan_token,
-                _emission_schemas=previous.emission_schemas,
-            )
-            callbacks._validate_state(carry)
         return _make_continuation(
             state,
             continuation.parameters,

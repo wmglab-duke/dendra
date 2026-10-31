@@ -598,6 +598,22 @@ direct calls and prepared bindings keep explicit state and callback arguments.
 
 ## Save callback carry independently
 
+Use `callbacks.detach_state(state)` for an in-memory callback gradient boundary
+on the same collection. Custom carry is detached with shared storage, aliases
+and view strides; built-in LFP fields are refreshed from current bound sources,
+with gradients following the ambient mode. Reducer totals, crossing latches,
+cadence, collection identity and emission metadata are retained. It runs no
+callback hooks or recording I/O. Simulation state, connection histories, RNG
+and parameter sources remain separately owned and unchanged.
+
+For a native Population, combine `model.detach()` with
+`callbacks.detach_state(results.state)` after backward and the optimizer update.
+Network model/connection-state truncation remains a separate responsibility.
+For a complete functional packet, `dn.func.detach_continuation` applies the same
+callback rules together with recurrent model-state detachment. See
+{ref}`functional-shared-callback-state-detach` and
+{download}`shared_callback_state_detach.py <../../examples/shared_callback_state_detach.py>`.
+
 For independently saved analysis,
 `callbacks.export_state(state)` and `callbacks.restore_state(packet)` provide
 the callback-only bridge. Export owns detached carry and emission metadata;

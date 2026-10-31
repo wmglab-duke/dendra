@@ -1524,6 +1524,7 @@ class Population(P, Sliceable):
 
         self.initialized: bool = False
         self._integrator_reinit_pending: bool = False
+        self._detached_materializations_pending: bool = False
         self.eval()
 
     def force_integrator_reinit(self):
@@ -3113,22 +3114,64 @@ class Population(P, Sliceable):
         }
 
     @classmethod
-    def _rematerialize_parameter_owner(cls, owner):
+    def _rematerialize_parameter_owner(cls, owner, *, replay_random=False):
         derive = getattr(owner, "_derive_parameter_buffers", None)
         install = getattr(owner, "_install_parameter_buffers", None)
         if not callable(derive) or not callable(install):
             return
         preserved = cls._preserved_stochastic_parameter_buffers(owner)
         values = derive()
+        if replay_random:
+            from dendra.models.networks._population_cache import (
+                _restore_parameter,
+                restore_population_cache_values,
+            )
+            from dendra.models.random_parameters import (
+                clone_random_parameter_tree,
+                evaluate_random_parameter,
+            )
+
+            for name, spec in getattr(owner, "random_parameters", {}).items():
+                if name not in preserved or not spec.reparameterized:
+                    continue
+                current = {
+                    parameter: (
+                        values[spec.full_parameter_name(parameter)]
+                        if spec.full_parameter_name(parameter) in values
+                        else getattr(owner, spec.full_parameter_name(parameter))
+                    )
+                    for parameter in spec.params
+                }
+                if not any(value.requires_grad for value in current.values()):
+                    continue
+                draws = getattr(owner, "_random_parameter_draws", {})
+                parameters = getattr(owner, "_random_parameter_parameters", {})
+                if name not in draws or name not in parameters:
+                    raise RuntimeError(
+                        f"Cannot reconnect detached RAND parameter {name!r}: "
+                        "retained sampling provenance is required for trainable "
+                        "reparameterized values. Use a distribution with a pure "
+                        "draw_sampler/transform contract."
+                    )
+                anchored = restore_population_cache_values(
+                    current, parameters[name], parameter_names=current
+                )
+                draw = clone_random_parameter_tree(draws[name], detach=True)
+                evaluated = evaluate_random_parameter(spec, anchored, draw).to(
+                    preserved[name]
+                )
+                preserved[name] = _restore_parameter(evaluated, preserved[name])
         for name, value in preserved.items():
-            if name in values:
+            if name in values or replay_random:
                 values[name] = value
         install(values)
         make_contiguous = getattr(owner, "make_contiguous", None)
         if callable(make_contiguous):
             make_contiguous()
 
-    def _deterministically_rematerialize_initialization_parameters(self):
+    def _deterministically_rematerialize_initialization_parameters(
+        self, *, preserve_state=False
+    ):
         # Parameter wrappers may cache resolved raw leaves in eval mode. A raw
         # output is a new generation even though initialization itself remains
         # an imperative no-grad transaction.
@@ -3137,7 +3180,7 @@ class Population(P, Sliceable):
             if callable(clear_cache):
                 clear_cache()
 
-        self._rematerialize_parameter_owner(self)
+        self._rematerialize_parameter_owner(self, replay_random=preserve_state)
         self._refresh_parameter_views_for_initialization()
 
         handler = getattr(self, "mech", None)
@@ -3149,7 +3192,9 @@ class Population(P, Sliceable):
         make_maps = getattr(handler, "make_maps", None)
         if callable(make_maps):
             make_maps()
-        set_buffers = getattr(handler, "set_buffers", None)
+        set_buffers = getattr(
+            handler, "_bind_state_geometry" if preserve_state else "set_buffers", None
+        )
         if callable(set_buffers):
             set_buffers(self.diam)
 
@@ -3157,9 +3202,9 @@ class Population(P, Sliceable):
         processes = tuple(getattr(handler, "material_processes", {}).values())
         owners = (*mechanisms, *processes)
         for owner in owners:
-            self._rematerialize_parameter_owner(owner)
+            self._rematerialize_parameter_owner(owner, replay_random=preserve_state)
             for state in getattr(owner, "DE", {}).values():
-                self._rematerialize_parameter_owner(state)
+                self._rematerialize_parameter_owner(state, replay_random=preserve_state)
 
         from dendra.models.mechanisms._state import _materialize_derived_buffers
 
@@ -3167,6 +3212,26 @@ class Population(P, Sliceable):
             _materialize_derived_buffers(owner)
             for state in getattr(owner, "DE", {}).values():
                 _materialize_derived_buffers(state)
+
+    def _refresh_detached_materializations(self):
+        """Reconnect parameter workspaces at a continued training boundary."""
+        if not (
+            getattr(self, "_detached_materializations_pending", False)
+            and self.training
+            and torch.is_grad_enabled()
+            and not torch.is_inference_mode_enabled()
+        ):
+            return False
+        # Leave failed refreshes pending and the solver invalid until a complete
+        # retry succeeds. Neither this path nor its owner materializers samples
+        # randomness or initializes recurrent state.
+        self.integrator.initialized = False
+        self._integrator_reinit_pending = True
+        self._deterministically_rematerialize_initialization_parameters(
+            preserve_state=True
+        )
+        self._detached_materializations_pending = False
+        return True
 
     def _invalidate_integrator_after_initialization_transform(self):
         integrator = getattr(self, "integrator", None)
@@ -3911,6 +3976,7 @@ class Population(P, Sliceable):
 
         ctx = nullcontext() if self.training else torch.no_grad()
         with _native_callback_storage(observer) as observer, ctx:
+            self._refresh_detached_materializations()
             self.integrator._initialize(
                 self,
                 dt_tensor,
@@ -4147,6 +4213,9 @@ class Population(P, Sliceable):
                 t_global = _time_grid_from_step_count(
                     self.t, n, dt_f, device=device
                 ).to(dtype)
+
+            if n:
+                self._refresh_detached_materializations()
 
             # --------------------------------------------------------------
             # Prepare intra
@@ -4476,6 +4545,7 @@ class Population(P, Sliceable):
                         return observer.finish(observed_state, observed_parts)
                     return
 
+                self._refresh_detached_materializations()
                 n_chunks = math.ceil(len(t) / chunklength)
                 t_chunks = torch.tensor_split(t, n_chunks)
 
@@ -4831,6 +4901,9 @@ class Population(P, Sliceable):
             # A no-grad state-dict copy can otherwise retain the destination's
             # old graph after its saved tensors have been overwritten.
             self.detach()
+            # Cached effective values are intentional initialization inputs,
+            # rather than an explicit request for a fresh training segment.
+            self._detached_materializations_pending = False
             # Structured transforms are fresh-initialization work:
             # every declared write is already present in the restored snapshot.
             self._restoring_steady_state = True
@@ -4926,6 +4999,8 @@ class Population(P, Sliceable):
         # were unchanged. Rebuild timestep-dependent solver workspaces before
         # the next step in every case.
         self.integrator.initialized = False
+        if populate_parameter_buffers:
+            self._detached_materializations_pending = False
         return self
 
     def initialize_(self):
@@ -6567,7 +6642,19 @@ class Population(P, Sliceable):
 
     def detach(self):
         """
-        Detach parameters and buffers from the autograd graph.
+        Truncate simulation history while retaining state values and raw sources.
+
+        The next positive-step, gradient-enabled training call rebuilds effective
+        parameter, derived and solver graphs from the current raw sources.
+        Retained RAND draws are replayed without resampling; NOISE stays detached.
+        Evaluation, no-grad, inference-mode and zero-step calls defer that refresh.
+        Clocks and recurrent state are not reset. Raw parameter objects and
+        externally computed nonleaf source graphs remain caller-owned.
+
+        Reconnecting trainable reparameterized RAND values requires retained
+        explicit draws from a pure distribution draw_sampler/transform contract.
+        Callback history is separate; detach its returned carry through the
+        owning callback collection when continuing observations.
 
         Returns
         -------
@@ -6583,6 +6670,7 @@ class Population(P, Sliceable):
             and self._unversioned_integrator_workspace_values_match(workspace_signature)
         )
         self.integrator.detach(self)
+        self._detached_materializations_pending = True
         if workspace_was_valid:
             # Detach is value preserving but rebinds tensors, so rebase only a
             # workspace that was coherent before the operation. Never bless a
@@ -7472,6 +7560,7 @@ class Population(P, Sliceable):
                         )
                     return None, functional_results
 
+                self._refresh_detached_materializations()
                 n_chunks = math.ceil(len(t) / chunklength)
                 t_chunks = torch.tensor_split(t, n_chunks)
 

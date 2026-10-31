@@ -385,6 +385,56 @@ See {ref}`functional-native-callback-storage` and the temporary-file example:
 python examples/native_callback_storage.py
 ```
 
+### Truncate independently owned callback carry
+
+`observations.detach_state(results.state)` truncates recurrent callback
+gradient history while retaining that collection's numerical carry, reducer
+totals, Recorder cadence, token and emission metadata. For native Population
+training, detach the model and observations separately after backward and the
+optimizer update:
+
+```python
+carry = None
+for _ in range(3):
+    optimizer.zero_grad()
+    results = model.run(
+        tstop=2.0, dt=DT, callbacks=observations, callback_state=carry,
+    )
+    loss = objective(results)
+    loss.backward()
+    optimizer.step()
+    model.detach()
+    carry = observations.detach_state(results.state)
+```
+
+`Population.detach()` reconnects deterministic parameter and derived, timestep
+and solver workspace graphs on the next positive-step training call with
+gradients enabled. It preserves simulation state, clocks and RNG progression,
+replaying retained RAND draws without selecting a new realization; NOISE remains
+detached. Zero-step, evaluation, `no_grad` and inference-mode calls defer this
+work. Custom reparameterized RAND sources require retained draws and pure
+`draw_sampler`/`transform` hooks for replay. Externally derived nonleaf source
+graphs remain the caller's responsibility.
+
+The returned custom carry shares its incoming Tensor storage, aliases and view
+strides while its earlier gradients are cut. Built-in LFP carry is refreshed
+from current bound field sources; call with gradients enabled when training
+those fields in the next segment. Parameters, model state, connections and RNG
+are untouched. Source expression graphs and earlier outputs remain caller-owned.
+The method performs no callback hooks, sampling, reset or recording I/O.
+
+It also handles Network callback carry, including Population scopes. Network
+model/connection gradient boundaries remain caller-owned. For complete
+functional packets, prefer `dn.func.detach_continuation`, which shares these
+callback rules and also truncates recurrent model state. Portable callback
+export/restore supplies detached owned data for transfer into an equivalent
+new collection; `detach_state` retains the current collection identity.
+See {ref}`functional-shared-callback-state-detach` and the complete example:
+
+```console
+python examples/shared_callback_state_detach.py
+```
+
 ### Continue functional execution
 
 `auxiliary["continuation"]` carries

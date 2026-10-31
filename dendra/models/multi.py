@@ -1826,6 +1826,19 @@ class MultiPopulation(Population):
                 )
         self._sync_core_buffers_to_population_device()
 
+    @classmethod
+    def _rematerialize_parameter_owner(cls, owner, *, replay_random=False):
+        # Continued training rebuilds packed physical fields from their child
+        # sources. Refresh those root owners after the shared cache-clear pass,
+        # without initializing or retaining any child mechanism/state runtime.
+        if replay_random and isinstance(owner, MultiPopulation):
+            for population in owner.populations.values():
+                cls._rematerialize_parameter_owner(population, replay_random=True)
+                population._refresh_parameter_views_for_initialization()
+        return super()._rematerialize_parameter_owner(
+            owner, replay_random=replay_random
+        )
+
     def populate_parameter_buffers(self, random_generation=None):
         """Populate component parameters, then synchronize composite geometry."""
         for population in self.populations.values():
