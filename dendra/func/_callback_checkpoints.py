@@ -9,7 +9,6 @@ from numbers import Integral
 import torch
 from torch.utils import _pytree as pytree
 
-from dendra.models._lfp_callbacks import _materialize_lfp_fields
 from dendra.models._threshold_callbacks import _restore_count
 
 from ._callbacks import (
@@ -486,12 +485,7 @@ def _validate_invariants(callbacks, carries):
             implementation = implementation.callback
         if not _is_prepared_lfp(implementation):
             continue
-        expected = _materialize_lfp_fields(
-            implementation._materialization_fields(),
-            device=implementation.device,
-            dtype=implementation.dtype,
-            padding=implementation.padding if implementation.rule is None else None,
-        )
+        expected = implementation._materialize_carry()
         if not _same(expected, carries[plan.name]):
             raise FunctionalizationError(
                 f"callback checkpoint LFP lead-field carry for {plan.name!r} "

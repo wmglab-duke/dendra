@@ -23,15 +23,14 @@ _PACKET_KEYS = ("format", "version", "owner", "frames", "callbacks")
 _LIFECYCLES = ("unspecified", "unstarted", "active")
 
 
-def _cold_boundary():
+def _cold_boundary(operation="continuation checkpoint export/restore"):
     if (
         torch.compiler.is_compiling()
         or torch._C._are_functorch_transforms_active()
         or torch.autograd.forward_ad._current_level >= 0
     ):
         raise FunctionalizationError(
-            "continuation checkpoint export/restore must run outside torch.compile, "
-            "torch.func and forward AD"
+            f"{operation} must run outside torch.compile, torch.func and forward AD"
         )
 
 
@@ -292,24 +291,32 @@ def _validate_frames(functional, continuation):
     functional._validate_state(continuation.state)
 
 
-def _callback_packet(callbacks, state, *, lifecycle, owner):
+def _validate_callback_state_presence(callbacks, state, *, lifecycle, owner):
     if lifecycle == "unstarted":
         if state is not None:
             raise FunctionalizationError(
                 "unstarted continuation must not contain callback state"
             )
-        return None
+        return False
     if callbacks is None:
         if state is not None:
             raise FunctionalizationError(
                 f"continuation callback state does not match {owner}'s callbacks"
             )
-        return None
+        return False
     if state is None:
         raise FunctionalizationError(
             f"continuation callback state is required for {owner}'s callbacks"
         )
-    return callbacks.export_state(state)
+    return True
+
+
+def _callback_packet(callbacks, state, *, lifecycle, owner):
+    if _validate_callback_state_presence(
+        callbacks, state, lifecycle=lifecycle, owner=owner
+    ):
+        return callbacks.export_state(state)
+    return None
 
 
 def _encode_continuation(functional, continuation, callbacks, lifecycle):

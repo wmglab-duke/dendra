@@ -182,6 +182,20 @@ Raw-bound host scheduling accepts the same packet as
 ``dn.func.run(bound, auxiliary["continuation"], ...)`` when its sources match
 the binding; see :ref:`functional-bound-continuation`.
 
+For training in separate segments, truncate recurrent gradient history with
+``dn.func.detach_continuation(runner, auxiliary["continuation"])`` after backward
+and the optimizer update. It keeps the optimizer's parameter/constant Tensor
+objects, numerical state, RNG carry and callback phase. The returned packet
+detaches recurrent model state and custom callback carry, and refreshes built-in
+LFP field carry from its current bound sources. Subsequent local gradients
+reach model parameters and trainable fields while earlier recurrent gradients
+stop at that boundary. Field refresh follows the ambient gradient mode;
+keep gradients enabled for a trainable LFP suffix. Detached recurrent tensors
+share their incoming storage, while nonleaf source graphs remain caller-owned. See
+:ref:`functional-continuation-detach` and the complete
+:download:`functional_continuation_detach.py <../../examples/functional_continuation_detach.py>`
+example for Population and Network training.
+
 Use ``dn.func.initialize(runner)`` to obtain fresh initialized state and effective
 sources before starting callbacks or executing a rollout:
 

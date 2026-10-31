@@ -69,6 +69,22 @@ directly to the next call. Portable export is a separate operation with an
 explicit autograd boundary. Save the result of `export_continuation`, rather
 than pickling the in-memory `Continuation` object.
 
+For separate training segments, use
+`dn.func.detach_continuation(program, auxiliary["continuation"])` after backward
+and the optimizer update. This keeps the existing parameter/constant Tensor
+objects, optimizer ownership and source graphs, while truncating recurrent
+model-state and custom callback-carry gradients. Numerical history, RNG,
+callback totals and sampling phase continue. Built-in LFP carry is refreshed
+from current bound field sources so subsequent segments retain field gradients
+when ambient gradients are enabled. Detached recurrent tensors share their
+incoming storage; this operation keeps view strides rather than making a value
+snapshot.
+An existing functional plan is also a target; supply `callbacks=callbacks` when
+carry is present. Runners select their configured collection. The operation
+preserves lifecycle and callback metadata and performs no recording I/O.
+See {ref}`functional-continuation-detach` for nonleaf-source responsibilities,
+the distinction from portable restoration, and a complete optimizer-loop example.
+
 `dn.func.initialize(program)` and `dn.func.initialize(functional, tensors)`
 supply fresh initialized packets with no callback carry; see
 {ref}`functional-runner-initialization` and

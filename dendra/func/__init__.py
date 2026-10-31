@@ -21,6 +21,7 @@ from ._compiled import CompiledPopulationChunk
 from ._connection_sampling import ConnectionSamplingDraw
 from ._continuation import Continuation
 from ._continuation_checkpoints import export_continuation, restore_continuation
+from ._continuation_detach import detach_continuation
 from ._continuous import (
     ContinuousConTensors,
     FunctionalContinuousCon,
@@ -123,6 +124,7 @@ __all__ = [
     "TensorScheduleTensors",
     "VarInput",
     "compile",
+    "detach_continuation",
     "export_continuation",
     "inspect_sources",
     "initialize",

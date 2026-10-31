@@ -156,6 +156,30 @@ inputs, draws and declared call-local ``extra=`` remain per-call arguments.
 
 .. autoclass:: dendra.func.Continuation
 
+``dn.func.detach_continuation(target, packet, callbacks=...)`` truncates recurrent
+gradient history while retaining parameter/constant Tensor identities, aliases,
+trainability and upstream graphs. It detaches model state and custom callback
+carry and rebuilds built-in LFP field carry from current bound sources, retaining
+future field gradients when ambient gradients are enabled. Recurrent tensors
+share their incoming storage and preserve view strides; repeated state/carry
+Tensor identities remain shared. Source/recurrent identity ties split at the
+boundary while raw source objects remain unchanged.
+Numerical state, clocks, RNG, reducers, sampling phase,
+callback metadata and initialization lifecycle are preserved.
+
+Targets are compiled Population/Network runners and existing functional plans.
+Runners use their configured callbacks; omit ``callbacks=``. Explicit plans
+require their matching collection when carry is present. Bindings, kernels and
+native models are not targets. The helper runs outside compilation, tensor
+transforms and forward AD, validates the receiving frames and ownership, and
+performs no initialization, sampling, timesteps or recording I/O. Source graphs
+computed upstream remain the caller's responsibility; portable export/restore
+instead creates independent detached source leaves. See
+:ref:`functional-continuation-detach` and
+:download:`functional_continuation_detach.py <../../examples/functional_continuation_detach.py>`.
+
+.. autofunction:: dendra.func.detach_continuation
+
 Existing explicit-state/keyword calls retain their contracts. Raw bindings
 support ``dn.func.run(bound, packet, ...)`` and successful raw-bound host runs
 publish ``auxiliary["continuation"]``. Create the binding with

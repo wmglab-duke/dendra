@@ -727,6 +727,14 @@ class LFP(_PreparedCallback):
         # lose their AD connection when its owner is updated between runs.
         return tuple(source[index] for index in range(source.shape[0]))
 
+    def _materialize_carry(self):
+        return _materialize_lfp_fields(
+            self._materialization_fields(),
+            device=self.device,
+            dtype=self.dtype,
+            padding=self.padding if self.rule is None else None,
+        )
+
     def _observe(self, state, fields):
         return _project_lfp(state["integrator"]["i_membrane"], fields, rule=self.rule)
 
@@ -735,12 +743,7 @@ class LFP(_PreparedCallback):
         del auxiliary
         # Build this at execution, not binding/probing: each fresh run needs
         # its own differentiable stack even after an earlier backward freed AD.
-        fields = _materialize_lfp_fields(
-            self._materialization_fields(),
-            device=self.device,
-            dtype=self.dtype,
-            padding=self.padding if self.rule is None else None,
-        )
+        fields = self._materialize_carry()
         return fields, self._observe(state, fields)
 
     def update(self, carry, state, auxiliary):

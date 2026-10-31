@@ -1081,6 +1081,85 @@ fresh effective bindings. It also checks raw-bound continuation and explicitly
 binds restored sources. Run
 `python examples/functional_continuation.py --backend aot_eager`.
 
+(functional-continuation-detach)=
+### Truncate recurrent gradient history
+
+Use `dn.func.detach_continuation(target, packet)` between training segments to
+stop gradients through their earlier recurrent history while retaining the
+optimizer's parameter and constant Tensor objects:
+
+```python
+continuation = None
+for inputs in segments:
+    optimizer.zero_grad()
+    state, auxiliary = program(continuation, inputs=inputs)
+    loss = objective(auxiliary)
+    loss.backward()
+    optimizer.step()
+    continuation = dn.func.detach_continuation(program, auxiliary["continuation"])
+```
+
+The returned `Continuation` keeps simulation values, clocks, delay histories,
+event queues, RNG state, callback totals and sampling phase. Recurrent model
+state and custom callback carry lose their earlier gradient history. The next
+segment starts from those values, records only new accepted samples, and
+builds a fresh local gradient graph. Built-in LFP lead-field carry is rebuilt
+from the current bound field sources, preserving gradients to trainable fields
+after an optimizer update. Perform this operation after that update when the
+next segment should use the updated fields. Field refresh follows the ambient
+gradient mode; keep gradients enabled when training those fields in the next
+segment.
+
+Detached recurrent tensors share storage with the incoming packet, preserving
+distinct views and their strides. Changes to that storage remain visible
+through both packets. Repeated Tensor identities within state and custom carry
+remain shared. A Tensor used as both a raw source and recurrent state receives
+a detached recurrent identity while its original source object is retained.
+
+Parameter and constant Tensor identities, aliases, trainability and upstream
+graphs remain intact. This preserves existing optimizers and raw bindings.
+Nonleaf source bindings, including retained initialization materializations,
+can still refer to earlier graphs. Recompute externally derived sources for a
+new segment when their graphs must also be replaced. The helper does not
+rerun initialization or materialize new model sources. Earlier recordings and
+losses remain caller-owned; release them when their graphs are no longer needed.
+
+The target is either compiled Population/Network runner or an existing
+`FunctionalPopulation`/`FunctionalNetwork`. Runners select their configured
+callbacks; omit `callbacks=`. For an explicit plan, supply its bound callback
+collection when the packet contains carry:
+
+```python
+continuation = dn.func.detach_continuation(
+    functional, auxiliary["continuation"], callbacks=callbacks,
+)
+state, auxiliary = dn.func.run(
+    bound, continuation, steps=64, callbacks=callbacks,
+)
+```
+
+The target validates the packet's sources, state and callback ownership.
+The helper retains lifecycle and callback metadata, including an initialized
+packet's unstarted recording state. It does not initialize callbacks, sample,
+advance time, reset reducers or write recording files. Native models, bindings
+and kernels are not targets; select the owning plan or runner. The operation
+runs on the host, outside compilation, tensor transforms and forward AD.
+
+Portable export/restore owns detached source leaves for saving and restoring
+independent bindings. Recurrent-history truncation retains the live source
+objects and the same callback collection identity. Activation checkpointing
+within a segment continues to recompute its full local gradient history.
+
+The complete
+{download}`functional_continuation_detach.py <../../examples/functional_continuation_detach.py>`
+example trains three continued segments for a Population and a Network. It
+checks optimizer identities, shared parameters, zero gradients to previous
+input tapes, nonzero local gradients, refreshed LFP fields and Recorder cadence:
+
+```console
+python examples/functional_continuation_detach.py
+```
+
 (functional-packet-execution)=
 ### Execute an explicit continuation
 
