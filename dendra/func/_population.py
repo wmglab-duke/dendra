@@ -13916,6 +13916,7 @@ class FunctionalPopulation:
         *,
         state=None,
         random_draw=None,
+        draws=None,
     ):
         """Purely initialize from declared defaults or a bound steady-state cache.
 
@@ -13932,8 +13933,17 @@ class FunctionalPopulation:
         previous mechanism State for pre-transform reads. Without ``state``,
         those reads use the State captured at lowering. ``inputs.states``
         supplies insertion-time values applied after the complete pre phase.
+        ``draws`` supplies one explicit initialization packet instead of the
+        legacy stochastic fields. Missing families are not sampled implicitly.
         """
 
+        if draws is not None:
+            from ._initialization_draws import _with_population_initialization_draws
+
+            inputs = _with_population_initialization_draws(
+                inputs, draws, random_draw=random_draw
+            )
+            random_draw = None
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_constants(constants)
@@ -14371,9 +14381,26 @@ class FunctionalPopulation:
         noise, stimulation = sharing.sample_runtime(state, steps=steps)
         return inputs._replace(noise=noise, stimulation=stimulation)
 
-    def initialize_host(self, parameters, constants, inputs, *, state=None):
-        """Sample missing RAND draws at a cold boundary, then initialize purely."""
-        if self._stimulation_rng_plan.enabled and not self._owned_cache_bound:
+    def initialize_host(
+        self,
+        parameters,
+        constants,
+        inputs,
+        *,
+        state=None,
+        draws=None,
+        _draws_capture=None,
+    ):
+        """Sample missing draws at a cold boundary, or replay an explicit packet."""
+        if draws is not None:
+            from ._initialization_draws import _with_population_initialization_draws
+
+            inputs = _with_population_initialization_draws(inputs, draws)
+        if (
+            draws is None
+            and self._stimulation_rng_plan.enabled
+            and not self._owned_cache_bound
+        ):
             needs_random = self._random_plan is not None
             needs_stimulation = self._poisson_plan.has_initialization
             supplied = (inputs.random_draw is not None, inputs.stimulation is not None)
@@ -14394,7 +14421,8 @@ class FunctionalPopulation:
                     random_draw=random_draw, stimulation=stimulation
                 )
         if (
-            self._random_plan is not None
+            draws is None
+            and self._random_plan is not None
             and not self._owned_cache_bound
             and inputs.random_draw is None
         ):
@@ -14404,7 +14432,8 @@ class FunctionalPopulation:
                 random_draw=self.sample_initialization_draw(parameters, state)
             )
         if (
-            self._poisson_plan is not None
+            draws is None
+            and self._poisson_plan is not None
             and self._poisson_plan.has_initialization
             and not self._owned_cache_bound
             and inputs.stimulation is None
@@ -14414,7 +14443,13 @@ class FunctionalPopulation:
             inputs = inputs._replace(
                 stimulation=self.sample_stimulation_initialization_draw(state)
             )
-        return self.initialize(parameters, constants, inputs, state=state)
+        initialized = self.initialize(parameters, constants, inputs, state=state)
+        if _draws_capture is not None:
+            consumed = initialized.initialization
+            cached = consumed.cache is not None
+            _draws_capture["random"] = None if cached else consumed.random_draw
+            _draws_capture["stimulation"] = None if cached else consumed.stimulation
+        return initialized
 
     def _initialize_owned_cache(self, parameters, constants, inputs, *, state=None):
         if self._owned_cache_error is not None:

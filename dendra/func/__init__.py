@@ -28,7 +28,8 @@ from ._continuous import (
 from ._convenience import CompiledRunner, compile
 from ._draws import RuntimeDraws
 from ._execution import ExecutionCapabilities, ExecutionReport
-from ._initialization import initialize
+from ._initialization import initialize, sample_initialization_draws
+from ._initialization_draws import InitializationDraws
 from ._inputs import Inputs
 from ._lowering import make_functional
 from ._netcon import FunctionalNetCon, NetConTensors, make_functional_netcon
@@ -93,6 +94,7 @@ __all__ = [
     "FunctionalNetStim",
     "FunctionalNetwork",
     "FunctionalizationError",
+    "InitializationDraws",
     "InitializationInput",
     "Inputs",
     "LFP",
@@ -132,4 +134,5 @@ __all__ = [
     "make_functional_network",
     "restore_continuation",
     "run",
+    "sample_initialization_draws",
 ]

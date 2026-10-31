@@ -159,6 +159,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "FunctionalNetwork",
         "FunctionalPopulation",
         "FunctionalizationError",
+        "InitializationDraws",
         "InitializationInput",
         "Inputs",
         "LFP",
@@ -198,6 +199,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "make_functional_network",
         "restore_continuation",
         "run",
+        "sample_initialization_draws",
     }
 
 

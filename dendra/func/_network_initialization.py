@@ -714,7 +714,14 @@ def _validate(functional, parameters, constants, state, inputs, draw, *, require
 
 
 def _initialize_components(
-    functional, parameters, constants, state, inputs, *, sample_random=False
+    functional,
+    parameters,
+    constants,
+    state,
+    inputs,
+    *,
+    sample_random=False,
+    _draws_capture=None,
 ):
     """Complete the native phases preceding NetStim initialization."""
     from ._network import NetworkTensors
@@ -730,6 +737,9 @@ def _initialize_components(
     }
     effective = parameters
     effective_constants = functional._bind_parameter_constants(parameters, constants)
+    if _draws_capture is not None:
+        _draws_capture["random"] = dict.fromkeys(functional.populations)
+        _draws_capture["stimulation"] = dict.fromkeys(functional.populations)
     with nullcontext() if functional.training else torch.no_grad():
         # Native initialize completes each Population in authored order before
         # resetting connections. Parameter-writing transforms affect every
@@ -827,6 +837,15 @@ def _initialize_components(
                     effective_constants["populations"][name],
                     populations[name],
                     inputs.cache.populations[name],
+                )
+            if (
+                _draws_capture is not None
+                and inputs.cache is None
+                and initialized.initialization.cache is None
+            ):
+                _draws_capture["random"][name] = initialized.initialization.random_draw
+                _draws_capture["stimulation"][name] = (
+                    initialized.initialization.stimulation
                 )
             if rng_plan.enabled:
                 cache = (
@@ -1000,6 +1019,8 @@ def _initialize_components(
                 reinit_delays=inputs.reinit_delays,
             ),
         )
+        if _draws_capture is not None:
+            _draws_capture["connections"] = draw
         if draw is not None:
             stimulation_pool = functional._stimulation_rng_after_connections(
                 stimulation_pool, draw.rng
@@ -1101,8 +1122,16 @@ def _finish_initialization(functional, packet, draw):
     return NetworkTensors(packet.parameters, packet.constants, state)
 
 
-def initialize(functional, parameters, constants, state, inputs, *, netstim_draw=None):
+def initialize(
+    functional, parameters, constants, state, inputs, *, netstim_draw=None, draws=None
+):
     """Initialize one complete boundary without sampling or mutating operands."""
+    if draws is not None:
+        from ._initialization_draws import _with_network_initialization_draws
+
+        inputs = _with_network_initialization_draws(
+            functional, inputs, draws, netstim_draw=netstim_draw
+        )
     (parameters, constants, state, inputs, netstim_draw), _ = (
         _canonicalize_mapping_tree((parameters, constants, state, inputs, netstim_draw))
     )
@@ -1116,8 +1145,21 @@ def initialize(functional, parameters, constants, state, inputs, *, netstim_draw
     return _finish_initialization(functional, packet, draw)
 
 
-def initialize_host(functional, parameters, constants, state, inputs):
+def initialize_host(
+    functional,
+    parameters,
+    constants,
+    state,
+    inputs,
+    *,
+    draws=None,
+    _draws_capture=None,
+):
     """Cold sampling adapter over the same pure initialization phases."""
+    if draws is not None:
+        from ._initialization_draws import _with_network_initialization_draws
+
+        inputs = _with_network_initialization_draws(functional, inputs, draws)
     (parameters, constants, state, inputs), _ = _canonicalize_mapping_tree(
         (parameters, constants, state, inputs)
     )
@@ -1130,18 +1172,26 @@ def initialize_host(functional, parameters, constants, state, inputs):
         state,
         inputs,
         inputs.netstim_draw,
-        require_draw=False,
+        require_draw=draws is not None,
     )
     packet = _initialize_components(
-        functional, parameters, constants, state, inputs, sample_random=True
+        functional,
+        parameters,
+        constants,
+        state,
+        inputs,
+        sample_random=draws is None,
+        _draws_capture=_draws_capture,
     )
     draw = inputs.netstim_draw
-    if functional.netstim is not None and draw is None:
+    if functional.netstim is not None and draw is None and draws is None:
         # Native initialization samples last. Population transforms may have
         # changed a parameter shared with NetStim, including conditional noise.
         draw = functional.sample_initialization_draw(
             packet.parameters, packet.state, constants=packet.constants
         )
+    if _draws_capture is not None:
+        _draws_capture["netstim"] = draw
     return _finish_initialization(functional, packet, draw)
 
 

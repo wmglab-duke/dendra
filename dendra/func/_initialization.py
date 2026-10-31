@@ -7,6 +7,7 @@ from collections.abc import Mapping
 import torch
 
 from ._continuation import _make_continuation
+from ._initialization_draws import InitializationDraws
 from ._network_bindings import _map_containers
 from ._types import FunctionalizationError, InitializationInput, PopulationTensors
 
@@ -31,24 +32,54 @@ def _initialization_input_mapping(inputs):
     )
 
 
-def _initialize_host(functional, parameters, constants, state, initialization):
+def _initialize_host(
+    functional,
+    parameters,
+    constants,
+    state,
+    initialization,
+    *,
+    draws=None,
+    _draws_capture=None,
+):
     """Dispatch without changing existing caller validation or result contracts."""
     from ._network import FunctionalNetwork
 
+    options = {}
+    if draws is not None:
+        options["draws"] = draws
+    if _draws_capture is not None:
+        options["_draws_capture"] = _draws_capture
     if isinstance(functional, FunctionalNetwork):
-        return functional._initialize_host(parameters, constants, state, initialization)
+        return functional._initialize_host(
+            parameters, constants, state, initialization, **options
+        )
     return functional.initialize_host(
-        parameters, constants, initialization, state=state
+        parameters, constants, initialization, state=state, **options
     )
 
 
 def _initialize_fresh(
-    functional, parameters, constants, state, initialization, *, gradient
+    functional,
+    parameters,
+    constants,
+    state,
+    initialization,
+    *,
+    gradient,
+    draws=None,
+    _draws_capture=None,
 ):
     """Run one fresh initialization with ordinary, versioned tensor outputs."""
     with torch.inference_mode(False), torch.set_grad_enabled(gradient):
         return _initialize_host(
-            functional, parameters, constants, state, initialization
+            functional,
+            parameters,
+            constants,
+            state,
+            initialization,
+            draws=draws,
+            _draws_capture=_draws_capture,
         )
 
 
@@ -104,18 +135,35 @@ def _runner_sources(
     )
 
 
-def _initialize_runner(runner, parameters, constants, initialization):
+def _initialize_runner(
+    runner, parameters, constants, initialization, *, draws=None, _draws_capture=None
+):
     """Initialize from runner defaults without entering its execution lifecycle."""
     state = runner._initial_state
     parameters, constants, selected, _ = _runner_sources(
         runner, parameters, constants, initialization, fresh=True
     )
     return _initialize_continuation(
-        runner._functional, parameters, constants, state, selected
+        runner._functional,
+        parameters,
+        constants,
+        state,
+        selected,
+        draws=draws,
+        _draws_capture=_draws_capture,
     )
 
 
-def _initialize_continuation(functional, parameters, constants, state, selected):
+def _initialize_continuation(
+    functional,
+    parameters,
+    constants,
+    state,
+    selected,
+    *,
+    draws=None,
+    _draws_capture=None,
+):
     """Publish effective initialization frames under the caller's gradient mode."""
     from ._network import FunctionalNetwork
 
@@ -128,6 +176,8 @@ def _initialize_continuation(functional, parameters, constants, state, selected)
             state,
             selected,
             gradient=gradient,
+            draws=draws,
+            _draws_capture=_draws_capture,
         )
         parameters, constants = initialized.parameters, initialized.constants
         if isinstance(functional, FunctionalNetwork):
@@ -144,6 +194,7 @@ def initialize(
     initialization=None,
     parameters=_UNSET,
     constants=_UNSET,
+    draws=None,
 ):
     """Initialize a runner or lowered model and return a Continuation.
 
@@ -169,6 +220,10 @@ def initialize(
     ordering follow the existing initialization machinery. Missing draws are
     sampled from independent explicit RNG carry. Supplied draws are replayed,
     including draws retained in an already initialized Population bundle.
+    ``draws=InitializationDraws(...)`` supplies the complete stochastic input
+    separately from deterministic initialization values and replays without
+    automatic sampling. It cannot be combined with legacy draw fields.
+    Use :func:`sample_initialization_draws` to capture packets in native order.
 
     This host entry point runs outside ``torch.compile``, ``torch.func`` and
     forward AD. The pure ``functional.initialize`` methods and their existing
@@ -189,6 +244,27 @@ def initialize(
     Source models, bundle containers and initialization defaults are unchanged.
     Runtime ``Inputs``, ``RuntimeDraws`` and waveform recipes remain run inputs.
     """
+    return _initialize_target(
+        functional,
+        tensors,
+        initialization=initialization,
+        parameters=parameters,
+        constants=constants,
+        draws=draws,
+    )
+
+
+def _initialize_target(
+    functional,
+    tensors,
+    *,
+    initialization,
+    parameters,
+    constants,
+    draws=None,
+    _draws_capture=None,
+):
+    """Resolve each public target once before the shared ordered execution."""
     from ._convenience import CompiledRunner
     from ._network_compile import CompiledNetworkRunner
 
@@ -223,6 +299,8 @@ def initialize(
             None if parameters is _UNSET else parameters,
             None if constants is _UNSET else constants,
             initialization,
+            draws=draws,
+            _draws_capture=_draws_capture,
         )
 
     from ._network import FunctionalNetwork, NetworkTensors
@@ -260,7 +338,51 @@ def initialize(
     else:
         constants = functional._bind_parameter_constants(parameters, constants)
 
-    return _initialize_continuation(functional, parameters, constants, state, selected)
+    return _initialize_continuation(
+        functional,
+        parameters,
+        constants,
+        state,
+        selected,
+        draws=draws,
+        _draws_capture=_draws_capture,
+    )
 
 
-__all__ = ["initialize"]
+def sample_initialization_draws(
+    functional,
+    tensors=_UNSET,
+    *,
+    initialization=None,
+    parameters=_UNSET,
+    constants=_UNSET,
+):
+    """Capture replayable initialization draws from a runner or lowered model.
+
+    Accepts the same targets and source overrides as :func:`initialize`.
+    Sampling runs the existing host initializer under ``no_grad``, including
+    pure transforms and cache restoration, to observe each sampling boundary
+    in native order. The resulting packet includes the actual draw selections
+    and intermediate RNG frames. Initialized model values are not published.
+    Source modules, input tensors, runner defaults and global RNG are unchanged.
+    Newly sampled tensors are detached. Supplied legacy draw fields are
+    captured as provided, preserving their tensor identities and gradient flags.
+
+    Replay with ``initialize(target, ..., draws=packet)``. Capture and replay
+    are separate initialization executions; each invokes authored transforms
+    once. Ordinary automatic initialization does not perform a capture pass.
+    """
+    captured = {}
+    with torch.inference_mode(False), torch.no_grad():
+        _initialize_target(
+            functional,
+            tensors,
+            initialization=initialization,
+            parameters=parameters,
+            constants=constants,
+            _draws_capture=captured,
+        )
+    return InitializationDraws(**captured)
+
+
+__all__ = ["initialize", "sample_initialization_draws"]

@@ -40,6 +40,32 @@ replay and complete examples.
 
 .. autofunction:: dendra.func.initialize
 
+``dn.func.sample_initialization_draws`` captures a canonical
+``InitializationDraws`` packet from a compiled runner or a lowered model and
+matching tensor bundle. Replay it with ``dn.func.initialize(..., draws=packet)``
+or the pure plan's ``initialize`` method. The packet groups ``random``,
+``stimulation``, ``netstim`` and ``connections`` draws; for Networks, the first
+two fields map Population names to their existing component packets.
+Unused families or Population entries use ``None``.
+
+Capture executes one ordered host initialization under ``no_grad`` to resolve
+sampling around transforms, cache restoration and shared writes. It returns
+newly sampled detached base draws and RNG carry, discards initialized state,
+and leaves native sources, global RNG and runner defaults unchanged. Supplied
+legacy draw fields are captured as provided, retaining Tensor identities and
+gradient flags without cloning or detaching them. Replay is a separate
+initialization execution and preserves ordinary parameter gradients. Automatic
+initialization without a packet samples within its single initialization call.
+Supplied canonical draws cannot be combined with legacy stochastic initialization
+fields; conflicts are rejected before hooks or sampling. Initialization and
+runtime draw packets are distinct types. See :ref:`functional-initialization-draws`
+for both target forms, ordering, compatibility and the runnable example.
+
+.. autoclass:: dendra.func.InitializationDraws
+   :members: random, stimulation, netstim, connections
+
+.. autofunction:: dendra.func.sample_initialization_draws
+
 ``dn.compile(Population)`` returns independent parameter leaves selectable by
 exact/unique partial names, glob patterns, or explicit regex selectors. Use
 ``find_parameters`` to preview matches and ``trainable_parameters`` to inspect

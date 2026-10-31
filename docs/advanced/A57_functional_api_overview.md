@@ -704,7 +704,7 @@ parameter replacements, aliases and gradient history. It has
 `callback_state=None`: initialization starts no callback or recording, performs
 no rollout and captures no execution kernel. Initialization itself builds the
 coefficients and samples the initialization draws required by the model's
-existing protocol. Runtime input tapes, `draws=` and call-local `extra` belong
+existing protocol. Runtime input tapes, `RuntimeDraws` and call-local `extra` belong
 to the subsequent run; a runner with `extra=dn.VarInput()` needs no runtime
 recipe for this initialization call.
 
@@ -796,6 +796,94 @@ initialization gradients, portable continuation and suffix optimization leaves:
 ```console
 python examples/functional_explicit_initialization.py
 python examples/functional_explicit_initialization.py --backend aot_eager
+```
+
+(functional-initialization-draws)=
+### Capture and replay initialization draws
+
+`dn.func.InitializationDraws` groups the stochastic inputs for a fresh
+initialization. Capture a packet from a compiled runner, then replay it with
+the same initialization recipe and effective sources:
+
+```python
+draws = dn.func.sample_initialization_draws(program)
+initial = dn.func.initialize(program, draws=draws)
+state, auxiliary = dn.func.run(program, initial)
+```
+
+For a lowered Population or Network, both calls accept its matching tensor
+bundle:
+
+```python
+draws = dn.func.sample_initialization_draws(functional, tensors)
+initial = dn.func.initialize(functional, tensors, draws=draws)
+```
+
+The sampler accepts the same `initialization=` override as `initialize`.
+Compiled runners also accept `parameters=` and `constants=` overrides; supply
+the same overrides when replaying. For explicit models, replace the intended
+bundle fields before capture and replay.
+
+| Packet field | Population | Network |
+| --- | --- | --- |
+| `random` | RAND/initialization NOISE draw packet | Draw packets keyed by Population name |
+| `stimulation` | Poisson initialization draw packet | Draw packets keyed by Population name |
+| `netstim` | `None` | NetStim initialization draw packet |
+| `connections` | `None` | Connection weight/delay sampling draw packet |
+
+Unused families or Population entries use `None`. The supplied packet must
+contain the draws required by the selected initialization; it does not request
+automatic sampling of omitted stochastic families. Newly sampled base draws
+and their resulting RNG carry are detached. When an initialization recipe
+already supplies legacy draw fields, capture retains their Tensor identities
+and gradient flags without cloning or detaching them. Parameters used to
+materialize samples retain their normal initialization gradients.
+
+Capture follows one complete ordered host initialization under `no_grad` to
+resolve sampling around transforms, caches and per-Population writes. It
+returns only the draw packet, discarding the initialized state. It leaves
+native sources, global RNG, runner defaults, execution caches and recording
+unchanged. Replay is a separate initialization call: its transforms execute
+once in the caller's gradient mode using the captured draws. Keep authored
+transforms functionally pure. Capture and replay run those transforms in two
+separate calls; they do not cache transform outputs between calls.
+
+For ordinary fresh initialization, `dn.func.initialize(...)` samples missing
+draws as part of its single ordered execution. There is no need to capture a
+packet first. Explicit capture is useful for comparing executions, replaying a
+chosen realization, or separating draw generation from differentiable
+initialization. The pure Population and Network `initialize` methods also
+accept `draws=InitializationDraws(...)`.
+
+Existing family-specific samplers and initialization fields remain supported.
+Choose either the canonical packet or the legacy stochastic fields:
+`draws=` cannot be combined with `InitializationInput.random_draw`,
+`InitializationInput.stimulation`, `NetworkInitializationInput.netstim_draw`
+or `NetworkInitializationInput.connection_draw`, including per-Population
+legacy fields. Conflicts are rejected before initialization hooks or sampling.
+Clear retained legacy draw fields before supplying a canonical packet.
+
+Initialization draws and runtime `RuntimeDraws` are distinct packet types.
+`initialize(..., draws=...)` consumes `InitializationDraws`;
+`run(..., draws=...)` consumes runtime draws. After initialization, use the
+returned `Continuation` and the existing portable checkpoint API to retain the
+resulting state, effective sources and RNG position.
+
+The complete
+{download}`functional_initialization_draws.py <../../examples/functional_initialization_draws.py>`
+example checks automatic-versus-explicit replay, source RNG isolation, shared
+parameters, scan gradients and portable continuation for both model kinds:
+
+```console
+python examples/functional_initialization_draws.py
+python examples/functional_initialization_draws.py --backend aot_eager
+```
+
+```{literalinclude} ../../examples/functional_initialization_draws.py
+:language: python
+:start-after: "# region draws"
+:end-before: "# endregion draws"
+:dedent: 4
 ```
 
 ### Fresh starts with a convenience runner

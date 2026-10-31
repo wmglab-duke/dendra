@@ -741,7 +741,9 @@ class FunctionalNetwork:
             raise ValueError("This Network plan has no bound initialization cache")
         _validate_tree(cache, self._cache_schema, "initialization.cache")
 
-    def initialize(self, parameters, constants, state, inputs, *, netstim_draw=None):
+    def initialize(
+        self, parameters, constants, state, inputs, *, netstim_draw=None, draws=None
+    ):
         """Initialize current explicit parameters and carry in native order.
 
         Population inputs and the starting clock are explicit. Existing carry
@@ -754,11 +756,19 @@ class FunctionalNetwork:
         Population retains the effective buffers and solver workspaces prepared
         at its own boundary. Resulting parameters and constants accompany state
         in :class:`NetworkTensors`; keep all three for explicit continuation.
+        ``draws`` supplies a complete :class:`InitializationDraws` packet for
+        replay instead of the legacy draw fields in ``inputs``.
         """
         from ._network_initialization import initialize
 
         return initialize(
-            self, parameters, constants, state, inputs, netstim_draw=netstim_draw
+            self,
+            parameters,
+            constants,
+            state,
+            inputs,
+            netstim_draw=netstim_draw,
+            draws=draws,
         )
 
     def sample_initialization_draw(self, parameters, state, *, constants=None):
@@ -834,10 +844,20 @@ class FunctionalNetwork:
             for name, plan in self.populations.items()
         }
 
-    def _initialize_host(self, parameters, constants, state, inputs):
+    def _initialize_host(
+        self, parameters, constants, state, inputs, *, draws=None, _draws_capture=None
+    ):
         from ._network_initialization import initialize_host
 
-        return initialize_host(self, parameters, constants, state, inputs)
+        return initialize_host(
+            self,
+            parameters,
+            constants,
+            state,
+            inputs,
+            draws=draws,
+            _draws_capture=_draws_capture,
+        )
 
     def _population_name(self, population):
         for name, candidate in self._source.populations.items():
