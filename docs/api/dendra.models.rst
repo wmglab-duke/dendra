@@ -403,12 +403,25 @@ on the Population. Opted-in ``run`` and ``longrun`` return the existing
 unchanged otherwise. Checkpointed execution retains its loss/result tuples.
 Ordinary ``callbacks=`` can coexist independently. The bridge supplies a
 gradient-preserving state snapshot and auxiliary ``{"v": ...}``, with pure
-updates after clock advancement and before native post-step hooks. Native
-Network execution, ``Population.step`` and functional-bridge HDF5 storage are
-currently unsupported. See :ref:`functional-native-population-callbacks` and
+updates after clock advancement and before native post-step hooks.
+``Population.step`` and functional-bridge HDF5 storage are currently
+unsupported. See :ref:`functional-native-population-callbacks` and
 the complete
 :download:`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
 example.
+
+Native ``Network.run`` and ``longrun`` accept the same ``functional_callbacks``
+and ``functional_callback_state`` keywords and opt-in result mapping. Bind the
+collection through ``make_functional_network`` for the exact initialized source
+Network; its initialized timestep remains authoritative. Qualified Network
+Recorders and Population-scoped pure callbacks keep their functional selections,
+cadence and outputs. Unscoped auxiliary data is
+``{"populations": {name: {"v": ...}}}``; scoped callbacks receive ``{"v": ...}``.
+Native Network state remains on the Network while explicit callback carry
+continues its observation phase. Ordinary native hooks can coexist independently.
+Pure-callback execution on ``Network.step`` and ``longrun_checkpointed`` is
+currently unsupported. See :ref:`functional-native-network-callbacks` and
+:download:`native_network_functional_callbacks.py <../../examples/native_network_functional_callbacks.py>`.
 
 Intrinsic activity
 ------------------

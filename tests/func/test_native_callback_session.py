@@ -221,3 +221,149 @@ def test_session_updates_use_current_buffer_owners_and_share_auxiliary_snapshot(
     assert updated["view"]["value"] is not replacement
     torch.testing.assert_close(updated["view"]["value"], replacement)
     torch.testing.assert_close(emitted["view"], replacement.square())
+
+
+class _NetworkViews(FunctionalCallback):
+    def initialize(self, state, auxiliary):
+        assert auxiliary is None
+        values = {
+            name: child["integrator"]["v"]
+            for name, child in state["populations"].items()
+        }
+        return values, values["left"].square()
+
+    def update(self, carry, state, auxiliary):
+        del carry
+        assert set(auxiliary) == {"populations"}
+        values = {}
+        for name, child in state["populations"].items():
+            values[name] = child["integrator"]["v"]
+            assert auxiliary["populations"][name]["v"] is values[name]
+        return values, values["left"].square()
+
+    def finalize(self, carry, emissions):
+        del carry
+        return emissions
+
+
+def _network_case():
+    from dendra.func._network import FunctionalNetwork
+
+    left, right = _case(requires_grad=True), _case(requires_grad=True)
+    right.population.v = right.population.v_alias = left.population.v
+    network = SimpleNamespace(
+        populations={"left": left.population, "right": right.population},
+        synapses={},
+        continuous_synapses={},
+        netstim=None,
+        t=left.population.t,
+        _clock_origin=left.population.t,
+        _clock_step=torch.tensor(0, dtype=torch.int64),
+        _duration_remainder=torch.tensor(0.0, dtype=torch.float64),
+    )
+    functional = object.__new__(FunctionalNetwork)
+    functional._source = network
+    functional.populations = {"left": left.functional, "right": right.functional}
+    for plan in functional.populations.values():
+        plan._random_plan = plan._poisson_plan = None
+    functional.synapses = functional.continuous_synapses = {}
+    functional.netstim = None
+    functional._rng_plan = SimpleNamespace(
+        enabled=False, streams={}, strip_population=lambda value: value
+    )
+    functional._stimulation_plan = SimpleNamespace(
+        enabled=False, plans={}, strip=lambda value: value
+    )
+    functional._connection_sampling_plan = SimpleNamespace(extract=lambda source: None)
+    events, frames = [], []
+    functional._validate_source = lambda: events.append("source")
+    functional._validate_state = frames.append
+    functional.extract = lambda: SimpleNamespace(
+        state={
+            "populations": {
+                "left": left.functional.extract().state,
+                "right": right.functional.extract().state,
+            },
+            "synapses": {},
+            "continuous_synapses": {},
+            "netstim": None,
+            "clock": {
+                "t": network.t,
+                "origin": network._clock_origin,
+                "step": network._clock_step,
+                "duration_remainder": network._duration_remainder,
+            },
+        }
+    )
+    callbacks = FunctionalCallbacks(functional, {"view": _NetworkViews()})
+    return SimpleNamespace(
+        population=left.population,
+        network=network,
+        functional=functional,
+        callbacks=callbacks,
+        events=events,
+        frames=frames,
+    )
+
+
+def test_network_session_preserves_cross_population_aliases_and_local_auxiliary():
+    case = _network_case()
+    session = _bind_native_callbacks(case.network, case.callbacks, None)
+    assert case.events == ["source"] and len(case.frames) == 1
+    snapshot = session._snapshot()
+    assert snapshot["clock"]["t"] is snapshot["populations"]["left"]["clock"]["t"]
+    assert snapshot["clock"]["t"] is not case.network.t
+    state, parts = session.start()
+    assert state["view"]["left"] is state["view"]["right"]
+    assert state["view"]["left"] is not case.population.v
+    with torch.no_grad():
+        case.population.v.add_(1.0)
+    updated, emitted = session.update(state)
+    assert updated["view"]["left"] is updated["view"]["right"]
+    session.collect(updated, parts, session.stack([emitted]))
+    result = session.finish(updated, parts)
+    assert result["view"].shape == (2, 1, 2)
+    assert case.events == ["source"] and len(case.frames) == 1
+    gradient = torch.autograd.grad(result["view"].sum(), case.population.v)[0]
+    torch.testing.assert_close(
+        gradient, torch.tensor([[6.0, 10.0]], dtype=torch.float64)
+    )
+
+
+def test_network_session_rejects_wrong_owner_and_lost_native_buffer_before_hooks():
+    case = _network_case()
+    for wrong_owner in (case.population, SimpleNamespace()):
+        with pytest.raises(FunctionalizationError, match="exact source Network"):
+            _bind_native_callbacks(wrong_owner, case.callbacks, None)
+    assert case.events == [] and case.frames == []
+    del case.population.v_alias
+    with pytest.raises(
+        FunctionalizationError, match="state binding lost runtime tensor.*v_alias"
+    ):
+        _bind_native_callbacks(case.network, case.callbacks, None)
+    assert case.events == ["source"] and case.frames == []
+
+
+def test_network_metadata_order_matches_extraction_without_copying_tensor_leaves():
+    case = _network_case()
+    expected = case.functional.extract().state
+    for name, plan in case.functional.populations.items():
+        value = case.network.populations[name].v
+        random = {"rng": {}, "values": {"sample": value}}
+        plan._poisson_plan = SimpleNamespace(entries=())
+        plan._random_plan = SimpleNamespace(
+            extract=lambda population, random=random: ({}, random)
+        )
+        expected["populations"][name]["stimulation"] = {"schedules": {}}
+        expected["populations"][name]["random"] = random
+    session = _bind_native_callbacks(case.network, case.callbacks, None)
+    actual = session.binding.state()
+    actual_leaves, actual_spec = torch.utils._pytree.tree_flatten(actual)
+    expected_leaves, expected_spec = torch.utils._pytree.tree_flatten(expected)
+    assert actual_spec == expected_spec
+    assert all(
+        observed is wanted
+        for observed, wanted in zip(actual_leaves, expected_leaves, strict=True)
+    )
+    for values in actual["populations"].values():
+        assert tuple(values)[-2:] == ("stimulation", "random")

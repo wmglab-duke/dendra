@@ -214,7 +214,9 @@ Scopes select exact top-level Population names and cannot be nested. A scoped
 Recorder uses local paths such as `"v"` or `"hh.m"`; named Slice regions also
 select components within a concatenated MultiPopulation. Native results belong
 to the inner callback; functional results and continuation use independent
-explicit carry. A pure `FunctionalCallback` child requires functional execution.
+explicit carry. Pure callback children bind through `functional.make_callbacks`
+and can also observe native Network `run` and `longrun` through that collection.
+They do not run through the ordinary imperative `callbacks=` hook list.
 See the {ref}`shared scope example <shared-population-callback-scopes>` and
 {doc}`A27_functional_network_callbacks` for scopes and configuration ownership.
 Both Raster entry points return only checked post-step samples in the
@@ -246,7 +248,7 @@ restoration uses detached field carry. See the
 Population and Network execution.
 
 (functional-native-callback-execution)=
-### Use pure callbacks with native Population execution
+### Use pure callbacks with native execution
 
 A bound pure callback collection also works with native `Population.run`,
 `longrun` and `longrun_checkpointed`. Build the collection from
@@ -274,9 +276,9 @@ gradient-preserving tensor-frame snapshot. Continued Recorder segments omit
 the shared boundary and preserve cadence; reducer results stay cumulative.
 
 One `FunctionalCallback` definition supplies the same pure analysis for native
-and functional Population dynamics. The native auxiliary packet contains
-`{"v": ...}`. Native `Network` methods, `Population.step` and HDF5 storage
-through this pure bridge are currently unsupported. Ordinary native Recorder
+and functional Population dynamics. The native Population auxiliary packet
+contains `{"v": ...}`. `Population.step` and HDF5 storage through this pure
+bridge are currently unsupported. Ordinary native Recorder
 HDF5 recording remains available through `callbacks=`. See
 {ref}`functional-native-population-callbacks` for the complete contract and
 {download}`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
@@ -284,6 +286,27 @@ for a runnable custom reducer, cadence, native loss, gradients and replay:
 
 ```console
 python examples/native_functional_callbacks.py
+```
+
+Native `Network.run` and `longrun` accept the same two keyword arguments.
+Create the bound collection with `dn.func.make_functional_network(network)`
+from the exact initialized source Network. Qualified Recorders select fields
+such as `"left.v"`; `dn.callbacks.PopulationCallback("right", callback)`
+selects one Population for a relative Recorder or custom pure analysis. The
+Network retains its simulation state while `results.state` continues callback
+carry. Both methods return `FunctionalCallbackResults` only when opted in.
+They use the timestep established by `network.initialize(dt)`.
+
+The native Network auxiliary packet is
+`{"populations": {name: {"v": ...}}}`; scoped callbacks receive `{"v": ...}`.
+Pure-callback execution on native `Network.step` and `longrun_checkpointed` is
+currently unsupported. See {ref}`functional-native-network-callbacks` and
+the complete
+{download}`native_network_functional_callbacks.py <../../examples/native_network_functional_callbacks.py>`
+example for unequal connected Populations, scope parity, cadence and gradients:
+
+```console
+python examples/native_network_functional_callbacks.py
 ```
 
 ### Continue functional execution

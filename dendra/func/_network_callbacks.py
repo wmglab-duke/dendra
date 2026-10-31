@@ -16,10 +16,139 @@ from ._callbacks import (
     FunctionalCallbacks,
     Recorder,
     _coerce_callback_configuration,
+    _ImperativeCallbackBinding,
     _is_prepared_callback,
+    _native_population_readers,
     _ThresholdCallback,
 )
 from ._types import FunctionalizationError
+
+
+@dataclass(frozen=True)
+class _ImperativeNetworkCallbackBinding:
+    callbacks: FunctionalCallbacks
+    functional: object
+    population_bindings: tuple
+    random_streams: tuple
+    stimulation_streams: tuple
+
+    def state(self):
+        from dendra.models.stim.waveform._poisson import poisson_generator_state
+
+        from ._poisson_stimulation import normalize_schedule
+        from ._rng_frames import _rng_values
+
+        functional = self.functional
+        network = functional._source
+        state = {
+            "populations": {},
+            "synapses": {
+                name: plan._checkpoint_values(network.synapses[name])
+                for name, plan in functional.synapses.items()
+            },
+            "continuous_synapses": {
+                name: network.continuous_synapses[name].state_dict_for_checkpoint()
+                for name in functional.continuous_synapses
+            },
+            "netstim": None,
+        }
+        schedules = {}
+        for name, binding in self.population_bindings:
+            plan = functional.populations[name]
+            population = network.populations[name]
+            values = binding.state()
+            if plan._poisson_plan is not None:
+                local = {}
+                for entry in plan._poisson_plan.entries:
+                    key = (id(entry.source), entry.dtype, entry.device)
+                    if key not in schedules:
+                        schedules[key] = normalize_schedule(
+                            entry.source,
+                            entry.source._spike_times,
+                            dtype=entry.dtype,
+                            device=entry.device,
+                        ).reshape(-1)
+                    local[entry.key] = schedules[key]
+                values["stimulation"] = {"schedules": local}
+            if plan._random_plan is not None:
+                # Match Population extraction's stimulation-before-RAND order.
+                # Provenance uses its existing frozen metadata reader without
+                # materializing inputs or detaching graph-bearing state.
+                values["random"] = plan._random_plan.extract(population)[1]
+            state["populations"][name] = functional._stimulation_plan.strip(
+                functional._rng_plan.strip_population(values)
+            )
+        if functional.netstim is not None:
+            checkpoint = network.netstim.state_dict_for_checkpoint()
+            state["netstim"] = {
+                name: checkpoint[name] for name in functional.netstim._state_schema
+            }
+        state["clock"] = {
+            "t": network.t,
+            "origin": network._clock_origin,
+            "step": network._clock_step,
+            "duration_remainder": network._duration_remainder,
+        }
+        sampling = functional._connection_sampling_plan.extract(network)
+        if sampling is not None:
+            state["connection_sampling"] = sampling
+        if functional._rng_plan.enabled:
+            state["rng"] = {
+                name: _rng_values(source, device)
+                for name, source, device in self.random_streams
+            }
+        if functional._stimulation_plan.enabled:
+            state["stimulation_rng"] = functional._stimulation_rng_plan.strip_pool(
+                {
+                    name: poisson_generator_state(source)
+                    for name, source in self.stimulation_streams
+                }
+            )
+            state = functional._connection_rng_from_stimulation(state)
+        return state
+
+    @staticmethod
+    def auxiliary(state):
+        return {
+            "populations": {
+                name: {"v": values["integrator"]["v"]}
+                for name, values in state["populations"].items()
+            }
+        }
+
+
+def _bind_native_network_callbacks(callbacks, network):
+    functional = callbacks._functional
+    if network is not functional._source:
+        raise FunctionalizationError(
+            "functional callbacks must be bound to the exact source "
+            "Network used by make_functional_network()"
+        )
+    functional._validate_source()
+    bindings = tuple(
+        (
+            name,
+            _ImperativeCallbackBinding(
+                callbacks, _native_population_readers(plan, network.populations[name])
+            ),
+        )
+        for name, plan in functional.populations.items()
+    )
+    random_streams = tuple(
+        (key, functional._rng_plan._sources[key], functional.populations[name].device)
+        for key, (name, _path, _attribute) in functional._rng_plan.streams.items()
+    )
+    stimulation = {}
+    for name, plan in functional._stimulation_plan.plans.items():
+        for entry in plan.entries:
+            stimulation.setdefault(
+                functional._stimulation_plan.local[name][entry.stream], entry.source
+            )
+    binding = _ImperativeNetworkCallbackBinding(
+        callbacks, functional, bindings, random_streams, tuple(stimulation.items())
+    )
+    functional._validate_state(binding.state())
+    return binding
 
 
 @dataclass(frozen=True)

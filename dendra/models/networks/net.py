@@ -30,6 +30,7 @@ from ..core import (
     _duration_step_budget,
     _load_compatible_state_dict_transactionally,
     _load_population_cache_transactionally,
+    _native_functional_callback_session,
     _time_grid_from_step_count,
     _validate_time_scalar,
     make_intra,
@@ -3686,7 +3687,16 @@ class Network(RNGMixin):
 
         return self
 
-    def run(self, tstop, extra=None, callbacks=None, progressbar=False):
+    def run(
+        self,
+        tstop,
+        extra=None,
+        callbacks=None,
+        progressbar=False,
+        *,
+        functional_callbacks=None,
+        functional_callback_state=None,
+    ):
         """
         Advance the network for a fixed duration.
 
@@ -3709,10 +3719,23 @@ class Network(RNGMixin):
             Callbacks invoked each step (wrapped in :class:`CallbackList`).
         progressbar : bool or tqdm.tqdm, optional
             If truthy, show a progress bar (auto-created if True). Default False.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Pure observations bound to this exact Network with
+            ``functional.make_callbacks(...)``. Qualified Recorders and
+            ``PopulationCallback`` scopes use the same functional contract.
+            Observations run after each step and clock advance, before native
+            post-step hooks.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from a previous result's ``state`` using the same callback
+            collection. Resumes sampling without another initial observation.
 
         Returns
         -------
-        None
+        None or dendra.func.FunctionalCallbackResults
+            Returns named pure observations and explicit callback carry when
+            supplied; otherwise returns ``None``. Model state remains on the
+            Network. Retained observations preserve gradients and are isolated
+            from subsequent native state mutation.
 
         Notes
         -----
@@ -3731,8 +3754,13 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before run()."
             )
         self._require_mode_runtime_ready()
+        observer = _native_functional_callback_session(
+            self, functional_callbacks, functional_callback_state
+        )
         self._validate_population_runtime_contracts()
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        if observer is not None:
+            observer.validate_dt(dt_f)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
@@ -3788,6 +3816,8 @@ class Network(RNGMixin):
                 _bind_callback_dt(c, self.dt)
             callbacks = CallbackList(callbacks)
             pre_loop_hook(callbacks, self)
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -3819,6 +3849,11 @@ class Network(RNGMixin):
                     compile_network_ops=self.compile_network_ops,
                 )
                 self._advance_runtime_clock()
+                if observer is not None:
+                    observed_state, emitted = observer.update(observed_state)
+                    observer.collect(
+                        observed_state, observed_parts, observer.stack([emitted])
+                    )
                 post_step_hook(callbacks, self)
                 local_ind += 1
 
@@ -3833,6 +3868,8 @@ class Network(RNGMixin):
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
     def longrun(
         self,
@@ -3841,6 +3878,9 @@ class Network(RNGMixin):
         extra=None,
         callbacks=None,
         progressbar=False,
+        *,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         """Advance the network in bounded-memory chunks without resetting state.
 
@@ -3868,10 +3908,19 @@ class Network(RNGMixin):
             timestep.
         progressbar : bool or tqdm.tqdm, optional
             If truthy, display progress over completed timesteps.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Pure observations bound to this exact Network, with the same
+            contract as :meth:`run`.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Explicit carry from the same callback collection. Preserves
+            sampling phase and reducer totals without a duplicate initial sample.
 
         Returns
         -------
-        None
+        None or dendra.func.FunctionalCallbackResults
+            Returns named pure observations and carry when supplied; otherwise
+            returns ``None``. Cadence and gradients continue across chunks and
+            calls without resetting the live Network state.
         """
         if self.dt is None:
             raise RuntimeError(
@@ -3884,6 +3933,9 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before longrun()."
             )
         self._require_mode_runtime_ready()
+        observer = _native_functional_callback_session(
+            self, functional_callbacks, functional_callback_state
+        )
         self._validate_population_runtime_contracts()
         if not isinstance(chunklength, int) or isinstance(chunklength, bool):
             raise ValueError("chunklength must be a positive integer.")
@@ -3891,6 +3943,8 @@ class Network(RNGMixin):
             raise ValueError("chunklength must be a positive integer.")
 
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        if observer is not None:
+            observer.validate_dt(dt_f)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
@@ -3928,6 +3982,8 @@ class Network(RNGMixin):
         with ctx:
             self._set_duration_remainder(duration_remainder)
             pre_loop_hook(callbacks, self)
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -3935,6 +3991,8 @@ class Network(RNGMixin):
 
             completed_steps = 0
             for chunk_start in range(0, n_steps, chunklength):
+                if observer is not None:
+                    observed_emissions = []
                 n_chunk = min(chunklength, n_steps - chunk_start)
                 time_chunk = initial_time + dt_f * torch.arange(
                     chunk_start,
@@ -3994,9 +4052,19 @@ class Network(RNGMixin):
                         compile_network_ops=self.compile_network_ops,
                     )
                     self._advance_runtime_clock()
+                    if observer is not None:
+                        observed_state, emitted = observer.update(observed_state)
+                        if emitted is not None:
+                            observed_emissions.append(emitted)
                     post_step_hook(callbacks, self)
                     completed_steps += 1
 
+                if observer is not None:
+                    observer.collect(
+                        observed_state,
+                        observed_parts,
+                        observer.stack(observed_emissions),
+                    )
                 post_chunk_hook(callbacks, self, time_chunk)
 
                 if progressbar:
@@ -4009,6 +4077,8 @@ class Network(RNGMixin):
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
     def batch(self, n, include_netstim=True):
         """

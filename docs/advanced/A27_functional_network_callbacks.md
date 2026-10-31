@@ -76,11 +76,78 @@ execution retains its replay-safe callback contract: hooks must be pure
 functions of model state, and scalar loss contributions from supported hooks
 are accumulated by the existing executor.
 
-The canonical wrapper can also hold a pure `FunctionalCallback` configuration
-for functional execution. Native execution requires a native `Callback` child
-and rejects a pure-only child. Functional binding accepts supported built-in
-native configurations and pure callbacks; wrapping an arbitrary native callback
-does not make its imperative hooks functionally lowerable.
+The canonical wrapper can also hold a pure `FunctionalCallback` configuration.
+Bind it through `functional.make_callbacks` for functional execution or the
+native Network pure-callback bridge described below. Hook forwarding through
+the ordinary native `callbacks=` list requires a native `Callback` child and
+rejects a pure-only child. Functional binding accepts supported built-in native
+configurations and pure callbacks; wrapping an arbitrary native callback does
+not make its imperative hooks functionally lowerable.
+
+(functional-native-network-callbacks)=
+## Use pure callbacks with native Network execution
+
+Native `Network.run` and `longrun` accept the same bound callback collection
+through `functional_callbacks=`. Build it from the exact initialized source
+Network. Its timestep comes from `network.initialize(dt)`; native Network run
+methods use that timestep without a per-call `dt` argument:
+
+```python
+functional, tensors = dn.func.make_functional_network(network)
+observations = functional.make_callbacks({
+    "trace": dn.Recorder(("left.v", "right.v", "t")),
+    "counts": dn.callbacks.PopulationCallback(
+        "right", dn.callbacks.APCount(node_check=[0, -1])
+    ),
+})
+first = network.run(10.0, functional_callbacks=observations)
+second = network.longrun(
+    10.0, chunklength=100, functional_callbacks=observations,
+    functional_callback_state=first.state,
+)
+```
+
+The Network owns its advancing model and connection state. Callback carry is
+separate: pass `results.state` to continue observation phase and reducer totals
+without repeating the shared recording boundary. Both native methods return
+the existing `FunctionalCallbackResults` mapping when opted in; their ordinary
+`None` return is unchanged when functional callbacks are omitted. Qualified
+Network Recorders and Population-scoped callbacks use the same selections,
+shapes, cadence and pure hooks as functional Network execution.
+
+Unscoped custom callbacks receive the complete Network state and auxiliary
+`{"populations": {name: {"v": ...}}}`. A scoped callback receives the selected
+Population state and auxiliary `{"v": ...}`. Pure updates observe accepted
+state after Network clock advancement and before ordinary native post-step
+hooks. Native tensor frames are snapshotted without detaching their gradients.
+Ordinary native `callbacks=` can coexist with the pure collection and keep
+their existing hook behavior.
+
+Fresh Recorder results include the current initial boundary; continued calls
+emit only new accepted samples. Zero-step calls retain the native loop-hook
+boundaries and the same fresh/resumed observation rules. Callback carry does
+not initialize or restore Network simulation state. The bridge requires a
+Network admitted by functional lowering. Native `Network.step`,
+`Network.longrun_checkpointed` and HDF5 storage through this pure bridge are
+currently unsupported. Native hook-list recording and functional host HDF5
+recording retain their existing APIs.
+
+The complete
+{download}`native_network_functional_callbacks.py <../../examples/native_network_functional_callbacks.py>`
+example connects unequal Populations and compares native `run`/`longrun`
+continuation with an independent functional Network. It checks a scoped custom
+summary, qualified and relative recording, cadence and parameter gradients:
+
+```console
+python examples/native_network_functional_callbacks.py
+```
+
+```{literalinclude} ../../examples/native_network_functional_callbacks.py
+:language: python
+:start-after: "# region callbacks"
+:end-before: "# endregion callbacks"
+:dedent: 4
+```
 
 The complete
 {download}`functional_network_callbacks.py <../../examples/functional_network_callbacks.py>`

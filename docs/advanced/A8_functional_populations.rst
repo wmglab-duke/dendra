@@ -2670,8 +2670,11 @@ recordings or native loss hooks retain the existing model-restoration behavior.
 
 The auxiliary mapping contains ``{"v": ...}``. A callback requiring other
 auxiliary keys belongs with the corresponding user-authored ``dn.func`` step.
-The pure bridge is currently unsupported on native ``Network`` methods and
-``Population.step``. HDF5 storage through ``functional_callbacks`` is also
+Native ``Network.run`` and ``longrun`` support bound Network collections
+through the same keyword arguments; see :ref:`functional-native-network-callbacks`
+for qualified recording and Population scopes. Pure-callback execution on
+``Population.step``, ``Network.step`` and ``Network.longrun_checkpointed`` is
+currently unsupported. HDF5 storage through ``functional_callbacks`` is also
 unsupported; use an ordinary native Recorder in ``callbacks`` for native HDF5
 recording, or functional host execution through ``dn.func.run``.
 

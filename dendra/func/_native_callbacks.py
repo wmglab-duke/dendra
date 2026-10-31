@@ -1,4 +1,4 @@
-"""Host lifecycle for pure callbacks observing a mutable native Population."""
+"""Host lifecycle for pure callbacks observing a mutable native model."""
 
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ class _NativeCallbackSession:
         return self.callbacks._update(
             callback_state,
             model_state,
-            {"v": model_state["integrator"]["v"]},
+            self.binding.auxiliary(model_state),
         )
 
     def stack(self, emissions):

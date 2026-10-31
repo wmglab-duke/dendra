@@ -1700,6 +1700,29 @@ class _ImperativeCallbackBinding:
             _put_path(state, public_path, value)
         return state
 
+    @staticmethod
+    def auxiliary(state):
+        return {"v": state["integrator"]["v"]}
+
+
+def _native_population_readers(functional, population):
+    readers = []
+    for leaf in functional._state_layout:
+        owner = (
+            population
+            if not leaf.module_path
+            else population.get_submodule(leaf.module_path)
+        )
+        if leaf.buffer_name not in owner._buffers and not hasattr(
+            owner, leaf.buffer_name
+        ):
+            raise FunctionalizationError(
+                "functional callback state binding lost runtime tensor "
+                f"{leaf.module_path}.{leaf.buffer_name}"
+            )
+        readers.append((leaf.public_path, owner, leaf.buffer_name))
+    return tuple(readers)
+
 
 class FunctionalCallbacks:
     """An immutable named collection of native functional callbacks.
@@ -1896,29 +1919,21 @@ class FunctionalCallbacks:
             raise FunctionalizationError(
                 "use native callbacks=[recorder] or dn.func.run for HDF5 recording"
             )
+        from ._network import FunctionalNetwork
+
+        if isinstance(self._functional, FunctionalNetwork):
+            from ._network_callbacks import _bind_native_network_callbacks
+
+            return _bind_native_network_callbacks(self, population)
         if population is not self._functional._population:
             raise FunctionalizationError(
                 "functional callbacks must be bound to the exact source "
                 "Population used by make_functional()"
             )
         self._functional._validate_source()
-        readers = []
-        for leaf in self._functional._state_layout:
-            owner = (
-                population
-                if not leaf.module_path
-                else population.get_submodule(leaf.module_path)
-            )
-            if leaf.buffer_name not in owner._buffers and not hasattr(
-                owner,
-                leaf.buffer_name,
-            ):
-                raise FunctionalizationError(
-                    "functional callback state binding lost runtime tensor "
-                    f"{leaf.module_path}.{leaf.buffer_name}"
-                )
-            readers.append((leaf.public_path, owner, leaf.buffer_name))
-        return _ImperativeCallbackBinding(self, tuple(readers))
+        return _ImperativeCallbackBinding(
+            self, _native_population_readers(self._functional, population)
+        )
 
     def _initialize(self, state):
         carries = {}
