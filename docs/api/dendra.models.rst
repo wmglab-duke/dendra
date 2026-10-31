@@ -394,6 +394,22 @@ for the full contract and runnable custom reducer/emitter example.
 .. autoclass:: dendra.func.FunctionalCallbacks
    :members: export_state, restore_state
 
+Native ``Population.run``, ``longrun`` and ``longrun_checkpointed`` accept a
+bound collection through ``functional_callbacks=`` and explicit continuation
+through ``functional_callback_state=results.state``. The collection must bind
+the exact source Population and matching timestep. Native model state remains
+on the Population. Opted-in ``run`` and ``longrun`` return the existing
+``FunctionalCallbackResults`` mapping; their normal ``None`` return is
+unchanged otherwise. Checkpointed execution retains its loss/result tuples.
+Ordinary ``callbacks=`` can coexist independently. The bridge supplies a
+gradient-preserving state snapshot and auxiliary ``{"v": ...}``, with pure
+updates after clock advancement and before native post-step hooks. Native
+Network execution, ``Population.step`` and functional-bridge HDF5 storage are
+currently unsupported. See :ref:`functional-native-population-callbacks` and
+the complete
+:download:`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
+example.
+
 Intrinsic activity
 ------------------
 

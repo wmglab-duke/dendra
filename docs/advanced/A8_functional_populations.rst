@@ -2613,36 +2613,86 @@ See ``examples/functional_threshold_callbacks.py`` for the convenience runner,
 and :ref:`functional-shared-threshold-configuration` for a complete shared
 configuration example with scan, while, gradients and portable continuation.
 
-The same callback plan can observe its source model through the ordinary
-``Population.longrun_checkpointed`` API. This is useful when an existing
-imperative simulation needs differentiable recordings or explicit reducer
-carry without being rewritten as a functional runner:
+.. _functional-native-population-callbacks:
+
+Pure callbacks with native Population execution
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The same callback plan can observe its source model through native
+``Population.run``, ``longrun`` and ``longrun_checkpointed``. Define an analysis
+once with ``FunctionalCallback.initialize``, ``update`` and ``finalize``, then
+use it with either native or functional dynamics. Native execution keeps model
+state on the Population and returns callback results with explicit carry:
 
 .. code-block:: python
 
-   loss, callback_results = model.longrun_checkpointed(
-       tstop=5.0,
-       chunklength=100,
-       dt=0.01,
-       functional_callbacks=callbacks,
+   fmodel, tensors = dn.func.make_functional(model, dt=0.01)
+   callbacks = fmodel.make_callbacks({"trace": dn.Recorder(("v", "t"))})
+   first = model.run(tstop=2.0, dt=0.01, functional_callbacks=callbacks)
+   second = model.longrun(
+       tstop=3.0, chunklength=100, dt=0.01,
+       functional_callbacks=callbacks, functional_callback_state=first.state,
    )
-   voltage = callback_results["trace"]["v"]
+   voltage = torch.cat((first["trace"]["v"], second["trace"]["v"]))
 
-The plan must come from the ``fmodel`` made from that exact ``model``; the
-bridge therefore applies only to Populations already admitted by
-``make_functional``.
-Ordinary ``callbacks=...`` may be supplied at the same time and retain their
-existing hook and scalar-loss behavior. With ``functional_callbacks``, the
-native result is appended to the usual return value: ``(loss, results)``, or
-``(loss, final_state, results)`` when ``return_final_state=True``. Continue a
-segmented imperative run with
-``functional_callback_state=callback_results.state``. Checkpoint replay
-threads the pure carry explicitly, and gradients through either an ordinary
-callback loss or a functional callback result preserve the live model across
-ordinary, ``autograd.grad``, and higher-order checkpoint replay.
-The bridge supplies the standard Population step auxiliary mapping (currently
-``{"v": ...}``); a callback that requires custom auxiliary keys belongs with
-the corresponding user-authored ``dn.func`` step.
+The plan must come from ``make_functional`` applied to that exact Population,
+and its timestep must match the native call. This bridge therefore applies to
+Populations admitted by functional lowering. Bind the collection once outside
+repeated execution. Supplying callback carry resumes its observation phase;
+the Population itself retains the simulation state. Callback carry does not
+restore or initialize the model.
+
+``run`` and ``longrun`` return the existing ``FunctionalCallbackResults``
+mapping when ``functional_callbacks`` is supplied. Access named observations
+with ``results[name]`` and continue with
+``functional_callback_state=results.state``. Without functional callbacks,
+their ordinary ``None`` return is unchanged. ``longrun_checkpointed`` retains
+its loss return contract: ``(loss_or_none, results)``, or
+``(loss_or_none, final_state, results)`` with ``return_final_state=True``.
+
+Ordinary native ``callbacks=...`` can run alongside the pure collection and
+retain their hook timing and loss behavior. Pure callbacks observe accepted
+post-step state after the clock advances and before native post-step hooks.
+Each observation receives a gradient-preserving snapshot of the native tensor
+frame, preserving aliases within that frame. Carry can retain a sampled value
+without that value changing when native buffers advance. Callback methods must
+still treat state, carry and emissions as read-only inputs.
+
+Fresh Recorder results include their initial boundary. Continued calls emit
+only new samples, preserving ``Recorder(dt=...)`` phase and reducer totals.
+Each method retains its native setup order. A zero-step ``run`` performs
+integrator and loop setup; zero-step ``longrun`` and checkpointed calls return
+without that setup. Callbacks observing initialization-sensitive fields follow
+those method-specific boundaries.
+Checkpointed execution threads callback carry explicitly through replay;
+recording collection occurs outside replay. Gradients through functional
+recordings or native loss hooks retain the existing model-restoration behavior.
+
+The auxiliary mapping contains ``{"v": ...}``. A callback requiring other
+auxiliary keys belongs with the corresponding user-authored ``dn.func`` step.
+The pure bridge is currently unsupported on native ``Network`` methods and
+``Population.step``. HDF5 storage through ``functional_callbacks`` is also
+unsupported; use an ordinary native Recorder in ``callbacks`` for native HDF5
+recording, or functional host execution through ``dn.func.run``.
+
+The complete
+:download:`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
+example continues a custom pure summary and Recorders across all three native
+methods. It compares functional trajectories, cadence and gradients, and checks
+that checkpoint replay preserves the live model:
+
+.. code-block:: console
+
+   python examples/native_functional_callbacks.py
+
+.. literalinclude:: ../../examples/native_functional_callbacks.py
+   :language: python
+   :start-after: # region checkpoint
+   :end-before: # endregion checkpoint
+   :dedent: 8
+
+Custom pure callbacks
+^^^^^^^^^^^^^^^^^^^^^
 
 ``auxiliary["callbacks"].state`` is explicit callback carry. Pass it back as
 ``callback_state=...`` when continuing: Dendra skips callback initialization,

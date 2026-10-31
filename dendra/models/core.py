@@ -67,6 +67,7 @@ from dendra.models.callbacks import (
     _append_tensor_indexed,
     _append_tensor_max,
     _bind_callback_dt,
+    _recorder_should_save,
 )
 from dendra.models.graph import get_area_from_graph
 from dendra.models.initialization import (
@@ -180,6 +181,7 @@ _STANDARD_CALLBACK_POST_STEP = Callback.post_step_hook
 _STANDARD_CALLBACK_LIST_PRE_STEP = CallbackList.pre_step_hook
 _STANDARD_CALLBACK_LIST_POST_STEP = CallbackList.post_step_hook
 _STANDARD_RECORDER_POST_STEP = Recorder.post_step_hook
+_STANDARD_RECORDER_SHOULD_SAVE = _recorder_should_save
 _STANDARD_RECORDER_APPEND_HELPERS = {
     "_append_tensor": _append_tensor,
     "_append_tensor_indexed": _append_tensor_indexed,
@@ -774,6 +776,12 @@ def _intra_fusion_recorder_buffers_safe(callback, model, generated):
     digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
     if generated.__code__.co_filename != f"<dendra.callbacks.recorder_func:{digest}>":
         return False
+    generated_globals = generated.__globals__
+    if type(generated_globals) is not dict or (
+        generated_globals.get("_recorder_should_save")
+        is not _STANDARD_RECORDER_SHOULD_SAVE
+    ):
+        return False
     try:
         tree = ast.parse(source)
         function = tree.body[0]
@@ -783,7 +791,7 @@ def _intra_fusion_recorder_buffers_safe(callback, model, generated):
         expected = [
             "def recorder(self, model):",
             "  if self.save_every is not None:",
-            "    save = self.i % self.save_every == 0",
+            "    save = _recorder_should_save(self.i, self.save_every)",
             "  else:",
             "    save = True",
             "  if save:",
@@ -825,7 +833,7 @@ def _intra_fusion_recorder_buffers_safe(callback, model, generated):
             call = expression.value
             helper_name = call.func.id
             helper = _STANDARD_RECORDER_APPEND_HELPERS.get(helper_name)
-            if helper is None or generated.__globals__.get(helper_name) is not helper:
+            if helper is None or generated_globals.get(helper_name) is not helper:
                 return False
             key = call.args[1].slice.value
             if type(key) is not str:
@@ -3922,9 +3930,12 @@ class Population(P, Sliceable):
         dt: Optional[float] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar: bool = False,
+        *,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         """
-        Run the axon model simulation.
+        Run the Population simulation.
 
         Parameters
         ----------
@@ -3987,6 +3998,23 @@ class Population(P, Sliceable):
         progressbar : bool or tqdm, optional
             If ``True``, displays a progress bar during simulation. Can also be
             a :class:`tqdm.tqdm` instance for custom progress tracking.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Pure observations bound to this exact Population with
+            ``functional.make_callbacks(...)``. They run alongside native
+            ``callbacks`` after each accepted step and clock advance, before
+            native post-step hooks.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from a previous result's ``state``. Requires the same
+            ``functional_callbacks`` collection and resumes its sampling phase
+            without another initial observation.
+
+        Returns
+        -------
+        None or dendra.func.FunctionalCallbackResults
+            With pure observations, returns their named results and explicit
+            callback carry. Otherwise returns ``None``. Model state remains
+            on the Population. Retained observations preserve gradients and
+            are isolated from subsequent native state mutation.
 
         Notes
         -----
@@ -4007,6 +4035,9 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        observer = _native_functional_callback_session(
+            self, functional_callbacks, functional_callback_state
+        )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -4015,6 +4046,8 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
+        if observer is not None:
+            observer.validate_dt(dt_f)
         if ve is not None and extra is not None:
             raise ValueError("Provide either 've' or 'extra', not both.")
         tstop_f = None
@@ -4102,6 +4135,8 @@ class Population(P, Sliceable):
                 force=self.force_integrator_reinit(),
                 compile_scope="population",
             )
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
 
             # Progress bar setup
             if progressbar:
@@ -4213,6 +4248,11 @@ class Population(P, Sliceable):
                     self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
                     self.t = self.t + dt_tensor
 
+                    if observer is not None:
+                        observed_state, emitted = observer.update(observed_state)
+                        observer.collect(
+                            observed_state, observed_parts, observer.stack([emitted])
+                        )
                     psh(callbacks, self)
                     local_ind += 1
 
@@ -4228,6 +4268,8 @@ class Population(P, Sliceable):
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
     def longrun(
         self,
@@ -4237,6 +4279,9 @@ class Population(P, Sliceable):
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar=False,
+        *,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         r"""
         Run a long simulation by dividing it into multiple smaller chunks.
@@ -4295,11 +4340,23 @@ class Population(P, Sliceable):
         progressbar : bool or tqdm, optional
             If ``True`` (or if a :class:`tqdm.tqdm` instance is provided), displays
             a progress bar to track simulation progress across chunks. Default is ``False``.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Pure observations bound to this exact Population, with the same
+            contract as :meth:`run` and :meth:`longrun_checkpointed`.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Explicit callback carry from the same bound collection. Resumes
+            observation without a duplicate initial sample.
+
+        Returns
+        -------
+        None or dendra.func.FunctionalCallbackResults
+            Pure observations return their named results and carry when
+            supplied. Existing calls without them return ``None``. Cadence
+            and gradients are preserved across chunks and continued calls.
 
         Notes
         -----
-        * Multi-contact handling is inferred from the number of ``extra`` entries;
-          the ``multicontact`` flag is no longer required.
+        * Multi-contact handling follows the number of ``extra`` entries.
         * When ``extra`` is provided, the method uses it to assemble the
           extracellular voltage ``ve`` via :func:`op_sc` (single contact) or
           :func:`op_mc` (multi-contact).
@@ -4309,6 +4366,9 @@ class Population(P, Sliceable):
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        observer = _native_functional_callback_session(
+            self, functional_callbacks, functional_callback_state
+        )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -4319,6 +4379,8 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
+        if observer is not None:
+            observer.validate_dt(dt_f)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
@@ -4346,6 +4408,9 @@ class Population(P, Sliceable):
 
                 if t.numel() == 0:
                     self._set_duration_remainder(duration_remainder)
+                    if observer is not None:
+                        observed_state, observed_parts = observer.start()
+                        return observer.finish(observed_state, observed_parts)
                     return
 
                 n_chunks = math.ceil(len(t) / chunklength)
@@ -4382,11 +4447,15 @@ class Population(P, Sliceable):
 
                 self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
+                if observer is not None:
+                    observed_state, observed_parts = observer.start()
 
                 # --------------------------------------------------------------
                 # Main chunk loop
                 # --------------------------------------------------------------
                 for i, t_chunk in enumerate(t_chunks):
+                    if observer is not None:
+                        observed_emissions = []
                     indexed_tapes = None
                     if with_intra:
                         tapes, indices = intra.init(t_chunk)
@@ -4481,8 +4550,20 @@ class Population(P, Sliceable):
                                 intra_c = _NoiseFreeStep(intra_c)
                             self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
                             self.t = self.t + dt_tensor
+                            if observer is not None:
+                                observed_state, emitted = observer.update(
+                                    observed_state
+                                )
+                                if emitted is not None:
+                                    observed_emissions.append(emitted)
                             psh(callbacks, self)
 
+                    if observer is not None:
+                        observer.collect(
+                            observed_state,
+                            observed_parts,
+                            observer.stack(observed_emissions),
+                        )
                     post_chunk_hook(callbacks, self, t_chunk)
 
                     if progressbar:
@@ -4493,6 +4574,8 @@ class Population(P, Sliceable):
 
                 if progressbar:
                     progressbar.close()
+                if observer is not None:
+                    return observer.finish(observed_state, observed_parts)
 
     def steady_state(self, dt=0.2, tstop=200.0, with_ve=True, with_intra=True):
         """
@@ -7218,27 +7301,9 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
-        if functional_callbacks is None:
-            if functional_callback_state is not None:
-                raise ValueError(
-                    "functional_callback_state requires functional_callbacks"
-                )
-            functional_callback_binding = None
-        else:
-            from dendra.func._callbacks import (
-                FunctionalCallbacks,
-                _collect_callback_emissions,
-                _complete_callback_results,
-                _host_callback_parts,
-                _setup_callback_state,
-            )
-
-            if not isinstance(functional_callbacks, FunctionalCallbacks):
-                raise TypeError(
-                    "functional_callbacks must be a FunctionalCallbacks plan "
-                    "created by functional.make_callbacks(...)"
-                )
-            functional_callback_binding = functional_callbacks._bind_imperative(self)
+        observer = _native_functional_callback_session(
+            self, functional_callbacks, functional_callback_state
+        )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -7249,8 +7314,8 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
-        if functional_callback_binding is not None:
-            functional_callbacks._validate_runtime_dt(dt_f)
+        if observer is not None:
+            observer.validate_dt(dt_f)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         self._refresh_compile_config_from_ctx()
@@ -7335,28 +7400,6 @@ class Population(P, Sliceable):
         def _checkpoint_contexts():
             return nullcontext(), _PreserveModelStateDuringRecompute()
 
-        def _prepare_functional_callback_state():
-            """Establish explicit native carry and the optional initial sample."""
-
-            if functional_callback_binding is None:
-                return None, []
-            model_state = (
-                functional_callback_binding.state()
-                if functional_callback_state is None
-                else None
-            )
-            native_state, parts = _setup_callback_state(
-                functional_callbacks, functional_callback_state, model_state
-            )
-            return native_state, _host_callback_parts(
-                functional_callbacks, native_state, parts
-            )
-
-        def _finalize_functional_callback_results(native_state, parts):
-            """Finalize one imperative execution segment without hiding carry."""
-
-            return _complete_callback_results(functional_callbacks, native_state, parts)
-
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
@@ -7368,12 +7411,12 @@ class Population(P, Sliceable):
 
                 if t.numel() == 0:
                     self._set_duration_remainder(duration_remainder)
-                    if functional_callback_binding is None:
+                    if observer is None:
                         if return_final_state:
                             return None, self.state_dict_for_checkpoint()
                         return None
-                    native_state, callback_parts = _prepare_functional_callback_state()
-                    functional_results = _finalize_functional_callback_results(
+                    native_state, callback_parts = observer.start()
+                    functional_results = observer.finish(
                         native_state,
                         callback_parts,
                     )
@@ -7405,7 +7448,8 @@ class Population(P, Sliceable):
                     compile_scope="population",
                 )
 
-                native_state, callback_parts = _prepare_functional_callback_state()
+                if observer is not None:
+                    native_state, callback_parts = observer.start()
 
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
@@ -7520,7 +7564,7 @@ class Population(P, Sliceable):
 
                         return state_out, chunk_loss, saw_loss_flag
 
-                    if functional_callback_binding is None:
+                    if observer is None:
                         state, chunk_loss, saw_loss_flag = _checkpoint(
                             _run_chunk,
                             state,
@@ -7588,13 +7632,8 @@ class Population(P, Sliceable):
                                 )
                                 self.t = self.t + dt_tensor
 
-                                model_state = functional_callback_binding.state()
-                                native_state_local, emitted = (
-                                    functional_callbacks._update(
-                                        native_state_local,
-                                        model_state,
-                                        {"v": model_state["integrator"]["v"]},
-                                    )
+                                native_state_local, emitted = observer.update(
+                                    native_state_local
                                 )
                                 if emitted is not None:
                                     emissions.append(emitted)
@@ -7622,7 +7661,7 @@ class Population(P, Sliceable):
                                     saw_loss_local = saw_loss_local or saw
 
                             state_out = self.state_dict_for_checkpoint()
-                            emitted_part = functional_callbacks._stack(emissions)
+                            emitted_part = observer.stack(emissions)
 
                             if chunk_loss is None:
                                 chunk_loss = torch.zeros(
@@ -7657,8 +7696,7 @@ class Population(P, Sliceable):
                             native_state,
                             **checkpoint_options,
                         )
-                        _collect_callback_emissions(
-                            functional_callbacks,
+                        observer.collect(
                             native_state,
                             callback_parts,
                             emitted_part,
@@ -7685,15 +7723,15 @@ class Population(P, Sliceable):
                     progressbar.close()
 
                 functional_results = None
-                if functional_callback_binding is not None:
-                    functional_results = _finalize_functional_callback_results(
+                if observer is not None:
+                    functional_results = observer.finish(
                         native_state,
                         callback_parts,
                     )
 
         if not saw_any_loss:
             total_loss = None
-            if functional_callback_binding is None:
+            if observer is None:
                 if return_final_state:
                     return None, self.state_dict_for_checkpoint()
                 return None
@@ -7702,7 +7740,7 @@ class Population(P, Sliceable):
         if return_final_state:
             final_state = self.state_dict_for_checkpoint()
 
-        if functional_callback_binding is not None:
+        if observer is not None:
             if return_final_state:
                 return total_loss, final_state, functional_results
             return total_loss, functional_results
@@ -10393,6 +10431,15 @@ class Myelinated(Axon):
 
 
 # callback helpers
+def _native_functional_callback_session(model, callbacks, callback_state):
+    """Bind optional pure observations without importing on the ordinary path."""
+    if callbacks is None and callback_state is None:
+        return None
+    from dendra.func._native_callbacks import _bind_native_callbacks
+
+    return _bind_native_callbacks(model, callbacks, callback_state)
+
+
 def pre_loop_hook(c, m):
     """
     Invoke the registered pre-loop hook on a callback list.

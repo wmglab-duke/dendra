@@ -245,6 +245,49 @@ restoration uses detached field carry. See the
 {ref}`complete LFP example <functional-shared-lfp-configuration>` for both
 Population and Network execution.
 
+(functional-native-callback-execution)=
+### Use pure callbacks with native Population execution
+
+A bound pure callback collection also works with native `Population.run`,
+`longrun` and `longrun_checkpointed`. Build the collection from
+`make_functional` for the exact source Population and the same timestep:
+
+```python
+functional, tensors = dn.func.make_functional(model, dt=DT)
+observations = functional.make_callbacks({"trace": dn.Recorder(("v", "t"))})
+first = model.run(tstop=10.0, dt=DT, functional_callbacks=observations)
+second = model.longrun(
+    tstop=10.0, chunklength=100, dt=DT,
+    functional_callbacks=observations,
+    functional_callback_state=first.state,
+)
+```
+
+The Population owns its advancing model state; callback carry is separate.
+`run` and `longrun` return `FunctionalCallbackResults` when this option is
+supplied, with named results and a `.state` carry. Their normal `None` return
+is unchanged when it is omitted. Checkpointed execution keeps its existing
+`(loss_or_none, results)` or `(loss_or_none, final_state, results)` form.
+Native `callbacks=` can coexist independently. Pure updates observe accepted
+state after clock advancement and before native post-step hooks, with a
+gradient-preserving tensor-frame snapshot. Continued Recorder segments omit
+the shared boundary and preserve cadence; reducer results stay cumulative.
+
+One `FunctionalCallback` definition supplies the same pure analysis for native
+and functional Population dynamics. The native auxiliary packet contains
+`{"v": ...}`. Native `Network` methods, `Population.step` and HDF5 storage
+through this pure bridge are currently unsupported. Ordinary native Recorder
+HDF5 recording remains available through `callbacks=`. See
+{ref}`functional-native-population-callbacks` for the complete contract and
+{download}`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
+for a runnable custom reducer, cadence, native loss, gradients and replay:
+
+```console
+python examples/native_functional_callbacks.py
+```
+
+### Continue functional execution
+
 `auxiliary["continuation"]` carries
 the returned simulation state, effective bindings and callback state together.
 Pass it to the next call to continue without recording the shared boundary twice:
