@@ -12179,11 +12179,15 @@ class FunctionalPopulation:
         canonical_by_identity = {
             id(parameter): name for name, parameter in parent_parameters.items()
         }
+        # A packed integrator can share a raw leaf with a retained component.
+        # Its first registered name then belongs to that component; select the
+        # live integrator's leaves by identity while retaining public names.
         canonical_parameter_names = {
-            name
-            for name in parent_parameters
-            if name == "celsius_param" or name.startswith("integrator.")
+            canonical_by_identity[id(parameter)]
+            for parameter in population.integrator.parameters()
         }
+        if "celsius_param" in parent_parameters:
+            canonical_parameter_names.add("celsius_param")
         # A packed initial source may alias a built child's trained Ion or
         # Material leaf. Its first public registration then belongs to that
         # child, but its packed-parent alias remains an initialization input.

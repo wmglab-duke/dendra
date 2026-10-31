@@ -216,7 +216,7 @@ Scopes select exact top-level Population names and cannot be nested. A scoped
 Recorder uses local paths such as `"v"` or `"hh.m"`; named Slice regions also
 select components within a concatenated MultiPopulation. Native results belong
 to the inner callback; functional results and continuation use independent
-explicit carry. Pure callback children bind through `functional.make_callbacks`
+explicit carry. Pure callback children bind through `dn.func.make_callbacks`
 and can also observe native Network `step`, `run`, `longrun` and `longrun_checkpointed`
 through that collection.
 They do not run through the ordinary imperative `callbacks=` hook list.
@@ -254,18 +254,44 @@ Population and Network execution.
 ### Use pure callbacks with native execution
 
 A bound pure callback collection also works with native `Population.step`, `run`,
-`longrun` and `longrun_checkpointed`. Build the collection from
-`make_functional` for the exact source Population and the same timestep:
+`longrun` and `longrun_checkpointed`. Prepare the collection directly from the
+exact initialized source Population and the same timestep:
 
 ```python
-functional, tensors = dn.func.make_functional(model, dt=DT)
-observations = functional.make_callbacks({"trace": dn.Recorder(("v", "t"))})
+observations = dn.func.make_callbacks(
+    model, {"trace": dn.Recorder(("v", "t"))}, dt=DT,
+)
 first = model.run(tstop=10.0, dt=DT, functional_callbacks=observations)
 second = model.longrun(
     tstop=10.0, chunklength=100, dt=DT,
     functional_callbacks=observations,
     functional_callback_state=first.state,
 )
+```
+
+The factory also accepts an existing `FunctionalPopulation` or
+`FunctionalNetwork`, reusing that exact plan:
+
+```python
+observations = dn.func.make_callbacks(functional, configurations)
+```
+
+Native Populations require `dt`; Networks and existing plans supply theirs,
+and an optional `dt` must match it. Existing `functional.make_callbacks(...)`
+methods remain available. Native-model preparation retains full functional
+lowering's setup cost and eligibility requirements. It does not initialize,
+advance, sample or move the model. Bind once outside repeated execution; each
+new collection has its own live carry identity. Portable callback export/restore
+transfers detached carry between equivalent collections.
+
+For existing bindings or runners, select `bound.functional` or
+`program.functional` explicitly. Runners retain their constructor-configured
+callbacks; preparing another collection does not replace them. Continuations
+and tensor bundles contain no owning plan and are not preparation targets.
+See {ref}`functional-shared-callback-preparation` and the complete example:
+
+```console
+python examples/shared_callback_preparation.py
 ```
 
 The Population owns its advancing model state; callback carry is separate.
@@ -296,8 +322,8 @@ python examples/native_functional_callbacks.py
 
 Native `Network.step`, `run`, `longrun` and `longrun_checkpointed` accept the same
 two keyword arguments. Create the bound collection with
-`dn.func.make_functional_network(network)` from the exact initialized source
-Network. Qualified Recorders select fields
+`dn.func.make_callbacks(network, configurations)` from the exact initialized
+source Network. Qualified Recorders select fields
 such as `"left.v"`; `dn.callbacks.PopulationCallback("right", callback)`
 selects one Population for a relative Recorder or custom pure analysis. The
 Network retains its simulation state while `results.state` continues callback
@@ -720,6 +746,8 @@ execution.
 An eager binding executes one step; a compiled binding executes its fixed
 width. Direct calls accept the same `callbacks=` and `callback_state=` contract
 as rollouts. Bind callback configurations once with `functional.make_callbacks`.
+The shared `dn.func.make_callbacks(functional, configurations)` factory accepts
+the same plan and returns the same collection type.
 Keep that collection when resuming its returned carry: carry is associated
 with its callback plan.
 

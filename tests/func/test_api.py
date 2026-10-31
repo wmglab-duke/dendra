@@ -192,6 +192,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "initialize",
         "longrun",
         "longrun_checkpointed",
+        "make_callbacks",
         "make_functional",
         "make_functional_continuous_con",
         "make_functional_netcon",

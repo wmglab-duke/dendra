@@ -252,7 +252,8 @@ or prepare the model. Bindings do not own simulation state. Population's explici
 ``bind(parameters, prepared)`` form remains available for graph-local control.
 Direct bindings and compiled chunks accept ``callbacks=`` and
 ``callback_state=`` and return ``(state, auxiliary)``. Bind a collection once
-with ``functional.make_callbacks``; its results and continuation carry appear
+with ``dn.func.make_callbacks(functional, configurations)`` or the compatible
+``functional.make_callbacks`` method; its results and continuation carry appear
 under ``auxiliary["callbacks"]``.
 For raw-bound host scheduling, ``run(bound, packet, ...)`` carries state and
 callback memory together and returns the next ``auxiliary["continuation"]``.
@@ -280,6 +281,26 @@ preparation lifetime contracts.
 
 Functional callback checkpoints
 -------------------------------
+
+.. autofunction:: dendra.func.make_callbacks
+
+``dn.func.make_callbacks(target, configurations, dt=...)`` prepares a named
+collection from an initialized native Population/Network or an existing
+``FunctionalPopulation``/``FunctionalNetwork``. Native Populations require
+``dt``; initialized Networks and existing plans supply their timestep, and an
+optional ``dt`` must match it. Existing plan methods remain supported.
+Native preparation retains full functional lowering's eligibility and setup
+cost; it does not initialize, advance, sample or move the model. Existing-plan
+preparation reuses that exact plan without lowering again.
+
+Keep the returned collection across repeated calls: every new collection has
+its own live carry identity. Portable export/restore transfers detached carry
+into equivalent newly prepared collections. The factory does not accept
+runners, bindings, tensor bundles or continuations. Select ``program.functional``
+or ``bound.functional`` explicitly when preparing for an existing plan; runner
+callbacks remain constructor-owned. See
+:ref:`functional-shared-callback-preparation` and
+:download:`shared_callback_preparation.py <../../examples/shared_callback_preparation.py>`.
 
 ``runner.callbacks`` exposes the bound collection, or ``None`` when callbacks
 are omitted. Its ``export_state`` and ``restore_state`` methods provide checked
@@ -316,9 +337,10 @@ Population in ``Network.step``, ``run``, ``longrun`` and
 ``longrun_checkpointed``. Native results belong to the supplied inner callback.
 Functional binding captures supported observation configuration into independent
 pure carry, without importing or changing native history. Native execution
-requires a native ``Callback`` child; pure ``FunctionalCallback`` children
-require functional execution. Arbitrary imperative callbacks are not lowered
-by adding a scope.
+through the ordinary ``callbacks=`` hook list requires a native ``Callback``
+child. Pure ``FunctionalCallback`` children use the prepared collection in
+functional execution or the native pure-callback bridge. Arbitrary imperative
+callbacks are not lowered by adding a scope.
 
 Scope names are exact top-level Population keys. Scopes cannot be nested,
 including across the two entry points. Recorder selections inside a scope are
@@ -399,7 +421,8 @@ for the full contract and runnable custom reducer/emitter example.
 Native ``Population.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
 a bound collection through ``functional_callbacks=`` and explicit continuation
 through ``functional_callback_state=results.state``. The collection must bind
-the exact source Population and matching timestep. Native model state remains
+the exact source Population and matching timestep; prepare it directly with
+``dn.func.make_callbacks(model, configurations, dt=...)``. Native model state remains
 on the Population. Opted-in ``step``, ``run`` and ``longrun`` return the existing
 ``FunctionalCallbackResults`` mapping. Without a pure collection, ``step``
 returns the model for chaining and ``run``/``longrun`` return ``None``.
@@ -415,9 +438,10 @@ the complete
 example.
 
 Native ``Network.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
-the same ``functional_callbacks`` and ``functional_callback_state`` keywords. Bind the
-collection through ``make_functional_network`` for the exact initialized source
-Network; its initialized timestep remains authoritative. Qualified Network
+the same ``functional_callbacks`` and ``functional_callback_state`` keywords.
+Prepare the collection with ``dn.func.make_callbacks(network, configurations)``
+for the exact initialized source Network; its initialized timestep remains
+authoritative. Qualified Network
 Recorders and Population-scoped pure callbacks keep their functional selections,
 cadence and outputs. Unscoped auxiliary data is
 ``{"populations": {name: {"v": ...}}}``; scoped callbacks receive ``{"v": ...}``.

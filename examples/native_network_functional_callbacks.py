@@ -92,16 +92,17 @@ def make_network():
     return network
 
 
-def make_callbacks(functional):
+def make_callbacks(target):
     # region callbacks
     scope = dn.callbacks.PopulationCallback
-    return functional.make_callbacks(
+    return dn.func.make_callbacks(
+        target,
         {
             "trace": dn.Recorder(("left.v", "right.v", "t")),
             "coarse": dn.Recorder(("left.v", "right.v", "t"), dt=2 * DT),
             "right_trace": scope("right", dn.Recorder(("v", "t"), dt=2 * DT)),
             "summary": scope("right", VoltageSummary()),
-        }
+        },
     )
     # endregion callbacks
 
@@ -111,8 +112,7 @@ def main():
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, DTYPE=torch.float64, DEVICE="cpu", IMEM=False):
         network = make_network()
         # region continuation
-        functional, _ = dn.func.make_functional_network(network)
-        callbacks = make_callbacks(functional)
+        callbacks = make_callbacks(network)
         first = network.run(FIRST * DT, functional_callbacks=callbacks)
         # region checkpoint
         hook_loss, boundary_state, middle = network.longrun_checkpointed(

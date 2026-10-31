@@ -2272,7 +2272,8 @@ a stable result name and bind the collection once, outside repeated simulations:
 
 .. code-block:: python
 
-   callbacks = fmodel.make_callbacks(
+   callbacks = dn.func.make_callbacks(
+       fmodel,
        {
            "trace": dn.Recorder(["v"]),
            "anomalies": dn.callbacks.AnomalyDetector(),
@@ -2293,6 +2294,58 @@ a stable result name and bind the collection once, outside repeated simulations:
    raster = auxiliary["callbacks"]["raster"]
    spike_count = auxiliary["callbacks"]["spike_count"]
    active = auxiliary["callbacks"]["active"]
+
+.. _functional-shared-callback-preparation:
+
+Prepare callbacks from models and plans
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``dn.func.make_callbacks(target, configurations, dt=...)`` prepares the same
+``FunctionalCallbacks`` collection from an initialized native model or an
+existing functional Population/Network plan. Native Populations require an
+explicit ``dt``. An initialized Network supplies its timestep; existing plans
+retain theirs. For a Network or existing plan, an optional ``dt`` must match
+that timestep. ``functional.make_callbacks(configurations)`` remains supported.
+
+For native observation, prepare directly from the model:
+
+.. code-block:: python
+
+   observations = dn.func.make_callbacks(
+       model, {"trace": dn.Recorder(("v", "t"))}, dt=0.025,
+   )
+   first = model.run(tstop=5.0, dt=0.025, functional_callbacks=observations)
+   second = model.run(
+       tstop=5.0, dt=0.025, functional_callbacks=observations,
+       functional_callback_state=first.state,
+   )
+
+Native-model preparation uses full functional lowering, with its existing
+eligibility requirements and setup cost. It does not initialize the model,
+advance its state, sample randomness or change its device. Preparation from an
+existing plan reuses that exact plan without lowering it again. This is host
+setup outside compiled execution and tensor transforms; perform it once and
+reuse the returned collection.
+
+Each preparation creates a new collection identity. Keep that collection when
+resuming its live carry. To transfer carry into an equivalent new collection,
+use ``export_state`` and ``restore_state``; restoration detaches callback carry
+and does not restore simulation state. Configurations prepared directly from a
+native model do not automatically belong to a separate plan or runner created
+from that model. Use the receiving plan to prepare its collection. For an
+existing raw binding or runner, pass ``bound.functional`` or
+``program.functional`` explicitly. Runners retain the callbacks supplied at
+construction; preparing a collection does not replace them. Tensor bundles and
+``Continuation`` packets do not carry a plan and are not preparation targets.
+
+The complete
+:download:`shared_callback_preparation.py <../../examples/shared_callback_preparation.py>`
+example covers native and existing-plan preparation for Populations and Networks,
+scoped analysis, cadence, gradients and portable callback carry:
+
+.. code-block:: console
+
+   python examples/shared_callback_preparation.py
 
 Binding a Recorder captures its configuration and prepares an independent
 immutable pure Recorder. Native recording history and phase are not imported
@@ -2626,8 +2679,9 @@ model state on the Population and returns callback results with explicit carry:
 
 .. code-block:: python
 
-   fmodel, tensors = dn.func.make_functional(model, dt=0.01)
-   callbacks = fmodel.make_callbacks({"trace": dn.Recorder(("v", "t"))})
+   callbacks = dn.func.make_callbacks(
+       model, {"trace": dn.Recorder(("v", "t"))}, dt=0.01,
+   )
    first = model.run(tstop=2.0, dt=0.01, functional_callbacks=callbacks)
    second = model.longrun(
        tstop=3.0, chunklength=100, dt=0.01,
@@ -2635,9 +2689,9 @@ model state on the Population and returns callback results with explicit carry:
    )
    voltage = torch.cat((first["trace"]["v"], second["trace"]["v"]))
 
-The plan must come from ``make_functional`` applied to that exact Population,
-and its timestep must match the native call. This bridge therefore applies to
-Populations admitted by functional lowering. Bind the collection once outside
+Prepare from that exact Population or its existing functional plan, with a
+timestep matching the native call. This bridge applies to Populations admitted
+by functional lowering. Bind the collection once outside
 repeated execution. Supplying callback carry resumes its observation phase;
 the Population itself retains the simulation state. Callback carry does not
 restore or initialize the model.
@@ -3003,11 +3057,11 @@ and bind the Recorder once, then pass explicit callback carry between calls:
 
    disk = dn.Recorder(("v", "t"), dt=0.1).set_hdf5("trace.h5", cache_every=4096)
    try:
-       functional, _ = dn.func.make_functional(model, dt=0.025)
-       observations = functional.make_callbacks({
-           "disk": disk,
-           "memory": dn.Recorder(("v", "t"), dt=0.1),
-       })
+       observations = dn.func.make_callbacks(
+           model,
+           {"disk": disk, "memory": dn.Recorder(("v", "t"), dt=0.1)},
+           dt=0.025,
+       )
        first = model.step(dt=0.025, functional_callbacks=observations)
        second = model.longrun(
            tstop=10.0, chunklength=256, dt=0.025,

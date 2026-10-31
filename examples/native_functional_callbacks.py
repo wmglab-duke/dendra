@@ -69,13 +69,15 @@ def make_model():
     return model
 
 
-def make_callbacks(functional):
-    return functional.make_callbacks(
+def make_callbacks(target):
+    return dn.func.make_callbacks(
+        target,
         {
             "summary": VoltageSummary(),
             "trace": dn.Recorder(("v", "t")),
             "coarse": dn.Recorder(("v", "t"), dt=2 * DT),
-        }
+        },
+        dt=DT,
     )
 
 
@@ -84,8 +86,7 @@ def main():
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, DTYPE=torch.float64, DEVICE="cpu", IMEM=False):
         model = make_model()
         # region binding
-        functional, _ = dn.func.make_functional(model, dt=DT)
-        callbacks = make_callbacks(functional)
+        callbacks = make_callbacks(model)
         first = model.run(
             tstop=FIRST * DT,
             dt=DT,

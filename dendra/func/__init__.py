@@ -1,6 +1,7 @@
 """Functional transforms for explicit-state Dendra execution."""
 
 from ._binding import BoundPopulation
+from ._callback_preparation import make_callbacks
 from ._callbacks import (
     LFP,
     Active,
@@ -127,6 +128,7 @@ __all__ = [
     "initialize",
     "longrun",
     "longrun_checkpointed",
+    "make_callbacks",
     "make_functional",
     "make_functional_continuous_con",
     "make_functional_netcon",

@@ -77,7 +77,7 @@ functions of model state, and scalar loss contributions from supported hooks
 are accumulated by the existing executor.
 
 The canonical wrapper can also hold a pure `FunctionalCallback` configuration.
-Bind it through `functional.make_callbacks` for functional execution or the
+Bind it through `dn.func.make_callbacks(target, configurations)` for functional execution or the
 native Network pure-callback bridge described below. Hook forwarding through
 the ordinary native `callbacks=` list requires a native `Callback` child and
 rejects a pure-only child. Functional binding accepts supported built-in native
@@ -94,8 +94,7 @@ exact initialized source Network. Its timestep comes from
 a per-call `dt` argument:
 
 ```python
-functional, tensors = dn.func.make_functional_network(network)
-observations = functional.make_callbacks({
+observations = dn.func.make_callbacks(network, {
     "trace": dn.Recorder(("left.v", "right.v", "t")),
     "counts": dn.callbacks.PopulationCallback(
         "right", dn.callbacks.APCount(node_check=[0, -1])
@@ -107,6 +106,17 @@ second = network.longrun(
     functional_callback_state=first.state,
 )
 ```
+
+The factory uses the initialized Network timestep; an optional `dt=` must match
+it. It also accepts an existing `FunctionalNetwork`, preserving its exact plan
+and avoiding another lowering. `functional.make_callbacks(...)` remains
+supported. Native-model preparation retains full lowering's eligibility and
+setup cost and does not initialize or advance the Network. Reuse the returned
+collection rather than preparing it again for each call. A newly prepared
+collection has its own carry identity; use portable export/restore to transfer
+carry between equivalent collections. See
+{ref}`functional-shared-callback-preparation` and
+{download}`shared_callback_preparation.py <../../examples/shared_callback_preparation.py>`.
 
 The Network owns its advancing model and connection state. Callback carry is
 separate: pass `results.state` to continue observation phase and reducer totals
