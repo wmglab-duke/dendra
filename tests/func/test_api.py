@@ -187,6 +187,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "TensorScheduleTensors",
         "VarInput",
         "compile",
+        "commit_continuation_",
         "detach_continuation",
         "export_continuation",
         "inspect_sources",

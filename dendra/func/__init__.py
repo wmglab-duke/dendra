@@ -34,6 +34,7 @@ from ._initialization import initialize, sample_initialization_draws
 from ._initialization_draws import InitializationDraws
 from ._inputs import Inputs
 from ._lowering import make_functional
+from ._native_handoff import commit_continuation_
 from ._netcon import FunctionalNetCon, NetConTensors, make_functional_netcon
 from ._netstim import (
     FunctionalNetStim,
@@ -124,6 +125,7 @@ __all__ = [
     "TensorScheduleTensors",
     "VarInput",
     "compile",
+    "commit_continuation_",
     "detach_continuation",
     "export_continuation",
     "inspect_sources",

@@ -17,6 +17,7 @@ Advanced
    advanced/A7_model_initialization.rst
    advanced/A57_functional_api_overview.md
    advanced/A58_functional_callback_checkpoints.md
+   advanced/A59_functional_native_handoff.md
    advanced/A8_functional_populations.rst
    advanced/A9_macroscopic_descriptor_training.rst
    advanced/A10_hard_transition_scans.rst

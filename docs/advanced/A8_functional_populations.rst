@@ -3882,8 +3882,21 @@ that GPU kernels or GPU code generation have passed.
 Resuming ordinary execution
 ----------------------------
 
-Functional execution does not update the original Population. Commit a state
-explicitly before returning to ``step``, ``run``, or ``longrun``:
+Functional execution does not update the original Population. Transfer a
+continuation explicitly before returning to ``step``, ``run``, or ``longrun``:
+
+.. code-block:: python
+
+   dn.func.commit_continuation_(program_or_plan, model, auxiliary["continuation"])
+
+This detached handoff transfers supported raw sources, runtime state and RNG
+together, preserving the receiving model's Parameter objects and aliases.
+Native suffix gradients belong to those receiving parameters. Callback carry,
+optimizer state and call-local inputs remain separate. Unsupported overrides
+without an equivalent native representation reject before publication. See
+:doc:`A59_functional_native_handoff` for complete runnable examples.
+
+For a state-only commit that retains runtime autograd history, use:
 
 .. code-block:: python
 

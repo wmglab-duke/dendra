@@ -227,7 +227,14 @@ disk examples. Dense queued payloads retain enqueue-time weights and transform
 values. Source-history training reconstructs deliveries from past activity
 using current weights and delays; see {doc}`A22_functional_source_history`.
 
-`plan.commit_state_(matching_network, state)` validates and commits a complete
+`dn.func.commit_continuation_(plan_or_runner, network, continuation)` transfers
+supported raw source values, runtime state and RNG to a compatible initialized
+native Network. The transfer detaches functional history and preserves the
+receiving Network's Parameter objects and aliases. See
+{doc}`A59_functional_native_handoff` for native suffix execution, ownership and
+the separate callback carry bridge.
+
+For a state-only commit, `plan.commit_state_(matching_network, state)` validates and commits a complete
 boundary, including the authoritative clock and optional NetStim RNG state.
 It does not transfer parameters or constants. Before native continuation, the
 receiving Network must have the same effective weights, physical delays,
