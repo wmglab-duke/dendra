@@ -415,12 +415,16 @@ def test_step_observer_guards_preserve_source_state(
         with pytest.raises(dn.func.FunctionalizationError, match="dt|timestep"):
             model.step(2 * DT, functional_callbacks=callbacks)
     disk = dn.Recorder(("left.v", "t") if network else ("v", "t")).set_hdf5(
-        str(tmp_path / "unsupported.h5"), cache_every=2
+        str(tmp_path / "changed.h5"), cache_every=2
     )
     functional, _ = dn.func.make_functional(model, dt=DT)
+    storage_callbacks = functional.make_callbacks({"disk": disk})
+    disk.cache_every = 3
     try:
-        with pytest.raises(dn.func.FunctionalizationError, match="HDF5"):
-            _step(model, network, callbacks=functional.make_callbacks({"disk": disk}))
+        with pytest.raises(
+            dn.func.FunctionalizationError, match="storage changed after binding"
+        ):
+            _step(model, network, callbacks=storage_callbacks)
     finally:
         disk.close()
     _assert_packet_equal(model.state_dict_for_checkpoint(), before)

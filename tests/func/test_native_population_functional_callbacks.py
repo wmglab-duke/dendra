@@ -381,20 +381,21 @@ def test_native_checkpoint_return_shapes_and_scalar_loss_coexist_with_shared_obs
     assert torch.isfinite(_gnabar(model).grad).all()
 
 
-def test_native_bridge_retains_hdf5_rejection_without_starting_recording(
+def test_native_bridge_rejects_changed_hdf5_storage_without_starting_recording(
     tmp_path,
     local_hdf5_writer,  # noqa: F811 - pytest injects the imported fixture
 ):
     model = _model()
-    configured = dn.Recorder("v").set_hdf5(
-        str(tmp_path / "unsupported.h5"), cache_every=2
-    )
+    configured = dn.Recorder("v").set_hdf5(str(tmp_path / "changed.h5"), cache_every=2)
     functional, _ = dn.func.make_functional(model, dt=DT)
     callbacks = functional.make_callbacks({"trace": configured})
+    configured.cache_every = 3
     before = _snapshot(model.state_dict_for_checkpoint())
     try:
         for method in ("run", "longrun"):
-            with pytest.raises(dn.func.FunctionalizationError, match="HDF5"):
+            with pytest.raises(
+                dn.func.FunctionalizationError, match="storage changed after binding"
+            ):
                 _execute(model, method, plan=callbacks, steps=0)
         assert configured.rec["v"] == [] and configured.run_number == 0
         _assert_packet_equal(model.state_dict_for_checkpoint(), before)

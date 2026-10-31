@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from functools import wraps
 
 from ._callbacks import FunctionalCallbacks, _BoundCadencedRecorder, _CallbackCollector
@@ -14,39 +15,47 @@ def _storage_bindings(callbacks):
     return callbacks._storage if isinstance(callbacks, FunctionalCallbacks) else {}
 
 
+@contextmanager
+def _recording_sessions(callbacks):
+    """Own one host invocation's storage outside numerical checkpoint replay."""
+    storage = _storage_bindings(callbacks)
+    if not storage:
+        yield {}
+        return
+    from dendra.models._recorder_storage import _RecorderHDF5Session
+
+    sessions = {}
+    try:
+        for name, (recorder, queue, path, interval, states) in storage.items():
+            if (
+                recorder.queue is not queue
+                or recorder.hdf5_path != path
+                or recorder.cache_every != interval
+                or tuple(recorder.states) != states
+                or not recorder.cache_with_hdf5
+            ):
+                raise FunctionalizationError(
+                    "HDF5 Recorder storage changed after binding; bind a new callback collection"
+                )
+            sessions[name] = _RecorderHDF5Session(recorder)
+        yield sessions
+        for session in sessions.values():
+            session.finish()
+    except BaseException:
+        for session in sessions.values():
+            session.abort()
+        raise
+
+
 def _host_recording(function):
     """Keep file sessions outside numerical functions and checkpoint replay."""
 
     @wraps(function)
     def execute(*args, **kwargs):
-        callbacks = kwargs.get("callbacks")
-        storage = _storage_bindings(callbacks)
-        if not storage:
-            return function(*args, **kwargs)
-        from dendra.models._recorder_storage import _RecorderHDF5Session
-
-        sessions = {}
-        try:
-            for name, (recorder, queue, path, interval, states) in storage.items():
-                if (
-                    recorder.queue is not queue
-                    or recorder.hdf5_path != path
-                    or recorder.cache_every != interval
-                    or tuple(recorder.states) != states
-                    or not recorder.cache_with_hdf5
-                ):
-                    raise FunctionalizationError(
-                        "HDF5 Recorder storage changed after binding; bind a new callback collection"
-                    )
-                sessions[name] = _RecorderHDF5Session(recorder)
-            result = function(*args, **kwargs, _recording_sessions=sessions)
-            for session in sessions.values():
-                session.finish()
-            return result
-        except BaseException:
-            for session in sessions.values():
-                session.abort()
-            raise
+        with _recording_sessions(kwargs.get("callbacks")) as sessions:
+            if not sessions:
+                return function(*args, **kwargs)
+            return function(*args, **kwargs, _recording_sessions=sessions)
 
     return execute
 

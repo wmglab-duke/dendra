@@ -90,7 +90,7 @@ def test_disabled_session_performs_no_population_access_and_rejects_orphan_state
         _bind_native_callbacks(Untouched(), object(), None)
 
 
-def test_session_reuses_exact_source_and_native_hdf5_validation():
+def test_session_reuses_exact_source_and_defers_storage_until_execution():
     case = _case()
     with pytest.raises(FunctionalizationError, match="exact source Population"):
         _bind_native_callbacks(torch.nn.Module(), case.callbacks, None)
@@ -98,9 +98,9 @@ def test_session_reuses_exact_source_and_native_hdf5_validation():
     _bind_native_callbacks(case.population, case.callbacks, None)
     assert case.events == ["source"]
     case.callbacks._storage = {"view": object()}
-    with pytest.raises(FunctionalizationError, match="HDF5 recording"):
-        _bind_native_callbacks(case.population, case.callbacks, None)
-    assert case.events == ["source"]
+    session = _bind_native_callbacks(case.population, case.callbacks, None)
+    assert session.storage is None
+    assert case.events == ["source", "source"]
 
 
 def test_session_owns_native_frames_preserves_aliases_and_survives_buffer_mutation():
@@ -172,7 +172,13 @@ def test_session_does_not_store_evolving_carry_and_repeated_starts_are_fresh():
     assert first is not second
     assert first["view"]["value"] is not second["view"]["value"]
     assert session.initial_callback_state is None
-    assert set(vars(session)) == {"callbacks", "binding", "initial_callback_state"}
+    assert set(vars(session)) == {
+        "callbacks",
+        "binding",
+        "initial_callback_state",
+        "storage",
+    }
+    assert session.storage is None
     with pytest.raises(FrozenInstanceError):
         session.initial_callback_state = first
 
@@ -208,6 +214,198 @@ def test_session_timestep_validation_forwards_identity_and_exception(monkeypatch
     with pytest.raises(ValueError) as caught:
         session.validate_dt(timestep)
     assert caught.value is failure and values == [timestep]
+
+
+def test_recording_without_storage_yields_the_original_session(monkeypatch):
+    from dendra.func import _recording
+
+    case = _case()
+    session = _bind_native_callbacks(case.population, case.callbacks, None)
+
+    def fail(*args):
+        raise AssertionError("no-storage observation must not open file sessions")
+
+    monkeypatch.setattr(_recording, "_recording_sessions", fail)
+    with session.recording() as opened:
+        assert opened is session
+    assert session.storage is None
+
+
+def test_collection_without_storage_keeps_the_existing_call_contract(monkeypatch):
+    from dendra.func import _native_callbacks
+
+    case = _case()
+    session = _bind_native_callbacks(case.population, case.callbacks, None)
+    state, parts, emitted, returned = (object() for _ in range(4))
+    seen = []
+
+    def collect(callbacks, callback_state, host_parts, emissions):
+        seen.append((callbacks, callback_state, host_parts, emissions))
+        return returned
+
+    monkeypatch.setattr(_native_callbacks, "_collect_callback_emissions", collect)
+    assert session.collect(state, parts, emitted, steps=3) is returned
+    assert seen == [(case.callbacks, state, parts, emitted)]
+
+
+def _storage_case(monkeypatch, names=("first",)):
+    from dendra.models import _recorder_storage
+
+    case = _case()
+    events, failures, recorders = [], {}, {}
+
+    class StorageSession:
+        def __init__(self, recorder):
+            self.recorder = recorder
+            self._event("open")
+
+        def _event(self, event):
+            key = event, self.recorder.name
+            events.append(key)
+            if key in failures:
+                raise failures[key]
+
+        def finish(self):
+            self._event("finish")
+
+        def abort(self):
+            self._event("abort")
+
+    monkeypatch.setattr(_recorder_storage, "_RecorderHDF5Session", StorageSession)
+    storage = {}
+    for name in names:
+        recorder = SimpleNamespace(
+            name=name,
+            queue=object(),
+            hdf5_path=f"{name}.h5",
+            cache_every=2,
+            states=("v",),
+            cache_with_hdf5=True,
+        )
+        recorders[name] = recorder
+        storage[name] = (
+            recorder,
+            recorder.queue,
+            recorder.hdf5_path,
+            recorder.cache_every,
+            recorder.states,
+        )
+    case.callbacks._storage = storage
+    carry = object()
+    session = _bind_native_callbacks(case.population, case.callbacks, carry)
+    return SimpleNamespace(
+        session=session, events=events, failures=failures, recorders=recorders
+    )
+
+
+def test_recording_storage_is_lazy_and_invocation_local_and_finishes_in_order(
+    monkeypatch,
+):
+    case = _storage_case(monkeypatch, ("first", "second"))
+    context = case.session.recording()
+    assert case.events == []
+    with context as opened:
+        assert opened is not case.session
+        assert opened.callbacks is case.session.callbacks
+        assert opened.binding is case.session.binding
+        assert opened.initial_callback_state is case.session.initial_callback_state
+        assert tuple(opened.storage) == ("first", "second")
+        assert case.session.storage is None
+        assert case.events == [("open", "first"), ("open", "second")]
+    assert case.events == [
+        ("open", "first"),
+        ("open", "second"),
+        ("finish", "first"),
+        ("finish", "second"),
+    ]
+    with case.session.recording() as repeated:
+        assert repeated.storage is not opened.storage
+        assert repeated.storage["first"] is not opened.storage["first"]
+    assert case.session.storage is None
+
+
+@pytest.mark.parametrize("failure", ("validation", "open"))
+def test_recording_partial_open_failure_aborts_only_previously_opened_sessions(
+    monkeypatch, failure
+):
+    case = _storage_case(monkeypatch, ("first", "second"))
+    if failure == "validation":
+        case.recorders["second"].hdf5_path = "changed.h5"
+        exception, message = FunctionalizationError, "storage changed after binding"
+        attempted = []
+    else:
+        case.failures["open", "second"] = RuntimeError("second open failed")
+        exception, message = RuntimeError, "second open failed"
+        attempted = [("open", "second")]
+    with pytest.raises(exception, match=message):
+        with case.session.recording():
+            raise AssertionError("partial open must not enter the host execution")
+    assert case.events == [("open", "first"), *attempted, ("abort", "first")]
+
+
+@pytest.mark.parametrize("failure", ("body", "finish"))
+def test_recording_failures_abort_in_open_order_and_keep_the_original_exception(
+    monkeypatch, failure
+):
+    case = _storage_case(monkeypatch, ("first", "second"))
+    error = RuntimeError(f"{failure} failed")
+    if failure == "finish":
+        case.failures["finish", "second"] = error
+    with pytest.raises(RuntimeError) as caught:
+        with case.session.recording():
+            if failure == "body":
+                raise error
+    assert caught.value is error
+    finished = (
+        [("finish", "first"), ("finish", "second")] if failure == "finish" else []
+    )
+    assert case.events == [
+        ("open", "first"),
+        ("open", "second"),
+        *finished,
+        ("abort", "first"),
+        ("abort", "second"),
+    ]
+
+
+def test_recording_abort_failure_retains_existing_exception_precedence(monkeypatch):
+    case = _storage_case(monkeypatch)
+    body_error, abort_error = RuntimeError("body failed"), ValueError("abort failed")
+    case.failures["abort", "first"] = abort_error
+    with pytest.raises(ValueError) as caught:
+        with case.session.recording():
+            raise body_error
+    assert caught.value is abort_error and abort_error.__context__ is body_error
+    assert case.events == [("open", "first"), ("abort", "first")]
+
+
+def test_storage_session_setup_and_collection_forward_only_supplied_host_options(
+    monkeypatch,
+):
+    from dendra.func import _native_callbacks
+
+    case = _storage_case(monkeypatch)
+    seen, parts = [], object()
+
+    def host_parts(callbacks, state, initial, *, storage):
+        seen.append((callbacks, state, initial, storage))
+        return parts
+
+    def collect(callbacks, state, host_parts, emitted, **options):
+        seen.append((callbacks, state, host_parts, emitted, options))
+
+    monkeypatch.setattr(_native_callbacks, "_host_callback_parts", host_parts)
+    monkeypatch.setattr(_native_callbacks, "_collect_callback_emissions", collect)
+    case.session.callbacks._validate_state = lambda state: state
+    with case.session.recording() as opened:
+        state, host_parts = opened.start()
+        assert host_parts is parts and seen[0][3] is opened.storage
+        assert state is opened.initial_callback_state
+        emitted = object()
+        opened.collect(state, parts, emitted)
+        opened.collect(state, parts, emitted, steps=0)
+        opened.collect(state, parts, emitted, steps=3)
+    assert [value[-1] for value in seen[1:]] == [{}, {"steps": 0}, {"steps": 3}]
 
 
 def test_session_updates_use_current_buffer_owners_and_share_auxiliary_snapshot():

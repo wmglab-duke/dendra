@@ -31,6 +31,7 @@ from ..core import (
     _duration_step_budget,
     _load_compatible_state_dict_transactionally,
     _load_population_cache_transactionally,
+    _native_callback_storage,
     _native_functional_callback_session,
     _time_grid_from_step_count,
     _validate_time_scalar,
@@ -3679,7 +3680,7 @@ class Network(RNGMixin):
         for c in callbacks:
             _bind_callback_dt(c, self.dt)
 
-        with ctx:
+        with _native_callback_storage(observer) as observer, ctx:
             if with_intra:
                 intra = {
                     n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
@@ -3712,7 +3713,7 @@ class Network(RNGMixin):
             if observer is not None:
                 observed_state, emitted = observer.update(observed_state)
                 observer.collect(
-                    observed_state, observed_parts, observer.stack([emitted])
+                    observed_state, observed_parts, observer.stack([emitted]), steps=1
                 )
             post_step_hook(callbacks, self)
             if loop_hooks:
@@ -3836,7 +3837,7 @@ class Network(RNGMixin):
         with_extra = bool(extra)
         tstart = self.t.item()
 
-        with ctx:
+        with _native_callback_storage(observer) as observer, ctx:
             self._set_duration_remainder(duration_remainder)
 
             if with_intra:
@@ -3887,7 +3888,10 @@ class Network(RNGMixin):
                 if observer is not None:
                     observed_state, emitted = observer.update(observed_state)
                     observer.collect(
-                        observed_state, observed_parts, observer.stack([emitted])
+                        observed_state,
+                        observed_parts,
+                        observer.stack([emitted]),
+                        steps=1,
                     )
                 post_step_hook(callbacks, self)
                 local_ind += 1
@@ -4014,7 +4018,7 @@ class Network(RNGMixin):
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
-        with ctx:
+        with _native_callback_storage(observer) as observer, ctx:
             self._set_duration_remainder(duration_remainder)
             pre_loop_hook(callbacks, self)
             if observer is not None:
@@ -4099,6 +4103,7 @@ class Network(RNGMixin):
                         observed_state,
                         observed_parts,
                         observer.stack(observed_emissions),
+                        steps=n_chunk,
                     )
                 post_chunk_hook(callbacks, self, time_chunk)
 
@@ -5396,7 +5401,10 @@ class Network(RNGMixin):
         total_loss = None
         saw_any_loss = False
 
-        with torch.nn.utils.parametrize.cached():
+        with (
+            _native_callback_storage(observer) as observer,
+            torch.nn.utils.parametrize.cached(),
+        ):
             with torch.set_grad_enabled(self.training):
                 self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
@@ -5566,7 +5574,12 @@ class Network(RNGMixin):
                         ) = _checkpoint(
                             _run_chunk, state, observed_state, **checkpoint_options
                         )
-                        observer.collect(observed_state, observed_parts, emitted_part)
+                        observer.collect(
+                            observed_state,
+                            observed_parts,
+                            emitted_part,
+                            steps=len(t_chunk),
+                        )
                         del emitted_part
 
                     total_loss, _ = _add_loss(total_loss, chunk_loss)

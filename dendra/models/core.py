@@ -3901,7 +3901,7 @@ class Population(P, Sliceable):
                 _bind_callback_dt(c, dt_f)
 
         ctx = nullcontext() if self.training else torch.no_grad()
-        with ctx:
+        with _native_callback_storage(observer) as observer, ctx:
             self.integrator._initialize(
                 self,
                 dt_tensor,
@@ -3941,7 +3941,7 @@ class Population(P, Sliceable):
             if observer is not None:
                 observed_state, emitted = observer.update(observed_state)
                 observer.collect(
-                    observed_state, observed_parts, observer.stack([emitted])
+                    observed_state, observed_parts, observer.stack([emitted]), steps=1
                 )
             post_step_hook(callbacks, self)
             if loop_hooks:
@@ -4113,7 +4113,7 @@ class Population(P, Sliceable):
 
         psh = post_step_hook
 
-        with ctx:
+        with _native_callback_storage(observer) as observer, ctx:
             # --------------------------------------------------------------
             # Determine number of steps and global time grid
             # --------------------------------------------------------------
@@ -4280,7 +4280,10 @@ class Population(P, Sliceable):
                     if observer is not None:
                         observed_state, emitted = observer.update(observed_state)
                         observer.collect(
-                            observed_state, observed_parts, observer.stack([emitted])
+                            observed_state,
+                            observed_parts,
+                            observer.stack([emitted]),
+                            steps=1,
                         )
                     psh(callbacks, self)
                     local_ind += 1
@@ -4426,7 +4429,10 @@ class Population(P, Sliceable):
 
         psh = post_step_hook
 
-        with torch.nn.utils.parametrize.cached():
+        with (
+            _native_callback_storage(observer) as observer,
+            torch.nn.utils.parametrize.cached(),
+        ):
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
                 # Global time grid and chunking
@@ -4592,6 +4598,7 @@ class Population(P, Sliceable):
                             observed_state,
                             observed_parts,
                             observer.stack(observed_emissions),
+                            steps=len(t_chunk),
                         )
                     post_chunk_hook(callbacks, self, t_chunk)
 
@@ -7395,7 +7402,10 @@ class Population(P, Sliceable):
         def _checkpoint_contexts():
             return _checkpoint_recompute_contexts(self)
 
-        with torch.nn.utils.parametrize.cached():
+        with (
+            _native_callback_storage(observer) as observer,
+            torch.nn.utils.parametrize.cached(),
+        ):
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
                 # Global time grid and chunking
@@ -7695,6 +7705,7 @@ class Population(P, Sliceable):
                             native_state,
                             callback_parts,
                             emitted_part,
+                            steps=len(t_chunk),
                         )
                         del emitted_part
 
@@ -10426,6 +10437,11 @@ class Myelinated(Axon):
 
 
 # callback helpers
+def _native_callback_storage(observer):
+    """Own optional host recording without importing on the ordinary path."""
+    return nullcontext() if observer is None else observer.recording()
+
+
 def _native_functional_callback_session(model, callbacks, callback_state):
     """Bind optional pure observations without importing on the ordinary path."""
     if callbacks is None and callback_state is None:

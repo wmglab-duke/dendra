@@ -414,12 +414,16 @@ def test_checkpoint_observer_guards_precede_execution(
     with pytest.raises(TypeError, match="FunctionalCallbackState"):
         _checkpoint(model, callbacks, steps=0, state=object())
     disk = dn.Recorder(("left.v", "t")).set_hdf5(
-        str(tmp_path / "unsupported.h5"), cache_every=2
+        str(tmp_path / "changed.h5"), cache_every=2
     )
     functional, _ = dn.func.make_functional_network(model)
+    storage_callbacks = functional.make_callbacks({"disk": disk})
+    disk.cache_every = 3
     try:
-        with pytest.raises(dn.func.FunctionalizationError, match="HDF5"):
-            _checkpoint(model, functional.make_callbacks({"disk": disk}), steps=0)
+        with pytest.raises(
+            dn.func.FunctionalizationError, match="storage changed after binding"
+        ):
+            _checkpoint(model, storage_callbacks, steps=0)
     finally:
         disk.close()
     _assert_packet_equal(model.state_dict_for_checkpoint(), frozen)

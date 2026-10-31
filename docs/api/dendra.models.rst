@@ -370,11 +370,13 @@ gradients; portable restoration retains detached field carry. See
 Recorder cadence selects the initial boundary and accepted-step multiples of
 ``int(record_dt / solver_dt)`` for both in-memory and HDF5 output. Configure
 HDF5 with ``dn.Recorder(...).set_hdf5(path, cache_every=...)``. Host runners
-stream its detached samples, omit that trajectory from callback outputs, and
-retain numerical sampling carry in the continuation. Paths, writer sessions
-and queued samples are excluded from portable checkpoints. Existing HDF5
-layout and ``H5Reader`` access apply. See :ref:`functional-recorder-storage` for
-timing, storage bounds, gradients and file-session continuation.
+and native pure-callback execution stream its detached samples, omit that
+trajectory from callback outputs, and retain numerical sampling carry in the
+continuation. Paths, writer sessions and queued samples are excluded from
+portable checkpoints. Existing HDF5 layout and ``H5Reader`` access apply.
+Direct tensor kernels reject HDF5 configurations. See
+:ref:`functional-recorder-storage` for timing, storage bounds, gradients and
+file-session continuation.
 
 Custom ``FunctionalCallback`` implementations support portable continuation with
 the optional ``checkpoint_configuration()`` hook. It returns a plain dictionary
@@ -404,8 +406,9 @@ returns the model for chaining and ``run``/``longrun`` return ``None``.
 Checkpointed execution retains its loss/result tuples.
 Ordinary ``callbacks=`` can coexist independently. The bridge supplies a
 gradient-preserving state snapshot and auxiliary ``{"v": ...}``, with pure
-updates after clock advancement and before native post-step hooks.
-Functional-bridge HDF5 storage is currently unsupported. See
+updates after clock advancement and before native post-step hooks. HDF5
+Recorders use the shared host collector, outside numerical checkpoint replay.
+See
 :ref:`functional-native-population-callbacks` and
 the complete
 :download:`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
@@ -441,6 +444,16 @@ step and run-family calls. Portable callback carry uses the existing
 ``export_state``/``restore_state`` protocol and restores no native model state.
 See :ref:`functional-native-step-callbacks` and
 :download:`native_step_functional_callbacks.py <../../examples/native_step_functional_callbacks.py>`.
+
+``Recorder.set_hdf5`` supports all native methods above, including scoped
+Network recording. Disk histories are omitted from results; sampling carry,
+in-memory histories and reducer outputs keep their existing ownership and
+gradient contracts. Each call with samples writes a separate ``run_N`` segment
+without repeating a continued boundary. ``cache_every`` counts solver iterations
+and a fresh initial boundary; recording cadence selects rows separately.
+Host storage lifetime does not depend on native ``loop_hooks``. Close the
+Recorder before file readback. See :ref:`functional-native-callback-storage` and
+:download:`native_callback_storage.py <../../examples/native_callback_storage.py>`.
 
 Intrinsic activity
 ------------------

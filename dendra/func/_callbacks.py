@@ -1915,10 +1915,6 @@ class FunctionalCallbacks:
                 raise FunctionalizationError(message)
 
     def _bind_imperative(self, population):
-        if self._storage:
-            raise FunctionalizationError(
-                "use native callbacks=[recorder] or dn.func.run for HDF5 recording"
-            )
         from ._network import FunctionalNetwork
 
         if isinstance(self._functional, FunctionalNetwork):

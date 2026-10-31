@@ -2674,10 +2674,10 @@ auxiliary keys belongs with the corresponding user-authored ``dn.func`` step.
 Native ``Network.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` support
 bound Network collections through the same keyword arguments and return
 conventions; see :ref:`functional-native-network-callbacks` for qualified
-recording, Population scopes and checkpointed continuation. HDF5 storage through
-``functional_callbacks`` is unsupported; use an ordinary native Recorder in
-``callbacks`` for native HDF5 recording, or functional host execution through
-``dn.func.run``.
+recording, Population scopes and checkpointed continuation. Recorders configured
+with ``set_hdf5`` stream through the same host storage path in either execution
+mode; see :ref:`functional-native-callback-storage`. Ordinary native Recorder
+hooks in ``callbacks`` retain their independent storage behavior.
 
 The complete
 :download:`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
@@ -2927,21 +2927,22 @@ Configure HDF5 storage on the same Recorder used by native execution:
 
    disk = dn.Recorder(["v", "hh.m", "t"], dt=0.1)
    disk.set_hdf5("trace.h5", cache_every=4096)
-   program = dn.compile(
-       model, dt=0.025, steps=100_000, chunk_steps=1024,
-       callbacks={"disk": disk},
-   )
    try:
+       program = dn.compile(
+           model, dt=0.025, steps=100_000, chunk_steps=1024,
+           callbacks={"disk": disk},
+       )
        state, auxiliary = program()
    finally:
        disk.close()
 
-The compiled numerical loop emits selected observations as tensors. The host
-runner stages completed sample batches in owned CPU storage and writes them
-through a bounded queue. File handles, processes and file counters stay outside
+The numerical loop emits observations as tensors. The host collector stages
+completed sample batches and sends owned CPU copies through a bounded queue.
+File handles, processes and file counters stay outside
 scan, while, pure callback carry and activation-checkpoint replay. Backward
 recomputation therefore does not write the samples again. ``dn.func.run`` host
-schedules use the same storage path; direct tensor kernels perform no file I/O.
+schedules and native pure-callback execution use the same storage path. Direct
+tensor kernels perform no file I/O and reject HDF5 Recorder configurations.
 
 An HDF5-only Recorder's trajectory is omitted from
 ``auxiliary["callbacks"]``. Its sampling carry remains in that collection's
@@ -2987,6 +2988,68 @@ continuation, HDF5 readback, scan input gradients and inference while execution:
 
    python examples/functional_recorder_storage.py
    python examples/functional_recorder_storage.py --backend aot_eager
+
+.. _functional-native-callback-storage:
+
+Use the same storage with native callbacks
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+A bound pure callback collection accepts the same ``set_hdf5`` configuration in
+native ``Population`` and ``Network`` execution. This includes ``step``, ``run``,
+``longrun`` and ``longrun_checkpointed``, and the ``dn.step`` helpers. Configure
+and bind the Recorder once, then pass explicit callback carry between calls:
+
+.. code-block:: python
+
+   disk = dn.Recorder(("v", "t"), dt=0.1).set_hdf5("trace.h5", cache_every=4096)
+   try:
+       functional, _ = dn.func.make_functional(model, dt=0.025)
+       observations = functional.make_callbacks({
+           "disk": disk,
+           "memory": dn.Recorder(("v", "t"), dt=0.1),
+       })
+       first = model.step(dt=0.025, functional_callbacks=observations)
+       second = model.longrun(
+           tstop=10.0, chunklength=256, dt=0.025,
+           functional_callbacks=observations,
+           functional_callback_state=first.state,
+       )
+       voltage = torch.cat((first["memory"]["v"], second["memory"]["v"]))
+   finally:
+       disk.close()
+
+For a Network, omit per-call ``dt`` and use qualified Recorders or
+``dn.callbacks.PopulationCallback(name, recorder)``. A scoped Recorder keeps its
+local variable names in the file. The native model retains its simulation state;
+``results.state`` retains numerical sampling phase. The disk Recorder's name is
+absent from ``results`` but remains in ``results.state``. In-memory observations
+and reducers retain their gradients; file samples are detached copies.
+
+Storage belongs to the host call, independently of native ``loop_hooks``.
+Finishing a manual step flushes that call's pending samples even when native
+loop hooks are disabled. Calls with samples create separate ``run_N`` segments;
+continued calls omit the shared boundary, and calls without samples create no
+datasets. ``cache_every`` counts solver iterations and a fresh initial boundary,
+while ``Recorder(dt=...)`` selects the sampled rows. Checkpointed calls collect
+completed forward spans outside replay, so backward does not append duplicate
+samples or advance file run counters. Keep the writer open while continuing,
+then call ``close()`` before reading its file.
+
+The complete
+:download:`native_callback_storage.py <../../examples/native_callback_storage.py>`
+example uses temporary files for a Population and a scoped Network Recorder.
+It continues manual steps through all run-family methods, compares in-memory
+values and gradients with functional execution, and checks HDF5 readback:
+
+.. code-block:: console
+
+   python examples/native_callback_storage.py
+
+.. literalinclude:: ../../examples/native_callback_storage.py
+   :language: python
+   :start-after: # region readback
+   :end-before: # endregion readback
+   :dedent: 4
 
 Functional optimization
 ~~~~~~~~~~~~~~~~~~~~~~~

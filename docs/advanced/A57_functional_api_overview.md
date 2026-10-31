@@ -197,8 +197,10 @@ separate storage requirements. Atomic rollouts retain dense finalization; see
 `Recorder.set_hdf5(path, cache_every=...)` routes its sampled trajectory to the
 host HDF5 writer instead of returned callback history. Its sampling carry
 remains available for continuation. In-memory recordings retain gradients;
-persisted samples are detached. See {ref}`functional-recorder-storage` for file
-segments, bounded storage and the complete runnable example.
+persisted samples are detached. Functional host schedules and native pure
+callback collections use the same storage path; direct tensor kernels reject
+HDF5 configurations. See {ref}`functional-recorder-storage` for file segments,
+bounded storage and the complete runnable examples.
 
 Use `dn.callbacks.APCount`, `Raster`, `Active`, `ActiveAL`, `ActiveALCount`
 and `AnomalyDetector` to configure native or functional spike analysis and
@@ -279,9 +281,11 @@ the shared boundary and preserve cadence; reducer results stay cumulative.
 
 One `FunctionalCallback` definition supplies the same pure analysis for native
 and functional Population dynamics. The native Population auxiliary packet
-contains `{"v": ...}`. HDF5 storage through this pure bridge is currently
-unsupported. Ordinary native Recorder HDF5 recording remains available through
-`callbacks=`. See
+contains `{"v": ...}`. Recorders configured with `set_hdf5` use host storage
+through `functional_callbacks=` as well as ordinary native hooks in `callbacks=`.
+Disk histories are omitted from returned results while their sampling carry
+remains in `results.state`; in-memory recordings and reducers retain gradients.
+See
 {ref}`functional-native-population-callbacks` for the complete contract and
 {download}`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
 for a runnable custom reducer, cadence, native loss, gradients and replay:
@@ -330,6 +334,19 @@ gradients and portable callback carry:
 
 ```console
 python examples/native_step_functional_callbacks.py
+```
+
+HDF5 storage works across these native methods for Populations and Networks,
+including scoped Network Recorders. File writes occur outside checkpoint replay,
+so backward does not repeat them. Each call with selected samples creates a
+`run_N` segment; callback carry preserves cadence and omits the shared boundary.
+Calls without samples create no datasets. `cache_every` counts solver iterations
+plus a fresh initial boundary; `Recorder(dt=...)` controls sampling separately.
+Close each configured Recorder after its last call and before reading its file.
+See {ref}`functional-native-callback-storage` and the temporary-file example:
+
+```console
+python examples/native_callback_storage.py
 ```
 
 ### Continue functional execution

@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass, replace
 
 from ._callbacks import (
     FunctionalCallbacks,
@@ -18,6 +19,19 @@ class _NativeCallbackSession:
     callbacks: FunctionalCallbacks
     binding: object
     initial_callback_state: object
+    storage: object = None
+
+    def recording(self):
+        if not self.callbacks._storage:
+            return nullcontext(self)
+        from ._recording import _recording_sessions
+
+        @contextmanager
+        def opened():
+            with _recording_sessions(self.callbacks) as sessions:
+                yield replace(self, storage=sessions)
+
+        return opened()
 
     def validate_dt(self, dt):
         self.callbacks._validate_runtime_dt(dt)
@@ -34,7 +48,8 @@ class _NativeCallbackSession:
         state, parts = _setup_callback_state(
             self.callbacks, self.initial_callback_state, model_state
         )
-        return state, _host_callback_parts(self.callbacks, state, parts)
+        options = {"storage": self.storage} if self.storage is not None else {}
+        return state, _host_callback_parts(self.callbacks, state, parts, **options)
 
     def update(self, callback_state):
         model_state = self._snapshot()
@@ -47,9 +62,10 @@ class _NativeCallbackSession:
     def stack(self, emissions):
         return self.callbacks._stack(emissions)
 
-    def collect(self, state, parts, stacked_emitted):
+    def collect(self, state, parts, stacked_emitted, *, steps=None):
+        options = {"steps": steps} if self.storage and steps is not None else {}
         return _collect_callback_emissions(
-            self.callbacks, state, parts, stacked_emitted
+            self.callbacks, state, parts, stacked_emitted, **options
         )
 
     def finish(self, state, parts):

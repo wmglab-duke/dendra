@@ -132,9 +132,22 @@ Fresh Recorder results include the current initial boundary; continued calls
 emit only new accepted samples. Zero-step calls retain the native loop-hook
 boundaries and the same fresh/resumed observation rules. Callback carry does
 not initialize or restore Network simulation state. The bridge requires a
-Network admitted by functional lowering. HDF5 storage through this pure bridge
-is currently unsupported. Native hook-list recording
-and functional host HDF5 recording retain their existing APIs.
+Network admitted by functional lowering. Recorders configured with `set_hdf5`
+stream detached samples through the host collector; their names remain in
+callback carry and are omitted from returned trajectory results. In-memory
+Recorders and reducers retain gradients. Native hook-list recording retains its
+independent behavior.
+
+Use a qualified Network Recorder or a scoped local Recorder for HDF5, with the
+same sampling phase across `step`, `run`, `longrun` and `longrun_checkpointed`.
+Each call with samples creates a `run_N` file segment; continued calls omit the
+shared boundary. `cache_every` counts solver iterations plus a fresh initial
+boundary, independently of `Recorder(dt=...)` sampling cadence. Storage and
+writer cleanup run on the host, outside backward replay, and do not depend on
+native `loop_hooks`. Call `recorder.close()` before reading the file. See
+{ref}`functional-native-callback-storage` and
+{download}`native_callback_storage.py <../../examples/native_callback_storage.py>`
+for a complete scoped example with file readback and gradients.
 
 Manual `Network.step` calls use the same collection and carry, including
 Population scopes and qualified recording. `loop_hooks` governs only native
