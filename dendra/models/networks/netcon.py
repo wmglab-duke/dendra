@@ -1,5 +1,6 @@
 import hashlib
 import warnings
+from numbers import Real
 from typing import Any, Dict, Literal
 
 import torch
@@ -3877,16 +3878,17 @@ class NetCon(Referency):
         pre_indices=None,
         times_ms=None,
         weight=1.0,
+        time_idx=None,
+        weight_idx=None,
         allow_past: bool = False,
     ):
         """
-        Schedule value-mode events on specific connections or pre indices.
+        Schedule events with direct values or indexed bound sources.
 
-        This API attaches *value-mode* scheduled events, where weights and
-        times are stored directly as tensors owned by the ``NetCon``. It is
-        suitable when you want event-specific weights/times that are not
-        shared by reference with other structures, or when you are fine
-        managing these tensors directly.
+        Direct weights and times are declaration-time tensors owned by the
+        ``NetCon``. Indexed values are gathered from the corresponding bound
+        source during simulation; both quantities can use indexed sources on
+        the same events.
 
         Exactly one of ``con_indices`` or ``pre_indices`` must be provided.
 
@@ -3901,13 +3903,13 @@ class NetCon(Referency):
             connection indices using the pre→connection CSR map (see
             :meth:`_expand_pre_to_con`). Mutually exclusive with
             ``con_indices``.
-        times_ms : Sequence[float] or torch.Tensor
+        times_ms : Sequence[float] or torch.Tensor, optional
             Event times in milliseconds. Must be broadcast-compatible with
             the selected connections *after* filtering out past events (see
             ``allow_past``). Times are converted to steps via
             the first grid step at or after the event for non-differentiable
             scheduling, and interpreted as continuous values when
-            ``diff_scheduled_times=True``.
+            ``diff_scheduled_times=True``. Omit when using ``time_idx``.
         weight : float or torch.Tensor, optional
             Dimensionless scalar or per-event weight *multiplier* applied on
             top of the base connection weights returned by ``self.weight()``.
@@ -3922,6 +3924,14 @@ class NetCon(Referency):
             When provided as a tensor requiring gradients, and when
             differentiable scheduling is enabled, gradients will flow into
             this tensor.
+        time_idx : Sequence[int] or torch.Tensor, optional
+            Nonnegative per-event indices into the tensor supplied to
+            :meth:`bind_time_source`. Mutually exclusive with ``times_ms``.
+        weight_idx : Sequence[int] or torch.Tensor, optional
+            Nonnegative per-event indices into the tensor supplied to
+            :meth:`bind_weight_source`. Referenced weights use that source
+            alone: omit ``weight`` or pass ``None``. The default numeric
+            ``weight=1.0`` is treated as omitted.
         allow_past : bool, optional
             If False (default), events whose scheduled integer step is smaller
             than the current ``global_step`` are dropped. If True, no such
@@ -3929,22 +3939,61 @@ class NetCon(Referency):
 
         Notes
         -----
-        * This is a *value-mode* scheduling API: weights and times are stored
-          directly in ``self.sched_weight`` and ``self.sched_time_ms``.
-        * For *reference-mode* weights or times (where event metadata lives in
-          a separate trainable tensor), use :meth:`schedule_ref` and
-          :meth:`schedule_time_ref` after binding sources with
-          :meth:`bind_weight_source` and :meth:`bind_time_source`.
+        * Direct values are stored in ``self.sched_weight`` and
+          ``self.sched_time_ms``; indexed quantities have zero value slots.
+        * :meth:`schedule_ref` and :meth:`schedule_time_ref` are compatible
+          adapters for declarations with one indexed quantity.
         * This method can be called multiple times; new events are appended.
         """
+        return self._schedule_tensor_events(
+            con_indices=con_indices,
+            pre_indices=pre_indices,
+            times_ms=times_ms,
+            weight=weight,
+            time_idx=time_idx,
+            weight_idx=weight_idx,
+            allow_past=allow_past,
+            api="schedule",
+        )
+
+    def _schedule_tensor_events(
+        self,
+        *,
+        con_indices,
+        pre_indices,
+        times_ms=None,
+        weight=1.0,
+        time_idx=None,
+        weight_idx=None,
+        allow_past,
+        api,
+    ):
+        """Declare aligned event columns with caller-specific diagnostics."""
+        reference_time = time_idx is not None or api == "schedule_time_ref"
+        reference_weight = weight_idx is not None or api == "schedule_ref"
+        if api == "schedule":
+            if reference_time and times_ms is not None:
+                raise ValueError("Provide only one of times_ms or time_idx")
+            if (
+                reference_weight
+                and weight is not None
+                and not (isinstance(weight, Real) and weight == 1.0)
+            ):
+                raise ValueError("Provide only one of weight or weight_idx")
+        if reference_weight and self._sched_w_source is None:
+            raise RuntimeError(f"call bind_weight_source(...) before {api}(...)")
+        if reference_time and self._sched_t_source is None:
+            raise RuntimeError(f"call bind_time_source(...) before {api}(...)")
         if (con_indices is None) == (pre_indices is None):
             raise ValueError("Provide exactly one of con_indices or pre_indices")
-        if times_ms is None:
+        if api == "schedule_ref" and (times_ms is None or weight_idx is None):
+            raise ValueError("times_ms and weight_idx are required")
+        if api == "schedule_time_ref" and time_idx is None:
+            raise ValueError("time_idx is required")
+        if not reference_time and times_ms is None:
             raise ValueError("times_ms is required")
 
         device, dtype = self.device, self.dtype
-
-        # → connection indices (raw, before any filtering)
         if pre_indices is not None:
             con_idx_raw = self._expand_pre_to_con(pre_indices).to(device)
         else:
@@ -3952,72 +4001,125 @@ class NetCon(Referency):
                 con_indices, device=device, dtype=torch.long
             ).view(-1)
 
-        tms_raw = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
-
-        if con_idx_raw.numel() != tms_raw.numel():
+        if reference_time:
+            tidx_raw = torch.as_tensor(time_idx, device=device, dtype=torch.long).view(
+                -1
+            )
+            if con_idx_raw.numel() != tidx_raw.numel():
+                raise ValueError(
+                    "con_indices/pre_indices and time_idx must match length"
+                )
+        else:
+            tms_raw = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
+        if reference_weight:
+            widx_raw = torch.as_tensor(
+                weight_idx, device=device, dtype=torch.long
+            ).view(-1)
+            if api == "schedule_ref" and not (
+                con_idx_raw.numel() == tms_raw.numel() == widx_raw.numel()
+            ):
+                raise ValueError(
+                    "indices, times_ms, and weight_idx must have same length"
+                )
+        if not reference_time and con_idx_raw.numel() != tms_raw.numel():
             raise ValueError("con_indices/pre_indices and times_ms must match length")
+        if reference_weight and con_idx_raw.numel() != widx_raw.numel():
+            raise ValueError("con_indices/pre_indices and weight_idx must match length")
         if (con_idx_raw < 0).any() or (con_idx_raw >= self.pre_idx.numel()).any():
             raise IndexError("connection index out of range")
+        if reference_time and (
+            (tidx_raw < 0).any() or (tidx_raw >= self._sched_t_source.numel()).any()
+        ):
+            raise IndexError("time_idx out of range for bound time source")
+        if reference_weight and (
+            (widx_raw < 0).any() or (widx_raw >= self._sched_w_source.numel()).any()
+        ):
+            raise IndexError("weight_idx out of range for bound weight source")
+        if reference_time:
+            tms_raw = self._sched_t_source.index_select(0, tidx_raw).to(dtype=dtype)
 
-        # legacy step field (used when diff_scheduled_times=False)
         steps_raw = _causal_step_index(tms_raw, self.dt.to(tms_raw.dtype))
-
-        # optional filtering of past events
         if not allow_past:
             cur = self.global_step.view(())
             keep = steps_raw >= cur
-            if not bool(keep.any()):
+            if not reference_time and not reference_weight and not bool(keep.any()):
                 return
             con_idx = con_idx_raw[keep]
-            tms = tms_raw[keep]
-            steps = steps_raw[keep]
+            if reference_time:
+                steps = steps_raw[keep]
+                tidx = tidx_raw[keep]
+                tms = tms_raw[keep]
+            else:
+                tms = tms_raw[keep]
+                steps = steps_raw[keep]
+            if reference_weight:
+                widx = widx_raw[keep]
+            if (reference_time or reference_weight) and con_idx.numel() == 0:
+                return
         else:
             con_idx = con_idx_raw
             tms = tms_raw
             steps = steps_raw
+            if reference_time:
+                tidx = tidx_raw
+            if reference_weight:
+                widx = widx_raw
 
         E_before = con_idx_raw.numel()
         E_after = con_idx.numel()
 
-        # Normalize weight (supports scalar, pre-filter length, or post-filter length)
-        if torch.is_tensor(weight):
+        if reference_weight:
+            w = torch.zeros(E_after, device=device, dtype=dtype)
+        elif torch.is_tensor(weight):
             w_raw = weight.to(device=device, dtype=dtype).view(-1)
             if w_raw.numel() == 1:
-                w = w_raw.expand(E_after)  # scalar → broadcast
+                w = w_raw.expand(E_after)
             elif w_raw.numel() == E_before:
-                w = (
-                    w_raw[keep] if not allow_past else w_raw
-                )  # per-event (pre-filter) → slice if filtered
+                w = w_raw[keep] if not allow_past else w_raw
             elif w_raw.numel() == E_after:
-                w = w_raw  # per-event (post-filter) already aligned
+                w = w_raw
             else:
+                if api == "schedule_time_ref":
+                    raise ValueError(
+                        f"weight must be scalar or have length {E_before} "
+                        f"(pre-filter) or {E_after} (post-filter)"
+                    )
                 raise ValueError(
                     f"weight tensor length must be 1, {E_before} (pre-filter), or {E_after} (post-filter)"
                 )
         else:
             w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
 
-        # append (outside compiled loop: changing E is fine)
+        if reference_time:
+            tms = torch.zeros(E_after, device=device, dtype=dtype)
+        elif api == "schedule_ref":
+            tms = tms.to(dtype=dtype)
         self._schedule_config_generation = (
             getattr(self, "_schedule_config_generation", 0) + 1
         )
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
         self.sched_time_ms = torch.cat([self.sched_time_ms, tms], dim=0)
+        if api == "schedule_time_ref":
+            self.sched_time_idx = torch.cat([self.sched_time_idx, tidx], dim=0)
         self.sched_weight = torch.cat([self.sched_weight, w], dim=0)
-
-        # keep ref-index arrays aligned (sentinel -1)
         filler = torch.full((E_after,), -1, device=device, dtype=torch.long)
-        self.sched_weight_idx = torch.cat([self.sched_weight_idx, filler], dim=0)
-        self.sched_time_idx = torch.cat([self.sched_time_idx, filler], dim=0)
+        self.sched_weight_idx = torch.cat(
+            [self.sched_weight_idx, widx if reference_weight else filler], dim=0
+        )
+        if api != "schedule_time_ref":
+            self.sched_time_idx = torch.cat(
+                [self.sched_time_idx, tidx if reference_time else filler], dim=0
+            )
 
     def bind_weight_source(self, source: torch.Tensor):
         """
         Bind a tensor providing per-event weights for reference-mode scheduling.
 
-        This method enables *reference-mode* scheduled weights used by
-        :meth:`schedule_ref`. Instead of storing per-event weights directly
-        inside ``NetCon``, you bind a tensor (usually a parameter) and then
+        This method supplies live indexed weights for :meth:`schedule` through
+        ``weight_idx`` and for its :meth:`schedule_ref` adapter. Instead of
+        storing per-event weights directly inside ``NetCon``, you bind a tensor
+        (usually a parameter) and then
         refer to entries in that tensor by integer indices.
 
         Parameters
@@ -4029,7 +4131,7 @@ class NetCon(Referency):
 
             * reside on the same device as the synapse (``self.device``), and
             * have a size at least as large as any ``weight_idx`` used in
-              :meth:`schedule_ref`.
+              :meth:`schedule` or :meth:`schedule_ref`.
 
             Typically this is a ``torch.nn.Parameter`` or another tensor that
             participates in the training loop.
@@ -4041,14 +4143,15 @@ class NetCon(Referency):
             1. Construct the weight source tensor (e.g. ``nn.Parameter``).
             2. Call ``netcon.bind_weight_source(weight_source)`` exactly once (or
                whenever you want to replace the source).
-            3. Use :meth:`schedule_ref` with ``weight_idx`` values indexing into
+            3. Use :meth:`schedule` with ``weight_idx`` values indexing into
                the bound tensor.
 
         * Calling this replaces any previously bound weight source.
         * The tensor is not copied; ``NetCon`` keeps a reference and reads from
           it during simulation.
-        * Gradients flow into the bound tensor whenever
-          ``diff_weights=True`` and the scheduling path is differentiable.
+        * Gradients flow into the bound tensor through differentiable schedule
+          evaluation. ``diff_weights`` separately controls base connection
+          weight gradients.
         """
         if source.device != self.device:
             raise ValueError("weight source must be on same device")
@@ -4061,9 +4164,10 @@ class NetCon(Referency):
         """
         Bind a tensor providing per-event times (ms) for reference-mode scheduling.
 
-        This method enables *reference-mode* scheduled times used by
-        :meth:`schedule_time_ref`. Instead of storing times directly in
-        ``NetCon``, you bind a tensor (usually a parameter) and then reference
+        This method supplies live indexed times for :meth:`schedule` through
+        ``time_idx`` and for its :meth:`schedule_time_ref` adapter. Instead of
+        storing times directly in ``NetCon``, you bind a tensor (usually a
+        parameter) and then reference
         entries in that tensor by integer indices.
 
         Parameters
@@ -4073,7 +4177,7 @@ class NetCon(Referency):
 
             * reside on the same device as the synapse (``self.device``), and
             * have a size at least as large as any ``time_idx`` used in
-              :meth:`schedule_time_ref`.
+              :meth:`schedule` or :meth:`schedule_time_ref`.
 
             Typically this is a ``torch.nn.Parameter`` or another tensor that
             participates in the training loop.
@@ -4084,7 +4188,7 @@ class NetCon(Referency):
 
             1. Construct the time source tensor (e.g. ``nn.Parameter`` in ms).
             2. Call ``netcon.bind_time_source(time_source)``.
-            3. Use :meth:`schedule_time_ref` with ``time_idx`` values indexing into
+            3. Use :meth:`schedule` with ``time_idx`` values indexing into
                the bound tensor.
 
         * Calling this replaces any previously bound time source.
@@ -4112,6 +4216,8 @@ class NetCon(Referency):
         """
         Schedule reference-mode events with weights drawn from a bound source.
 
+        This is the compatible adapter for :meth:`schedule` with ``weight_idx``.
+
         This API is the reference-mode counterpart to :meth:`schedule`. Instead
         of passing explicit weights, you pass integer indices into a tensor
         that has previously been bound via :meth:`bind_weight_source`.
@@ -4129,8 +4235,8 @@ class NetCon(Referency):
             map (see :meth:`_expand_pre_to_con`). Mutually exclusive with
             ``con_indices``.
         times_ms : Sequence[float] or torch.Tensor
-            Event times in milliseconds, one per event. Converted to integer
-            steps via rounding for non-differentiable behavior; used as
+            Event times in milliseconds, one per event. Assigned to the first
+            grid step at or after each event for non-differentiable behavior; used as
             continuous times when ``diff_scheduled_times=True``.
         weight_idx : Sequence[int] or torch.Tensor
             Integer indices into the tensor bound by :meth:`bind_weight_source`.
@@ -4178,64 +4284,13 @@ class NetCon(Referency):
         * The value-mode slots for weights are still allocated but set to zero;
           only reference-mode contributions are active for these events.
         """
-        if self._sched_w_source is None:
-            raise RuntimeError("call bind_weight_source(...) before schedule_ref(...)")
-        if (con_indices is None) == (pre_indices is None):
-            raise ValueError("Provide exactly one of con_indices or pre_indices")
-        if times_ms is None or weight_idx is None:
-            raise ValueError("times_ms and weight_idx are required")
-
-        device, dtype = self.device, self.dtype
-        if pre_indices is not None:
-            con_idx = self._expand_pre_to_con(pre_indices).to(device)
-        else:
-            con_idx = torch.as_tensor(
-                con_indices, device=device, dtype=torch.long
-            ).view(-1)
-
-        tms = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
-        widx = torch.as_tensor(weight_idx, device=device, dtype=torch.long).view(-1)
-        if not (con_idx.numel() == tms.numel() == widx.numel()):
-            raise ValueError("indices, times_ms, and weight_idx must have same length")
-
-        if (con_idx < 0).any() or (con_idx >= self.pre_idx.numel()).any():
-            raise IndexError("connection index out of range")
-        if (widx < 0).any() or (widx >= self._sched_w_source.numel()).any():
-            raise IndexError("weight_idx out of range for bound weight source")
-
-        steps = _causal_step_index(tms, self.dt.to(tms.dtype))
-        if not allow_past:
-            cur = self.global_step.view(())
-            keep = steps >= cur
-            con_idx, tms, steps, widx = (
-                con_idx[keep],
-                tms[keep],
-                steps[keep],
-                widx[keep],
-            )
-            if con_idx.numel() == 0:
-                return
-
-        self._schedule_config_generation = (
-            getattr(self, "_schedule_config_generation", 0) + 1
-        )
-        self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
-        self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
-        self.sched_time_ms = torch.cat([self.sched_time_ms, tms.to(dtype=dtype)], dim=0)
-        self.sched_weight = torch.cat(
-            [
-                self.sched_weight,
-                torch.zeros(con_idx.numel(), device=device, dtype=dtype),
-            ],
-            dim=0,
-        )
-        self.sched_weight_idx = torch.cat([self.sched_weight_idx, widx], dim=0)
-        self.sched_time_idx = torch.cat(
-            [
-                self.sched_time_idx,
-                torch.full((con_idx.numel(),), -1, device=device, dtype=torch.long),
-            ],
-            dim=0,
+        return self._schedule_tensor_events(
+            con_indices=con_indices,
+            pre_indices=pre_indices,
+            times_ms=times_ms,
+            weight_idx=weight_idx,
+            allow_past=allow_past,
+            api="schedule_ref",
         )
 
     def schedule_time_ref(
@@ -4249,6 +4304,8 @@ class NetCon(Referency):
     ):
         """
         Schedule events whose times come by reference from a bound tensor.
+
+        This is the compatible adapter for :meth:`schedule` with ``time_idx``.
 
         This API is the time-reference analogue of :meth:`schedule`. Instead
         of providing explicit event times, you provide integer indices into a
@@ -4315,91 +4372,13 @@ class NetCon(Referency):
           the actual times are obtained at runtime from the bound tensor via
           ``sched_time_idx``.
         """
-        if self._sched_t_source is None:
-            raise RuntimeError(
-                "call bind_time_source(...) before schedule_time_ref(...)"
-            )
-        if (con_indices is None) == (pre_indices is None):
-            raise ValueError("Provide exactly one of con_indices or pre_indices")
-        if time_idx is None:
-            raise ValueError("time_idx is required")
-
-        device, dtype = self.device, self.dtype
-
-        # -> connection indices
-        if pre_indices is not None:
-            con_idx = self._expand_pre_to_con(pre_indices).to(device)
-        else:
-            con_idx = torch.as_tensor(
-                con_indices, device=device, dtype=torch.long
-            ).view(-1)
-
-        tidx = torch.as_tensor(time_idx, device=device, dtype=torch.long).view(-1)
-        if con_idx.numel() != tidx.numel():
-            raise ValueError("con_indices/pre_indices and time_idx must match length")
-
-        if (con_idx < 0).any() or (con_idx >= self.pre_idx.numel()).any():
-            raise IndexError("connection index out of range")
-        if (tidx < 0).any() or (tidx >= self._sched_t_source.numel()).any():
-            raise IndexError("time_idx out of range for bound time source")
-
-        # Use a zeros value slot for times and record sched_time_idx. Keep the
-        # legacy hard-step field populated from the current reference values.
-        tms_now = self._sched_t_source.index_select(0, tidx).to(dtype=dtype)
-        steps = _causal_step_index(tms_now, self.dt.to(dtype))
-        E_before = con_idx.numel()
-        if not allow_past:
-            cur = self.global_step.view(())
-            keep = steps >= cur
-            con_idx, steps, tidx, tms_now = (
-                con_idx[keep],
-                steps[keep],
-                tidx[keep],
-                tms_now[keep],
-            )
-            if con_idx.numel() == 0:
-                return
-        E_after = con_idx.numel()
-
-        # weight value-mode (optional)
-        if torch.is_tensor(weight):
-            w_raw = weight.to(device=device, dtype=dtype).view(-1)
-            if w_raw.numel() == 1:
-                w = w_raw.expand(E_after)
-            elif w_raw.numel() == E_before:
-                w = w_raw[keep] if not allow_past else w_raw
-            elif w_raw.numel() == E_after:
-                w = w_raw
-            else:
-                raise ValueError(
-                    f"weight must be scalar or have length {E_before} "
-                    f"(pre-filter) or {E_after} (post-filter)"
-                )
-        else:
-            w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
-
-        self._schedule_config_generation = (
-            getattr(self, "_schedule_config_generation", 0) + 1
-        )
-        self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
-        self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
-        self.sched_time_ms = torch.cat(
-            [
-                self.sched_time_ms,
-                torch.zeros(E_after, device=device, dtype=dtype),
-            ],
-            dim=0,
-        )  # value slot 0
-        self.sched_time_idx = torch.cat([self.sched_time_idx, tidx], dim=0)
-        self.sched_weight = torch.cat([self.sched_weight, w], dim=0)
-
-        # keep weight ref index aligned (no weight-ref here, so -1)
-        self.sched_weight_idx = torch.cat(
-            [
-                self.sched_weight_idx,
-                torch.full((con_idx.numel(),), -1, device=device, dtype=torch.long),
-            ],
-            dim=0,
+        return self._schedule_tensor_events(
+            con_indices=con_indices,
+            pre_indices=pre_indices,
+            time_idx=time_idx,
+            weight=weight,
+            allow_past=allow_past,
+            api="schedule_time_ref",
         )
 
     def clear_schedule(self):

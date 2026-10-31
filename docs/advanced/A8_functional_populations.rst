@@ -2880,10 +2880,15 @@ dynamically; updates must fit the allocated history.
 Schedule tensors remain configuration sources. ``schedule(...)`` retains
 declaration-time value tensors, including graphs created by expansion or
 masking; ``Network.detach()`` does not rebuild them. For iterative training,
-use ``bind_weight_source(...)`` with ``schedule_ref(...)`` for live indexed
-weights, or ``bind_time_source(...)`` with ``schedule_time_ref(...)`` for live
-indexed times. Each method leaves the other quantity in value mode. Replace or
-redeclare value-mode tensors whose graphs have been consumed by backward.
+bind live sources with ``bind_time_source(...)`` and
+``bind_weight_source(...)``, then supply ``time_idx`` and ``weight_idx`` to
+``schedule(...)``. Either field can also use ordinary values independently.
+The ``schedule_ref`` and ``schedule_time_ref`` convenience methods select
+indexed weights and indexed times, respectively. Replace or redeclare
+value-mode tensors whose graphs have been consumed by backward. See
+:ref:`functional-tensor-schedules` and the complete
+:download:`shared_schedule_bindings.py <../../examples/shared_schedule_bindings.py>`
+example.
 
 Native checkpoints contain source/effective values and runtime state, without
 pending graph-refresh intent. After loading source/effective values from

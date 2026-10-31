@@ -124,6 +124,22 @@ def test_event_and_continuous_start_steps_retain_distinct_native_precision():
     assert continuous.item() == 2
 
 
+@pytest.mark.mps
+@pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS is unavailable")
+def test_mps_event_start_step_transfers_before_float64_clock_calculation():
+    dt = torch.tensor(0.1, device="mps", dtype=torch.float32)
+    reference = torch.zeros(1, device="mps", dtype=torch.long)
+    for time in (
+        0.15,
+        torch.tensor(0.15, device="cpu", dtype=torch.float64),
+        torch.tensor(0.15, device="mps", dtype=torch.float32),
+    ):
+        step = event_initial_step(time, dt, reference)
+        assert step.device == reference.device and step.dtype == reference.dtype
+        assert step.shape == reference.shape
+        assert step.item() == round(float(time) / float(dt))
+
+
 @pytest.mark.parametrize("t", (-1e20, 1e20))
 def test_event_start_step_rejects_overflow_as_native_integer_conversion_does(t):
     with pytest.raises(OverflowError):

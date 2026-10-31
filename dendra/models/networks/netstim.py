@@ -2,7 +2,7 @@ import copy
 import heapq
 import math
 from collections.abc import Iterable
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Optional
 
 import torch
@@ -1107,6 +1107,58 @@ class NetStim(DNModule, Sliceable):
             width=float(getattr(self, "sched_width", 1.0)),
         )
 
+    def _schedule_tensor_events(
+        self,
+        specs,
+        *,
+        times=None,
+        weight=1.0,
+        time_idx=None,
+        weight_idx=None,
+        allow_past=False,
+        api="schedule",
+    ):
+        """Expand one declaration with independently selected value/ref fields."""
+        fields = {}
+        time_reference = time_idx is not None or api == "schedule_time_ref"
+        weight_reference = weight_idx is not None or api == "schedule_ref"
+        if not time_reference:
+            fields["times"] = self._normalize_schedule_tensor(
+                times, len(specs), name="time"
+            )
+        else:
+            fields["time_idx"] = self._normalize_schedule_tensor(
+                time_idx, len(specs), name="time_idx", dtype=torch.long
+            )
+        if not weight_reference:
+            fields["weight"] = self._normalize_schedule_tensor(
+                weight, len(specs), name="weight"
+            )
+        else:
+            fields["weight_idx"] = self._normalize_schedule_tensor(
+                weight_idx, len(specs), name="weight_idx", dtype=torch.long
+            )
+        flat_idx, fields = self._expand_schedule_specs_to_flat_tensors(specs, fields)
+        if api == "schedule":
+            for name in ("time_idx", "weight_idx"):
+                if name in fields and bool((fields[name] < 0).any()):
+                    raise IndexError(f"{name} must contain nonnegative indices")
+        zeros = None
+        if api == "schedule_ref":
+            zeros = torch.zeros_like(fields["times"], dtype=self.dtype())
+        elif time_reference or weight_reference:
+            zeros = torch.zeros(
+                flat_idx.numel(), device=self.device(), dtype=self.dtype()
+            )
+        return self._append_tensor_schedule(
+            flat_idx,
+            times_ms=fields.get("times", zeros),
+            weight=fields.get("weight", zeros),
+            time_idx=fields.get("time_idx"),
+            weight_idx=fields.get("weight_idx"),
+            allow_past=allow_past,
+        )
+
     def schedule(
         self,
         indices,
@@ -1116,6 +1168,8 @@ class NetStim(DNModule, Sliceable):
         times_ms=None,
         allow_past: bool = False,
         differentiable=None,
+        time_idx=None,
+        weight_idx=None,
     ):
         """Add explicit scheduled spikes, optionally with differentiable weights/times.
 
@@ -1132,28 +1186,47 @@ class NetStim(DNModule, Sliceable):
         Tensor schedules contribute their amplitude to ``spike_gate``; downstream
         NetCons must use ``diff_spiking=True`` to propagate gradients into the
         scheduled times or weights.
+
+        ``time_idx`` reads live times from ``bind_time_source`` instead of
+        ``times``/``times_ms``. ``weight_idx`` reads live amplitudes from
+        ``bind_weight_source`` instead of ``weight``. Either or both fields may
+        be indexed. Referenced fields have no additive value offset: the default
+        unit ``weight`` (or ``None``) is omitted when ``weight_idx`` is supplied.
+        Indices must be nonnegative. Indexed events use tensor storage;
+        ``differentiable=False`` selects the incompatible consuming calendar.
         """
         if times is None:
             times = times_ms
         elif times_ms is not None:
             raise ValueError("Provide only one of times or times_ms")
-        if times is None:
+        if time_idx is not None and times is not None:
+            raise ValueError("Provide only one of times/times_ms or time_idx")
+        if weight_idx is not None and not (
+            weight is None or (isinstance(weight, Real) and weight == 1.0)
+        ):
+            raise ValueError("Provide only one of weight or weight_idx")
+        indexed = time_idx is not None or weight_idx is not None
+        if indexed and differentiable is not None and not bool(differentiable):
+            raise ValueError(
+                "Indexed schedules require tensor storage; differentiable=False "
+                "selects the consuming calendar."
+            )
+        if time_idx is not None and self._sched_t_source is None:
+            raise RuntimeError("call bind_time_source(...) before schedule(...)")
+        if weight_idx is not None and self._sched_w_source is None:
+            raise RuntimeError("call bind_weight_source(...) before schedule(...)")
+        if times is None and time_idx is None:
             raise ValueError("scheduled times are required")
 
         specs = self._normalize_index_specs(indices)
 
-        if self._should_use_tensor_schedule(times, weight, differentiable):
-            times_t = self._normalize_schedule_tensor(times, len(specs), name="time")
-            weight_t = self._normalize_schedule_tensor(
-                weight, len(specs), name="weight"
-            )
-            flat_idx, vals = self._expand_schedule_specs_to_flat_tensors(
-                specs, {"times": times_t, "weight": weight_t}
-            )
-            return self._append_tensor_schedule(
-                flat_idx,
-                times_ms=vals["times"],
-                weight=vals["weight"],
+        if indexed or self._should_use_tensor_schedule(times, weight, differentiable):
+            return self._schedule_tensor_events(
+                specs,
+                times=times,
+                weight=weight,
+                time_idx=time_idx,
+                weight_idx=weight_idx,
                 allow_past=allow_past,
             )
 
@@ -1205,19 +1278,12 @@ class NetStim(DNModule, Sliceable):
         if times is None or weight_idx is None:
             raise ValueError("times/times_ms and weight_idx are required")
         specs = self._normalize_index_specs(indices)
-        times_t = self._normalize_schedule_tensor(times, len(specs), name="time")
-        widx_t = self._normalize_schedule_tensor(
-            weight_idx, len(specs), name="weight_idx", dtype=torch.long
-        )
-        flat_idx, vals = self._expand_schedule_specs_to_flat_tensors(
-            specs, {"times": times_t, "weight_idx": widx_t}
-        )
-        return self._append_tensor_schedule(
-            flat_idx,
-            times_ms=vals["times"],
-            weight=torch.zeros_like(vals["times"], dtype=self.dtype()),
-            weight_idx=vals["weight_idx"].to(torch.long),
+        return self._schedule_tensor_events(
+            specs,
+            times=times,
+            weight_idx=weight_idx,
             allow_past=allow_past,
+            api="schedule_ref",
         )
 
     def schedule_time_ref(
@@ -1229,21 +1295,12 @@ class NetStim(DNModule, Sliceable):
                 "call bind_time_source(...) before schedule_time_ref(...)"
             )
         specs = self._normalize_index_specs(indices)
-        tidx_t = self._normalize_schedule_tensor(
-            time_idx, len(specs), name="time_idx", dtype=torch.long
-        )
-        weight_t = self._normalize_schedule_tensor(weight, len(specs), name="weight")
-        flat_idx, vals = self._expand_schedule_specs_to_flat_tensors(
-            specs, {"time_idx": tidx_t, "weight": weight_t}
-        )
-        return self._append_tensor_schedule(
-            flat_idx,
-            times_ms=torch.zeros(
-                vals["weight"].numel(), device=self.device(), dtype=self.dtype()
-            ),
-            weight=vals["weight"],
-            time_idx=vals["time_idx"].to(torch.long),
+        return self._schedule_tensor_events(
+            specs,
+            time_idx=time_idx,
+            weight=weight,
             allow_past=allow_past,
+            api="schedule_time_ref",
         )
 
     @torch.no_grad()

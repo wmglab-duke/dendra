@@ -11,9 +11,12 @@ kernelspec:
 
 Functional NetStim and NetCon schedules accept explicit event times,
 amplitudes, and indexed source vectors, including differentiable values.
-Declare events through the ordinary `schedule`, `schedule_ref`, and
-`schedule_time_ref` APIs before lowering. Event routing and reference indices
-are fixed for a lowered plan; floating values remain explicit inputs.
+Declare events through `schedule` before lowering. Each event's time and
+amplitude can independently use a value or an index into a bound source;
+`time_idx` and `weight_idx` can be supplied together. The `schedule_ref` and
+`schedule_time_ref` convenience methods use the same declaration machinery.
+Event routing and reference indices are fixed for a lowered plan; floating
+values remain explicit inputs.
 
 Index expansion and `allow_past` filtering happen when events are declared,
 before lowering. Editing packet values reevaluates retained events; it does
@@ -32,6 +35,52 @@ NetCon base weights retain the target receiver's units. Reference events gather
 from bound one-dimensional source tensors by integer index. Multiple events,
 and multiple schedule owners, can use the same source entry.
 
+Choose the time and amplitude independently:
+
+| Event time | Event amplitude | `schedule` arguments |
+| --- | --- | --- |
+| Value | Value | `times_ms=times, weight=amplitudes` |
+| Value | Indexed source | `times_ms=times, weight_idx=amplitude_indices` |
+| Indexed source | Value | `time_idx=time_indices, weight=amplitudes` |
+| Indexed source | Indexed source | `time_idx=time_indices, weight_idx=amplitude_indices` |
+
+Bind each referenced source with `bind_time_source` or `bind_weight_source`
+before declaring the events. NetStim accepts its target generator indices as
+`indices`; NetCon accepts `con_indices` or `pre_indices`. NetStim also accepts
+`times` as an alias for `times_ms`. Existing `schedule_ref` and
+`schedule_time_ref` calls select indexed amplitudes and indexed times,
+respectively.
+
+Value and reference arguments for the same field are mutually exclusive.
+With `weight_idx`, omit `weight`: the indexed amplitude is used directly,
+without an added unit amplitude. The default numerical `weight=1.0` and
+`weight=None` also select that indexed amplitude; a Tensor or non-unit numerical
+`weight` cannot accompany `weight_idx`. Canonical reference indices must be
+nonnegative and within the bound source.
+
+The complete
+{download}`shared_schedule_bindings.py <../../examples/shared_schedule_bindings.py>`
+example binds the same trainable time and amplitude vectors to NetStim and
+NetCon, indexes both for each event, and compares native and functional
+optimizer segments and checkpoint continuation:
+
+```{literalinclude} ../../examples/shared_schedule_bindings.py
+:language: python
+:start-after: "# region declarations"
+:end-before: "# endregion declarations"
+:dedent: 4
+```
+
+Value-mode tensors remain declaration-time configuration. Expansion, filtering
+and concatenation can retain nonleaf graphs even when the supplied tensor is a
+leaf. `Network.detach()` does not reconstruct those expressions. For repeated
+optimizer segments, use indexed source leaves for the fields that change;
+replace or redeclare value-mode tensors whose graphs have been consumed.
+Arbitrary external nonleaf source expressions remain caller-owned.
+
+The following example also shows value-only schedules and the convenience
+reference methods:
+
 ```{literalinclude} ../../examples/functional_tensor_schedules.py
 :language: python
 :start-after: "# region declarations"
@@ -42,6 +91,10 @@ and multiple schedule owners, can use the same source entry.
 NetStim's unit-amplitude Python schedule uses consuming heap calendars. Select
 tensor storage with `differentiable=True`, tensor-valued trainable times, or
 non-unit/tensor amplitudes. Indexed reference methods also use tensor storage.
+Any indexed field selects tensor storage for canonical `schedule` calls;
+`differentiable=False` cannot be combined with indexed fields because it selects
+the consuming calendar. For hard tensor scheduling, use
+`set_diff_config(diff_scheduled_times=False)`.
 Functional NetStim lowering also accepts consuming heap calendars with explicit
 cursor carry, as described in {doc}`A16_functional_heap_schedules`.
 
@@ -72,9 +125,10 @@ present. Extraction creates independent leaves, preserving each tensor's
 gradient flag and each source vector's dtype. Gradients from repeated indices
 accumulate into the shared source entry with the native gather/cast policy.
 
-Snapshots from different owners are independent even if their native source
-vectors were shared. Preserve intended parameter sharing by supplying the same
-explicit tensor to both packets:
+Whole-Network lowering preserves shared source aliases across schedule owners.
+Separate NetStim and NetCon extractions create independent snapshots even if
+their native source vectors were shared. For separate extractions, preserve
+intended parameter sharing by supplying the same explicit tensor to both packets:
 
 ```{literalinclude} ../../examples/functional_tensor_schedules.py
 :language: python
@@ -156,6 +210,29 @@ The shown checkpoint retains live parameter references during a fixed-parameter
 forward pass. For a durable snapshot across optimizer updates, serialize it or
 clone/detach parameter values as well as carry. Restore intentional source
 sharing when rebuilding independently cloned packets.
+
+For segmented training, the same indexed source leaves can remain owned by an
+optimizer. After backward and the optimizer update, use `network.detach()` for
+native model history, or `dn.func.detach_continuation(functional, packet)` for a
+functional continuation. Indexed schedule values are gathered from the current
+sources in the next segment:
+
+```{literalinclude} ../../examples/shared_schedule_bindings.py
+:language: python
+:start-after: "# region training"
+:end-before: "# endregion training"
+:dedent: 12
+```
+
+Portable functional restoration creates owned source leaves and preserves
+their aliases; create the receiving optimizer from those restored leaves.
+Native source/runtime restoration uses `receiver.load(...)` followed by
+`receiver.restore_dict_from_checkpoint(...)` and `receiver.detach()` before
+resumed training. The complete shared-binding example checks both paths:
+
+```console
+python examples/shared_schedule_bindings.py
+```
 
 Schedule packets are configuration/parameter inputs rather than changing
 carry. NetCon's native runtime checkpoint excludes schedule configuration;

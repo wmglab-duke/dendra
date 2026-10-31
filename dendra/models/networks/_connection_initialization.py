@@ -17,8 +17,12 @@ def event_initial_step(t, dt, reference):
     # Native event initialization evaluates the ratio in Python Float64 even
     # when the connection uses Float32 or resides on an accelerator. Keep the
     # calculation on CPU, which also supports MPS simulation devices.
+    # Transfer before casting: MPS cannot combine a CPU transfer and Float64
+    # conversion in one operation.
+    if torch.is_tensor(t):
+        t = t.to(device="cpu")
     time = torch.as_tensor(t, device="cpu", dtype=torch.float64).reshape(1)
-    step = torch.round(time / dt.to(device="cpu", dtype=torch.float64).reshape(1))
+    step = torch.round(time / dt.to(device="cpu").to(dtype=torch.float64).reshape(1))
     if not torch._C._are_functorch_transforms_active():
         outside_range = ((step < -(2**63)) | (step >= 2**63)).any()
         if torch.compiler.is_compiling():
