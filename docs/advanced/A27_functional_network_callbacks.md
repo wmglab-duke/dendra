@@ -87,10 +87,10 @@ not make its imperative hooks functionally lowerable.
 (functional-native-network-callbacks)=
 ## Use pure callbacks with native Network execution
 
-Native `Network.run` and `longrun` accept the same bound callback collection
-through `functional_callbacks=`. Build it from the exact initialized source
-Network. Its timestep comes from `network.initialize(dt)`; native Network run
-methods use that timestep without a per-call `dt` argument:
+Native `Network.run`, `longrun` and `longrun_checkpointed` accept the same bound
+callback collection through `functional_callbacks=`. Build it from the exact
+initialized source Network. Its timestep comes from `network.initialize(dt)`;
+native Network run methods use that timestep without a per-call `dt` argument:
 
 ```python
 functional, tensors = dn.func.make_functional_network(network)
@@ -109,10 +109,13 @@ second = network.longrun(
 
 The Network owns its advancing model and connection state. Callback carry is
 separate: pass `results.state` to continue observation phase and reducer totals
-without repeating the shared recording boundary. Both native methods return
+without repeating the shared recording boundary. `run` and `longrun` return
 the existing `FunctionalCallbackResults` mapping when opted in; their ordinary
-`None` return is unchanged when functional callbacks are omitted. Qualified
-Network Recorders and Population-scoped callbacks use the same selections,
+`None` return is unchanged when functional callbacks are omitted.
+`longrun_checkpointed` returns `(loss_or_none, results)`, or
+`(loss_or_none, final_state, results)` with `return_final_state=True`.
+Without a pure collection, it retains its ordinary native loss/state return.
+Qualified Network Recorders and Population-scoped callbacks use the same selections,
 shapes, cadence and pure hooks as functional Network execution.
 
 Unscoped custom callbacks receive the complete Network state and auxiliary
@@ -127,16 +130,40 @@ Fresh Recorder results include the current initial boundary; continued calls
 emit only new accepted samples. Zero-step calls retain the native loop-hook
 boundaries and the same fresh/resumed observation rules. Callback carry does
 not initialize or restore Network simulation state. The bridge requires a
-Network admitted by functional lowering. Native `Network.step`,
-`Network.longrun_checkpointed` and HDF5 storage through this pure bridge are
-currently unsupported. Native hook-list recording and functional host HDF5
-recording retain their existing APIs.
+Network admitted by functional lowering. Native `Network.step` and HDF5 storage
+through this pure bridge are currently unsupported. Native hook-list recording
+and functional host HDF5 recording retain their existing APIs.
+
+### Checkpointed native observations
+
+Continue the same collection through checkpointed execution using
+`functional_callback_state=previous.state`. Callback carry is threaded through
+each checkpointed chunk; recording collection happens outside replay. Native
+`callbacks=` may contribute an independent scalar hook loss and must retain
+their replay-safe behavior. If no native hook contributes a loss,
+`loss_or_none` is `None`; construct an objective from the pure callback results.
+
+```{literalinclude} ../../examples/native_network_functional_callbacks.py
+:language: python
+:start-after: "# region checkpoint"
+:end-before: "# endregion checkpoint"
+:dedent: 8
+```
+
+`final_state` is the existing native Network checkpoint dictionary. It is
+separate from callback carry in `results.state`. With
+`restore_state_after_backward=True`, checkpoint recomputation restores the live
+Network around replay, including gradients taken only through pure recordings
+or reducer results. `safe_checkpoint` keeps its native input-cloning policy.
+The callback return and continuation conventions match the Population bridge;
+native Network checkpoints retain their existing format.
 
 The complete
 {download}`native_network_functional_callbacks.py <../../examples/native_network_functional_callbacks.py>`
-example connects unequal Populations and compares native `run`/`longrun`
-continuation with an independent functional Network. It checks a scoped custom
-summary, qualified and relative recording, cadence and parameter gradients:
+example connects unequal Populations and continues native `run`, checkpointed
+longrun and ordinary longrun against an independent functional Network. It
+checks a scoped custom summary, qualified and relative recording, cadence,
+parameter gradients and live voltage/clock preservation after backward:
 
 ```console
 python examples/native_network_functional_callbacks.py

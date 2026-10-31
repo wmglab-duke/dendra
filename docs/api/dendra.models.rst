@@ -410,8 +410,8 @@ the complete
 :download:`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
 example.
 
-Native ``Network.run`` and ``longrun`` accept the same ``functional_callbacks``
-and ``functional_callback_state`` keywords and opt-in result mapping. Bind the
+Native ``Network.run``, ``longrun`` and ``longrun_checkpointed`` accept the same
+``functional_callbacks`` and ``functional_callback_state`` keywords. Bind the
 collection through ``make_functional_network`` for the exact initialized source
 Network; its initialized timestep remains authoritative. Qualified Network
 Recorders and Population-scoped pure callbacks keep their functional selections,
@@ -419,7 +419,14 @@ cadence and outputs. Unscoped auxiliary data is
 ``{"populations": {name: {"v": ...}}}``; scoped callbacks receive ``{"v": ...}``.
 Native Network state remains on the Network while explicit callback carry
 continues its observation phase. Ordinary native hooks can coexist independently.
-Pure-callback execution on ``Network.step`` and ``longrun_checkpointed`` is
+Opted-in ``run`` and ``longrun`` return ``FunctionalCallbackResults``.
+Checkpointed execution returns ``(loss_or_none, results)``, or
+``(loss_or_none, final_state, results)`` with ``return_final_state=True``.
+Callback carry crosses checkpoint boundaries explicitly and emission collection
+stays outside replay. With ``restore_state_after_backward=True``, recomputation
+preserves the live Network for callback-only gradients as well as native loss
+hooks. Native returns and checkpoint formats remain unchanged when the pure
+collection is omitted. Pure-callback execution on ``Network.step`` is
 currently unsupported. See :ref:`functional-native-network-callbacks` and
 :download:`native_network_functional_callbacks.py <../../examples/native_network_functional_callbacks.py>`.
 

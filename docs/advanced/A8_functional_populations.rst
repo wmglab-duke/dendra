@@ -2670,10 +2670,11 @@ recordings or native loss hooks retain the existing model-restoration behavior.
 
 The auxiliary mapping contains ``{"v": ...}``. A callback requiring other
 auxiliary keys belongs with the corresponding user-authored ``dn.func`` step.
-Native ``Network.run`` and ``longrun`` support bound Network collections
-through the same keyword arguments; see :ref:`functional-native-network-callbacks`
-for qualified recording and Population scopes. Pure-callback execution on
-``Population.step``, ``Network.step`` and ``Network.longrun_checkpointed`` is
+Native ``Network.run``, ``longrun`` and ``longrun_checkpointed`` support bound
+Network collections through the same keyword arguments and return conventions;
+see :ref:`functional-native-network-callbacks` for qualified recording,
+Population scopes and checkpointed continuation. Pure-callback execution on
+``Population.step`` and ``Network.step`` is
 currently unsupported. HDF5 storage through ``functional_callbacks`` is also
 unsupported; use an ordinary native Recorder in ``callbacks`` for native HDF5
 recording, or functional host execution through ``dn.func.run``.

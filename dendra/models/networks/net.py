@@ -24,6 +24,7 @@ from dendra.helpers import (
     jit_enabled_for_scope,
 )
 
+from .._checkpoint import _checkpoint_recompute_contexts
 from ..callbacks import CallbackList, _bind_callback_dt
 from ..core import (
     Population,
@@ -5169,6 +5170,8 @@ class Network(RNGMixin):
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         """Run the network for a long horizon using activation checkpointing.
 
@@ -5200,11 +5203,29 @@ class Network(RNGMixin):
             If ``True``, clone checkpoint input tensors at each chunk boundary
             to guard against inadvertent in-place mutation.
         restore_state_after_backward:
-            If ``True``, restores the forward final state after backward
-            completes (useful because checkpointing replays forward during
-            backward and mutates module state).
+            If ``True``, isolate checkpoint recomputation from the live Network
+            state, including differentiation through pure callback results.
+            Backward, ``autograd.grad`` and higher-order derivatives preserve
+            the state visible before replay, including later simulation calls.
         return_final_state:
             If ``True``, return ``(loss, final_state_dict)``.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Pure observations bound to this exact Network, with the same
+            contract as :meth:`run` and :meth:`longrun`. Carry and emissions
+            pass explicitly through checkpoints; collection runs outside replay.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same callback collection. Resumes sampling phase
+            and reducer totals without another initial observation.
+
+        Returns
+        -------
+        loss or tuple
+            Without pure observations, retains the ordinary loss or
+            ``(loss, final_state_dict)`` return. With pure observations, returns
+            ``(loss_or_none, results)``, or
+            ``(loss_or_none, final_state_dict, results)`` when
+            ``return_final_state=True``. Results contain named observations
+            and explicit callback carry; model state remains on the Network.
 
         Notes
         -----
@@ -5232,12 +5253,17 @@ class Network(RNGMixin):
                 "longrun_checkpointed()."
             )
         self._require_mode_runtime_ready()
+        observer = _native_functional_callback_session(
+            self, functional_callbacks, functional_callback_state
+        )
         self._validate_population_runtime_contracts()
         if isinstance(chunklength, bool) or not isinstance(chunklength, int):
             raise TypeError("chunklength must be a positive integer")
         if chunklength <= 0:
             raise ValueError("chunklength must be a positive integer")
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        if observer is not None:
+            observer.validate_dt(dt_f)
         tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
@@ -5330,19 +5356,8 @@ class Network(RNGMixin):
 
             return _clone_any(sd)
 
-        def _copy_state_containers(sd):
-            """Deep-copy container structure while preserving tensor identity."""
-
-            def _copy_any(v):
-                if isinstance(v, dict):
-                    return {kk: _copy_any(vv) for kk, vv in v.items()}
-                if isinstance(v, list):
-                    return [_copy_any(vv) for vv in v]
-                if isinstance(v, tuple):
-                    return tuple(_copy_any(vv) for vv in v)
-                return v
-
-            return _copy_any(sd)
+        def _checkpoint_contexts():
+            return _checkpoint_recompute_contexts(self)
 
         total_loss = None
         saw_any_loss = False
@@ -5351,6 +5366,8 @@ class Network(RNGMixin):
             with torch.set_grad_enabled(self.training):
                 self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
+                if observer is not None:
+                    observed_state, observed_parts = observer.start()
 
                 # Snapshot boundary state after pre-loop hooks.
                 state = self.state_dict_for_checkpoint()
@@ -5363,12 +5380,20 @@ class Network(RNGMixin):
 
                 # Local alias for speed
                 _checkpoint = torch.utils.checkpoint.checkpoint
+                checkpoint_options = {
+                    "use_reentrant": False,
+                    "determinism_check": "none",
+                }
+                if restore_state_after_backward:
+                    checkpoint_options["context_fn"] = _checkpoint_contexts
 
                 for chunk_idx, t_chunk in enumerate(t_chunks):
                     if pbar is not None:
                         pbar.set_description(f"{t_chunk[0].item():.1f} ms")
 
-                    def _run_chunk(state_in, t_chunk_local=t_chunk):
+                    def _run_chunk(
+                        state_in, observed_state_in=None, t_chunk_local=t_chunk
+                    ):
                         # Optional safety: clone checkpoint inputs to avoid
                         # in-place mutation of checkpoint input tensors.
                         state_local = state_in
@@ -5415,6 +5440,9 @@ class Network(RNGMixin):
 
                         chunk_loss = None
                         saw_loss_local = False
+                        if observer is not None:
+                            observed_state_local = observed_state_in
+                            emissions = []
 
                         for i_t in range(len(t_chunk_local)):
                             # Intra for this step.
@@ -5447,6 +5475,12 @@ class Network(RNGMixin):
                                 compile_network_ops=self.compile_network_ops,
                             )
                             self._advance_runtime_clock()
+                            if observer is not None:
+                                observed_state_local, emitted = observer.update(
+                                    observed_state_local
+                                )
+                                if emitted is not None:
+                                    emissions.append(emitted)
 
                             # Replay-safe loss aggregation via callback returns.
                             for cb in callbacks:
@@ -5474,14 +5508,32 @@ class Network(RNGMixin):
                             device=chunk_loss.device,
                             dtype=torch.int32,
                         )
+                        if observer is not None:
+                            return (
+                                state_out,
+                                observed_state_local,
+                                observer.stack(emissions),
+                                chunk_loss,
+                                saw_loss_flag,
+                            )
                         return state_out, chunk_loss, saw_loss_flag
 
-                    state, chunk_loss, saw_loss_flag = _checkpoint(
-                        _run_chunk,
-                        state,
-                        use_reentrant=False,
-                        determinism_check="none",
-                    )
+                    if observer is None:
+                        state, chunk_loss, saw_loss_flag = _checkpoint(
+                            _run_chunk, state, **checkpoint_options
+                        )
+                    else:
+                        (
+                            state,
+                            observed_state,
+                            emitted_part,
+                            chunk_loss,
+                            saw_loss_flag,
+                        ) = _checkpoint(
+                            _run_chunk, state, observed_state, **checkpoint_options
+                        )
+                        observer.collect(observed_state, observed_parts, emitted_part)
+                        del emitted_part
 
                     total_loss, _ = _add_loss(total_loss, chunk_loss)
                     saw_any_loss = saw_any_loss or bool(int(saw_loss_flag.item()))
@@ -5497,30 +5549,22 @@ class Network(RNGMixin):
 
                 if pbar is not None:
                     pbar.close()
+                if observer is not None:
+                    functional_results = observer.finish(observed_state, observed_parts)
 
         if not saw_any_loss:
+            total_loss = None
+            if observer is None:
+                if return_final_state:
+                    return None, self.state_dict_for_checkpoint()
+                return None
+
+        final_state = self.state_dict_for_checkpoint() if return_final_state else None
+
+        if observer is not None:
             if return_final_state:
-                return None, self.state_dict_for_checkpoint()
-            return None
-
-        final_state = None
-        if restore_state_after_backward or return_final_state:
-            final_state = self.state_dict_for_checkpoint()
-
-        if (
-            restore_state_after_backward
-            and isinstance(total_loss, torch.Tensor)
-            and total_loss.requires_grad
-        ):
-            final_state_for_hook = _copy_state_containers(final_state)
-
-            def _queue_restore(grad, fs=final_state_for_hook):
-                torch.autograd.Variable._execution_engine.queue_callback(
-                    lambda: self.restore_dict_from_checkpoint(fs)
-                )
-                return grad
-
-            total_loss.register_hook(_queue_restore)
+                return total_loss, final_state, functional_results
+            return total_loss, functional_results
 
         if return_final_state:
             return total_loss, final_state

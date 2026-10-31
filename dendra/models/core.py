@@ -58,6 +58,7 @@ from dendra.helpers import (
     op_mc,
     op_sc,
 )
+from dendra.models._checkpoint import _checkpoint_recompute_contexts
 from dendra.models.backend import Backend as A
 from dendra.models.callbacks import (
     Callback,
@@ -7363,42 +7364,8 @@ class Population(P, Sliceable):
             """
             return _clone_nested_state(sd)
 
-        def _copy_state_containers(sd: Dict[str, Any]) -> Dict[str, Any]:
-            """
-            Copy only nested containers (not tensors) so checkpoint replay can
-            restore the captured live bindings after mutating the module.
-            """
-
-            def _copy(value):
-                if isinstance(value, Mapping):
-                    return {key: _copy(item) for key, item in value.items()}
-                if isinstance(value, list):
-                    return [_copy(item) for item in value]
-                if isinstance(value, tuple):
-                    return tuple(_copy(item) for item in value)
-                return value
-
-            return _copy(sd)
-
-        class _PreserveModelStateDuringRecompute:
-            """Reusable context for first- and higher-order checkpoint replay."""
-
-            def __init__(context_self):
-                context_self._previous = []
-
-            def __enter__(context_self):
-                context_self._previous.append(
-                    _copy_state_containers(self.state_dict_for_checkpoint())
-                )
-                return None
-
-            def __exit__(context_self, exc_type, exc_value, traceback):
-                previous = context_self._previous.pop()
-                self.restore_dict_from_checkpoint(previous)
-                return False
-
         def _checkpoint_contexts():
-            return nullcontext(), _PreserveModelStateDuringRecompute()
+            return _checkpoint_recompute_contexts(self)
 
         with torch.nn.utils.parametrize.cached():
             with torch.set_grad_enabled(self.training):

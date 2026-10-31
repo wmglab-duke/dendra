@@ -5,9 +5,10 @@ Run from the repository root::
 
     python examples/native_network_functional_callbacks.py
 
-The bounded CPU example connects unequal Populations, continues observations
-across native run and longrun, and compares scoped results, Recorder cadence
-and parameter gradients with an independent functional Network.
+The bounded CPU example connects unequal Populations and continues observations
+across native run, checkpointed longrun and longrun. It compares scoped results,
+Recorder cadence and parameter gradients with an independent functional Network,
+and checks live-state restoration after a callback-only objective's backward.
 """
 
 from __future__ import annotations
@@ -18,8 +19,8 @@ import dendra as dn
 from dendra.models.mod import graded_syn, pas
 
 DT = 0.025
-FIRST, LAST = 3, 5
-STEPS = FIRST + LAST
+FIRST, CHECKPOINTED, LAST = 3, 3, 2
+STEPS = FIRST + CHECKPOINTED + LAST
 G = "integrator.mech.mechanisms.leak.g_param"
 
 
@@ -113,16 +114,30 @@ def main():
         functional, _ = dn.func.make_functional_network(network)
         callbacks = make_callbacks(functional)
         first = network.run(FIRST * DT, functional_callbacks=callbacks)
+        # region checkpoint
+        hook_loss, boundary_state, middle = network.longrun_checkpointed(
+            CHECKPOINTED * DT,
+            chunklength=2,
+            functional_callbacks=callbacks,
+            functional_callback_state=first.state,
+            safe_checkpoint=True,
+            return_final_state=True,
+        )
+        # With no native loss hook, gradients can use only pure observations.
+        assert hook_loss is None and isinstance(boundary_state, dict)
+        # endregion checkpoint
         last = network.longrun(
             LAST * DT,
             chunklength=2,
             functional_callbacks=callbacks,
-            functional_callback_state=first.state,
+            functional_callback_state=middle.state,
         )
         # endregion continuation
         joined = {
             name: {
-                field: torch.cat((first[name][field], last[name][field]))
+                field: torch.cat(
+                    tuple(result[name][field] for result in (first, middle, last))
+                )
                 for field in first[name]
             }
             for name in ("trace", "coarse", "right_trace")
@@ -176,14 +191,23 @@ def main():
         functional_parameters = tuple(
             tensors.parameters["populations"][name][G] for name in ("left", "right")
         )
+        final_voltage = {
+            name: population.v.detach().clone()
+            for name, population in network.populations.items()
+        }
+        final_time = network.t.detach().clone()
         observed = torch.autograd.grad(native_loss, native_parameters)
         wanted = torch.autograd.grad(functional_loss, functional_parameters)
         for gradient, reference_gradient in zip(observed, wanted, strict=True):
             torch.testing.assert_close(gradient, reference_gradient)
             assert torch.isfinite(gradient).all() and gradient.abs().sum() > 0
+        for name, population in network.populations.items():
+            torch.testing.assert_close(population.v, final_voltage[name])
+        torch.testing.assert_close(network.t, final_time)
         # endregion gradients
         print(
-            "Native Network pure callbacks: scopes, cadence, continuation and gradients passed"
+            "Native Network pure callbacks: scopes, cadence, continuation, "
+            "gradients and checkpoint replay passed"
         )
 
 
