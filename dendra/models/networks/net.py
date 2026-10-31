@@ -272,9 +272,11 @@ def step(
 
 
 def get_local_index(population, mech, index):
-    indices = torch.full_like(
-        population.v, -1, dtype=torch.long, device=population.device()
-    ).flatten()
+    # Lookup storage must not inherit expanded voltage strides: MPS
+    # index_copy_ does not update a singleton zero-stride destination.
+    indices = torch.full(
+        (population.v.numel(),), -1, dtype=torch.long, device=population.device()
+    )
     mech_key_flat = to_flat_idx_mech(population.shape, mech, population.device())
     indices.index_copy_(
         0,
@@ -837,6 +839,8 @@ class WeightExpander(torch.nn.Module):
             ),
         )
         self._sampling_draws = None
+        self._block_lengths = ()
+        self._detached_materializations_pending = False
 
     def forward(self):
         return self.w
@@ -889,6 +893,55 @@ class WeightExpander(torch.nn.Module):
             ]
         )
 
+    def _detach_for_continuation(self, memo):
+        from ._runtime_detach import _detach_runtime_tree
+
+        self.w = _detach_runtime_tree(self.w, memo)
+        self._detached_materializations_pending = True
+
+    def _derive_detached_values(self):
+        """Reconnect current raw inputs without drawing another realization."""
+        draws = self.sampling_draws
+        if draws is not None:
+            value = self.derive_values(draws)
+        else:
+            # Legacy native samplers may have no explicit-draw contract. Frozen
+            # blocks retain their numerical sample; inventing a pathwise
+            # derivative for a trainable block would silently give wrong grads.
+            block_lengths = getattr(self, "_block_lengths", ())
+            if len(block_lengths) != len(self.weights):
+                raise RuntimeError(
+                    "Cannot reconnect detached connection parameters without "
+                    "their initialized block layout. Call initialize()."
+                )
+            values = []
+            stored = self.w.split(block_lengths)
+            for source, n, previous in zip(self.weights, self.n, stored, strict=True):
+                if source.deterministic():
+                    values.append(source.derive_values(n))
+                elif any(
+                    tensor.requires_grad
+                    for tensor in (*source.parameters(), *source.buffers())
+                ):
+                    raise RuntimeError(
+                        "Cannot reconnect detached trainable connection sampling "
+                        "without retained explicit draws. Use a distribution "
+                        "with pure draw/transform hooks and initialize()."
+                    )
+                else:
+                    values.append(previous)
+            value = torch.cat(values)
+        if not torch.is_tensor(value) or (
+            value.shape != self.w.shape
+            or value.dtype != self.w.dtype
+            or value.device != self.w.device
+        ):
+            raise RuntimeError(
+                "Detached connection materialization changed shape, dtype, or "
+                "device. Call initialize()."
+            )
+        return value
+
     def init(self, reinit=True):
         if reinit or not self.w.numel():
             values, draws = [], {}
@@ -904,7 +957,9 @@ class WeightExpander(torch.nn.Module):
                     values.append(source.sample(n))
                     supported = False
             self.w = torch.cat(values)
+            self._block_lengths = tuple(value.shape[0] for value in values)
             self._sampling_draws = draws if supported else None
+        self._detached_materializations_pending = False
         return self
 
     def get_extra_state(self):
@@ -1244,6 +1299,7 @@ class Network(RNGMixin):
         self.dt = None
         self.built = False
         self._mode_requires_initialize = False
+        self._detached_materializations_pending = False
 
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
@@ -1486,6 +1542,112 @@ class Network(RNGMixin):
         for connection in self.continuous_synapses.values():
             _bind_clock_reference(connection, self)
 
+    def detach(self):
+        """Truncate simulation history while retaining live raw parameter sources.
+
+        Populations, connection histories, queued payloads and NetStim carry
+        retain their values. Clocks, duration remainder, RNG streams, schedules
+        and raw parameter/Tensor identities are unchanged. Callback carry has
+        separate ownership; use its collection's ``detach_state`` method.
+
+        The next positive-step, gradient-enabled training call reconnects
+        effective connection parameters from current raw sources and retained
+        independent sampling draws, without resampling or initializing state.
+        Evaluation, no-grad, inference-mode and zero-step calls defer this work.
+        Quantized delay routes remain initialization configuration; dynamic
+        differentiable event delays must fit the allocated history capacity.
+        Externally computed nonleaf sources remain caller-owned.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
+        """
+        memo = {}
+        seen = set()
+        with torch.inference_mode(False), torch.no_grad():
+            for population in self.populations.values():
+                if id(population) not in seen:
+                    seen.add(id(population))
+                    population.detach()
+            for collection in (self.synapses, self.continuous_synapses):
+                for connection in collection.values():
+                    if id(connection) in seen:
+                        continue
+                    seen.add(id(connection))
+                    connection._detach_runtime(memo)
+                    for materializer in (connection.weight, connection.delay_ms):
+                        if id(materializer) not in seen:
+                            seen.add(id(materializer))
+                            materializer._detach_for_continuation(memo)
+            if self.netstim is not None:
+                self.netstim._detach_runtime(memo)
+        self._detached_materializations_pending = True
+        return self
+
+    def detach_(self):
+        """In-place alias of :meth:`detach` that returns ``None``."""
+        self.detach()
+
+    def _refresh_detached_materializations(self, dt, *, grad_enabled=None):
+        if not (
+            self.training
+            and torch.is_grad_enabled()
+            and not torch.is_inference_mode_enabled()
+            and grad_enabled is not False
+        ):
+            return
+        connections = tuple(
+            dict.fromkeys((*self.synapses.values(), *self.continuous_synapses.values()))
+        )
+        pending = tuple(
+            dict.fromkeys(
+                materializer
+                for connection in connections
+                for materializer in (connection.weight, connection.delay_ms)
+                if getattr(materializer, "_detached_materializations_pending", False)
+            )
+        )
+        refresh = getattr(self, "_detached_materializations_pending", False) or bool(
+            pending
+        )
+        if refresh:
+            # Clear authored parameter-wrapper caches before either population
+            # or connection materialization; shared sources see one generation.
+            for module in self.modules():
+                clear_cache = getattr(module, "clear_cache", None)
+                if callable(clear_cache):
+                    clear_cache()
+        pending_populations = tuple(
+            population
+            for population in self.populations.values()
+            if getattr(population, "_detached_materializations_pending", False)
+        )
+        try:
+            _refresh_detached_population_materializations(self.populations, dt)
+            if not refresh:
+                return
+            values = {
+                materializer: materializer._derive_detached_values()
+                for materializer in pending
+            }
+            # Validate all outputs before publishing any new connection values.
+            # Failure preserves queued traffic and leaves the entire attempted
+            # refresh pending, including already rebuilt Population workspaces.
+            for connection in connections:
+                connection._validate_detached_parameter_values(
+                    values.get(connection.weight, connection.weight.w),
+                    values.get(connection.delay_ms, connection.delay_ms.w),
+                )
+            for materializer, value in values.items():
+                materializer.w = value
+                materializer._detached_materializations_pending = False
+            self._detached_materializations_pending = False
+        except Exception:
+            for population in pending_populations:
+                population._detached_materializations_pending = True
+            raise
+
     def train(self, mode=True):
         """
         Switch populations and synapses into training mode.
@@ -1647,7 +1809,43 @@ class Network(RNGMixin):
             return self.t.detach().clone()
         return self._clock_origin + self._clock_step.to(self.t.dtype) * float(self.dt)
 
+    def _promote_pending_inference_runtime(self):
+        if not (
+            getattr(self, "_detached_materializations_pending", False)
+            and not torch.is_inference_mode_enabled()
+        ):
+            return
+        from ._runtime_detach import _promote_inference_runtime_tree
+
+        memo = {}
+        with torch.no_grad():
+            for name in ("t", "_clock_origin", "_clock_step", "_duration_remainder"):
+                value = getattr(self, name)
+                if torch.is_inference(value):
+                    setattr(self, name, _promote_inference_runtime_tree(value, memo))
+            for population in self.populations.values():
+                if any(
+                    torch.is_tensor(value) and torch.is_inference(value)
+                    for value in (
+                        population.t,
+                        population.v,
+                        getattr(population, "vc", None),
+                    )
+                ):
+                    # The existing runtime restoration owns all integrator,
+                    # mechanism, material, delay and stochastic carry fields.
+                    # It preserves raw sources and consumes no random draws.
+                    population.restore_dict_from_checkpoint(
+                        population.state_dict_for_checkpoint()
+                    )
+            for collection in (self.synapses, self.continuous_synapses):
+                for connection in collection.values():
+                    connection._detach_runtime(memo, _promote_inference=True)
+            if self.netstim is not None:
+                self.netstim._detach_runtime(memo, _promote_inference=True)
+
     def _sync_runtime_clock(self):
+        self._promote_pending_inference_runtime()
         with torch.no_grad():
             self.t.copy_(self._runtime_clock_value())
             self._sync_population_clocks()
@@ -3453,6 +3651,7 @@ class Network(RNGMixin):
         # functional stream checkpoints apply until this new native boundary.
         self.__dict__.pop("_functional_connection_sampling_rng", None)
         self._mode_requires_initialize = False
+        self._detached_materializations_pending = False
         return self
 
     def initialize_pops_from_state_cache(self, *, dt=None):
@@ -3711,7 +3910,7 @@ class Network(RNGMixin):
             _bind_callback_dt(c, self.dt)
 
         with _native_callback_storage(observer) as observer, ctx:
-            _refresh_detached_population_materializations(self.populations, dt_f)
+            self._refresh_detached_materializations(dt_f)
             if with_intra:
                 intra = {
                     n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
@@ -3880,7 +4079,7 @@ class Network(RNGMixin):
 
         with _native_callback_storage(observer) as observer, ctx:
             if n_steps:
-                _refresh_detached_population_materializations(self.populations, dt_f)
+                self._refresh_detached_materializations(dt_f)
             self._set_duration_remainder(duration_remainder)
 
             if with_intra:
@@ -4075,7 +4274,7 @@ class Network(RNGMixin):
 
         with _native_callback_storage(observer) as observer, ctx:
             if n_steps:
-                _refresh_detached_population_materializations(self.populations, dt_f)
+                self._refresh_detached_materializations(dt_f)
             self._set_duration_remainder(duration_remainder)
             pre_loop_hook(callbacks, self)
             if observer is not None:
@@ -5469,6 +5668,7 @@ class Network(RNGMixin):
 
         total_loss = None
         saw_any_loss = False
+        ambient_grad_enabled = torch.is_grad_enabled()
 
         with (
             _native_callback_storage(observer) as observer,
@@ -5476,8 +5676,8 @@ class Network(RNGMixin):
         ):
             with torch.set_grad_enabled(self.training):
                 if n_steps:
-                    _refresh_detached_population_materializations(
-                        self.populations, dt_f
+                    self._refresh_detached_materializations(
+                        dt_f, grad_enabled=ambient_grad_enabled
                     )
                 self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)

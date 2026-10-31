@@ -2826,9 +2826,9 @@ outputs remain caller-owned. It performs no callback initialization, update or
 finalization, sampling, state reset or recording I/O. Call it on the host,
 outside compilation, tensor transforms and forward AD.
 
-The same method supports Population-scoped Network callback carry. Network
-model and connection-state truncation remain separate caller responsibilities;
-detaching the observations alone does not truncate their simulation history.
+The same method supports Population-scoped Network callback carry. Pair it with
+``network.detach()`` to truncate the native Network's simulation history;
+detaching the observations alone does not truncate model or connection history.
 For full functional packets, use ``dn.func.detach_continuation`` to handle model
 state and callback carry together. Both APIs use the same callback detachment
 rules. Use portable export/restore when transferring detached owned carry into
@@ -2843,6 +2843,76 @@ trainable LFP fields, reducer totals and cadence:
 .. code-block:: console
 
    python examples/shared_callback_state_detach.py
+
+.. _functional-shared-network-detach:
+
+Truncate connected native Network history
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Use ``network.detach()`` after backward and the optimizer update to truncate
+recurrent Population, connection and stimulus history between training
+segments. It preserves numerical state and the original raw parameter source
+objects, including shared sources. Detach independently owned pure callback
+carry with the same prepared collection:
+
+.. literalinclude:: ../../examples/shared_network_detach.py
+   :language: python
+   :start-after: # region boundary
+   :end-before: # endregion boundary
+   :dedent: 12
+
+``Network.detach()`` returns the Network; ``detach_()`` performs the same work
+and returns ``None``. Neither method initializes or resets components, invokes
+hooks, resamples, advances clocks or changes RNG progression and duration
+remainders. External clock owners are preserved.
+
+The next positive-step training call with gradients enabled reconnects
+connection weight and delay graphs from current raw inputs, replaying retained
+stochastic base draws without selecting a new realization. Population parameter
+and workspace graphs follow the same deferred refresh rules as
+``Population.detach()``. Evaluation, ``no_grad``, inference-mode and zero-step
+calls defer this work. Pending enqueue-time payloads retain their values;
+source-history delivery uses refreshed parameters.
+Initialized quantized delay routes and dispatch remain fixed until
+``initialize()``. Differentiable event delay paths read current delays
+dynamically; updates must fit the allocated history.
+
+Schedule tensors remain configuration sources. ``schedule(...)`` retains
+declaration-time value tensors, including graphs created by expansion or
+masking; ``Network.detach()`` does not rebuild them. For iterative training,
+use ``bind_weight_source(...)`` with ``schedule_ref(...)`` for live indexed
+weights, or ``bind_time_source(...)`` with ``schedule_time_ref(...)`` for live
+indexed times. Each method leaves the other quantity in value mode. Replace or
+redeclare value-mode tensors whose graphs have been consumed by backward.
+
+Native checkpoints contain source/effective values and runtime state, without
+pending graph-refresh intent. After loading source/effective values from
+``network.state_dict()`` and runtime from
+``network.state_dict_for_checkpoint()``, establish a fresh boundary on an
+equivalently initialized training receiver:
+
+.. code-block:: python
+
+   receiver.load(saved_sources)
+   receiver.restore_dict_from_checkpoint(saved_runtime)
+   receiver.detach()
+
+Restore callback carry into the receiver's prepared collection separately;
+use that collection's ``detach_state`` to establish its local gradient boundary.
+
+Externally derived nonleaf source expressions retain their own graphs and
+remain the caller's responsibility. Callback field graphs follow
+``observations.detach_state`` and its ambient gradient mode. For a functional
+``Continuation``, use ``dn.func.detach_continuation`` instead.
+
+The complete
+:download:`shared_network_detach.py <../../examples/shared_network_detach.py>`
+example trains a connected native Network with repeated optimizer updates,
+independently scoped observations and continued sampling:
+
+.. code-block:: console
+
+   python examples/shared_network_detach.py
 
 .. _functional-native-step-callbacks:
 

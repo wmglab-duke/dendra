@@ -1516,13 +1516,35 @@ class NetStim(DNModule, Sliceable):
             Self, detached in-place.
         """
         with torch.no_grad():
-            self.next_stoch_time = self.next_stoch_time.detach()
-            self.next_sched_time = self.next_sched_time.detach()
-            self.spike_counts = self.spike_counts.detach()
-            self.spikes = self.spikes.detach()
-            self.spike_gate = self.spike_gate.detach()
-            self.t_last = self.t_last.detach()
+            self._detach_runtime()
         return self
+
+    def _detach_runtime(self, memo=None, *, _promote_inference=False):
+        from ._runtime_detach import (
+            _detach_runtime_tree,
+            _promote_inference_runtime_tree,
+        )
+
+        memo = {} if memo is None else memo
+        transform = (
+            _promote_inference_runtime_tree
+            if _promote_inference
+            else _detach_runtime_tree
+        )
+        for name in (
+            "next_stoch_time",
+            "next_sched_time",
+            "spike_counts",
+            "spikes",
+            "spike_gate",
+            "t_last",
+            "heap_cursor",
+            "heap_override_active",
+            "heap_head_override",
+        ):
+            value = self._buffers.get(name, self.__dict__.get(name))
+            if value is not None:
+                setattr(self, name, transform(value, memo))
 
     def detach_(self):
         """In-place variant of :meth:`detach` that returns ``None``."""

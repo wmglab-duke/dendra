@@ -606,9 +606,17 @@ cadence, collection identity and emission metadata are retained. It runs no
 callback hooks or recording I/O. Simulation state, connection histories, RNG
 and parameter sources remain separately owned and unchanged.
 
-For a native Population, combine `model.detach()` with
+For a native Population or Network, combine `model.detach()` with
 `callbacks.detach_state(results.state)` after backward and the optimizer update.
-Network model/connection-state truncation remains a separate responsibility.
+`Network.detach()` preserves numerical runtime histories and raw parameter
+sources while cutting their earlier gradients. Connection parameter graphs are
+refreshed on the next positive-step, grad-enabled training call from current
+sources and retained stochastic draws, without resampling. Pending enqueue-time
+payload values are preserved. Initialized quantized delay routes remain fixed
+until `initialize()`; differentiable event delays use current values within the
+allocated history. Externally derived nonleaf source graphs remain the caller's
+responsibility. See {ref}`functional-shared-network-detach` and
+{download}`shared_network_detach.py <../../examples/shared_network_detach.py>`.
 For a complete functional packet, `dn.func.detach_continuation` applies the same
 callback rules together with recurrent model-state detachment. See
 {ref}`functional-shared-callback-state-detach` and

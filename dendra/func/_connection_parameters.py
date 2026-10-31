@@ -138,6 +138,10 @@ def _binding(module, *, identities=True):
                     for name, value in vars(child).items()
                     if not _is_internal_module_state(child, name)
                     and name not in ("_cache", "_sampling_draws")
+                    and not (
+                        isinstance(child, WeightExpander)
+                        and name == "_detached_materializations_pending"
+                    )
                     and not isinstance(value, torch.nn.Module)
                 ),
                 tuple(

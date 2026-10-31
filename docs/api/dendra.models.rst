@@ -450,9 +450,17 @@ gradients follow the ambient gradient mode. No callback initialization, update,
 finalization, sampling, resets or recording I/O are performed. Model state,
 connections, parameters and RNG remain unchanged and separately owned.
 
-For native Population training, call ``model.detach()`` and
+For native Population or Network training, call ``model.detach()`` and
 ``callbacks.detach_state(results.state)`` after backward and the optimizer
-update. Network model/connection truncation remains the caller's responsibility.
+update. ``Network.detach()`` truncates runtime histories while preserving their
+values, raw parameter source identities, clocks and RNG. Its next positive-step,
+grad-enabled training call refreshes connection weight/delay graphs from current
+sources and retained stochastic draws, without resampling or changing pending
+enqueue-time payload values. Initialized quantized delay routes remain fixed
+until ``initialize()``; differentiable event delays read current values within
+the allocated history. ``detach()`` returns the Network; ``detach_()``
+returns ``None``. See :ref:`functional-shared-network-detach` and
+:download:`shared_network_detach.py <../../examples/shared_network_detach.py>`.
 ``dn.func.detach_continuation`` shares these callback rules for full functional
 packets. Source expressions and earlier outputs retain their own graphs. See
 :ref:`functional-shared-callback-state-detach` and

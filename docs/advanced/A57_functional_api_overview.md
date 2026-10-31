@@ -428,10 +428,33 @@ those fields in the next segment. Parameters, model state, connections and RNG
 are untouched. Source expression graphs and earlier outputs remain caller-owned.
 The method performs no callback hooks, sampling, reset or recording I/O.
 
-It also handles Network callback carry, including Population scopes. Network
-model/connection gradient boundaries remain caller-owned. For complete
-functional packets, prefer `dn.func.detach_continuation`, which shares these
-callback rules and also truncates recurrent model state. Portable callback
+It also handles Network callback carry, including Population scopes. For native
+Network training, pair `network.detach()` with
+`observations.detach_state(results.state)` after backward and the optimizer
+update. `Network.detach()` truncates Population, connection and stimulus runtime
+histories while retaining their numerical values and raw parameter source
+objects. It returns the Network; `detach_()` performs the same operation and
+returns `None`.
+
+The next positive-step, grad-enabled training call reconnects connection weight
+and delay graphs from current raw inputs and retained stochastic base draws,
+without resampling. Pending enqueue-time payloads retain their values;
+source-history delivery uses the refreshed parameters. Initialized quantized
+delay routes and dispatch remain fixed until `initialize()`. Differentiable
+event delay paths read current delays dynamically; updates must fit the
+allocated history. Evaluation, `no_grad`, inference mode and zero-step calls
+defer this work. Clocks, RNG, ownership and the duration remainder are preserved,
+without initialization or hooks.
+Externally derived nonleaf source graphs remain the caller's responsibility.
+See {ref}`functional-shared-network-detach` and its connected training example:
+
+```console
+python examples/shared_network_detach.py
+```
+
+For complete functional packets, prefer `dn.func.detach_continuation`, which
+shares these callback rules and also truncates recurrent model state. Portable
+callback
 export/restore supplies detached owned data for transfer into an equivalent
 new collection; `detach_state` retains the current collection identity.
 See {ref}`functional-shared-callback-state-detach` and the complete example:

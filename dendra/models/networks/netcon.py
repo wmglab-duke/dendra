@@ -61,6 +61,7 @@ from ._pending_calendar import (
     pending_calendar_from_legacy,
     pending_calendar_pop,
 )
+from ._runtime_detach import _detach_runtime_tree, _promote_inference_runtime_tree
 from ._source_history import (
     read_float_history,
     read_packed_history,
@@ -784,8 +785,35 @@ class ContinuousCon(Referency):
         )
 
     def detach(self):
-        for n, b in self.named_buffers():
-            setattr(self, n, b.detach())
+        """Detach continued state while preserving raw parameter sources."""
+        memo = {}
+        self._detach_runtime(memo)
+        self.weight._detach_for_continuation(memo)
+        self.delay_ms._detach_for_continuation(memo)
+
+    def _detach_runtime(self, memo=None, *, _promote_inference=False):
+        memo = {} if memo is None else memo
+        transform = (
+            _promote_inference_runtime_tree
+            if _promote_inference
+            else _detach_runtime_tree
+        )
+        for name in (
+            "delivery_buffer",
+            "delivery_mask",
+            "current_time_step",
+            "global_step",
+            "state_cache_pre_value_history",
+        ):
+            if name in self._buffers:
+                setattr(self, name, transform(self._buffers[name], memo))
+
+    def _validate_detached_parameter_values(self, weights, delays):
+        for name, value in (("weights", weights), ("delays", delays)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (self._n_conn,):
+                raise ValueError(
+                    f"ContinuousCon {name} must preserve the initialized connection shape."
+                )
 
     def initialize(
         self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
@@ -804,7 +832,7 @@ class ContinuousCon(Referency):
                     self.t, self.dt, self.global_step, dtype=self.dtype
                 )
             )
-        self.detach()
+        self._detach_runtime()
         self._configure_advance_impl()
         self._continuous_delivery_initialized = True
         return self
@@ -963,7 +991,7 @@ class ContinuousCon(Referency):
         )
         for name, value in state.items():
             getattr(self, name).copy_(value)
-        self.detach()
+        self._detach_runtime()
         self._configure_advance_impl()
         return self
 
@@ -5126,22 +5154,66 @@ class NetCon(Referency):
 
     def detach(self):
         """
-        Detach internal buffers from the current computation graph.
+        Detach runtime history and defer fresh effective parameter graphs.
 
-        This simply calls ``.detach()`` on all registered buffers and rebinds
-        them. It is useful when:
-
-        * starting a fresh forward pass between episodes,
-        * freezing the internal state for inference,
-        * or avoiding backpropagation through previous simulation windows.
-
-        Notes
-        -----
-        * This does not change the values of buffers; it only affects their
-          ``grad_fn`` and autograd history.
+        Pending deliveries retain their enqueue-time values. Raw parameter and
+        schedule sources remain unchanged; initialized quantized routing stays
+        fixed until initialization. Network execution reconnects pending weight
+        and delay materializations at its next gradient-enabled training boundary.
         """
-        for n, b in self.named_buffers():
-            setattr(self, n, b.detach())
+        memo = {}
+        self._detach_runtime(memo)
+        self.weight._detach_for_continuation(memo)
+        self.delay_ms._detach_for_continuation(memo)
+
+    def _detach_runtime(self, memo=None, *, _promote_inference=False):
+        memo = {} if memo is None else memo
+        transform = (
+            _promote_inference_runtime_tree
+            if _promote_inference
+            else _detach_runtime_tree
+        )
+        for name in (
+            "delivery_buffer",
+            "current_time_step",
+            "global_step",
+            "has_spiked",
+            "is_spiking",
+            "spike_history_packed",
+            "source_gate_history",
+            "bitpack_source_has_spiked",
+            "events",
+            "event_queue",
+            "sched_wsum",
+            "sched_counts",
+            "state_cache_gate_history",
+        ):
+            if name in self._buffers:
+                setattr(self, name, transform(self._buffers[name], memo))
+        for name in ("_pending_calendar", "_pending_event_calendar"):
+            value = getattr(self, name, None)
+            if value is not None:
+                setattr(self, name, transform(value, memo))
+
+    def _validate_detached_parameter_values(self, weights, delays):
+        for name, value in (("weights", weights), ("delays", delays)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (self._n_conn,):
+                raise ValueError(
+                    f"NetCon {name} must preserve the initialized connection shape."
+                )
+        if self.training and self.train_flags is not None and self.train_flags[1]:
+            with torch.no_grad():
+                steps = delays.to(dtype=self.dtype) / self.dt.to(
+                    device=delays.device, dtype=self.dtype
+                )
+                if not bool(torch.isfinite(steps).all()) or bool(
+                    (steps >= self.max_delay_steps).any()
+                ):
+                    raise ValueError(
+                        "Updated differentiable NetCon delays must be finite and fit "
+                        "the initialized delay capacity; repair the values or call "
+                        "Network.initialize(..., max_delay_ms=...) with a larger capacity."
+                    )
 
     def initialize(
         self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
@@ -5250,7 +5322,7 @@ class NetCon(Referency):
             self.global_step.copy_(
                 event_initial_step(self.t, self.dt, self.global_step)
             )
-        self.detach()
+        self._detach_runtime()
         self._mode_requires_initialize = False
         self._schedule_config_generation = getattr(
             self, "_schedule_config_generation", 0
@@ -5457,7 +5529,7 @@ class NetCon(Referency):
                         *(restored[prefix + name] for name in CalendarState._fields)
                     )
                 )
-        self.detach()
+        self._detach_runtime()
         return self
 
     def state_dict_for_checkpoint(self):
