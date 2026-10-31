@@ -394,24 +394,25 @@ for the full contract and runnable custom reducer/emitter example.
 .. autoclass:: dendra.func.FunctionalCallbacks
    :members: export_state, restore_state
 
-Native ``Population.run``, ``longrun`` and ``longrun_checkpointed`` accept a
-bound collection through ``functional_callbacks=`` and explicit continuation
+Native ``Population.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
+a bound collection through ``functional_callbacks=`` and explicit continuation
 through ``functional_callback_state=results.state``. The collection must bind
 the exact source Population and matching timestep. Native model state remains
-on the Population. Opted-in ``run`` and ``longrun`` return the existing
-``FunctionalCallbackResults`` mapping; their normal ``None`` return is
-unchanged otherwise. Checkpointed execution retains its loss/result tuples.
+on the Population. Opted-in ``step``, ``run`` and ``longrun`` return the existing
+``FunctionalCallbackResults`` mapping. Without a pure collection, ``step``
+returns the model for chaining and ``run``/``longrun`` return ``None``.
+Checkpointed execution retains its loss/result tuples.
 Ordinary ``callbacks=`` can coexist independently. The bridge supplies a
 gradient-preserving state snapshot and auxiliary ``{"v": ...}``, with pure
 updates after clock advancement and before native post-step hooks.
-``Population.step`` and functional-bridge HDF5 storage are currently
-unsupported. See :ref:`functional-native-population-callbacks` and
+Functional-bridge HDF5 storage is currently unsupported. See
+:ref:`functional-native-population-callbacks` and
 the complete
 :download:`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
 example.
 
-Native ``Network.run``, ``longrun`` and ``longrun_checkpointed`` accept the same
-``functional_callbacks`` and ``functional_callback_state`` keywords. Bind the
+Native ``Network.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
+the same ``functional_callbacks`` and ``functional_callback_state`` keywords. Bind the
 collection through ``make_functional_network`` for the exact initialized source
 Network; its initialized timestep remains authoritative. Qualified Network
 Recorders and Population-scoped pure callbacks keep their functional selections,
@@ -419,16 +420,27 @@ cadence and outputs. Unscoped auxiliary data is
 ``{"populations": {name: {"v": ...}}}``; scoped callbacks receive ``{"v": ...}``.
 Native Network state remains on the Network while explicit callback carry
 continues its observation phase. Ordinary native hooks can coexist independently.
-Opted-in ``run`` and ``longrun`` return ``FunctionalCallbackResults``.
+Opted-in ``step``, ``run`` and ``longrun`` return ``FunctionalCallbackResults``;
+default ``step`` keeps its chainable Network return.
 Checkpointed execution returns ``(loss_or_none, results)``, or
 ``(loss_or_none, final_state, results)`` with ``return_final_state=True``.
 Callback carry crosses checkpoint boundaries explicitly and emission collection
 stays outside replay. With ``restore_state_after_backward=True``, recomputation
 preserves the live Network for callback-only gradients as well as native loss
 hooks. Native returns and checkpoint formats remain unchanged when the pure
-collection is omitted. Pure-callback execution on ``Network.step`` is
-currently unsupported. See :ref:`functional-native-network-callbacks` and
+collection is omitted. See :ref:`functional-native-network-callbacks` and
 :download:`native_network_functional_callbacks.py <../../examples/native_network_functional_callbacks.py>`.
+
+``loop_hooks`` controls native imperative loop hooks only. Pure initialization
+runs when callback carry is omitted; supplied carry resumes sampling phase and
+reducer totals. Fresh full-rate recording includes initial and post-step frames;
+continued steps emit only new selected frames. ``dn.step``, ``dn.step_population``
+and ``dn.step_network`` accept the same callback keywords and retain the same
+default/opt-in return conventions. Callback carry can continue across native
+step and run-family calls. Portable callback carry uses the existing
+``export_state``/``restore_state`` protocol and restores no native model state.
+See :ref:`functional-native-step-callbacks` and
+:download:`native_step_functional_callbacks.py <../../examples/native_step_functional_callbacks.py>`.
 
 Intrinsic activity
 ------------------

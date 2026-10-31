@@ -215,7 +215,7 @@ Recorder uses local paths such as `"v"` or `"hh.m"`; named Slice regions also
 select components within a concatenated MultiPopulation. Native results belong
 to the inner callback; functional results and continuation use independent
 explicit carry. Pure callback children bind through `functional.make_callbacks`
-and can also observe native Network `run`, `longrun` and `longrun_checkpointed`
+and can also observe native Network `step`, `run`, `longrun` and `longrun_checkpointed`
 through that collection.
 They do not run through the ordinary imperative `callbacks=` hook list.
 See the {ref}`shared scope example <shared-population-callback-scopes>` and
@@ -251,7 +251,7 @@ Population and Network execution.
 (functional-native-callback-execution)=
 ### Use pure callbacks with native execution
 
-A bound pure callback collection also works with native `Population.run`,
+A bound pure callback collection also works with native `Population.step`, `run`,
 `longrun` and `longrun_checkpointed`. Build the collection from
 `make_functional` for the exact source Population and the same timestep:
 
@@ -267,10 +267,11 @@ second = model.longrun(
 ```
 
 The Population owns its advancing model state; callback carry is separate.
-`run` and `longrun` return `FunctionalCallbackResults` when this option is
-supplied, with named results and a `.state` carry. Their normal `None` return
-is unchanged when it is omitted. Checkpointed execution keeps its existing
-`(loss_or_none, results)` or `(loss_or_none, final_state, results)` form.
+`step`, `run` and `longrun` return `FunctionalCallbackResults` when this option is
+supplied, with named results and a `.state` carry. Without it, `step` returns
+the model for chaining and `run`/`longrun` return `None`. Checkpointed execution
+keeps its existing `(loss_or_none, results)` or
+`(loss_or_none, final_state, results)` form.
 Native `callbacks=` can coexist independently. Pure updates observe accepted
 state after clock advancement and before native post-step hooks, with a
 gradient-preserving tensor-frame snapshot. Continued Recorder segments omit
@@ -278,9 +279,9 @@ the shared boundary and preserve cadence; reducer results stay cumulative.
 
 One `FunctionalCallback` definition supplies the same pure analysis for native
 and functional Population dynamics. The native Population auxiliary packet
-contains `{"v": ...}`. `Population.step` and HDF5 storage through this pure
-bridge are currently unsupported. Ordinary native Recorder
-HDF5 recording remains available through `callbacks=`. See
+contains `{"v": ...}`. HDF5 storage through this pure bridge is currently
+unsupported. Ordinary native Recorder HDF5 recording remains available through
+`callbacks=`. See
 {ref}`functional-native-population-callbacks` for the complete contract and
 {download}`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
 for a runnable custom reducer, cadence, native loss, gradients and replay:
@@ -289,14 +290,15 @@ for a runnable custom reducer, cadence, native loss, gradients and replay:
 python examples/native_functional_callbacks.py
 ```
 
-Native `Network.run`, `longrun` and `longrun_checkpointed` accept the same two
-keyword arguments. Create the bound collection with `dn.func.make_functional_network(network)`
-from the exact initialized source Network. Qualified Recorders select fields
+Native `Network.step`, `run`, `longrun` and `longrun_checkpointed` accept the same
+two keyword arguments. Create the bound collection with
+`dn.func.make_functional_network(network)` from the exact initialized source
+Network. Qualified Recorders select fields
 such as `"left.v"`; `dn.callbacks.PopulationCallback("right", callback)`
 selects one Population for a relative Recorder or custom pure analysis. The
 Network retains its simulation state while `results.state` continues callback
-carry. `run` and `longrun` return `FunctionalCallbackResults` only when opted in;
-checkpointed execution appends it to the existing loss/state return, producing
+carry. `step`, `run` and `longrun` return `FunctionalCallbackResults` only when
+opted in; checkpointed execution appends it to the existing loss/state return, producing
 `(loss_or_none, results)` or `(loss_or_none, final_state, results)`.
 They use the timestep established by `network.initialize(dt)`.
 
@@ -305,8 +307,7 @@ The native Network auxiliary packet is
 Callback carry remains explicit through checkpointed chunks, with recording
 collection outside replay. With the default `restore_state_after_backward=True`,
 recomputation preserves the live Network even when the objective uses only
-pure callback results and no native hook loss. Pure-callback execution on native
-`Network.step` is currently unsupported. See
+pure callback results and no native hook loss. See
 {ref}`functional-native-network-callbacks` and the complete
 {download}`native_network_functional_callbacks.py <../../examples/native_network_functional_callbacks.py>`
 example for unequal connected Populations, scope parity, cadence, gradients
@@ -314,6 +315,21 @@ and checkpoint replay:
 
 ```console
 python examples/native_network_functional_callbacks.py
+```
+
+For manual control loops, pass callback carry through consecutive native
+`step` calls. `loop_hooks` controls only ordinary native loop hooks; pure
+initialization runs when carry is absent. A fresh full-rate Recorder emits its
+initial and post-step frames; continued steps emit only new frames, preserving
+cadence and reducer totals. `dn.step`, `dn.step_population` and `dn.step_network`
+accept the same callback keywords and return results only when opted in.
+See {ref}`functional-native-step-callbacks` and
+{download}`native_step_functional_callbacks.py <../../examples/native_step_functional_callbacks.py>`
+for a Population/Network control-loop example with mixed-method continuation,
+gradients and portable callback carry:
+
+```console
+python examples/native_step_functional_callbacks.py
 ```
 
 ### Continue functional execution

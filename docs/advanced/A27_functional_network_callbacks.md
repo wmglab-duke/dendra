@@ -87,10 +87,11 @@ not make its imperative hooks functionally lowerable.
 (functional-native-network-callbacks)=
 ## Use pure callbacks with native Network execution
 
-Native `Network.run`, `longrun` and `longrun_checkpointed` accept the same bound
-callback collection through `functional_callbacks=`. Build it from the exact
-initialized source Network. Its timestep comes from `network.initialize(dt)`;
-native Network run methods use that timestep without a per-call `dt` argument:
+Native `Network.step`, `run`, `longrun` and `longrun_checkpointed` accept the same
+bound callback collection through `functional_callbacks=`. Build it from the
+exact initialized source Network. Its timestep comes from
+`network.initialize(dt)`; native Network execution uses that timestep without
+a per-call `dt` argument:
 
 ```python
 functional, tensors = dn.func.make_functional_network(network)
@@ -109,9 +110,10 @@ second = network.longrun(
 
 The Network owns its advancing model and connection state. Callback carry is
 separate: pass `results.state` to continue observation phase and reducer totals
-without repeating the shared recording boundary. `run` and `longrun` return
+without repeating the shared recording boundary. `step`, `run` and `longrun` return
 the existing `FunctionalCallbackResults` mapping when opted in; their ordinary
-`None` return is unchanged when functional callbacks are omitted.
+return is unchanged when functional callbacks are omitted: `step` returns the
+Network for chaining, while `run` and `longrun` return `None`.
 `longrun_checkpointed` returns `(loss_or_none, results)`, or
 `(loss_or_none, final_state, results)` with `return_final_state=True`.
 Without a pure collection, it retains its ordinary native loss/state return.
@@ -130,9 +132,18 @@ Fresh Recorder results include the current initial boundary; continued calls
 emit only new accepted samples. Zero-step calls retain the native loop-hook
 boundaries and the same fresh/resumed observation rules. Callback carry does
 not initialize or restore Network simulation state. The bridge requires a
-Network admitted by functional lowering. Native `Network.step` and HDF5 storage
-through this pure bridge are currently unsupported. Native hook-list recording
+Network admitted by functional lowering. HDF5 storage through this pure bridge
+is currently unsupported. Native hook-list recording
 and functional host HDF5 recording retain their existing APIs.
+
+Manual `Network.step` calls use the same collection and carry, including
+Population scopes and qualified recording. `loop_hooks` governs only native
+loop hooks; pure initialization runs when callback carry is absent. A continued
+step emits only its new selected samples and retains reducer totals. The
+`dn.step` and `dn.step_network` helpers expose the same callback arguments.
+See {ref}`functional-native-step-callbacks` and the complete
+{download}`native_step_functional_callbacks.py <../../examples/native_step_functional_callbacks.py>`
+example for manual stepping, mixed-method continuation and portable carry.
 
 ### Checkpointed native observations
 

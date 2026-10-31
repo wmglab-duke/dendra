@@ -15,6 +15,8 @@ def step(
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
     loop_hooks: bool = False,
+    functional_callbacks=None,
+    functional_callback_state=None,
 ):
     """Advance a Dendra Population or Network by one timestep.
 
@@ -39,15 +41,31 @@ def step(
     loop_hooks : bool, optional
         Whether to call ``pre_loop_hook`` and ``post_loop_hook`` around the
         single step.
+    functional_callbacks : dendra.func.FunctionalCallbacks, optional
+        Pure observations bound to this exact model. They observe the accepted
+        state after clock advancement and before native post-step hooks.
+    functional_callback_state : dendra.func.FunctionalCallbackState, optional
+        Carry from the same callback collection. Supply the previous result's
+        ``state`` to continue sampling phase and reducer totals without another
+        initial observation. Native ``loop_hooks`` remain independent.
 
     Returns
     -------
-    Population or Network
-        The advanced object, returned for chaining.
+    Population, Network or dendra.func.FunctionalCallbackResults
+        The advanced object for chaining when pure observations are omitted.
+        With pure observations, returns their named results and explicit callback
+        carry; simulation state remains on the model.
     """
     # Import lazily to keep the top-level helper lightweight and avoid creating
     # extra import-time coupling between dendra.__init__ and the model classes.
     from .models import Network, Population
+
+    callback_options = {}
+    if functional_callbacks is not None or functional_callback_state is not None:
+        callback_options = {
+            "functional_callbacks": functional_callbacks,
+            "functional_callback_state": functional_callback_state,
+        }
 
     if isinstance(model, Population):
         return model.step(
@@ -56,6 +74,7 @@ def step(
             extra=extra,
             callbacks=callbacks,
             loop_hooks=loop_hooks,
+            **callback_options,
         )
 
     if isinstance(model, Network):
@@ -75,7 +94,9 @@ def step(
                     "was passed to dn.step(). Reinitialize/build the network with "
                     "the desired timestep instead."
                 )
-        return model.step(extra=extra, callbacks=callbacks, loop_hooks=loop_hooks)
+        return model.step(
+            extra=extra, callbacks=callbacks, loop_hooks=loop_hooks, **callback_options
+        )
 
     raise TypeError(
         f"dn.step expects a dendra Population or Network; got {type(model).__name__}."
@@ -90,6 +111,8 @@ def step_population(
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
     loop_hooks: bool = False,
+    functional_callbacks=None,
+    functional_callback_state=None,
 ):
     """Advance a Dendra Population by one timestep.
 
@@ -111,18 +134,33 @@ def step_population(
     loop_hooks : bool, optional
         Whether to call ``pre_loop_hook`` and ``post_loop_hook`` around the
         single step.
+    functional_callbacks : dendra.func.FunctionalCallbacks, optional
+        Pure observations bound to this exact Population.
+    functional_callback_state : dendra.func.FunctionalCallbackState, optional
+        Carry from the same callback collection. Supply the previous result's
+        ``state`` to continue its sampling phase and reducer totals without
+        another initial observation.
+
     Returns
     -------
-    Population
-        The advanced population, returned for chaining.
+    Population or dendra.func.FunctionalCallbackResults
+        The advanced Population for chaining when pure observations are omitted.
+        With pure observations, returns their named results and explicit callback
+        carry; simulation state remains on the Population.
     """
-
+    callback_options = {}
+    if functional_callbacks is not None or functional_callback_state is not None:
+        callback_options = {
+            "functional_callbacks": functional_callbacks,
+            "functional_callback_state": functional_callback_state,
+        }
     return population.step(
         dt=dt,
         ve=ve,
         extra=extra,
         callbacks=callbacks,
         loop_hooks=loop_hooks,
+        **callback_options,
     )
 
 
@@ -132,6 +170,8 @@ def step_network(
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
     loop_hooks: bool = False,
+    functional_callbacks=None,
+    functional_callback_state=None,
 ):
     """Advance a Dendra Network by one timestep.
 
@@ -149,10 +189,26 @@ def step_network(
     loop_hooks : bool, optional
         Whether to call ``pre_loop_hook`` and ``post_loop_hook`` around the
         single step.
+    functional_callbacks : dendra.func.FunctionalCallbacks, optional
+        Pure observations bound to this exact Network.
+    functional_callback_state : dendra.func.FunctionalCallbackState, optional
+        Carry from the same callback collection. Supply the previous result's
+        ``state`` to continue its sampling phase and reducer totals without
+        another initial observation.
+
     Returns
     -------
-    Network
-        The advanced network, returned for chaining.
+    Network or dendra.func.FunctionalCallbackResults
+        The advanced Network for chaining when pure observations are omitted.
+        With pure observations, returns their named results and explicit callback
+        carry; simulation state remains on the Network.
     """
-
-    return network.step(extra=extra, callbacks=callbacks, loop_hooks=loop_hooks)
+    callback_options = {}
+    if functional_callbacks is not None or functional_callback_state is not None:
+        callback_options = {
+            "functional_callbacks": functional_callbacks,
+            "functional_callback_state": functional_callback_state,
+        }
+    return network.step(
+        extra=extra, callbacks=callbacks, loop_hooks=loop_hooks, **callback_options
+    )

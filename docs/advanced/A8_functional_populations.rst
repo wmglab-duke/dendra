@@ -2619,10 +2619,10 @@ Pure callbacks with native Population execution
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 The same callback plan can observe its source model through native
-``Population.run``, ``longrun`` and ``longrun_checkpointed``. Define an analysis
-once with ``FunctionalCallback.initialize``, ``update`` and ``finalize``, then
-use it with either native or functional dynamics. Native execution keeps model
-state on the Population and returns callback results with explicit carry:
+``Population.step``, ``run``, ``longrun`` and ``longrun_checkpointed``. Define an
+analysis once with ``FunctionalCallback.initialize``, ``update`` and ``finalize``,
+then use it with either native or functional dynamics. Native execution keeps
+model state on the Population and returns callback results with explicit carry:
 
 .. code-block:: python
 
@@ -2642,11 +2642,12 @@ repeated execution. Supplying callback carry resumes its observation phase;
 the Population itself retains the simulation state. Callback carry does not
 restore or initialize the model.
 
-``run`` and ``longrun`` return the existing ``FunctionalCallbackResults``
+``step``, ``run`` and ``longrun`` return the existing ``FunctionalCallbackResults``
 mapping when ``functional_callbacks`` is supplied. Access named observations
 with ``results[name]`` and continue with
 ``functional_callback_state=results.state``. Without functional callbacks,
-their ordinary ``None`` return is unchanged. ``longrun_checkpointed`` retains
+``step`` returns the model for chaining, while ``run`` and ``longrun`` retain
+their ordinary ``None`` return. ``longrun_checkpointed`` retains
 its loss return contract: ``(loss_or_none, results)``, or
 ``(loss_or_none, final_state, results)`` with ``return_final_state=True``.
 
@@ -2670,20 +2671,19 @@ recordings or native loss hooks retain the existing model-restoration behavior.
 
 The auxiliary mapping contains ``{"v": ...}``. A callback requiring other
 auxiliary keys belongs with the corresponding user-authored ``dn.func`` step.
-Native ``Network.run``, ``longrun`` and ``longrun_checkpointed`` support bound
-Network collections through the same keyword arguments and return conventions;
-see :ref:`functional-native-network-callbacks` for qualified recording,
-Population scopes and checkpointed continuation. Pure-callback execution on
-``Population.step`` and ``Network.step`` is
-currently unsupported. HDF5 storage through ``functional_callbacks`` is also
-unsupported; use an ordinary native Recorder in ``callbacks`` for native HDF5
-recording, or functional host execution through ``dn.func.run``.
+Native ``Network.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` support
+bound Network collections through the same keyword arguments and return
+conventions; see :ref:`functional-native-network-callbacks` for qualified
+recording, Population scopes and checkpointed continuation. HDF5 storage through
+``functional_callbacks`` is unsupported; use an ordinary native Recorder in
+``callbacks`` for native HDF5 recording, or functional host execution through
+``dn.func.run``.
 
 The complete
 :download:`native_functional_callbacks.py <../../examples/native_functional_callbacks.py>`
-example continues a custom pure summary and Recorders across all three native
-methods. It compares functional trajectories, cadence and gradients, and checks
-that checkpoint replay preserves the live model:
+example continues a custom pure summary and Recorders across native ``run``,
+``longrun`` and ``longrun_checkpointed``. It compares functional trajectories,
+cadence and gradients, and checks that checkpoint replay preserves the live model:
 
 .. code-block:: console
 
@@ -2694,6 +2694,68 @@ that checkpoint replay preserves the live model:
    :start-after: # region checkpoint
    :end-before: # endregion checkpoint
    :dedent: 8
+
+.. _functional-native-step-callbacks:
+
+Manually controlled native steps
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``Population.step`` and ``Network.step`` accept the same bound collection and
+explicit callback carry. With functional callbacks omitted, they return the
+model itself for chaining. Opted-in calls return ``FunctionalCallbackResults``;
+the model remains the owner of its advancing simulation state:
+
+.. code-block:: python
+
+   carry = None
+   for _ in range(10):
+       result = model.step(
+           dt=DT, functional_callbacks=callbacks,
+           functional_callback_state=carry,
+       )
+       carry = result.state
+       voltage = result["trace"]["v"]
+
+For a Network, omit ``dt``: its initialized timestep is authoritative. The
+collection must bind to the exact source model and matching timestep.
+``dn.step``, ``dn.step_population`` and ``dn.step_network`` accept the same
+functional callback arguments and preserve these return conventions.
+
+``loop_hooks`` controls only ordinary native pre/post-loop hooks. Pure callback
+initialization is controlled by callback carry: it runs when carry is omitted,
+after any requested native pre-loop hook and before the native pre-step hook.
+Providing carry continues its phase even with ``loop_hooks=True``. Pure updates
+observe the accepted state after clock advancement and before the native
+post-step hook; result completion follows any requested native post-loop hook.
+
+A fresh full-rate Recorder result contains the initial and post-step frames.
+A continued step emits only its new accepted frame; cadenced recording may
+return an empty segment when that step is not selected. Carry can continue
+between ``step``, ``run``, ``longrun`` and ``longrun_checkpointed`` without
+resetting reducer totals or duplicating the shared boundary.
+
+The complete
+:download:`native_step_functional_callbacks.py <../../examples/native_step_functional_callbacks.py>`
+example manually steps a Population and a Network, then continues through the
+run-family methods. It compares pure summaries, full/cadenced recording and
+gradients with independent functional execution:
+
+.. code-block:: console
+
+   python examples/native_step_functional_callbacks.py
+
+.. literalinclude:: ../../examples/native_step_functional_callbacks.py
+   :language: python
+   :start-after: # region manual
+   :end-before: # endregion manual
+   :dedent: 4
+
+Existing ``callbacks.export_state`` and ``restore_state`` support portable
+callback carry, including custom analyses with ``checkpoint_configuration``.
+Portable carry is detached and excludes recording history. It does not restore
+the native model: keep the model at the matching boundary or restore its native
+checkpoint separately. The example restores callback carry at its live model's
+current boundary and takes another step.
 
 Custom pure callbacks
 ^^^^^^^^^^^^^^^^^^^^^

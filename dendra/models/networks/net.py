@@ -3570,7 +3570,15 @@ class Network(RNGMixin):
                 clear_deliveries=clear_deliveries,
             )
 
-    def step(self, *, extra=None, callbacks=None, loop_hooks: bool = False):
+    def step(
+        self,
+        *,
+        extra=None,
+        callbacks=None,
+        loop_hooks: bool = False,
+        functional_callbacks=None,
+        functional_callback_state=None,
+    ):
         """Advance this network by exactly one timestep.
 
         The timestep is the network timestep established by ``initialize(dt)``
@@ -3594,11 +3602,23 @@ class Network(RNGMixin):
         loop_hooks : bool, optional
             If ``True``, also call ``pre_loop_hook`` before the step and
             ``post_loop_hook`` after the step.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Pure observations bound to this exact Network with
+            ``functional.make_callbacks(...)``. Qualified Recorders and
+            ``PopulationCallback`` scopes retain their functional contract.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same callback collection. Without carry, initialize
+            observations before the step; supplied carry continues sampling
+            phase and reducer totals without another initial observation.
+            ``loop_hooks`` governs native hooks independently of this carry.
 
         Returns
         -------
-        Network
-            ``self``, for chaining.
+        Network or dendra.func.FunctionalCallbackResults
+            Returns ``self`` for chaining when pure observations are omitted.
+            With pure observations, returns their named results and explicit
+            callback carry. Model state remains on the Network. Observations
+            preserve gradients and own their sampled tensor values.
         """
         if self.dt is None:
             raise RuntimeError(
@@ -3611,9 +3631,14 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before step()."
             )
         self._require_mode_runtime_ready()
+        observer = _native_functional_callback_session(
+            self, functional_callbacks, functional_callback_state
+        )
         self._validate_population_runtime_contracts()
 
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        if observer is not None:
+            observer.validate_dt(dt_f)
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
 
@@ -3663,6 +3688,8 @@ class Network(RNGMixin):
 
             if loop_hooks:
                 pre_loop_hook(callbacks, self)
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
             pre_step_hook(callbacks, self)
 
             intra_c = prepare_intra({}, intra, 0) if with_intra else {}
@@ -3682,9 +3709,16 @@ class Network(RNGMixin):
             )
             self._advance_runtime_clock()
 
+            if observer is not None:
+                observed_state, emitted = observer.update(observed_state)
+                observer.collect(
+                    observed_state, observed_parts, observer.stack([emitted])
+                )
             post_step_hook(callbacks, self)
             if loop_hooks:
                 post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
         return self
 

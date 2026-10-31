@@ -134,3 +134,103 @@ def test_network_instance_step_rejects_stale_wiring():
 
     with pytest.raises(RuntimeError, match="wiring has changed"):
         net.step()
+
+
+class _StepTarget:
+    """Avoid constructing numerical models when checking helper forwarding."""
+
+    def __init__(self):
+        torch.nn.Module.__init__(self)
+        self.initialized = self.built = True
+        self.dt = 0.01
+        self.synapses = {}
+        self._mode_requires_initialize = False
+        self.received = None
+
+
+class _PopulationStepTarget(_StepTarget, dn.Population):
+    def step(self, dt=None, *, ve=None, extra=None, callbacks=None, loop_hooks=False):
+        self.received = {
+            "dt": dt,
+            "ve": ve,
+            "extra": extra,
+            "callbacks": callbacks,
+            "loop_hooks": loop_hooks,
+        }
+        return self
+
+
+class _NetworkStepTarget(_StepTarget, dn.Network):
+    def step(self, *, extra=None, callbacks=None, loop_hooks=False):
+        self.received = {
+            "extra": extra,
+            "callbacks": callbacks,
+            "loop_hooks": loop_hooks,
+        }
+        return self
+
+
+_STEP_HELPERS = (
+    (dn.step, _PopulationStepTarget),
+    (dn.step_population, _PopulationStepTarget),
+    (dn.step, _NetworkStepTarget),
+    (dn.step_network, _NetworkStepTarget),
+)
+
+
+@pytest.mark.parametrize("helper,target", _STEP_HELPERS)
+def test_step_helpers_forward_callback_packets_and_return_results_unchanged(
+    helper, target, monkeypatch
+):
+    model, returned, received = target(), object(), []
+
+    def capture(**kwargs):
+        received.append(kwargs)
+        return returned
+
+    monkeypatch.setattr(model, "step", capture)
+    options = {
+        "extra": object(),
+        "callbacks": [object()],
+        "loop_hooks": True,
+        "functional_callbacks": object(),
+        "functional_callback_state": object(),
+    }
+    if isinstance(model, dn.Population):
+        options.update(dt=0.02, ve=object())
+    assert helper(model, **options) is returned
+    assert len(received) == 1 and received[0] == options
+    assert all(received[0][key] is value for key, value in options.items())
+
+
+@pytest.mark.parametrize("helper,target", _STEP_HELPERS)
+def test_step_helpers_keep_authored_legacy_step_signatures_when_callbacks_are_omitted(
+    helper, target
+):
+    model = target()
+    assert helper(model) is model
+    expected = {"extra": None, "callbacks": None, "loop_hooks": False}
+    if isinstance(model, dn.Population):
+        expected.update(dt=None, ve=None)
+    assert model.received == expected
+
+
+@pytest.mark.parametrize("helper,target", _STEP_HELPERS)
+def test_step_helpers_forward_orphan_callback_state_to_the_native_guard(
+    helper, target, monkeypatch
+):
+    model = target()
+    base = dn.Population if isinstance(model, dn.Population) else dn.Network
+    monkeypatch.setattr(model, "step", base.step.__get__(model, type(model)))
+    with pytest.raises(ValueError, match="requires functional_callbacks"):
+        helper(model, functional_callback_state=object())
+
+
+def test_public_step_keeps_network_voltage_and_timestep_validation_before_forwarding():
+    model = _NetworkStepTarget()
+    options = {"functional_callbacks": object(), "functional_callback_state": object()}
+    with pytest.raises(TypeError, match="only valid for Population"):
+        dn.step(model, dt=0.02, ve=object(), **options)
+    with pytest.raises(ValueError, match="timestep is"):
+        dn.step(model, dt=0.02, **options)
+    assert model.received is None
