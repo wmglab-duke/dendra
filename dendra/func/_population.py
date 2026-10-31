@@ -24,6 +24,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils._device import DeviceContext
 
 from dendra.helpers import MEMBRANE_ASSEMBLY, ctx, current_check_purity
+from dendra.models._runtime_inputs import normalize_input_tape
 from dendra.models.core import (
     Axon,
     Cable,
@@ -16956,68 +16957,14 @@ class FunctionalPopulation:
     def _normalize_rollout_value(self, value, *, name: str, steps: int | None):
         if value is None:
             return None, steps
-        if not torch.is_tensor(value):
-            raise TypeError(f"{name} must be a Tensor or None")
-        if value.ndim == 0:
-            raise ValueError(f"{name} needs a leading time axis; got a scalar tensor")
-        if value.device != self.device or value.dtype != self.dtype:
-            raise ValueError(f"{name} must use {self.device}/{self.dtype}")
-        value_steps = int(value.shape[0])
-        if steps is not None and value_steps != steps:
-            raise ValueError(
-                f"{name} has {value_steps} steps, but the rollout expects {steps}"
-            )
-
-        # Match Population's direct-drive contract. Ordinary trailing
-        # broadcasting is authoritative, so a payload whose size happens to
-        # equal an explicit batch axis retains its established spatial suffix
-        # meaning. Only when that fails may a low-rank payload be interpreted
-        # as batch-only and padded with singleton population/compartment axes.
-        payload_shape = tuple(value.shape[1:])
-        target_shape = (value_steps, *self.shape)
-        trailing_error = None
-        if len(payload_shape) <= len(self.shape):
-            aligned_shape = (
-                value_steps,
-                *((1,) * (len(self.shape) - len(payload_shape))),
-                *payload_shape,
-            )
-            try:
-                normalized = torch.broadcast_to(
-                    value.reshape(aligned_shape),
-                    target_shape,
-                )
-                return normalized.contiguous(), value_steps
-            except RuntimeError as exc:
-                trailing_error = exc
-
-        batch_shape = self.shape[:-2]
-        if batch_shape and 0 < len(payload_shape) <= len(batch_shape):
-            batch_aligned_shape = (
-                value_steps,
-                *((1,) * (len(batch_shape) - len(payload_shape))),
-                *payload_shape,
-            )
-            try:
-                batch_value = torch.broadcast_to(
-                    value.reshape(batch_aligned_shape),
-                    (value_steps, *batch_shape),
-                )
-                normalized = torch.broadcast_to(
-                    batch_value.reshape(value_steps, *batch_shape, 1, 1),
-                    target_shape,
-                )
-                return normalized.contiguous(), value_steps
-            except RuntimeError:
-                pass
-
-        raise ValueError(
-            f"{name} per-step shape {payload_shape} is not broadcastable to "
-            f"Population shape {self.shape}. Ordinary trailing PyTorch "
-            "broadcasting is tried first; a batch-only fallback accepts "
-            f"payloads broadcastable to explicit batch shape {batch_shape}. "
-            "Use singleton axes to disambiguate batch and spatial intent."
-        ) from trailing_error
+        return normalize_input_tape(
+            value,
+            name=name,
+            steps=steps,
+            shape=self.shape,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     def _transition_rollout_values(
         self,

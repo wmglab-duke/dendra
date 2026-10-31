@@ -59,6 +59,11 @@ from dendra.helpers import (
     op_sc,
 )
 from dendra.models._checkpoint import _checkpoint_recompute_contexts
+from dendra.models._runtime_inputs import (
+    native_input_sources,
+    normalize_input_frame,
+    normalize_input_tape,
+)
 from dendra.models.backend import Backend as A
 from dendra.models.callbacks import (
     Callback,
@@ -3462,6 +3467,23 @@ class Population(P, Sliceable):
         stims, indices, _ = _prepare_intra_run(self, intra, n, dt)
         return stims, indices
 
+    def _normalize_runtime_inputs(self, inputs, *, steps=None, step=False):
+        """Normalize canonical drives without coercing their source tensors."""
+        options = dict(
+            shape=tuple(self.v.shape), device=self.device(), dtype=self.dtype()
+        )
+        if step:
+            return (
+                normalize_input_frame(inputs.ve, name="ve", **options),
+                normalize_input_frame(inputs.intra, name="intra", **options),
+                1,
+            )
+        ve, steps = normalize_input_tape(inputs.ve, name="ve", steps=steps, **options)
+        intra, steps = normalize_input_tape(
+            inputs.intra, name="intra", steps=steps, **options
+        )
+        return ve, intra, steps
+
     # extracellular helpers
     def _broadcast_step_value(
         self, value: TensorLike, *, name: str, dtype=None
@@ -3880,6 +3902,7 @@ class Population(P, Sliceable):
         self,
         dt: Optional[float] = None,
         *,
+        inputs=None,
         ve: Optional[TensorLike] = None,
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
@@ -3901,6 +3924,11 @@ class Population(P, Sliceable):
             tried first. If it fails, low-rank data may broadcast right-aligned
             within the explicit batch shape and be shared spatially. A leading
             singleton time dimension ``[1, ...]`` is also accepted.
+        inputs : dendra.func.Inputs, optional
+            One strict Tensor frame of extracellular voltage and/or intracellular
+            current. An explicit ``ve`` frame conflicts with ``ve=`` or ``extra=``;
+            an explicit ``intra`` frame conflicts with solver-level Slice injections.
+            Omitted fields retain the existing stimulation sources.
         extra : extracellular specification, optional
             Higher-level extracellular stimulation specification with the same
             shape and broadcasting semantics as :meth:`run`. It is evaluated
@@ -3954,6 +3982,14 @@ class Population(P, Sliceable):
         if observer is not None:
             observer.validate_dt(dt_f)
 
+        input_ve = input_intra = None
+        if inputs is not None:
+            packet = native_input_sources(inputs, ve=ve, extra=extra)
+            with nullcontext() if self.training else torch.no_grad():
+                input_ve, input_intra, _ = self._normalize_runtime_inputs(
+                    packet, step=True
+                )
+
         if ve is not None and extra is not None:
             raise ValueError("Provide either 've' or 'extra', not both.")
 
@@ -3963,6 +3999,10 @@ class Population(P, Sliceable):
             self.intra = self.build_intra()
         intra = self.intra
         with_intra = intra is not None
+        if input_intra is not None and with_intra:
+            raise ValueError(
+                "explicit intra cannot be combined with registered intracellular stimulation"
+            )
 
         device = self.device()
         dtype = self.dtype()
@@ -3990,7 +4030,9 @@ class Population(P, Sliceable):
                 observed_state, observed_parts = observer.start()
             pre_step_hook(callbacks, self)
 
-            if ve is not None:
+            if input_ve is not None:
+                ve_c = input_ve
+            elif ve is not None:
                 ve_c = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
                 if ve_c.dim() == self.v.dim() + 1 and int(ve_c.shape[0]) == 1:
                     ve_c = ve_c[0]
@@ -4008,7 +4050,7 @@ class Population(P, Sliceable):
                 s = [st[0] for st in stims]
                 intra_c = self._call_make_intra(intra, s, indices)
             else:
-                intra_c = None
+                intra_c = input_intra
 
             self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
             self.t = self.t + dt_tensor
@@ -4035,6 +4077,7 @@ class Population(P, Sliceable):
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar: bool = False,
         *,
+        inputs=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
@@ -4052,6 +4095,12 @@ class Population(P, Sliceable):
             ``[n_timesteps, *batch, 1, 1]`` for explicit per-batch, spatially
             shared input. The number of time steps is inferred from
             ``ve.shape[0]``.
+        inputs : dendra.func.Inputs, optional
+            Strict time-first Tensor tapes. With ``tstop``, both tapes must match
+            its accepted complete steps; without it, their common leading length
+            determines the horizon. Existing ``ve=`` remains authoritative when
+            supplied. Explicit voltage cannot duplicate ``ve=`` or ``extra=``;
+            explicit current cannot replace registered solver-level Slice injections.
         extra : tuple or sequence of tuples, optional
             Extracellular input specification(s), with the same semantics as
             :meth:`longrun`.
@@ -4160,6 +4209,11 @@ class Population(P, Sliceable):
         )
         if observer is not None:
             observer.validate_dt(dt_f)
+        packet = (
+            native_input_sources(inputs, ve=ve, extra=extra)
+            if inputs is not None
+            else None
+        )
         if ve is not None and extra is not None:
             raise ValueError("Provide either 've' or 'extra', not both.")
         tstop_f = None
@@ -4167,9 +4221,13 @@ class Population(P, Sliceable):
         duration_remainder = None
         if ve is None:
             if tstop is None:
-                raise ValueError("tstop must be provided when 've' is not given.")
-            tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-            duration_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+                if packet is None or (packet.ve is None and packet.intra is None):
+                    raise ValueError("tstop must be provided when 've' is not given.")
+            else:
+                tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
+                duration_steps, duration_remainder = self._duration_budget(
+                    tstop_f, dt_f
+                )
 
         # auto-build intra if missing
         if self.intra is None:
@@ -4185,6 +4243,21 @@ class Population(P, Sliceable):
 
         if ve is not None:
             ve = self._normalize_precomputed_ve(ve).contiguous()
+
+        input_intra = None
+        if packet is not None:
+            with nullcontext() if self.training else torch.no_grad():
+                input_ve, input_intra, input_steps = self._normalize_runtime_inputs(
+                    packet,
+                    steps=int(ve.shape[0]) if ve is not None else duration_steps,
+                )
+            if input_intra is not None and with_intra:
+                raise ValueError(
+                    "explicit intra cannot be combined with registered intracellular stimulation"
+                )
+            if input_ve is not None:
+                ve = input_ve
+            duration_steps = input_steps
 
         # dt as scalar and tensor
         dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
@@ -4294,7 +4367,8 @@ class Population(P, Sliceable):
                         ve_list,
                         stims if with_intra else None,
                         indices if with_intra else None,
-                    ),
+                    )
+                    + ((input_intra,) if input_intra is not None else ()),
                     post_step=psh,
                 )
             )
@@ -4354,7 +4428,7 @@ class Population(P, Sliceable):
                         else:
                             intra_c = self._call_make_intra(intra, s, indices)
                     else:
-                        intra_c = None
+                        intra_c = None if input_intra is None else input_intra[i]
 
                     # Integrator step
                     pre_step_hook(callbacks, self)
@@ -4398,6 +4472,7 @@ class Population(P, Sliceable):
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar=False,
         *,
+        inputs=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
@@ -4422,6 +4497,11 @@ class Population(P, Sliceable):
         dt : float, optional
             The simulation time step in milliseconds. If ``None``, the default value
             from the backend will be used.
+        inputs : dendra.func.Inputs, optional
+            Strict time-first voltage/current tapes matching the accepted steps
+            for ``tstop``. Tapes are indexed at actual chunk boundaries. Omitted
+            current retains Slice injections; explicit current conflicts with
+            those injections. Explicit voltage conflicts with ``extra``.
         extra : tuple or sequence of tuples, optional
             Extracellular input specification(s).
 
@@ -4521,6 +4601,18 @@ class Population(P, Sliceable):
         intra = self.intra
         with_intra = intra is not None
 
+        input_ve = input_intra = None
+        if inputs is not None:
+            packet = native_input_sources(inputs, extra=extra)
+            with torch.set_grad_enabled(self.training):
+                input_ve, input_intra, _ = self._normalize_runtime_inputs(
+                    packet, steps=n_steps
+                )
+            if input_intra is not None and with_intra:
+                raise ValueError(
+                    "explicit intra cannot be combined with registered intracellular stimulation"
+                )
+
         # dt scalars
         dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
 
@@ -4586,7 +4678,14 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 # Main chunk loop
                 # --------------------------------------------------------------
+                input_start = 0
                 for i, t_chunk in enumerate(t_chunks):
+                    input_stop = input_start + len(t_chunk)
+                    input_intra_chunk = (
+                        None
+                        if input_intra is None
+                        else input_intra[input_start:input_stop]
+                    )
                     if observer is not None:
                         observed_emissions = []
                     indexed_tapes = None
@@ -4604,7 +4703,12 @@ class Population(P, Sliceable):
                     if with_extra:
                         ve_list = self._compute_extra_chunk(extra_cfg, i, t_chunk)
                     else:
-                        ve_list = None
+                        ve_list = (
+                            None
+                            if input_ve is None
+                            else input_ve[input_start:input_stop]
+                        )
+                    input_start = input_stop
 
                     pre_chunk_hook(callbacks, self, t_chunk)
 
@@ -4622,6 +4726,11 @@ class Population(P, Sliceable):
                                 ve_list,
                                 stims if with_intra else None,
                                 indices if with_intra else None,
+                            )
+                            + (
+                                (input_intra_chunk,)
+                                if input_intra_chunk is not None
+                                else ()
                             ),
                             post_step=psh,
                         )
@@ -4676,7 +4785,11 @@ class Population(P, Sliceable):
                                 else:
                                     intra_c = self._call_make_intra(intra, s, indices)
                             else:
-                                intra_c = None
+                                intra_c = (
+                                    None
+                                    if input_intra_chunk is None
+                                    else input_intra_chunk[j]
+                                )
 
                             pre_step_hook(callbacks, self)
                             if skip_empty_noise:
@@ -7355,6 +7468,7 @@ class Population(P, Sliceable):
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar=False,
         *,
+        inputs=None,
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
@@ -7382,6 +7496,11 @@ class Population(P, Sliceable):
         dt : float, optional
             Time step size in milliseconds. If None, uses the global default
             ``A.dt``.
+        inputs : dendra.func.Inputs, optional
+            Strict time-first voltage/current tapes matching accepted steps.
+            Checkpoint recomputation reuses each chunk's original input slices,
+            preserving gradients to their caller-owned sources. Omitted fields
+            retain registered stimulation; duplicate drive sources are rejected.
         extra : ExtraSpec, optional
             Extracellular configuration with the same ``(ve_s, time)`` shape
             and trailing-first broadcasting contract as :meth:`longrun`.
@@ -7489,6 +7608,18 @@ class Population(P, Sliceable):
             self.intra = self.build_intra()
         intra = self.intra
         with_intra = intra is not None
+
+        input_ve = input_intra = None
+        if inputs is not None:
+            packet = native_input_sources(inputs, extra=extra)
+            with torch.set_grad_enabled(self.training):
+                input_ve, input_intra, _ = self._normalize_runtime_inputs(
+                    packet, steps=n_steps
+                )
+            if input_intra is not None and with_intra:
+                raise ValueError(
+                    "explicit intra cannot be combined with registered intracellular stimulation"
+                )
 
         # dt scalars
         dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
@@ -7609,12 +7740,31 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 # Main chunk loop (checkpointed)
                 # --------------------------------------------------------------
+                input_start = 0
                 for i, t_chunk in enumerate(t_chunks):
                     chunk_idx = int(i)
                     t_chunk_local = t_chunk
+                    input_stop = input_start + len(t_chunk)
+                    input_ve_chunk = (
+                        None if input_ve is None else input_ve[input_start:input_stop]
+                    )
+                    input_intra_chunk = (
+                        None
+                        if input_intra is None
+                        else input_intra[input_start:input_stop]
+                    )
+                    input_start = input_stop
+                    checkpoint_inputs = (
+                        () if inputs is None else (input_ve_chunk, input_intra_chunk)
+                    )
 
                     def _run_chunk(
-                        state_in, t_chunk_local=t_chunk_local, chunk_idx=chunk_idx
+                        state_in,
+                        input_ve_chunk=None,
+                        input_intra_chunk=None,
+                        *,
+                        t_chunk_local=t_chunk_local,
+                        chunk_idx=chunk_idx,
                     ):
                         # IMPORTANT: torch.utils.checkpoint forbids in-place mutation of
                         # checkpoint *inputs*. If out-of-place stepping is guaranteed,
@@ -7641,7 +7791,7 @@ class Population(P, Sliceable):
                                 extra_cfg, chunk_idx, t_chunk_local
                             )
                         else:
-                            ve_list = None
+                            ve_list = input_ve_chunk
 
                         pre_chunk_hook(callbacks, self, t_chunk_local)
 
@@ -7655,7 +7805,11 @@ class Population(P, Sliceable):
                                 s = [st[j] for st in stims]
                                 intra_c = self._call_make_intra(intra, s, indices)
                             else:
-                                intra_c = None
+                                intra_c = (
+                                    None
+                                    if input_intra_chunk is None
+                                    else input_intra_chunk[j]
+                                )
 
                             self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
                             self.t = self.t + dt_tensor
@@ -7701,6 +7855,7 @@ class Population(P, Sliceable):
                         state, chunk_loss, saw_loss_flag = _checkpoint(
                             _run_chunk,
                             state,
+                            *checkpoint_inputs,
                             **checkpoint_options,
                         )
                     else:
@@ -7708,6 +7863,9 @@ class Population(P, Sliceable):
                         def _run_chunk_functional(
                             state_in,
                             native_state_in,
+                            input_ve_chunk=None,
+                            input_intra_chunk=None,
+                            *,
                             t_chunk_local=t_chunk_local,
                             chunk_idx=chunk_idx,
                         ):
@@ -7734,7 +7892,7 @@ class Population(P, Sliceable):
                                     t_chunk_local,
                                 )
                             else:
-                                ve_list = None
+                                ve_list = input_ve_chunk
 
                             pre_chunk_hook(callbacks, self, t_chunk_local)
 
@@ -7754,7 +7912,11 @@ class Population(P, Sliceable):
                                         indices,
                                     )
                                 else:
-                                    intra_c = None
+                                    intra_c = (
+                                        None
+                                        if input_intra_chunk is None
+                                        else input_intra_chunk[j]
+                                    )
 
                                 self._step(
                                     self.integrator,
@@ -7827,6 +7989,7 @@ class Population(P, Sliceable):
                             _run_chunk_functional,
                             state,
                             native_state,
+                            *checkpoint_inputs,
                             **checkpoint_options,
                         )
                         observer.collect(

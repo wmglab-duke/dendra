@@ -8,6 +8,7 @@ from contextlib import nullcontext
 from typing import Dict, Literal, NamedTuple, Optional
 
 import torch
+from torch.utils import _pytree as pytree
 from tqdm.auto import tqdm
 
 from dendra._bootstrap import reset_torch_compiler
@@ -25,6 +26,11 @@ from dendra.helpers import (
 )
 
 from .._checkpoint import _checkpoint_recompute_contexts
+from .._runtime_inputs import (
+    native_input_sources,
+    normalize_input_frame,
+    normalize_input_tape,
+)
 from ..callbacks import CallbackList, _bind_callback_dt
 from ..core import (
     Population,
@@ -241,6 +247,66 @@ def _advance_network_component(component, *, compile_network_ops: bool = False):
     if compile_network_ops and hasattr(component, "advance_compiled"):
         return component.advance_compiled()
     return component.advance()
+
+
+def _network_runtime_inputs(network, inputs, *, extra, intra, steps=None, frame=False):
+    """Normalize deterministic operands before sampling any native Waveform."""
+    if inputs is None:
+        return None
+    if not isinstance(inputs, Mapping):
+        raise TypeError("Network inputs must map Population names to Inputs packets")
+    unknown = [name for name in inputs if name not in network.populations]
+    if unknown:
+        raise KeyError(f"inputs specified for unknown populations: {unknown!r}")
+    result = {}
+    for name, value in inputs.items():
+        # Conflict depends on whether an extra declaration exists for this
+        # Population; leave its value and legacy validation to the caller.
+        legacy_extra = () if extra is not None and name in extra else None
+        packet = native_input_sources(value, extra=legacy_extra)
+        if packet.intra is not None and name in intra:
+            raise ValueError(
+                "explicit intra cannot be combined with registered intracellular stimulation"
+            )
+        population = network.populations[name]
+        values = {}
+        for field in ("ve", "intra"):
+            options = {
+                "name": f"inputs[{name!r}].{field}",
+                "shape": tuple(population.shape),
+                "device": population.device(),
+                "dtype": population.dtype(),
+            }
+            if frame:
+                values[field] = normalize_input_frame(getattr(packet, field), **options)
+            else:
+                values[field], _ = normalize_input_tape(
+                    getattr(packet, field), steps=steps, **options
+                )
+        result[name] = packet._replace(**values)
+    return result
+
+
+def _slice_network_runtime_inputs(inputs, start, stop):
+    if inputs is None:
+        return None
+    return {
+        name: packet._replace(
+            ve=None if packet.ve is None else packet.ve[start:stop],
+            intra=None if packet.intra is None else packet.intra[start:stop],
+        )
+        for name, packet in inputs.items()
+    }
+
+
+def _apply_network_runtime_inputs(extra, intra, inputs, index=None):
+    if inputs is not None:
+        for name, packet in inputs.items():
+            if packet.ve is not None:
+                extra[name] = packet.ve if index is None else packet.ve[index]
+            if packet.intra is not None:
+                intra[name] = packet.intra if index is None else packet.intra[index]
+    return extra, intra
 
 
 def step(
@@ -3795,6 +3861,7 @@ class Network(RNGMixin):
         self,
         *,
         extra=None,
+        inputs=None,
         callbacks=None,
         loop_hooks: bool = False,
         callback_state=None,
@@ -3818,6 +3885,11 @@ class Network(RNGMixin):
             Waveform output to ``[*batch, np, 1]``. Ordinary trailing
             broadcasting is tried first, followed only on failure by a
             low-rank, right-aligned batch-only fallback.
+        inputs : mapping of str to dendra.func.Inputs, optional
+            Deterministic extracellular voltage and intracellular current frames
+            keyed by exact Population names. A supplied ``ve`` conflicts with
+            ``extra`` for that Population; supplied ``intra`` conflicts with
+            registered solver stimulation. Omitted fields retain those sources.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this exact model and timestep.
@@ -3884,6 +3956,10 @@ class Network(RNGMixin):
             if p.intra is not None:
                 intra[n] = p.intra
 
+        with nullcontext() if self.training else torch.no_grad():
+            runtime_inputs = _network_runtime_inputs(
+                self, inputs, extra=extra, intra=intra, frame=True
+            )
         extra = extra if extra is not None else {}
         extra_prepped = {}
         with nullcontext() if self.training else torch.no_grad():
@@ -3925,6 +4001,10 @@ class Network(RNGMixin):
 
             intra_c = prepare_intra({}, intra, 0) if with_intra else {}
             extra_c = prepare_extra(extra, 0) if with_extra else {}
+            if runtime_inputs is not None:
+                extra_c, intra_c = _apply_network_runtime_inputs(
+                    extra_c, intra_c, runtime_inputs
+                )
 
             self._step(
                 self._population_step_items,
@@ -3960,6 +4040,7 @@ class Network(RNGMixin):
         callbacks=None,
         progressbar=False,
         *,
+        inputs=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
@@ -3982,6 +4063,10 @@ class Network(RNGMixin):
             tried first; only on failure may low-rank value axes use a
             right-aligned batch-only fallback. Explicit singleton axes
             disambiguate equal-size batch and spatial dimensions.
+        inputs : mapping of str to dendra.func.Inputs, optional
+            Deterministic time-leading voltage/current tapes keyed by exact
+            Population names. Tape lengths must equal the accepted duration's
+            timestep count. Fields share the conflict rules of :meth:`step`.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this exact model and timestep.
@@ -4052,6 +4137,10 @@ class Network(RNGMixin):
             if p.intra is not None:
                 intra[n] = p.intra
 
+        with nullcontext() if self.training else torch.no_grad():
+            runtime_inputs = _network_runtime_inputs(
+                self, inputs, extra=extra, intra=intra, steps=n_steps
+            )
         extra = extra if extra is not None else {}
         extra_prepped = {}
         with nullcontext() if self.training else torch.no_grad():
@@ -4112,6 +4201,10 @@ class Network(RNGMixin):
 
                 if with_extra:
                     extra_c = prepare_extra(extra, local_ind)
+                if runtime_inputs is not None:
+                    extra_c, intra_c = _apply_network_runtime_inputs(
+                        extra_c, intra_c, runtime_inputs, local_ind
+                    )
 
                 pre_step_hook(callbacks, self)
                 self._step(
@@ -4160,6 +4253,7 @@ class Network(RNGMixin):
         callbacks=None,
         progressbar=False,
         *,
+        inputs=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
@@ -4185,6 +4279,10 @@ class Network(RNGMixin):
         extra : dict[str, tuple[torch.Tensor, object]], optional
             Population-specific extracellular stimuli with the same public
             ``(v, waveform)`` format and shape contract as :meth:`run`.
+        inputs : mapping of str to dendra.func.Inputs, optional
+            Deterministic time-leading voltage/current tapes with the same
+            contract as :meth:`run`. Chunk boundaries retain tape views and
+            gradients; all tape lengths match the full accepted duration.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this exact model and timestep.
@@ -4251,6 +4349,13 @@ class Network(RNGMixin):
             if pop.intra is not None:
                 intra[name] = pop.intra
 
+        runtime_inputs = None
+        if inputs is not None:
+            n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+            with nullcontext() if self.training else torch.no_grad():
+                runtime_inputs = _network_runtime_inputs(
+                    self, inputs, extra=extra, intra=intra, steps=n_steps
+                )
         extra = extra if extra is not None else {}
         extra_sources = {}
         with nullcontext() if self.training else torch.no_grad():
@@ -4268,7 +4373,8 @@ class Network(RNGMixin):
         for callback in callbacks:
             _bind_callback_dt(callback, self.dt)
 
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        if inputs is None:
+            n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
@@ -4289,6 +4395,9 @@ class Network(RNGMixin):
                 if observer is not None:
                     observed_emissions = []
                 n_chunk = min(chunklength, n_steps - chunk_start)
+                inputs_chunk = _slice_network_runtime_inputs(
+                    runtime_inputs, chunk_start, chunk_start + n_chunk
+                )
                 time_chunk = initial_time + dt_f * torch.arange(
                     chunk_start,
                     chunk_start + n_chunk,
@@ -4332,6 +4441,10 @@ class Network(RNGMixin):
                     extra_c = (
                         prepare_extra(extra_chunk, local_ind) if extra_chunk else {}
                     )
+                    if inputs_chunk is not None:
+                        extra_c, intra_c = _apply_network_runtime_inputs(
+                            extra_c, intra_c, inputs_chunk, local_ind
+                        )
 
                     pre_step_hook(callbacks, self)
                     self._step(
@@ -5462,6 +5575,7 @@ class Network(RNGMixin):
         callbacks=None,
         progressbar=False,
         *,
+        inputs=None,
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
@@ -5491,6 +5605,10 @@ class Network(RNGMixin):
         extra:
             Optional population-specific ``(v, waveform)`` mapping with the
             same shape and broadcasting contract as :meth:`run`.
+        inputs : mapping of str to dendra.func.Inputs, optional
+            Deterministic time-leading voltage/current tapes with the same
+            contract as :meth:`run`. Checkpoint chunks retain their own tape
+            slices so replay uses the same frames and preserves input gradients.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this exact model and timestep.
@@ -5619,6 +5737,11 @@ class Network(RNGMixin):
             if pop.intra is not None:
                 intra_sources[name] = pop.intra
 
+        with torch.set_grad_enabled(self.training):
+            runtime_inputs = _network_runtime_inputs(
+                self, inputs, extra=extra, intra=intra_sources, steps=n_steps
+            )
+
         def _as_loss_tensor(x):
             if x is None:
                 return None
@@ -5702,13 +5825,32 @@ class Network(RNGMixin):
                 if restore_state_after_backward:
                     checkpoint_options["context_fn"] = _checkpoint_contexts
 
+                input_offset = 0
                 for chunk_idx, t_chunk in enumerate(t_chunks):
+                    inputs_chunk = _slice_network_runtime_inputs(
+                        runtime_inputs, input_offset, input_offset + len(t_chunk)
+                    )
+                    checkpoint_inputs, input_spec = (
+                        ((), None)
+                        if inputs_chunk is None
+                        else pytree.tree_flatten(inputs_chunk)
+                    )
+                    input_offset += len(t_chunk)
                     if pbar is not None:
                         pbar.set_description(f"{t_chunk[0].item():.1f} ms")
 
                     def _run_chunk(
-                        state_in, observed_state_in=None, t_chunk_local=t_chunk
+                        state_in,
+                        observed_state_in=None,
+                        *input_values,
+                        t_chunk_local=t_chunk,
+                        input_spec_local=input_spec,
                     ):
+                        inputs_local = (
+                            None
+                            if input_spec_local is None
+                            else pytree.tree_unflatten(input_values, input_spec_local)
+                        )
                         # Optional safety: clone checkpoint inputs to avoid
                         # in-place mutation of checkpoint input tensors.
                         state_local = state_in
@@ -5775,6 +5917,10 @@ class Network(RNGMixin):
                             if len(extra_ts) > 0:
                                 for name, (v_dev, ts) in extra_ts.items():
                                     extra_c[name] = v_dev * ts[..., i_t].unsqueeze(-1)
+                            if inputs_local is not None:
+                                extra_c, intra_c = _apply_network_runtime_inputs(
+                                    extra_c, intra_c, inputs_local, i_t
+                                )
 
                             # Advance network dynamics.
                             self._step(
@@ -5834,9 +5980,18 @@ class Network(RNGMixin):
                         return state_out, chunk_loss, saw_loss_flag
 
                     if observer is None:
-                        state, chunk_loss, saw_loss_flag = _checkpoint(
-                            _run_chunk, state, **checkpoint_options
-                        )
+                        if runtime_inputs is None:
+                            state, chunk_loss, saw_loss_flag = _checkpoint(
+                                _run_chunk, state, **checkpoint_options
+                            )
+                        else:
+                            state, chunk_loss, saw_loss_flag = _checkpoint(
+                                _run_chunk,
+                                state,
+                                None,
+                                *checkpoint_inputs,
+                                **checkpoint_options,
+                            )
                     else:
                         (
                             state,
@@ -5845,7 +6000,11 @@ class Network(RNGMixin):
                             chunk_loss,
                             saw_loss_flag,
                         ) = _checkpoint(
-                            _run_chunk, state, observed_state, **checkpoint_options
+                            _run_chunk,
+                            state,
+                            observed_state,
+                            *checkpoint_inputs,
+                            **checkpoint_options,
                         )
                         observer.collect(
                             observed_state,

@@ -18,9 +18,16 @@ class Inputs(NamedTuple):
     time-leading tapes. Their existing broadcasting rules apply. Tensor
     references, views and gradients remain caller-owned.
 
+    Native Population and Network ``step``, ``run``, ``longrun`` and
+    ``longrun_checkpointed`` accept these same deterministic packets.
+    ``Slice.inject`` remains the waveform interface; omitting ``intra`` retains
+    its registered stimulation, while explicit ``intra`` conflicts with
+    registered solver-level injections.
+
     Networks accept a mapping from Population names to these same packets.
-    Supply stochastic values and their RNG timelines separately through
-    ``draws=``. Existing ``StepInput``, ``RolloutInput`` and
+    Functional execution accepts stochastic values and RNG timelines separately
+    through ``draws=``; native execution retains its automatic sampling.
+    Existing ``StepInput``, ``RolloutInput`` and
     ``NetworkRolloutInput`` packets remain supported.
     """
 

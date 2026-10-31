@@ -731,6 +731,13 @@ Use one deterministic packet for a Population:
 inputs = dn.func.Inputs(ve=external_voltage, intra=injected_current)
 ```
 
+The same `inputs=` packet is accepted by native Population `step`, `run`,
+`longrun` and `longrun_checkpointed`. Native Networks accept the named
+Population mapping below. Native execution keeps its model-owned state and
+RNG lifecycle; the deterministic packet does not introduce native draw tapes.
+See {doc}`A61_shared_runtime_inputs` for native horizons, validation and
+registered waveform behavior.
+
 Use the same packets by Population name for a Network:
 
 ```python
