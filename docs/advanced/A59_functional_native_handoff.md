@@ -378,8 +378,8 @@ Inputs, runtime draws and call-local `extra` arguments are not stored in a
 execution resumes. Native `step` accepts a single `RuntimeDraws` frame, while
 `run`, `longrun` and `longrun_checkpointed` accept time-leading tapes matching
 their accepted timestep count. They replay NOISE/SDE, Network NetStim and
-Population/Network solver-owned intra/call-local extra Poisson banks.
-Mechanism-owned Poisson replay is currently unsupported. Supply
+Population/Network mechanism-owned injections and solver-owned intra/call-local
+extra Poisson banks. Supply
 external `extra` configuration again; its waveform and generator state remain
 caller-owned. See {doc}`A61_shared_runtime_inputs`.
 Bindings that have no native owner cannot be silently installed by model handoff.

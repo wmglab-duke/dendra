@@ -227,7 +227,7 @@ def test_network_runtime_draw_rejection_keeps_clock_values_rng_and_parameters(
     _close(torch.get_rng_state(), global_rng)
 
 
-def test_network_mechanism_owned_poisson_rejects_before_sampling_and_clock_advancement(
+def test_incomplete_network_mechanism_poisson_draws_reject_before_live_mutation(
     monkeypatch,
 ):
     model, pulses = _poisson_network()
@@ -237,14 +237,20 @@ def test_network_mechanism_owned_poisson_rejects_before_sampling_and_clock_advan
     )
     functional, tensors = dn.func.make_functional_network(model)
     packet = functional.sample_runtime_draws(tensors.state)
+    first = next(iter(packet.draws["populations"]))
+    packet = packet._replace(
+        draws={
+            **packet.draws,
+            "populations": {
+                **packet.draws["populations"],
+                first: {**packet.draws["populations"][first], "stimulation": {}},
+            },
+        }
+    )
     saved = _snapshot(model.state_dict_for_checkpoint())
     states = tuple(pulse.generator.get_state().clone() for pulse in pulses)
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Unsupported replay evaluated a Poisson waveform")
-
-    for pulse in pulses:
-        monkeypatch.setattr(pulse, "forward", forbidden)
+    _forbid_owned_sampling(monkeypatch, model, *(pulse.generator for pulse in pulses))
     with pytest.raises(
         (ValueError, dn.func.FunctionalizationError), match="Poisson|poisson"
     ):

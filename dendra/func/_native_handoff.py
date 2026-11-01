@@ -492,9 +492,9 @@ def commit_continuation_(functional, target, continuation):
     export/restore between collections. Inputs and call-local extracellular
     ``extra`` remain invocation arguments. Native ``step`` accepts one
     ``RuntimeDraws`` frame for NOISE/SDE, Network NetStim and Population/Network
-    solver-owned intra/call-local extra Poisson banks. Native ``run``,
+    mechanism-owned injections and solver-owned intra/call-local extra Poisson
+    banks. Native ``run``,
     ``longrun`` and ``longrun_checkpointed`` accept time-leading draw tapes.
-    Mechanism-owned Poisson replay is currently unsupported.
     """
     _cold_boundary("commit_continuation_")
     if type(continuation) is not Continuation:

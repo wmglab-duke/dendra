@@ -1,4 +1,4 @@
-"""Native frame/tape bindings for NOISE/SDE, NetStim and bank Poisson draws."""
+"""Native frame/tape bindings for NOISE/SDE, NetStim and Poisson draws."""
 
 from __future__ import annotations
 
@@ -34,12 +34,7 @@ from ._stimulation_rng import _generator_bindings, _validate_tracked_generators
 from ._types import FunctionalizationError, RuntimeNoiseDraw, StimulationDraw
 
 
-def _bank_poisson_plan(population, extra):
-    handler = getattr(population, "mech", None)
-    if handler is not None and _poisson_waveforms(handler):
-        raise ValueError(
-            "Native draws do not support mechanism-owned Poisson stimulation"
-        )
+def _native_poisson_plan(population, extra, *, dt=None):
     roots = []
 
     def visit(value):
@@ -56,11 +51,21 @@ def _bank_poisson_plan(population, extra):
     registered = _poisson_waveforms(population)
     if not registered and not any(_poisson_waveforms(root) for root in roots):
         return None
-    plan = PoissonStimulationPlan.native_banks(population, extra)
-    bank_nodes = {id(entry.source) for entry in plan.entries}
-    if any(id(node) not in bank_nodes for node in registered.values()):
+    plan = PoissonStimulationPlan.native_runtime(population, extra, dt=dt)
+    replay_nodes = {id(entry.source) for entry in plan.entries}
+    mechanism_nodes = {
+        id(entry.source) for entry in plan.entries if entry.kind == "mechanism"
+    }
+    handler = getattr(population, "mech", None)
+    unregistered_mechanism = handler is not None and any(
+        id(node) not in mechanism_nodes for node in _poisson_waveforms(handler).values()
+    )
+    if unregistered_mechanism or any(
+        id(node) not in replay_nodes for node in registered.values()
+    ):
         raise ValueError(
-            "Native draws support randomized Poisson only in Population waveform banks"
+            "Native draws support randomized Poisson only in waveform banks "
+            "and registered mechanism injections"
         )
     return plan if plan.enabled else None
 
@@ -94,10 +99,11 @@ def _publish(updates):
         source.restore_rng_checkpoint(payload, policy="checkpoint")
 
 
-def _bank_poisson_invocations(plan, draws):
+def _poisson_invocations(native, draws):
     """Validate a Population's recipes and own each ordered native schedule."""
+    plan = native.poisson
     packet = StimulationDraw(draws, {})
-    plan.validate(packet, validate_rng=False)
+    native.validate_stimulation(packet)
     for entry in plan.entries:
         if entry.key in plan._event_slots and plan._runtime_counts[entry.key]:
             values = packet.draws[entry.key]
@@ -156,8 +162,13 @@ def _validate_model_rng(model, references, boundaries, *, steps=None):
 class _PopulationReplayPlan:
     """Cold native source inventory shared by all frames of one invocation."""
 
-    def __init__(self, population, extra, *, validate_rng_ownership=True):
-        self.poisson = _bank_poisson_plan(population, extra)
+    def __init__(self, population, extra, *, dt=None, validate_rng_ownership=True):
+        self.dt = dt
+        self.poisson = _native_poisson_plan(population, extra, dt=dt)
+        self._poisson_initialization_profiled = False
+        self.has_bank_poisson = self.poisson is not None and any(
+            entry.kind in ("extra", "intra") for entry in self.poisson.entries
+        )
         self.noise = RuntimeNoisePlan(population)
         self.owners = dict(_parameterized_owner_paths(population))
         self.sources = {
@@ -239,11 +250,33 @@ class _PopulationReplayPlan:
                 "This Population has no recurrent NOISE or State SDE draws"
             )
         if self.poisson is not None and steps is not None:
-            self.poisson.validate(
-                StimulationDraw(draws["stimulation"], {}),
-                steps=steps,
-                validate_rng=False,
+            self.validate_stimulation(
+                StimulationDraw(draws["stimulation"], {}), steps=steps
             )
+
+    def validate_stimulation(self, packet, *, steps=None):
+        """Admit exact runtime or shared initialization-reserved draw layouts.
+
+        Snapshot-only plans do not reserve fresh-initialization invocations.
+        Probe that separate layout only when a supplied mechanism draw has
+        additional invocation rows; ordinary runtime replay never initializes.
+        """
+        try:
+            self.poisson.validate(packet, steps=steps, validate_rng=False)
+            return
+        except ValueError:
+            if self._poisson_initialization_profiled:
+                raise
+            self.poisson.validate(
+                packet, steps=steps, validate_rng=False, _allow_reserved_rows=True
+            )
+        from ._poisson_invocations import profile_native_mechanism_invocations
+
+        profile_native_mechanism_invocations(
+            self.poisson, dt=self.dt, initialization=True
+        )
+        self._poisson_initialization_profiled = True
+        self.poisson.validate(packet, steps=steps, validate_rng=False)
 
     def validate_tape(self, packet, steps):
         self.validate_draws(packet.draws, steps=steps)
@@ -268,11 +301,18 @@ class _PopulationReplayPlan:
 
 class _PopulationReplay:
     def __init__(
-        self, population, draws, extra, *, validate_rng_ownership=True, _plan=None
+        self,
+        population,
+        draws,
+        extra,
+        *,
+        dt=None,
+        validate_rng_ownership=True,
+        _plan=None,
     ):
         self.plan = (
             _PopulationReplayPlan(
-                population, extra, validate_rng_ownership=validate_rng_ownership
+                population, extra, dt=dt, validate_rng_ownership=validate_rng_ownership
             )
             if _plan is None
             else _plan
@@ -312,8 +352,8 @@ class _PopulationReplay:
         self.poisson_invocations = ()
         self.bank_replay = None
         if self.poisson is not None:
-            self.poisson_invocations = _bank_poisson_invocations(
-                self.poisson, draws["stimulation"]
+            self.poisson_invocations = _poisson_invocations(
+                self.plan, draws["stimulation"]
             )
             self.bank_replay = _NativePoissonInvocationReplay(
                 (entry.source, schedule) for entry, schedule in self.poisson_invocations
@@ -352,17 +392,27 @@ class _PopulationReplay:
             if stream not in self.borrowed
         ]
 
-    def scope(self):
-        return _bound_replay_slots(self.slots)
+    @contextmanager
+    def scope(self, *, poisson=True):
+        with (
+            _bound_replay_slots(self.slots),
+            self.bank_scope(finish=True) if poisson else nullcontext(),
+        ):
+            yield
 
     @contextmanager
-    def _bank_scope(self):
+    def _bank_scope(self, *, finish):
         with _bound_replay_slots(self.poisson_slots):
             yield
-            self.bank_replay.finish()
+            if finish:
+                self.bank_replay.finish()
 
-    def bank_scope(self):
-        return nullcontext() if self.bank_replay is None else self._bank_scope()
+    def bank_scope(self, *, finish=False):
+        return (
+            nullcontext()
+            if self.bank_replay is None
+            else self._bank_scope(finish=finish)
+        )
 
     def publish(self):
         _publish(self.updates)
@@ -372,10 +422,10 @@ class _PopulationReplay:
             _clear_pending_poisson_rng((self.poisson,))
 
 
-def bind_population_runtime_draws(population, packet, *, extra=None):
+def bind_population_runtime_draws(population, packet, *, extra=None, dt=None):
     packet = _normalize_runtime_draws(packet)
     _keys(packet.rng, ("model", "stimulation"), "draws.rng")
-    replay = _PopulationReplay(population, packet.draws, extra)
+    replay = _PopulationReplay(population, packet.draws, extra, dt=dt)
     replay.bind_rng(packet.rng["model"])
     replay.bind_stimulation_rng(packet.rng["stimulation"])
     return replay
@@ -384,7 +434,9 @@ def bind_population_runtime_draws(population, packet, *, extra=None):
 class _NetworkReplayPlan:
     """Canonical stream routes and source plans for one native Network call."""
 
-    def __init__(self, network, extra, *, _population_models=None, _populations=None):
+    def __init__(
+        self, network, extra, *, dt=None, _population_models=None, _populations=None
+    ):
         from dendra.models.networks.net import _network_step_schedule
 
         self.network = network
@@ -398,6 +450,7 @@ class _NetworkReplayPlan:
                 name: _PopulationReplayPlan(
                     population,
                     None if extra is None else extra.get(name),
+                    dt=dt,
                     validate_rng_ownership=False,
                 )
                 for name, population in populations.items()
@@ -512,7 +565,7 @@ class _NetworkReplayPlan:
 
 
 class _NetworkReplay:
-    def __init__(self, network, packet, extra, *, _plan=None):
+    def __init__(self, network, packet, extra, *, dt=None, _plan=None):
         from dendra.models.networks.net import _network_step_schedule
 
         _keys(packet.draws, ("populations", "netstim"), "draws.draws")
@@ -530,6 +583,7 @@ class _NetworkReplay:
                 population,
                 packet.draws["populations"][name],
                 None if extra is None else extra.get(name),
+                dt=dt,
                 validate_rng_ownership=False,
                 _plan=None if _plan is None else _plan.populations[name],
             )
@@ -539,6 +593,7 @@ class _NetworkReplay:
             _NetworkReplayPlan(
                 network,
                 extra,
+                dt=dt,
                 _population_models=population_models,
                 _populations={
                     name: replay.plan for name, replay in self.populations.items()
@@ -599,6 +654,7 @@ class _NetworkReplay:
         for phase, names in (
             ("extra", () if extra is None else extra),
             ("intra", network.populations),
+            ("mechanism", self.plan.population_models),
         ):
             for name in names:
                 for entry, schedule in self.populations[name].poisson_invocations:
@@ -646,8 +702,8 @@ class _NetworkReplay:
         self.netstim._rng.set_state(self.netstim_rng)
 
 
-def bind_network_runtime_draws(network, packet, *, extra=None):
-    return _NetworkReplay(network, _normalize_runtime_draws(packet), extra)
+def bind_network_runtime_draws(network, packet, *, extra=None, dt=None):
+    return _NetworkReplay(network, _normalize_runtime_draws(packet), extra, dt=dt)
 
 
 class _PreserveReplayStateDuringRecompute:
@@ -711,16 +767,18 @@ class _NativeRuntimeDrawTape:
     reads the same tape and rejects mutation before restoring native state.
     """
 
-    def __init__(self, model, packet, steps, extra, *, network, checkpointed=False):
+    def __init__(
+        self, model, packet, steps, extra, *, network, checkpointed=False, dt=None
+    ):
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
             raise ValueError("steps must be a non-negative integer")
         self.model, self.extra = model, extra
         self.packet = _normalize_runtime_draws(packet)
         self.steps, self.network = steps, network
         self.plan = (
-            _NetworkReplayPlan(model, extra)
+            _NetworkReplayPlan(model, extra, dt=dt)
             if network
-            else _PopulationReplayPlan(model, extra)
+            else _PopulationReplayPlan(model, extra, dt=dt)
         )
         self.plan.validate_tape(self.packet, steps)
         self.binding = _runtime_draws_binding(self.packet)
@@ -781,16 +839,22 @@ class _NativeRuntimeDrawTape:
 
 
 def bind_population_runtime_draw_tape(
-    population, packet, *, steps, extra=None, checkpointed=False
+    population, packet, *, steps, extra=None, checkpointed=False, dt=None
 ):
     return _NativeRuntimeDrawTape(
-        population, packet, steps, extra, network=False, checkpointed=checkpointed
+        population,
+        packet,
+        steps,
+        extra,
+        network=False,
+        checkpointed=checkpointed,
+        dt=dt,
     )
 
 
 def bind_network_runtime_draw_tape(
-    network, packet, *, steps, extra=None, checkpointed=False
+    network, packet, *, steps, extra=None, checkpointed=False, dt=None
 ):
     return _NativeRuntimeDrawTape(
-        network, packet, steps, extra, network=True, checkpointed=checkpointed
+        network, packet, steps, extra, network=True, checkpointed=checkpointed, dt=dt
     )

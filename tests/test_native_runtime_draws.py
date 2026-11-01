@@ -240,21 +240,19 @@ def test_population_bad_runtime_packets_reject_before_sampling_or_advancing(
     _close(torch.get_rng_state(), global_rng)
 
 
-def test_mechanism_poisson_runtime_draws_reject_before_waveform_or_generator_use(
+def test_incomplete_mechanism_poisson_draws_reject_before_live_mutation(
     monkeypatch,
 ):
     model, _, pulse = _poisson_population("mechanism")
     functional, tensors = dn.func.make_functional(model, dt=POISSON_DT)
     packet = functional.sample_runtime_draws(tensors.state)
+    packet = packet._replace(draws={**packet.draws, "stimulation": {}})
     saved, rng = (
         _snapshot(model.state_dict_for_checkpoint()),
         pulse.generator.get_state().clone(),
     )
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("Unsupported replay evaluated a randomized waveform")
-
-    monkeypatch.setattr(pulse, "forward", forbidden)
+    _forbid_owned_sampling(monkeypatch, model, pulse.generator)
     with pytest.raises(
         (ValueError, dn.func.FunctionalizationError), match="Poisson|poisson"
     ):

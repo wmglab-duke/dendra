@@ -167,9 +167,8 @@ through `draws=` on native Population/Network `step`, `dn.step`,
 `dn.func.RuntimeDraws` packet for NOISE, State SDE and optional Network NetStim.
 Native `run`, `longrun` and `longrun_checkpointed` consume a time-leading
 `RuntimeDraws` tape. Population and Network execution also replays randomized
-Poisson waveforms in
-solver-owned intracellular injections and call-local extracellular `extra` banks.
-Mechanism-owned Poisson replay is unsupported.
+Poisson waveforms in mechanism-owned injections, solver-owned intracellular
+injections and call-local extracellular `extra` banks.
 Omitting `draws` retains the native sampling lifecycle.
 
 Use the existing functional plan's sampler. Lower the initialized native model
@@ -225,6 +224,16 @@ deterministic waveforms retain their existing time-grid semantics. Calls with
 omitted `draws` retain the native automatic sampling lifecycle, including the
 existing whole-run or per-chunk preparation of solver-level waveform banks.
 
+Mechanism-owned injections consume explicit draws when their owning hooks
+evaluate them. Repeated calls, custom pure waveform containers and solver-stage
+evaluations use the same fixed invocation profiles as functional execution;
+registered Poisson children that are not called consume no random values.
+Native Network execution preserves the order of extracellular banks,
+intracellular banks and per-Population mechanism evaluations, including when
+those phases share waveform objects or generators. This applies to runtime
+execution from an initialized model; `draws=` does not replay native fresh
+initialization.
+
 Validation checks the entire supplied tape before executing its first frame,
 including later RNG frames and Poisson recipes. Draw tensors remain
 caller-owned. Keep them unchanged until backward finishes: checkpoint
@@ -263,6 +272,19 @@ Networks:
 python examples/shared_runtime_draw_tapes.py
 ```
 
+The complete
+{download}`shared_mechanism_poisson_replay.py <../../examples/shared_mechanism_poisson_replay.py>`
+example defines a mechanism injection hook, attaches a repeated randomized
+Poisson waveform through `Slice.inject`, and checks native/functional parity,
+waveform gradients and checkpoint continuation for a Population and a Network:
+
+```{literalinclude} ../../examples/shared_mechanism_poisson_replay.py
+:language: python
+:start-after: "# region replay"
+:end-before: "# endregion replay"
+:dedent: 4
+```
+
 ### RNG publication and Poisson ownership
 
 Explicit native execution uses detached base draws and publishes their
@@ -290,8 +312,9 @@ sources retain their own state; see {doc}`A59_functional_native_handoff`.
 Network replay validates the complete packet before evaluating live banks. It
 consumes extracellular banks in the supplied `extra` mapping order, then
 intracellular banks in Population order, before the Network's numerical phases.
-One invocation cursor spans all banks, including shared physical waveform
-children. A generator shared by several Populations has one authoritative RNG
+One invocation cursor spans all banks and subsequent mechanism evaluations,
+including shared physical waveform children. A generator shared by several
+Populations has one authoritative RNG
 timeline, including when a waveform borrows a declared RAND/NOISE/SDE stream
 owned by another Population. A later automatic step starts from the published
 endpoint. Supply compatible bank bindings in the same order used to prepare

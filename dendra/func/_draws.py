@@ -17,15 +17,17 @@ class RuntimeDraws(NamedTuple):
     Network execution. ``step`` and its public helpers consume one frame;
     ``run``, ``longrun`` and ``longrun_checkpointed`` consume a time-leading
     tape matching their accepted timestep count. These packets cover
-    NOISE/State SDE, optional Network NetStim and solver-owned intra/call-local
-    extra randomized Poisson banks with finite n and fixed invocation counts.
+    NOISE/State SDE, optional Network NetStim and randomized Poisson waveform
+    injections with finite n and fixed invocation counts, including those
+    owned by mechanisms and solver-owned intra/call-local extra banks.
     A Population with replayed Poisson banks evaluates its solver-level banks
     once per accepted step, independently of native execution chunk size.
     Populations without these banks retain native whole-run/per-chunk waveform
     evaluation. Omitted draws retain automatic bank preparation and sampling.
-    Network banks retain global invocation order and
-    shared waveform/generator ownership. Mechanism-owned Poisson replay is
-    currently unsupported.
+    Mechanism injections consume their authored invocation recipe in the
+    numerical phases that evaluate them, including repeated and unused calls.
+    Network execution retains global invocation order and shared waveform/
+    generator ownership.
     Numerical draw families and stream routes are fixed by the lowered model.
     Shared RNG bytes occur once at each native publication boundary, including
     intermediate Population boundaries when a Network exposes them.

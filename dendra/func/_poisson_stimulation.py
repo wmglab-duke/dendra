@@ -61,6 +61,19 @@ def randomized_nodes(waveform):
     return tuple(visit(waveform, ""))
 
 
+def is_poisson_runtime_buffer(module, name):
+    """Identify invocation scratch and schedules owned by explicit carry."""
+    from dendra.models.stim.waveform._poisson import (
+        POISSON_INVOCATION_POSITION,
+        POISSON_INVOCATION_STACK,
+    )
+
+    recipe = getattr(module, "_functional_poisson_recipe", False)
+    return (
+        recipe and name in (POISSON_INVOCATION_STACK, POISSON_INVOCATION_POSITION)
+    ) or (name == "_spike_times" and (type(module) is _randomized_poisson or recipe))
+
+
 def poisson_event_slots(module):
     """Resolve the fixed native loop width around randomized descendants."""
     if type(module) is _randomized_poisson:
@@ -191,12 +204,11 @@ class PoissonStimulationPlan:
             functional._intra,
             functional._extra,
             check_purity=functional._check_purity,
-            include_mechanisms=True,
         )
 
     @classmethod
-    def native_banks(cls, population, extra):
-        """Prepare the same bank recipes without lowering model dynamics."""
+    def native_runtime(cls, population, extra, *, dt=None):
+        """Prepare native bank and mechanism recipes without numerical lowering."""
         from dendra.helpers import current_check_purity
 
         from ._stimuli import FunctionalExtra, FunctionalIntra
@@ -207,14 +219,15 @@ class PoissonStimulationPlan:
             FunctionalIntra(population),
             FunctionalExtra(population, extra, namespace="stimulation.extra"),
             check_purity=current_check_purity(),
-            include_mechanisms=False,
         )
+        from ._poisson_invocations import profile_native_mechanism_invocations
+
+        profile_native_mechanism_invocations(result, dt=dt)
         return result
 
-    def _initialize(
-        self, population, intra, extra, *, check_purity, include_mechanisms
-    ):
+    def _initialize(self, population, intra, extra, *, check_purity):
         self.population = population
+        self.check_purity = check_purity
         self._extra_sources = extra._waveforms._sources
         dtype, device = population.dtype(), population.device()
         entries, streams, identities, bank_calls = [], {}, {}, []
@@ -263,9 +276,7 @@ class PoissonStimulationPlan:
                     bank_calls.extend(local_entries[path] for path in order)
         from ._mechanism_injections import mechanism_injection_owners
 
-        for owner_path, owner in (
-            mechanism_injection_owners(self.population) if include_mechanisms else ()
-        ):
+        for owner_path, owner in mechanism_injection_owners(self.population):
             for index, waveform in enumerate(owner.injected_waveforms):
                 for path, source in randomized_nodes(waveform):
                     relative = f"{owner_path}.injected_waveforms.{index}.{path + '.' if path else ''}_spike_times"
@@ -592,7 +603,9 @@ class PoissonStimulationPlan:
                             "Poisson stimulation RNG contains an invalid frame."
                         ) from error
 
-    def validate(self, packet, *, steps=None, validate_rng=True):
+    def validate(
+        self, packet, *, steps=None, validate_rng=True, _allow_reserved_rows=False
+    ):
         if not isinstance(packet, StimulationDraw):
             raise ValueError(
                 "Randomized Poisson stimulation requires an explicit StimulationDraw packet"
@@ -608,6 +621,22 @@ class PoissonStimulationPlan:
             shape = self._draw_shape(entry)
             if steps is not None:
                 shape = (steps, *shape)
+            if (
+                _allow_reserved_rows
+                and entry.kind == "mechanism"
+                and torch.is_tensor(value)
+            ):
+                prefix = () if steps is None else (steps,)
+                actual = tuple(value.shape)
+                if (
+                    len(actual) == len(prefix) + 2
+                    and actual[: len(prefix)] == prefix
+                    and actual[-1] == entry.source.n
+                    and actual[-2] > self._capacities[entry.key]
+                ):
+                    # A native runtime adapter verifies this prospective layout
+                    # against the actual initialization profile before accepting it.
+                    shape = actual
             if (
                 not torch.is_tensor(value)
                 or tuple(value.shape) != shape

@@ -38,7 +38,7 @@ from ._initialization_sources import (
     _class_member_guards,
     _member_binding,
 )
-from ._mechanism_injections import _binding, _literal
+from ._mechanism_injections import _binding, _literal, mechanism_injection_helper
 from ._raw_source_discovery import (
     CUSTOM_MATERIAL_CONTEXT_NAMES,
     registered_source_slots,
@@ -163,6 +163,10 @@ def _receiver_member(owner, name):
         return "buffer", None
     if name in owner._modules:
         return "child", owner._modules[name]
+    if name == "t" and isinstance(owner, MaterialProcess):
+        # Population.build owns this reference; execution copies rebind it to
+        # the explicit Population clock, as in the generic pure-hook audit.
+        return "clock", None
     value = inspect.getattr_static(owner, name)
     if type(value) is property:
         if value.fget is None or value.fset is not None or value.fdel is not None:
@@ -189,6 +193,11 @@ def _hook_signature(method, owner, *, strict, seen=None):
     )
     if trusted is not None:
         return "shared-material-helper", trusted, _binding(target)
+    injection_helper = (
+        mechanism_injection_helper(owner, method) if owner is not None else None
+    )
+    if injection_helper is not None:
+        return "shared-mechanism-injection-helper", injection_helper, _binding(target)
     _reject_rng_object(target)
     _reject_rng_reads(target)
     forbidden = p._forbidden_initialization_callable_name(target)
@@ -465,9 +474,16 @@ def custom_material_constant_slots(process):
         *process.runtime_noises,
         *getattr(process, "_functional_material_slots", ()),
     }
+    from ._poisson_stimulation import is_poisson_runtime_buffer
+
+    modules = _safe_modules(process)
+    owners = dict(modules)
     for path, value, _registry in registered_source_slots(
-        _safe_modules(process), collections=("_buffers",), namespace=vars
+        modules, collections=("_buffers",), namespace=vars
     ):
+        owner_path, _separator, name = path.rpartition(".")
+        if is_poisson_runtime_buffer(owners[owner_path], name):
+            continue
         if "." in path or (path not in excluded and not path.startswith("_mp_")):
             yield path, value
 
@@ -619,9 +635,12 @@ class CustomMaterialProcessPlan:
                 return
             seen.add(id(function))
             self._functions.append(function)
-            # Canonical helper globals are frozen separately. Its registered
-            # receiver frame is supplied by ordinary Population bindings.
-            if custom_material_process_helper(owner, method) is not None:
+            # Canonical helper globals are frozen by the material/injection
+            # plans. Ordinary Population bindings supply their receiver frame.
+            if (
+                custom_material_process_helper(owner, method) is not None
+                or mechanism_injection_helper(owner, method) is not None
+            ):
                 return
             for name, value in _global_values(function).items():
                 self._dependencies.append(("dict", function.__globals__, name))

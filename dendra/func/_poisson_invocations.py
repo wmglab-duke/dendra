@@ -225,3 +225,114 @@ def validate_poisson_invocations(functional, tensors):
                 runtime_order=runtime_order,
                 initialization_order=initialization_order,
             )
+
+
+def profile_native_mechanism_invocations(plan, *, dt=None, initialization=False):
+    """Freeze native hook calls with the same counters and recipe contract.
+
+    Native replay needs only the cold invocation inventory, not a lowered
+    transition, tensor bundle, or compiled solver. The runtime probe retains
+    the initialized frame. A separate, lazy initialization probe resolves
+    reserved invocation rows only when a runtime packet supplies them.
+    Their randomized waveforms use fixed schedules, and their own RNG modules
+    own any unrelated NOISE/SDE sampling performed by native numerical hooks.
+    """
+    entries = tuple(entry for entry in plan.entries if entry.kind == "mechanism")
+    if not entries:
+        return
+    from dendra.helpers import ctx
+    from dendra.models.backend import Backend
+
+    from ._noise_workspaces import refresh_noise_workspaces
+    from ._poisson_stimulation import configure_execution
+    from ._population import (
+        _authored_workspace_classes,
+        _class_state_snapshot,
+        _deepcopy_execution_module,
+        _global_rng_snapshot,
+        _rebind_population_time_references,
+        _restore_class_state,
+        _restore_global_rng,
+    )
+
+    population = plan.population
+    device = population.device()
+    snapshot = _global_rng_snapshot(device) if plan.check_purity else None
+    classes = (
+        _class_state_snapshot(_authored_workspace_classes(population))
+        if plan.check_purity
+        else None
+    )
+    bindings = tuple((entry.key, entry.node_path) for entry in entries)
+
+    def execution_copy():
+        execution = _deepcopy_execution_module(population)
+        _rebind_population_time_references(execution)
+        configure_execution(execution)
+        execution.jit = execution.jit_network_solves = False
+        execution.integrator.clear_jit_cache()
+        return execution
+
+    try:
+        with (
+            torch.inference_mode(False),
+            torch.no_grad(),
+            ctx(JIT=0, JIT_NETWORK_SOLVES=0),
+        ):
+            if initialization:
+                runtime_profile = {
+                    entry.key: plan._runtime_counts[entry.key] for entry in entries
+                }
+                runtime_order = tuple(
+                    entry.key
+                    for entry in plan._runtime_entries
+                    if entry.kind == "mechanism"
+                )
+            else:
+                runtime = execution_copy()
+                timestep = runtime.t.new_tensor(Backend.dt if dt is None else dt)
+                runtime.integrator._initialize(runtime, timestep)
+                counts, names, order = _instrument(runtime, bindings)
+                runtime.integrator.step(runtime, timestep)
+                runtime_profile, runtime_order = _check(
+                    counts, names, order, "an accepted step"
+                )
+
+            initialization_profile = {entry.key: 0 for entry in entries}
+            initialization_order = ()
+            if initialization:
+                initial = execution_copy()
+                initial.t = torch.zeros_like(initial.t)
+                initial.integrator.init_v(initial)
+                handler = initial.mech
+                handler._reset_initialization_timestep()
+                handler._sync_celsius(initial.celsius)
+                refresh_noise_workspaces(
+                    initial, initial.t.new_zeros(()), initialization=True
+                )
+                counts, names, order = _instrument(initial, bindings)
+                handler._initialize_tensor_transaction(
+                    initial.v,
+                    initial.celsius,
+                    state_overrides={
+                        mechanism.name: mechanism._init_params
+                        for mechanism in handler.mechanisms.values()
+                    },
+                    call_local_currents=True,
+                )
+                initialization_profile, initialization_order = _check(
+                    counts, names, order, "fresh initialization"
+                )
+            plan.set_invocation_profile(
+                runtime=runtime_profile,
+                initialization=initialization_profile,
+                runtime_order=runtime_order,
+                initialization_order=initialization_order,
+            )
+    finally:
+        try:
+            if classes is not None:
+                _restore_class_state(classes)
+        finally:
+            if snapshot is not None:
+                _restore_global_rng(snapshot, device)

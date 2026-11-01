@@ -789,8 +789,8 @@ Population mapping below. The helpers `dn.step`, `dn.step_population` and
 Native execution keeps its model-owned state and RNG lifecycle. Native steps
 accept a separate `draws=` frame, and `run`, `longrun` and
 `longrun_checkpointed` accept time-leading draw tapes. They replay NOISE/State
-SDE, optional Network NetStim and randomized Poisson in solver-owned intra and
-call-local extra banks. Mechanism-owned Poisson replay is currently unsupported.
+SDE, optional Network NetStim and randomized Poisson in mechanism-owned
+injections, solver-owned intra and call-local extra banks.
 See {doc}`A61_shared_runtime_inputs` for native horizons, validation and
 registered waveform behavior.
 

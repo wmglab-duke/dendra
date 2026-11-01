@@ -3907,7 +3907,7 @@ class Population(P, Sliceable):
         self, replay, intra, dt, extra_cfg, *, ve=None, current=None
     ):
         """Evaluate one accepted-step bank recipe using ordinary native assembly."""
-        with replay.bank_scope():
+        with replay.bank_scope(finish=False):
             if extra_cfg is not None and extra_cfg.functional:
                 time = self.t.reshape(1).to(device=self.device(), dtype=self.dtype())
                 values = self._compute_extra_chunk(extra_cfg, 0, time)
@@ -3954,9 +3954,9 @@ class Population(P, Sliceable):
         draws : dendra.func.RuntimeDraws, optional
             One explicit NOISE/SDE draw frame with authoritative RNG suffixes.
             Solver-owned intracellular and call-local extracellular Poisson
-            waveform banks consume invocation-indexed draws. Mechanism-owned
-            Poisson replay is currently unsupported. Omission retains automatic
-            sampling; supplied base draws and schedules remain detached.
+            waveform banks, and mechanism-owned waveform injections, consume
+            invocation-indexed draws in native execution order. Omission retains
+            automatic sampling; supplied base draws and schedules remain detached.
         extra : extracellular specification, optional
             Higher-level extracellular stimulation specification with the same
             shape and broadcasting semantics as :meth:`run`. It is evaluated
@@ -4017,7 +4017,7 @@ class Population(P, Sliceable):
         if draws is not None:
             from dendra.func._native_runtime_draws import bind_population_runtime_draws
 
-            replay = bind_population_runtime_draws(self, draws, extra=extra)
+            replay = bind_population_runtime_draws(self, draws, extra=extra, dt=dt_f)
 
         input_ve = input_intra = None
         if inputs is not None:
@@ -4067,7 +4067,7 @@ class Population(P, Sliceable):
                 observed_state, observed_parts = observer.start()
             pre_step_hook(callbacks, self)
 
-            with nullcontext() if replay is None else replay.bank_scope():
+            with nullcontext() if replay is None else replay.bank_scope(finish=False):
                 if input_ve is not None:
                     ve_c = input_ve
                 elif ve is not None:
@@ -4148,6 +4148,8 @@ class Population(P, Sliceable):
             explicit current cannot replace registered solver-level Slice injections.
         draws : dendra.func.RuntimeDraws, optional
             Explicit time-leading draw and RNG tapes matching the accepted steps.
+            Mechanism-owned waveform injections consume their accepted-step
+            invocation recipes in native numerical order.
             Populations with randomized Poisson bank waveforms replay their banks
             per accepted step. Other waveforms retain full-run preparation.
             Changing replay chunking does not change the experiment. Omission retains automatic
@@ -4339,6 +4341,7 @@ class Population(P, Sliceable):
                 draws,
                 steps=int(ve.shape[0]) if ve is not None else horizon_steps,
                 extra=extra,
+                dt=dt_f,
             )
             if self.intra is None:
                 self.intra = self.build_intra()
@@ -4349,7 +4352,7 @@ class Population(P, Sliceable):
                     "explicit intra cannot be combined with registered intracellular stimulation"
                 )
 
-        replay_banks = replay_tape is not None and replay_tape.plan.poisson is not None
+        replay_banks = replay_tape is not None and replay_tape.plan.has_bank_poisson
 
         # dt as scalar and tensor
         dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
@@ -4658,6 +4661,8 @@ class Population(P, Sliceable):
             contacts is not supported and will raise a :class:`ValueError`.
         draws : dendra.func.RuntimeDraws, optional
             Time-leading explicit draws and RNG boundaries matching accepted steps.
+            Mechanism-owned waveform injections consume their accepted-step
+            invocation recipes in native numerical order.
             Poisson bank recipes replay per step independently of chunklength;
             other waveforms retain per-chunk preparation. Omitted draws retain
             automatic sampling. Supplied base draws are detached while
@@ -4736,7 +4741,7 @@ class Population(P, Sliceable):
             )
 
             replay_tape = bind_population_runtime_draw_tape(
-                self, draws, steps=n_steps, extra=extra
+                self, draws, steps=n_steps, extra=extra, dt=dt_f
             )
 
         self._refresh_compile_config_from_ctx()
@@ -4760,7 +4765,7 @@ class Population(P, Sliceable):
                     "explicit intra cannot be combined with registered intracellular stimulation"
                 )
 
-        replay_banks = replay_tape is not None and replay_tape.plan.poisson is not None
+        replay_banks = replay_tape is not None and replay_tape.plan.has_bank_poisson
 
         # dt scalars
         dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
@@ -7808,7 +7813,7 @@ class Population(P, Sliceable):
             )
 
             replay_tape = bind_population_runtime_draw_tape(
-                self, draws, steps=n_steps, extra=extra, checkpointed=True
+                self, draws, steps=n_steps, extra=extra, dt=dt_f, checkpointed=True
             )
 
         self._refresh_compile_config_from_ctx()
@@ -7832,7 +7837,7 @@ class Population(P, Sliceable):
                     "explicit intra cannot be combined with registered intracellular stimulation"
                 )
 
-        replay_banks = replay_tape is not None and replay_tape.plan.poisson is not None
+        replay_banks = replay_tape is not None and replay_tape.plan.has_bank_poisson
 
         # dt scalars
         dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())

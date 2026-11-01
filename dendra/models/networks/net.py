@@ -220,7 +220,7 @@ def advance_populations(populations, dt, extra, intra, runtime_draws=None):
             step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
         else:
             replay = runtime_draws.populations[n]
-            with replay.scope():
+            with replay.scope(poisson=False):
                 step_pop(
                     pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
                 )
@@ -355,7 +355,10 @@ def step(
     if runtime_draws is None:
         advance_populations(populations, dt, extra, intra)
     else:
-        advance_populations(populations, dt, extra, intra, runtime_draws=runtime_draws)
+        with runtime_draws.bank_scope():
+            advance_populations(
+                populations, dt, extra, intra, runtime_draws=runtime_draws
+            )
 
 
 def get_local_index(population, mech, index):
@@ -3915,8 +3918,8 @@ class Network(RNGMixin):
         draws : dendra.func.RuntimeDraws, optional
             One explicit NOISE/SDE and NetStim frame with authoritative RNG
             boundaries. Solver-owned intracellular and call-local extracellular
-            Poisson banks consume invocation-indexed draws in native Network
-            order. Mechanism-owned Poisson replay is currently unsupported.
+            Poisson banks, and mechanism-owned waveform injections, consume
+            invocation-indexed draws in native Network order.
             Omission retains automatic sampling; supplied base draws and
             schedules remain detached.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
@@ -3976,7 +3979,7 @@ class Network(RNGMixin):
         if draws is not None:
             from dendra.func._native_runtime_draws import bind_network_runtime_draws
 
-            replay = bind_network_runtime_draws(self, draws, extra=extra)
+            replay = bind_network_runtime_draws(self, draws, extra=extra, dt=dt_f)
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
 
@@ -4032,7 +4035,7 @@ class Network(RNGMixin):
 
         with _native_callback_storage(observer) as observer, ctx:
             self._refresh_detached_materializations(dt_f)
-            with nullcontext() if replay is None else replay.bank_scope():
+            with nullcontext() if replay is None else replay.bank_scope(finish=False):
                 if with_intra:
                     intra = {
                         n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
@@ -4128,9 +4131,10 @@ class Network(RNGMixin):
             Population names. Tape lengths must equal the selected horizon's
             timestep count. Fields share the conflict rules of :meth:`step`.
         draws : dendra.func.RuntimeDraws, optional
-            Explicit time-leading NOISE/SDE, NetStim and waveform-bank draws.
-            Poisson-bearing Populations consume one waveform recipe per accepted
-            step, independently of execution chunking. Other Populations retain
+            Explicit time-leading NOISE/SDE, NetStim and Poisson waveform draws,
+            including mechanism-owned injections.
+            Populations with randomized Poisson banks consume one bank recipe per
+            accepted step, independently of execution chunking. Other banks retain
             native bulk waveform preparation. Base draws and schedules remain
             detached; model and stimulation parameters retain their gradients.
             Omission retains automatic sampling and native bank preparation cadence.
@@ -4206,7 +4210,7 @@ class Network(RNGMixin):
             from dendra.func._native_runtime_draws import bind_network_runtime_draw_tape
 
             draw_tape = bind_network_runtime_draw_tape(
-                self, draws, steps=n_steps, extra=extra
+                self, draws, steps=n_steps, extra=extra, dt=dt_f
             )
             self._refresh_compile_config_from_ctx()
             self._sync_runtime_clock()
@@ -4225,7 +4229,15 @@ class Network(RNGMixin):
                 self, inputs, extra=extra, intra=intra, steps=n_steps
             )
         extra = extra if extra is not None else {}
-        replay_names = () if draw_tape is None else draw_tape.plan.poisson_plans
+        replay_names = (
+            ()
+            if draw_tape is None
+            else tuple(
+                name
+                for name, plan in draw_tape.plan.populations.items()
+                if plan.has_bank_poisson
+            )
+        )
         extra_prepped = {}
         with nullcontext() if self.training else torch.no_grad():
             if draw_tape is None:
@@ -4478,7 +4490,7 @@ class Network(RNGMixin):
                 request_steps, request_duration, dt_f, self._duration_budget
             )
             draw_tape = bind_network_runtime_draw_tape(
-                self, draws, steps=n_steps, extra=extra
+                self, draws, steps=n_steps, extra=extra, dt=dt_f
             )
             self._refresh_compile_config_from_ctx()
             self._sync_runtime_clock()
@@ -4523,7 +4535,15 @@ class Network(RNGMixin):
             n_steps, duration_remainder = execution_step_budget(
                 request_steps, request_duration, dt_f, self._duration_budget
             )
-        replay_names = () if draw_tape is None else draw_tape.plan.poisson_plans
+        replay_names = (
+            ()
+            if draw_tape is None
+            else tuple(
+                name
+                for name, plan in draw_tape.plan.populations.items()
+                if plan.has_bank_poisson
+            )
+        )
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
@@ -5909,7 +5929,7 @@ class Network(RNGMixin):
             from dendra.func._native_runtime_draws import bind_network_runtime_draw_tape
 
             draw_tape = bind_network_runtime_draw_tape(
-                self, draws, steps=n_steps, extra=extra, checkpointed=True
+                self, draws, steps=n_steps, extra=extra, dt=dt_f, checkpointed=True
             )
             self._refresh_compile_config_from_ctx()
             self._sync_runtime_clock()
@@ -5955,7 +5975,15 @@ class Network(RNGMixin):
             name: (spatial, temporal)
             for name, (spatial, temporal, _device, _dtype) in extra_prepped.items()
         }
-        replay_names = () if draw_tape is None else draw_tape.plan.poisson_plans
+        replay_names = (
+            ()
+            if draw_tape is None
+            else tuple(
+                name
+                for name, plan in draw_tape.plan.populations.items()
+                if plan.has_bank_poisson
+            )
+        )
 
         def _as_loss_tensor(x):
             if x is None:
@@ -6324,9 +6352,9 @@ def _prepare_network_replay_banks(
 ):
     """Evaluate accepted-step banks using one ordered explicit invocation cursor."""
     prepared_extra = {}
-    with replay.bank_scope():
+    with replay.bank_scope(finish=False):
         for name, (spatial, waveform) in extra.items():
-            if name not in replay.poisson_plans:
+            if not replay.populations[name].plan.has_bank_poisson:
                 continue
             population = network.populations[name]
             device, dtype = population.device(), population.dtype()
@@ -6344,7 +6372,7 @@ def _prepare_network_replay_banks(
         prepared_intra = {
             name: (source, *network.populations[name].prep_intra(source, 1, dt))
             for name, source in intra.items()
-            if name in replay.poisson_plans
+            if replay.populations[name].plan.has_bank_poisson
         }
     extra_c = {} if extra_c is None else extra_c
     intra_c = {} if intra_c is None else intra_c
