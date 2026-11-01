@@ -13,13 +13,19 @@ class RuntimeDraws(NamedTuple):
 
     Obtain a packet with ``functional.sample_runtime_draws(state)`` or a
     time-leading tape with ``functional.sample_runtime_draws(state, steps=N)``.
-    Pass it through ``draws=`` in functional execution or a native Population/
-    Network ``step`` and its public helpers. Native steps consume one packet
-    for NOISE/State SDE and optional Network NetStim. Population and Network
-    steps also replay solver-owned intra and call-local extra randomized
-    Poisson banks with finite n and fixed invocation counts. Network banks
-    retain global invocation order and shared waveform/generator ownership.
-    Mechanism-owned Poisson and native run-family draw tapes are unsupported.
+    Pass it through ``draws=`` in functional execution or native Population/
+    Network execution. ``step`` and its public helpers consume one frame;
+    ``run``, ``longrun`` and ``longrun_checkpointed`` consume a time-leading
+    tape matching their accepted timestep count. These packets cover
+    NOISE/State SDE, optional Network NetStim and solver-owned intra/call-local
+    extra randomized Poisson banks with finite n and fixed invocation counts.
+    A Population with replayed Poisson banks evaluates its solver-level banks
+    once per accepted step, independently of native execution chunk size.
+    Populations without these banks retain native whole-run/per-chunk waveform
+    evaluation. Omitted draws retain automatic bank preparation and sampling.
+    Network banks retain global invocation order and
+    shared waveform/generator ownership. Mechanism-owned Poisson replay is
+    currently unsupported.
     Numerical draw families and stream routes are fixed by the lowered model.
     Shared RNG bytes occur once at each native publication boundary, including
     intermediate Population boundaries when a Network exposes them.
@@ -29,9 +35,15 @@ class RuntimeDraws(NamedTuple):
     Existing initialization draw packets and runtime input tuples keep their
     separate public formats.
 
+    Native checkpointed training requires versioned tensor leaves. Clone
+    inference tensors outside ``torch.inference_mode()`` before passing them
+    to that execution path; ordinary replay and inference retain their support.
+
     Sampling leaves source generators and incoming state unchanged. Native
     execution publishes the supplied RNG timeline at its existing boundaries;
-    later steps with omitted draws continue from that published position.
+    later steps with omitted draws continue from that published position. Keep
+    tapes unchanged until checkpoint backward finishes; recomputation reuses
+    their original frames and rejects changed tensor leaves.
     """
 
     draws: dict[str, object]

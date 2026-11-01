@@ -159,14 +159,15 @@ Runtime state and the physical duration remainder continue through the native
 model's existing checkpoint methods. Supply the remaining input tape again
 when resuming.
 
-## Explicit runtime draws for native steps
+## Explicit runtime draws
 
 `Inputs` contains deterministic drives. Supply stochastic values separately
 through `draws=` on native Population/Network `step`, `dn.step`,
 `dn.step_population` and `dn.step_network`. These calls consume one
 `dn.func.RuntimeDraws` packet for NOISE, State SDE and optional Network NetStim.
-Native `run`, `longrun` and `longrun_checkpointed` do not accept draw tapes.
-Population and Network steps also replay randomized Poisson waveforms in
+Native `run`, `longrun` and `longrun_checkpointed` consume a time-leading
+`RuntimeDraws` tape. Population and Network execution also replays randomized
+Poisson waveforms in
 solver-owned intracellular injections and call-local extracellular `extra` banks.
 Mechanism-owned Poisson replay is unsupported.
 Omitting `draws` retains the native sampling lifecycle.
@@ -187,6 +188,82 @@ frames. Existing plans can be reused while the model remains compatible;
 `program.functional` also exposes a compiled runner's plan. Packet families,
 shapes, dtype/device and stream routes follow that plan. Keep the sampled packet
 intact rather than constructing its draw or RNG fields manually.
+
+### Run-family tapes
+
+Supply `steps=N` to the same sampler for a time-leading tape:
+
+```python
+functional, _ = dn.func.make_functional(population, dt=dt)
+boundary = dn.func.capture_continuation(functional, population)
+draws = functional.sample_runtime_draws(boundary.state, steps=100)
+population.longrun(
+    steps=100,
+    chunklength=32,
+    dt=dt,
+    inputs=inputs,
+    draws=draws,
+)
+```
+
+A Network accepts the same argument using its initialized timestep; omit `dt`
+from the native call and key deterministic `inputs` by Population name. `run`
+also accepts these tapes. Use `longrun_checkpointed(..., draws=draws)` for
+activation-checkpointed training. The packet has one row for every accepted
+solver step; its leading length must match the horizon resolved from
+`steps`, `duration`, `tstop` or existing input-tape rules. Draw tapes alone do
+not select a horizon. A zero-step explicit tape performs no stochastic
+evaluation or RNG publication.
+
+Explicit Poisson replay evaluates one complete invocation recipe per accepted
+step. A Population containing replayed Poisson banks evaluates its solver-level
+intracellular and extracellular banks per accepted step. Populations without
+these banks retain native whole-run/per-chunk waveform evaluation, including
+when another Population in the same Network replays Poisson inputs. The supplied
+random values and Poisson recipes are independent of `chunklength`; custom
+deterministic waveforms retain their existing time-grid semantics. Calls with
+omitted `draws` retain the native automatic sampling lifecycle, including the
+existing whole-run or per-chunk preparation of solver-level waveform banks.
+
+Validation checks the entire supplied tape before executing its first frame,
+including later RNG frames and Poisson recipes. Draw tensors remain
+caller-owned. Keep them unchanged until backward finishes: checkpoint
+recomputation reads the same frames and rejects mutated leaves. With the default
+`restore_state_after_backward=True`, recomputing a checkpointed chunk restores
+the live model, caller-owned Poisson schedule history and generator positions
+afterward. Model parameters, waveform
+parameters and deterministic input gradients retain their usual paths; supplied
+base draws remain detached.
+
+Native checkpointed training requires tape tensors with mutation counters.
+Tensors created under `torch.inference_mode()` must be cloned outside that
+context before the call. Ordinary replay and inference execution accept those
+tensors directly; an empty tape does not require checkpoint operands.
+
+When resuming a native checkpoint, supply the remaining draw and input slices
+again. Save call-local extracellular waveform state separately when needed;
+those objects remain caller-owned. A later native step with omitted draws
+continues from the final replayed RNG boundary.
+
+The complete
+{download}`shared_runtime_draw_tapes.py <../../examples/shared_runtime_draw_tapes.py>`
+example samples one tape, runs a native prefix and checkpointed suffix, restores
+the prefix into a compatible receiver, and continues with a different chunk
+size. It checks callback phase and training gradients for both Populations and
+Networks:
+
+```{literalinclude} ../../examples/shared_runtime_draw_tapes.py
+:language: python
+:start-after: "# region prefix"
+:end-before: "# endregion prefix"
+:dedent: 4
+```
+
+```console
+python examples/shared_runtime_draw_tapes.py
+```
+
+### RNG publication and Poisson ownership
 
 Explicit native execution uses detached base draws and publishes their
 authoritative RNG frames at the normal execution boundaries. Shared Network

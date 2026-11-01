@@ -15,6 +15,15 @@ def _seed_tensor(seed, device):
 
 def _rng_values(rng, device):
     extra = rng if isinstance(rng, dict) else rng.get_extra_state()
+    device = torch.device(device)
+    if device.type != "cpu" and str(device) not in extra["rng_state"]:
+        # A cold accelerator stream can have only its unindexed route so far.
+        # Tensor sampling uses the receiving device's exact indexed route. Seed
+        # that lazy route on an isolated sampler so the carried schema is fixed
+        # before the first draw, without changing native generator ownership.
+        sampler = RNGModule.from_checkpoint(extra)
+        sampler._rng(device)
+        extra = sampler.get_extra_state()
     return {
         "seed": _seed_tensor(extra["base_seed"], device),
         "negative": torch.tensor(

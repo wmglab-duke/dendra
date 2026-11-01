@@ -3903,6 +3903,22 @@ class Population(P, Sliceable):
         """Start a fresh duration budget for a new simulation episode."""
         self._duration_remainder = torch.zeros((), device="cpu", dtype=torch.float64)
 
+    def _prepare_replayed_stimulation(
+        self, replay, intra, dt, extra_cfg, *, ve=None, current=None
+    ):
+        """Evaluate one accepted-step bank recipe using ordinary native assembly."""
+        with replay.bank_scope():
+            if extra_cfg is not None and extra_cfg.functional:
+                time = self.t.reshape(1).to(device=self.device(), dtype=self.dtype())
+                values = self._compute_extra_chunk(extra_cfg, 0, time)
+                ve = None if values is None else values[0]
+            if intra is not None:
+                stims, indices = self.prep_intra(intra, 1, dt)
+                current = self._call_make_intra(
+                    intra, [stim[0] for stim in stims], indices
+                )
+        return ve, current
+
     def step(
         self,
         dt: Optional[float] = None,
@@ -4106,6 +4122,7 @@ class Population(P, Sliceable):
         steps=None,
         duration=None,
         inputs=None,
+        draws=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
@@ -4129,6 +4146,12 @@ class Population(P, Sliceable):
             determines the horizon. Existing ``ve=`` remains authoritative when
             supplied. Explicit voltage cannot duplicate ``ve=`` or ``extra=``;
             explicit current cannot replace registered solver-level Slice injections.
+        draws : dendra.func.RuntimeDraws, optional
+            Explicit time-leading draw and RNG tapes matching the accepted steps.
+            Populations with randomized Poisson bank waveforms replay their banks
+            per accepted step. Other waveforms retain full-run preparation.
+            Changing replay chunking does not change the experiment. Omission retains automatic
+            sampling. Base draws remain detached; model/input gradients are kept.
         extra : tuple or sequence of tuples, optional
             Extracellular input specification(s), with the same semantics as
             :meth:`longrun`.
@@ -4272,7 +4295,7 @@ class Population(P, Sliceable):
             raise ValueError("tstop must be provided when 've' is not given.")
 
         # auto-build intra if missing
-        if self.intra is None:
+        if self.intra is None and draws is None:
             intra = self.build_intra()
             self.intra = intra
         else:
@@ -4304,6 +4327,29 @@ class Population(P, Sliceable):
             if input_ve is not None:
                 ve = input_ve
             horizon_steps = input_steps
+
+        replay_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import (
+                bind_population_runtime_draw_tape,
+            )
+
+            replay_tape = bind_population_runtime_draw_tape(
+                self,
+                draws,
+                steps=int(ve.shape[0]) if ve is not None else horizon_steps,
+                extra=extra,
+            )
+            if self.intra is None:
+                self.intra = self.build_intra()
+            intra = self.intra
+            with_intra = intra is not None
+            if input_intra is not None and with_intra:
+                raise ValueError(
+                    "explicit intra cannot be combined with registered intracellular stimulation"
+                )
+
+        replay_banks = replay_tape is not None and replay_tape.plan.poisson is not None
 
         # dt as scalar and tensor
         dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
@@ -4340,8 +4386,10 @@ class Population(P, Sliceable):
             # Prepare intra
             # --------------------------------------------------------------
             indexed_tapes = None
-            reconcile_extra_poisson_rng(self, extra)
-            if with_intra:
+            stims = indices = None
+            if replay_tape is None:
+                reconcile_extra_poisson_rng(self, extra)
+            if with_intra and not replay_banks and (replay_tape is None or n > 0):
                 if (
                     n > 0
                     and _can_index_intra_tapes(self, intra)
@@ -4384,6 +4432,7 @@ class Population(P, Sliceable):
             # --------------------------------------------------------------
             # Prepare extracellular input via 'extra' if needed
             # --------------------------------------------------------------
+            extra_cfg = None
             if ve is None and extra is not None:
                 # One "chunk" for the whole run
                 extra_cfg = self._prepare_extra(extra, t_global, n_chunks=1)
@@ -4392,7 +4441,12 @@ class Population(P, Sliceable):
                     extra_cfg.einsum = extra_cfg.einsum
 
                 # Single chunk index 0, over full time grid
-                ve_list = self._compute_extra_chunk(extra_cfg, 0, t_global)
+                ve_list = (
+                    self._compute_extra_chunk(extra_cfg, 0, t_global)
+                    if (not replay_banks or not extra_cfg.functional)
+                    and (replay_tape is None or n > 0 or not extra_cfg.functional)
+                    else None
+                )
             else:
                 ve_list = None
 
@@ -4443,8 +4497,19 @@ class Population(P, Sliceable):
                     else:
                         ve_c = None
 
-                    # Intracellular stimulation for this step
-                    if with_intra:
+                    # Explicit recipes use the accepted clock and ordinary
+                    # native bank/assembly operations before the numerical step.
+                    replay = None if replay_tape is None else replay_tape.frame(i)
+                    if replay is not None and replay_banks:
+                        ve_c, intra_c = self._prepare_replayed_stimulation(
+                            replay,
+                            intra,
+                            dt_f,
+                            extra_cfg,
+                            ve=ve_c,
+                            current=None if input_intra is None else input_intra[i],
+                        )
+                    elif with_intra:
                         s = [st[local_ind] for st in stims]
                         if fuse_intra and (
                             stable_intra_callbacks
@@ -4481,7 +4546,10 @@ class Population(P, Sliceable):
                     pre_step_hook(callbacks, self)
                     if skip_empty_noise:
                         intra_c = _NoiseFreeStep(intra_c)
-                    self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                    with nullcontext() if replay is None else replay.scope():
+                        self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                    if replay is not None:
+                        replay.publish()
                     self.t = self.t + dt_tensor
 
                     if observer is not None:
@@ -4522,6 +4590,7 @@ class Population(P, Sliceable):
         steps=None,
         duration=None,
         inputs=None,
+        draws=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
@@ -4587,6 +4656,12 @@ class Population(P, Sliceable):
 
             Mixing :class:`Waveform` and tensor time specifications across
             contacts is not supported and will raise a :class:`ValueError`.
+        draws : dendra.func.RuntimeDraws, optional
+            Time-leading explicit draws and RNG boundaries matching accepted steps.
+            Poisson bank recipes replay per step independently of chunklength;
+            other waveforms retain per-chunk preparation. Omitted draws retain
+            automatic sampling. Supplied base draws are detached while
+            model, waveform and input gradients are preserved.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this Population or a compatible
@@ -4654,6 +4729,16 @@ class Population(P, Sliceable):
         n_steps, duration_remainder = execution_step_budget(
             requested_steps, requested_duration, dt_f, self._duration_budget
         )
+        replay_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import (
+                bind_population_runtime_draw_tape,
+            )
+
+            replay_tape = bind_population_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra
+            )
+
         self._refresh_compile_config_from_ctx()
 
         # Match step()/run(): injections registered after initialization
@@ -4674,6 +4759,8 @@ class Population(P, Sliceable):
                 raise ValueError(
                     "explicit intra cannot be combined with registered intracellular stimulation"
                 )
+
+        replay_banks = replay_tape is not None and replay_tape.plan.poisson is not None
 
         # dt scalars
         dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
@@ -4744,6 +4831,7 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 input_start = 0
                 for i, t_chunk in enumerate(t_chunks):
+                    draw_start = input_start
                     input_stop = input_start + len(t_chunk)
                     input_intra_chunk = (
                         None
@@ -4753,8 +4841,12 @@ class Population(P, Sliceable):
                     if observer is not None:
                         observed_emissions = []
                     indexed_tapes = None
-                    reconcile_extra_poisson_rng(self, extra)
-                    if with_intra:
+                    stims = indices = None
+                    if replay_tape is None:
+                        reconcile_extra_poisson_rng(self, extra)
+                    else:
+                        replay_tape.validate_fresh()
+                    if with_intra and not replay_banks:
                         tapes, indices = intra.init(t_chunk)
                         # Waveform output always carries time on its last axis;
                         # leading axes are population batch/sweep axes.
@@ -4765,7 +4857,7 @@ class Population(P, Sliceable):
                             indexed=_can_index_intra_tapes(self, intra),
                         )
 
-                    if with_extra:
+                    if with_extra and (not replay_banks or not extra_cfg.functional):
                         ve_list = self._compute_extra_chunk(extra_cfg, i, t_chunk)
                     else:
                         ve_list = (
@@ -4819,7 +4911,23 @@ class Population(P, Sliceable):
                         for j in range(len(t_chunk)):
                             ve_c = ve_list[j] if ve_list is not None else None
 
-                            if with_intra:
+                            replay = (
+                                None
+                                if replay_tape is None
+                                else replay_tape.frame(draw_start + j)
+                            )
+                            if replay is not None and replay_banks:
+                                ve_c, intra_c = self._prepare_replayed_stimulation(
+                                    replay,
+                                    intra,
+                                    dt_f,
+                                    extra_cfg,
+                                    ve=ve_c,
+                                    current=None
+                                    if input_intra_chunk is None
+                                    else input_intra_chunk[j],
+                                )
+                            elif with_intra:
                                 s = [st[j] for st in stims]
                                 if fuse_intra and (
                                     stable_intra_callbacks
@@ -4859,7 +4967,12 @@ class Population(P, Sliceable):
                             pre_step_hook(callbacks, self)
                             if skip_empty_noise:
                                 intra_c = _NoiseFreeStep(intra_c)
-                            self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                            with nullcontext() if replay is None else replay.scope():
+                                self._step(
+                                    self.integrator, self, dt_tensor, ve_c, intra_c
+                                )
+                            if replay is not None:
+                                replay.publish()
                             self.t = self.t + dt_tensor
                             if observer is not None:
                                 observed_state, emitted = observer.update(
@@ -7536,6 +7649,7 @@ class Population(P, Sliceable):
         steps=None,
         duration=None,
         inputs=None,
+        draws=None,
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
@@ -7574,6 +7688,13 @@ class Population(P, Sliceable):
             Checkpoint recomputation reuses each chunk's original input slices,
             preserving gradients to their caller-owned sources. Omitted fields
             retain registered stimulation; duplicate drive sources are rejected.
+        draws : dendra.func.RuntimeDraws, optional
+            Time-leading explicit draws and RNG boundaries matching accepted steps.
+            Checkpoint recomputation reuses the original step recipes without
+            sampling again. Keep tape tensors unchanged until backward completes.
+            Checkpointed training requires mutation counters; clone inference
+            tensors outside ``torch.inference_mode()`` before passing them here.
+            Omission retains automatic sampling and its bank preparation cadence.
         extra : ExtraSpec, optional
             Extracellular configuration with the same ``(ve_s, time)`` shape
             and trailing-first broadcasting contract as :meth:`longrun`.
@@ -7680,6 +7801,16 @@ class Population(P, Sliceable):
         n_steps, duration_remainder = execution_step_budget(
             requested_steps, requested_duration, dt_f, self._duration_budget
         )
+        replay_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import (
+                bind_population_runtime_draw_tape,
+            )
+
+            replay_tape = bind_population_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra, checkpointed=True
+            )
+
         self._refresh_compile_config_from_ctx()
 
         # Match step()/run(): injections registered after initialization
@@ -7700,6 +7831,8 @@ class Population(P, Sliceable):
                 raise ValueError(
                     "explicit intra cannot be combined with registered intracellular stimulation"
                 )
+
+        replay_banks = replay_tape is not None and replay_tape.plan.poisson is not None
 
         # dt scalars
         dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
@@ -7738,7 +7871,11 @@ class Population(P, Sliceable):
             return _clone_nested_state(sd)
 
         def _checkpoint_contexts():
-            return _checkpoint_recompute_contexts(self)
+            return (
+                _checkpoint_recompute_contexts(self)
+                if replay_tape is None
+                else replay_tape.checkpoint_contexts()
+            )
 
         with (
             _native_callback_storage(observer) as observer,
@@ -7824,6 +7961,7 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 input_start = 0
                 for i, t_chunk in enumerate(t_chunks):
+                    draw_start = input_start
                     chunk_idx = int(i)
                     t_chunk_local = t_chunk
                     input_stop = input_start + len(t_chunk)
@@ -7847,7 +7985,10 @@ class Population(P, Sliceable):
                         *,
                         t_chunk_local=t_chunk_local,
                         chunk_idx=chunk_idx,
+                        draw_start=draw_start,
                     ):
+                        if replay_tape is not None:
+                            replay_tape.validate_fresh()
                         # IMPORTANT: torch.utils.checkpoint forbids in-place mutation of
                         # checkpoint *inputs*. If out-of-place stepping is guaranteed,
                         # we can safely reuse the boundary tensors. Otherwise, clone.
@@ -7860,8 +8001,9 @@ class Population(P, Sliceable):
                         # Restore model state at chunk boundary
                         self.restore_dict_from_checkpoint(state_local)
 
-                        reconcile_extra_poisson_rng(self, extra)
-                        if with_intra:
+                        if replay_tape is None:
+                            reconcile_extra_poisson_rng(self, extra)
+                        if with_intra and not replay_banks:
                             stims, indices = intra.init(t_chunk_local)
                             # Waveform output always carries time on its last
                             # axis; leading axes are population batch/sweep axes.
@@ -7869,7 +8011,9 @@ class Population(P, Sliceable):
                         else:
                             stims, indices = None, None
 
-                        if with_extra:
+                        if with_extra and (
+                            not replay_banks or not extra_cfg.functional
+                        ):
                             ve_list = self._compute_extra_chunk(
                                 extra_cfg, chunk_idx, t_chunk_local
                             )
@@ -7884,7 +8028,23 @@ class Population(P, Sliceable):
                         for j in range(len(t_chunk_local)):
                             ve_c = ve_list[j] if ve_list is not None else None
 
-                            if with_intra:
+                            replay = (
+                                None
+                                if replay_tape is None
+                                else replay_tape.frame(draw_start + j)
+                            )
+                            if replay is not None and replay_banks:
+                                ve_c, intra_c = self._prepare_replayed_stimulation(
+                                    replay,
+                                    intra,
+                                    dt_f,
+                                    extra_cfg,
+                                    ve=ve_c,
+                                    current=None
+                                    if input_intra_chunk is None
+                                    else input_intra_chunk[j],
+                                )
+                            elif with_intra:
                                 s = [st[j] for st in stims]
                                 intra_c = self._call_make_intra(intra, s, indices)
                             else:
@@ -7894,7 +8054,12 @@ class Population(P, Sliceable):
                                     else input_intra_chunk[j]
                                 )
 
-                            self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                            with nullcontext() if replay is None else replay.scope():
+                                self._step(
+                                    self.integrator, self, dt_tensor, ve_c, intra_c
+                                )
+                            if replay is not None:
+                                replay.publish()
                             self.t = self.t + dt_tensor
 
                             # Replay-safe post-step callbacks (may contribute loss)
@@ -7951,7 +8116,10 @@ class Population(P, Sliceable):
                             *,
                             t_chunk_local=t_chunk_local,
                             chunk_idx=chunk_idx,
+                            draw_start=draw_start,
                         ):
+                            if replay_tape is not None:
+                                replay_tape.validate_fresh()
                             # Functional callback carry is an explicit checkpoint
                             # input/output. The model boundary follows the same
                             # mutation-safety policy as the ordinary path.
@@ -7962,14 +8130,17 @@ class Population(P, Sliceable):
                             )
                             self.restore_dict_from_checkpoint(state_local)
 
-                            reconcile_extra_poisson_rng(self, extra)
-                            if with_intra:
+                            if replay_tape is None:
+                                reconcile_extra_poisson_rng(self, extra)
+                            if with_intra and not replay_banks:
                                 stims, indices = intra.init(t_chunk_local)
                                 stims = [s.unbind(-1) for s in stims]
                             else:
                                 stims, indices = None, None
 
-                            if with_extra:
+                            if with_extra and (
+                                not replay_banks or not extra_cfg.functional
+                            ):
                                 ve_list = self._compute_extra_chunk(
                                     extra_cfg,
                                     chunk_idx,
@@ -7988,7 +8159,23 @@ class Population(P, Sliceable):
                             for j in range(len(t_chunk_local)):
                                 ve_c = ve_list[j] if ve_list is not None else None
 
-                                if with_intra:
+                                replay = (
+                                    None
+                                    if replay_tape is None
+                                    else replay_tape.frame(draw_start + j)
+                                )
+                                if replay is not None and replay_banks:
+                                    ve_c, intra_c = self._prepare_replayed_stimulation(
+                                        replay,
+                                        intra,
+                                        dt_f,
+                                        extra_cfg,
+                                        ve=ve_c,
+                                        current=None
+                                        if input_intra_chunk is None
+                                        else input_intra_chunk[j],
+                                    )
+                                elif with_intra:
                                     s = [st[j] for st in stims]
                                     intra_c = self._call_make_intra(
                                         intra,
@@ -8002,13 +8189,14 @@ class Population(P, Sliceable):
                                         else input_intra_chunk[j]
                                     )
 
-                                self._step(
-                                    self.integrator,
-                                    self,
-                                    dt_tensor,
-                                    ve_c,
-                                    intra_c,
-                                )
+                                with (
+                                    nullcontext() if replay is None else replay.scope()
+                                ):
+                                    self._step(
+                                        self.integrator, self, dt_tensor, ve_c, intra_c
+                                    )
+                                if replay is not None:
+                                    replay.publish()
                                 self.t = self.t + dt_tensor
 
                                 native_state_local, emitted = observer.update(

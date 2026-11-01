@@ -25,8 +25,9 @@ class Inputs(NamedTuple):
     registered solver-level injections.
 
     Networks accept a mapping from Population names to these same packets.
-    Functional execution accepts stochastic values and RNG timelines separately
-    through ``draws=``; native execution retains its automatic sampling.
+    Functional and native execution accept stochastic values and RNG timelines
+    separately through ``draws=RuntimeDraws(...)``. Omitting draws retains
+    automatic sampling.
     Existing ``StepInput``, ``RolloutInput`` and
     ``NetworkRolloutInput`` packets remain supported.
     """

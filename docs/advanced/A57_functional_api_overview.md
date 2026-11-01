@@ -787,10 +787,10 @@ The same `inputs=` packet is accepted by native Population `step`, `run`,
 Population mapping below. The helpers `dn.step`, `dn.step_population` and
 `dn.step_network` accept the corresponding one-step frames through `inputs=`.
 Native execution keeps its model-owned state and RNG lifecycle. Native steps
-also accept a separate `draws=` packet for NOISE/State SDE and optional Network
-NetStim. Population and Network steps replay randomized Poisson in solver-owned
-intra and call-local extra banks. Mechanism-owned Poisson and native run-family
-draw tapes remain unsupported.
+accept a separate `draws=` frame, and `run`, `longrun` and
+`longrun_checkpointed` accept time-leading draw tapes. They replay NOISE/State
+SDE, optional Network NetStim and randomized Poisson in solver-owned intra and
+call-local extra banks. Mechanism-owned Poisson replay is currently unsupported.
 See {doc}`A61_shared_runtime_inputs` for native horizons, validation and
 registered waveform behavior.
 
@@ -838,6 +838,29 @@ helper. Sampling leaves the model and generators unchanged; execution publishes
 the packet's authoritative RNG timeline, so a later step with omitted draws
 continues from its suffix. See {doc}`A61_shared_runtime_inputs` and
 {download}`shared_runtime_draws.py <../../examples/shared_runtime_draws.py>`.
+For native run methods, supply `steps=N` to the sampler and use a matching
+execution horizon. The same tape can drive native and functional execution:
+
+```python
+boundary = dn.func.capture_continuation(functional, population)
+draws = functional.sample_runtime_draws(boundary.state, steps=100)
+population.longrun(
+    steps=100, dt=dt, chunklength=32, inputs=inputs, draws=draws,
+)
+```
+
+A Network uses its initialized timestep and a Population-name input mapping;
+omit `dt` from its native run call. Explicit Poisson recipes are replayed once
+per accepted step, independently of the native chunk size. A Population with
+replayed Poisson banks evaluates its solver-level banks per accepted step;
+other Populations retain native whole-run/per-chunk waveform evaluation. Calls
+without `draws` retain their existing automatic sampling and waveform-bank cadence.
+Keep draw tensors unchanged until checkpoint recomputation finishes. The
+complete
+{download}`shared_runtime_draw_tapes.py <../../examples/shared_runtime_draw_tapes.py>`
+example covers both model types, callback continuation, native checkpoint
+restoration and gradients.
+
 Population and Network Poisson replay use the same finite-`n`, fixed-invocation recipes,
 including repeated shared waveform children and custom containers. Uniforms
 and schedules stay detached while amplitude and field gradients remain live;

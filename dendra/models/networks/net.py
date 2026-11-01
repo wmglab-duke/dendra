@@ -4093,6 +4093,7 @@ class Network(RNGMixin):
         steps=None,
         duration=None,
         inputs=None,
+        draws=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
@@ -4126,6 +4127,13 @@ class Network(RNGMixin):
             Deterministic time-leading voltage/current tapes keyed by exact
             Population names. Tape lengths must equal the selected horizon's
             timestep count. Fields share the conflict rules of :meth:`step`.
+        draws : dendra.func.RuntimeDraws, optional
+            Explicit time-leading NOISE/SDE, NetStim and waveform-bank draws.
+            Poisson-bearing Populations consume one waveform recipe per accepted
+            step, independently of execution chunking. Other Populations retain
+            native bulk waveform preparation. Base draws and schedules remain
+            detached; model and stimulation parameters retain their gradients.
+            Omission retains automatic sampling and native bank preparation cadence.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this Network or a compatible initialized
@@ -4186,12 +4194,22 @@ class Network(RNGMixin):
         request_steps, request_duration = native_horizon_request(
             tstop, steps=steps, duration=duration
         )
-        self._refresh_compile_config_from_ctx()
-        self._sync_runtime_clock()
+        if draws is None:
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
 
         n_steps, duration_remainder = execution_step_budget(
             request_steps, request_duration, dt_f, self._duration_budget
         )
+        draw_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import bind_network_runtime_draw_tape
+
+            draw_tape = bind_network_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra
+            )
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -4207,30 +4225,40 @@ class Network(RNGMixin):
                 self, inputs, extra=extra, intra=intra, steps=n_steps
             )
         extra = extra if extra is not None else {}
+        replay_names = () if draw_tape is None else draw_tape.plan.poisson_plans
         extra_prepped = {}
         with nullcontext() if self.training else torch.no_grad():
-            reconcile_extra_poisson_rng(self, extra)
+            if draw_tape is None:
+                reconcile_extra_poisson_rng(self, extra)
             for n, (v, t) in extra.items():
                 pop = self.populations[n]
                 dev, dtp = pop.device(), pop.dtype()
                 v_dev = pop._normalize_spatial(v)
-                t0 = self.t.to(device=dev, dtype=dtp)
-                t_grid = _time_grid_from_step_count(t0, n_steps, dt_f, device=dev).to(
-                    dtp
-                )
-                values = _evaluate_extra_waveform(
-                    pop,
-                    t,
-                    t_grid,
-                    n_steps=n_steps,
-                    name=f"extra[{n!r}] Waveform output",
-                    rng_owner=self,
-                )
+                values = t
+                if draw_tape is None or (n_steps and n not in replay_names):
+                    t0 = self.t.to(device=dev, dtype=dtp)
+                    t_grid = _time_grid_from_step_count(
+                        t0, n_steps, dt_f, device=dev
+                    ).to(dtp)
+                    values = _evaluate_extra_waveform(
+                        pop,
+                        t,
+                        t_grid,
+                        n_steps=n_steps,
+                        name=f"extra[{n!r}] Waveform output",
+                        rng_owner=self,
+                    )
                 extra_prepped[n] = (v_dev, values)
         extra = extra_prepped
 
         with_intra = bool(intra)
         with_extra = bool(extra)
+        replay_intra = {
+            name: source for name, source in intra.items() if name in replay_names
+        }
+        bulk_extra = {
+            name: value for name, value in extra.items() if name not in replay_names
+        }
         tstart = self.t.item()
 
         with _native_callback_storage(observer) as observer, ctx:
@@ -4243,6 +4271,7 @@ class Network(RNGMixin):
                 intra = {
                     n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt_f))
                     for n, intra_ in intra.items()
+                    if draw_tape is None or (n_steps and n not in replay_names)
                 }
 
             if callbacks is None:
@@ -4261,20 +4290,33 @@ class Network(RNGMixin):
             local_ind = 0
 
             for _ in range(n_steps):
-                intra_c = {}
-                extra_c = {}
-
-                if with_intra:
-                    intra_c = prepare_intra(intra_c, intra, local_ind)
-
-                if with_extra:
-                    extra_c = prepare_extra(extra, local_ind)
+                replay = None if draw_tape is None else draw_tape.frame(local_ind)
+                if replay is None:
+                    intra_c = {}
+                    extra_c = {}
+                    if with_intra:
+                        intra_c = prepare_intra(intra_c, intra, local_ind)
+                    if with_extra:
+                        extra_c = prepare_extra(extra, local_ind)
+                else:
+                    extra_c = prepare_extra(bulk_extra, local_ind)
+                    intra_c = prepare_intra({}, intra, local_ind)
+                    extra_c, intra_c = _prepare_network_replay_banks(
+                        self,
+                        replay,
+                        replay_intra,
+                        extra,
+                        dt_f,
+                        extra_c=extra_c,
+                        intra_c=intra_c,
+                    )
                 if runtime_inputs is not None:
                     extra_c, intra_c = _apply_network_runtime_inputs(
                         extra_c, intra_c, runtime_inputs, local_ind
                     )
 
                 pre_step_hook(callbacks, self)
+                draw_options = {} if replay is None else {"runtime_draws": replay}
                 self._step(
                     self._population_step_items,
                     self._synapse_step_items,
@@ -4286,7 +4328,10 @@ class Network(RNGMixin):
                     extra=extra_c,
                     intra=intra_c,
                     compile_network_ops=self.compile_network_ops,
+                    **draw_options,
                 )
+                if replay is not None:
+                    replay.publish_stimulation()
                 self._advance_runtime_clock()
                 if observer is not None:
                     observed_state, emitted = observer.update(observed_state)
@@ -4324,6 +4369,7 @@ class Network(RNGMixin):
         steps=None,
         duration=None,
         inputs=None,
+        draws=None,
         callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
@@ -4359,6 +4405,10 @@ class Network(RNGMixin):
             Deterministic time-leading voltage/current tapes with the same
             contract as :meth:`run`. Chunk boundaries retain tape views and
             gradients; all tape lengths match the selected timestep count.
+        draws : dendra.func.RuntimeDraws, optional
+            Explicit time-leading draws with the same contract as :meth:`run`.
+            Each accepted step consumes its own waveform recipe and RNG frame;
+            changing ``chunklength`` does not change replayed stochastic values.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this Network or a compatible initialized
@@ -4417,8 +4467,21 @@ class Network(RNGMixin):
         request_steps, request_duration = native_horizon_request(
             tstop, steps=steps, duration=duration
         )
-        self._refresh_compile_config_from_ctx()
-        self._sync_runtime_clock()
+        draw_tape = None
+        if draws is None:
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
+        else:
+            from dendra.func._native_runtime_draws import bind_network_runtime_draw_tape
+
+            n_steps, duration_remainder = execution_step_budget(
+                request_steps, request_duration, dt_f, self._duration_budget
+            )
+            draw_tape = bind_network_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra
+            )
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -4431,9 +4494,10 @@ class Network(RNGMixin):
 
         runtime_inputs = None
         if inputs is not None:
-            n_steps, duration_remainder = execution_step_budget(
-                request_steps, request_duration, dt_f, self._duration_budget
-            )
+            if draw_tape is None:
+                n_steps, duration_remainder = execution_step_budget(
+                    request_steps, request_duration, dt_f, self._duration_budget
+                )
             with nullcontext() if self.training else torch.no_grad():
                 runtime_inputs = _network_runtime_inputs(
                     self, inputs, extra=extra, intra=intra, steps=n_steps
@@ -4455,10 +4519,11 @@ class Network(RNGMixin):
         for callback in callbacks:
             _bind_callback_dt(callback, self.dt)
 
-        if inputs is None:
+        if inputs is None and draw_tape is None:
             n_steps, duration_remainder = execution_step_budget(
                 request_steps, request_duration, dt_f, self._duration_budget
             )
+        replay_names = () if draw_tape is None else draw_tape.plan.poisson_plans
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
@@ -4477,6 +4542,8 @@ class Network(RNGMixin):
 
             completed_steps = 0
             for chunk_start in range(0, n_steps, chunklength):
+                if draw_tape is not None:
+                    draw_tape.validate_fresh()
                 if observer is not None:
                     observed_emissions = []
                 n_chunk = min(chunklength, n_steps - chunk_start)
@@ -4490,17 +4557,20 @@ class Network(RNGMixin):
                     dtype=torch.double,
                 )
                 time_chunk = time_chunk.to(dtype=self.t.dtype)
-                reconcile_extra_poisson_rng(self, extra)
+                if draw_tape is None:
+                    reconcile_extra_poisson_rng(self, extra)
                 intra_chunk = {
                     name: (
                         source,
                         *self.populations[name].prep_intra(source, n_chunk, dt_f),
                     )
                     for name, source in intra.items()
+                    if name not in replay_names
                 }
-
                 extra_chunk = {}
                 for name, (spatial, temporal) in extra_sources.items():
+                    if name in replay_names:
+                        continue
                     pop = self.populations[name]
                     device, dtype = pop.device(), pop.dtype()
                     start = self.t.to(device=device, dtype=dtype)
@@ -4522,18 +4592,34 @@ class Network(RNGMixin):
 
                 pre_chunk_hook(callbacks, self, time_chunk)
                 for local_ind in range(n_chunk):
+                    replay = (
+                        None
+                        if draw_tape is None
+                        else draw_tape.frame(chunk_start + local_ind)
+                    )
                     intra_c = (
                         prepare_intra({}, intra_chunk, local_ind) if intra_chunk else {}
                     )
                     extra_c = (
                         prepare_extra(extra_chunk, local_ind) if extra_chunk else {}
                     )
+                    if replay is not None:
+                        extra_c, intra_c = _prepare_network_replay_banks(
+                            self,
+                            replay,
+                            intra,
+                            extra_sources,
+                            dt_f,
+                            extra_c=extra_c,
+                            intra_c=intra_c,
+                        )
                     if inputs_chunk is not None:
                         extra_c, intra_c = _apply_network_runtime_inputs(
                             extra_c, intra_c, inputs_chunk, local_ind
                         )
 
                     pre_step_hook(callbacks, self)
+                    draw_options = {} if replay is None else {"runtime_draws": replay}
                     self._step(
                         self._population_step_items,
                         self._synapse_step_items,
@@ -4545,7 +4631,10 @@ class Network(RNGMixin):
                         extra=extra_c,
                         intra=intra_c,
                         compile_network_ops=self.compile_network_ops,
+                        **draw_options,
                     )
+                    if replay is not None:
+                        replay.publish_stimulation()
                     self._advance_runtime_clock()
                     if observer is not None:
                         observed_state, emitted = observer.update(observed_state)
@@ -5665,6 +5754,7 @@ class Network(RNGMixin):
         steps=None,
         duration=None,
         inputs=None,
+        draws=None,
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
@@ -5704,6 +5794,12 @@ class Network(RNGMixin):
             Deterministic time-leading voltage/current tapes with the same
             contract as :meth:`run`. Checkpoint chunks retain their own tape
             slices so replay uses the same frames and preserves input gradients.
+        draws : dendra.func.RuntimeDraws, optional
+            Explicit time-leading draws with the same contract as :meth:`run`.
+            Checkpoint replay consumes the same accepted-step recipes and RNG
+            frames. Keep the tape unchanged until backward has completed.
+            Checkpointed training requires mutation counters; clone inference
+            tensors outside ``torch.inference_mode()`` before passing them here.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this Network or a compatible initialized
@@ -5789,16 +5885,18 @@ class Network(RNGMixin):
         request_steps, request_duration = native_horizon_request(
             tstop, steps=steps, duration=duration
         )
-        self._refresh_compile_config_from_ctx()
-        self._sync_runtime_clock()
+        if draws is None:
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
 
         # Normalize callbacks.
         if callbacks is None:
             callbacks = []
         if not isinstance(callbacks, CallbackList):
             callbacks = CallbackList(callbacks)
-        for c in callbacks:
-            _bind_callback_dt(c, self.dt)
+        if draws is None:
+            for c in callbacks:
+                _bind_callback_dt(c, self.dt)
 
         # Use the same retained-duration budget as run()/longrun(). Exact
         # decimal-form arithmetic keeps common decimal multiples composable
@@ -5806,6 +5904,17 @@ class Network(RNGMixin):
         n_steps, duration_remainder = execution_step_budget(
             request_steps, request_duration, dt_f, self._duration_budget
         )
+        draw_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import bind_network_runtime_draw_tape
+
+            draw_tape = bind_network_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra, checkpointed=True
+            )
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
+            for c in callbacks:
+                _bind_callback_dt(c, self.dt)
         initial_time = self.t.double().detach().clone()
         t_grid = initial_time + dt_f * torch.arange(
             n_steps,
@@ -5842,6 +5951,11 @@ class Network(RNGMixin):
             runtime_inputs = _network_runtime_inputs(
                 self, inputs, extra=extra, intra=intra_sources, steps=n_steps
             )
+        replay_extra = {
+            name: (spatial, temporal)
+            for name, (spatial, temporal, _device, _dtype) in extra_prepped.items()
+        }
+        replay_names = () if draw_tape is None else draw_tape.plan.poisson_plans
 
         def _as_loss_tensor(x):
             if x is None:
@@ -5888,7 +6002,11 @@ class Network(RNGMixin):
             return _clone_any(sd)
 
         def _checkpoint_contexts():
-            return _checkpoint_recompute_contexts(self)
+            return (
+                _checkpoint_recompute_contexts(self)
+                if draw_tape is None
+                else draw_tape.checkpoint_contexts()
+            )
 
         total_loss = None
         saw_any_loss = False
@@ -5929,6 +6047,7 @@ class Network(RNGMixin):
 
                 input_offset = 0
                 for chunk_idx, t_chunk in enumerate(t_chunks):
+                    draw_start = input_offset
                     inputs_chunk = _slice_network_runtime_inputs(
                         runtime_inputs, input_offset, input_offset + len(t_chunk)
                     )
@@ -5947,7 +6066,10 @@ class Network(RNGMixin):
                         *input_values,
                         t_chunk_local=t_chunk,
                         input_spec_local=input_spec,
+                        draw_start_local=draw_start,
                     ):
+                        if draw_tape is not None:
+                            draw_tape.validate_fresh()
                         inputs_local = (
                             None
                             if input_spec_local is None
@@ -5962,11 +6084,14 @@ class Network(RNGMixin):
                         self.restore_dict_from_checkpoint(state_local)
                         pre_chunk_hook(callbacks, self, t_chunk_local)
 
-                        reconcile_extra_poisson_rng(self, extra)
                         # Prepare per-chunk intra specs (bounded to chunklength).
                         intra_chunk = {}
+                        if draw_tape is None:
+                            reconcile_extra_poisson_rng(self, extra)
                         if len(intra_sources) > 0:
                             for name, intra_obj in intra_sources.items():
+                                if name in replay_names:
+                                    continue
                                 stims, indices = self.populations[name].prep_intra(
                                     intra_obj, len(t_chunk_local), dt_f
                                 )
@@ -5981,6 +6106,8 @@ class Network(RNGMixin):
                                 dev,
                                 dtp,
                             ) in extra_prepped.items():
+                                if name in replay_names:
+                                    continue
                                 t0 = self.t.to(device=dev, dtype=dtp)
                                 chunk_steps = int(len(t_chunk_local))
                                 t_grid_local = _time_grid_from_step_count(
@@ -6006,6 +6133,11 @@ class Network(RNGMixin):
                             emissions = []
 
                         for i_t in range(len(t_chunk_local)):
+                            replay = (
+                                None
+                                if draw_tape is None
+                                else draw_tape.frame(draw_start_local + i_t)
+                            )
                             # Intra for this step.
                             intra_c = {}
                             if len(intra_chunk) > 0:
@@ -6021,12 +6153,25 @@ class Network(RNGMixin):
                             if len(extra_ts) > 0:
                                 for name, (v_dev, ts) in extra_ts.items():
                                     extra_c[name] = v_dev * ts[..., i_t].unsqueeze(-1)
+                            if replay is not None:
+                                extra_c, intra_c = _prepare_network_replay_banks(
+                                    self,
+                                    replay,
+                                    intra_sources,
+                                    replay_extra,
+                                    dt_f,
+                                    extra_c=extra_c,
+                                    intra_c=intra_c,
+                                )
                             if inputs_local is not None:
                                 extra_c, intra_c = _apply_network_runtime_inputs(
                                     extra_c, intra_c, inputs_local, i_t
                                 )
 
                             # Advance network dynamics.
+                            draw_options = (
+                                {} if replay is None else {"runtime_draws": replay}
+                            )
                             self._step(
                                 self.populations,
                                 self.synapses,
@@ -6038,7 +6183,10 @@ class Network(RNGMixin):
                                 extra=extra_c,
                                 intra=intra_c,
                                 compile_network_ops=self.compile_network_ops,
+                                **draw_options,
                             )
+                            if replay is not None:
+                                replay.publish_stimulation()
                             self._advance_runtime_clock()
                             if observer is not None:
                                 observed_state_local, emitted = observer.update(
@@ -6169,6 +6317,39 @@ def prepare_extra(extra, local_ind: int):
     Prepares the voltage and time data for the current step.
     """
     return {n: v * t[..., local_ind].unsqueeze(-1) for n, (v, t) in extra.items()}
+
+
+def _prepare_network_replay_banks(
+    network, replay, intra, extra, dt, *, extra_c=None, intra_c=None
+):
+    """Evaluate accepted-step banks using one ordered explicit invocation cursor."""
+    prepared_extra = {}
+    with replay.bank_scope():
+        for name, (spatial, waveform) in extra.items():
+            if name not in replay.poisson_plans:
+                continue
+            population = network.populations[name]
+            device, dtype = population.device(), population.dtype()
+            start = network.t.to(device=device, dtype=dtype)
+            times = _time_grid_from_step_count(start, 1, dt, device=device).to(dtype)
+            values = _evaluate_extra_waveform(
+                population,
+                waveform,
+                times,
+                n_steps=1,
+                name=f"extra[{name!r}] Waveform output",
+                rng_owner=network,
+            )
+            prepared_extra[name] = (spatial, values)
+        prepared_intra = {
+            name: (source, *network.populations[name].prep_intra(source, 1, dt))
+            for name, source in intra.items()
+            if name in replay.poisson_plans
+        }
+    extra_c = {} if extra_c is None else extra_c
+    intra_c = {} if intra_c is None else intra_c
+    extra_c.update(prepare_extra(prepared_extra, 0))
+    return extra_c, prepare_intra(intra_c, prepared_intra, 0)
 
 
 def _evaluate_extra_waveform(
