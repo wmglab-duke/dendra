@@ -156,8 +156,9 @@ inputs, draws and declared call-local ``extra=`` remain per-call arguments.
 
 .. autoclass:: dendra.func.Continuation
 
-``dn.func.capture_continuation(target, native_model=None)`` creates an owned
-detached packet from a current initialized native Population or Network.
+``dn.func.capture_continuation(target, native_model=None, *, callbacks=None,
+callback_state=None)`` creates an owned snapshot from a current initialized
+native Population or Network, detaching its model sources and recurrent state.
 Targets are lowered functional plans or compiled programs; omission captures
 the target's original native model. A supplied model must match the plan's
 structure, dtype/device, mode and source sharing. A configured native timestep
@@ -167,11 +168,28 @@ values and trainability, including shared sources, rather than edited program
 defaults or trainable selectors. It preserves clocks, pending traffic, retained
 materializations and RNG carry without initializing, advancing or sampling a
 model. It derives deterministic snapshot baselines from native materializations.
-Its first execution
-starts fresh callback carry at the captured boundary; transfer existing carry
-through the explicit callback export/restore bridge. See
+Omitting ``callback_state=`` starts fresh callbacks at the captured boundary.
+To retain reductions and recording phase, use the target's prepared collection
+for native warmup and pass its result's ``.state`` to capture. An explicit plan
+also requires its bound ``callbacks=`` collection when carry is supplied;
+runners infer ``program.callbacks`` and reject non-``None`` ``callbacks=``.
+The packet owns detached recurrent callback carry, retaining its trainability
+flags; suffix recordings contain only new selected samples, without repeating
+the boundary. Built-in LFP field carry is rebuilt from the collection's current
+bound field sources into owned storage using the ambient gradient mode. Enabled
+gradients preserve suffix gradients to those external fields, including after
+native-prefix backward; captured model-source and earlier recurrent graphs stay
+detached. Externally computed nonleaf field sources retain their upstream graph
+lifetime. Capture excludes prior recordings and does not initialize callbacks
+or open storage. Same-collection custom callbacks need no portable checkpoint
+hook for capture; exporting the packet retains the existing checkpoint
+requirements. Portable LFP restoration keeps detached saved field carry; call
+``detach_continuation`` with gradients enabled before resuming field training
+to refresh fields from the receiving collection. Transfer carry between different
+collections through their explicit export/restore bridge before capture. See
 :doc:`../advanced/A59_functional_native_handoff` and
-:download:`functional_continuation_capture.py <../../examples/functional_continuation_capture.py>`.
+:download:`functional_continuation_capture.py <../../examples/functional_continuation_capture.py>`
+and :download:`functional_callback_capture.py <../../examples/functional_callback_capture.py>`.
 
 .. autofunction:: dendra.func.capture_continuation
 

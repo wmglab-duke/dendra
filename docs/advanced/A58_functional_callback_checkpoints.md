@@ -64,6 +64,24 @@ For an explicitly lowered Population or Network, use the collection returned by
 `functional.make_callbacks(...)` instead. Both expose the same `export_state`
 and `restore_state` methods.
 
+For native warmup, use that same prepared collection with the native model and
+pass its result's `.state` to
+`dn.func.capture_continuation(target, callback_state=results.state)`. An explicit
+plan also requires `callbacks=callbacks`; a runner infers its configured
+collection. Capture retains owned detached recurrent carry, accumulated
+reductions and Recorder phase, so the first functional suffix emits only new
+selected samples. Built-in LFP field carry is refreshed from current bound field
+sources using the ambient gradient mode and owns its storage; enabled gradients
+connect the suffix to those external fields. The captured model sources and
+earlier recurrent graphs are detached. The packet can be exported immediately
+under the usual callback checkpoint requirements. Portable LFP restoration
+retains detached saved field carry; use `dn.func.detach_continuation` with
+gradients enabled to refresh fields before resuming field training. Capture
+itself does not require custom portable hooks or include earlier recordings.
+Different collections use `export_state` / `restore_state` before capture.
+See {doc}`A59_functional_native_handoff` and
+{download}`functional_callback_capture.py <../../examples/functional_callback_capture.py>`.
+
 For continuation with live graph history, pass `auxiliary["continuation"]`
 directly to the next call. Portable export is a separate operation with an
 explicit autograd boundary. Save the result of `export_continuation`, rather
@@ -586,7 +604,10 @@ share a checkpoint contract when their resolved observation settings match.
 
 For LFP, restored lead-field carry is detached. It does not acquire a gradient
 connection to the receiving collection's lead-field Tensors. Use direct
-in-memory continuation when such gradients must span the boundary.
+in-memory continuation when such gradients must span the boundary. For new
+field gradients only in the restored suffix, call `dn.func.detach_continuation`
+with gradients enabled to refresh LFP carry from the receiving collection's
+current field sources before execution.
 
 Ordinary carry still belongs to its exact in-memory callback collection.
 Restoration is the explicit checked bridge into an equivalent reconstructed

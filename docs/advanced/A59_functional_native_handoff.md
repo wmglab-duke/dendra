@@ -14,8 +14,9 @@ kernelspec:
 (functional-native-handoff)=
 # Continuing between native and functional execution
 
-`dn.func.capture_continuation(target, native_model=None)` captures the current
-native Population or Network as an independent functional continuation.
+`dn.func.capture_continuation(target, native_model=None, *, callbacks=None,
+callback_state=None)` captures the current native Population or Network as an
+independent functional continuation, optionally retaining existing callback carry.
 `dn.func.commit_continuation_(target, native_model, continuation)` transfers a
 functional continuation back to a native model. Both operations include sources,
 simulation state, clocks and RNG carry at the selected boundary.
@@ -48,9 +49,11 @@ lowering or compilation. It ignores edited program defaults, the program's
 `trainable` selection and its snapshot/fresh restart policy. Source Tensor
 identity ties and trainability are preserved in owned detached Tensor leaves;
 later edits to native tensors or program defaults do not change the packet.
-Suffix gradients belong to the captured leaves and do not reach the native
-prefix. Use `dn.func.inspect_sources(continuation).trainable_leaves` to select
-the captured sources for an optimizer.
+Suffix gradients through the captured model sources belong to those leaves and
+do not reach the native model's sources or its earlier recurrent graph. Use
+`dn.func.inspect_sources(continuation).trainable_leaves` to select the captured
+model sources for an optimizer. Callback-bound LFP field sources have the
+separate gradient behavior described below.
 
 Capture does not initialize a model, advance time or sample random values. It
 reads retained draws and native materializations, and deterministically derives
@@ -59,9 +62,10 @@ program state, defaults, RNG and execution reports retain their values. Capture
 runs outside `torch.compile`, `torch.func` transforms and forward automatic
 differentiation.
 
-The returned packet has no callback carry. On its first functional execution,
-the receiving collection starts at the captured boundary, including its usual
-initial recording sample. The packet can be exported before that first call:
+Omitting `callback_state=` returns a packet with no callback carry. On its first
+functional execution, the receiving collection starts at the captured boundary,
+including its usual initial recording sample. The packet can be exported before
+that first call:
 
 ```{literalinclude} ../../examples/functional_continuation_capture.py
 :language: python
@@ -71,18 +75,85 @@ initial recording sample. The packet can be exported before that first call:
 ```
 
 The example supplies `callbacks` for explicit plans and uses `None` for programs,
-which select their configured collection. To continue existing native callback
-reductions or recording phase, export the native collection's state and restore
-it into the receiving functional collection through the existing callback
-bridge. Attach that restored carry explicitly to a `Continuation`; capture
-does not inspect native callback histories. See
-{doc}`A58_functional_callback_checkpoints`.
+which select their configured collection.
 
 An extracellular `extra` recipe bound during lowering belongs to the plan;
 capture snapshots its represented field and waveform Tensor sources. Recreate
 equivalent bindings on a receiving plan when restoring a portable packet.
 `Inputs`, runtime draw tapes and call-local `extra` recipes for `VarInput` slots
 remain invocation arguments and must be supplied again when execution resumes.
+
+### Retain native callback reductions and recording phase
+
+Use the same prepared callback collection for native warmup and functional
+execution. A runner exposes its collection as `program.callbacks`; an explicit
+plan prepares one with `plan.make_callbacks(...)`. Pass the native result's
+`.state` through `callback_state=` when capturing. For an explicit plan, also
+supply `callbacks=callbacks`. Runners infer their configured collection and
+reject a non-`None` `callbacks=` argument.
+
+The complete
+{download}`functional_callback_capture.py <../../examples/functional_callback_capture.py>`
+example covers a Population and a two-Population Network through both target
+forms. Its native prefix uses the target's prepared collection with a cadenced
+Recorder and an APCount accumulator:
+
+```{literalinclude} ../../examples/functional_callback_capture.py
+:language: python
+:start-after: "# region capture_callbacks"
+:end-before: "# endregion capture_callbacks"
+:dedent: 4
+```
+
+The resulting packet retains callback totals, threshold crossing state and
+Recorder phase. Its first functional call emits only new selected post-step
+samples; joining the native prefix's recordings with the suffix does not repeat
+the boundary sample. Capture copies recurrent callback values into owned
+detached storage, preserving their trainability flags while cutting the earlier
+recurrent graph. Later edits to the native result's carry do not change the
+packet. It does not initialize or update callbacks, finalize observations, open
+recording storage, or include earlier recordings. Custom callbacks in the same
+collection do not need `checkpoint_configuration()` for capture.
+
+Built-in LFP lead-field carry is rebuilt from the callback collection's current
+bound field sources and copied into owned storage. This refresh follows the
+ambient gradient mode: keep gradients enabled when the functional suffix should
+train those external fields. Its new field graph supports suffix gradients even
+after backward has consumed the native prefix's LFP graph. Model-source and
+recurrent-prefix gradients remain cut. Externally computed nonleaf field sources
+retain their own upstream graph lifetime, as with
+{ref}`functional-continuation-detach`.
+
+The captured packet includes model sources, state and RNG together with callback
+carry, so it can be exported before its first functional call. Portable export
+retains its existing callback requirements: built-ins are supported, and custom
+callbacks need the optional checkpoint protocol. The example saves and restores
+the built-in Recorder and APCount state into a reconstructed receiving target:
+
+```{literalinclude} ../../examples/functional_callback_capture.py
+:language: python
+:start-after: "# region checkpoint_callbacks"
+:end-before: "# endregion checkpoint_callbacks"
+:dedent: 4
+```
+
+Portable LFP export and restoration retain detached saved field carry. To resume
+field training after restoration, call `dn.func.detach_continuation` with
+gradients enabled to refresh LFP carry from the receiving collection's current
+field sources before execution.
+
+Carry belongs to one prepared collection. When native warmup uses a different
+collection, first use its `export_state(...)` and the receiving collection's
+`restore_state(...)` bridge, then pass the restored carry to capture. Capture
+does not infer or adopt another collection's identity. Save prefix recordings
+separately. See {doc}`A58_functional_callback_checkpoints` for callback
+compatibility and portable custom callbacks.
+
+Run the complete example with:
+
+```console
+python examples/functional_callback_capture.py
+```
 
 ## Transfer a functional continuation to a native model
 

@@ -1190,11 +1190,22 @@ original native model's current sources, state, clocks and RNG into independent
 detached leaves, preserving source ties and trainability. Supply
 `native_model=compatible_model` to capture another initialized model at the
 same timestep. Edited program defaults and restart policies do not replace
-native values. The first functional call starts callbacks at the captured
-boundary; existing callback carry uses its explicit export/restore bridge.
+native values. To retain native callback totals and recording phase, use the
+target's prepared collection for native warmup and supply its result's `.state`
+as `callback_state=` to capture. Runners infer `program.callbacks`; explicit
+plans also require `callbacks=callbacks` when carry is supplied. Capture owns
+detached recurrent carry and the suffix emits only new samples. Built-in LFP
+field carry is rebuilt from the collection's current bound field sources using
+the ambient gradient mode, preserving suffix field gradients when enabled.
+Model-source and earlier recurrent graphs remain cut. Omitting carry starts
+callbacks at the captured boundary. Different collections use the explicit
+callback export/restore bridge before capture.
 See {doc}`A59_functional_native_handoff` and the complete
 {download}`functional_continuation_capture.py <../../examples/functional_continuation_capture.py>`
-example for lowered plans, programs, portable replay and suffix gradients.
+and
+{download}`functional_callback_capture.py <../../examples/functional_callback_capture.py>`
+examples for lowered plans, programs, callback phase, portable replay and suffix
+gradients.
 
 (functional-continuation-detach)=
 ### Truncate recurrent gradient history

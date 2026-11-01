@@ -23,7 +23,7 @@ def _lfp_recipe(callback):
     )
 
 
-def _refresh_invariants(callbacks, state, memo):
+def _refresh_invariants(callbacks, state, memo, transform=None):
     partition = _CallbackCarryPartition.from_plans(callbacks._plans)
     recipes = {}
     for plan in callbacks._plans:
@@ -39,33 +39,36 @@ def _refresh_invariants(callbacks, state, memo):
                 )
             continue
         recipes[key] = recipe
-        memo[key] = implementation._materialize_carry()
+        value = implementation._materialize_carry()
+        memo[key] = value if transform is None else transform(state[plan.name], value)
 
 
-def _detach_recurrent_values(state, callbacks, callback_state):
-    """Detach validated recurrent frames with one memo, preserving traversal."""
+def _map_recurrent_values(
+    state, callbacks, callback_state, transform, *, invariant_transform=None
+):
+    """Map validated recurrent frames after refreshing their shared invariants."""
     memo = {}
     if callback_state is not None:
         # Seed every invariant before visiting recurrent values: a custom
         # carry or model state can alias an invariant's old Tensor.
-        _refresh_invariants(callbacks, callback_state, memo)
+        _refresh_invariants(callbacks, callback_state, memo, invariant_transform)
 
-    def detach(value):
+    def mapped(value):
         if isinstance(value, torch.Tensor):
             key = id(value)
             if key not in memo:
-                memo[key] = value.detach()
+                memo[key] = transform(value)
             return memo[key]
         return value
 
     state = pytree.tree_map(
-        detach, state, is_leaf=lambda value: isinstance(value, torch.Tensor)
+        mapped, state, is_leaf=lambda value: isinstance(value, torch.Tensor)
     )
     carry = None
     if callback_state is not None:
         carry = FunctionalCallbackState(
             carries=pytree.tree_map(
-                detach,
+                mapped,
                 callback_state.carries,
                 is_leaf=lambda value: isinstance(value, torch.Tensor),
             ),
@@ -74,6 +77,13 @@ def _detach_recurrent_values(state, callbacks, callback_state):
         )
         callbacks._validate_state(carry)
     return state, carry
+
+
+def _detach_recurrent_values(state, callbacks, callback_state):
+    """Detach validated recurrent frames with one memo, preserving traversal."""
+    return _map_recurrent_values(
+        state, callbacks, callback_state, lambda value: value.detach()
+    )
 
 
 def _detach_callback_state(callbacks, state):

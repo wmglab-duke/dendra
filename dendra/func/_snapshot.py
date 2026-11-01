@@ -10,7 +10,9 @@ from ._network_bindings import AliasSnapshots, _map_containers
 _PRESERVE_TRAINABILITY = object()
 
 
-def _snapshot_frames(functional, tensors, *, trainable=_PRESERVE_TRAINABILITY):
+def _snapshot_frames(
+    functional, tensors, *, trainable=_PRESERVE_TRAINABILITY, snapshots=None
+):
     """Own continuation frames or preserve the established runner policy.
 
     Capture retains current trainability and Tensor identity ties across all
@@ -33,7 +35,8 @@ def _snapshot_frames(functional, tensors, *, trainable=_PRESERVE_TRAINABILITY):
             else dict(tensors.constants)
         )
         if trainable is _PRESERVE_TRAINABILITY:
-            return AliasSnapshots().tree(None, (parameters, constants, tensors.state))
+            snapshots = AliasSnapshots() if snapshots is None else snapshots
+            return snapshots.tree(None, (parameters, constants, tensors.state))
         state = pytree.tree_map_only(
             torch.Tensor, lambda value: value.detach().clone(), tensors.state
         )

@@ -183,6 +183,17 @@ class AliasSnapshots:
         self._memo = {}
         self._preserve_native_grad = preserve_native_grad
 
+    def resolve(self, native):
+        """Resolve a source already represented by this extraction's owned leaf."""
+        entry = self._memo.get(id(native))
+        return native if entry is None else entry[2]
+
+    def remember(self, native, copied):
+        """Seed an owned invariant before visiting recurrent source aliases."""
+        schema = (tuple(copied.shape), copied.dtype, copied.device)
+        self._memo[id(native)] = native, schema, copied
+        return copied
+
     def snapshot(self, native, value):
         if not torch.is_tensor(value):
             return value
