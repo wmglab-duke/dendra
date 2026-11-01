@@ -784,7 +784,9 @@ inputs = dn.func.Inputs(ve=external_voltage, intra=injected_current)
 
 The same `inputs=` packet is accepted by native Population `step`, `run`,
 `longrun` and `longrun_checkpointed`. Native Networks accept the named
-Population mapping below. Native execution keeps its model-owned state and
+Population mapping below. The helpers `dn.step`, `dn.step_population` and
+`dn.step_network` accept the corresponding one-step frames through `inputs=`.
+Native execution keeps its model-owned state and
 RNG lifecycle; the deterministic packet does not introduce native draw tapes.
 See {doc}`A61_shared_runtime_inputs` for native horizons, validation and
 registered waveform behavior.

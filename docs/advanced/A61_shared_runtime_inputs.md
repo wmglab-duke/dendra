@@ -32,7 +32,8 @@ Explicit singleton axes distinguish batch and spatial dimensions.
 
 The complete runnable
 {download}`shared_runtime_inputs.py <../../examples/shared_runtime_inputs.py>`
-example compares native and functional values and gradients:
+example compares native runs, one-step helpers and functional values and
+input gradients:
 
 ```{literalinclude} ../../examples/shared_runtime_inputs.py
 :language: python
@@ -88,6 +89,29 @@ call's accepted step count.
 `network.step(inputs={"left": dn.func.Inputs(intra=current_frame)})` consumes
 frames without a separate duration. The Network's initialized timestep applies
 to every Population.
+
+## One-step helpers
+
+`dn.step`, `dn.step_population` and `dn.step_network` accept the same `inputs=`
+frames as the corresponding native method:
+
+```python
+frame = dn.func.Inputs(ve=voltage_frame, intra=current_frame)
+dn.step(model, dt=dt, inputs=frame)
+dn.step_population(model, dt=dt, inputs=frame)
+
+frames = {"left": dn.func.Inputs(intra=current_frame)}
+dn.step(network, inputs=frames)
+dn.step_network(network, inputs=frames)
+```
+
+Each call advances one step. Helpers forward the packet unchanged to the native
+method, preserving its Tensor references, views, gradients, validation and
+stimulation-conflict rules. They accept the same prepared callback collection
+and explicit `callback_state=` carry. Supply a Population's timestep through
+`dt=`; a Network uses its initialized timestep. The runnable example steps
+independent models with these helpers and compares their values and input
+gradients against native runs and functional execution.
 
 ## Waveforms and existing stimulation arguments
 

@@ -65,7 +65,22 @@ def population_example():
         torch.testing.assert_close(gradient, wanted)
         assert gradient.isfinite().all() and gradient.abs().sum() > 0
     # endregion population
-    print("Population: native/functional input values and gradients passed")
+    # region population_helpers
+    stepped = population()
+    for index in range(STEPS):
+        frame = dn.func.Inputs(ve=inputs.ve[index], intra=inputs.intra[index])
+        if index % 2 == 0:
+            dn.step(stepped, dt=DT, inputs=frame)
+        else:
+            dn.step_population(stepped, dt=DT, inputs=frame)
+    torch.testing.assert_close(stepped.v, model.v)
+    gradients = torch.autograd.grad(stepped.v.square().mean(), inputs)
+    for gradient, wanted in zip(gradients, reference, strict=True):
+        torch.testing.assert_close(gradient, wanted)
+    # endregion population_helpers
+    print(
+        "Population: native/functional runs and step helpers match input values and gradients"
+    )
 
 
 def network_example():
@@ -99,7 +114,31 @@ def network_example():
         torch.testing.assert_close(gradient, wanted)
         assert gradient.isfinite().all() and gradient.abs().sum() > 0
     # endregion network
-    print("Network: named Population inputs, chunk tails and gradients passed")
+    # region network_helpers
+    stepped = dn.Network(
+        {"left": population(initialize=False), "right": population(initialize=False)}
+    )
+    stepped.train()
+    stepped.initialize(DT)
+    for index in range(STEPS):
+        frames = {
+            "left": dn.func.Inputs(intra=left.intra[index]),
+            "right": dn.func.Inputs(ve=right.ve[index]),
+        }
+        if index % 2 == 0:
+            dn.step(stepped, inputs=frames)
+        else:
+            dn.step_network(stepped, inputs=frames)
+    for name, model in stepped.populations.items():
+        torch.testing.assert_close(model.v, network.populations[name].v)
+    loss = stepped.left.v.square().mean() + stepped.right.v.square().mean()
+    gradients = torch.autograd.grad(loss, (left.intra, right.ve))
+    for gradient, wanted in zip(gradients, reference, strict=True):
+        torch.testing.assert_close(gradient, wanted)
+    # endregion network_helpers
+    print(
+        "Network: named inputs, chunk tails and step helpers match values and gradients"
+    )
 
 
 def registered_injection_example():

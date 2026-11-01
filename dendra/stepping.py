@@ -11,6 +11,7 @@ def step(
     model,
     dt: Optional[float] = None,
     *,
+    inputs=None,
     ve=None,
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
@@ -29,6 +30,11 @@ def step(
         Population timestep in milliseconds. For ``Network`` objects, the
         timestep is fixed by ``network.initialize(dt)``/``network.build(dt)``;
         if ``dt`` is provided here it must match ``network.dt``.
+    inputs : dendra.func.Inputs or mapping of str to dendra.func.Inputs, optional
+        Deterministic voltage and current frames. A Population consumes one
+        packet; a Network consumes a mapping keyed by exact Population names.
+        Frames pass unchanged to the native method, which validates broadcasting,
+        dtype/device and conflicts with existing stimulation sources.
     ve : Tensor, optional
         Population-only precomputed extracellular voltage for this single step.
     extra : optional
@@ -69,14 +75,16 @@ def step(
     # extra import-time coupling between dendra.__init__ and the model classes.
     from .models import Network, Population
 
-    callback_options = {}
+    step_options = {}
     if functional_callbacks is not None or functional_callback_state is not None:
-        callback_options = {
+        step_options = {
             "functional_callbacks": functional_callbacks,
             "functional_callback_state": functional_callback_state,
         }
     if callback_state is not None:
-        callback_options["callback_state"] = callback_state
+        step_options["callback_state"] = callback_state
+    if inputs is not None:
+        step_options["inputs"] = inputs
 
     if isinstance(model, Population):
         return model.step(
@@ -85,7 +93,7 @@ def step(
             extra=extra,
             callbacks=callbacks,
             loop_hooks=loop_hooks,
-            **callback_options,
+            **step_options,
         )
 
     if isinstance(model, Network):
@@ -106,7 +114,7 @@ def step(
                     "the desired timestep instead."
                 )
         return model.step(
-            extra=extra, callbacks=callbacks, loop_hooks=loop_hooks, **callback_options
+            extra=extra, callbacks=callbacks, loop_hooks=loop_hooks, **step_options
         )
 
     raise TypeError(
@@ -118,6 +126,7 @@ def step_population(
     population,
     dt: Optional[float] = None,
     *,
+    inputs=None,
     ve=None,
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
@@ -134,6 +143,10 @@ def step_population(
         Object to advance.
     dt : float, optional
         Population timestep in milliseconds.
+    inputs : dendra.func.Inputs, optional
+        Deterministic extracellular voltage and intracellular current frames.
+        The native method validates broadcasting, dtype/device and stimulation
+        conflicts. Tensor references and gradients are retained.
     ve : Tensor, optional
         Precomputed extracellular voltage for this single step.
     extra : optional
@@ -168,21 +181,23 @@ def step_population(
         With pure observations, returns their named results and explicit callback
         carry; simulation state remains on the Population.
     """
-    callback_options = {}
+    step_options = {}
     if functional_callbacks is not None or functional_callback_state is not None:
-        callback_options = {
+        step_options = {
             "functional_callbacks": functional_callbacks,
             "functional_callback_state": functional_callback_state,
         }
     if callback_state is not None:
-        callback_options["callback_state"] = callback_state
+        step_options["callback_state"] = callback_state
+    if inputs is not None:
+        step_options["inputs"] = inputs
     return population.step(
         dt=dt,
         ve=ve,
         extra=extra,
         callbacks=callbacks,
         loop_hooks=loop_hooks,
-        **callback_options,
+        **step_options,
     )
 
 
@@ -190,6 +205,7 @@ def step_network(
     network,
     *,
     extra=None,
+    inputs=None,
     callbacks: Optional[Sequence[Callback]] = None,
     loop_hooks: bool = False,
     callback_state=None,
@@ -205,6 +221,10 @@ def step_network(
     extra : optional
         Extracellular stimulation specification. This is the same population-name
         mapping accepted by ``Network.run(extra=...)``.
+    inputs : mapping of str to dendra.func.Inputs, optional
+        Deterministic voltage and current frames keyed by exact Population names.
+        The native method validates broadcasting, dtype/device and stimulation
+        conflicts. Tensor references and gradients are retained.
     callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
         Native hook sequence, or a pure collection prepared once with
         ``dn.func.make_callbacks`` for this Network or a compatible initialized
@@ -234,14 +254,16 @@ def step_network(
         With pure observations, returns their named results and explicit callback
         carry; simulation state remains on the Network.
     """
-    callback_options = {}
+    step_options = {}
     if functional_callbacks is not None or functional_callback_state is not None:
-        callback_options = {
+        step_options = {
             "functional_callbacks": functional_callbacks,
             "functional_callback_state": functional_callback_state,
         }
     if callback_state is not None:
-        callback_options["callback_state"] = callback_state
+        step_options["callback_state"] = callback_state
+    if inputs is not None:
+        step_options["inputs"] = inputs
     return network.step(
-        extra=extra, callbacks=callbacks, loop_hooks=loop_hooks, **callback_options
+        extra=extra, callbacks=callbacks, loop_hooks=loop_hooks, **step_options
     )
