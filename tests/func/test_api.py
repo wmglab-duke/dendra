@@ -186,6 +186,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "StimulusTensors",
         "TensorScheduleTensors",
         "VarInput",
+        "capture_continuation",
         "compile",
         "commit_continuation_",
         "detach_continuation",

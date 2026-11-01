@@ -45,6 +45,7 @@ from ._runtime_extra import (
     _MISSING_RUNTIME_EXTRA,
     VarInput,
 )
+from ._snapshot import _snapshot_frames
 from ._types import FunctionalizationError
 
 _OWNED_PREPARE = FunctionalPopulation.prepare
@@ -219,10 +220,8 @@ class CompiledRunner:
             self._functional, tensors = make_functional(
                 population, dt=dt, extra=None if self._runtime_extra else extra
             )
-            self._parameters = tensors.independent_parameters(trainable=trainable)
-            self._constants = dict(tensors.constants)
-            self._initial_state = pytree.tree_map_only(
-                torch.Tensor, lambda value: value.detach().clone(), tensors.state
+            self._parameters, self._constants, self._initial_state = _snapshot_frames(
+                self._functional, tensors, trainable=trainable
             )
             self._initialization_inputs = pytree.tree_map_only(
                 torch.Tensor,

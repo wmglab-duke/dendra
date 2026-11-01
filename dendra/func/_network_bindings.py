@@ -174,15 +174,22 @@ class AliasSnapshots:
     memo so temporary materializations cannot collide through Python id reuse.
     Views with different identities remain different inputs; no storage alias
     or parameterization relationship is inferred.
+
+    Native-boundary capture opts into the native source's trainability; ordinary
+    component extraction retains the adapter's existing gradient convention.
     """
 
-    def __init__(self):
+    def __init__(self, *, preserve_native_grad=False):
         self._memo = {}
+        self._preserve_native_grad = preserve_native_grad
 
     def snapshot(self, native, value):
         if not torch.is_tensor(value):
             return value
         source = native if torch.is_tensor(native) else value
+        requires_grad = (
+            source.requires_grad if self._preserve_native_grad else value.requires_grad
+        )
         identity = id(source)
         schema = (tuple(value.shape), value.dtype, value.device)
         if identity in self._memo:
@@ -195,13 +202,13 @@ class AliasSnapshots:
             # A raw source may be a trainable input to one component and a
             # config buffer to another. Keep their common owned leaf while
             # retaining the trainability requested by either reader.
-            if value.requires_grad and not copied.requires_grad:
+            if requires_grad and not copied.requires_grad:
                 with torch.inference_mode(False):
                     copied.requires_grad_(True)
             return copied
         with torch.inference_mode(False):
             copied = value.detach().clone(memory_format=torch.preserve_format)
-            copied.requires_grad_(value.requires_grad)
+            copied.requires_grad_(requires_grad)
         self._memo[identity] = source, schema, copied
         return copied
 

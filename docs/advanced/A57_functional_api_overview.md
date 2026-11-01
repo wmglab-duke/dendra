@@ -1184,6 +1184,18 @@ fresh effective bindings. It also checks raw-bound continuation and explicitly
 binds restored sources. Run
 `python examples/functional_continuation.py --backend aot_eager`.
 
+To continue a native simulation functionally, use
+`continuation = dn.func.capture_continuation(program_or_plan)`. It captures the
+original native model's current sources, state, clocks and RNG into independent
+detached leaves, preserving source ties and trainability. Supply
+`native_model=compatible_model` to capture another initialized model at the
+same timestep. Edited program defaults and restart policies do not replace
+native values. The first functional call starts callbacks at the captured
+boundary; existing callback carry uses its explicit export/restore bridge.
+See {doc}`A59_functional_native_handoff` and the complete
+{download}`functional_continuation_capture.py <../../examples/functional_continuation_capture.py>`
+example for lowered plans, programs, portable replay and suffix gradients.
+
 (functional-continuation-detach)=
 ### Truncate recurrent gradient history
 

@@ -13446,7 +13446,7 @@ class FunctionalPopulation:
         )
         return (*ordered, *layout.values())
 
-    def _extract_native_state(self, population):
+    def _extract_native_state(self, population, *, snapshots=None):
         from ._material_stochasticity import stochastic_diffusion_timestep_matches
 
         state = {}
@@ -13480,13 +13480,23 @@ class FunctionalPopulation:
                 value = configured[leaf.public_path]
             else:
                 value = _buffer_at(population, leaf.module_path, leaf.buffer_name)
-            _put_path(state, leaf.public_path, _clone_tensor(value))
+            _put_path(
+                state,
+                leaf.public_path,
+                _clone_tensor(value)
+                if snapshots is None
+                else snapshots.snapshot(value, value),
+            )
         if self._poisson_plan is not None:
             state["stimulation"] = self._poisson_plan.extract(population)
         return state
 
     def extract(self, population: Population | None = None) -> PopulationTensors:
         """Extract explicit initialization, constants/state, and raw parameters."""
+        return self._extract(population)
+
+    def _extract(self, population=None, *, snapshots=None):
+        """Extract with optional aggregate ownership, retaining public defaults."""
         self._validate_rng_load_policies()
         population = self._population if population is None else population
         self._validate_compatible_population(population)
@@ -13498,11 +13508,19 @@ class FunctionalPopulation:
                 "Population initialization structure does not match this "
                 "functional execution plan."
             )
-        state = self._extract_native_state(population)
+        state = self._extract_native_state(population, snapshots=snapshots)
         if self._random_plan is not None:
             _random_constants, state["random"] = self._random_plan.extract(population)
         state = self._stimulation_rng_plan.strip_state(state)
         self._validate_state(state)
+
+        def constant_snapshot(value):
+            return (
+                _clone_tensor(value)
+                if snapshots is None
+                else snapshots.snapshot(value, value)
+            )
+
         all_parameters = dict(population.named_parameters())
         parameters = (
             {
@@ -13560,10 +13578,10 @@ class FunctionalPopulation:
                                 "exactly equal values."
                             )
                         continue
-                    constants[public_name] = _clone_tensor(value)
+                    constants[public_name] = constant_snapshot(value)
             constants.update(
                 {
-                    entry.key: _clone_tensor(
+                    entry.key: constant_snapshot(
                         _buffer_at(population, entry.module_path, entry.buffer_name)
                     )
                     for entry in self._parametrization_constants
@@ -13577,20 +13595,20 @@ class FunctionalPopulation:
         else:
             constants = {
                 **{
-                    name: _clone_tensor(_geometry_constant_value(population, name))
+                    name: constant_snapshot(_geometry_constant_value(population, name))
                     for name in self._geometry_constant_names
                     if name
                     not in {"canonical_area_cm2", "canonical_edge_resistance_ohm"}
                 },
                 **(
                     {
-                        "canonical_area_cm2": _clone_tensor(
+                        "canonical_area_cm2": constant_snapshot(
                             _geometry_constant_value(
                                 population,
                                 "canonical_area_cm2",
                             )
                         ),
-                        "canonical_edge_resistance_ohm": _clone_tensor(
+                        "canonical_edge_resistance_ohm": constant_snapshot(
                             _geometry_constant_value(
                                 population,
                                 "canonical_edge_resistance_ohm",
@@ -13602,7 +13620,7 @@ class FunctionalPopulation:
                     else {}
                 ),
                 **{
-                    entry.key: _clone_tensor(
+                    entry.key: constant_snapshot(
                         _buffer_at(population, entry.module_path, entry.buffer_name)
                     )
                     for entry in self._parametrization_constants
@@ -13693,6 +13711,8 @@ class FunctionalPopulation:
                 }
             ),
         )
+        if snapshots is not None:
+            parameters = snapshots.tree(self._parameter_sources(population), parameters)
         return PopulationTensors(
             parameters=parameters,
             constants=constants,

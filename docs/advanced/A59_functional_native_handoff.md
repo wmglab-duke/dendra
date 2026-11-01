@@ -12,7 +12,79 @@ kernelspec:
 ---
 
 (functional-native-handoff)=
-# Continuing a functional simulation natively
+# Continuing between native and functional execution
+
+`dn.func.capture_continuation(target, native_model=None)` captures the current
+native Population or Network as an independent functional continuation.
+`dn.func.commit_continuation_(target, native_model, continuation)` transfers a
+functional continuation back to a native model. Both operations include sources,
+simulation state, clocks and RNG carry at the selected boundary.
+
+## Capture current native execution
+
+`target` is a lowered functional Population/Network plan or a `dn.compile`
+program. Omit `native_model` to capture the native model used to construct that
+target, or pass a compatible initialized native model explicitly. The native
+model must match the plan's structure, dtype/device, mode and source sharing.
+A built, initialized Population can be captured before its first native run at
+the plan's timestep. If native execution has already configured its integrator,
+that timestep must match the plan so existing histories retain their meaning.
+A Network must be initialized at the plan's timestep.
+
+The complete runnable
+{download}`functional_continuation_capture.py <../../examples/functional_continuation_capture.py>`
+example covers both target forms for a Population and a two-Population Network
+with a shared parameter:
+
+```{literalinclude} ../../examples/functional_continuation_capture.py
+:language: python
+:start-after: "# region capture"
+:end-before: "# endregion capture"
+:dedent: 4
+```
+
+Capture reads the native model's current values, including changes since
+lowering or compilation. It ignores edited program defaults, the program's
+`trainable` selection and its snapshot/fresh restart policy. Source Tensor
+identity ties and trainability are preserved in owned detached Tensor leaves;
+later edits to native tensors or program defaults do not change the packet.
+Suffix gradients belong to the captured leaves and do not reach the native
+prefix. Use `dn.func.inspect_sources(continuation).trainable_leaves` to select
+the captured sources for an optimizer.
+
+Capture does not initialize a model, advance time or sample random values. It
+reads retained draws and native materializations, and deterministically derives
+the snapshot baselines needed to preserve those materializations. Native and
+program state, defaults, RNG and execution reports retain their values. Capture
+runs outside `torch.compile`, `torch.func` transforms and forward automatic
+differentiation.
+
+The returned packet has no callback carry. On its first functional execution,
+the receiving collection starts at the captured boundary, including its usual
+initial recording sample. The packet can be exported before that first call:
+
+```{literalinclude} ../../examples/functional_continuation_capture.py
+:language: python
+:start-after: "# region checkpoint"
+:end-before: "# endregion checkpoint"
+:dedent: 4
+```
+
+The example supplies `callbacks` for explicit plans and uses `None` for programs,
+which select their configured collection. To continue existing native callback
+reductions or recording phase, export the native collection's state and restore
+it into the receiving functional collection through the existing callback
+bridge. Attach that restored carry explicitly to a `Continuation`; capture
+does not inspect native callback histories. See
+{doc}`A58_functional_callback_checkpoints`.
+
+An extracellular `extra` recipe bound during lowering belongs to the plan;
+capture snapshots its represented field and waveform Tensor sources. Recreate
+equivalent bindings on a receiving plan when restoring a portable packet.
+`Inputs`, runtime draw tapes and call-local `extra` recipes for `VarInput` slots
+remain invocation arguments and must be supplied again when execution resumes.
+
+## Transfer a functional continuation to a native model
 
 `dn.func.commit_continuation_(program_or_plan, target, continuation)` transfers a
 functional continuation to an initialized native Population or Network. It

@@ -156,6 +156,25 @@ inputs, draws and declared call-local ``extra=`` remain per-call arguments.
 
 .. autoclass:: dendra.func.Continuation
 
+``dn.func.capture_continuation(target, native_model=None)`` creates an owned
+detached packet from a current initialized native Population or Network.
+Targets are lowered functional plans or compiled programs; omission captures
+the target's original native model. A supplied model must match the plan's
+structure, dtype/device, mode and source sharing. A configured native timestep
+must match the plan; an initialized Population can also be captured before its
+first native run. Capture uses native
+values and trainability, including shared sources, rather than edited program
+defaults or trainable selectors. It preserves clocks, pending traffic, retained
+materializations and RNG carry without initializing, advancing or sampling a
+model. It derives deterministic snapshot baselines from native materializations.
+Its first execution
+starts fresh callback carry at the captured boundary; transfer existing carry
+through the explicit callback export/restore bridge. See
+:doc:`../advanced/A59_functional_native_handoff` and
+:download:`functional_continuation_capture.py <../../examples/functional_continuation_capture.py>`.
+
+.. autofunction:: dendra.func.capture_continuation
+
 ``dn.func.detach_continuation(target, packet, callbacks=...)`` truncates recurrent
 gradient history while retaining parameter/constant Tensor identities, aliases,
 trainability and upstream graphs. It detaches model state and custom callback

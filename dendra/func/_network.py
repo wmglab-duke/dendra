@@ -1014,8 +1014,9 @@ class FunctionalNetwork:
 
         return clone(state, self._state_schema)
 
-    def _extract(self, network):
-        snapshots = AliasSnapshots()
+    def _extract(self, network, *, snapshots=None):
+        owned = snapshots is not None
+        snapshots = AliasSnapshots() if snapshots is None else snapshots
         parameters = {
             "populations": {},
             "synapses": {},
@@ -1036,14 +1037,22 @@ class FunctionalNetwork:
         }
         for name, plan in self.populations.items():
             population = network.populations[name]
-            packet = plan.extract(population)
-            parameters["populations"][name] = snapshots.tree(
-                plan._parameter_sources(population), packet.parameters
+            packet = (
+                plan._extract(population, snapshots=snapshots)
+                if owned
+                else plan.extract(population)
             )
-            native_constants = plan._parametrization_constant_sources(population)
-            constants["populations"][name] = snapshots.tree(
-                native_constants, packet.constants
-            )
+            if owned:
+                parameters["populations"][name] = packet.parameters
+                constants["populations"][name] = packet.constants
+            else:
+                parameters["populations"][name] = snapshots.tree(
+                    plan._parameter_sources(population), packet.parameters
+                )
+                native_constants = plan._parametrization_constant_sources(population)
+                constants["populations"][name] = snapshots.tree(
+                    native_constants, packet.constants
+                )
             state["populations"][name] = self._stimulation_plan.strip(
                 self._rng_plan.strip_population(packet.state)
             )
@@ -1062,7 +1071,11 @@ class FunctionalNetwork:
                 "schedule": snapshots.tree(schedule, packet.schedule),
             }
             constants["synapses"][name] = source_constants
-            state["synapses"][name] = packet.state
+            state["synapses"][name] = (
+                snapshots.tree(plan._checkpoint_values(connection), packet.state)
+                if owned
+                else packet.state
+            )
         for name, plan in self.continuous_synapses.items():
             connection = network.continuous_synapses[name]
             sources = self._connection_parameter_plans["continuous_synapses", name]
@@ -1080,7 +1093,11 @@ class FunctionalNetwork:
                 ),
             }
             constants["continuous_synapses"][name] = source_constants
-            state["continuous_synapses"][name] = packet.state
+            state["continuous_synapses"][name] = (
+                snapshots.tree(connection.state_dict_for_checkpoint(), packet.state)
+                if owned
+                else packet.state
+            )
         if self.netstim is not None:
             source = network.netstim
             packet = self.netstim.extract(source)
@@ -1101,12 +1118,20 @@ class FunctionalNetwork:
                 packet.constants,
             )
             constants["netstim"]["sources"] = source_constants
-            state["netstim"] = packet.state
+            state["netstim"] = (
+                snapshots.tree(source.state_dict_for_checkpoint(), packet.state)
+                if owned
+                else packet.state
+            )
+
+        def clock_snapshot(value):
+            return snapshots.snapshot(value, value) if owned else _snapshot(value)
+
         state["clock"] = {
-            "t": _snapshot(network.t),
-            "origin": _snapshot(network._clock_origin),
-            "step": _snapshot(network._clock_step),
-            "duration_remainder": _snapshot(network._duration_remainder),
+            "t": clock_snapshot(network.t),
+            "origin": clock_snapshot(network._clock_origin),
+            "step": clock_snapshot(network._clock_step),
+            "duration_remainder": clock_snapshot(network._duration_remainder),
         }
         sampling = self._connection_sampling_plan.extract(network)
         if sampling is not None:
