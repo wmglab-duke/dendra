@@ -56,7 +56,9 @@ from ..parametric import cacheable, is_parametric, to_param
 from ..rng import RNGMixin, _restore_rng_lifecycle, _snapshot_rng_lifecycle
 from ..slice import SynapseSlots
 from ..stim.waveform._poisson import (
+    borrow_pending_poisson_rng,
     coalesce_pending_poisson_rng,
+    reconcile_extra_poisson_rng,
     restore_poisson_rng_lifecycle,
     snapshot_poisson_rng_lifecycle,
     validate_poisson_checkpoint_stream_aliases,
@@ -4000,6 +4002,7 @@ class Network(RNGMixin):
             nullcontext() if self.training else torch.no_grad(),
             nullcontext() if replay is None else replay.bank_scope(finish=False),
         ):
+            reconcile_extra_poisson_rng(self, extra)
             for n, (v, t) in extra.items():
                 pop = self.populations[n]
                 dev, dtp = pop.device(), pop.dtype()
@@ -4007,7 +4010,12 @@ class Network(RNGMixin):
                 t0 = self.t.to(device=dev, dtype=dtp)
                 t_grid = _time_grid_from_step_count(t0, 1, dt_f, device=dev).to(dtp)
                 values = _evaluate_extra_waveform(
-                    pop, t, t_grid, n_steps=1, name=f"extra[{n!r}] Waveform output"
+                    pop,
+                    t,
+                    t_grid,
+                    n_steps=1,
+                    name=f"extra[{n!r}] Waveform output",
+                    rng_owner=self,
                 )
                 extra_prepped[n] = (v_dev, values)
         extra = extra_prepped
@@ -4201,6 +4209,7 @@ class Network(RNGMixin):
         extra = extra if extra is not None else {}
         extra_prepped = {}
         with nullcontext() if self.training else torch.no_grad():
+            reconcile_extra_poisson_rng(self, extra)
             for n, (v, t) in extra.items():
                 pop = self.populations[n]
                 dev, dtp = pop.device(), pop.dtype()
@@ -4215,6 +4224,7 @@ class Network(RNGMixin):
                     t_grid,
                     n_steps=n_steps,
                     name=f"extra[{n!r}] Waveform output",
+                    rng_owner=self,
                 )
                 extra_prepped[n] = (v_dev, values)
         extra = extra_prepped
@@ -4480,6 +4490,7 @@ class Network(RNGMixin):
                     dtype=torch.double,
                 )
                 time_chunk = time_chunk.to(dtype=self.t.dtype)
+                reconcile_extra_poisson_rng(self, extra)
                 intra_chunk = {
                     name: (
                         source,
@@ -4502,6 +4513,7 @@ class Network(RNGMixin):
                         t_grid,
                         n_steps=n_chunk,
                         name=f"extra[{name!r}] Waveform output",
+                        rng_owner=self,
                     )
                     extra_chunk[name] = (
                         spatial,
@@ -5950,6 +5962,7 @@ class Network(RNGMixin):
                         self.restore_dict_from_checkpoint(state_local)
                         pre_chunk_hook(callbacks, self, t_chunk_local)
 
+                        reconcile_extra_poisson_rng(self, extra)
                         # Prepare per-chunk intra specs (bounded to chunklength).
                         intra_chunk = {}
                         if len(intra_sources) > 0:
@@ -5979,6 +5992,7 @@ class Network(RNGMixin):
                                     t_grid_local,
                                     n_steps=chunk_steps,
                                     name=f"extra[{name!r}] Waveform output",
+                                    rng_owner=self,
                                 )
                                 extra_ts[name] = (
                                     v_dev,
@@ -6157,7 +6171,9 @@ def prepare_extra(extra, local_ind: int):
     return {n: v * t[..., local_ind].unsqueeze(-1) for n, (v, t) in extra.items()}
 
 
-def _evaluate_extra_waveform(pop, waveform, time_grid, *, n_steps, name):
+def _evaluate_extra_waveform(
+    pop, waveform, time_grid, *, n_steps, name, rng_owner=None
+):
     """Place and evaluate one Network waveform before another can move it.
 
     ``Module.to`` mutates a waveform in place.  Evaluating immediately is
@@ -6166,7 +6182,8 @@ def _evaluate_extra_waveform(pop, waveform, time_grid, *, n_steps, name):
     placement requested for the final population.
     """
     waveform = waveform.to(device=pop.device(), dtype=pop.dtype())
-    values = waveform(time_grid)
+    with borrow_pending_poisson_rng(pop if rng_owner is None else rng_owner, waveform):
+        values = waveform(time_grid)
     return pop._normalize_temporal_values(
         values,
         n_steps=n_steps,

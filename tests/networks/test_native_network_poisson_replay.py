@@ -579,14 +579,9 @@ def test_network_poisson_cannot_borrow_netstim_private_rng_before_native_mutatio
 
 def test_explicit_global_network_poisson_replay_clears_deferred_handoff_frames():
     source, native = _case(global_stream=True), _case(global_stream=True)
-    # Handoff transfers model-owned state. The caller-owned extra bindings
-    # participate in the subsequent replay rather than the handoff plan.
-    handoff, _ = dn.func.make_functional_network(source.model)
-    dn.func.commit_continuation_(
-        handoff, native.model, dn.func.capture_continuation(handoff)
-    )
     functional, _ = dn.func.make_functional_network(source.model, extra=source.extra)
     boundary = dn.func.capture_continuation(functional)
+    dn.func.commit_continuation_(functional, native.model, boundary)
     assert any(
         vars(node).get("_functional_poisson_rng") is not None for node in native.nodes
     )

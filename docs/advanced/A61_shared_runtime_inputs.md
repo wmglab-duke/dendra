@@ -204,6 +204,11 @@ Shared waveform and generator identities remain intact, and each waveform keeps
 its final invoked schedule for native checkpoints and later execution.
 External `extra` waveforms and generators remain caller-owned: save their state
 alongside the model when checkpointing, and supply the same configuration again.
+When resuming through `dn.func.commit_continuation_`, compatible model/extra
+Parameter and generator aliases are preserved. A shared pending global RNG
+boundary is consumed by its first native waveform invocation, including an
+extracellular invocation before intracellular stimulation. Independent external
+sources retain their own state; see {doc}`A59_functional_native_handoff`.
 
 Network replay validates the complete packet before evaluating live banks. It
 consumes extracellular banks in the supplied `extra` mapping order, then

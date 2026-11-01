@@ -465,18 +465,23 @@ class PoissonStimulationPlan:
         )
 
     def extract(self, population=None):
-        from dendra.models.stim.waveform._poisson import poisson_generator_state
+        from dendra.models.stim.waveform._poisson import poisson_stream_state
 
         sources = self._resolved_sources(population)
-        rng = {}
+        streams = {}
         schedules = {}
         for entry in self.entries:
             source = sources[entry.key]
-            rng.setdefault(entry.stream, poisson_generator_state(source))
+            streams.setdefault(entry.stream, []).append(source)
             schedules[entry.key] = normalize_schedule(
                 source, source._spike_times, dtype=entry.dtype, device=entry.device
             ).reshape(-1)
-        return {"rng": rng, "schedules": schedules}
+        return {
+            "rng": {
+                name: poisson_stream_state(nodes) for name, nodes in streams.items()
+            },
+            "schedules": schedules,
+        }
 
     def _samplers(self, state, samplers):
         self.validate_source()
@@ -899,10 +904,13 @@ class NetworkStimulationPlan:
         for name, plan in self.plans.items():
             for entry in plan.entries:
                 canonical = self.local[name][entry.stream]
-                if self.default_streams.get(
-                    canonical
-                ) in devices and not _is_default_poisson_generator(
-                    resolved[name][entry.key].generator
+                if (
+                    self.default_streams.get(canonical) in devices
+                    and not _is_default_poisson_generator(
+                        resolved[name][entry.key].generator
+                    )
+                    and resolved[name][entry.key].generator
+                    is not getattr(self, "_staged_default_streams", {}).get(canonical)
                 ):
                     raise FunctionalizationError(
                         "Poisson generators shared with connection sampling must retain default-stream ownership."
@@ -973,16 +981,21 @@ class NetworkStimulationPlan:
         return tuple(name for name in order if name in self.plans)
 
     def extract(self, network=None):
+        from dendra.models.stim.waveform._poisson import poisson_stream_state
+
         if network is None:
             self.validate_source()
         else:
             self.validate_compatible_network(network)
-        result = {}
+        streams = {}
         for name, plan in self.plans.items():
-            state = plan.extract(None if network is None else network.populations[name])
-            for local, canonical in self.local[name].items():
-                result.setdefault(canonical, state["rng"][local])
-        return result
+            sources = plan._resolved_sources(
+                None if network is None else network.populations[name]
+            )
+            for entry in plan.entries:
+                canonical = self.local[name][entry.stream]
+                streams.setdefault(canonical, []).append(sources[entry.key])
+        return {name: poisson_stream_state(nodes) for name, nodes in streams.items()}
 
     def expand(self, name, state, pool):
         if name not in self.plans:

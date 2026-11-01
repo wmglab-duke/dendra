@@ -14,6 +14,7 @@ from dendra.models.networks.net import Network
 
 from ._continuation import Continuation
 from ._continuation_checkpoints import _cold_boundary, _validate_frames
+from ._handoff_staging import stage_native_handoff
 from ._native_handoff_sources import (
     _NativeSourceGroup,
     _registered_owner,
@@ -21,11 +22,7 @@ from ._native_handoff_sources import (
 )
 from ._native_network_sources import network_source_frames, scalar_source_writes
 from ._network import FunctionalNetwork
-from ._population import (
-    FunctionalPopulation,
-    _deepcopy_execution_module,
-    _rebind_population_time_references,
-)
+from ._population import FunctionalPopulation, _rebind_population_time_references
 from ._types import FunctionalizationError
 
 
@@ -259,9 +256,26 @@ def _refresh_native(functional, target, parameters, constants):
 def _compare_preparation(functional, target, parameters, constants):
     """Reject synthetic overrides which cannot survive native rematerialization."""
     actual = functional.extract(target)
+    populations = (
+        ((("populations", name), plan) for name, plan in functional.populations.items())
+        if isinstance(functional, FunctionalNetwork)
+        else (((), functional),)
+    )
+    # Randomized bank schedules are runtime history, not raw sources. Their
+    # parameter operands are replaced by invocation packets during execution;
+    # restored native buffers instead hold the continuation's latest schedule.
+    runtime_schedules = {
+        (*prefix, entry.parameter)
+        for prefix, plan in populations
+        if plan._poisson_plan is not None
+        for entry in plan._poisson_plan.entries
+        if entry.kind != "mechanism"
+    }
     # Parameters without an owned raw source (external extra, opaque samples,
     # and synthetic scalar sources) must still agree after staged restoration.
     for path, value in _tensor_paths(parameters):
+        if path in runtime_schedules:
+            continue
         if not _equal(value, _at(actual.parameters, path)):
             raise FunctionalizationError(
                 f"Native handoff has no equivalent source for parameters.{'.'.join(map(str, path))}"
@@ -506,7 +520,7 @@ def commit_continuation_(functional, target, continuation):
         parameters, constants, state = _owned(
             (continuation.parameters, continuation.constants, continuation.state)
         )
-        staged = _deepcopy_execution_module(target)
+        staged, staged_functional = stage_native_handoff(functional, target)
         if isinstance(functional, FunctionalNetwork):
             for population in staged.populations.values():
                 _rebind_population_time_references(population)
@@ -515,23 +529,23 @@ def commit_continuation_(functional, target, continuation):
         # The public state-only adapter checks live raw/effective consistency.
         # Restore while the private native clone still has coherent sources,
         # then apply new sources and rebuild against the restored draw history.
-        functional.commit_state_(staged, state)
+        staged_functional.commit_state_(staged, state)
         for destination, value, _label in _source_writes(
-            _source_frames(functional, staged), parameters, constants
+            _source_frames(staged_functional, staged), parameters, constants
         ):
             destination.copy_(value)
         scalar_writes = []
         if isinstance(functional, FunctionalNetwork):
             for owner, name, value in scalar_source_writes(
-                functional, staged, parameters, constants
+                staged_functional, staged, parameters, constants
             ):
                 setattr(owner, name, value)
             scalar_writes = scalar_source_writes(
                 functional, target, parameters, constants
             )
             constants = functional._bind_parameter_constants(parameters, constants)
-        _refresh_native(functional, staged, parameters, constants)
-        _compare_preparation(functional, staged, parameters, constants)
+        _refresh_native(staged_functional, staged, parameters, constants)
+        _compare_preparation(staged_functional, staged, parameters, constants)
         protected = {id(destination) for destination, _value, _label in writes}
         source_bindings = tuple(
             (path, registry_name, name, value)

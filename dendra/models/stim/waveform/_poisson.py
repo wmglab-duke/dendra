@@ -7,6 +7,7 @@ adapter alone owns a Torch generator and preserves the native scalar draw order.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from contextlib import contextmanager
 
 import torch
 
@@ -239,7 +240,30 @@ class _PendingPoissonRNG:
 
     def __init__(self, generator, state):
         self.generator = generator
-        self.state = state.detach().clone()
+        self._state = state.detach().clone()
+        self._parent = None
+
+    def _root(self):
+        root = self
+        while root._parent is not None:
+            root = root._parent
+        return root
+
+    def share(self, other):
+        # Link roots so a later merge also retains earlier, absent aliases.
+        # No holder retains waveform objects or replaces caller registrations.
+        root, destination = self._root(), other._root()
+        if root is not destination:
+            root._parent = destination
+            root._state = None
+
+    @property
+    def state(self):
+        return self._root()._state
+
+    @state.setter
+    def state(self, value):
+        self._root()._state = value
 
 
 def defer_poisson_generator_restore(waveforms, state):
@@ -271,6 +295,132 @@ def restore_pending_poisson_rng(waveform):
     ):
         waveform.generator.set_state(frame.state)
         frame.state = None
+
+
+def _shared_pending_poisson_frames(waveforms):
+    frames = {}
+    for waveform in waveforms:
+        frame = vars(waveform).get("_functional_poisson_rng")
+        if (
+            frame is not None
+            and frame.generator is waveform.generator
+            and frame.state is not None
+        ):
+            frames.setdefault(id(frame), frame)
+    frames = tuple(frames.values())
+    if frames and any(
+        not torch.equal(frame.state, frames[0].state) for frame in frames[1:]
+    ):
+        raise ValueError("Shared Poisson generators have inconsistent pending frames.")
+    return frames
+
+
+def poisson_stream_state(waveforms):
+    """Read one logical stream, including a frame deferred on any alias."""
+    waveforms = tuple(waveforms)
+    frames = _shared_pending_poisson_frames(waveforms)
+    state = frames[0].state if frames else waveforms[0].generator.get_state()
+    return state.detach().clone()
+
+
+def _pending_poisson_groups(owner, waveforms):
+    external = tuple(
+        node
+        for waveform in waveforms
+        for node in _poisson_waveforms(waveform).values()
+        if vars(node).get("_native_poisson_replay") is None
+    )
+    if not external:
+        return (), ()
+    groups = {}
+    for node in (*_poisson_waveforms(owner).values(), *external):
+        groups.setdefault(id(node.generator), {})[id(node)] = node
+    external_generators = {id(node.generator) for node in external}
+    pending = []
+    for generator, nodes in groups.items():
+        if generator not in external_generators:
+            continue
+        frames = _shared_pending_poisson_frames(nodes.values())
+        if frames:
+            pending.append((tuple(nodes.values()), frames))
+    return external, tuple(pending)
+
+
+def _share_pending_poisson_groups(groups):
+    # All streams have been validated before any holder is changed.
+    for _nodes, frames in groups:
+        for frame in frames[1:]:
+            frame.share(frames[0])
+
+
+def reconcile_extra_poisson_rng(owner, extra):
+    """Unify deferred holders before either native waveform bank samples.
+
+    Inspect only the structural contact containers, leaving spatial/temporal
+    validation, placement and waveform invocation with their existing callers.
+    No missing holder is installed and no generator state is restored here.
+    """
+    from .core import Waveform
+
+    if isinstance(extra, Mapping):
+        contacts = extra.values()
+    elif isinstance(extra, (tuple, list)):
+        tuple_of_pairs = (
+            isinstance(extra, tuple)
+            and bool(extra)
+            and all(isinstance(item, tuple) and len(item) == 2 for item in extra)
+        )
+        contacts = (
+            (extra,) if isinstance(extra, tuple) and not tuple_of_pairs else extra
+        )
+    else:
+        return
+    waveforms = tuple(
+        contact[1]
+        for contact in contacts
+        if isinstance(contact, (tuple, list))
+        and len(contact) == 2
+        and isinstance(contact[1], Waveform)
+    )
+    _external, groups = _pending_poisson_groups(owner, waveforms)
+    _share_pending_poisson_groups(groups)
+
+
+@contextmanager
+def borrow_pending_poisson_rng(owner, waveform):
+    """Lend caller-owned extra the model's shared frame during evaluation.
+
+    Binding a frame does not restore a generator. The first actual randomized
+    child invocation consumes it through the ordinary native sampling path.
+    Caller registrations are restored afterward, including on failure, while
+    equivalent holders share consumption even after the temporary binding ends.
+    """
+    external, groups = _pending_poisson_groups(owner, (waveform,))
+    _share_pending_poisson_groups(groups)
+    missing, bindings = object(), []
+    external_ids = {id(node) for node in external}
+    for nodes, frames in groups:
+        for node in nodes:
+            if id(node) in external_ids:
+                bindings.append(
+                    (
+                        vars(node),
+                        vars(node).get("_functional_poisson_rng", missing),
+                        frames[0],
+                    )
+                )
+    applied = []
+    try:
+        for namespace, previous, frame in bindings:
+            applied.append((namespace, previous))
+            namespace["_functional_poisson_rng"] = frame
+        yield
+    finally:
+        for namespace, previous in reversed(applied):
+            if previous is missing:
+                namespace.pop("_functional_poisson_rng", None)
+            else:
+                namespace["_functional_poisson_rng"] = previous
 
 
 def _poisson_waveforms(owner):

@@ -34,10 +34,7 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from dendra._bootstrap import (
-    reset_torch_compiler,
-    torch_compiler_warning_context,
-)
+from dendra._bootstrap import reset_torch_compiler, torch_compiler_warning_context
 from dendra.helpers import (
     BACKEND,
     COMPILE_MODE,
@@ -139,8 +136,10 @@ from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
 from dendra.models.stim.waveform._poisson import (
     apply_prepared_poisson_state,
+    borrow_pending_poisson_rng,
     poisson_state_dict_for_checkpoint,
     prepare_poisson_state_from_checkpoint,
+    reconcile_extra_poisson_rng,
     restore_poisson_rng_lifecycle,
     snapshot_poisson_rng_lifecycle,
 )
@@ -3856,14 +3855,16 @@ class Population(P, Sliceable):
                 # [n_contacts, np, n_t_chunk]
                 t_per_contact: List[torch.Tensor] = []
                 for wf in cfg.waveforms:
-                    t_i = wf(t_chunk).to(self.dtype())
+                    with borrow_pending_poisson_rng(self, wf):
+                        t_i = wf(t_chunk).to(self.dtype())
                     t_i = self._expand_eval_time(t_i, n_steps=t_chunk.numel())
                     t_per_contact.append(t_i.unsqueeze(0))  # [1, np, n_t_chunk]
 
                 t_extra = torch.cat(t_per_contact, dim=0)
             else:
                 wf = cfg.waveforms[0]
-                t_extra = wf(t_chunk).to(self.dtype())
+                with borrow_pending_poisson_rng(self, wf):
+                    t_extra = wf(t_chunk).to(self.dtype())
                 t_extra = self._expand_eval_time(t_extra, n_steps=t_chunk.numel())
         else:
             # Non-functional: use pre-split chunks
@@ -4061,6 +4062,7 @@ class Population(P, Sliceable):
                 elif extra is not None:
                     t_step = self.t.reshape(1).to(device=device, dtype=dtype)
                     extra_cfg = self._prepare_extra(extra, t_step, n_chunks=1)
+                    reconcile_extra_poisson_rng(self, extra)
                     ve_list = self._compute_extra_chunk(extra_cfg, 0, t_step)
                     ve_c = None if ve_list is None else ve_list[0]
                 else:
@@ -4338,6 +4340,7 @@ class Population(P, Sliceable):
             # Prepare intra
             # --------------------------------------------------------------
             indexed_tapes = None
+            reconcile_extra_poisson_rng(self, extra)
             if with_intra:
                 if (
                     n > 0
@@ -4750,6 +4753,7 @@ class Population(P, Sliceable):
                     if observer is not None:
                         observed_emissions = []
                     indexed_tapes = None
+                    reconcile_extra_poisson_rng(self, extra)
                     if with_intra:
                         tapes, indices = intra.init(t_chunk)
                         # Waveform output always carries time on its last axis;
@@ -7856,6 +7860,7 @@ class Population(P, Sliceable):
                         # Restore model state at chunk boundary
                         self.restore_dict_from_checkpoint(state_local)
 
+                        reconcile_extra_poisson_rng(self, extra)
                         if with_intra:
                             stims, indices = intra.init(t_chunk_local)
                             # Waveform output always carries time on its last
@@ -7957,6 +7962,7 @@ class Population(P, Sliceable):
                             )
                             self.restore_dict_from_checkpoint(state_local)
 
+                            reconcile_extra_poisson_rng(self, extra)
                             if with_intra:
                                 stims, indices = intra.init(t_chunk_local)
                                 stims = [s.unbind(-1) for s in stims]

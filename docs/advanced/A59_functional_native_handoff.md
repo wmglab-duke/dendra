@@ -239,6 +239,55 @@ operations. They retain their existing graph behavior and require callers to
 align effective native sources separately. Use `commit_continuation_` for a
 detached transfer of sources and state together.
 
+### Shared sources in bound extracellular stimulation
+
+A plan-bound `extra` waveform can share a raw Parameter or Poisson generator
+with registered model stimulation. Handoff preserves those relationships when
+validating the target and deriving its native materializations. The same rules
+apply to Populations and Networks, including sharing across Populations.
+
+Only native-owned sources and runtime state are transferred. If an external
+waveform refers to a native-owned Parameter, it sees the transferred value
+through that existing alias. Independent external fields, waveform parameters
+and schedule history remain caller-owned; handoff does not install overrides
+for those sources. Supply compatible `extra` bindings again when native
+execution resumes.
+
+The complete
+{download}`shared_handoff_staging.py <../../examples/shared_handoff_staging.py>`
+example runs a functional prefix with shared amplitude and Poisson sources,
+then transfers its boundary to the authored native model:
+
+```{literalinclude} ../../examples/shared_handoff_staging.py
+:language: python
+:start-after: "# region handoff"
+:end-before: "# endregion handoff"
+:dedent: 4
+```
+
+For global Torch streams, handoff retains the incoming RNG boundary without
+immediately changing ambient randomness. The first native waveform invocation
+using the shared stream consumes that boundary once. An extracellular waveform
+evaluated before intracellular stimulation therefore continues the same stream
+without a later rewind:
+
+```{literalinclude} ../../examples/shared_handoff_staging.py
+:language: python
+:start-after: "# region automatic"
+:end-before: "# endregion automatic"
+:dedent: 4
+```
+
+Save caller-owned extracellular waveform and generator state alongside a native
+checkpoint, and reconstruct the same source-sharing relationships on restore.
+A separate external generator remains independently owned even when the model
+has its own committed RNG state. The example checks native suffix gradients,
+raw Parameter identities and checkpoint continuation for both model types:
+
+```console
+python examples/shared_handoff_staging.py
+```
+
 ## Callbacks and call-local stimulation
 
 Callback carry belongs to its prepared callback collection. Model handoff

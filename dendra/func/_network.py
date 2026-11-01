@@ -42,7 +42,6 @@ from ._network_initialization import (
     NetworkInitializationInput,
 )
 from ._population import (
-    _deepcopy_execution_module,
     _subclass_contract_failures,
     _subclass_contract_matches,
     _subclass_slot_contract,
@@ -2279,11 +2278,15 @@ class FunctionalNetwork:
             for name, plan in self.populations.items()
             if plan._random_plan is not None
         }
-        staged = _deepcopy_execution_module(network)
-        for name, plan in self.populations.items():
+        from ._handoff_staging import stage_native_handoff
+
+        staged, staged_functional = stage_native_handoff(self, network)
+        for name, plan in staged_functional.populations.items():
             plan.commit_state_(
                 staged.populations[name],
-                self._expand_population_state(name, state["populations"][name], state),
+                staged_functional._expand_population_state(
+                    name, state["populations"][name], state
+                ),
             )
         for name, plan in self.synapses.items():
             plan.commit_state_(staged.synapses[name], state["synapses"][name])
