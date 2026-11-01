@@ -324,10 +324,12 @@ scopes. Recorded history and HDF5 sessions remain separately owned; see
 {doc}`A58_functional_callback_checkpoints`. Portable export requires the optional
 checkpoint protocol for custom callbacks.
 
-Inputs, runtime draw tapes and call-local `extra` arguments are not stored in a
-`Continuation`. Supply them again for resumed native execution through the
-corresponding native input or stimulation API. Bindings that have no native
-owner cannot be silently installed by model handoff.
+Inputs, runtime draws and call-local `extra` arguments are not stored in a
+`Continuation`. Supply deterministic inputs and stimulation again when native
+execution resumes. Native `step` accepts a single `RuntimeDraws` packet for
+NOISE/SDE and Network NetStim; native run-family draw tapes and randomized
+Poisson replay are currently unsupported. See {doc}`A61_shared_runtime_inputs`.
+Bindings that have no native owner cannot be silently installed by model handoff.
 
 The complete example executes here:
 

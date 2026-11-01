@@ -3907,6 +3907,7 @@ class Population(P, Sliceable):
         dt: Optional[float] = None,
         *,
         inputs=None,
+        draws=None,
         ve: Optional[TensorLike] = None,
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
@@ -3933,6 +3934,10 @@ class Population(P, Sliceable):
             current. An explicit ``ve`` frame conflicts with ``ve=`` or ``extra=``;
             an explicit ``intra`` frame conflicts with solver-level Slice injections.
             Omitted fields retain the existing stimulation sources.
+        draws : dendra.func.RuntimeDraws, optional
+            One explicit NOISE/SDE draw frame with authoritative RNG suffixes.
+            Omission retains automatic sampling. Randomized Poisson replay is
+            currently unsupported. Supplied base draws remain detached.
         extra : extracellular specification, optional
             Higher-level extracellular stimulation specification with the same
             shape and broadcasting semantics as :meth:`run`. It is evaluated
@@ -3988,6 +3993,12 @@ class Population(P, Sliceable):
         )
         if observer is not None:
             observer.validate_dt(dt_f)
+
+        replay = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import bind_population_runtime_draws
+
+            replay = bind_population_runtime_draws(self, draws, extra=extra)
 
         input_ve = input_intra = None
         if inputs is not None:
@@ -4059,7 +4070,10 @@ class Population(P, Sliceable):
             else:
                 intra_c = input_intra
 
-            self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+            with nullcontext() if replay is None else replay.scope():
+                self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+            if replay is not None:
+                replay.publish()
             self.t = self.t + dt_tensor
 
             if observer is not None:

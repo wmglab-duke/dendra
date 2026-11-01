@@ -2456,6 +2456,10 @@ class State(Parameterized):
         assigned = self._derive_assigned_values(v, values)
         if self.method in {"euler_maruyama", "euler_heun"}:
             if draws is None:
+                # Native one-step replay supplies validated call-local inputs.
+                # The explicit argument retains precedence over that binding.
+                draws = getattr(self, "_native_sde_draws", None)
+            if draws is None:
                 draws = {
                     name: self._sde_randn_like(name, values[name])
                     for name in self._sde_draw_state_names

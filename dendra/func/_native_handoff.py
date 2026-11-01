@@ -474,9 +474,11 @@ def commit_continuation_(functional, target, continuation):
     ``plan.commit_state_`` methods retain their existing graph-preserving API.
 
     Callback carry is separate: this operation neither installs callbacks nor
-    opens storage. Use the callback collection's export/restore protocol when
-    transferring observations. Inputs, draw tapes and extracellular ``extra``
-    remain invocation arguments; native calls must supply them separately.
+    opens storage. Reuse its prepared collection and explicit carry, or use
+    export/restore between collections. Inputs and call-local extracellular
+    ``extra`` remain invocation arguments. Native ``step`` accepts one
+    ``RuntimeDraws`` frame for NOISE/SDE and Network NetStim; native run-family
+    draw tapes and randomized Poisson replay are currently unsupported.
     """
     _cold_boundary("commit_continuation_")
     if type(continuation) is not Continuation:

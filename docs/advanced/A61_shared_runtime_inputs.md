@@ -159,10 +159,55 @@ Runtime state and the physical duration remainder continue through the native
 model's existing checkpoint methods. Supply the remaining input tape again
 when resuming.
 
-`Inputs` contains deterministic drives only. It does not add an explicit
-`draws=` argument to native execution. Native RNG ownership and sampling order
-remain part of the native lifecycle; functional draw packets remain described
-in {doc}`A57_functional_api_overview`.
+## Explicit runtime draws for native steps
+
+`Inputs` contains deterministic drives. Supply stochastic values separately
+through `draws=` on native Population/Network `step`, `dn.step`,
+`dn.step_population` and `dn.step_network`. These calls consume one
+`dn.func.RuntimeDraws` packet for NOISE, State SDE and optional Network NetStim.
+Native `run`, `longrun` and `longrun_checkpointed` do not accept draw tapes.
+Randomized Poisson stimulation is rejected for explicit native draws; omitting
+`draws` retains the native sampling lifecycle.
+
+Use the existing functional plan's sampler. Lower the initialized native model
+once, capture its current boundary, then sample without advancing native state
+or its generators:
+
+```python
+functional, _ = dn.func.make_functional(model, dt=dt)
+boundary = dn.func.capture_continuation(functional, model)
+draws = functional.sample_runtime_draws(boundary.state)
+dn.step(model, dt=dt, inputs=frame, draws=draws)
+```
+
+A Network uses its initialized timestep and a Population-name mapping of input
+frames. Existing plans can be reused while the model remains compatible;
+`program.functional` also exposes a compiled runner's plan. Packet families,
+shapes, dtype/device and stream routes follow that plan. Keep the sampled packet
+intact rather than constructing its draw or RNG fields manually.
+
+Explicit native execution uses detached base draws and publishes their
+authoritative RNG frames at the normal execution boundaries. Shared Network
+streams retain their Population ordering. Later native steps with omitted
+`draws` continue from the published suffix. Model parameters and deterministic
+inputs retain their normal gradients; draw values and RNG carry remain
+detached. Recordings and callback carry use the same native step contract.
+
+Explicit SDE draws pass supplied tensors through native compiled kernels.
+Omitting draws retains the native RNG/backend restrictions: automatic State SDE
+sampling can fail under strict full-graph capture of `torch.Generator`, even
+when explicit-draw steps compile successfully.
+
+The complete
+{download}`shared_runtime_draws.py <../../examples/shared_runtime_draws.py>`
+example compares explicit native steps and helpers with functional references,
+checks parameter gradients and recordings, then resumes ordinary native sampling:
+
+```console
+python examples/shared_runtime_draws.py
+```
+
+See {doc}`A57_functional_api_overview` for functional draw tapes and host sampling.
 
 The complete example executes here:
 

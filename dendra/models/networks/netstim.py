@@ -1388,7 +1388,7 @@ class NetStim(DNModule, Sliceable):
         self.heap_override_active = self.heap_override_active & ~s_sched
         self._update_heap_head()
 
-    def forward(self, t, *, bptt: bool = False, dt=None):
+    def forward(self, t, *, bptt: bool = False, dt=None, exp_rand=None):
         r"""
         Advance generator clocks to time ``t`` and emit a spike mask.
 
@@ -1417,6 +1417,11 @@ class NetStim(DNModule, Sliceable):
         bptt : bool, optional
             If True, keep graph connections across steps (no detach) to enable
             backprop-through-time. Default is False.
+        exp_rand : torch.Tensor, optional
+            Prevalidated full-shaped unit-rate exponential base draw. Its values
+            are detached before use. Omitting it samples the native generator;
+            supplying it leaves generator state unchanged. The enclosing runtime
+            draw adapter publishes the packet's authoritative RNG frame.
 
         Returns
         -------
@@ -1432,13 +1437,16 @@ class NetStim(DNModule, Sliceable):
         )
         sched_gate, sched_hard = self._scheduled_tensor_gate(t, dt=dt)
 
-        # Every call consumes one full-shaped draw, including deterministic,
-        # exhausted, or not-yet-due generators. Keep the native RNG cadence.
-        eps = torch.finfo(dtype).tiny
-        U = torch.rand(
-            self.shape, generator=self._rng, device=device, dtype=dtype
-        ).clamp_min(eps)
-        exp_rand = -torch.log(U)
+        if exp_rand is None:
+            # Native sampling consumes one full-shaped draw, including
+            # deterministic, exhausted, or not-yet-due generators.
+            eps = torch.finfo(dtype).tiny
+            U = torch.rand(
+                self.shape, generator=self._rng, device=device, dtype=dtype
+            ).clamp_min(eps)
+            exp_rand = -torch.log(U)
+        else:
+            exp_rand = exp_rand.detach()
         parameters = self.renewal_parameters()
         transition = netstim_renewal(
             NetStimState(self.next_stoch_time, self.spike_counts, self.t_last),

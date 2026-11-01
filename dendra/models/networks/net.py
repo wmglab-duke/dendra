@@ -212,9 +212,17 @@ def _network_step_schedule(network):
     )
 
 
-def advance_populations(populations, dt, extra, intra):
+def advance_populations(populations, dt, extra, intra, runtime_draws=None):
     for n, pop in _named_items(populations):
-        step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
+        if runtime_draws is None:
+            step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
+        else:
+            replay = runtime_draws.populations[n]
+            with replay.scope():
+                step_pop(
+                    pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
+                )
+            replay.publish()
 
 
 def _refresh_detached_population_materializations(populations, dt):
@@ -321,11 +329,18 @@ def step(
     extra: Dict[str, torch.Tensor | None] = {},
     intra: Dict[str, torch.Tensor | None] = {},
     compile_network_ops=False,
+    runtime_draws=None,
 ):
     if netstim is not None:
         # NetStim has explicit heap/schedule side effects; keep it eager unless
         # NetStim grows a compile-safe method of its own.
-        netstim(t, bptt=netstim.training, dt=dt)
+        if runtime_draws is None:
+            netstim(t, bptt=netstim.training, dt=dt)
+        else:
+            netstim(
+                t, bptt=netstim.training, dt=dt, exp_rand=runtime_draws.netstim_draw
+            )
+            runtime_draws.publish_netstim()
     for _, target in _named_items(continuous_targets):
         target.reset_continuous_inputs()
     for _, c in _named_items(continuous_synapses):
@@ -335,7 +350,10 @@ def step(
 
     # Population/integrator compilation is handled inside each integrator with
     # scope="network_population". The stateful Python wrapper remains eager.
-    advance_populations(populations, dt, extra, intra)
+    if runtime_draws is None:
+        advance_populations(populations, dt, extra, intra)
+    else:
+        advance_populations(populations, dt, extra, intra, runtime_draws=runtime_draws)
 
 
 def get_local_index(population, mech, index):
@@ -3863,6 +3881,7 @@ class Network(RNGMixin):
         *,
         extra=None,
         inputs=None,
+        draws=None,
         callbacks=None,
         loop_hooks: bool = False,
         callback_state=None,
@@ -3891,6 +3910,10 @@ class Network(RNGMixin):
             keyed by exact Population names. A supplied ``ve`` conflicts with
             ``extra`` for that Population; supplied ``intra`` conflicts with
             registered solver stimulation. Omitted fields retain those sources.
+        draws : dendra.func.RuntimeDraws, optional
+            One explicit NOISE/SDE and NetStim frame with authoritative RNG
+            boundaries. Omission retains automatic sampling. Randomized Poisson
+            replay is currently unsupported; supplied base draws are detached.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this Network or a compatible initialized
@@ -3944,6 +3967,11 @@ class Network(RNGMixin):
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
         if observer is not None:
             observer.validate_dt(dt_f)
+        replay = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import bind_network_runtime_draws
+
+            replay = bind_network_runtime_draws(self, draws, extra=extra)
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
 
@@ -4009,6 +4037,7 @@ class Network(RNGMixin):
                     extra_c, intra_c, runtime_inputs
                 )
 
+            draw_options = {} if replay is None else {"runtime_draws": replay}
             self._step(
                 self._population_step_items,
                 self._synapse_step_items,
@@ -4020,6 +4049,7 @@ class Network(RNGMixin):
                 extra=extra_c,
                 intra=intra_c,
                 compile_network_ops=self.compile_network_ops,
+                **draw_options,
             )
             self._advance_runtime_clock()
 

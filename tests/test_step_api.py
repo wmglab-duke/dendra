@@ -209,6 +209,7 @@ def test_step_helpers_forward_callback_packets_and_return_results_unchanged(
     monkeypatch.setattr(model, "step", capture)
     options = {
         "inputs": object(),
+        "draws": object(),
         "extra": object(),
         "callbacks": [object()],
         "loop_hooks": True,
@@ -228,7 +229,10 @@ def test_step_helpers_keep_authored_legacy_step_signatures_when_inputs_are_omitt
     helper, target, explicit_none
 ):
     model = target()
-    assert helper(model, **({"inputs": None} if explicit_none else {})) is model
+    assert (
+        helper(model, **({"inputs": None, "draws": None} if explicit_none else {}))
+        is model
+    )
     expected = {"extra": None, "callbacks": None, "loop_hooks": False}
     if isinstance(model, dn.Population):
         expected.update(dt=None, ve=None)

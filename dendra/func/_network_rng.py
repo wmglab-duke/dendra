@@ -13,6 +13,27 @@ from ._rng_frames import _rng_extra, _rng_values, _sampler_from_frame
 from ._types import FunctionalizationError, RuntimeNoiseDraw
 
 
+def _network_stream_inventory(populations, stream_plans):
+    """Name physical streams once in Population and declaration order."""
+    from ._population import _parameterized_owner_paths
+
+    local_streams, streams, sources, identities, consumers = {}, {}, {}, {}, {}
+    for name, population in populations.items():
+        local = {}
+        declarations = stream_plans[name]
+        if declarations is not None:
+            owners = dict(_parameterized_owner_paths(population))
+            for stream, (path, attribute) in declarations.items():
+                source = getattr(owners[path], attribute)
+                key = identities.setdefault(id(source), f"stream_{len(identities)}")
+                streams.setdefault(key, (name, path, attribute))
+                sources.setdefault(key, source)
+                local[stream] = key
+                consumers.setdefault(key, set()).add(name)
+        local_streams[name] = local
+    return local_streams, streams, sources, identities, consumers
+
+
 class NetworkRNGPlan:
     """Project one explicit carry per authored stream into Population adapters.
 
@@ -26,24 +47,19 @@ class NetworkRNGPlan:
         self.functional = functional
         self.network = network
         self.populations = functional.populations
-        self.local_streams = {}
-        self.streams = {}
-        self._sources = {}
-        identities = {}
-        consumers = {}
-        for name, plan in self.populations.items():
-            local = {}
-            random = plan._random_plan
-            if random is not None:
-                owners = self._owners(network.populations[name])
-                for stream, (path, attribute) in random.streams.items():
-                    source = getattr(owners[path], attribute)
-                    key = identities.setdefault(id(source), f"stream_{len(identities)}")
-                    self.streams.setdefault(key, (name, path, attribute))
-                    self._sources.setdefault(key, source)
-                    local[stream] = key
-                    consumers.setdefault(key, set()).add(name)
-            self.local_streams[name] = local
+        (
+            self.local_streams,
+            self.streams,
+            self._sources,
+            identities,
+            consumers,
+        ) = _network_stream_inventory(
+            {name: network.populations[name] for name in self.populations},
+            {
+                name: None if plan._random_plan is None else plan._random_plan.streams
+                for name, plan in self.populations.items()
+            },
+        )
         self._topology = self._current_topology(network)
         self._cache_paths = {}
         for name, population in network.populations.items():

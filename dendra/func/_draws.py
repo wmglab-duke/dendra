@@ -13,7 +13,10 @@ class RuntimeDraws(NamedTuple):
 
     Obtain a packet with ``functional.sample_runtime_draws(state)`` or a
     time-leading tape with ``functional.sample_runtime_draws(state, steps=N)``.
-    Pass it through the additive ``draws=`` argument of functional execution.
+    Pass it through ``draws=`` in functional execution or a native Population/
+    Network ``step`` and its public helpers. Native steps consume one packet
+    for NOISE/State SDE and optional Network NetStim; randomized Poisson
+    stimulation and native run-family draw tapes are unsupported.
     Numerical draw families and stream routes are fixed by the lowered model.
     Shared RNG bytes occur once at each native publication boundary, including
     intermediate Population boundaries when a Network exposes them.
@@ -22,6 +25,10 @@ class RuntimeDraws(NamedTuple):
     the model and its distributions retain their ordinary gradient paths.
     Existing initialization draw packets and runtime input tuples keep their
     separate public formats.
+
+    Sampling leaves source generators and incoming state unchanged. Native
+    execution publishes the supplied RNG timeline at its existing boundaries;
+    later steps with omitted draws continue from that published position.
     """
 
     draws: dict[str, object]

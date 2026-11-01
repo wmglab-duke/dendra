@@ -12,6 +12,7 @@ def step(
     dt: Optional[float] = None,
     *,
     inputs=None,
+    draws=None,
     ve=None,
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
@@ -35,6 +36,10 @@ def step(
         packet; a Network consumes a mapping keyed by exact Population names.
         Frames pass unchanged to the native method, which validates broadcasting,
         dtype/device and conflicts with existing stimulation sources.
+    draws : dendra.func.RuntimeDraws, optional
+        One explicit native NOISE/SDE frame, including NetStim for a Network.
+        The native method validates and consumes it, publishing its RNG suffixes.
+        Randomized Poisson replay is currently unsupported.
     ve : Tensor, optional
         Population-only precomputed extracellular voltage for this single step.
     extra : optional
@@ -85,6 +90,8 @@ def step(
         step_options["callback_state"] = callback_state
     if inputs is not None:
         step_options["inputs"] = inputs
+    if draws is not None:
+        step_options["draws"] = draws
 
     if isinstance(model, Population):
         return model.step(
@@ -127,6 +134,7 @@ def step_population(
     dt: Optional[float] = None,
     *,
     inputs=None,
+    draws=None,
     ve=None,
     extra=None,
     callbacks: Optional[Sequence[Callback]] = None,
@@ -147,6 +155,9 @@ def step_population(
         Deterministic extracellular voltage and intracellular current frames.
         The native method validates broadcasting, dtype/device and stimulation
         conflicts. Tensor references and gradients are retained.
+    draws : dendra.func.RuntimeDraws, optional
+        One explicit NOISE/SDE frame and authoritative RNG suffixes, validated
+        by the native method. Randomized Poisson replay is currently unsupported.
     ve : Tensor, optional
         Precomputed extracellular voltage for this single step.
     extra : optional
@@ -191,6 +202,8 @@ def step_population(
         step_options["callback_state"] = callback_state
     if inputs is not None:
         step_options["inputs"] = inputs
+    if draws is not None:
+        step_options["draws"] = draws
     return population.step(
         dt=dt,
         ve=ve,
@@ -206,6 +219,7 @@ def step_network(
     *,
     extra=None,
     inputs=None,
+    draws=None,
     callbacks: Optional[Sequence[Callback]] = None,
     loop_hooks: bool = False,
     callback_state=None,
@@ -225,6 +239,10 @@ def step_network(
         Deterministic voltage and current frames keyed by exact Population names.
         The native method validates broadcasting, dtype/device and stimulation
         conflicts. Tensor references and gradients are retained.
+    draws : dendra.func.RuntimeDraws, optional
+        One explicit NOISE/SDE and NetStim frame and authoritative RNG
+        boundaries, validated by the native method. Randomized Poisson replay
+        is currently unsupported.
     callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
         Native hook sequence, or a pure collection prepared once with
         ``dn.func.make_callbacks`` for this Network or a compatible initialized
@@ -264,6 +282,8 @@ def step_network(
         step_options["callback_state"] = callback_state
     if inputs is not None:
         step_options["inputs"] = inputs
+    if draws is not None:
+        step_options["draws"] = draws
     return network.step(
         extra=extra, callbacks=callbacks, loop_hooks=loop_hooks, **step_options
     )

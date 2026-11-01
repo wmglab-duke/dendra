@@ -28,6 +28,7 @@ from .random_parameters import (
     RandomParameterSpec,
     RuntimeNoiseSpec,
     clone_random_parameter_tree,
+    evaluate_runtime_noise,
     get_random_distribution,
     make_random_parameter_spec,
     make_runtime_noise_spec,
@@ -4046,6 +4047,7 @@ class Parameterized(SimpleParameterized):
             tuple(self.runtime_noises) if not names else tuple(str(n) for n in names)
         )
         phase_norm = None if phase is None else str(phase).strip().lower()
+        draws = getattr(self, "_native_runtime_noise_draws", None)
         any_sampled = False
         with torch.no_grad():
             for name in selected:
@@ -4058,21 +4060,33 @@ class Parameterized(SimpleParameterized):
                 if phase_norm is not None and spec.phase != phase_norm:
                     continue
                 buffer = getattr(self, name)
-                rng = getattr(self, spec.effective_rng_name)
-                if isinstance(rng, RNGModule):
-                    rng.init(buffer.device)
+                if draws is None:
+                    rng = getattr(self, spec.effective_rng_name)
+                    if isinstance(rng, RNGModule):
+                        rng.init(buffer.device)
                 distribution_params = {
                     p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
                 }
-                sample = sample_runtime_noise(
-                    spec,
-                    distribution_params,
-                    rng,
-                    tuple(buffer.shape),
-                    device=buffer.device,
-                    dtype=buffer.dtype,
-                    dt=dt,
-                )
+                if draws is None:
+                    sample = sample_runtime_noise(
+                        spec,
+                        distribution_params,
+                        rng,
+                        tuple(buffer.shape),
+                        device=buffer.device,
+                        dtype=buffer.dtype,
+                        dt=dt,
+                    )
+                else:
+                    # One-step replay binds validated base draws temporarily.
+                    # Reuse the native detached transform and buffer write;
+                    # supplied draws never initialize or consume an RNG.
+                    sample = evaluate_runtime_noise(
+                        spec,
+                        distribution_params,
+                        clone_random_parameter_tree(draws[name], detach=True),
+                        dt=dt,
+                    )
                 buffer.copy_(sample.to(device=buffer.device, dtype=buffer.dtype))
                 any_sampled = True
         return any_sampled

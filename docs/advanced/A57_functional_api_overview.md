@@ -786,8 +786,10 @@ The same `inputs=` packet is accepted by native Population `step`, `run`,
 `longrun` and `longrun_checkpointed`. Native Networks accept the named
 Population mapping below. The helpers `dn.step`, `dn.step_population` and
 `dn.step_network` accept the corresponding one-step frames through `inputs=`.
-Native execution keeps its model-owned state and
-RNG lifecycle; the deterministic packet does not introduce native draw tapes.
+Native execution keeps its model-owned state and RNG lifecycle. Native steps
+also accept a separate `draws=` packet for NOISE/State SDE and optional Network
+NetStim; native run-family draw tapes and explicit randomized Poisson replay are
+unsupported.
 See {doc}`A61_shared_runtime_inputs` for native horizons, validation and
 registered waveform behavior.
 
@@ -827,6 +829,14 @@ its component schema by hand. A step uses the no-`steps` form. The packet
 covers the model's NetStim, NOISE/SDE and randomized Poisson requests and
 preserves shared generator ordering. Draw values are detached from sampling;
 model and distribution parameters retain their normal gradient paths.
+
+For native one-step replay, lower once and sample from a captured native
+boundary with `functional.sample_runtime_draws(boundary.state)`, omitting
+`steps`. Pass that packet to the native `step` method or a public one-step
+helper. Sampling leaves the model and generators unchanged; execution publishes
+the packet's authoritative RNG timeline, so a later step with omitted draws
+continues from its suffix. See {doc}`A61_shared_runtime_inputs` and
+{download}`shared_runtime_draws.py <../../examples/shared_runtime_draws.py>`.
 
 Pure calls require explicit stochastic packets. Host `dn.func.run` and
 `dn.compile` sample omitted packets in bounded spans from the supplied state's
