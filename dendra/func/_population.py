@@ -33,6 +33,7 @@ from dendra.models.core import (
     SingleCompartment,
     Unmyelinated,
     _PassiveEndDiameter,
+    _time_grid_from_step_count,
 )
 from dendra.models.core import step as _standard_population_step
 from dendra.models.extcell import ExtCellAxon, ExtCellTree
@@ -16923,6 +16924,11 @@ class FunctionalPopulation:
         start = state["clock"]["t"]
         if dt is None:
             dt = start.new_tensor(self.dt)
+        if self.device.type == "mps":
+            dt_cpu = dt.to(device="cpu").to(dtype=torch.float64)
+            return _time_grid_from_step_count(
+                start, steps, dt_cpu, device=self.device
+            ).to(self.dtype)
         offsets = torch.arange(
             steps,
             device=self.device,

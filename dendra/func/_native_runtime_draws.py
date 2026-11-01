@@ -1,23 +1,29 @@
-"""Cold native bindings for canonical single-step NOISE/SDE and NetStim draws."""
+"""Native single-step bindings for NOISE/SDE, NetStim and bank Poisson draws."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 from torch.utils import _pytree
 
 from dendra.models.rng import RNGModule
-from dendra.models.stim.waveform._poisson import _poisson_waveforms
+from dendra.models.stim.waveform._poisson import (
+    _NativePoissonInvocationReplay,
+    _poisson_waveforms,
+    native_poisson_schedule_from_draws,
+)
 
 from ._draws import _normalize_runtime_draws
 from ._network_draws import _keys, _tensor
 from ._network_rng import _network_stream_inventory
+from ._poisson_stimulation import PoissonStimulationPlan
 from ._population import _parameterized_owner_paths
 from ._rng_frames import _rng_extra, _rng_values
 from ._runtime_noise import RuntimeNoisePlan
-from ._types import RuntimeNoiseDraw
+from ._stimulation_rng import _generator_bindings, _validate_tracked_generators
+from ._types import RuntimeNoiseDraw, StimulationDraw
 
 
 def _reject_poisson(population, extra):
@@ -40,6 +46,54 @@ def _reject_poisson(population, extra):
     visit(extra)
 
 
+def _bank_poisson_plan(population, extra):
+    handler = getattr(population, "mech", None)
+    if handler is not None and _poisson_waveforms(handler):
+        raise ValueError(
+            "Native draws do not support mechanism-owned Poisson stimulation"
+        )
+    roots = []
+
+    def visit(value):
+        if isinstance(value, torch.nn.Module):
+            roots.append(value)
+        elif isinstance(value, Mapping):
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, (tuple, list)):
+            for child in value:
+                visit(child)
+
+    visit(extra)
+    registered = _poisson_waveforms(population)
+    if not registered and not any(_poisson_waveforms(root) for root in roots):
+        return None
+    plan = PoissonStimulationPlan.native_banks(population, extra)
+    bank_nodes = {id(entry.source) for entry in plan.entries}
+    if any(id(node) not in bank_nodes for node in registered.values()):
+        raise ValueError(
+            "Native draws support randomized Poisson only in Population waveform banks"
+        )
+    return plan if plan.enabled else None
+
+
+@contextmanager
+def _bound_replay_slots(slots):
+    previous = []
+    missing = object()
+    try:
+        for owner, name, values in slots:
+            previous.append((owner, name, vars(owner).get(name, missing)))
+            setattr(owner, name, values)
+        yield
+    finally:
+        for owner, name, value in reversed(previous):
+            if value is missing:
+                delattr(owner, name)
+            else:
+                setattr(owner, name, value)
+
+
 def _prepare_rng(source, frame):
     """Own and validate bytes on an isolated sampler before live publication."""
     payload = _rng_extra(frame)
@@ -53,24 +107,42 @@ def _publish(updates):
 
 
 class _PopulationReplay:
-    def __init__(self, population, draws, extra):
-        _reject_poisson(population, extra)
+    def __init__(self, population, draws, extra, *, bank_poisson=False):
+        if not bank_poisson:
+            _reject_poisson(population, extra)
+        self.poisson = _bank_poisson_plan(population, extra) if bank_poisson else None
         self.noise = RuntimeNoisePlan(population)
         self.owners = dict(_parameterized_owner_paths(population))
         self.sources = {
             stream: getattr(self.owners[path], attribute)
             for stream, (path, attribute) in self.noise.streams.items()
         }
+        generators = _generator_bindings(self.sources)
+        self.borrowed = (
+            {}
+            if self.poisson is None
+            else {
+                stream: generators[id(generator)]
+                for stream, generator in self.poisson.streams.items()
+                if id(generator) in generators
+            }
+        )
+        if self.poisson is not None:
+            _validate_tracked_generators(
+                population, self.sources, self.poisson.streams.values()
+            )
+        borrowed = {owner for owner, _device in self.borrowed.values()}
         self.reference = (
             {
                 stream: _rng_values(source, population.device())
                 for stream, source in self.sources.items()
+                if self.noise.runtime or stream in borrowed
             }
-            if self.noise.runtime
+            if self.noise.runtime or borrowed
             else {}
         )
         _keys(draws, ("noise", "stimulation"), "draws.draws")
-        if draws["stimulation"] is not None:
+        if self.poisson is None and draws["stimulation"] is not None:
             raise ValueError(
                 "Native draws do not support randomized Poisson stimulation"
             )
@@ -105,6 +177,53 @@ class _PopulationReplay:
             (owner, "_native_sde_draws", values) for owner, values in sde.items()
         )
         self.updates = []
+        self.poisson_updates = []
+        self.poisson_slots = []
+        self.bank_replay = None
+        if self.poisson is not None:
+            packet = StimulationDraw(draws["stimulation"], {})
+            self.poisson.validate(packet, validate_rng=False)
+            positions = {}
+            invocations = []
+            for entry in self.poisson.entries:
+                if (
+                    entry.key in self.poisson._event_slots
+                    and self.poisson._runtime_counts[entry.key]
+                ):
+                    values = packet.draws[entry.key]
+                    rows = (
+                        values.unsqueeze(0)
+                        if self.poisson._capacities[entry.key] == 1
+                        else values
+                    )
+                    self.poisson._check_event_slots(
+                        entry, rows[: self.poisson._runtime_counts[entry.key]]
+                    )
+            for entry in self.poisson._runtime_entries:
+                position = positions.get(entry.key, 0)
+                values = packet.draws[entry.key]
+                value = (
+                    values
+                    if self.poisson._capacities[entry.key] == 1
+                    else values[position]
+                )
+                invocations.append(
+                    (
+                        entry.source,
+                        native_poisson_schedule_from_draws(
+                            entry.source, value, dtype=entry.dtype, device=entry.device
+                        ),
+                    )
+                )
+                positions[entry.key] = position + 1
+            self.bank_replay = _NativePoissonInvocationReplay(invocations)
+            seen = set()
+            for entry in self.poisson.entries:
+                if id(entry.source) not in seen:
+                    self.poisson_slots.append(
+                        (entry.source, "_native_poisson_replay", self.bank_replay)
+                    )
+                    seen.add(id(entry.source))
 
     def bind_rng(self, model):
         _keys(model, self.reference, "draws.rng.model")
@@ -121,32 +240,55 @@ class _PopulationReplay:
                 frame[leaf] = actual[leaf]["step"]
             self.updates.append(_prepare_rng(self.sources[stream], frame))
 
-    @contextmanager
+    def bind_stimulation_rng(self, values):
+        streams = {} if self.poisson is None else self.poisson.streams
+        _keys(values, set(streams) - set(self.borrowed), "draws.rng.stimulation")
+        if self.poisson is None:
+            return
+        complete = dict(values)
+        for stream, (owner, device) in self.borrowed.items():
+            payload = next(
+                payload
+                for source, payload in self.updates
+                if source is self.sources[owner]
+            )
+            complete[stream] = payload["rng_state"][device]
+        self.poisson._validate_rng(complete)
+        self.poisson_updates = [
+            (generator, values[stream].detach().cpu().clone())
+            for stream, generator in streams.items()
+            if stream not in self.borrowed
+        ]
+
     def scope(self):
-        previous = []
-        missing = object()
-        try:
-            for owner, name, values in self.slots:
-                previous.append((owner, name, vars(owner).get(name, missing)))
-                setattr(owner, name, values)
+        return _bound_replay_slots(self.slots)
+
+    @contextmanager
+    def _bank_scope(self):
+        with _bound_replay_slots(self.poisson_slots):
             yield
-        finally:
-            for owner, name, value in reversed(previous):
-                if value is missing:
-                    delattr(owner, name)
-                else:
-                    setattr(owner, name, value)
+            self.bank_replay.finish()
+
+    def bank_scope(self):
+        return nullcontext() if self.bank_replay is None else self._bank_scope()
 
     def publish(self):
         _publish(self.updates)
+        for generator, state in self.poisson_updates:
+            generator.set_state(state)
+        if self.poisson is not None:
+            for entry in self.poisson.entries:
+                pending = vars(entry.source).get("_functional_poisson_rng")
+                if pending is not None and pending.generator is entry.source.generator:
+                    pending.state = None
 
 
 def bind_population_runtime_draws(population, packet, *, extra=None):
     packet = _normalize_runtime_draws(packet)
     _keys(packet.rng, ("model", "stimulation"), "draws.rng")
-    _keys(packet.rng["stimulation"], (), "draws.rng.stimulation")
-    replay = _PopulationReplay(population, packet.draws, extra)
+    replay = _PopulationReplay(population, packet.draws, extra, bank_poisson=True)
     replay.bind_rng(packet.rng["model"])
+    replay.bind_stimulation_rng(packet.rng["stimulation"])
     return replay
 
 

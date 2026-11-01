@@ -166,8 +166,10 @@ through `draws=` on native Population/Network `step`, `dn.step`,
 `dn.step_population` and `dn.step_network`. These calls consume one
 `dn.func.RuntimeDraws` packet for NOISE, State SDE and optional Network NetStim.
 Native `run`, `longrun` and `longrun_checkpointed` do not accept draw tapes.
-Randomized Poisson stimulation is rejected for explicit native draws; omitting
-`draws` retains the native sampling lifecycle.
+Population steps also replay randomized Poisson waveforms in solver-owned
+intracellular injections and call-local extracellular `extra` banks.
+Mechanism-owned Poisson and native Network Poisson replay are unsupported.
+Omitting `draws` retains the native sampling lifecycle.
 
 Use the existing functional plan's sampler. Lower the initialized native model
 once, capture its current boundary, then sample without advancing native state
@@ -193,6 +195,16 @@ streams retain their Population ordering. Later native steps with omitted
 inputs retain their normal gradients; draw values and RNG carry remain
 detached. Recordings and callback carry use the same native step contract.
 
+Poisson replay consumes each waveform invocation's supplied uniforms in its
+prepared order, including repeated shared children and custom containers with
+fixed invocation counts. Recipes require finite `n` and the existing functional
+fixed-count envelope. Schedules and uniforms are detached; waveform amplitude,
+container gain and extracellular field gradients retain their normal paths.
+Shared waveform and generator identities remain intact, and each waveform keeps
+its final invoked schedule for native checkpoints and later execution.
+External `extra` waveforms and generators remain caller-owned: save their state
+alongside the model when checkpointing, and supply the same configuration again.
+
 Explicit SDE draws pass supplied tensors through native compiled kernels.
 Omitting draws retains the native RNG/backend restrictions: automatic State SDE
 sampling can fail under strict full-graph capture of `torch.Generator`, even
@@ -205,6 +217,16 @@ checks parameter gradients and recordings, then resumes ordinary native sampling
 
 ```console
 python examples/shared_runtime_draws.py
+```
+
+The complete
+{download}`shared_poisson_replay.py <../../examples/shared_poisson_replay.py>`
+example changes sampled uniforms, compares native and functional Population
+steps for intra/extra banks, checks amplitude/field gradients and resumes
+automatic sampling from a native checkpoint:
+
+```console
+python examples/shared_poisson_replay.py
 ```
 
 See {doc}`A57_functional_api_overview` for functional draw tapes and host sampling.

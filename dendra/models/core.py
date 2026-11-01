@@ -3936,8 +3936,10 @@ class Population(P, Sliceable):
             Omitted fields retain the existing stimulation sources.
         draws : dendra.func.RuntimeDraws, optional
             One explicit NOISE/SDE draw frame with authoritative RNG suffixes.
-            Omission retains automatic sampling. Randomized Poisson replay is
-            currently unsupported. Supplied base draws remain detached.
+            Solver-owned intracellular and call-local extracellular Poisson
+            waveform banks consume invocation-indexed draws. Mechanism-owned
+            Poisson replay is currently unsupported. Omission retains automatic
+            sampling; supplied base draws and schedules remain detached.
         extra : extracellular specification, optional
             Higher-level extracellular stimulation specification with the same
             shape and broadcasting semantics as :meth:`run`. It is evaluated
@@ -4048,27 +4050,28 @@ class Population(P, Sliceable):
                 observed_state, observed_parts = observer.start()
             pre_step_hook(callbacks, self)
 
-            if input_ve is not None:
-                ve_c = input_ve
-            elif ve is not None:
-                ve_c = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
-                if ve_c.dim() == self.v.dim() + 1 and int(ve_c.shape[0]) == 1:
-                    ve_c = ve_c[0]
-                ve_c = self._broadcast_step_value(ve_c, name="ve").contiguous()
-            elif extra is not None:
-                t_step = self.t.reshape(1).to(device=device, dtype=dtype)
-                extra_cfg = self._prepare_extra(extra, t_step, n_chunks=1)
-                ve_list = self._compute_extra_chunk(extra_cfg, 0, t_step)
-                ve_c = None if ve_list is None else ve_list[0]
-            else:
-                ve_c = None
+            with nullcontext() if replay is None else replay.bank_scope():
+                if input_ve is not None:
+                    ve_c = input_ve
+                elif ve is not None:
+                    ve_c = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
+                    if ve_c.dim() == self.v.dim() + 1 and int(ve_c.shape[0]) == 1:
+                        ve_c = ve_c[0]
+                    ve_c = self._broadcast_step_value(ve_c, name="ve").contiguous()
+                elif extra is not None:
+                    t_step = self.t.reshape(1).to(device=device, dtype=dtype)
+                    extra_cfg = self._prepare_extra(extra, t_step, n_chunks=1)
+                    ve_list = self._compute_extra_chunk(extra_cfg, 0, t_step)
+                    ve_c = None if ve_list is None else ve_list[0]
+                else:
+                    ve_c = None
 
-            if with_intra:
-                stims, indices = self.prep_intra(intra, 1, dt_f)
-                s = [st[0] for st in stims]
-                intra_c = self._call_make_intra(intra, s, indices)
-            else:
-                intra_c = input_intra
+                if with_intra:
+                    stims, indices = self.prep_intra(intra, 1, dt_f)
+                    s = [st[0] for st in stims]
+                    intra_c = self._call_make_intra(intra, s, indices)
+                else:
+                    intra_c = input_intra
 
             with nullcontext() if replay is None else replay.scope():
                 self._step(self.integrator, self, dt_tensor, ve_c, intra_c)

@@ -115,6 +115,67 @@ def poisson_invocation_event_count(draws, *, interval, start, noise, off):
     return torch.isfinite(schedule).sum().clamp_min(1)
 
 
+def native_poisson_schedule_from_draws(waveform, draws, *, dtype=None, device=None):
+    """Own the native variable-length schedule for one validated invocation.
+
+    Count events on the float64 construction clock before converting to the
+    waveform's buffer dtype. A finite native onset may overflow that dtype and
+    must still retain its child invocation. Empty schedules retain the native
+    single-infinity sentinel and registered intracellular singleton axes.
+    Native banks may supply their receiving dtype/device before lazy waveform
+    preparation moves the authored module there.
+    """
+    recipe = {
+        "interval": waveform.interval,
+        "start": waveform.start,
+        "noise": waveform.noise,
+        "off": waveform.off,
+    }
+    count = int(poisson_invocation_event_count(draws, **recipe).item())
+    schedule = poisson_schedule_from_draws(
+        draws,
+        **recipe,
+        dtype=waveform._spike_times.dtype if dtype is None else dtype,
+        device=waveform._spike_times.device if device is None else device,
+    )[:count]
+    return schedule.reshape(schedule.shape + (1,) * waveform._spike_time_trailing_dims)
+
+
+class _NativePoissonInvocationReplay:
+    """Consume validated schedules in the native bank's physical call order.
+
+    The eager caller temporarily binds this object to its waveform nodes.
+    Schedules are already owned and shaped for their receiving nodes. No
+    sampler, class conversion, or registered scratch buffer participates in
+    consumption. Publication retains each physical waveform's latest schedule.
+    """
+
+    def __init__(self, invocations):
+        self.invocations = tuple(invocations)
+        self.position = 0
+
+    def consume(self, waveform):
+        if self.position >= len(self.invocations):
+            raise ValueError(
+                "Poisson replay has no remaining invocation for this waveform."
+            )
+        expected, schedule = self.invocations[self.position]
+        if waveform is not expected:
+            raise ValueError(
+                "Poisson replay invocation order does not match the prepared "
+                "waveform profile."
+            )
+        waveform._spike_times = schedule
+        self.position += 1
+
+    def finish(self):
+        if self.position != len(self.invocations):
+            raise ValueError(
+                "Poisson replay did not consume its complete waveform "
+                "invocation profile."
+            )
+
+
 def sample_poisson_draws(*, interval, n, start, noise, off, generator, dtype=None):
     """Sample native scalar uniforms, returning a padded draw and event count.
 

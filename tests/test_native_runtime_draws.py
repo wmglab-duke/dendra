@@ -240,10 +240,10 @@ def test_population_bad_runtime_packets_reject_before_sampling_or_advancing(
     _close(torch.get_rng_state(), global_rng)
 
 
-def test_randomized_poisson_runtime_draws_reject_before_waveform_or_generator_use(
+def test_mechanism_poisson_runtime_draws_reject_before_waveform_or_generator_use(
     monkeypatch,
 ):
-    model, _, pulse = _poisson_population()
+    model, _, pulse = _poisson_population("mechanism")
     functional, tensors = dn.func.make_functional(model, dt=POISSON_DT)
     packet = functional.sample_runtime_draws(tensors.state)
     saved, rng = (

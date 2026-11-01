@@ -183,12 +183,41 @@ class PoissonStimulationPlan:
     """Fixed invocation recipes; draws and RNG positions remain tensor inputs."""
 
     def __init__(self, functional):
-        self.functional = functional
-        self.population = functional._population
+        self._initialize(
+            functional._population,
+            functional._intra,
+            functional._extra,
+            check_purity=functional._check_purity,
+            include_mechanisms=True,
+        )
+
+    @classmethod
+    def native_banks(cls, population, extra):
+        """Prepare the same bank recipes without lowering model dynamics."""
+        from dendra.helpers import current_check_purity
+
+        from ._stimuli import FunctionalExtra, FunctionalIntra
+
+        result = cls.__new__(cls)
+        result._initialize(
+            population,
+            FunctionalIntra(population),
+            FunctionalExtra(population, extra, namespace="stimulation.extra"),
+            check_purity=current_check_purity(),
+            include_mechanisms=False,
+        )
+        return result
+
+    def _initialize(
+        self, population, intra, extra, *, check_purity, include_mechanisms
+    ):
+        self.population = population
+        self._extra_sources = extra._waveforms._sources
+        dtype, device = population.dtype(), population.device()
         entries, streams, identities, bank_calls = [], {}, {}, []
         # Native step evaluates extracellular contacts before intracellular
         # injections, then enters mechanism evaluation.
-        for kind, plan in (("extra", functional._extra), ("intra", functional._intra)):
+        for kind, plan in (("extra", extra), ("intra", intra)):
             bank = plan._waveforms
             for index, waveform in enumerate(bank._sources):
                 local_entries = {}
@@ -207,8 +236,8 @@ class PoissonStimulationPlan:
                             None,
                             source,
                             stream,
-                            functional.dtype,
-                            functional.device,
+                            dtype,
+                            device,
                             index,
                             path,
                         )
@@ -219,19 +248,21 @@ class PoissonStimulationPlan:
 
                     times = (
                         self.population.t.detach()
-                        .to(dtype=functional.dtype, device=functional.device)
+                        .to(dtype=dtype, device=device)
                         .reshape(-1)
                     )
                     order = profile_waveform_invocations(
                         bank._bank.waveforms[index],
                         tuple(local_entries),
                         times,
-                        check_purity=functional._check_purity,
+                        check_purity=check_purity,
                     )
                     bank_calls.extend(local_entries[path] for path in order)
         from ._mechanism_injections import mechanism_injection_owners
 
-        for owner_path, owner in mechanism_injection_owners(self.population):
+        for owner_path, owner in (
+            mechanism_injection_owners(self.population) if include_mechanisms else ()
+        ):
             for index, waveform in enumerate(owner.injected_waveforms):
                 for path, source in randomized_nodes(waveform):
                     relative = f"{owner_path}.injected_waveforms.{index}.{path + '.' if path else ''}_spike_times"
@@ -247,8 +278,8 @@ class PoissonStimulationPlan:
                             f"population.{relative}",
                             source,
                             stream,
-                            functional.dtype,
-                            functional.device,
+                            dtype,
+                            device,
                             None,
                             relative.rsplit(".", 1)[0],
                         )
@@ -388,7 +419,7 @@ class PoissonStimulationPlan:
 
             source = _solver_injection_specs(population)[entry.root_index][0]
         else:
-            source = self.functional._extra._waveforms._sources[entry.root_index]
+            source = self._extra_sources[entry.root_index]
         return source.get_submodule(entry.node_path) if entry.node_path else source
 
     def _resolved_sources(self, population=None):

@@ -39,7 +39,8 @@ def step(
     draws : dendra.func.RuntimeDraws, optional
         One explicit native NOISE/SDE frame, including NetStim for a Network.
         The native method validates and consumes it, publishing its RNG suffixes.
-        Randomized Poisson replay is currently unsupported.
+        Populations also replay solver-owned intra/extra Poisson waveform banks.
+        Network and mechanism-owned Poisson replay are currently unsupported.
     ve : Tensor, optional
         Population-only precomputed extracellular voltage for this single step.
     extra : optional
@@ -157,7 +158,8 @@ def step_population(
         conflicts. Tensor references and gradients are retained.
     draws : dendra.func.RuntimeDraws, optional
         One explicit NOISE/SDE frame and authoritative RNG suffixes, validated
-        by the native method. Randomized Poisson replay is currently unsupported.
+        by the native method. Solver-owned intra/extra Poisson waveform banks
+        consume invocation-indexed draws; mechanism-owned replay is unsupported.
     ve : Tensor, optional
         Precomputed extracellular voltage for this single step.
     extra : optional

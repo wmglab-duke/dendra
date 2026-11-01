@@ -788,8 +788,9 @@ Population mapping below. The helpers `dn.step`, `dn.step_population` and
 `dn.step_network` accept the corresponding one-step frames through `inputs=`.
 Native execution keeps its model-owned state and RNG lifecycle. Native steps
 also accept a separate `draws=` packet for NOISE/State SDE and optional Network
-NetStim; native run-family draw tapes and explicit randomized Poisson replay are
-unsupported.
+NetStim. Population steps replay randomized Poisson in solver-owned intra and
+call-local extra banks. Mechanism-owned Poisson, native Network Poisson and
+native run-family draw tapes remain unsupported.
 See {doc}`A61_shared_runtime_inputs` for native horizons, validation and
 registered waveform behavior.
 
@@ -837,6 +838,10 @@ helper. Sampling leaves the model and generators unchanged; execution publishes
 the packet's authoritative RNG timeline, so a later step with omitted draws
 continues from its suffix. See {doc}`A61_shared_runtime_inputs` and
 {download}`shared_runtime_draws.py <../../examples/shared_runtime_draws.py>`.
+Population Poisson replay uses the same finite-`n`, fixed-invocation recipes,
+including repeated shared waveform children and custom containers. Uniforms
+and schedules stay detached while amplitude and field gradients remain live;
+see {download}`shared_poisson_replay.py <../../examples/shared_poisson_replay.py>`.
 
 Pure calls require explicit stochastic packets. Host `dn.func.run` and
 `dn.compile` sample omitted packets in bounded spans from the supplied state's

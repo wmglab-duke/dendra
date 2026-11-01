@@ -128,7 +128,9 @@ class Waveform(SimpleParameterized):
         raise NotImplementedError
 
     def forward(self, t):
-        return self.fn(torch.as_tensor(t))
+        # An ambient default-device context must not relocate a supplied grid.
+        device = t.device if torch.is_tensor(t) else None
+        return self.fn(torch.as_tensor(t, device=device))
 
     def repeat(
         self, freq: float, delay: float = 0.0, off: float = torch.inf, *, tau=0.01
@@ -737,5 +739,9 @@ class _randomized_poisson(_poisson):
         self.randomize_every_call = True
 
     def fn(self, t: torch.Tensor) -> torch.Tensor:
-        self.regenerate_schedule_()
+        replay = getattr(self, "_native_poisson_replay", None)
+        if replay is None:
+            self.regenerate_schedule_()
+        else:
+            replay.consume(self)
         return super().fn(t)
