@@ -34,7 +34,7 @@ from ._stimulation_rng import _generator_bindings, _validate_tracked_generators
 from ._types import FunctionalizationError, RuntimeNoiseDraw, StimulationDraw
 
 
-def _native_poisson_plan(population, extra, *, dt=None):
+def _native_poisson_plan(population, extra, *, dt=None, _initialization=False):
     roots = []
 
     def visit(value):
@@ -51,7 +51,9 @@ def _native_poisson_plan(population, extra, *, dt=None):
     registered = _poisson_waveforms(population)
     if not registered and not any(_poisson_waveforms(root) for root in roots):
         return None
-    plan = PoissonStimulationPlan.native_runtime(population, extra, dt=dt)
+    plan = PoissonStimulationPlan.native_runtime(
+        population, extra, dt=dt, _initialization=_initialization
+    )
     replay_nodes = {id(entry.source) for entry in plan.entries}
     mechanism_nodes = {
         id(entry.source) for entry in plan.entries if entry.kind == "mechanism"

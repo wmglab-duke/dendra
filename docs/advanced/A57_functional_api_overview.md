@@ -1159,10 +1159,40 @@ draws = dn.func.sample_initialization_draws(functional, tensors)
 initial = dn.func.initialize(functional, tensors, draws=draws)
 ```
 
-The sampler accepts the same `initialization=` override as `initialize`.
-Compiled runners also accept `parameters=` and `constants=` overrides; supply
-the same overrides when replaying. For explicit models, replace the intended
-bundle fields before capture and replay.
+The same sampler accepts an initialized native Population or Network, without
+functional lowering. Native initialization consumes the same packet through
+`draws=`:
+
+```python
+draws = dn.func.sample_initialization_draws(population)
+population.initialize(draws=draws)
+
+draws = dn.func.sample_initialization_draws(network)
+network.initialize(dt, draws=draws)
+```
+
+Native capture follows the next initialization with its default options. A
+Network uses its initialized timestep. Native capture and explicit replay
+require an already built and initialized model; capture does not build or
+initialize a fresh source. Capture reads its current logical RNG carry,
+including retained connection-sampling checkpoints. Native capture does not
+accept `initialization=`, `parameters=` or `constants=`
+overrides. Set native model sources before capture, and replay with the same
+sources and initialization options. Explicit native replay does not support
+`force_rebuild=True` or timestep/device changes that rebuild connections.
+Existing calls that omit `draws` retain their automatic sampling policy.
+
+Population and Network native initialization retain their mutating, chaining
+contract. `dn.func.initialize` returns a `Continuation` and leaves the native
+source unchanged. A packet captured from either interface can initialize the
+other when their sources, declarations and initialization options match.
+Use a separate compatible native receiver when retaining an existing lowered
+plan: native connection reinitialization can invalidate its source configuration.
+
+For lowered targets, the sampler accepts the same `initialization=` override as
+`dn.func.initialize`. Compiled runners also accept `parameters=` and `constants=`
+overrides; supply the same overrides when replaying. For explicit models,
+replace the intended bundle fields before capture and replay.
 
 | Packet field | Population | Network |
 | --- | --- | --- |
@@ -1205,9 +1235,25 @@ Clear retained legacy draw fields before supplying a canonical packet.
 
 Initialization draws and runtime `RuntimeDraws` are distinct packet types.
 `initialize(..., draws=...)` consumes `InitializationDraws`;
-`run(..., draws=...)` consumes runtime draws. After initialization, use the
-returned `Continuation` and the existing portable checkpoint API to retain the
-resulting state, effective sources and RNG position.
+`run(..., draws=...)` consumes runtime draws. After functional initialization,
+use the returned `Continuation` and the existing portable checkpoint API to
+retain the resulting state, effective sources and RNG position. Native model
+checkpoints retain those initialized values and RNG positions through the
+existing `state_dict_for_checkpoint` and `restore_dict_from_checkpoint` methods.
+
+The complete
+{download}`shared_initialization_draws.py <../../examples/shared_initialization_draws.py>`
+example samples from initialized native Populations and Networks containing
+RAND, initialization NOISE and repeated Poisson waveforms. The Network also
+contains NetStim and stochastic connection weights. It checks native/functional
+replay, training gradients and runtime checkpoint continuation:
+
+```{literalinclude} ../../examples/shared_initialization_draws.py
+:language: python
+:start-after: "# region initialization"
+:end-before: "# endregion initialization"
+:dedent: 4
+```
 
 The complete
 {download}`functional_initialization_draws.py <../../examples/functional_initialization_draws.py>`

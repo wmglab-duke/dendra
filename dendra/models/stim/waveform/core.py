@@ -652,6 +652,9 @@ class _poisson(Waveform):
 
     def _make_schedule(self, gen: torch.Generator) -> torch.Tensor:
         """Generate all spike onset times once, store as buffer."""
+        initialization = vars(self).get("_native_initialization_draws")
+        if initialization is not None:
+            return initialization.poisson_schedule(self, gen)
         restore_pending_poisson_rng(self)
         draws, count = sample_poisson_draws(
             interval=self.interval,

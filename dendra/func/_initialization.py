@@ -357,9 +357,17 @@ def sample_initialization_draws(
     parameters=_UNSET,
     constants=_UNSET,
 ):
-    """Capture replayable initialization draws from a runner or lowered model.
+    """Capture replayable initialization draws from native or functional models.
 
-    Accepts the same targets and source overrides as :func:`initialize`.
+    Initialized native Populations and Networks use their default initialization
+    options and current sources. A Network retains its initialized timestep.
+    Native capture executes an isolated copy, without lowering, building a fresh
+    source model or publishing initialized values. Extra tensor bundles, source
+    overrides and deterministic initialization packets belong to functional
+    targets. Explicit draw replay does not support native forced rebuilds.
+
+    Functional targets accept the same tensor bundles and source overrides as
+    :func:`initialize`.
     Sampling runs the existing host initializer under ``no_grad``, including
     pure transforms and cache restoration, to observe each sampling boundary
     in native order. The resulting packet includes the actual draw selections
@@ -368,10 +376,31 @@ def sample_initialization_draws(
     Newly sampled tensors are detached. Supplied legacy draw fields are
     captured as provided, preserving their tensor identities and gradient flags.
 
-    Replay with ``initialize(target, ..., draws=packet)``. Capture and replay
-    are separate initialization executions; each invokes authored transforms
-    once. Ordinary automatic initialization does not perform a capture pass.
+    Replay native packets with ``target.initialize(..., draws=packet)`` and
+    functional packets with ``dn.func.initialize(target, ..., draws=packet)``.
+    Functional capture and replay are separate initialization executions; each
+    invokes authored transforms once. Native capture can run cold invocation
+    probes on disposable copies. Ordinary automatic initialization does not
+    perform a capture pass.
     """
+    from dendra.models import Network, Population
+
+    if isinstance(functional, (Population, Network)):
+        if tensors is not _UNSET:
+            raise TypeError(
+                "tensors must be omitted for native initialization sampling"
+            )
+        if (
+            initialization is not None
+            or parameters is not _UNSET
+            or constants is not _UNSET
+        ):
+            raise TypeError(
+                "Native initialization sampling uses the model's initialization defaults"
+            )
+        from ._native_initialization_draws import sample_native_initialization_draws
+
+        return sample_native_initialization_draws(functional)
     captured = {}
     with torch.inference_mode(False), torch.no_grad():
         _initialize_target(

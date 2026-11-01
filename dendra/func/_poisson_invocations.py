@@ -229,7 +229,7 @@ def validate_poisson_invocations(functional, tensors):
 
 
 @contextmanager
-def native_invocation_probe(population, *, check_purity):
+def native_invocation_probe(population, *, check_purity, prepare_initialization=False):
     """Lend disposable fixed-schedule copies to native invocation observers."""
     from dendra.helpers import ctx
 
@@ -258,6 +258,11 @@ def native_invocation_probe(population, *, check_purity):
         configure_execution(execution)
         execution.jit = execution.jit_network_solves = False
         execution.integrator.clear_jit_cache()
+        if prepare_initialization:
+            execution.t = torch.zeros_like(execution.t).detach()
+            execution.integrator.init_v(execution)
+            execution.mech._reset_initialization_timestep()
+            execution.pre_initialize()
         return execution
 
     try:
@@ -276,7 +281,9 @@ def native_invocation_probe(population, *, check_purity):
                 _restore_global_rng(snapshot, device)
 
 
-def profile_native_mechanism_invocations(plan, *, dt=None, initialization=False):
+def profile_native_mechanism_invocations(
+    plan, *, dt=None, initialization=False, prepare_initialization=False
+):
     """Freeze native runtime or lazily reserved initialization invocations."""
     entries = tuple(entry for entry in plan.entries if entry.kind == "mechanism")
     if not entries:
@@ -287,9 +294,11 @@ def profile_native_mechanism_invocations(plan, *, dt=None, initialization=False)
 
     bindings = tuple((entry.key, entry.node_path) for entry in entries)
     with native_invocation_probe(
-        plan.population, check_purity=plan.check_purity
+        plan.population,
+        check_purity=plan.check_purity,
+        prepare_initialization=prepare_initialization,
     ) as copy:
-        if initialization:
+        if initialization and not prepare_initialization:
             runtime_profile = {
                 entry.key: plan._runtime_counts[entry.key] for entry in entries
             }
@@ -311,10 +320,12 @@ def profile_native_mechanism_invocations(plan, *, dt=None, initialization=False)
         initialization_order = ()
         if initialization:
             initial = copy()
-            initial.t = torch.zeros_like(initial.t)
-            initial.integrator.init_v(initial)
+            if not prepare_initialization:
+                initial.t = torch.zeros_like(initial.t)
+                initial.integrator.init_v(initial)
             handler = initial.mech
-            handler._reset_initialization_timestep()
+            if not prepare_initialization:
+                handler._reset_initialization_timestep()
             handler._sync_celsius(initial.celsius)
             refresh_noise_workspaces(
                 initial, initial.t.new_zeros(()), initialization=True

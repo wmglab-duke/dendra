@@ -12,7 +12,13 @@ class InitializationDraws(NamedTuple):
     """Replayable base draws and RNG carry for fresh initialization.
 
     Obtain a complete packet with :func:`dendra.func.sample_initialization_draws`
-    and pass it to :func:`dendra.func.initialize` through ``draws=``. For a
+    from an initialized native model, a lowered model and tensor bundle, or a
+    compiled runner. Pass it through ``draws=`` to native Population/Network
+    ``initialize`` or :func:`dendra.func.initialize`. Native initialization
+    mutates and returns the model; functional initialization returns a
+    ``Continuation``. Native capture follows default initialization options and
+    requires an already built, initialized canonical model. Explicit native
+    replay does not support forced rebuilding. For a
     Population, ``random`` contains its RAND/NOISE packet and ``stimulation``
     its Poisson packet. For a Network those fields map Population names to
     packets or ``None``; ``netstim`` and ``connections`` contain its existing

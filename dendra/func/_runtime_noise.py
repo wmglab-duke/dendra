@@ -135,7 +135,7 @@ def _validate_rng_adapter(rng):
 class RuntimeNoisePlan:
     """Static draw schemas; numerical values and stream boundaries are operands."""
 
-    def __init__(self, population):
+    def __init__(self, population, *, _metadata_only=False):
         from dendra.models.random_parameters import sample_runtime_noise_draw
 
         from ._population import (
@@ -197,49 +197,51 @@ class RuntimeNoisePlan:
                 raise FunctionalizationError(
                     "NOISE draws must be nonempty Tensor trees"
                 )
-            from dendra.models.random_parameters import evaluate_runtime_noise
+            if not _metadata_only:
+                from dendra.models.random_parameters import evaluate_runtime_noise
 
-            from ._population import _audit_tensor_binding
+                from ._population import _audit_tensor_binding
 
-            audit_parameters = {
-                parameter: getattr(owner, spec.full_parameter_name(parameter))
-                .detach()
-                .clone()
-                for parameter in spec.params
-            }
-            audit_draw = _pytree.tree_map(lambda leaf: leaf.detach().clone(), draw)
-            audit_dt = value.new_tensor(1.0)
-            audited = (
-                *audit_parameters.values(),
-                *_pytree.tree_leaves(audit_draw),
-                audit_dt,
-            )
-            versions = (
-                tuple(_audit_tensor_binding(leaf) for leaf in audited)
-                if self.check_purity
-                else None
-            )
-            with _rng_diagnostic_scope(
-                population.device(), enabled=self.check_purity
-            ) as diagnostic:
-                probe = evaluate_runtime_noise(
-                    spec, audit_parameters, audit_draw, dt=audit_dt
+                audit_parameters = {
+                    parameter: getattr(owner, spec.full_parameter_name(parameter))
+                    .detach()
+                    .clone()
+                    for parameter in spec.params
+                }
+                audit_draw = _pytree.tree_map(lambda leaf: leaf.detach().clone(), draw)
+                audit_dt = value.new_tensor(1.0)
+                audited = (
+                    *audit_parameters.values(),
+                    *_pytree.tree_leaves(audit_draw),
+                    audit_dt,
                 )
-            if diagnostic.changes or (
-                versions is not None
-                and versions != tuple(_audit_tensor_binding(leaf) for leaf in audited)
-            ):
-                raise FunctionalizationError(
-                    "NOISE transform must preserve its explicit parameters, draws, dt, and global RNG state"
+                versions = (
+                    tuple(_audit_tensor_binding(leaf) for leaf in audited)
+                    if self.check_purity
+                    else None
                 )
-            if not torch.is_tensor(probe):
-                raise FunctionalizationError("NOISE transform must return a Tensor")
-            try:
-                _buffer_value(probe, tuple(value.shape))
-            except RuntimeError as error:
-                raise FunctionalizationError(
-                    "NOISE transform result cannot broadcast to its declared buffer"
-                ) from error
+                with _rng_diagnostic_scope(
+                    population.device(), enabled=self.check_purity
+                ) as diagnostic:
+                    probe = evaluate_runtime_noise(
+                        spec, audit_parameters, audit_draw, dt=audit_dt
+                    )
+                if diagnostic.changes or (
+                    versions is not None
+                    and versions
+                    != tuple(_audit_tensor_binding(leaf) for leaf in audited)
+                ):
+                    raise FunctionalizationError(
+                        "NOISE transform must preserve its explicit parameters, draws, dt, and global RNG state"
+                    )
+                if not torch.is_tensor(probe):
+                    raise FunctionalizationError("NOISE transform must return a Tensor")
+                try:
+                    _buffer_value(probe, tuple(value.shape))
+                except RuntimeError as error:
+                    raise FunctionalizationError(
+                        "NOISE transform result cannot broadcast to its declared buffer"
+                    ) from error
             key = f"{path + '.' if path else ''}{name}"
             entries.append(
                 _NoiseEntry(

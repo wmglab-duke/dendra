@@ -480,12 +480,8 @@ class RandomParameterPlan:
             for entry in self.entries
         }
 
-    def sample(self, state, *, samplers=None):
-        from dendra.models.random_parameters import (
-            RandomParameterDrawRequest,
-            sample_random_parameter_draws,
-        )
-
+    def _initialization_entries(self):
+        """Select native ordered resampling and initial NOISE requests."""
         selected = tuple(
             entry for entry in self.entries if entry.spec.resample_on_initialize
         )
@@ -518,6 +514,15 @@ class RandomParameterPlan:
                     if entry is not None:
                         scheduled.append(entry)
             scheduled = tuple(scheduled)
+        return scheduled
+
+    def sample(self, state, *, samplers=None):
+        from dendra.models.random_parameters import (
+            RandomParameterDrawRequest,
+            sample_random_parameter_draws,
+        )
+
+        scheduled = self._initialization_entries()
         requests = tuple(
             RandomParameterDrawRequest(
                 entry.stream,

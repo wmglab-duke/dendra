@@ -1033,6 +1033,9 @@ class WeightExpander(torch.nn.Module):
         return value
 
     def init(self, reinit=True):
+        initialization_draws = vars(self).get("_native_initialization_draws")
+        if initialization_draws is not None:
+            initialization_draws.begin_connection(self, reinit=reinit)
         if reinit or not self.w.numel():
             values, draws = [], {}
             supported = True
@@ -1040,8 +1043,14 @@ class WeightExpander(torch.nn.Module):
                 if source.deterministic():
                     values.append(source.derive_values(n))
                 elif connection_distribution_is_supported(source.param):
-                    value, draw = source.param.sample_with_draw((n,))
-                    values.append(source._convert(value))
+                    if initialization_draws is None:
+                        value, draw = source.param.sample_with_draw((n,))
+                        value = source._convert(value)
+                    else:
+                        value, draw = initialization_draws.connection_sample(
+                            self, index, source, n
+                        )
+                    values.append(value)
                     draws[str(index)] = draw.detach().clone()
                 else:
                     values.append(source.sample(n))
@@ -1050,6 +1059,8 @@ class WeightExpander(torch.nn.Module):
             self._block_lengths = tuple(value.shape[0] for value in values)
             self._sampling_draws = draws if supported else None
         self._detached_materializations_pending = False
+        if initialization_draws is not None:
+            initialization_draws.complete_connection(self)
         return self
 
     def get_extra_state(self):
@@ -3660,6 +3671,8 @@ class Network(RNGMixin):
         t=0.0,
         max_delay_ms=None,
         force_rebuild: bool = False,
+        *,
+        draws=None,
     ):
         """
         Initialize populations, synapses, and optional NetStim for simulation.
@@ -3686,12 +3699,32 @@ class Network(RNGMixin):
             Maximum allowed synaptic delay. Default is None.
         force_rebuild : bool, optional
             If True, rebuild NetCons even if already built. Default is False.
+        draws : dendra.func.InitializationDraws, optional
+            Replay explicit Population, connection and NetStim initialization
+            draws without automatic sampling. The packet's RNG boundaries
+            remain authoritative for subsequent execution. Omission retains
+            automatic native initialization.
 
         Returns
         -------
         Network
             Self, for chaining.
         """
+        if draws is not None:
+            from dendra.func._native_initialization_draws import initialize_native
+
+            return initialize_native(
+                self,
+                draws=draws,
+                options={
+                    "dt": dt,
+                    "reinit_weights": reinit_weights,
+                    "reinit_delays": reinit_delays,
+                    "t": t,
+                    "max_delay_ms": max_delay_ms,
+                    "force_rebuild": force_rebuild,
+                },
+            )
         dt_f = _validate_time_scalar(dt, name="dt", positive=True)
         t_f = _validate_time_scalar(t, name="t", positive=None)
         self._refresh_compile_config_from_ctx()
@@ -3739,7 +3772,8 @@ class Network(RNGMixin):
             self.netstim.detach()
         # Native initialization uses the ambient Torch generators. Explicit
         # functional stream checkpoints apply until this new native boundary.
-        self.__dict__.pop("_functional_connection_sampling_rng", None)
+        if vars(self).get("_native_initialization_draws") is None:
+            self.__dict__.pop("_functional_connection_sampling_rng", None)
         self._mode_requires_initialize = False
         self._detached_materializations_pending = False
         return self

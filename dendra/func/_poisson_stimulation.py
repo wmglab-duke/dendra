@@ -207,7 +207,7 @@ class PoissonStimulationPlan:
         )
 
     @classmethod
-    def native_runtime(cls, population, extra, *, dt=None):
+    def native_runtime(cls, population, extra, *, dt=None, _initialization=False):
         """Prepare native bank and mechanism recipes without numerical lowering."""
         from dendra.helpers import current_check_purity
 
@@ -222,7 +222,12 @@ class PoissonStimulationPlan:
         )
         from ._poisson_invocations import profile_native_mechanism_invocations
 
-        profile_native_mechanism_invocations(result, dt=dt)
+        profile_native_mechanism_invocations(
+            result,
+            dt=dt,
+            initialization=_initialization,
+            prepare_initialization=_initialization,
+        )
         return result
 
     def _initialize(self, population, intra, extra, *, check_purity):

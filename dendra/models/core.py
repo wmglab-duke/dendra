@@ -5219,7 +5219,9 @@ class Population(P, Sliceable):
         """Refresh subclass-owned derived parameter views before state setup."""
         return None
 
-    def initialize(self, force_rebuild=False, populate_parameter_buffers=True):
+    def initialize(
+        self, force_rebuild=False, populate_parameter_buffers=True, *, draws=None
+    ):
         """
         Build, populate, and initialize mechanisms for simulation.
 
@@ -5228,12 +5230,31 @@ class Population(P, Sliceable):
         force_rebuild : bool, optional
             If True, force rebuilding of mechanisms even if a built graph
             already exists.
+        draws : dendra.func.InitializationDraws, optional
+            Replay explicit initialization draws on a compatible initialized
+            population. Capture a packet with
+            ``dn.func.sample_initialization_draws(population)``. Explicit replay
+            does not support forced rebuilding.
 
         Returns
         -------
         Population
             The initialized population instance.
         """
+        if draws is not None:
+            from dendra.func._native_initialization_draws import initialize_native
+
+            return initialize_native(
+                self,
+                draws=draws,
+                options={
+                    "force_rebuild": force_rebuild,
+                    "populate_parameter_buffers": populate_parameter_buffers,
+                },
+            )
+        boundary = vars(self).get("_native_initialization_boundary")
+        if boundary is not None:
+            boundary.begin()
         # Initialization is a state transition, not a best-effort refresh.  If
         # any build/population/hook phase fails, callers must repair and retry
         # instead of stepping a partially reset model advertised as initialized.
@@ -5258,6 +5279,9 @@ class Population(P, Sliceable):
         # not reset voltage, repopulate parameters, advance RNG streams, or run
         # pre-initialization hooks/Mechanism INITIAL blocks before restoring it.
         if self._restore_steady_state():
+            boundary = vars(self).get("_native_initialization_boundary")
+            if boundary is not None:
+                boundary.finish(cached=True)
             return self
 
         # Fresh initialization starts with a zero population clock and a
@@ -5297,14 +5321,17 @@ class Population(P, Sliceable):
         self.integrator.initialized = False
         if populate_parameter_buffers:
             self._detached_materializations_pending = False
+        boundary = vars(self).get("_native_initialization_boundary")
+        if boundary is not None:
+            boundary.finish(cached=False)
         return self
 
-    def initialize_(self):
+    def initialize_(self, *args, **kwargs):
         """
         "In-place" alias of :meth:`initialize`. Same as :meth:`initialize`, but
         does not return self.
         """
-        self.initialize()
+        self.initialize(*args, **kwargs)
 
     def load(self, state_dict):
         """

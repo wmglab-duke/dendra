@@ -3973,6 +3973,7 @@ class Parameterized(SimpleParameterized):
         selected = (
             tuple(self.random_parameters) if not names else tuple(str(n) for n in names)
         )
+        initialization_draws = getattr(self, "_native_initialization_draws", None)
         any_sampled = False
         for name in selected:
             if name not in self.random_parameters:
@@ -3991,20 +3992,34 @@ class Parameterized(SimpleParameterized):
                         continue
             buffer = getattr(self, name)
             rng = getattr(self, spec.effective_rng_name)
-            if isinstance(rng, RNGModule):
-                rng.init(buffer.device)
-            prepare_rng_for_random_parameter(spec, rng, random_generation)
-            distribution_params = {
-                p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
-            }
-            sample, draw = sample_random_parameter_with_draw(
-                spec,
-                distribution_params,
-                rng,
-                tuple(buffer.shape),
-                device=buffer.device,
-                dtype=buffer.dtype,
-            )
+            if initialization_draws is None:
+                if isinstance(rng, RNGModule):
+                    rng.init(buffer.device)
+                prepare_rng_for_random_parameter(spec, rng, random_generation)
+                distribution_params = {
+                    p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
+                }
+                sample, draw = sample_random_parameter_with_draw(
+                    spec,
+                    distribution_params,
+                    rng,
+                    tuple(buffer.shape),
+                    device=buffer.device,
+                    dtype=buffer.dtype,
+                )
+            else:
+                distribution_params = {
+                    p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
+                }
+                sample, draw = initialization_draws.random(
+                    self,
+                    name,
+                    spec,
+                    distribution_params,
+                    rng,
+                    buffer,
+                    random_generation,
+                )
             setattr(self, name, sample.to(device=buffer.device, dtype=buffer.dtype))
             if get_random_distribution(spec.distribution).draw_sampler is not None:
                 self._random_parameter_draws[name] = clone_random_parameter_tree(
@@ -4048,6 +4063,7 @@ class Parameterized(SimpleParameterized):
         )
         phase_norm = None if phase is None else str(phase).strip().lower()
         draws = getattr(self, "_native_runtime_noise_draws", None)
+        initialization_draws = getattr(self, "_native_initialization_draws", None)
         any_sampled = False
         with torch.no_grad():
             for name in selected:
@@ -4060,14 +4076,24 @@ class Parameterized(SimpleParameterized):
                 if phase_norm is not None and spec.phase != phase_norm:
                     continue
                 buffer = getattr(self, name)
-                if draws is None:
+                if draws is None and initialization_draws is None:
                     rng = getattr(self, spec.effective_rng_name)
                     if isinstance(rng, RNGModule):
                         rng.init(buffer.device)
                 distribution_params = {
                     p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
                 }
-                if draws is None:
+                if initialization_draws is not None:
+                    sample = initialization_draws.noise(
+                        self,
+                        name,
+                        spec,
+                        distribution_params,
+                        getattr(self, spec.effective_rng_name),
+                        buffer,
+                        dt,
+                    )
+                elif draws is None:
                     sample = sample_runtime_noise(
                         spec,
                         distribution_params,

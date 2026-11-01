@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Mapping
+from dataclasses import dataclass
 from types import MethodType
 
 import torch
@@ -177,6 +178,152 @@ def _binding(module, *, identities=True):
     return tuple(entries), torch_bindings
 
 
+def _sampling_schema(source, count, *, device, check_purity):
+    if not check_purity:
+        return source.sampling_draw_schema(count)
+    # Metadata hooks run before numerical materialization. Probe a private
+    # module so diagnostics can reject mutation without touching the source.
+    gradient = torch.is_grad_enabled()
+    with torch.inference_mode(False), torch.set_grad_enabled(gradient):
+        p = _helpers()
+        execution = p._deepcopy_execution_module(source)
+        rng = p._global_rng_snapshot(device)
+        before = _binding(execution, identities=False)
+        tensors = {
+            name: (value._version, _clone(value))
+            for name, value in p._module_tensor_slots(execution)
+        }
+        try:
+            with torch.no_grad():
+                first = execution.sampling_draw_schema(count)
+                second = execution.sampling_draw_schema(count)
+                placeholder = connection_distribution_placeholder(
+                    execution.param, (count,)
+                )
+                repeated = connection_distribution_placeholder(
+                    execution.param, (count,)
+                )
+            if p._global_rng_changes(rng, device):
+                raise FunctionalizationError(
+                    "Connection sampling metadata purity diagnostics observed implicit random draws."
+                )
+            if (
+                first != second
+                or not torch.equal(placeholder, repeated)
+                or (before != _binding(execution, identities=False))
+            ):
+                raise FunctionalizationError(
+                    "Connection sampling metadata purity diagnostics observed mutable or nondeterministic state."
+                )
+            for name, value in p._module_tensor_slots(execution):
+                version, saved = tensors[name]
+                if value._version != version or not torch.equal(value, saved):
+                    raise FunctionalizationError(
+                        "Connection sampling metadata purity diagnostics observed an in-place tensor write."
+                    )
+            return first
+        finally:
+            p._restore_global_rng(rng, device)
+
+
+def _sampling_role_metadata(connection, native, *, check_purity):
+    """Inspect one materializer without evaluating its numerical sources."""
+    module = getattr(connection, native)
+    if type(module) is not WeightExpander or any(
+        name in vars(module)
+        or inspect.getattr_static(type(module), name)
+        is not inspect.getattr_static(WeightExpander, name)
+        for name in ("forward", "derive_values", "init", "deterministic")
+    ):
+        raise FunctionalizationError(
+            "Connection parameters need the canonical initialized WeightExpander adapter."
+        )
+    if any(
+        type(source) is not ParameterOrDistributionWrapper for source in module.weights
+    ):
+        raise FunctionalizationError(
+            "Connection parameter source wrappers changed; lower again."
+        )
+    from ._torch_parametrizations import failures as torch_failures
+
+    failures = torch_failures(module, diagnostic=check_purity)
+    if failures:
+        raise FunctionalizationError("; ".join(failures))
+    value = module._buffers.get("w")
+    if not torch.is_tensor(value) or value.ndim != 1:
+        raise FunctionalizationError(
+            "Initialize one-dimensional connection parameter storage before lowering."
+        )
+    schema = tuple(value.shape), value.dtype, value.device
+    raw = all(
+        source.deterministic() or connection_distribution_is_supported(source.param)
+        for source in module.weights
+    )
+    draws = (
+        {
+            str(index): _sampling_schema(
+                source, count, device=value.device, check_purity=check_purity
+            )
+            for index, (source, count) in enumerate(
+                zip(module.weights, module.n, strict=True)
+            )
+            if not source.deterministic()
+        }
+        if raw
+        else {}
+    )
+    return module, schema, raw, draws
+
+
+@dataclass(frozen=True)
+class _ConnectionSamplingMetadata:
+    """Shared draw contract without prepared values or baseline evaluation."""
+
+    _draw_schemas: dict
+    _check_purity: bool
+    _class_guards: tuple
+
+    @property
+    def sampling_devices(self):
+        """Devices whose global random streams native initialization consumes."""
+        return tuple(
+            dict.fromkeys(
+                device
+                for schemas in self._draw_schemas.values()
+                for _shape, _dtype, device in schemas.values()
+            )
+        )
+
+    @property
+    def draw_schemas(self):
+        return {role: dict(schemas) for role, schemas in self._draw_schemas.items()}
+
+    def requires_initialization_draw(self, *, reinit_weights=True, reinit_delays=True):
+        flags = {"weights": reinit_weights, "delays": reinit_delays}
+        if any(type(value) is not bool for value in flags.values()):
+            raise TypeError("Connection reinitialization flags must be booleans.")
+        return any(
+            flags[role] and schemas for role, schemas in self._draw_schemas.items()
+        )
+
+    def _validate_draws(self, role, draws):
+        schemas = self._draw_schemas[role]
+        if not isinstance(draws, Mapping) or set(draws) != set(schemas):
+            raise FunctionalizationError(
+                f"Connection {role} initialization needs explicit base draws for blocks {tuple(schemas)}."
+            )
+        for index, (shape, dtype, device) in schemas.items():
+            value = draws[index]
+            if not torch.is_tensor(value) or (
+                tuple(value.shape),
+                value.dtype,
+                value.device,
+            ) != (tuple(shape), dtype, device):
+                raise FunctionalizationError(
+                    f"Connection {role} base draw {index!r} changed tensor schema."
+                )
+
+
 class _DeriveValues(torch.nn.Module):
     def __init__(self, source):
         super().__init__()
@@ -223,50 +370,14 @@ class ConnectionParameterPlan:
         modules = {}
         p = _helpers()
         for role, native in _ROLES:
-            module = getattr(connection, native)
-            if type(module) is not WeightExpander or any(
-                name in vars(module)
-                or inspect.getattr_static(type(module), name)
-                is not inspect.getattr_static(WeightExpander, name)
-                for name in ("forward", "derive_values", "init", "deterministic")
-            ):
-                raise FunctionalizationError(
-                    "Connection parameters need the canonical initialized WeightExpander adapter."
-                )
-            if any(
-                type(source) is not ParameterOrDistributionWrapper
-                for source in module.weights
-            ):
-                raise FunctionalizationError(
-                    "Connection parameter source wrappers changed; lower again."
-                )
-            modules[native] = module
-            from ._torch_parametrizations import failures as torch_failures
-
-            failures = torch_failures(module, diagnostic=self._check_purity)
-            if failures:
-                raise FunctionalizationError("; ".join(failures))
-            value = module._buffers.get("w")
-            if not torch.is_tensor(value) or value.ndim != 1:
-                raise FunctionalizationError(
-                    "Initialize one-dimensional connection parameter storage before lowering."
-                )
-            self._schemas[role] = (tuple(value.shape), value.dtype, value.device)
-            self._raw[role] = all(
-                source.deterministic()
-                or connection_distribution_is_supported(source.param)
-                for source in module.weights
+            module, schema, raw, draws = _sampling_role_metadata(
+                connection, native, check_purity=self._check_purity
             )
-            self._draw_schemas[role] = (
-                {
-                    str(index): self._sampling_schema(source, count, role=role)
-                    for index, (source, count) in enumerate(
-                        zip(module.weights, module.n, strict=True)
-                    )
-                    if not source.deterministic()
-                }
-                if self._raw[role]
-                else {}
+            modules[native] = module
+            self._schemas[role], self._raw[role], self._draw_schemas[role] = (
+                schema,
+                raw,
+                draws,
             )
             provenance = module.sampling_draws if self._raw[role] else None
             self._snapshot_draw_schemas[role] = {
@@ -360,6 +471,9 @@ class ConnectionParameterPlan:
                 _append_materializer_class_guards(
                     self._class_guards, child, seen_classes, p
                 )
+        self._sampling_inventory = _ConnectionSamplingMetadata(
+            self._draw_schemas, self._check_purity, tuple(self._class_guards)
+        )
         self._raw_sources = self._raw_sources.with_schema(
             "parameter", self.parameter_sources()
         )
@@ -400,58 +514,26 @@ class ConnectionParameterPlan:
         }
 
     @staticmethod
+    def sampling_metadata(connection):
+        """Capture only draw schemas and guards at a native initialization boundary."""
+        check_purity = current_check_purity()
+        schemas, guards, seen = {}, [], set()
+        helpers = _helpers()
+        for role, native in _ROLES:
+            module, _schema, _raw, schemas[role] = _sampling_role_metadata(
+                connection, native, check_purity=check_purity
+            )
+            for child in module.modules():
+                _append_materializer_class_guards(guards, child, seen, helpers)
+        return _ConnectionSamplingMetadata(schemas, check_purity, tuple(guards))
+
+    @staticmethod
     def _resolve(connection, path):
         native, relative = path
         owner = getattr(connection, native)
         prefix, _, name = relative.rpartition(".")
         owner = owner.get_submodule(prefix)
         return owner._parameters.get(name, owner._buffers.get(name))
-
-    def _sampling_schema(self, source, count, *, role):
-        if not self._check_purity:
-            return source.sampling_draw_schema(count)
-        # Metadata hooks run before numerical materialization. Probe a private
-        # module so diagnostics can reject mutation without touching the source.
-        p = _helpers()
-        execution = p._deepcopy_execution_module(source)
-        device = self._schemas[role][2]
-        rng = p._global_rng_snapshot(device)
-        before = _binding(execution, identities=False)
-        tensors = {
-            name: (value._version, _clone(value))
-            for name, value in p._module_tensor_slots(execution)
-        }
-        try:
-            with torch.no_grad():
-                first = execution.sampling_draw_schema(count)
-                second = execution.sampling_draw_schema(count)
-                placeholder = connection_distribution_placeholder(
-                    execution.param, (count,)
-                )
-                repeated = connection_distribution_placeholder(
-                    execution.param, (count,)
-                )
-            if p._global_rng_changes(rng, device):
-                raise FunctionalizationError(
-                    "Connection sampling metadata purity diagnostics observed implicit random draws."
-                )
-            if (
-                first != second
-                or not torch.equal(placeholder, repeated)
-                or (before != _binding(execution, identities=False))
-            ):
-                raise FunctionalizationError(
-                    "Connection sampling metadata purity diagnostics observed mutable or nondeterministic state."
-                )
-            for name, value in p._module_tensor_slots(execution):
-                version, saved = tensors[name]
-                if value._version != version or not torch.equal(value, saved):
-                    raise FunctionalizationError(
-                        "Connection sampling metadata purity diagnostics observed an in-place tensor write."
-                    )
-            return first
-        finally:
-            p._restore_global_rng(rng, device)
 
     def parameter_sources(self, connection=None):
         connection = self._source if connection is None else connection
@@ -582,13 +664,7 @@ class ConnectionParameterPlan:
     @property
     def sampling_devices(self):
         """Devices whose global random streams native initialization consumes."""
-        return tuple(
-            dict.fromkeys(
-                device
-                for schemas in self._draw_schemas.values()
-                for _shape, _dtype, device in schemas.values()
-            )
-        )
+        return self._sampling_inventory.sampling_devices
 
     @property
     def has_sampling(self):
@@ -596,7 +672,7 @@ class ConnectionParameterPlan:
 
     @property
     def draw_schemas(self):
-        return {role: dict(schemas) for role, schemas in self._draw_schemas.items()}
+        return self._sampling_inventory.draw_schemas
 
     def extract(self, snapshots=None, connection=None):
         connection = self._source if connection is None else connection
@@ -939,29 +1015,12 @@ class ConnectionParameterPlan:
         return result
 
     def requires_initialization_draw(self, *, reinit_weights=True, reinit_delays=True):
-        flags = {"weights": reinit_weights, "delays": reinit_delays}
-        if any(type(value) is not bool for value in flags.values()):
-            raise TypeError("Connection reinitialization flags must be booleans.")
-        return any(
-            flags[role] and schemas for role, schemas in self._draw_schemas.items()
+        return self._sampling_inventory.requires_initialization_draw(
+            reinit_weights=reinit_weights, reinit_delays=reinit_delays
         )
 
     def _validate_draws(self, role, draws):
-        schemas = self._draw_schemas[role]
-        if not isinstance(draws, Mapping) or set(draws) != set(schemas):
-            raise FunctionalizationError(
-                f"Connection {role} initialization needs explicit base draws for blocks {tuple(schemas)}."
-            )
-        for index, (shape, dtype, device) in schemas.items():
-            value = draws[index]
-            if not torch.is_tensor(value) or (
-                tuple(value.shape),
-                value.dtype,
-                value.device,
-            ) != (tuple(shape), dtype, device):
-                raise FunctionalizationError(
-                    f"Connection {role} base draw {index!r} changed tensor schema."
-                )
+        self._sampling_inventory._validate_draws(role, draws)
 
     def sample_initialization_draw(
         self,

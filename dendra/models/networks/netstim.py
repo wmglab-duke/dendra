@@ -664,6 +664,7 @@ class NetStim(DNModule, Sliceable):
         self._renewal_initialized = False
         self.init_rng()
         device, dtype = self.device(), self.dtype()
+        initialization_draws = vars(self).get("_native_initialization_draws")
 
         with torch.no_grad():
             noise = self._broadcast_to_state(
@@ -674,10 +675,13 @@ class NetStim(DNModule, Sliceable):
             )
 
             if torch.any(noise > 0):
-                eps = torch.finfo(dtype).tiny
-                U = torch.rand(
-                    self.shape, generator=self._rng, device=device, dtype=dtype
-                ).clamp_min(eps)
+                if initialization_draws is None:
+                    eps = torch.finfo(dtype).tiny
+                    U = torch.rand(
+                        self.shape, generator=self._rng, device=device, dtype=dtype
+                    ).clamp_min(eps)
+                else:
+                    exp_rand = initialization_draws.netstim_draw(self, noise)
                 # Use a detached interval here; we don't want grads through this random kick.
                 interval0 = self._broadcast_to_state(
                     evaluate_netstim_interval(self.interval).detach(),
@@ -685,11 +689,16 @@ class NetStim(DNModule, Sliceable):
                     device=device,
                     name="interval",
                 )
-                exp_rand = -torch.log(U)
+                if initialization_draws is None:
+                    exp_rand = -torch.log(U)
             else:
                 # Deterministic initialization must not consume an RNG draw.
                 interval0 = torch.zeros_like(start)
-                exp_rand = torch.zeros_like(start)
+                exp_rand = (
+                    torch.zeros_like(start)
+                    if initialization_draws is None
+                    else initialization_draws.netstim_draw(self, noise)
+                )
 
             state = netstim_initial_state(interval0, start, noise, exp_rand)
             self.next_stoch_time = self.next_stoch_time.detach()
@@ -703,6 +712,9 @@ class NetStim(DNModule, Sliceable):
             self.spikes.zero_()
             self.spike_gate = torch.zeros(self.shape, device=device, dtype=dtype)
             self.t_last.copy_(state.t_last)
+
+        if initialization_draws is not None:
+            initialization_draws.complete_netstim(self)
 
         self._renewal_generation += 1
         self._renewal_initialized = True
