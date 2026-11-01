@@ -529,6 +529,9 @@ class _bwd_euler_ub(Integrator):
         # Select solver first (depends on device and method)
         self._select_solver(model.device())
 
+        if not torch.is_tensor(dt):
+            dt = torch.as_tensor(dt, device=model.v.device, dtype=model.v.dtype)
+
         B, K = _model_solve_shape(model)
         self.B, self.K = B, K
         cm = _as_solve_matrix(model.cm, model) * _as_solve_matrix(model.cm_scale, model)
@@ -576,13 +579,15 @@ class _bwd_euler_ub(Integrator):
         membrane_source=None,
     ):
         """Return the shared unbranched implicit voltage update."""
+        # Match preparation's model-dtype rounding before converting to seconds.
+        # Python scalar arithmetic can otherwise perturb the diagonal relative
+        # to the prepared off-diagonals, especially in float32 cable solves.
+        if not torch.is_tensor(dt):
+            dt = torch.as_tensor(dt, device=v.device, dtype=v.dtype)
         # Retain a logical singleton axis until dt is combined with spatial
         # tensors. Scalar-only binary batching otherwise selects lane zero for
         # an empty outer vmap.
-        if torch.is_tensor(dt):
-            dt_s = dt.reshape(1) * 1.0e-3
-        else:
-            dt_s = dt * 1.0e-3
+        dt_s = dt.reshape(1) * 1.0e-3
 
         v_flat = _flatten_to_solve(v, self.K, self.base_shape)
         gtot = _flatten_to_solve(gtot, self.K, self.base_shape)

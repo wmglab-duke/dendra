@@ -3912,8 +3912,11 @@ class Network(RNGMixin):
             registered solver stimulation. Omitted fields retain those sources.
         draws : dendra.func.RuntimeDraws, optional
             One explicit NOISE/SDE and NetStim frame with authoritative RNG
-            boundaries. Omission retains automatic sampling. Randomized Poisson
-            replay is currently unsupported; supplied base draws are detached.
+            boundaries. Solver-owned intracellular and call-local extracellular
+            Poisson banks consume invocation-indexed draws in native Network
+            order. Mechanism-owned Poisson replay is currently unsupported.
+            Omission retains automatic sampling; supplied base draws and
+            schedules remain detached.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
             ``dn.func.make_callbacks`` for this Network or a compatible initialized
@@ -3993,7 +3996,10 @@ class Network(RNGMixin):
             )
         extra = extra if extra is not None else {}
         extra_prepped = {}
-        with nullcontext() if self.training else torch.no_grad():
+        with (
+            nullcontext() if self.training else torch.no_grad(),
+            nullcontext() if replay is None else replay.bank_scope(finish=False),
+        ):
             for n, (v, t) in extra.items():
                 pop = self.populations[n]
                 dev, dtp = pop.device(), pop.dtype()
@@ -4018,11 +4024,12 @@ class Network(RNGMixin):
 
         with _native_callback_storage(observer) as observer, ctx:
             self._refresh_detached_materializations(dt_f)
-            if with_intra:
-                intra = {
-                    n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
-                    for n, intra_ in intra.items()
-                }
+            with nullcontext() if replay is None else replay.bank_scope():
+                if with_intra:
+                    intra = {
+                        n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
+                        for n, intra_ in intra.items()
+                    }
 
             if loop_hooks:
                 pre_loop_hook(callbacks, self)
@@ -4051,6 +4058,8 @@ class Network(RNGMixin):
                 compile_network_ops=self.compile_network_ops,
                 **draw_options,
             )
+            if replay is not None:
+                replay.publish_stimulation()
             self._advance_runtime_clock()
 
             if observer is not None:

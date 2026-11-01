@@ -477,9 +477,9 @@ def commit_continuation_(functional, target, continuation):
     opens storage. Reuse its prepared collection and explicit carry, or use
     export/restore between collections. Inputs and call-local extracellular
     ``extra`` remain invocation arguments. Native ``step`` accepts one
-    ``RuntimeDraws`` frame for NOISE/SDE, Network NetStim and Population
-    solver-owned intra/call-local extra Poisson banks. Mechanism-owned Poisson,
-    native Network Poisson and native run-family draw tapes are unsupported.
+    ``RuntimeDraws`` frame for NOISE/SDE, Network NetStim and Population/Network
+    solver-owned intra/call-local extra Poisson banks. Mechanism-owned Poisson
+    and native run-family draw tapes are unsupported.
     """
     _cold_boundary("commit_continuation_")
     if type(continuation) is not Continuation:

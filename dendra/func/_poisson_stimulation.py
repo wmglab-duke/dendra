@@ -159,6 +159,7 @@ def _cold_validation():
 
 def _validate_generator_domains(owner, generators):
     """Reject aliases across adapters with independently owned RNG carries."""
+    from dendra.models.networks.netstim import NetStim
     from dendra.models.rng import RNGMixin, RNGModule
 
     identities = {id(generator) for generator in generators}
@@ -168,10 +169,12 @@ def _validate_generator_domains(owner, generators):
         if isinstance(module, RNGModule):
             # Shared model streams are qualified by the combined RNG plan.
             continue
-        if isinstance(module, RNGMixin) and any(
-            id(generator) in identities
-            for generator in (module._cpu_gen, *module._device_gens.values())
-        ):
+        private = ()
+        if isinstance(module, RNGMixin):
+            private = (module._cpu_gen, *module._device_gens.values())
+        elif isinstance(module, NetStim):
+            private = (module._rng, module._seeder)
+        if any(id(generator) in identities for generator in private):
             raise FunctionalizationError(
                 "Sharing a Poisson generator with a model-owned private RNG "
                 "is currently unsupported. Supply a declared RNGModule stream "
@@ -824,6 +827,21 @@ class PoissonStimulationPlan:
                 defer_poisson_generator_restore(sources, state["rng"][stream])
 
 
+def _network_stimulation_stream_inventory(plans):
+    """Name physical Poisson generators once in Population/declaration order."""
+    streams, local, identities = {}, {}, {}
+    for name, plan in plans.items():
+        bindings = {}
+        for key, generator in plan.streams.items():
+            canonical = identities.setdefault(
+                id(generator), f"stream_{len(identities)}"
+            )
+            streams.setdefault(canonical, generator)
+            bindings[key] = canonical
+        local[name] = bindings
+    return streams, local
+
+
 class NetworkStimulationPlan:
     """One authoritative byte-state per generator shared by Network stimuli."""
 
@@ -834,17 +852,7 @@ class NetworkStimulationPlan:
             for name, plan in functional.populations.items()
             if plan._poisson_plan is not None
         }
-        self.streams, self.local = {}, {}
-        identities = {}
-        for name, plan in self.plans.items():
-            local = {}
-            for key, generator in plan.streams.items():
-                canonical = identities.setdefault(
-                    id(generator), f"stream_{len(identities)}"
-                )
-                self.streams.setdefault(canonical, generator)
-                local[key] = canonical
-            self.local[name] = local
+        self.streams, self.local = _network_stimulation_stream_inventory(self.plans)
         self.enabled = bool(self.streams)
         from dendra.models.stim.waveform._poisson import _is_default_poisson_generator
 

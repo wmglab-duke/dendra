@@ -130,6 +130,22 @@ def _legacy_population_noise(inputs):
     return getattr(inputs, "noise", None) if draws is None else draws
 
 
+def _network_model_boundaries(local_streams, references, borrowed_devices):
+    """Retain ordinary consumer boundaries and one suffix per borrowed device."""
+    result = {}
+    for canonical, reference in references.items():
+        consumers = tuple(
+            population
+            for population, streams in local_streams.items()
+            if canonical in streams.values()
+        )
+        result[canonical] = {
+            leaf: ("step",) if (canonical, leaf) in borrowed_devices else consumers
+            for leaf in reference
+        }
+    return result
+
+
 class NetworkRuntimeDrawPlan:
     """Route every alias to one authoritative physical-stream boundary.
 
@@ -150,7 +166,6 @@ class NetworkRuntimeDrawPlan:
             for local in plan._runtime_draw_plan.model_reference
         } | {owner for owner, _device in self.borrowed_devices}
         self.model_reference = {}
-        self.boundaries = {}
         for canonical, (name, _path, _attribute) in self.random.streams.items():
             if canonical not in retained:
                 continue
@@ -161,17 +176,9 @@ class NetworkRuntimeDrawPlan:
             )
             reference = functional.populations[name]._random_plan.rng_reference[local]
             self.model_reference[canonical] = reference
-            consumers = tuple(
-                population
-                for population, streams in self.random.local_streams.items()
-                if canonical in streams.values()
-            )
-            self.boundaries[canonical] = {
-                leaf: ("step",)
-                if (canonical, leaf) in self.borrowed_devices
-                else consumers
-                for leaf in reference
-            }
+        self.boundaries = _network_model_boundaries(
+            self.random.local_streams, self.model_reference, self.borrowed_devices
+        )
         self.stimulation_reference = {
             stream: source.get_state().detach().clone()
             for stream, source in self.stimulation.streams.items()

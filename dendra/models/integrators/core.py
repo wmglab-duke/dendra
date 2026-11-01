@@ -446,6 +446,43 @@ def _population_membrane_metadata_plain(handler):
 
 
 @contextmanager
+def _owned_runtime_noise_frame(module):
+    """Lend a compiled training call detached NOISE inputs it can retain.
+
+    Native sampling updates its persistent buffers in place. AOT backward can
+    retain those inputs even when eager autograd would only save an expression
+    derived from them. Bind one private copy per physical NOISE tensor for this
+    invocation, including all registered aliases, then restore the live buffer
+    registrations before the caller observes or samples the model again.
+    """
+    modules = tuple(module.modules())
+    identities = {
+        id(owner._buffers[name])
+        for owner in modules
+        for name in getattr(owner, "runtime_noises", {})
+    }
+    if not identities:
+        yield
+        return
+    copies, originals = {}, []
+    try:
+        for owner in modules:
+            for name, value in owner._buffers.items():
+                if id(value) not in identities:
+                    continue
+                if id(value) not in copies:
+                    copies[id(value)] = value.detach().clone(
+                        memory_format=torch.preserve_format
+                    )
+                originals.append((owner, name, value))
+                owner._buffers[name] = copies[id(value)]
+        yield
+    finally:
+        for owner, name, value in reversed(originals):
+            owner._buffers[name] = value
+
+
+@contextmanager
 def _population_step_context(integrator, *, stable=False):
     """Temporarily reuse a proof supplied by an observer-stable host loop."""
     previous = integrator._direct_membrane_structure_prevalidated
@@ -1048,6 +1085,9 @@ class Integrator(torch.nn.Module):
                 kwargs,
             )
         self._sample_runtime_noises()
+        if self.jit and torch.is_grad_enabled():
+            with _owned_runtime_noise_frame(self):
+                return self._kernel(name, *args, **kwargs)
         return self._kernel(name, *args, **kwargs)
 
     def _step_with_intra(self, name, args, source, stimuli, indices, kwargs):

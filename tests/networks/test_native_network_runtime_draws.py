@@ -227,10 +227,14 @@ def test_network_runtime_draw_rejection_keeps_clock_values_rng_and_parameters(
     _close(torch.get_rng_state(), global_rng)
 
 
-def test_network_randomized_poisson_rejects_before_sampling_and_clock_advancement(
+def test_network_mechanism_owned_poisson_rejects_before_sampling_and_clock_advancement(
     monkeypatch,
 ):
     model, pulses = _poisson_network()
+    assert all(
+        population.mech.probe.injected_waveforms
+        for population in model.populations.values()
+    )
     functional, tensors = dn.func.make_functional_network(model)
     packet = functional.sample_runtime_draws(tensors.state)
     saved = _snapshot(model.state_dict_for_checkpoint())

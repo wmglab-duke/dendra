@@ -15,10 +15,11 @@ class RuntimeDraws(NamedTuple):
     time-leading tape with ``functional.sample_runtime_draws(state, steps=N)``.
     Pass it through ``draws=`` in functional execution or a native Population/
     Network ``step`` and its public helpers. Native steps consume one packet
-    for NOISE/State SDE and optional Network NetStim. Population steps also
-    replay solver-owned intra and call-local extra randomized Poisson banks
-    with finite n and fixed invocation counts. Mechanism-owned Poisson,
-    native Network Poisson and native run-family draw tapes are unsupported.
+    for NOISE/State SDE and optional Network NetStim. Population and Network
+    steps also replay solver-owned intra and call-local extra randomized
+    Poisson banks with finite n and fixed invocation counts. Network banks
+    retain global invocation order and shared waveform/generator ownership.
+    Mechanism-owned Poisson and native run-family draw tapes are unsupported.
     Numerical draw families and stream routes are fixed by the lowered model.
     Shared RNG bytes occur once at each native publication boundary, including
     intermediate Population boundaries when a Network exposes them.

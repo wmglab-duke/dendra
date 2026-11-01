@@ -342,6 +342,28 @@ class NetworkRNGPlan:
         return result
 
 
+def _network_borrowed_stimulation_streams(network, model_sources, plans, local):
+    """Resolve Poisson borrowers against declared model streams Network-wide."""
+    from ._stimulation_rng import (
+        _generator_bindings,
+        _validate_registered_rng_owners,
+    )
+
+    generators = _generator_bindings(model_sources)
+    result, requested = {}, set()
+    for name, plan in plans.items():
+        sources = plan._resolved_sources(network.populations[name])
+        for entry in plan.entries:
+            generator = sources[entry.key].generator
+            requested.add(id(generator))
+            if id(generator) in generators:
+                result[local[name][entry.stream]] = generators[id(generator)]
+    _validate_registered_rng_owners(
+        network, {id(source) for source in model_sources.values()}, requested
+    )
+    return result
+
+
 class NetworkStimulationRNGPlan:
     """Share physical model generators with Network Poisson consumers.
 
@@ -370,30 +392,15 @@ class NetworkStimulationRNGPlan:
                 )
 
     def _current_borrowed(self, network):
-        generators = {}
-        declared = set()
-        for canonical, (name, path, attribute) in self.random.streams.items():
-            source = getattr(
+        sources = {
+            canonical: getattr(
                 self.random._owners(network.populations[name])[path], attribute
             )
-            declared.add(id(source))
-            generators[id(source._cpu_gen)] = (canonical, "cpu")
-            for device, generator in source._device_gens.items():
-                generators[id(generator)] = (canonical, str(device))
-        result = {}
-        requested = set()
-        for name, plan in self.stimulation.plans.items():
-            sources = plan._resolved_sources(network.populations[name])
-            for entry in plan.entries:
-                generator = sources[entry.key].generator
-                requested.add(id(generator))
-                if id(generator) in generators:
-                    canonical = self.stimulation.local[name][entry.stream]
-                    result[canonical] = generators[id(generator)]
-        from ._stimulation_rng import _validate_registered_rng_owners
-
-        _validate_registered_rng_owners(network, declared, requested)
-        return result
+            for canonical, (name, path, attribute) in self.random.streams.items()
+        }
+        return _network_borrowed_stimulation_streams(
+            network, sources, self.stimulation.plans, self.stimulation.local
+        )
 
     def validate_compatible_network(self, network):
         if self._current_borrowed(network) != self.borrowed:

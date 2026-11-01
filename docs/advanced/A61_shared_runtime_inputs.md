@@ -166,9 +166,9 @@ through `draws=` on native Population/Network `step`, `dn.step`,
 `dn.step_population` and `dn.step_network`. These calls consume one
 `dn.func.RuntimeDraws` packet for NOISE, State SDE and optional Network NetStim.
 Native `run`, `longrun` and `longrun_checkpointed` do not accept draw tapes.
-Population steps also replay randomized Poisson waveforms in solver-owned
-intracellular injections and call-local extracellular `extra` banks.
-Mechanism-owned Poisson and native Network Poisson replay are unsupported.
+Population and Network steps also replay randomized Poisson waveforms in
+solver-owned intracellular injections and call-local extracellular `extra` banks.
+Mechanism-owned Poisson replay is unsupported.
 Omitting `draws` retains the native sampling lifecycle.
 
 Use the existing functional plan's sampler. Lower the initialized native model
@@ -205,6 +205,26 @@ its final invoked schedule for native checkpoints and later execution.
 External `extra` waveforms and generators remain caller-owned: save their state
 alongside the model when checkpointing, and supply the same configuration again.
 
+Network replay validates the complete packet before evaluating live banks. It
+consumes extracellular banks in the supplied `extra` mapping order, then
+intracellular banks in Population order, before the Network's numerical phases.
+One invocation cursor spans all banks, including shared physical waveform
+children. A generator shared by several Populations has one authoritative RNG
+timeline, including when a waveform borrows a declared RAND/NOISE/SDE stream
+owned by another Population. A later automatic step starts from the published
+endpoint. Supply compatible bank bindings in the same order used to prepare
+the functional plan:
+
+```python
+extra = {"right": (right_field, right_waveform), "left": (left_field, left_waveform)}
+functional, _ = dn.func.make_functional(network, dt=dt, extra=extra)
+boundary = dn.func.capture_continuation(functional, network)
+draws = functional.sample_runtime_draws(boundary.state)
+network.step(extra=extra, draws=draws)
+# dn.step(network, extra=extra, draws=draws) and
+# dn.step_network(network, extra=extra, draws=draws) use the same contract.
+```
+
 Explicit SDE draws pass supplied tensors through native compiled kernels.
 Omitting draws retains the native RNG/backend restrictions: automatic State SDE
 sampling can fail under strict full-graph capture of `torch.Generator`, even
@@ -227,6 +247,16 @@ automatic sampling from a native checkpoint:
 
 ```console
 python examples/shared_poisson_replay.py
+```
+
+The complete
+{download}`shared_network_poisson_replay.py <../../examples/shared_network_poisson_replay.py>`
+example replays shared waveform children across two Populations, uses reversed
+extracellular mapping order, checks amplitude/field gradients and resumes
+automatic sampling after native checkpoint restoration:
+
+```console
+python examples/shared_network_poisson_replay.py
 ```
 
 See {doc}`A57_functional_api_overview` for functional draw tapes and host sampling.

@@ -327,9 +327,9 @@ checkpoint protocol for custom callbacks.
 Inputs, runtime draws and call-local `extra` arguments are not stored in a
 `Continuation`. Supply deterministic inputs and stimulation again when native
 execution resumes. Native `step` accepts a single `RuntimeDraws` packet for
-NOISE/SDE, Network NetStim and Population solver-owned intra/call-local extra
-Poisson banks. Mechanism-owned Poisson, native Network Poisson and native
-run-family draw tapes remain unsupported. Supply
+NOISE/SDE, Network NetStim and Population/Network solver-owned intra/call-local
+extra Poisson banks. Mechanism-owned Poisson and native run-family draw tapes
+remain unsupported. Supply
 external `extra` configuration again; its waveform and generator state remain
 caller-owned. See {doc}`A61_shared_runtime_inputs`.
 Bindings that have no native owner cannot be silently installed by model handoff.
