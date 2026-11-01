@@ -8,10 +8,8 @@ from types import MethodType
 import torch
 from torch.utils import _pytree
 
-from dendra.models.random_parameters import sample_random_parameter_draw
 from dendra.models.rng import RNGModule
 
-from ._rng_diagnostics import _rng_diagnostic_scope
 from ._rng_frames import _rng_values, _sampler_from_frame
 from ._types import FunctionalizationError, RuntimeNoiseDraw, StimulationDraw
 
@@ -67,6 +65,49 @@ def _assert_shared_frame(actual, expected):
         raise ValueError(message)
 
 
+def _instrument_kernel_requests(module, mechanism_bindings, sde_bindings):
+    """Observe the same request boundaries on a private native or pure program."""
+    from dendra.models.mechanisms._state import State
+
+    observed = []
+    for entry, path in {
+        entry.key: (entry, path) for entry, path in mechanism_bindings
+    }.values():
+        owner = module.get_submodule(path)
+        original = owner.fn
+
+        def call(self, *args, _entry=entry, _original=original, **kwargs):
+            del self
+            observed.append(("poisson", _entry))
+            return _original(*args, **kwargs)
+
+        owner.fn = MethodType(call, owner)
+    states = {}
+    for entry, path in sde_bindings:
+        states.setdefault(path, {})[entry.name] = entry
+    for path, entries in states.items():
+        owner = module.get_submodule(path)
+
+        def normal(self, name, like, *, _entries=entries):
+            del self
+            observed.append(("sde", _entries[name]))
+            return torch.ones_like(like).detach()
+
+        owner._derive_advance_values = MethodType(State._derive_advance_values, owner)
+        owner._sde_randn_like = MethodType(normal, owner)
+    return observed
+
+
+def _check_kernel_requests(observed, mechanism, sde):
+    expected = Counter(("poisson", entry.key) for entry in mechanism)
+    expected.update(("sde", entry.key) for entry in sde)
+    if Counter((kind, entry.key) for kind, entry in observed) != expected:
+        raise FunctionalizationError(
+            "Shared stochastic execution needs fixed Poisson and State SDE invocation counts"
+        )
+    return tuple(observed)
+
+
 def _kernel_requests(functional, tensors):
     """Observe the native Poisson/SDE boundary order on disposable operands.
 
@@ -83,8 +124,6 @@ def _kernel_requests(functional, tensors):
     if not mechanism:
         return tuple(("sde", entry) for entry in sde)
     from torch.func import functional_call
-
-    from dendra.models.mechanisms._state import State
 
     from ._population import (
         _authored_workspace_classes,
@@ -103,7 +142,6 @@ def _kernel_requests(functional, tensors):
         if functional._check_purity
         else None
     )
-    observed = []
     with _functional_probe_restore_scope(functional, classes, snapshot):
         with torch.inference_mode(False), torch.no_grad():
             parameters, constants, state = _pytree.tree_map_only(
@@ -120,33 +158,11 @@ def _kernel_requests(functional, tensors):
             )
             transition = _deepcopy_execution_module(functional._transition)
             _rebind_population_time_references(transition.population)
-            # Registration occurrences already have distinct private owners.
-            by_key = {entry.key: entry for entry in mechanism}
-            for entry in by_key.values():
-                owner = transition.get_submodule(entry.mapping.rsplit(".", 1)[0])
-                original = owner.fn
-
-                def call(self, *args, _entry=entry, _original=original, **kwargs):
-                    del self
-                    observed.append(("poisson", _entry))
-                    return _original(*args, **kwargs)
-
-                owner.fn = MethodType(call, owner)
-            states = {}
-            for entry in sde:
-                states.setdefault(entry.path, {})[entry.name] = entry
-            for path, entries in states.items():
-                owner = transition.population.get_submodule(path)
-
-                def normal(self, name, like, *, _entries=entries):
-                    del self
-                    observed.append(("sde", _entries[name]))
-                    return torch.ones_like(like).detach()
-
-                owner._derive_advance_values = MethodType(
-                    State._derive_advance_values, owner
-                )
-                owner._sde_randn_like = MethodType(normal, owner)
+            observed = _instrument_kernel_requests(
+                transition,
+                ((entry, entry.mapping.rsplit(".", 1)[0]) for entry in mechanism),
+                ((entry, f"population.{entry.path}") for entry in sde),
+            )
             functional_call(
                 transition,
                 mapping,
@@ -164,13 +180,39 @@ def _kernel_requests(functional, tensors):
                 ),
                 tie_weights=False,
             )
-    expected = Counter(("poisson", entry.key) for entry in mechanism)
-    expected.update(("sde", entry.key) for entry in sde)
-    if Counter((kind, entry.key) for kind, entry in observed) != expected:
-        raise FunctionalizationError(
-            "Shared stochastic execution needs fixed Poisson and State SDE invocation counts"
-        )
-    return tuple(observed)
+    return _check_kernel_requests(observed, mechanism, sde)
+
+
+def native_runtime_requests(population, noise, poisson, *, dt):
+    """Capture native kernel interleaving without preparing a functional model."""
+    mechanism = () if poisson is None else poisson._entries_for_phase("mechanism")
+    sde = noise.sde.entries
+    if not sde:
+        kernel = tuple(("poisson", entry) for entry in mechanism)
+    elif not mechanism:
+        kernel = tuple(("sde", entry) for entry in sde)
+    else:
+        from ._poisson_invocations import native_invocation_probe
+
+        with native_invocation_probe(
+            population, check_purity=noise.check_purity
+        ) as copy:
+            execution = copy()
+            timestep = execution.t.new_tensor(dt)
+            execution.integrator._initialize(execution, timestep)
+            observed = _instrument_kernel_requests(
+                execution,
+                ((entry, entry.node_path) for entry in mechanism),
+                ((entry, entry.path) for entry in sde),
+            )
+            execution.integrator.step(execution, timestep)
+        kernel = _check_kernel_requests(observed, mechanism, sde)
+    banks = (
+        ()
+        if poisson is None
+        else tuple(("poisson", entry) for entry in poisson._bank_entries)
+    )
+    return (*banks, *(("noise", entry) for entry in noise.noise_runtime), *kernel)
 
 
 class StimulationRNGPlan:
@@ -403,39 +445,15 @@ class StimulationRNGPlan:
 
     def sample_request(self, kind, entry, context):
         """Consume one existing sampler at its native request boundary."""
-        if kind == "poisson":
-            draw = self.poisson._sample_entry(
-                entry, context["poisson_samplers"][entry.stream]
-            )
-            position = context["positions"][entry.key]
-            self.poisson._assign_draw(
-                context["stimulation_draws"], entry, position, draw
-            )
-            context["positions"][entry.key] += 1
-            return
-        with _rng_diagnostic_scope(
-            self.functional.device,
-            enabled=context.get("diagnostic_enabled", self.functional._check_purity),
-        ) as diagnostic:
-            draw = sample_random_parameter_draw(
-                entry.spec,
-                context["random_samplers"][entry.stream],
-                entry.shape,
-                device=entry.device,
-                dtype=entry.dtype,
-            )
-        if diagnostic.changes:
-            raise FunctionalizationError(
-                "Stochastic draw sampler consumed global RNG; use its explicit RNGModule"
-            )
-        leaves, specification = _pytree.tree_flatten(draw)
-        if hasattr(entry, "draw_spec") and specification != entry.draw_spec:
-            raise FunctionalizationError("NOISE draw tree changed; lower again")
-        if len(leaves) != len(entry.draw_names):
-            raise FunctionalizationError("Stochastic draw tree changed; lower again")
-        context["noise_draws"].update(
-            (name, leaf.detach().clone())
-            for name, leaf in zip(entry.draw_names, leaves, strict=True)
+        from ._runtime_sampling import sample_runtime_request
+
+        sample_runtime_request(
+            self.poisson,
+            kind,
+            entry,
+            context,
+            device=self.functional.device,
+            check_purity=self.functional._check_purity,
         )
 
     def finish_packets(self, context):
@@ -508,7 +526,13 @@ class StimulationRNGPlan:
         return self.functional._runtime_draw_plan.legacy(packet)
 
     def sample_runtime_draws(
-        self, state, *, steps=None, samplers=None, poisson_samplers=None
+        self,
+        state,
+        *,
+        steps=None,
+        samplers=None,
+        poisson_samplers=None,
+        _runtime_layout=False,
     ):
         """Capture each physical generator once after the accepted step."""
         if steps is not None and (
@@ -524,66 +548,83 @@ class StimulationRNGPlan:
             if samplers is None
             else {stream: samplers[stream] for stream in plan.model_reference}
         )
-        context = self.begin_packets(
-            state, samplers=samplers, poisson_samplers=poisson_samplers
-        )
-        ordinary_noise = plan.has_noise and not self.enabled
-        if ordinary_noise:
-            context["diagnostic_enabled"] = False
-
-        def sample_step():
-            # Ordinary NOISE historically checks global RNG unconditionally.
-            # Keep that transaction around its native ordered request group;
-            # mixed borrowed streams retain the captured optional policy.
-            with _rng_diagnostic_scope(
-                self.functional.device, enabled=ordinary_noise
-            ) as diagnostic:
-                for kind, entry in self.runtime_requests():
-                    self.sample_request(kind, entry, context)
-            if diagnostic.changes:
-                raise FunctionalizationError(
-                    "NOISE draw sampler consumed global RNG; use explicit RNGModule"
-                )
-            return plan.finish_context(context)
-
-        if steps is None:
-            return sample_step()
-        packets = []
-        for _ in range(steps):
-            context["noise_draws"] = {}
-            context["stimulation_draws"] = (
-                {} if self.poisson is None else self.poisson._placeholder_draws()
+        if steps == 0 and not _runtime_layout:
+            # Retain the compatibility adapter's RNG lookup/allocation order.
+            context = self.begin_packets(
+                state, samplers=samplers, poisson_samplers=poisson_samplers
             )
-            context["positions"] = Counter()
-            packets.append(sample_step())
-        if packets:
-            return _pytree.tree_map(
-                lambda *values: None if values[0] is None else torch.stack(values),
-                *packets,
+            packet = plan.finish_context(context)
+            noise = self.noise._empty_tape_draws() if plan.has_noise else None
+            stimulation = (
+                None
+                if self.poisson is None
+                else {
+                    entry.key: torch.empty(
+                        (0, *self.poisson._draw_shape(entry)),
+                        dtype=self.poisson.draw_dtype,
+                        device=self.poisson.streams[entry.stream].device,
+                    )
+                    for entry in self.poisson.entries
+                }
             )
-        packet = plan.finish_context(context)
-        noise = self.noise._empty_tape_draws() if plan.has_noise else None
-        stimulation = (
-            None
+            from ._draws import RuntimeDraws
+
+            return RuntimeDraws(
+                {"noise": noise, "stimulation": stimulation},
+                _pytree.tree_map_only(
+                    torch.Tensor,
+                    lambda value: value.new_empty((0, *value.shape)),
+                    packet.rng,
+                ),
+            )
+        state = self.expand_state(state)
+        generators = (
+            {}
             if self.poisson is None
-            else {
-                entry.key: torch.empty(
-                    (0, *self.poisson._draw_shape(entry)),
-                    dtype=self.poisson.draw_dtype,
-                    device=self.poisson.streams[entry.stream].device,
-                )
-                for entry in self.poisson.entries
-            }
+            else self.poisson._samplers(state, poisson_samplers)
         )
-        from ._draws import RuntimeDraws
+        generators = dict(generators)
+        for stream, (owner, device) in self.borrowed.items():
+            generators[stream] = samplers[owner]._generator_for(device)
+        from ._runtime_sampling import PopulationSamplingSpec, RuntimeSamplingProgram
 
-        return RuntimeDraws(
-            {"noise": noise, "stimulation": stimulation},
-            _pytree.tree_map_only(
-                torch.Tensor,
-                lambda value: value.new_empty((0, *value.shape)),
-                packet.rng,
-            ),
+        spec = PopulationSamplingSpec(
+            self.noise,
+            self.poisson,
+            self.runtime_requests(),
+            self.functional.device,
+            self.functional._check_purity,
+            {stream: stream for stream in plan.model_reference},
+            {}
+            if self.poisson is None
+            else {stream: stream for stream in self.poisson.streams},
+            plan.has_noise and not self.enabled,
+            _runtime_layout,
+        )
+        program = RuntimeSamplingProgram(
+            {"population": spec},
+            plan.model_reference,
+            {} if self.poisson is None else self.poisson.streams,
+            {
+                stream: frame
+                for stream, frame in plan.stimulation_reference.items()
+                if stream not in self.borrowed
+            },
+            self.borrowed,
+            {
+                stream: {leaf: ("step",) for leaf in frame}
+                for stream, frame in plan.model_reference.items()
+            },
+            (),
+            (),
+            False,
+        )
+        return program.sample(
+            {},
+            {},
+            steps=steps,
+            samplers=samplers,
+            poisson_samplers=generators,
         )
 
     def sample_initialization(self, state, *, samplers=None, poisson_samplers=None):

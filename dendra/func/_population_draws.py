@@ -86,6 +86,18 @@ class PopulationRuntimeDrawPlan:
             return self.sharing.sample_runtime_draws(state, steps=steps)
         return self._packet(None, None, {}, {})
 
+    def sample_runtime(self, state, *, steps=None):
+        """Allocate canonical runtime operands without initializer reservations."""
+        if steps is not None and (
+            isinstance(steps, bool) or not isinstance(steps, int) or steps < 0
+        ):
+            raise ValueError("steps must be a non-negative integer")
+        if self.has_noise or self.poisson is not None:
+            return self.sharing.sample_runtime_draws(
+                state, steps=steps, _runtime_layout=True
+            )
+        return self._packet(None, None, {}, {})
+
     def legacy(self, packet):
         """Project the existing public packet layouts without copying values."""
         model_rng = {
@@ -198,7 +210,9 @@ class PopulationRuntimeDrawPlan:
                     "This Population has no randomized Poisson stimulation"
                 )
         else:
-            self.poisson.validate(stimulation, steps=steps, validate_rng=False)
+            self.poisson.validate(
+                stimulation, steps=steps, validate_rng=False, _runtime_layout=True
+            )
             from ._poisson_stimulation import _cold_validation
 
             if _cold_validation():

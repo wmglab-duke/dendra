@@ -389,12 +389,16 @@ class PoissonStimulationPlan:
             for entry in self.entries
         }
 
-    def _draw_shape(self, entry):
-        count = self._capacities[entry.key]
+    def _draw_shape(self, entry, *, runtime=False):
+        count = (
+            max(self._runtime_counts[entry.key], 1)
+            if runtime
+            else self._capacities[entry.key]
+        )
         return (entry.source.n,) if count == 1 else (count, entry.source.n)
 
-    def _assign_draw(self, draws, entry, index, value):
-        if self._capacities[entry.key] == 1:
+    def _assign_draw(self, draws, entry, index, value, *, runtime=False):
+        if len(self._draw_shape(entry, runtime=runtime)) == 1:
             draws[entry.key] = value.detach().clone()
         else:
             draws[entry.key][index] = value.detach()
@@ -529,10 +533,10 @@ class PoissonStimulationPlan:
             self.schedules(packet, initialization=True), self._initialization_keys
         )
 
-    def _placeholder_draws(self):
+    def _placeholder_draws(self, *, runtime=False):
         return {
             entry.key: torch.full(
-                self._draw_shape(entry),
+                self._draw_shape(entry, runtime=runtime),
                 0.5,
                 dtype=self.draw_dtype,
                 device=self.streams[entry.stream].device,
@@ -604,7 +608,13 @@ class PoissonStimulationPlan:
                         ) from error
 
     def validate(
-        self, packet, *, steps=None, validate_rng=True, _allow_reserved_rows=False
+        self,
+        packet,
+        *,
+        steps=None,
+        validate_rng=True,
+        _allow_reserved_rows=False,
+        _runtime_layout=False,
     ):
         if not isinstance(packet, StimulationDraw):
             raise ValueError(
@@ -616,11 +626,21 @@ class PoissonStimulationPlan:
             raise ValueError(
                 "Poisson stimulation draw or RNG names do not match this plan"
             )
+        runtime_layout = legacy_layout = True
         for entry in self.entries:
             value = packet.draws[entry.key]
             shape = self._draw_shape(entry)
             if steps is not None:
                 shape = (steps, *shape)
+            if _runtime_layout and torch.is_tensor(value):
+                runtime_shape = self._draw_shape(entry, runtime=True)
+                if steps is not None:
+                    runtime_shape = (steps, *runtime_shape)
+                actual = tuple(value.shape)
+                runtime_layout = runtime_layout and actual == runtime_shape
+                legacy_layout = legacy_layout and actual == shape
+                if runtime_layout:
+                    shape = runtime_shape
             if (
                 _allow_reserved_rows
                 and entry.kind == "mechanism"
@@ -639,6 +659,8 @@ class PoissonStimulationPlan:
                     shape = actual
             if (
                 not torch.is_tensor(value)
+                or _runtime_layout
+                and not (runtime_layout or legacy_layout)
                 or tuple(value.shape) != shape
                 or value.dtype != self.draw_dtype
                 or value.device != self.streams[entry.stream].device
@@ -694,7 +716,7 @@ class PoissonStimulationPlan:
         for entry in self.entries:
             source = entry.source
             draws = packet.draws[entry.key].detach()
-            if self._capacities[entry.key] == 1:
+            if draws.ndim == 1:
                 draws = draws.unsqueeze(0)
             if entry.key in self._event_slots and counts[entry.key]:
                 self._check_event_slots(entry, draws[: counts[entry.key]])

@@ -11,8 +11,12 @@ from torch.utils import _pytree as pytree
 class RuntimeDraws(NamedTuple):
     """Named runtime draw values and authoritative RNG publication timelines.
 
-    Obtain a packet with ``functional.sample_runtime_draws(state)`` or a
-    time-leading tape with ``functional.sample_runtime_draws(state, steps=N)``.
+    Obtain a frame with ``dn.func.sample_runtime_draws(model, dt=dt)`` or a
+    time-leading tape with ``dn.func.sample_runtime_draws(model, dt=dt, steps=N)``.
+    Native Networks use their initialized timestep. Lowered plans, bindings,
+    compiled chunks and runners require an explicit state or ``Continuation``
+    as the sampler's second argument. Sampling an initialized native model
+    does not require functional lowering or initialize a fresh model.
     Pass it through ``draws=`` in functional execution or native Population/
     Network execution. ``step`` and its public helpers consume one frame;
     ``run``, ``longrun`` and ``longrun_checkpointed`` consume a time-leading
@@ -28,7 +32,7 @@ class RuntimeDraws(NamedTuple):
     numerical phases that evaluate them, including repeated and unused calls.
     Network execution retains global invocation order and shared waveform/
     generator ownership.
-    Numerical draw families and stream routes are fixed by the lowered model.
+    Numerical draw families and stream routes follow the model's declarations.
     Shared RNG bytes occur once at each native publication boundary, including
     intermediate Population boundaries when a Network exposes them.
 
@@ -36,6 +40,11 @@ class RuntimeDraws(NamedTuple):
     the model and its distributions retain their ordinary gradient paths.
     Existing initialization draw packets and runtime input tuples keep their
     separate public formats.
+
+    The shared sampler allocates Poisson invocation rows for runtime calls
+    only, independently of fresh-initialization availability. Existing plan
+    sampling methods retain their formats, including reserved initializer rows;
+    runtime execution accepts those compatible layouts as well.
 
     Native checkpointed training requires versioned tensor leaves. Clone
     inference tensors outside ``torch.inference_mode()`` before passing them

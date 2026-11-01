@@ -29,6 +29,7 @@ from ._netstim_renewal import (
     broadcast_netstim_time,
     netstim_initial_state,
     netstim_renewal,
+    sample_netstim_exponential,
 )
 from ._tensor_schedules import causal_step_index as _causal_step_index
 from ._tensor_schedules import netstim_tensor_schedule, resolve_schedule_values
@@ -1440,11 +1441,9 @@ class NetStim(DNModule, Sliceable):
         if exp_rand is None:
             # Native sampling consumes one full-shaped draw, including
             # deterministic, exhausted, or not-yet-due generators.
-            eps = torch.finfo(dtype).tiny
-            U = torch.rand(
-                self.shape, generator=self._rng, device=device, dtype=dtype
-            ).clamp_min(eps)
-            exp_rand = -torch.log(U)
+            exp_rand = sample_netstim_exponential(
+                self._rng, self.shape, device=device, dtype=dtype
+            )
         else:
             exp_rand = exp_rand.detach()
         parameters = self.renewal_parameters()

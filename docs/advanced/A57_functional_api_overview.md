@@ -824,17 +824,18 @@ the same Population is also an error. Other Populations can use either source
 independently.
 
 Use `draws=RuntimeDraws(...)` separately for runtime stochastic values and their
-RNG timeline. Obtain a packet from
-`functional.sample_runtime_draws(state, steps=N)`, rather than constructing
-its component schema by hand. A step uses the no-`steps` form. The packet
+RNG timeline. Obtain a packet with
+`dn.func.sample_runtime_draws(functional, continuation, steps=N)`, rather than
+constructing its component schema by hand. A step uses the no-`steps` form. The packet
 covers the model's NetStim, NOISE/SDE and randomized Poisson requests and
-preserves shared generator ordering. Draw values are detached from sampling;
-model and distribution parameters retain their normal gradient paths.
+preserves shared generator ordering. Runtime base draws and RNG carry are
+detached. Parameter gradients follow each mechanism's native rules, including
+detached NOISE evaluation.
 
-For native one-step replay, lower once and sample from a captured native
-boundary with `functional.sample_runtime_draws(boundary.state)`, omitting
-`steps`. Pass that packet to the native `step` method or a public one-step
-helper. Sampling leaves the model and generators unchanged; execution publishes
+For native one-step replay, use `dn.func.sample_runtime_draws(population, dt=dt)`
+or `dn.func.sample_runtime_draws(network)`. The initialized native model supplies
+its current logical RNG boundary. Pass that packet to the native `step` method
+or a public one-step helper. Sampling leaves the model and generators unchanged; execution publishes
 the packet's authoritative RNG timeline, so a later step with omitted draws
 continues from its suffix. See {doc}`A61_shared_runtime_inputs` and
 {download}`shared_runtime_draws.py <../../examples/shared_runtime_draws.py>`.
@@ -842,8 +843,7 @@ For native run methods, supply `steps=N` to the sampler and use a matching
 execution horizon. The same tape can drive native and functional execution:
 
 ```python
-boundary = dn.func.capture_continuation(functional, population)
-draws = functional.sample_runtime_draws(boundary.state, steps=100)
+draws = dn.func.sample_runtime_draws(population, dt=dt, steps=100)
 population.longrun(
     steps=100, dt=dt, chunklength=32, inputs=inputs, draws=draws,
 )
@@ -860,6 +860,15 @@ complete
 {download}`shared_runtime_draw_tapes.py <../../examples/shared_runtime_draw_tapes.py>`
 example covers both model types, callback continuation, native checkpoint
 restoration and gradients.
+
+The shared sampler accepts explicit state or a `Continuation` for lowered plans,
+bindings, compiled chunks and runners; those targets never infer an initial
+boundary. Runtime Poisson draws contain only runtime invocation rows. Existing
+plan sampler methods retain their formats, including reserved initialization
+rows, and runtime ingress accepts both compatible layouts. The complete
+{download}`shared_runtime_draw_sampling.py <../../examples/shared_runtime_draw_sampling.py>`
+example samples directly from native models and replays through native and
+functional execution with gradients and checkpoint continuation.
 
 Population and Network Poisson replay use the same finite-`n`, fixed-invocation recipes,
 including repeated shared waveform children and custom containers. Uniforms

@@ -23,6 +23,14 @@ class NetStimTransition(NamedTuple):
     heap_fires: torch.Tensor
 
 
+def sample_netstim_exponential(generator, shape, *, device, dtype):
+    """Draw the shared native full-shape unit exponential from an owned stream."""
+    uniform = torch.rand(
+        shape, generator=generator, device=device, dtype=dtype
+    ).clamp_min(torch.finfo(dtype).tiny)
+    return -torch.log(uniform)
+
+
 def broadcast_netstim_time(t, shape, *, device, dtype):
     """Interpret scalar, per-batch, or per-generator simulation times.
 

@@ -5,12 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 import torch
-from torch.utils import _pytree
 
 from ._draws import RuntimeDraws, _normalize_runtime_draws
-from ._rng_diagnostics import _rng_diagnostic_scope
-from ._rng_frames import _rng_values
-from ._types import FunctionalizationError
 
 
 def _owned_runtime_sampling(functional):
@@ -260,122 +256,69 @@ class NetworkRuntimeDrawPlan:
             },
         )
 
-    def sample(self, state, *, steps=None):
+    def sample(self, state, *, steps=None, _runtime_layout=False):
         """Execute the existing native request program with one frame authority."""
         if steps is not None and (
             isinstance(steps, bool) or not isinstance(steps, int) or steps < 0
         ):
             raise ValueError("steps must be a non-negative integer")
-        if steps == 0:
+        if steps == 0 and not _runtime_layout:
             return self._empty()
+        from ._runtime_sampling import PopulationSamplingSpec, RuntimeSamplingProgram
+
+        populations = {
+            name: PopulationSamplingSpec(
+                plan._noise_plan,
+                plan._poisson_plan,
+                plan._stimulation_rng_plan.runtime_requests(),
+                plan.device,
+                plan._check_purity,
+                {
+                    local: canonical
+                    for local, canonical in self.random.local_streams[name].items()
+                    if canonical in self.model_reference
+                },
+                self.stimulation.local.get(name, {}),
+                not self.sharing.enabled
+                and plan._noise_plan is not None
+                and bool(plan._noise_plan.runtime),
+                _runtime_layout,
+            )
+            for name, plan in self.functional.populations.items()
+        }
+        program = RuntimeSamplingProgram(
+            populations,
+            self.model_reference,
+            self.stimulation.streams,
+            self.stimulation_reference,
+            self.sharing.borrowed,
+            self.boundaries,
+            tuple(self.stimulation._ordered_names("extra")),
+            tuple(self.stimulation._ordered_names("intra")),
+            True,
+            self.netstim_reference,
+        )
         model = self._model_pool(state)
         samplers = self.random._samplers(
             {owner: model[owner] for owner in self.model_reference}
         )
         pool = self._stimulation_pool(state, model)
         poisson_samplers = self.sharing._poisson_samplers(samplers, pool)
-        netstim_state = state["netstim"]
-        packets = []
-        for _index in range(1 if steps is None else steps):
-            contexts = {}
-            for name, plan in self.functional.populations.items():
-                local = self.sharing.expand_population(
-                    name, state["populations"][name], model, pool
-                )
-                contexts[name] = plan._stimulation_rng_plan.begin_packets(
-                    local,
-                    samplers={
-                        local: samplers[self.random.local_streams[name][local]]
-                        for local in plan._runtime_draw_plan.model_reference
-                    },
-                    poisson_samplers={
-                        local: poisson_samplers[canonical]
-                        for local, canonical in self.stimulation.local.get(
-                            name, {}
-                        ).items()
-                    },
-                )
-            model_frames = {
-                canonical: {leaf: {} for leaf in reference}
-                for canonical, reference in self.model_reference.items()
-            }
-            netstim = (
-                None
-                if self.functional.netstim is None
-                else self.functional.netstim.sample_step_draw(netstim_state)
-            )
-            if netstim is not None:
-                netstim_state = {**netstim_state, "rng_state": netstim.rng_state}
-            for phase in ("extra", "intra", "mechanism"):
-                names = (
-                    self.stimulation._ordered_names(phase)
-                    if phase != "mechanism"
-                    else self.functional.populations
-                )
-                for name in names:
-                    plan = self.functional.populations[name]
-                    adapter, context = plan._stimulation_rng_plan, contexts[name]
-                    ordinary = (
-                        phase == "mechanism"
-                        and not self.sharing.enabled
-                        and plan._noise_plan is not None
-                        and bool(plan._noise_plan.runtime)
-                    )
-                    if ordinary:
-                        context["diagnostic_enabled"] = False
-                    with _rng_diagnostic_scope(
-                        plan.device, enabled=ordinary
-                    ) as diagnostic:
-                        for kind, entry in adapter.runtime_requests(phase):
-                            adapter.sample_request(kind, entry, context)
-                    if diagnostic.changes:
-                        raise FunctionalizationError(
-                            "NOISE draw sampler consumed global RNG; use explicit RNGModule"
-                        )
-                    if phase == "mechanism":
-                        for local, canonical in self.random.local_streams[name].items():
-                            if canonical not in self.model_reference:
-                                continue
-                            frame = _rng_values(samplers[canonical], plan.device)
-                            for leaf, value in frame.items():
-                                if (canonical, leaf) not in self.borrowed_devices:
-                                    model_frames[canonical][leaf][name] = value
-            for canonical, leaf in self.borrowed_devices:
-                reference = self.model_reference[canonical][leaf]
-                model_frames[canonical][leaf]["step"] = _rng_values(
-                    samplers[canonical], reference.device
-                )[leaf]
-            packet = RuntimeDraws(
-                {
-                    "populations": {
-                        name: {
-                            "noise": None
-                            if plan._noise_plan is None or not plan._noise_plan.runtime
-                            else contexts[name]["noise_draws"],
-                            "stimulation": None
-                            if plan._poisson_plan is None
-                            else contexts[name]["stimulation_draws"],
-                        }
-                        for name, plan in self.functional.populations.items()
-                    },
-                    "netstim": None if netstim is None else netstim.exp_rand,
-                },
-                {
-                    "model": model_frames,
-                    "stimulation": {
-                        stream: poisson_samplers[stream].get_state().clone()
-                        for stream in self.stimulation_reference
-                    },
-                    "netstim": None if netstim is None else netstim.rng_state,
-                },
-            )
-            packets.append(packet)
-        if steps is None:
-            return packets[0]
-        return _pytree.tree_map(
-            lambda *values: None if values[0] is None else torch.stack(values),
-            *packets,
+        return program.sample(
+            model,
+            pool,
+            steps=steps,
+            samplers=samplers,
+            poisson_samplers=poisson_samplers,
+            netstim_state=state["netstim"],
+            sample_netstim=None
+            if self.functional.netstim is None
+            else self.functional.netstim.sample_step_draw,
         )
+
+    def sample_runtime(self, state, *, steps=None):
+        """Allocate canonical runtime rows independently of initialization."""
+        return self.sample(state, steps=steps, _runtime_layout=True)
 
     def local(self, name, packet):
         """Expose one Population's static routes at numerical consumption."""

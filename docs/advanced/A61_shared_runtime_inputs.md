@@ -171,31 +171,49 @@ Poisson waveforms in mechanism-owned injections, solver-owned intracellular
 injections and call-local extracellular `extra` banks.
 Omitting `draws` retains the native sampling lifecycle.
 
-Use the existing functional plan's sampler. Lower the initialized native model
-once, capture its current boundary, then sample without advancing native state
-or its generators:
+Sample directly from an initialized native Population without advancing its
+state or generators:
 
 ```python
-functional, _ = dn.func.make_functional(model, dt=dt)
-boundary = dn.func.capture_continuation(functional, model)
-draws = functional.sample_runtime_draws(boundary.state)
+draws = dn.func.sample_runtime_draws(model, dt=dt)
 dn.step(model, dt=dt, inputs=frame, draws=draws)
 ```
 
 A Network uses its initialized timestep and a Population-name mapping of input
-frames. Existing plans can be reused while the model remains compatible;
-`program.functional` also exposes a compiled runner's plan. Packet families,
-shapes, dtype/device and stream routes follow that plan. Keep the sampled packet
-intact rather than constructing its draw or RNG fields manually.
+frames:
+
+```python
+draws = dn.func.sample_runtime_draws(network)
+network.step(inputs={"left": dn.func.Inputs(intra=current_frame)}, draws=draws)
+```
+
+The sampler reads the model's current logical RNG boundary, including a deferred
+Poisson boundary restored from a checkpoint. It leaves model tensors, generator
+identities and both live and global RNG state unchanged. Native sampling supports
+initialized canonical single-device Populations and Networks; it does not build
+or initialize an uninitialized model.
+
+The same function accepts a lowered plan, binding, compiled chunk or runner with
+an explicit state mapping or `Continuation`:
+
+```python
+draws = dn.func.sample_runtime_draws(functional, boundary, steps=100)
+next_draws = dn.func.sample_runtime_draws(program, continuation, steps=100)
+```
+
+State is required for those targets: omitted state does not select a runner's
+snapshot or fresh-initialization policy. Their timestep and extracellular
+bindings are fixed by the lowered plan. Existing
+`functional.sample_runtime_draws(state, steps=...)` methods remain available.
+Packet families, shapes, dtype/device and stream routes follow the model. Keep
+the sampled packet intact rather than constructing its fields manually.
 
 ### Run-family tapes
 
 Supply `steps=N` to the same sampler for a time-leading tape:
 
 ```python
-functional, _ = dn.func.make_functional(population, dt=dt)
-boundary = dn.func.capture_continuation(functional, population)
-draws = functional.sample_runtime_draws(boundary.state, steps=100)
+draws = dn.func.sample_runtime_draws(population, dt=dt, steps=100)
 population.longrun(
     steps=100,
     chunklength=32,
@@ -211,8 +229,39 @@ also accepts these tapes. Use `longrun_checkpointed(..., draws=draws)` for
 activation-checkpointed training. The packet has one row for every accepted
 solver step; its leading length must match the horizon resolved from
 `steps`, `duration`, `tstop` or existing input-tape rules. Draw tapes alone do
-not select a horizon. A zero-step explicit tape performs no stochastic
-evaluation or RNG publication.
+not select a horizon. Zero-step replay advances no live simulation state or RNG
+boundary.
+
+The shared sampler uses a runtime-only Poisson invocation layout, independent of
+how often an initializer evaluates its waveforms. Existing sampler methods and
+initialization packets retain their formats. Both native and functional runtime
+execution accept the runtime layout and compatible reserved-row layouts; all
+supplied rows are validated before adaptation. Sampling under
+`torch.inference_mode()` returns detached, versioned tensors that can also be
+used as checkpointed-training operands.
+
+The complete
+{download}`shared_runtime_draw_sampling.py <../../examples/shared_runtime_draw_sampling.py>`
+example samples directly from a Population and a Network containing NOISE, a
+State SDE, repeated Poisson injections and optional NetStim input. It replays a
+prefix and a checkpointed suffix while retaining waveform gradients:
+
+```{literalinclude} ../../examples/shared_runtime_draw_sampling.py
+:language: python
+:start-after: "# region sample"
+:end-before: "# endregion sample"
+:dedent: 4
+```
+
+After restoring the prefix checkpoint, sampling reads its retained RNG boundary.
+The same remaining packet can drive either native or functional execution:
+
+```{literalinclude} ../../examples/shared_runtime_draw_sampling.py
+:language: python
+:start-after: "# region continuation"
+:end-before: "# endregion continuation"
+:dedent: 4
+```
 
 Explicit Poisson replay evaluates one complete invocation recipe per accepted
 step. A Population containing replayed Poisson banks evaluates its solver-level
@@ -317,14 +366,11 @@ including shared physical waveform children. A generator shared by several
 Populations has one authoritative RNG
 timeline, including when a waveform borrows a declared RAND/NOISE/SDE stream
 owned by another Population. A later automatic step starts from the published
-endpoint. Supply compatible bank bindings in the same order used to prepare
-the functional plan:
+endpoint. Supply compatible bank bindings in the same order used for sampling:
 
 ```python
 extra = {"right": (right_field, right_waveform), "left": (left_field, left_waveform)}
-functional, _ = dn.func.make_functional(network, dt=dt, extra=extra)
-boundary = dn.func.capture_continuation(functional, network)
-draws = functional.sample_runtime_draws(boundary.state)
+draws = dn.func.sample_runtime_draws(network, extra=extra)
 network.step(extra=extra, draws=draws)
 # dn.step(network, extra=extra, draws=draws) and
 # dn.step_network(network, extra=extra, draws=draws) use the same contract.

@@ -18,6 +18,7 @@ from dendra.models.networks._netstim_renewal import (
     broadcast_netstim_time,
     netstim_initial_state,
     netstim_renewal,
+    sample_netstim_exponential,
 )
 from dendra.models.networks._tensor_schedules import (
     netstim_tensor_schedule,
@@ -372,13 +373,9 @@ class FunctionalNetStim:
         consume = not initialize or bool(torch.any(parameters["noise"] > 0))
         with torch.inference_mode(False), torch.no_grad():
             if consume:
-                uniform = torch.rand(
-                    self.shape,
-                    generator=generator,
-                    device=self.device,
-                    dtype=self.dtype,
-                ).clamp_min(torch.finfo(self.dtype).tiny)
-                exp_rand = -torch.log(uniform)
+                exp_rand = sample_netstim_exponential(
+                    generator, self.shape, device=self.device, dtype=self.dtype
+                )
             else:
                 exp_rand = torch.zeros(self.shape, device=self.device, dtype=self.dtype)
             return NetStimDraw(exp_rand, generator.get_state())
