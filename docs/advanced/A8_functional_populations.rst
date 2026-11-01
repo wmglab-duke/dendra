@@ -214,6 +214,14 @@ no-state runner calls retain their configured restart policy. See
 :download:`functional_runner_initialization.py <../../examples/functional_runner_initialization.py>`
 example for Population and Network usage.
 
+Use ``dn.func.initialize(runner, continuation)`` to start another trial from
+the packet's effective sources and current RNG carry. Fresh initialization
+resets simulation histories and callback carry under the existing recipe,
+reseeding and cache policies. With a lowered Population plan, supply its recipe
+explicitly as ``initialize(functional, continuation, initialization=recipe)``.
+See :ref:`functional-packet-initialization` for repeated optimization trials and
+initialization draw replay.
+
 To save a complete portable continuation and restore it into a compatible
 lowered Population or Network, use the shared functions:
 

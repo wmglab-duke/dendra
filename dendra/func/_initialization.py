@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 import torch
 
-from ._continuation import _make_continuation
+from ._continuation import Continuation, _make_continuation, _resolve_continuation
 from ._initialization_draws import InitializationDraws
 from ._network_bindings import _map_containers
 from ._types import FunctionalizationError, InitializationInput, PopulationTensors
@@ -136,10 +136,17 @@ def _runner_sources(
 
 
 def _initialize_runner(
-    runner, parameters, constants, initialization, *, draws=None, _draws_capture=None
+    runner,
+    parameters,
+    constants,
+    initialization,
+    *,
+    state=_UNSET,
+    draws=None,
+    _draws_capture=None,
 ):
-    """Initialize from runner defaults without entering its execution lifecycle."""
-    state = runner._initial_state
+    """Initialize selected sources without entering the runner's lifecycle."""
+    state = runner._initial_state if state is _UNSET else _map_containers(state, dict)
     parameters, constants, selected, _ = _runner_sources(
         runner, parameters, constants, initialization, fresh=True
     )
@@ -207,12 +214,25 @@ def initialize(
     to control ordinary no-state calls. Runner defaults, prepared caches and
     execution reports remain unchanged.
 
+    ``initialize(program, continuation)`` starts fresh from the packet's
+    effective parameters/constants and current RNG carry instead of runner
+    defaults. The runner supplies its initialization recipe unless overridden
+    with ``initialization=``. Non-None ``parameters=`` or ``constants=`` cannot
+    accompany a continuation. Existing samples, reseeding and cache restoration
+    follow the selected recipe and native initialization policies. Transforms
+    run on the supplied effective sources; an earlier raw baseline is not
+    reconstructed. Callback carry is discarded for the fresh trial.
+
     For a lowered model, ``tensors`` is the matching ``PopulationTensors`` or
     ``NetworkTensors`` bundle returned by ``make_functional``. Its explicit
     state, parameters and constants
     supply the starting clock/RNG carry and raw sources; no native extraction is
-    performed. The result retains effective initialization replacements, aliases
-    and gradient history without copying or detaching Tensor leaves.
+    performed. A ``Continuation`` also supplies these three frames. With a
+    Population plan and continuation, ``initialization=`` is required because
+    neither stores the initialization recipe. A Network plan supplies its
+    ``initialization_inputs`` by default. The result retains effective
+    initialization replacements, aliases and gradient history without copying
+    or detaching Tensor leaves.
 
     ``initialization`` overrides the existing model-specific initialization
     packet. Omission uses ``tensors.initialization`` for a Population or
@@ -270,9 +290,18 @@ def _initialize_target(
 
     is_runner = type(functional) in (CompiledRunner, CompiledNetworkRunner)
     if is_runner:
-        if tensors is not _UNSET:
+        if tensors is not _UNSET and not isinstance(tensors, Continuation):
             raise TypeError(
                 "tensors cannot be supplied when initializing a compiled runner"
+            )
+        if isinstance(tensors, Continuation):
+            # Fresh initialization selects its own recipe and resets callbacks.
+            _, parameters, constants, _ = _resolve_continuation(
+                tensors,
+                None if parameters is _UNSET else parameters,
+                None if constants is _UNSET else constants,
+                None,
+                None,
             )
     else:
         for name, value in (("parameters", parameters), ("constants", constants)):
@@ -299,6 +328,7 @@ def _initialize_target(
             None if parameters is _UNSET else parameters,
             None if constants is _UNSET else constants,
             initialization,
+            state=tensors.state if isinstance(tensors, Continuation) else _UNSET,
             draws=draws,
             _draws_capture=_draws_capture,
         )
@@ -307,15 +337,23 @@ def _initialize_target(
     from ._population import FunctionalPopulation
 
     if type(functional) is FunctionalPopulation:
-        if type(tensors) is not PopulationTensors:
+        if type(tensors) is not PopulationTensors and not isinstance(
+            tensors, Continuation
+        ):
             raise TypeError(
-                "tensors must be a PopulationTensors for this FunctionalPopulation"
+                "tensors must be a PopulationTensors or Continuation for this FunctionalPopulation"
+            )
+        if isinstance(tensors, Continuation) and initialization is None:
+            raise TypeError(
+                "initialization is required when initializing a FunctionalPopulation from a Continuation"
             )
         selected = tensors.initialization if initialization is None else initialization
     elif type(functional) is FunctionalNetwork:
-        if type(tensors) is not NetworkTensors:
+        if type(tensors) is not NetworkTensors and not isinstance(
+            tensors, Continuation
+        ):
             raise TypeError(
-                "tensors must be a NetworkTensors for this FunctionalNetwork"
+                "tensors must be a NetworkTensors or Continuation for this FunctionalNetwork"
             )
         selected = (
             functional.initialization_inputs
@@ -366,8 +404,9 @@ def sample_initialization_draws(
     overrides and deterministic initialization packets belong to functional
     targets. Explicit draw replay does not support native forced rebuilds.
 
-    Functional targets accept the same tensor bundles and source overrides as
-    :func:`initialize`.
+    Functional targets accept the same tensor bundles, continuations and source
+    overrides as :func:`initialize`. With a continuation, capture observes its
+    current effective sources and RNG carry without advancing the packet.
     Sampling runs the existing host initializer under ``no_grad``, including
     pure transforms and cache restoration, to observe each sampling boundary
     in native order. The resulting packet includes the actual draw selections

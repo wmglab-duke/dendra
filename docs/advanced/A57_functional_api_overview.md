@@ -1081,6 +1081,93 @@ python examples/functional_runner_initialization.py
 python examples/functional_runner_initialization.py --backend aot_eager
 ```
 
+(functional-packet-initialization)=
+### Restart from a continuation
+
+Pass a `Continuation` as the second argument to initialize another trial from
+its effective parameters, constants and current RNG carry:
+
+```python
+trial = dn.func.initialize(program)
+optimizer = torch.optim.Adam(
+    dn.func.inspect_sources(trial).trainable_leaves, lr=1e-4,
+)
+for iteration in range(10):
+    optimizer.zero_grad(set_to_none=True)
+    state, auxiliary = dn.func.run(program, trial)
+    voltage = auxiliary["callbacks"]["trace"]["v"]
+    loss = (voltage - target_voltage).square().mean()
+    loss.backward()
+    optimizer.step()
+
+    finished = dn.func.detach_continuation(program, auxiliary["continuation"])
+    trial = dn.func.initialize(program, finished)
+```
+
+Here `program` is a training runner with a `"trace"` Recorder, and
+`target_voltage` has a compatible shape. For a Network, select a qualified
+voltage field such as `"cortex.v"`. The complete example below constructs both
+model kinds and uses optimizer-owned raw parameter leaves.
+
+`run(program, packet)` continues the packet's simulation and callback history.
+`initialize(program, packet)` instead executes the fresh initialization
+protocol on its sources. It rebuilds initial state and histories, follows the
+initialization recipe's clock and cache policies, and returns a packet with
+`callback_state=None`. The next run starts fresh callback reductions and
+recordings at the initialized boundary. The input packet and runner defaults
+remain unchanged. A supplied packet owns its parameters and constants;
+non-`None` `parameters=` or `constants=` overrides cannot be combined with it.
+`initialization=` can override the runner's initialization recipe.
+
+The packet's RNG carry supplies the incoming stream position. Existing
+`reseed_on_initialize`, retained-sample and cache restoration policies still
+apply. In contrast, `initialize(program)` starts from the runner's captured
+initial state and RNG carry. Repeating `initialize(program, packet)` with the
+same unchanged packet repeats the same sampling; use each returned continuation
+to carry the streams forward between trials.
+
+`detach_continuation` ends the previous simulation graph while preserving
+optimizer-owned parameter leaves. Initialization itself preserves gradients.
+Parameter-writing initialization transforms run again on the packet's
+effective sources: they do not recover an earlier pre-transform baseline.
+For source expressions computed outside initialization, such as `raw * gain`,
+recompute those expressions when constructing the next trial's source packet
+if they require a new autograd graph.
+
+The same operation accepts lowered plans:
+
+```python
+# A Population Continuation does not contain its initialization recipe.
+trial = dn.func.initialize(
+    functional_population, finished, initialization=population_recipe,
+)
+
+# A Network plan retains its default initialization recipe.
+trial = dn.func.initialize(functional_network, finished)
+```
+
+For a Population, retain `tensors.initialization` from `make_functional` as
+`population_recipe`, or provide another `InitializationInput`. Supplying a
+Population continuation requires explicit `initialization=`; voltage and
+initial state are not inferred from its running state. Both plan forms use the
+packet's sources and RNG carry without reading the native model.
+
+The complete
+{download}`functional_packet_initialization.py <../../examples/functional_packet_initialization.py>`
+example checks independent optimization trials, shared parameter identity,
+fresh recording, continued RNG, draw replay and portable restart:
+
+```console
+python examples/functional_packet_initialization.py
+python examples/functional_packet_initialization.py --backend aot_eager
+```
+
+```{literalinclude} ../../examples/functional_packet_initialization.py
+:language: python
+:start-after: "# region training"
+:end-before: "# endregion training"
+```
+
 (functional-explicit-initialization)=
 ### Initialize explicit sources
 
@@ -1158,6 +1245,21 @@ bundle:
 draws = dn.func.sample_initialization_draws(functional, tensors)
 initial = dn.func.initialize(functional, tensors, draws=draws)
 ```
+
+Both functions also accept a continuation. For a runner, sampling uses the
+packet's current sources and RNG carry together with the runner's recipe:
+
+```python
+draws = dn.func.sample_initialization_draws(program, finished)
+trial = dn.func.initialize(program, finished, draws=draws)
+```
+
+Use the same `initialization=` recipe for capture and replay. With a lowered
+Population and a continuation, both calls require that argument explicitly.
+Sampling leaves the supplied packet unchanged, and replay publishes its
+resulting RNG carry in the returned continuation. See
+{ref}`functional-packet-initialization` for repeated-trial ownership and RNG
+policies.
 
 The same sampler accepts an initialized native Population or Network, without
 functional lowering. Native initialization consumes the same packet through

@@ -44,6 +44,11 @@ class Continuation:
     fresh recording and reductions. This host form creates a raw binding for
     the invocation without retaining sources or preparation in the plan/kernel.
 
+    ``dn.func.initialize(program_or_plan, packet, ...)`` starts a fresh trial
+    from its effective sources and RNG carry, discarding callback carry. A
+    runner retains its initialization recipe; an explicit Population plan
+    requires ``initialization=`` because the packet does not store a recipe.
+
     Eager plans and compiled chunks accept ``bind(packet)`` to select its raw
     parameter/constant sources. Binding does not retain the packet or adopt
     state/callback carry; continue with ``run(bound, packet, ...)`` explicitly.

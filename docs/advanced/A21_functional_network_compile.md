@@ -156,6 +156,13 @@ complete
 {download}`functional_runner_initialization.py <../../examples/functional_runner_initialization.py>`
 example for both model families.
 
+To restart from an executed packet's effective sources and current RNG carry,
+use `dn.func.initialize(runner, auxiliary["continuation"])`. The fresh protocol
+resets simulation histories and callback carry according to the initialization
+recipe; it retains effective source identities and native reseeding/cache
+policies. The next run starts fresh recordings. See
+{ref}`functional-packet-initialization` for optimization trials and draw replay.
+
 Select `initialization="fresh"` to construct initial state from current
 parameters on each call without explicit state. Population initialization,
 connection resets, and NetStim initialization use the same pure components as

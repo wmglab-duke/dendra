@@ -38,6 +38,14 @@ and typed initialization results remain available. See
 :ref:`functional-explicit-initialization` for ownership, caches, stochastic
 replay and complete examples.
 
+``dn.func.initialize(program_or_plan, continuation)`` starts fresh initialization
+from the packet's effective parameters, constants and current RNG carry. The
+returned packet has no callback carry. Runners and Network plans retain their
+default initialization recipes; a Population plan with a continuation requires
+explicit ``initialization=``. Runner source overrides cannot be combined with
+a continuation. See :ref:`functional-packet-initialization` for source ownership,
+native RNG/cache policies and independent optimization trials.
+
 .. autofunction:: dendra.func.initialize
 
 ``dn.func.sample_initialization_draws`` captures a canonical
@@ -47,6 +55,10 @@ or the pure plan's ``initialize`` method. The packet groups ``random``,
 ``stimulation``, ``netstim`` and ``connections`` draws; for Networks, the first
 two fields map Population names to their existing component packets.
 Unused families or Population entries use ``None``.
+
+Functional capture also accepts a continuation with the same target and recipe
+rules as ``initialize``. It samples from the packet's current RNG carry and
+effective sources without advancing or modifying that packet.
 
 Capture executes one ordered host initialization under ``no_grad`` to resolve
 sampling around transforms, cache restoration and shared writes. It returns
