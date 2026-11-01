@@ -1162,6 +1162,17 @@ class FunctionalNetwork:
 
     def _validate_compatible(self, network):
         _eligible(network)
+        # Check collection scopes before RNG and source adapters resolve names
+        # from this plan against the receiving Network.
+        if any(
+            tuple(getattr(network, name)) != tuple(getattr(self, name))
+            for name in ("populations", "synapses", "continuous_synapses")
+        ):
+            raise FunctionalizationError(
+                "Network phase topology does not match this plan."
+            )
+        if (network.netstim is None) != (self.netstim is None):
+            raise FunctionalizationError("Network NetStim presence does not match.")
         self._stimulation_plan.validate_compatible_network(network)
         self._rng_plan.validate_compatible_network(network)
         self._stimulation_rng_plan.validate_compatible_network(network)
@@ -1222,8 +1233,6 @@ class FunctionalNetwork:
                 raise FunctionalizationError(
                     "Network continuous bindings do not match."
                 )
-        if (network.netstim is None) != (self.netstim is None):
-            raise FunctionalizationError("Network NetStim presence does not match.")
         if self.netstim is not None:
             self._netstim_parameter_plan.validate_source(network.netstim)
             self._netstim_parameter_plan._validate_runtime_ownership(

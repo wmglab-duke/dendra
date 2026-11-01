@@ -3939,9 +3939,12 @@ class Population(P, Sliceable):
             at the model's current time and converted to this step's ``ve``.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
-            ``dn.func.make_callbacks`` for this exact model and timestep.
-            Pure observations run after clock advancement and before native
-            post-step hooks. Native hooks retain their loop/chunk/step timing.
+            ``dn.func.make_callbacks`` for this Population or a compatible
+            initialized Population. Requested ``dt`` must honor prepared Recorder
+            cadence and threshold timing. Pure observations read this receiver's
+            state with fixed prepared selections. They run after clock advancement
+            and before native post-step hooks. Native hooks retain their
+            loop/chunk/step timing.
         loop_hooks : bool, optional
             If ``True``, also call ``pre_loop_hook`` before the step and
             ``post_loop_hook`` after the step. Leave this ``False`` when
@@ -4162,9 +4165,12 @@ class Population(P, Sliceable):
             ``A.dt`` from the backend is used.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
-            ``dn.func.make_callbacks`` for this exact model and timestep.
-            Pure observations run after clock advancement and before native
-            post-step hooks. Native hooks retain their loop/chunk/step timing.
+            ``dn.func.make_callbacks`` for this Population or a compatible
+            initialized Population. Requested ``dt`` must honor prepared Recorder
+            cadence and threshold timing. Pure observations read this receiver's
+            state with fixed prepared selections. They run after clock advancement
+            and before native post-step hooks. Native hooks retain their
+            loop/chunk/step timing.
         progressbar : bool or tqdm, optional
             If ``True``, displays a progress bar during simulation. Can also be
             a :class:`tqdm.tqdm` instance for custom progress tracking.
@@ -4563,9 +4569,12 @@ class Population(P, Sliceable):
             contacts is not supported and will raise a :class:`ValueError`.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
-            ``dn.func.make_callbacks`` for this exact model and timestep.
-            Pure observations run after clock advancement and before native
-            post-step hooks. Native hooks retain their loop/chunk/step timing.
+            ``dn.func.make_callbacks`` for this Population or a compatible
+            initialized Population. Requested ``dt`` must honor prepared Recorder
+            cadence and threshold timing. Pure observations read this receiver's
+            state with fixed prepared selections. They run after clock advancement
+            and before native post-step hooks. Native hooks retain their
+            loop/chunk/step timing.
         progressbar : bool or tqdm, optional
             If ``True`` (or if a :class:`tqdm.tqdm` instance is provided), displays
             a progress bar to track simulation progress across chunks. Default is ``False``.
@@ -7549,9 +7558,12 @@ class Population(P, Sliceable):
             and trailing-first broadcasting contract as :meth:`longrun`.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
-            ``dn.func.make_callbacks`` for this exact model and timestep.
-            Pure observations run after clock advancement and before native
-            post-step hooks. Native hooks retain their loop/chunk/step timing.
+            ``dn.func.make_callbacks`` for this Population or a compatible
+            initialized Population. Requested ``dt`` must honor prepared Recorder
+            cadence and threshold timing. Pure observations read this receiver's
+            state with fixed prepared selections. They run after clock advancement
+            and before native post-step hooks. Native hooks retain their
+            loop/chunk/step timing.
         progressbar : bool, optional
             If True, display a progress bar during the run. Default is False.
         safe_checkpoint : bool, optional

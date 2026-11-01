@@ -3893,8 +3893,10 @@ class Network(RNGMixin):
             registered solver stimulation. Omitted fields retain those sources.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
-            ``dn.func.make_callbacks`` for this exact model and timestep.
-            Pure observations run after clock advancement and before native
+            ``dn.func.make_callbacks`` for this Network or a compatible initialized
+            Network with matching timestep and mode. Pure observations read this
+            receiver's state with fixed prepared paths, scopes and selections.
+            They run after clock advancement and before native
             post-step hooks. Native hooks retain their loop/chunk/step timing.
         loop_hooks : bool, optional
             If ``True``, also call ``pre_loop_hook`` before the step and
@@ -4079,8 +4081,10 @@ class Network(RNGMixin):
             timestep count. Fields share the conflict rules of :meth:`step`.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
-            ``dn.func.make_callbacks`` for this exact model and timestep.
-            Pure observations run after clock advancement and before native
+            ``dn.func.make_callbacks`` for this Network or a compatible initialized
+            Network with matching timestep and mode. Pure observations read this
+            receiver's state with fixed prepared paths, scopes and selections.
+            They run after clock advancement and before native
             post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool or tqdm.tqdm, optional
             If truthy, show a progress bar (auto-created if True). Default False.
@@ -4308,8 +4312,10 @@ class Network(RNGMixin):
             gradients; all tape lengths match the selected timestep count.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
-            ``dn.func.make_callbacks`` for this exact model and timestep.
-            Pure observations run after clock advancement and before native
+            ``dn.func.make_callbacks`` for this Network or a compatible initialized
+            Network with matching timestep and mode. Pure observations read this
+            receiver's state with fixed prepared paths, scopes and selections.
+            They run after clock advancement and before native
             post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool or tqdm.tqdm, optional
             If truthy, display progress over completed timesteps.
@@ -5649,8 +5655,10 @@ class Network(RNGMixin):
             slices so replay uses the same frames and preserves input gradients.
         callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
             Native hook sequence, or a pure collection prepared once with
-            ``dn.func.make_callbacks`` for this exact model and timestep.
-            Pure observations run after clock advancement and before native
+            ``dn.func.make_callbacks`` for this Network or a compatible initialized
+            Network with matching timestep and mode. Pure observations read this
+            receiver's state with fixed prepared paths, scopes and selections.
+            They run after clock advancement and before native
             post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar:
             If ``True``, displays a tqdm progress bar over chunks.

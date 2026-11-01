@@ -37,7 +37,10 @@ def step(
         same population-name mapping accepted by ``Network.run(extra=...)``.
     callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
         Native hook sequence, or a pure collection prepared once with
-        ``dn.func.make_callbacks`` for this exact model and timestep.
+        ``dn.func.make_callbacks`` for this model or a compatible initialized
+        receiver. Observations read receiver state with fixed prepared selections.
+        Population ``dt`` must honor prepared cadence and threshold timing;
+        a Network uses its matching initialized timestep and mode.
         Pure observations run after clock advancement and before native
         post-step hooks. Native hooks retain their loop/chunk/step timing.
     loop_hooks : bool, optional
@@ -138,7 +141,9 @@ def step_population(
         ``Population.run(extra=...)``.
     callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
         Native hook sequence, or a pure collection prepared once with
-        ``dn.func.make_callbacks`` for this exact model and timestep.
+        ``dn.func.make_callbacks`` for this Population or a compatible initialized
+        receiver. Observations read receiver state with fixed prepared selections.
+        Requested ``dt`` must honor prepared cadence and threshold timing.
         Pure observations run after clock advancement and before native
         post-step hooks. Native hooks retain their loop/chunk/step timing.
     loop_hooks : bool, optional
@@ -202,7 +207,9 @@ def step_network(
         mapping accepted by ``Network.run(extra=...)``.
     callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
         Native hook sequence, or a pure collection prepared once with
-        ``dn.func.make_callbacks`` for this exact model and timestep.
+        ``dn.func.make_callbacks`` for this Network or a compatible initialized
+        receiver with matching timestep and mode. Observations read receiver
+        state with fixed prepared selections.
         Pure observations run after clock advancement and before native
         post-step hooks. Native hooks retain their loop/chunk/step timing.
     loop_hooks : bool, optional

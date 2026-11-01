@@ -354,6 +354,17 @@ Native preparation retains full functional lowering's eligibility and setup
 cost; it does not initialize, advance, sample or move the model. Existing-plan
 preparation reuses that exact plan without lowering again.
 
+After preparation, a collection can observe compatible initialized native
+models at its timestep. The receiver supplies runtime state and must match the
+prepared structure, state layout, dtype/device, execution mode and source
+sharing. Paths, scopes and selection indices stay fixed. Physical Slice and
+region configuration must refer to the exact source model at preparation;
+native reuse applies the resolved indices to the receiver. Functional execution
+still requires the collection's exact owning plan.
+Population execution checks its requested timestep against prepared Recorder
+cadence and threshold timing and can configure its integrator for that call.
+A Network's initialized timestep and mode must match the prepared plan.
+
 Keep the returned collection across repeated calls: every new collection has
 its own live carry identity. Portable export/restore transfers detached carry
 into equivalent newly prepared collections. The factory does not accept
@@ -371,6 +382,18 @@ calls retain the existing ``callback_state=`` contract; raw-bound host runs
 also accept it as part of a shared continuation packet. See
 :doc:`../advanced/A58_functional_callback_checkpoints` for complete Population
 and Network examples, ownership, and compatibility rules.
+
+For functional-to-native handoff, commit model sources and state with
+``dn.func.commit_continuation_(program, receiver, packet)``, then call the native
+receiver with ``callbacks=program.callbacks`` and
+``callback_state=program.callbacks.detach_state(packet.callback_state)``.
+Callback detachment retains reducer totals and Recorder cadence while cutting
+their earlier recurrent gradients. Native model gradients belong to receiving
+Parameters; external LFP fields remain configured on the same collection and
+refresh under the ambient gradient mode. Custom callbacks need no serialization
+protocol for same-collection reuse. Different collections use export/restore.
+See :doc:`../advanced/A59_functional_native_handoff` and
+:download:`shared_callback_rebinding.py <../../examples/shared_callback_rebinding.py>`.
 
 ``dn.Recorder`` configures native and functional recording;
 ``dn.func.Recorder`` remains supported. Functional binding captures observation
@@ -505,8 +528,8 @@ packets. Source expressions and earlier outputs retain their own graphs. See
 
 Native ``Population.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
 a prepared ``FunctionalCallbacks`` collection through ``callbacks=`` and explicit
-continuation through ``callback_state=results.state``. The collection must bind
-the exact source Population and matching timestep; prepare it directly with
+continuation through ``callback_state=results.state``. The collection must match
+the receiving Population's structure and timestep; prepare it directly with
 ``dn.func.make_callbacks(model, configurations, dt=...)``. Native model state remains
 on the Population. Opted-in ``step``, ``run`` and ``longrun`` return the existing
 ``FunctionalCallbackResults`` mapping. Without a pure collection, ``step``
@@ -532,7 +555,8 @@ example.
 Native ``Network.step``, ``run``, ``longrun`` and ``longrun_checkpointed`` accept
 the same ``callbacks`` and ``callback_state`` keywords and compatibility spellings.
 Prepare the collection with ``dn.func.make_callbacks(network, configurations)``
-for the exact initialized source Network; its initialized timestep remains
+from an initialized source Network, or reuse a compatible prepared collection.
+The receiving Network's initialized timestep remains
 authoritative. Qualified Network
 Recorders and Population-scoped pure callbacks keep their functional selections,
 cadence and outputs. Unscoped auxiliary data is

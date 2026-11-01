@@ -28,9 +28,11 @@ from ._types import FunctionalizationError
 class _ImperativeNetworkCallbackBinding:
     callbacks: FunctionalCallbacks
     functional: object
+    network: object
     population_bindings: tuple
     random_streams: tuple
     stimulation_streams: tuple
+    stimulation_sources: dict | None
 
     def state(self):
         from dendra.models.stim.waveform._poisson import poisson_generator_state
@@ -39,7 +41,7 @@ class _ImperativeNetworkCallbackBinding:
         from ._rng_frames import _rng_values
 
         functional = self.functional
-        network = functional._source
+        network = self.network
         state = {
             "populations": {},
             "synapses": {
@@ -60,11 +62,16 @@ class _ImperativeNetworkCallbackBinding:
             if plan._poisson_plan is not None:
                 local = {}
                 for entry in plan._poisson_plan.entries:
-                    key = (id(entry.source), entry.dtype, entry.device)
+                    source = (
+                        entry.source
+                        if self.stimulation_sources is None
+                        else self.stimulation_sources[name][entry.key]
+                    )
+                    key = (id(source), entry.dtype, entry.device)
                     if key not in schedules:
                         schedules[key] = normalize_schedule(
-                            entry.source,
-                            entry.source._spike_times,
+                            source,
+                            source._spike_times,
                             dtype=entry.dtype,
                             device=entry.device,
                         ).reshape(-1)
@@ -119,12 +126,28 @@ class _ImperativeNetworkCallbackBinding:
 
 def _bind_native_network_callbacks(callbacks, network):
     functional = callbacks._functional
-    if network is not functional._source:
-        raise FunctionalizationError(
-            "functional callbacks must be bound to the exact source "
-            "Network used by make_functional_network()"
-        )
+    original = network is functional._source
+    if not original:
+        from dendra.models.networks.net import Network
+
+        if not isinstance(network, Network):
+            raise FunctionalizationError(
+                "functional callbacks require a compatible initialized Network"
+            )
     functional._validate_source()
+    if not original:
+        functional._validate_compatible(network)
+        # Network extraction delegates these checks to component extraction.
+        # Binding only needs the validators and native readers, preserving live
+        # autograd history without snapshotting or preparing model inputs.
+        for name, plan in functional.populations.items():
+            plan._validate_compatible_population(network.populations[name])
+        for name, plan in functional.synapses.items():
+            plan._validate_compatible(network.synapses[name])
+        for name, plan in functional.continuous_synapses.items():
+            plan._validate_compatible(network.continuous_synapses[name])
+        if functional.netstim is not None:
+            functional.netstim._validate_compatible(network.netstim)
     bindings = tuple(
         (
             name,
@@ -134,18 +157,50 @@ def _bind_native_network_callbacks(callbacks, network):
         )
         for name, plan in functional.populations.items()
     )
-    random_streams = tuple(
-        (key, functional._rng_plan._sources[key], functional.populations[name].device)
-        for key, (name, _path, _attribute) in functional._rng_plan.streams.items()
-    )
+    if original:
+        random_streams = tuple(
+            (
+                key,
+                functional._rng_plan._sources[key],
+                functional.populations[name].device,
+            )
+            for key, (name, _path, _attribute) in functional._rng_plan.streams.items()
+        )
+    else:
+        owners = {
+            name: functional._rng_plan._owners(network.populations[name])
+            for name, plan in functional.populations.items()
+            if plan._random_plan is not None
+        }
+        random_streams = tuple(
+            (
+                key,
+                getattr(owners[name][path], attribute),
+                functional.populations[name].device,
+            )
+            for key, (name, path, attribute) in functional._rng_plan.streams.items()
+        )
     stimulation = {}
+    stimulation_sources = None if original else {}
     for name, plan in functional._stimulation_plan.plans.items():
+        sources = (
+            None if original else plan._resolved_sources(network.populations[name])
+        )
+        if not original:
+            stimulation_sources[name] = sources
         for entry in plan.entries:
+            source = entry.source if original else sources[entry.key]
             stimulation.setdefault(
-                functional._stimulation_plan.local[name][entry.stream], entry.source
+                functional._stimulation_plan.local[name][entry.stream], source
             )
     binding = _ImperativeNetworkCallbackBinding(
-        callbacks, functional, bindings, random_streams, tuple(stimulation.items())
+        callbacks,
+        functional,
+        network,
+        bindings,
+        random_streams,
+        tuple(stimulation.items()),
+        stimulation_sources,
     )
     functional._validate_state(binding.state())
     return binding

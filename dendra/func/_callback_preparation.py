@@ -32,9 +32,11 @@ def make_callbacks(
     -------
     FunctionalCallbacks
         Bound observations with explicit results and continuation carry. Reuse
-        this collection across calls; ordinary preparation creates a new carry
-        token. Use portable callback checkpoints to transfer carry between
-        equivalent independently prepared collections.
+        this collection across native calls on compatible initialized receivers;
+        observations read the receiving model with fixed prepared paths, scopes
+        and selections. Ordinary preparation creates a new carry token. Use
+        portable callback checkpoints to transfer carry between equivalent
+        independently prepared collections.
 
     Notes
     -----
@@ -45,6 +47,15 @@ def make_callbacks(
     The existing plan methods and compile-time callback configuration remain
     supported. Runners, bindings and tensor packets are not preparation targets;
     use an owning functional plan when one is available.
+
+    Functional execution requires this collection's exact owning plan, and live
+    carry requires the same collection. Physical Slice and region configurations
+    must refer to the original source model during preparation; native reuse
+    applies their resolved indices to the receiver. Population execution checks
+    its requested timestep against prepared Recorder cadence and threshold
+    timing. A receiving Network's initialized timestep and mode must match the
+    plan. Callback-bound LFP fields and plan-bound ``extra`` retain their existing
+    sources.
     """
     if (
         torch.compiler.is_compiling()

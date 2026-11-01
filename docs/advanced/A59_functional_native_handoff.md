@@ -243,8 +243,64 @@ detached transfer of sources and state together.
 
 Callback carry belongs to its prepared callback collection. Model handoff
 leaves `continuation.callback_state` unchanged and does not install callbacks
-or open storage. Transfer callback carry to a compatible receiving collection
-through its existing portable state protocol:
+or open storage. Reuse the same prepared collection on a compatible initialized
+native receiver, including `program.callbacks`:
+
+```{literalinclude} ../../examples/shared_callback_rebinding.py
+:language: python
+:start-after: "# region handoff"
+:end-before: "# endregion handoff"
+:dedent: 4
+```
+
+`commit_continuation_` transfers detached model sources and simulation state.
+`callbacks.detach_state(packet.callback_state)` separately truncates the callback
+recurrent graph, retaining reducer totals, crossing latches and Recorder cadence.
+The native suffix emits only new selected samples, without repeating the shared
+boundary. Omit `callback_state=` to start fresh observations at that boundary.
+Keep live carry without detaching only when its earlier callback graph should
+remain connected.
+
+Native callback observations come from the receiving model. Prepared paths,
+Population scopes and selection indices remain fixed; compatible receivers
+match the collection's model structure, runtime layout, dtype/device, execution
+mode and source-sharing requirements. Population execution checks its requested
+timestep against prepared Recorder cadence and threshold timing; a Network's
+initialized timestep must match the plan. Physical Slice and region
+configuration still requires the exact original source model during preparation;
+the resulting indices are reused on the receiver. Functional execution still
+requires the collection's exact owning plan. A different collection requires
+the explicit export/restore bridge, even if its configuration matches.
+
+After model handoff and callback detachment, native model-parameter gradients
+belong to the receiving Parameters. They do not reach the functional prefix,
+the program's independent parameters or the source native model. External LFP
+field sources remain configured on the same callback collection. Detaching
+callback state with gradients enabled refreshes its field carry from those
+sources and retains suffix field gradients; it does not transfer fields into
+the receiving model. Externally computed nonleaf field sources retain their own
+upstream graph lifetime.
+
+Custom pure callbacks need no serialization protocol for same-collection reuse:
+
+```{literalinclude} ../../examples/shared_callback_rebinding.py
+:language: python
+:start-after: "# region reducer"
+:end-before: "# endregion reducer"
+```
+
+The complete
+{download}`shared_callback_rebinding.py <../../examples/shared_callback_rebinding.py>`
+example covers Populations and Networks, compares cadenced recordings and
+reducer totals with native and functional references, and checks receiving
+Parameter gradients:
+
+```console
+python examples/shared_callback_rebinding.py
+```
+
+To use an independently prepared receiving collection or save portable carry,
+transfer callback state through its checkpoint protocol:
 
 ```python
 saved_callbacks = program.callbacks.export_state(continuation.callback_state)
@@ -260,12 +316,13 @@ target.run(
 )
 ```
 
-This snippet uses a Population. Use equivalent callback configurations and the
-same names when preparing the receiving collection. For Networks, use the
+This portable snippet uses a Population. Use equivalent callback configurations
+and the same names when preparing the receiving collection. For Networks, use the
 initialized Network timestep, omit the `dt` argument to `run`, and select the
 corresponding Network recorder paths or `dn.callbacks.PopulationCallback`
 scopes. Recorded history and HDF5 sessions remain separately owned; see
-{doc}`A58_functional_callback_checkpoints`.
+{doc}`A58_functional_callback_checkpoints`. Portable export requires the optional
+checkpoint protocol for custom callbacks.
 
 Inputs, runtime draw tapes and call-local `extra` arguments are not stored in a
 `Continuation`. Supply them again for resumed native execution through the

@@ -90,9 +90,9 @@ def test_disabled_session_performs_no_population_access_and_rejects_orphan_state
         _bind_native_callbacks(Untouched(), object(), None)
 
 
-def test_session_reuses_exact_source_and_defers_storage_until_execution():
+def test_session_rejects_incompatible_receivers_and_defers_storage_until_execution():
     case = _case()
-    with pytest.raises(FunctionalizationError, match="exact source Population"):
+    with pytest.raises((TypeError, FunctionalizationError), match="Population"):
         _bind_native_callbacks(torch.nn.Module(), case.callbacks, None)
     assert case.events == []
     _bind_native_callbacks(case.population, case.callbacks, None)
@@ -531,7 +531,9 @@ def test_network_session_preserves_cross_population_aliases_and_local_auxiliary(
 def test_network_session_rejects_wrong_owner_and_lost_native_buffer_before_hooks():
     case = _network_case()
     for wrong_owner in (case.population, SimpleNamespace()):
-        with pytest.raises(FunctionalizationError, match="exact source Network"):
+        with pytest.raises(
+            FunctionalizationError, match="compatible initialized Network"
+        ):
             _bind_native_callbacks(wrong_owner, case.callbacks, None)
     assert case.events == [] and case.frames == []
     del case.population.v_alias

@@ -283,8 +283,11 @@ def test_callback_argument_conflicts_and_orphan_carry_reject_before_advancing(ne
                 callbacks=callbacks,
                 callback_state=object(),
             )
-        with pytest.raises(dn.func.FunctionalizationError, match="exact source"):
-            _call(_case(network)[0], network, method, steps=0, callbacks=callbacks)
+        incompatible = _case(network)[0]
+        incompatible.eval()
+        incompatible.initialize(DT) if network else incompatible.initialize()
+        with pytest.raises(dn.func.FunctionalizationError, match="mode|structure"):
+            _call(incompatible, network, method, steps=0, callbacks=callbacks)
         _assert_packet_equal(model.state_dict_for_checkpoint(), frozen)
     if not network:
         with pytest.raises(dn.func.FunctionalizationError, match="dt|timestep"):

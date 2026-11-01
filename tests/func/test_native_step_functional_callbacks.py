@@ -407,8 +407,11 @@ def test_step_observer_guards_preserve_source_state(
         _step(model, network, state=object())
     with pytest.raises(TypeError, match="FunctionalCallbacks"):
         _step(model, network, callbacks={})
-    with pytest.raises(dn.func.FunctionalizationError, match="exact source"):
-        _step(_case(network)[0], network, callbacks=callbacks)
+    incompatible = _case(network)[0]
+    incompatible.eval()
+    incompatible.initialize(DT) if network else incompatible.initialize()
+    with pytest.raises(dn.func.FunctionalizationError, match="mode|structure"):
+        _step(incompatible, network, callbacks=callbacks)
     with pytest.raises(TypeError, match="FunctionalCallbackState"):
         _step(model, network, callbacks=callbacks, state=object())
     if not network:

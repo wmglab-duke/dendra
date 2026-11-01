@@ -409,8 +409,11 @@ def test_checkpoint_observer_guards_precede_execution(
         _checkpoint(model, steps=0, state=object())
     with pytest.raises(TypeError, match="FunctionalCallbacks"):
         _checkpoint(model, {}, steps=0)
-    with pytest.raises(dn.func.FunctionalizationError, match="exact source Network"):
-        _checkpoint(_driven()[0], callbacks, steps=0)
+    incompatible = _driven()[0]
+    incompatible.eval()
+    incompatible.initialize(DT)
+    with pytest.raises(dn.func.FunctionalizationError, match="mode"):
+        _checkpoint(incompatible, callbacks, steps=0)
     with pytest.raises(TypeError, match="FunctionalCallbackState"):
         _checkpoint(model, callbacks, steps=0, state=object())
     disk = dn.Recorder(("left.v", "t")).set_hdf5(

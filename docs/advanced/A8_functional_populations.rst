@@ -2346,6 +2346,18 @@ existing plan reuses that exact plan without lowering it again. This is host
 setup outside compiled execution and tensor transforms; perform it once and
 reuse the returned collection.
 
+The prepared collection can also observe another compatible initialized native
+Population or Network at the same timestep. All runtime observations come from
+the receiving model. Its structure, state layout, dtype/device, execution mode
+and source-sharing relationships must satisfy the prepared plan. Paths,
+Population scopes and resolved selection indices stay fixed. Physical Slice
+and region configuration still requires the exact source model at preparation;
+native reuse applies the prepared indices to the receiver. Functional execution
+continues to require the collection's exact owning plan.
+Population execution checks the requested timestep against prepared Recorder
+cadence and threshold timing, configuring its integrator for that call.
+A Network's initialized timestep and mode must match the prepared plan.
+
 Each preparation creates a new collection identity. Keep that collection when
 resuming its live carry. To transfer carry into an equivalent new collection,
 use ``export_state`` and ``restore_state``; restoration detaches callback carry
@@ -2365,6 +2377,17 @@ scoped analysis, cadence, gradients and portable callback carry:
 .. code-block:: console
 
    python examples/shared_callback_preparation.py
+
+After ``dn.func.commit_continuation_(program, receiver, packet)``, reuse
+``program.callbacks`` directly with the native receiver. Pass
+``program.callbacks.detach_state(packet.callback_state)`` as ``callback_state=``
+to truncate callback recurrent gradients while retaining reducer totals and
+Recorder cadence. Receiving native Parameters own subsequent model gradients;
+external LFP fields remain sources of the same collection and refresh under the
+ambient gradient mode. Custom callbacks need no serialization hooks for this
+same-collection reuse. See :doc:`A59_functional_native_handoff` and
+:download:`shared_callback_rebinding.py <../../examples/shared_callback_rebinding.py>`
+for complete Population and Network examples.
 
 Binding a Recorder captures its configuration and prepares an independent
 immutable pure Recorder. Native recording history and phase are not imported
@@ -2690,8 +2713,9 @@ configuration example with scan, while, gradients and portable continuation.
 Pure callbacks with native Population execution
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-The same callback plan can observe its source model through native
-``Population.step``, ``run``, ``longrun`` and ``longrun_checkpointed``. Define an
+The same callback plan can observe its source model or a compatible receiver
+through native ``Population.step``, ``run``, ``longrun`` and
+``longrun_checkpointed``. Define an
 analysis once with ``FunctionalCallback.initialize``, ``update`` and ``finalize``,
 then use it with either native or functional dynamics. Native execution keeps
 model state on the Population and returns callback results with explicit carry:
@@ -2708,9 +2732,10 @@ model state on the Population and returns callback results with explicit carry:
    )
    voltage = torch.cat((first["trace"]["v"], second["trace"]["v"]))
 
-Prepare from that exact Population or its existing functional plan, with a
-timestep matching the native call. This bridge applies to Populations admitted
-by functional lowering. Bind the collection once outside
+Prepare from an initialized Population or its existing functional plan, with a
+timestep matching the native call. Reuse the resulting collection on compatible
+native Populations with the same prepared selections. This bridge applies to
+Populations admitted by functional lowering. Bind the collection once outside
 repeated execution. Supplying callback carry resumes its observation phase;
 the Population itself retains the simulation state. Callback carry does not
 restore or initialize the model.
@@ -2947,7 +2972,7 @@ simulation state:
        voltage = result["trace"]["v"]
 
 For a Network, omit ``dt``: its initialized timestep is authoritative. The
-collection must bind to the exact source model and matching timestep.
+collection must be prepared for a compatible model and matching timestep.
 ``dn.step``, ``dn.step_population`` and ``dn.step_network`` accept the same
 callback arguments and compatibility spellings, preserving these return
 conventions.

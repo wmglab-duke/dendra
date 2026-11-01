@@ -1938,12 +1938,17 @@ class FunctionalCallbacks:
             from ._network_callbacks import _bind_native_network_callbacks
 
             return _bind_native_network_callbacks(self, population)
-        if population is not self._functional._population:
-            raise FunctionalizationError(
-                "functional callbacks must be bound to the exact source "
-                "Population used by make_functional()"
-            )
+        original = population is self._functional._population
+        if not original:
+            from dendra.models.core import Population
+
+            if not isinstance(population, Population):
+                raise FunctionalizationError(
+                    "functional callbacks require a compatible native Population"
+                )
         self._functional._validate_source()
+        if not original:
+            self._functional._validate_compatible_population(population)
         return _ImperativeCallbackBinding(
             self, _native_population_readers(self._functional, population)
         )

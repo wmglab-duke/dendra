@@ -82,6 +82,30 @@ Different collections use `export_state` / `restore_state` before capture.
 See {doc}`A59_functional_native_handoff` and
 {download}`functional_callback_capture.py <../../examples/functional_callback_capture.py>`.
 
+For an in-process functional-to-native handoff, keep the prepared collection:
+
+```python
+_, auxiliary = dn.func.run(program)
+packet = auxiliary["continuation"]
+dn.func.commit_continuation_(program, native_receiver, packet)
+carry = program.callbacks.detach_state(packet.callback_state)
+results = native_receiver.run(
+    steps=100, dt=solver_dt,
+    callbacks=program.callbacks, callback_state=carry,
+)
+```
+
+This Population snippet uses an initialized compatible receiver; a Network uses
+its initialized timestep and omits `dt`. The same collection observes the
+receiver's state with its prepared paths, scopes and selection indices. Totals
+and Recorder phase continue without serializing custom carry. Model handoff
+cuts model-source gradients, and `detach_state` cuts callback recurrent
+gradients while refreshing external LFP field carry under the ambient gradient
+mode. Custom callbacks do not need `checkpoint_configuration()` for this reuse.
+Functional owner checks and carry collection tokens remain exact; use portable
+export/restore when moving carry into another collection. See
+{download}`shared_callback_rebinding.py <../../examples/shared_callback_rebinding.py>`.
+
 For continuation with live graph history, pass `auxiliary["continuation"]`
 directly to the next call. Portable export is a separate operation with an
 explicit autograd boundary. Save the result of `export_continuation`, rather
@@ -611,7 +635,11 @@ current field sources before execution.
 
 Ordinary carry still belongs to its exact in-memory callback collection.
 Restoration is the explicit checked bridge into an equivalent reconstructed
-collection. The public `(state, auxiliary)` result and `callback_state=`
+collection. Keeping that collection permits in-process observation of another
+compatible native model; it does not change its functional-plan owner or carry
+token. Physical Slice and region configurations must belong to the original
+source at preparation, and their prepared indices remain fixed during native
+reuse. The public `(state, auxiliary)` result and `callback_state=`
 execution argument use the same contract for eager bindings, direct chunks,
 host scheduling, scan and supported inference while loops.
 Raw-bound `dn.func.run` additionally accepts the shared continuation packet;

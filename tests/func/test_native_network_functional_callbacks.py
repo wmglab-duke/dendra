@@ -483,7 +483,7 @@ def test_older_native_network_observation_gradients_preserve_later_model_state()
 
 
 @pytest.mark.parametrize("method", _METHODS)
-def test_native_network_observer_defaults_and_exact_owner_state_validation(method):
+def test_native_network_observer_defaults_and_compatible_owner_state_validation(method):
     model = _network()
     assert _execute(model, method, steps=0) is None
     callbacks = _plan(model)[2]
@@ -492,8 +492,11 @@ def test_native_network_observer_defaults_and_exact_owner_state_validation(metho
         _execute(model, method, state=object(), steps=0)
     with pytest.raises(TypeError, match="FunctionalCallbacks"):
         _execute(model, method, callbacks={}, steps=0)
-    with pytest.raises(dn.func.FunctionalizationError, match="exact source Network"):
-        _execute(_network(), method, callbacks=callbacks, steps=0)
+    incompatible = _network()
+    incompatible.eval()
+    incompatible.initialize(DT)
+    with pytest.raises(dn.func.FunctionalizationError, match="mode"):
+        _execute(incompatible, method, callbacks=callbacks, steps=0)
     with pytest.raises(TypeError, match="FunctionalCallbackState"):
         _execute(model, method, callbacks=callbacks, state=object(), steps=0)
     _assert_packet_equal(model.state_dict_for_checkpoint(), frozen)

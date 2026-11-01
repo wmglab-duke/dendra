@@ -90,7 +90,7 @@ not make its imperative hooks functionally lowerable.
 Native `Network.step`, `run`, `longrun` and `longrun_checkpointed` accept the same
 bound callback collection through `callbacks=` and explicit carry through
 `callback_state=`. Build it from the
-exact initialized source Network. Its timestep comes from
+initialized source Network. Its timestep comes from
 `network.initialize(dt)`; native Network execution uses that timestep without
 a per-call `dt` argument:
 
@@ -118,6 +118,24 @@ collection has its own carry identity; use portable export/restore to transfer
 carry between equivalent collections. See
 {ref}`functional-shared-callback-preparation` and
 {download}`shared_callback_preparation.py <../../examples/shared_callback_preparation.py>`.
+
+A prepared collection also observes a compatible initialized native Network at
+the same timestep, using that receiver's runtime state. Top-level names, model
+structure, state layout, dtype/device, execution mode and source sharing must
+match its prepared requirements. Qualified paths, scopes and resolved selection
+indices remain fixed. Physical Slice and region configurations require the exact
+source Network at preparation; reuse applies those indices to the receiving
+Network. Functional execution still requires the exact owning plan, and carry
+still belongs to its original collection.
+
+For functional-to-native continuation, commit the packet with
+`dn.func.commit_continuation_(program, receiver, packet)`, then pass
+`callbacks=program.callbacks` and
+`callback_state=program.callbacks.detach_state(packet.callback_state)` to native
+execution. This retains totals and Recorder phase while truncating earlier
+recurrent gradients. Custom callbacks need no portable checkpoint hooks for
+same-collection reuse. See {doc}`A59_functional_native_handoff` and
+{download}`shared_callback_rebinding.py <../../examples/shared_callback_rebinding.py>`.
 
 The Network owns its advancing model and connection state. Callback carry is
 separate: pass `results.state` to continue observation phase and reducer totals

@@ -378,8 +378,9 @@ def test_new_bindings_keep_live_tokens_independent_and_portable_carry_compatible
         _execute(model, "longrun", second, state=prefix.state, steps=0)
     _assert_packet_equal(model.state_dict_for_checkpoint(), frozen)
     other = _case(network)
-    with pytest.raises(dn.func.FunctionalizationError, match="exact source"):
-        _execute(other, "run", first, steps=0)
+    compatible = _execute(other, "run", first, steps=0)
+    assert compatible.state.plan_token is prefix.state.plan_token
+    assert compatible["trace"][_trace(network)[0]].shape[0] == 1
     packet = _disk(first.export_state(prefix.state), tmp_path / "callbacks.pt")
     restored = second.restore_state(packet)
     suffix = _execute(model, "longrun", second, state=restored, steps=2)

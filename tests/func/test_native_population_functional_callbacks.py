@@ -348,8 +348,11 @@ def test_ordinary_native_default_returns_and_validation_remain_compatible(method
         _execute(model, method, state=object(), steps=0)
     with pytest.raises(TypeError, match="FunctionalCallbacks"):
         _execute(model, method, plan={}, steps=0)
-    with pytest.raises(dn.func.FunctionalizationError, match="exact source Population"):
-        _execute(_model(), method, plan=callbacks, steps=0)
+    incompatible = _model()
+    incompatible.eval()
+    incompatible.initialize()
+    with pytest.raises(dn.func.FunctionalizationError, match="mode|structure"):
+        _execute(incompatible, method, plan=callbacks, steps=0)
     with pytest.raises(dn.func.FunctionalizationError, match="dt|timestep"):
         options = {"chunklength": 2} if method == "longrun" else {}
         getattr(model, method)(

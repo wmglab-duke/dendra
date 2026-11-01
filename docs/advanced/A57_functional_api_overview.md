@@ -267,7 +267,7 @@ Population and Network execution.
 
 A bound pure callback collection also works with native `Population.step`, `run`,
 `longrun` and `longrun_checkpointed`. Prepare the collection directly from the
-exact initialized source Population and the same timestep:
+initialized source Population and the same timestep:
 
 ```python
 observations = dn.func.make_callbacks(
@@ -295,6 +295,19 @@ lowering's setup cost and eligibility requirements. It does not initialize,
 advance, sample or move the model. Bind once outside repeated execution; each
 new collection has its own live carry identity. Portable callback export/restore
 transfers detached carry between equivalent collections.
+
+Once prepared, the same collection can observe another compatible initialized
+native Population or Network at its timestep. The receiving model supplies all
+runtime observations; it must match the prepared structure, state layout,
+dtype/device, execution mode and source-sharing requirements. Resolved callback
+paths, Population scopes and selection indices stay fixed. A physical Slice or
+region must belong to the exact source model when configuring the collection;
+reuse applies those prepared indices to the receiving model. Functional
+execution still requires the collection's exact owning plan, and live carry
+still requires that same collection.
+Population execution checks its requested timestep against prepared Recorder
+cadence and threshold timing; it can configure its integrator for that call.
+A Network's initialized timestep and mode must match the prepared plan.
 
 For existing bindings or runners, select `bound.functional` or
 `program.functional` explicitly. Runners retain their constructor-configured
@@ -343,8 +356,9 @@ python examples/native_functional_callbacks.py
 Native `Network.step`, `run`, `longrun` and `longrun_checkpointed` accept the same
 `callbacks=` and `callback_state=` arguments and compatibility spellings.
 Create the bound collection with
-`dn.func.make_callbacks(network, configurations)` from the exact initialized
-source Network. Qualified Recorders select fields
+`dn.func.make_callbacks(network, configurations)` from an initialized source
+Network, or reuse a collection prepared for a compatible Network. Qualified
+Recorders select fields
 such as `"left.v"`; `dn.callbacks.PopulationCallback("right", callback)`
 selects one Population for a relative Recorder or custom pure analysis. The
 Network retains its simulation state while `results.state` continues callback
@@ -367,6 +381,31 @@ and checkpoint replay:
 ```console
 python examples/native_network_functional_callbacks.py
 ```
+
+Reuse `program.callbacks` after a functional-to-native handoff with the existing
+`callbacks=` and `callback_state=` arguments:
+
+```python
+_, auxiliary = dn.func.run(program)
+packet = auxiliary["continuation"]
+dn.func.commit_continuation_(program, receiver, packet)
+carry = program.callbacks.detach_state(packet.callback_state)
+results = receiver.run(
+    steps=100, dt=DT, callbacks=program.callbacks, callback_state=carry,
+)
+```
+
+This Population example assumes an independently initialized compatible
+`receiver`; omit `dt` for a Network. Model handoff copies detached values into
+the receiver, and callback detachment truncates its earlier recurrent graph
+while retaining totals and recording phase. Native model-parameter gradients
+belong to the receiver. LFP fields remain external sources of the same
+collection, with refreshed field gradients when detaching under enabled
+gradients. A custom pure callback needs no serialization hooks for this
+in-process reuse. Use export/restore when changing collections or saving
+portable carry. See {doc}`A59_functional_native_handoff` and
+{download}`shared_callback_rebinding.py <../../examples/shared_callback_rebinding.py>`
+for complete Population and Network examples.
 
 For manual control loops, pass callback carry through consecutive native
 `step` calls. `loop_hooks` controls only ordinary native loop hooks; pure
