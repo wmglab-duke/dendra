@@ -33,7 +33,7 @@ def make_population():
     model.dx.fill_(20.0)
     model.insert(pas.rename("leak"), g=0.001, e=-45.0)
     model.eval()
-    model.initialize(DT)
+    model.initialize()
     return model
 
 

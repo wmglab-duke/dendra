@@ -45,7 +45,7 @@ def main():
         before_build = dn.func.inspect_sources(cell)
         print("Registered Population sources before initialization:")
         print(before_build)
-        cell.initialize(DT)
+        cell.initialize()
         after_build = dn.func.inspect_sources(cell)
         assert any(
             entry.tensor is cell.mech.leak.g_param for entry in after_build.entries

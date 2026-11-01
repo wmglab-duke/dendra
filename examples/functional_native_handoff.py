@@ -34,7 +34,10 @@ def make_model(network):
         model = dn.Network({"left": model, "right": right})
         right.mech.leak.g_param = model.left.mech.leak.g_param
     model.train()
-    model.initialize(DT)
+    if network:
+        model.initialize(DT)
+    else:
+        model.initialize()
     return model
 
 

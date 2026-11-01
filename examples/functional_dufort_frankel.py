@@ -31,7 +31,7 @@ def run_population_demo():
             dtype=DTYPE,
         )
         population.insert(pas, g=0.001, e=-70.0)
-        population.initialize(DT)
+        population.initialize()
 
     functional, tensors = dn.func.make_functional(population, dt=DT)
     prepared = functional.prepare(tensors.parameters, tensors.constants)

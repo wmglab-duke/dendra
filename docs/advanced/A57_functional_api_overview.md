@@ -652,6 +652,11 @@ trainable leaves and optimizes a resumed segment without selecting internal
 materialization keys. See {doc}`A58_functional_callback_checkpoints` for the
 detached checkpoint boundary.
 
+For a complete native prefix → compiled execution → portable restoration →
+native suffix workflow, see {doc}`A63_shared_api_conformance`. It combines
+deterministic inputs, mixed horizons, recording phase, source sharing and
+explicit gradient ownership at each boundary.
+
 After a raw-bound run, its returned continuation reports the same effective
 binding sources:
 

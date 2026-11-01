@@ -207,6 +207,7 @@ def _callbacks(state, *, emit_initial):
     # Test the callback/runner boundary without compilation or a model fixture.
     # Real compiled and checkpointed runners have separate integration coverage.
     callbacks = object.__new__(FunctionalCallbacks)
+    callbacks._storage = {}
     callbacks._state_token = object()
     callbacks._plans = tuple(
         FunctionalCallbacks._probe(name, callback, state)

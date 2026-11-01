@@ -26,7 +26,7 @@ def run_population_demo():
             [2.0], L=30.0, dx=10.0, integrator=dn.euler(), dtype=DTYPE
         )
         population.insert(pas, g=0.001, e=-70.0)
-        population.initialize(DT)
+        population.initialize()
 
     functional, tensors = dn.func.make_functional(population, dt=DT)
     prepared = functional.prepare(tensors.parameters, tensors.constants)

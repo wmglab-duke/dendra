@@ -9,6 +9,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from dendra.models._checkpoint import _copy_state_containers
+from dendra.models.core import Cable
 from dendra.models.networks.net import Network
 
 from ._continuation import Continuation
@@ -306,6 +307,14 @@ def _preserve_native_bindings(target):
         raise
 
 
+def _canonical_geometry_buffer(owner, name):
+    return (
+        issubclass(type(owner), Cable)
+        and vars(owner).get("_compartment_graph") is not None
+        and name in Cable._CANONICAL_GEOMETRY_TENSORS
+    )
+
+
 def _publication_buffers(target, staged, protected):
     result, memo = [], {}
     originals = dict(target.named_modules())
@@ -317,7 +326,10 @@ def _publication_buffers(target, staged, protected):
                 continue
             unchanged = (
                 torch.is_tensor(previous)
-                and not previous.requires_grad
+                and (
+                    not previous.requires_grad
+                    or _canonical_geometry_buffer(owner, name)
+                )
                 and previous.shape == value.shape
                 and previous.dtype == value.dtype
                 and previous.device == value.device
@@ -349,7 +361,7 @@ def _publish_runtime(target, staged, buffers, source_bindings, scalar_writes):
         restored = owner._buffers.get(name)
         if (
             torch.is_tensor(restored)
-            and not value.requires_grad
+            and (not value.requires_grad or _canonical_geometry_buffer(owner, name))
             and restored.shape == value.shape
             and restored.dtype == value.dtype
             and restored.device == value.device

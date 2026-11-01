@@ -91,6 +91,7 @@ def _case(endpoint, monkeypatch, *, mode="emitting", failures=()):
             return carry
 
     callbacks = object.__new__(Callbacks)
+    callbacks._storage = {}
     case = SimpleNamespace(
         events=events,
         errors=errors,

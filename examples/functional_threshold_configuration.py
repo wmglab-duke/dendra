@@ -45,7 +45,10 @@ def make_model(network):
     population = make_population()
     model = dn.Network({"cell": population}) if network else population
     model.train()
-    model.initialize(DT)
+    if network:
+        model.initialize(DT)
+    else:
+        model.initialize()
     return model
 
 

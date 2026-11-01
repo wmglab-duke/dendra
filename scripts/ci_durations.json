@@ -1,2197 +1,2797 @@
 {
   "schema_version": 1,
   "provenance": {
-    "source_revision": "2a6de18",
-    "measured_at": "2026-10-25",
-    "source": "Four successful complete CPU/NEURON branch-coverage shard manifests",
-    "platform": "macOS arm64; Python3.12; single-thread CPU per job",
-    "selected_tests": 13592,
-    "includes": "pytest setup/call/teardown report durations; excludes install and collection",
-    "warning": "Scheduling estimates only; refresh from current successful complete GitLab run when available"
+    "campaign": "shared-api-conformance-20261031",
+    "source_revision": "c6a3990bcbc3af407bec387df5fed5b1fb2deefa",
+    "source_snapshot_sha256": "48b993e03523736c72c3827a1babcf74fe4b58f41625164077d82f5f4c1cb5ce",
+    "measured_at": "2026-11-01",
+    "source": "Ten complete successful shared-API CPU/NEURON branch-coverage shard manifests",
+    "selected_tests": 16118,
+    "selected_nodeids_sha256": "f412184e0756e4d6cfc1578354753dc91faa6e7a7e1ac6e0a06eb9db50abf305",
+    "prior_profile_sha256": "a63647f876b5c0889f213e1f9f9282b8a77f90bcc4ab71077803880892cb7aed",
+    "platform": "macOS arm64; Python3.12; single-thread CPU per job; three bounded local workers",
+    "torch_version": "2.15.0",
+    "worker_count": 3,
+    "shard_count": 10,
+    "cache_context": "Shared external compiler caches; local concurrent worker contention. These are scheduling estimates, not cold GitLab measurements.",
+    "includes": "pytest setup/call/teardown report durations including reviewed skips/xfails; excludes installation and collection",
+    "warning": "No two-hour CI guarantee: runner hardware, PyTorch version, cold compilation and installation costs differ. Refresh from a complete successful current GitLab run when available."
   },
   "modules": {
     "tests/fields/test_analytic.py": {
-      "seconds": 0.10306808684254065,
+      "seconds": 0.1065413331380114,
       "tests": 21
     },
     "tests/fields/test_field_execution_matrix.py": {
-      "seconds": 0.06025866745039821,
+      "seconds": 0.056097242748364806,
       "tests": 29
     },
     "tests/fields/test_precomputed.py": {
-      "seconds": 0.05532470910111442,
+      "seconds": 0.04817166889552027,
       "tests": 16
     },
     "tests/fields/test_quasipotentials.py": {
-      "seconds": 0.4546741649392061,
+      "seconds": 0.418927664286457,
       "tests": 9
     },
     "tests/fields/test_spherical_cartesian.py": {
-      "seconds": 0.11919229198247194,
+      "seconds": 0.080136124859564,
       "tests": 3
     },
     "tests/func/test_activity_callbacks.py": {
-      "seconds": 5.115217869053595,
+      "seconds": 5.963178506586701,
       "tests": 53
     },
     "tests/func/test_api.py": {
-      "seconds": 12.45243287133053,
+      "seconds": 12.609933581668884,
       "tests": 25
     },
+    "tests/func/test_api_lifecycle_conformance.py": {
+      "seconds": 11.249986417009495,
+      "tests": 2
+    },
     "tests/func/test_atomic_transform_composition.py": {
-      "seconds": 95.98904766800115,
+      "seconds": 89.30204704066273,
       "tests": 6
     },
     "tests/func/test_authored_initial_values.py": {
-      "seconds": 11.705208161845803,
+      "seconds": 9.830033623497002,
       "tests": 15
     },
     "tests/func/test_block_precision.py": {
-      "seconds": 2.476520332216751,
+      "seconds": 2.2893119951477274,
       "tests": 22
     },
+    "tests/func/test_bound_continuation.py": {
+      "seconds": 57.05255983071402,
+      "tests": 16
+    },
+    "tests/func/test_bound_continuation_backends.py": {
+      "seconds": 68.20667799888179,
+      "tests": 2
+    },
+    "tests/func/test_bound_continuation_guards.py": {
+      "seconds": 18.258407959598117,
+      "tests": 16
+    },
     "tests/func/test_bound_execution.py": {
-      "seconds": 109.85733413184062,
+      "seconds": 93.42984479363076,
       "tests": 49
     },
+    "tests/func/test_bound_network_execution.py": {
+      "seconds": 75.94570133334491,
+      "tests": 19
+    },
+    "tests/func/test_cache_storage_spans.py": {
+      "seconds": 0.34165083209518343,
+      "tests": 15
+    },
+    "tests/func/test_callback_checkpoint_backends.py": {
+      "seconds": 26.259871374000795,
+      "tests": 2
+    },
+    "tests/func/test_callback_checkpoint_edges.py": {
+      "seconds": 2.69631174672395,
+      "tests": 6
+    },
+    "tests/func/test_callback_checkpoint_network.py": {
+      "seconds": 26.43426104146056,
+      "tests": 9
+    },
+    "tests/func/test_callback_checkpoint_protocol.py": {
+      "seconds": 28.759035670780577,
+      "tests": 59
+    },
+    "tests/func/test_callback_checkpoints.py": {
+      "seconds": 27.400346545269713,
+      "tests": 62
+    },
+    "tests/func/test_callback_completion_contracts.py": {
+      "seconds": 0.008564040763303638,
+      "tests": 19
+    },
     "tests/func/test_callback_concatenation.py": {
-      "seconds": 0.027700998878572136,
+      "seconds": 0.033956667059101164,
       "tests": 33
     },
+    "tests/func/test_callback_free_while.py": {
+      "seconds": 55.08637987612747,
+      "tests": 15
+    },
+    "tests/func/test_callback_invariant_restoration.py": {
+      "seconds": 0.0025345388567075133,
+      "tests": 8
+    },
+    "tests/func/test_callback_preparation.py": {
+      "seconds": 5.613050542888232,
+      "tests": 18
+    },
+    "tests/func/test_callback_retention.py": {
+      "seconds": 138.45672171062324,
+      "tests": 16
+    },
+    "tests/func/test_callback_setup_contracts.py": {
+      "seconds": 0.02017475652974099,
+      "tests": 25
+    },
+    "tests/func/test_callback_state_detach.py": {
+      "seconds": 2.4969587099039927,
+      "tests": 9
+    },
     "tests/func/test_callbacks.py": {
-      "seconds": 36.85565903969109,
+      "seconds": 30.90421587158926,
       "tests": 36
     },
+    "tests/func/test_checkpoint_lifecycle.py": {
+      "seconds": 37.905535287223756,
+      "tests": 41
+    },
     "tests/func/test_checkpoint_operand_trees.py": {
-      "seconds": 1.1642073750845157,
+      "seconds": 0.6010014582425356,
       "tests": 7
     },
     "tests/func/test_checkpointed_composition.py": {
-      "seconds": 40.87787687499076,
+      "seconds": 45.56498325103894,
       "tests": 5
     },
     "tests/func/test_class_diagnostic_transactions.py": {
-      "seconds": 1.3397076650289819,
+      "seconds": 1.371396961971186,
       "tests": 13
     },
     "tests/func/test_clearance_process.py": {
-      "seconds": 423.1379639938823,
+      "seconds": 593.6666018381948,
       "tests": 49
     },
     "tests/func/test_compilation_lifecycle.py": {
-      "seconds": 50.19711558398558,
+      "seconds": 39.844319458003156,
       "tests": 5
     },
     "tests/func/test_compiled_chunk.py": {
-      "seconds": 44.589967658917885,
+      "seconds": 45.7956380401738,
       "tests": 32
     },
     "tests/func/test_compiled_loop_views.py": {
-      "seconds": 56.57272999896668,
+      "seconds": 60.44561453838833,
       "tests": 13
     },
     "tests/func/test_compiled_sde_views.py": {
-      "seconds": 55.8738092489657,
+      "seconds": 71.77454383403528,
       "tests": 4
     },
     "tests/func/test_compiled_threshold_callbacks.py": {
-      "seconds": 291.05175504431827,
+      "seconds": 399.3179228340741,
       "tests": 20
     },
     "tests/func/test_compiled_validation_cache.py": {
-      "seconds": 5.715079959016293,
+      "seconds": 7.435485333204269,
       "tests": 2
     },
     "tests/func/test_connection_initialization.py": {
-      "seconds": 15.958700661372859,
+      "seconds": 15.47355846024584,
       "tests": 57
     },
     "tests/func/test_connection_parameter_commit.py": {
-      "seconds": 1.2357355011045001,
+      "seconds": 1.1448758321348578,
       "tests": 4
     },
     "tests/func/test_connection_parameter_initialization.py": {
-      "seconds": 7.437404168071225,
+      "seconds": 7.108487706515007,
       "tests": 29
     },
     "tests/func/test_connection_parameter_sources.py": {
-      "seconds": 1.8232803322607651,
+      "seconds": 2.521357081248425,
       "tests": 21
     },
     "tests/func/test_connection_sampling_sources.py": {
-      "seconds": 14.097755123628303,
+      "seconds": 14.046427246881649,
       "tests": 26
     },
+    "tests/func/test_continuation.py": {
+      "seconds": 78.1318382929312,
+      "tests": 39
+    },
+    "tests/func/test_continuation_backends.py": {
+      "seconds": 68.44524266605731,
+      "tests": 2
+    },
+    "tests/func/test_continuation_checkpoint_compatibility.py": {
+      "seconds": 12.479579123668373,
+      "tests": 7
+    },
+    "tests/func/test_continuation_checkpoint_initialization.py": {
+      "seconds": 9.062737916829064,
+      "tests": 8
+    },
+    "tests/func/test_continuation_checkpoints.py": {
+      "seconds": 63.72961729299277,
+      "tests": 40
+    },
+    "tests/func/test_continuation_detach.py": {
+      "seconds": 20.720532749895938,
+      "tests": 17
+    },
+    "tests/func/test_continuation_initialization.py": {
+      "seconds": 5.027807543054223,
+      "tests": 8
+    },
+    "tests/func/test_continuous_binding_guard_contracts.py": {
+      "seconds": 0.3678829614073038,
+      "tests": 24
+    },
     "tests/func/test_continuous_cache_initialization.py": {
-      "seconds": 3.8067741658887826,
+      "seconds": 3.615535458433442,
       "tests": 22
     },
     "tests/func/test_continuous_cache_metadata.py": {
-      "seconds": 1.8846994609339163,
+      "seconds": 1.8139788318658248,
       "tests": 7
     },
+    "tests/func/test_continuous_class_guard_contracts.py": {
+      "seconds": 0.005262915976345539,
+      "tests": 8
+    },
     "tests/func/test_continuous_con.py": {
-      "seconds": 6.895433454425074,
+      "seconds": 11.616519825882278,
       "tests": 65
     },
     "tests/func/test_continuous_receive.py": {
-      "seconds": 25.124095460982062,
+      "seconds": 32.81154917064123,
       "tests": 32
     },
     "tests/func/test_continuous_transforms.py": {
-      "seconds": 11.63255583139835,
+      "seconds": 15.760482198442332,
       "tests": 82
     },
     "tests/func/test_convenience_checkpointing.py": {
-      "seconds": 331.949614081881,
+      "seconds": 378.7539948745398,
       "tests": 35
     },
     "tests/func/test_convenience_edges.py": {
-      "seconds": 23.683007751009427,
+      "seconds": 20.861644828226417,
       "tests": 21
     },
     "tests/func/test_convenience_extra.py": {
-      "seconds": 1076.6771938305465,
+      "seconds": 1087.6999241679441,
       "tests": 64
     },
     "tests/func/test_convenience_inductor.py": {
-      "seconds": 62.51604691793909,
+      "seconds": 59.711908334167674,
       "tests": 1
     },
     "tests/func/test_convenience_initialization.py": {
-      "seconds": 528.9369732048362,
+      "seconds": 638.5106886312133,
       "tests": 46
     },
     "tests/func/test_convenience_runner.py": {
-      "seconds": 74.34713220683625,
-      "tests": 46
+      "seconds": 78.85291516629513,
+      "tests": 44
     },
     "tests/func/test_convenience_validation.py": {
-      "seconds": 57.19656574772671,
+      "seconds": 61.64957154286094,
       "tests": 25
     },
     "tests/func/test_cuda_acceptance_reference.py": {
-      "seconds": 9.104712999076582,
+      "seconds": 9.160681750625372,
       "tests": 20
     },
     "tests/func/test_cuda_functional_reference.py": {
-      "seconds": 0.6999108754680492,
+      "seconds": 0.6362932574702427,
       "tests": 42
     },
     "tests/func/test_custom_connection_sampling_network.py": {
-      "seconds": 53.606208913144656,
+      "seconds": 52.82668162253685,
       "tests": 14
     },
     "tests/func/test_custom_connection_sampling_sources.py": {
-      "seconds": 4.908479329023976,
+      "seconds": 4.763793464167975,
       "tests": 23
     },
     "tests/func/test_custom_material_aliases.py": {
-      "seconds": 5.223589084984269,
+      "seconds": 5.232746208435856,
       "tests": 13
     },
     "tests/func/test_custom_material_process_guards.py": {
-      "seconds": 0.6772897032788023,
+      "seconds": 0.7909640837460756,
       "tests": 41
     },
     "tests/func/test_custom_material_processes.py": {
-      "seconds": 151.42642349627567,
+      "seconds": 165.26789012632798,
       "tests": 14
     },
     "tests/func/test_custom_waveform_invocations.py": {
-      "seconds": 3442.078805538069,
+      "seconds": 2946.569721502252,
       "tests": 23
     },
     "tests/func/test_declared_state_initialization.py": {
-      "seconds": 14.931715912476648,
+      "seconds": 15.927083539194427,
       "tests": 70
     },
     "tests/func/test_dendra_models.py": {
-      "seconds": 175.52336075075436,
+      "seconds": 175.70932345627807,
       "tests": 46
     },
     "tests/func/test_derived_buffers.py": {
-      "seconds": 9.069258625851944,
+      "seconds": 8.786822295398451,
       "tests": 10
     },
     "tests/func/test_device_policy.py": {
-      "seconds": 0.006680211110506207,
+      "seconds": 0.006574790691956878,
       "tests": 20
     },
+    "tests/func/test_direct_callbacks.py": {
+      "seconds": 167.34916583134327,
+      "tests": 23
+    },
+    "tests/func/test_direct_callbacks_backends.py": {
+      "seconds": 16.61295949900523,
+      "tests": 1
+    },
+    "tests/func/test_direct_callbacks_network.py": {
+      "seconds": 50.726611835183576,
+      "tests": 7
+    },
     "tests/func/test_dufort_autograd.py": {
-      "seconds": 7.88948900118703,
+      "seconds": 14.042892082827166,
       "tests": 6
     },
     "tests/func/test_dufort_contracts.py": {
-      "seconds": 23.41491450369358,
+      "seconds": 23.500420460943133,
       "tests": 35
     },
     "tests/func/test_dufort_frankel.py": {
-      "seconds": 812.6916455042083,
+      "seconds": 526.7508187505882,
       "tests": 51
     },
+    "tests/func/test_empty_noise_tape_contracts.py": {
+      "seconds": 0.008605421637184918,
+      "tests": 14
+    },
     "tests/func/test_euler.py": {
-      "seconds": 192.8660488409223,
+      "seconds": 131.8903927525971,
       "tests": 31
     },
     "tests/func/test_euler_contracts.py": {
-      "seconds": 10.090736204874702,
+      "seconds": 11.9373004588997,
       "tests": 38
     },
     "tests/func/test_event_receive.py": {
-      "seconds": 107.57429908605991,
+      "seconds": 82.54695679363795,
       "tests": 48
     },
     "tests/func/test_execution_regime_matrix.py": {
-      "seconds": 51.48210667114472,
+      "seconds": 41.6408472082112,
       "tests": 24
     },
     "tests/func/test_execution_reporting.py": {
-      "seconds": 59.62608187709702,
+      "seconds": 50.233590289601125,
       "tests": 19
     },
     "tests/func/test_explicit_batch.py": {
-      "seconds": 31.095743126701564,
+      "seconds": 21.674475839245133,
       "tests": 32
     },
+    "tests/func/test_explicit_continuation_checkpoints.py": {
+      "seconds": 32.883477334165946,
+      "tests": 27
+    },
+    "tests/func/test_explicit_continuation_schema.py": {
+      "seconds": 0.9914185848319903,
+      "tests": 4
+    },
+    "tests/func/test_explicit_initialization.py": {
+      "seconds": 38.42386429652106,
+      "tests": 30
+    },
+    "tests/func/test_explicit_population_while.py": {
+      "seconds": 49.92943946190644,
+      "tests": 15
+    },
+    "tests/func/test_explicit_source_inspection.py": {
+      "seconds": 17.530918330536224,
+      "tests": 20
+    },
     "tests/func/test_extcell_axon.py": {
-      "seconds": 3.1911308300914243,
+      "seconds": 3.0924613787792623,
       "tests": 15
     },
     "tests/func/test_extcell_material_concatenation.py": {
-      "seconds": 23.476676460937597,
+      "seconds": 23.557445957907476,
       "tests": 4
     },
     "tests/func/test_extcell_multi_population.py": {
-      "seconds": 137.242672790715,
+      "seconds": 117.86739549017511,
       "tests": 38
     },
     "tests/func/test_extcell_multi_transforms.py": {
-      "seconds": 3.020301209005993,
+      "seconds": 1.6621334984665737,
       "tests": 8
     },
     "tests/func/test_extcell_multi_workspace.py": {
-      "seconds": 3.173824869794771,
+      "seconds": 1.500825778930448,
       "tests": 31
     },
     "tests/func/test_extcell_tree.py": {
-      "seconds": 6.989811079984065,
+      "seconds": 5.859992915880866,
       "tests": 22
     },
+    "tests/func/test_frame_paths.py": {
+      "seconds": 1.1038923806045204,
+      "tests": 21
+    },
     "tests/func/test_functional_callback_contract.py": {
-      "seconds": 22.549228211981244,
+      "seconds": 15.08570320904255,
       "tests": 20
     },
     "tests/func/test_functional_initialization.py": {
-      "seconds": 19.43569274857873,
+      "seconds": 16.32165470730979,
       "tests": 32
     },
     "tests/func/test_functional_netstim.py": {
-      "seconds": 4.34252601332264,
+      "seconds": 6.828417285345495,
       "tests": 74
     },
     "tests/func/test_functional_optimization_example.py": {
-      "seconds": 37.71824587392621,
+      "seconds": 25.537421541986987,
       "tests": 4
     },
     "tests/func/test_functional_optimization_example_cli.py": {
-      "seconds": 0.013426418008748442,
+      "seconds": 0.014354082988575101,
       "tests": 6
     },
     "tests/func/test_functional_training_benchmark.py": {
-      "seconds": 29.29252296179766,
+      "seconds": 29.15446837292984,
       "tests": 17
     },
+    "tests/func/test_generic_callbacks.py": {
+      "seconds": 64.98163491394371,
+      "tests": 7
+    },
     "tests/func/test_heap_netstim.py": {
-      "seconds": 3.9024238361162134,
+      "seconds": 6.673095955862664,
       "tests": 31
     },
     "tests/func/test_hh_broadcasting.py": {
-      "seconds": 15.141711341100745,
+      "seconds": 11.876943460898474,
       "tests": 25
     },
+    "tests/func/test_host_chunk_execution_contracts.py": {
+      "seconds": 0.027198456577025354,
+      "tests": 36
+    },
     "tests/func/test_imperative_checkpoint_callbacks.py": {
-      "seconds": 1.4672043351456523,
+      "seconds": 1.813490081927739,
       "tests": 13
     },
     "tests/func/test_inference_operand_signature.py": {
-      "seconds": 15.003825501829851,
+      "seconds": 17.560173791716807,
       "tests": 17
     },
     "tests/func/test_initial_value_shared_carry.py": {
-      "seconds": 0.41943941597128287,
+      "seconds": 0.4194160010665655,
       "tests": 2
     },
+    "tests/func/test_initialization_draws.py": {
+      "seconds": 38.117057334282435,
+      "tests": 23
+    },
+    "tests/func/test_initialization_execution.py": {
+      "seconds": 2.3481040407205,
+      "tests": 8
+    },
     "tests/func/test_initialization_parity.py": {
-      "seconds": 254.3605269981781,
+      "seconds": 207.21024183137342,
       "tests": 65
     },
+    "tests/func/test_initialization_previous_state.py": {
+      "seconds": 0.9598758730571717,
+      "tests": 9
+    },
+    "tests/func/test_initialization_previous_state_diagnostics.py": {
+      "seconds": 0.745454459101893,
+      "tests": 4
+    },
     "tests/func/test_initialization_snapshot.py": {
-      "seconds": 0.027236207097303122,
+      "seconds": 0.00693637365475297,
       "tests": 9
     },
     "tests/func/test_initialization_source_execution.py": {
-      "seconds": 254.32324375235476,
+      "seconds": 175.88151046214625,
       "tests": 31
     },
     "tests/func/test_initialization_source_network_aliases.py": {
-      "seconds": 54.1613012481248,
+      "seconds": 53.7932160833152,
       "tests": 6
     },
     "tests/func/test_initialization_sources_plan.py": {
-      "seconds": 10.64614854217507,
+      "seconds": 13.452180538559332,
       "tests": 68
     },
+    "tests/func/test_initialization_state_precedence.py": {
+      "seconds": 11.57946028909646,
+      "tests": 9
+    },
     "tests/func/test_initializer_cache_config_aliases.py": {
-      "seconds": 41.417987459979486,
+      "seconds": 42.06688570883125,
       "tests": 6
     },
     "tests/func/test_initializer_parametrization_execution.py": {
-      "seconds": 363.067591417057,
+      "seconds": 236.8016364540672,
       "tests": 18
     },
     "tests/func/test_initializer_parametrization_sources.py": {
-      "seconds": 37.16131236992078,
+      "seconds": 35.934537080232985,
       "tests": 41
     },
     "tests/func/test_input_bindings.py": {
-      "seconds": 34.965139089210425,
+      "seconds": 42.376683083944954,
       "tests": 34
     },
+    "tests/func/test_inputs_backends.py": {
+      "seconds": 27.195779166184366,
+      "tests": 1
+    },
+    "tests/func/test_inputs_contracts.py": {
+      "seconds": 0.005750079988501966,
+      "tests": 5
+    },
+    "tests/func/test_inputs_host.py": {
+      "seconds": 50.442202961305156,
+      "tests": 14
+    },
+    "tests/func/test_inputs_network.py": {
+      "seconds": 325.24774262460414,
+      "tests": 20
+    },
+    "tests/func/test_inputs_population.py": {
+      "seconds": 229.72898649901617,
+      "tests": 15
+    },
     "tests/func/test_integrator_contract.py": {
-      "seconds": 0.8720317100523971,
+      "seconds": 1.0077393352985382,
       "tests": 27
     },
+    "tests/func/test_invocation_probe_rollback.py": {
+      "seconds": 0.016179417027160525,
+      "tests": 15
+    },
     "tests/func/test_lfp.py": {
-      "seconds": 243.03625604195986,
+      "seconds": 309.76887000049464,
       "tests": 32
     },
     "tests/func/test_lowered_chunk_composition.py": {
-      "seconds": 60.65049200085923,
+      "seconds": 50.83640112623107,
       "tests": 5
     },
+    "tests/func/test_lowering_api.py": {
+      "seconds": 2.8724551210179925,
+      "tests": 35
+    },
+    "tests/func/test_lowering_api_backends.py": {
+      "seconds": 14.446677207015455,
+      "tests": 1
+    },
     "tests/func/test_material_concatenation.py": {
-      "seconds": 351.45743595820386,
+      "seconds": 302.62050174560864,
       "tests": 34
     },
     "tests/func/test_material_diffusion.py": {
-      "seconds": 631.8758237519069,
+      "seconds": 513.2885484603466,
       "tests": 44
     },
     "tests/func/test_material_preparation_guards.py": {
-      "seconds": 51.98153450182872,
+      "seconds": 41.69736491993535,
       "tests": 11
     },
     "tests/func/test_material_processes.py": {
-      "seconds": 1470.520608617575,
+      "seconds": 1584.0521115935408,
       "tests": 105
     },
     "tests/func/test_material_stochastic_diffusion_checkpoint.py": {
-      "seconds": 2.490977419016417,
+      "seconds": 2.216212294064462,
       "tests": 11
     },
     "tests/func/test_material_stochastic_review.py": {
-      "seconds": 2.1468940421473235,
+      "seconds": 2.3501548735657707,
       "tests": 12
     },
     "tests/func/test_material_stochastic_review_execution.py": {
-      "seconds": 13.111566666164435,
+      "seconds": 14.93205599905923,
       "tests": 8
     },
     "tests/func/test_material_stochastic_sampling.py": {
-      "seconds": 651.2297497972031,
+      "seconds": 500.4981519598514,
       "tests": 32
     },
     "tests/func/test_material_stochastic_stock_gradients.py": {
-      "seconds": 1.2528157089254819,
+      "seconds": 1.2724324180744588,
       "tests": 6
     },
+    "tests/func/test_materialization_overrides.py": {
+      "seconds": 0.007334792986512184,
+      "tests": 15
+    },
+    "tests/func/test_materializer_alias_contracts.py": {
+      "seconds": 0.009682499337941408,
+      "tests": 12
+    },
+    "tests/func/test_materializer_class_guards.py": {
+      "seconds": 0.022137999651022255,
+      "tests": 8
+    },
     "tests/func/test_materials.py": {
-      "seconds": 4.945806206960697,
+      "seconds": 5.275548961129971,
       "tests": 7
     },
     "tests/func/test_mechanism_delay_execution.py": {
-      "seconds": 214.6972213733825,
+      "seconds": 170.56844870955683,
       "tests": 44
     },
     "tests/func/test_mechanism_delay_owners.py": {
-      "seconds": 41.75148812792031,
+      "seconds": 34.25786224601325,
       "tests": 14
     },
     "tests/func/test_mechanism_delay_plan.py": {
-      "seconds": 94.18215612450149,
+      "seconds": 72.49727837461978,
       "tests": 83
     },
     "tests/func/test_mechanism_delay_transforms.py": {
-      "seconds": 119.82476737402612,
+      "seconds": 115.73514612589497,
       "tests": 10
     },
     "tests/func/test_mechanism_injection_execution.py": {
-      "seconds": 146.89619270915864,
+      "seconds": 176.5893825009698,
       "tests": 34
     },
     "tests/func/test_mechanism_injection_plan.py": {
-      "seconds": 161.23495600750903,
+      "seconds": 137.29988062230404,
       "tests": 129
     },
     "tests/func/test_mechanism_injection_transforms.py": {
-      "seconds": 120.859792121395,
+      "seconds": 113.71623042237479,
       "tests": 20
     },
     "tests/func/test_membrane_coefficient_contract.py": {
-      "seconds": 0.45162608509417623,
+      "seconds": 0.4970763314049691,
       "tests": 10
     },
     "tests/func/test_membrane_current.py": {
-      "seconds": 117.61030020774342,
+      "seconds": 109.16207900457084,
       "tests": 72
     },
     "tests/func/test_multi_population.py": {
-      "seconds": 17.498165669036098,
+      "seconds": 14.848290920839645,
       "tests": 31
     },
     "tests/func/test_myelinated_models.py": {
-      "seconds": 16.41758137679426,
+      "seconds": 17.32008045632392,
       "tests": 16
     },
     "tests/func/test_native_cable.py": {
-      "seconds": 11.664160792715847,
+      "seconds": 8.007034631446004,
       "tests": 26
     },
+    "tests/func/test_native_cable_geometry_lifecycle.py": {
+      "seconds": 0.10203579207882285,
+      "tests": 2
+    },
+    "tests/func/test_native_callback_arguments.py": {
+      "seconds": 18.65834403934423,
+      "tests": 19
+    },
+    "tests/func/test_native_callback_session.py": {
+      "seconds": 0.017603293526917696,
+      "tests": 20
+    },
+    "tests/func/test_native_callback_storage.py": {
+      "seconds": 19.59900632838253,
+      "tests": 18
+    },
+    "tests/func/test_native_handoff.py": {
+      "seconds": 11.002355880336836,
+      "tests": 39
+    },
+    "tests/func/test_native_handoff_stochastic.py": {
+      "seconds": 3.4014184169936925,
+      "tests": 2
+    },
+    "tests/func/test_native_handoff_topologies.py": {
+      "seconds": 1.015850416966714,
+      "tests": 4
+    },
+    "tests/func/test_native_network_checkpoint_callbacks.py": {
+      "seconds": 30.24729133793153,
+      "tests": 14
+    },
+    "tests/func/test_native_network_functional_callbacks.py": {
+      "seconds": 16.30790849996265,
+      "tests": 17
+    },
+    "tests/func/test_native_population_functional_callbacks.py": {
+      "seconds": 2.739669914590195,
+      "tests": 21
+    },
+    "tests/func/test_native_runtime_input_callbacks.py": {
+      "seconds": 0.5816125839482993,
+      "tests": 2
+    },
+    "tests/func/test_native_source_inspection.py": {
+      "seconds": 0.5636321624042466,
+      "tests": 22
+    },
+    "tests/func/test_native_step_functional_callbacks.py": {
+      "seconds": 23.50895474513527,
+      "tests": 20
+    },
     "tests/func/test_netcon.py": {
-      "seconds": 8.092525378102437,
+      "seconds": 6.471545163542032,
       "tests": 31
     },
     "tests/func/test_netcon_bitpacked_inference.py": {
-      "seconds": 16.432409124972764,
+      "seconds": 13.512363078072667,
       "tests": 29
     },
     "tests/func/test_netcon_cache_initialization.py": {
-      "seconds": 3.5818299160455354,
+      "seconds": 2.8411672867368907,
       "tests": 43
     },
     "tests/func/test_netcon_delay_interpolation.py": {
-      "seconds": 23.201645841181744,
+      "seconds": 11.827090082457289,
       "tests": 34
     },
     "tests/func/test_netcon_pending_calendar.py": {
-      "seconds": 19.977205084695015,
+      "seconds": 10.011254294659011,
       "tests": 37
     },
     "tests/func/test_netcon_schedules.py": {
-      "seconds": 14.941236792015843,
+      "seconds": 13.448155332240276,
       "tests": 26
     },
     "tests/func/test_netcon_source_history.py": {
-      "seconds": 44.92200912942644,
+      "seconds": 29.66799803962931,
       "tests": 56
     },
     "tests/func/test_netcon_threshold.py": {
-      "seconds": 23.64064271200914,
+      "seconds": 18.239155951770954,
       "tests": 42
     },
     "tests/func/test_netstim_parameter_initialization.py": {
-      "seconds": 4.415356328885537,
+      "seconds": 4.117764835478738,
       "tests": 18
     },
     "tests/func/test_netstim_parameter_sources.py": {
-      "seconds": 2.1060190001153387,
+      "seconds": 1.8976386713329703,
       "tests": 27
     },
     "tests/func/test_netstim_retained_config_parameters.py": {
-      "seconds": 1.4380296269082464,
+      "seconds": 1.244538665865548,
       "tests": 6
     },
     "tests/func/test_netstim_schedules.py": {
-      "seconds": 3.2517025829292834,
+      "seconds": 5.154702746192925,
       "tests": 45
     },
     "tests/func/test_network.py": {
-      "seconds": 223.42639454110758,
+      "seconds": 158.30136803281493,
       "tests": 23
     },
     "tests/func/test_network_bindings.py": {
-      "seconds": 3.2998768319375813,
+      "seconds": 2.3944599160458893,
       "tests": 16
     },
     "tests/func/test_network_bitpacked_inference.py": {
-      "seconds": 109.46940070803976,
+      "seconds": 60.0936549147591,
       "tests": 12
     },
     "tests/func/test_network_cache_aliases.py": {
-      "seconds": 62.287385041068774,
+      "seconds": 33.959854957298376,
       "tests": 13
     },
     "tests/func/test_network_cache_initialization.py": {
-      "seconds": 114.71338133572135,
+      "seconds": 96.40170525398571,
       "tests": 17
     },
     "tests/func/test_network_callbacks.py": {
-      "seconds": 53.54974179266719,
-      "tests": 15
+      "seconds": 43.28513116494287,
+      "tests": 13
     },
     "tests/func/test_network_clock_lifecycle.py": {
-      "seconds": 140.07132841204293,
+      "seconds": 106.31055182858836,
       "tests": 7
     },
     "tests/func/test_network_compile.py": {
-      "seconds": 301.07861825294094,
+      "seconds": 219.38814625085797,
       "tests": 24
     },
     "tests/func/test_network_compile_edges.py": {
-      "seconds": 26.122742458013818,
+      "seconds": 21.510959166218527,
       "tests": 3
     },
     "tests/func/test_network_connection_parameters.py": {
-      "seconds": 239.20250312110875,
+      "seconds": 260.43497841758654,
       "tests": 22
     },
     "tests/func/test_network_connection_sampling.py": {
-      "seconds": 108.72970288118813,
+      "seconds": 116.67162946041208,
       "tests": 29
     },
     "tests/func/test_network_dtype_conformance.py": {
-      "seconds": 119.13440383190755,
+      "seconds": 124.95092503994238,
       "tests": 3
     },
     "tests/func/test_network_execution_reporting.py": {
-      "seconds": 125.89971937605878,
+      "seconds": 102.5342207927024,
       "tests": 14
     },
     "tests/func/test_network_extra.py": {
-      "seconds": 448.0102225820883,
+      "seconds": 240.60449508321472,
       "tests": 19
     },
     "tests/func/test_network_extra_contracts.py": {
-      "seconds": 4.712248543975875,
+      "seconds": 2.76117158413399,
       "tests": 16
     },
     "tests/func/test_network_fresh_compile.py": {
-      "seconds": 220.39941958599957,
+      "seconds": 161.37744675611611,
       "tests": 13
     },
     "tests/func/test_network_initialization.py": {
-      "seconds": 28.430429705127608,
+      "seconds": 6.674488084507175,
       "tests": 12
     },
     "tests/func/test_network_initialization_bindings.py": {
-      "seconds": 1.3138062090147287,
+      "seconds": 1.5538957488024607,
       "tests": 7
     },
-    "tests/func/test_network_initialization_ordering.py": {
-      "seconds": 172.3059636639664,
+    "tests/func/test_network_initialization_draws.py": {
+      "seconds": 9.088425373309292,
       "tests": 20
     },
+    "tests/func/test_network_initialization_ordering.py": {
+      "seconds": 149.48371279193088,
+      "tests": 20
+    },
+    "tests/func/test_network_initialization_precedence.py": {
+      "seconds": 14.554898625938222,
+      "tests": 4
+    },
     "tests/func/test_network_initialization_rng.py": {
-      "seconds": 79.1122096637846,
+      "seconds": 68.07150766730774,
       "tests": 39
     },
     "tests/func/test_network_mapping_boundaries.py": {
-      "seconds": 5.996394630870782,
+      "seconds": 5.957360871252604,
       "tests": 29
     },
     "tests/func/test_network_mixed_conformance.py": {
-      "seconds": 469.7508625430637,
+      "seconds": 541.4983464997495,
       "tests": 14
     },
     "tests/func/test_network_netstim_parameters.py": {
-      "seconds": 139.90516295994166,
+      "seconds": 118.05438783369027,
       "tests": 19
     },
     "tests/func/test_network_ordering_live_preparation.py": {
-      "seconds": 4.109325791068841,
+      "seconds": 5.597039207001217,
       "tests": 6
     },
     "tests/func/test_network_ordering_snapshot_extraction.py": {
-      "seconds": 2.5824131679255515,
+      "seconds": 2.548752748640254,
       "tests": 13
     },
     "tests/func/test_network_parameters.py": {
-      "seconds": 0.20855333632789552,
+      "seconds": 0.22470979043282568,
       "tests": 17
     },
     "tests/func/test_network_pending_calendar.py": {
-      "seconds": 271.3264025459066,
+      "seconds": 192.42414712009486,
       "tests": 22
     },
+    "tests/func/test_network_poisson_sampler_contracts.py": {
+      "seconds": 0.012989834300242364,
+      "tests": 23
+    },
     "tests/func/test_network_population_caches.py": {
-      "seconds": 56.64322146080667,
+      "seconds": 58.04670870327391,
       "tests": 13
     },
     "tests/func/test_network_population_callback_edges.py": {
-      "seconds": 13.355214959650766,
+      "seconds": 15.891788206645288,
       "tests": 34
     },
     "tests/func/test_network_population_callbacks.py": {
-      "seconds": 89.26953937707003,
+      "seconds": 72.03442845598329,
       "tests": 10
     },
     "tests/func/test_network_random_parameters.py": {
-      "seconds": 288.9476924602641,
+      "seconds": 240.47460658696946,
       "tests": 16
     },
     "tests/func/test_network_recorder_region_edges.py": {
-      "seconds": 2.8695974540314637,
-      "tests": 19
+      "seconds": 1.3738557490287349,
+      "tests": 17
     },
     "tests/func/test_network_recorder_regions.py": {
-      "seconds": 137.6296585428645,
+      "seconds": 96.09536112600472,
       "tests": 10
     },
     "tests/func/test_network_rng_cache_validation.py": {
-      "seconds": 3.37688275083201,
+      "seconds": 3.42787520296406,
       "tests": 7
     },
     "tests/func/test_network_rng_sharing.py": {
-      "seconds": 266.2421679554973,
+      "seconds": 283.26202350121457,
       "tests": 39
     },
     "tests/func/test_network_rollout.py": {
-      "seconds": 288.17752120795194,
+      "seconds": 205.44045320199803,
       "tests": 27
     },
     "tests/func/test_network_rollout_operands.py": {
-      "seconds": 40.08849483303493,
+      "seconds": 38.04349412582815,
       "tests": 8
     },
+    "tests/func/test_network_runtime_draws.py": {
+      "seconds": 756.6110134136397,
+      "tests": 9
+    },
+    "tests/func/test_network_runtime_extra.py": {
+      "seconds": 259.7258675462799,
+      "tests": 14
+    },
     "tests/func/test_network_runtime_noise.py": {
-      "seconds": 238.42976475018077,
+      "seconds": 222.75549725082237,
       "tests": 14
     },
     "tests/func/test_network_source_history.py": {
-      "seconds": 199.28256358293584,
+      "seconds": 160.75713737111073,
       "tests": 17
     },
     "tests/func/test_network_stochastic_conformance.py": {
-      "seconds": 1023.0415374989389,
+      "seconds": 750.7840543377679,
       "tests": 10
     },
     "tests/func/test_network_subclasses.py": {
-      "seconds": 96.16663612076081,
+      "seconds": 74.22194708778989,
       "tests": 22
     },
     "tests/func/test_network_torch_parametrizations.py": {
-      "seconds": 552.8275566302473,
+      "seconds": 410.2980490856571,
       "tests": 23
     },
     "tests/func/test_network_while.py": {
-      "seconds": 409.8185923360288,
+      "seconds": 309.0027872940991,
       "tests": 29
     },
     "tests/func/test_network_while_edges.py": {
-      "seconds": 37.43070891191019,
+      "seconds": 27.142622337676585,
       "tests": 25
     },
     "tests/func/test_noise_workspaces.py": {
-      "seconds": 129.7667232058593,
+      "seconds": 125.88658841652796,
       "tests": 32
     },
     "tests/func/test_operator_family_selection.py": {
-      "seconds": 2.372623994888272,
+      "seconds": 1.915380668709986,
       "tests": 29
     },
+    "tests/func/test_owned_tensor_tree_cloning.py": {
+      "seconds": 0.03317550290375948,
+      "tests": 21
+    },
+    "tests/func/test_packet_binding.py": {
+      "seconds": 115.83354624954518,
+      "tests": 17
+    },
+    "tests/func/test_packet_binding_guards.py": {
+      "seconds": 24.99105212558061,
+      "tests": 18
+    },
+    "tests/func/test_packet_execution.py": {
+      "seconds": 121.76848612225149,
+      "tests": 31
+    },
     "tests/func/test_parameter_materialization.py": {
-      "seconds": 10.5200819997699,
+      "seconds": 9.08963941282127,
       "tests": 54
     },
     "tests/func/test_parameter_selectors.py": {
-      "seconds": 0.08906875632237643,
+      "seconds": 0.05336508702021092,
       "tests": 82
     },
     "tests/func/test_passive_end_diameter.py": {
-      "seconds": 12.304378416039981,
+      "seconds": 7.2350011670496315,
       "tests": 9
     },
     "tests/func/test_passive_end_reversal.py": {
-      "seconds": 6.488327291968744,
+      "seconds": 9.78977179119829,
       "tests": 3
     },
     "tests/func/test_plain_population.py": {
-      "seconds": 114.34352350636618,
+      "seconds": 86.05803953844588,
       "tests": 34
     },
     "tests/func/test_point_integrator_contracts.py": {
-      "seconds": 23.09862445521867,
+      "seconds": 32.163163124467246,
       "tests": 64
     },
     "tests/func/test_point_integrators.py": {
-      "seconds": 754.8150613344624,
+      "seconds": 801.623562328401,
       "tests": 55
     },
     "tests/func/test_point_processes.py": {
-      "seconds": 3.458817539969459,
+      "seconds": 5.102276582503691,
       "tests": 15
     },
     "tests/func/test_poisson_cache_aliases.py": {
-      "seconds": 1.008985083841253,
+      "seconds": 0.7460240009240806,
       "tests": 3
     },
     "tests/func/test_poisson_execution_isolation.py": {
-      "seconds": 48.692646081966814,
+      "seconds": 9.095376709126867,
       "tests": 8
     },
     "tests/func/test_poisson_invocation_execution.py": {
-      "seconds": 1606.0697805773816,
+      "seconds": 1704.2861323273974,
       "tests": 39
     },
     "tests/func/test_poisson_invocation_guards.py": {
-      "seconds": 5.794923375535291,
+      "seconds": 7.222861666115932,
       "tests": 19
     },
     "tests/func/test_poisson_invocation_topology.py": {
-      "seconds": 0.17690491711255163,
+      "seconds": 0.2202222489286214,
       "tests": 2
     },
     "tests/func/test_poisson_plan_contracts.py": {
-      "seconds": 2.3897027901839465,
+      "seconds": 4.498303081374615,
       "tests": 23
     },
     "tests/func/test_poisson_stimulation.py": {
-      "seconds": 491.38734717003535,
+      "seconds": 542.1856188384118,
       "tests": 46
     },
     "tests/func/test_population_cache_initialization.py": {
-      "seconds": 29.43218058202183,
+      "seconds": 18.28150450286921,
       "tests": 16
     },
     "tests/func/test_population_cache_materializations.py": {
-      "seconds": 26.067052374011837,
+      "seconds": 34.68927641736809,
       "tests": 23
     },
+    "tests/func/test_population_configuration_sources.py": {
+      "seconds": 0.19049983308650553,
+      "tests": 13
+    },
+    "tests/func/test_population_initialization_draws.py": {
+      "seconds": 12.567951625678688,
+      "tests": 15
+    },
     "tests/func/test_population_initialization_transforms.py": {
-      "seconds": 21.9734675011714,
+      "seconds": 15.115889835287817,
       "tests": 9
     },
     "tests/func/test_population_owned_cache.py": {
-      "seconds": 49.71150516089983,
+      "seconds": 31.125225044088438,
       "tests": 22
     },
+    "tests/func/test_population_shared_scan.py": {
+      "seconds": 105.94152928935364,
+      "tests": 11
+    },
     "tests/func/test_population_subclass_guards.py": {
-      "seconds": 90.25245129020186,
+      "seconds": 61.251246704137884,
       "tests": 32
     },
     "tests/func/test_population_subclasses.py": {
-      "seconds": 4.712662164354697,
+      "seconds": 3.950082586496137,
       "tests": 56
     },
+    "tests/func/test_prepared_callbacks.py": {
+      "seconds": 25.961171459406614,
+      "tests": 19
+    },
+    "tests/func/test_prepared_constant_collection.py": {
+      "seconds": 0.006814453285187483,
+      "tests": 14
+    },
     "tests/func/test_prepared_parameter_contracts.py": {
-      "seconds": 0.05425424984423444,
+      "seconds": 0.062337584095075727,
       "tests": 6
     },
     "tests/func/test_purity_policy.py": {
-      "seconds": 82.4899112090934,
+      "seconds": 89.10699978726916,
       "tests": 16
     },
     "tests/func/test_random_native_commit.py": {
-      "seconds": 3.8109477069810964,
+      "seconds": 4.13791408308316,
       "tests": 11
     },
     "tests/func/test_random_parameters.py": {
-      "seconds": 19.009558249847032,
+      "seconds": 25.686204042402096,
       "tests": 35
     },
+    "tests/func/test_raw_binding_backends.py": {
+      "seconds": 26.924647791078314,
+      "tests": 1
+    },
+    "tests/func/test_raw_binding_guards.py": {
+      "seconds": 3.684036707156338,
+      "tests": 9
+    },
+    "tests/func/test_raw_binding_inference.py": {
+      "seconds": 1.1404391236137599,
+      "tests": 13
+    },
+    "tests/func/test_raw_bindings.py": {
+      "seconds": 96.17821595724672,
+      "tests": 15
+    },
+    "tests/func/test_raw_source_inventory.py": {
+      "seconds": 0.07961308222729713,
+      "tests": 11
+    },
+    "tests/func/test_recorder_cadence.py": {
+      "seconds": 85.98685817280784,
+      "tests": 28
+    },
     "tests/func/test_recorder_regions.py": {
-      "seconds": 161.88929900119547,
+      "seconds": 133.06195395695977,
       "tests": 28
     },
     "tests/func/test_recorder_while_loop.py": {
-      "seconds": 152.66821908630664,
+      "seconds": 124.2103682475863,
       "tests": 21
     },
     "tests/func/test_regional_geometry.py": {
-      "seconds": 11.619818329520058,
+      "seconds": 10.830557002685964,
       "tests": 24
     },
     "tests/func/test_regional_hh.py": {
-      "seconds": 16.74591091403272,
+      "seconds": 4.444373877136968,
       "tests": 8
     },
     "tests/func/test_regional_parameters.py": {
-      "seconds": 4.8322737069102,
+      "seconds": 7.748376207659021,
       "tests": 22
     },
     "tests/func/test_regional_shared_fields.py": {
-      "seconds": 50.31866358302068,
+      "seconds": 53.776267919223756,
       "tests": 29
     },
     "tests/func/test_registered_module_traversal.py": {
-      "seconds": 0.008504877041559666,
+      "seconds": 0.0040633773896843195,
+      "tests": 11
+    },
+    "tests/func/test_registered_prepared_constants.py": {
+      "seconds": 0.008949749520979822,
+      "tests": 12
+    },
+    "tests/func/test_registered_rng_ownership_contracts.py": {
+      "seconds": 0.014601919800043106,
+      "tests": 24
+    },
+    "tests/func/test_registered_tensor_binding_frames.py": {
+      "seconds": 0.013330165529623628,
+      "tests": 19
+    },
+    "tests/func/test_retained_frame_lifecycle.py": {
+      "seconds": 0.7963326710741967,
+      "tests": 12
+    },
+    "tests/func/test_retained_frame_projection.py": {
+      "seconds": 2.070597082260065,
+      "tests": 10
+    },
+    "tests/func/test_retained_frame_validation.py": {
+      "seconds": 1.9094481719657779,
+      "tests": 15
+    },
+    "tests/func/test_retained_materialization_inventory.py": {
+      "seconds": 19.43340820982121,
       "tests": 11
     },
     "tests/func/test_rng_diagnostic_transactions.py": {
-      "seconds": 0.6010327501571737,
+      "seconds": 2.8314147086348385,
       "tests": 14
     },
     "tests/func/test_rng_frame_restoration.py": {
-      "seconds": 1.5905484590330161,
+      "seconds": 1.323409455246292,
       "tests": 14
     },
     "tests/func/test_rng_load_policies.py": {
-      "seconds": 108.20339292299468,
+      "seconds": 123.84128287085332,
       "tests": 25
     },
     "tests/func/test_rollout_input_contracts.py": {
-      "seconds": 2.2727960410993546,
+      "seconds": 2.528240585117601,
       "tests": 13
     },
     "tests/func/test_runge_kutta.py": {
-      "seconds": 1012.4442666750401,
+      "seconds": 686.2347883303883,
       "tests": 48
     },
     "tests/func/test_runge_kutta_contracts.py": {
-      "seconds": 26.101402914035134,
+      "seconds": 25.894430082291365,
       "tests": 34
     },
+    "tests/func/test_runner_chunking.py": {
+      "seconds": 1893.685063789948,
+      "tests": 22
+    },
     "tests/func/test_runner_compiled_callback_edges.py": {
-      "seconds": 20.70684233296197,
+      "seconds": 21.24059337528888,
       "tests": 4
     },
     "tests/func/test_runner_compiled_callbacks.py": {
-      "seconds": 257.77164962602546,
+      "seconds": 173.13839842088055,
       "tests": 19
     },
     "tests/func/test_runner_compiled_chunks.py": {
-      "seconds": 287.35670704592485,
+      "seconds": 191.32462349859998,
       "tests": 37
     },
+    "tests/func/test_runner_execution.py": {
+      "seconds": 81.16036841145251,
+      "tests": 50
+    },
+    "tests/func/test_runner_horizons.py": {
+      "seconds": 801.0931285440456,
+      "tests": 27
+    },
+    "tests/func/test_runner_initialization.py": {
+      "seconds": 55.406838003662415,
+      "tests": 31
+    },
     "tests/func/test_runner_parameter_selectors.py": {
-      "seconds": 10.103130956180394,
+      "seconds": 13.018763667205349,
       "tests": 8
     },
     "tests/func/test_runner_stimulation_clock.py": {
-      "seconds": 30.88487808208447,
+      "seconds": 31.710296250297688,
       "tests": 4
     },
     "tests/func/test_runners.py": {
-      "seconds": 113.55289842491038,
+      "seconds": 109.92580770305358,
       "tests": 86
     },
+    "tests/func/test_runtime_draws.py": {
+      "seconds": 625.2386089178035,
+      "tests": 14
+    },
+    "tests/func/test_runtime_draws_checkpoint_freshness.py": {
+      "seconds": 2.2236807900480926,
+      "tests": 4
+    },
+    "tests/func/test_runtime_draws_dormant_rng.py": {
+      "seconds": 14.43643550015986,
+      "tests": 8
+    },
+    "tests/func/test_runtime_draws_empty.py": {
+      "seconds": 13.549524500966072,
+      "tests": 4
+    },
+    "tests/func/test_runtime_draws_optional_families.py": {
+      "seconds": 19.560241999221034,
+      "tests": 2
+    },
+    "tests/func/test_runtime_draws_order.py": {
+      "seconds": 0.5000473338877782,
+      "tests": 2
+    },
+    "tests/func/test_runtime_draws_prepared_guards.py": {
+      "seconds": 0.7496402900433168,
+      "tests": 4
+    },
+    "tests/func/test_runtime_extra.py": {
+      "seconds": 71.8205968295224,
+      "tests": 30
+    },
+    "tests/func/test_runtime_extra_backends.py": {
+      "seconds": 25.1520881250035,
+      "tests": 1
+    },
+    "tests/func/test_runtime_extra_schedule.py": {
+      "seconds": 0.6047186639625579,
+      "tests": 9
+    },
+    "tests/func/test_runtime_extra_stochastic_model.py": {
+      "seconds": 198.67187058285344,
+      "tests": 2
+    },
     "tests/func/test_runtime_noise.py": {
-      "seconds": 7.616505914658774,
+      "seconds": 2.9468387020751834,
       "tests": 30
     },
     "tests/func/test_runtime_noise_execution.py": {
-      "seconds": 10.014390334137715,
+      "seconds": 11.066942624864168,
       "tests": 4
     },
     "tests/func/test_scalar_tree.py": {
-      "seconds": 21.13787804316962,
+      "seconds": 6.693352873902768,
       "tests": 17
     },
     "tests/func/test_scalar_tree_precision.py": {
-      "seconds": 1.5105235410155728,
+      "seconds": 1.558708374737762,
       "tests": 6
     },
     "tests/func/test_scan_autograd.py": {
-      "seconds": 0.74939924973296,
+      "seconds": 0.9080122087616473,
       "tests": 14
     },
     "tests/func/test_scan_blocks.py": {
-      "seconds": 205.28181991702877,
+      "seconds": 200.53437800204847,
       "tests": 32
     },
     "tests/func/test_scan_capture_hooks.py": {
-      "seconds": 0.014758207951672375,
+      "seconds": 0.23886962502729148,
       "tests": 3
     },
     "tests/func/test_scan_chunk.py": {
-      "seconds": 163.299221292953,
+      "seconds": 155.30379924550653,
       "tests": 29
     },
     "tests/func/test_scan_cpp_policy.py": {
-      "seconds": 0.019697038282174617,
-      "tests": 34
+      "seconds": 0.017072013579308987,
+      "tests": 37
     },
     "tests/func/test_scan_discrete_materialization.py": {
-      "seconds": 1.5293576685944572,
+      "seconds": 8.023105165339075,
       "tests": 36
     },
     "tests/func/test_scan_donation.py": {
-      "seconds": 25.552818958007265,
-      "tests": 36
+      "seconds": 41.00576129183173,
+      "tests": 39
     },
     "tests/func/test_scan_donation_workflows.py": {
-      "seconds": 562.2595377919497,
+      "seconds": 518.2371838329127,
       "tests": 8
     },
     "tests/func/test_scan_edges.py": {
-      "seconds": 50.52221587317763,
+      "seconds": 39.269996832939796,
       "tests": 7
     },
     "tests/func/test_scan_hh_validation.py": {
-      "seconds": 456.15768766909605,
+      "seconds": 464.21508845873177,
       "tests": 6
     },
     "tests/func/test_scan_inductor.py": {
-      "seconds": 0.5940612051053904,
+      "seconds": 4.2625729168066755,
       "tests": 44
     },
     "tests/func/test_scan_packed.py": {
-      "seconds": 39.847435211064294,
+      "seconds": 24.330490417894907,
       "tests": 6
     },
     "tests/func/test_scan_phase_recording.py": {
-      "seconds": 15.951205918099731,
+      "seconds": 21.25055737607181,
       "tests": 10
     },
     "tests/func/test_scan_recording.py": {
-      "seconds": 10.198834209062625,
+      "seconds": 19.214674913790077,
       "tests": 4
     },
     "tests/func/test_scan_tree.py": {
-      "seconds": 19.547324951912742,
+      "seconds": 20.144740786519833,
       "tests": 26
     },
+    "tests/func/test_scheduling_compatibility.py": {
+      "seconds": 1.9150030409218743,
+      "tests": 2
+    },
+    "tests/func/test_scheduling_legacy_adapter.py": {
+      "seconds": 0.15102291700895876,
+      "tests": 1
+    },
     "tests/func/test_scnv.py": {
-      "seconds": 43.119429331680294,
+      "seconds": 42.51227578474209,
       "tests": 13
     },
     "tests/func/test_scnv_guards.py": {
-      "seconds": 0.29021000204375014,
+      "seconds": 0.2382869169814512,
       "tests": 12
     },
+    "tests/func/test_shared_activity_configuration.py": {
+      "seconds": 49.07142029388342,
+      "tests": 45
+    },
+    "tests/func/test_shared_api_network_conformance.py": {
+      "seconds": 46.537661791895516,
+      "tests": 1
+    },
+    "tests/func/test_shared_api_population_conformance.py": {
+      "seconds": 5.96802112495061,
+      "tests": 1
+    },
     "tests/func/test_shared_field_initialization.py": {
-      "seconds": 8.009555956174154,
+      "seconds": 8.816855331533588,
       "tests": 28
     },
+    "tests/func/test_shared_lfp_configuration.py": {
+      "seconds": 139.23256708716508,
+      "tests": 19
+    },
+    "tests/func/test_shared_population_callback_scopes.py": {
+      "seconds": 82.17232870776206,
+      "tests": 13
+    },
+    "tests/func/test_shared_recorder_configuration.py": {
+      "seconds": 188.56258916750085,
+      "tests": 20
+    },
     "tests/func/test_shared_rng_samplers.py": {
-      "seconds": 0.2223981668939814,
+      "seconds": 0.23558928875718266,
       "tests": 5
     },
     "tests/func/test_shared_sc_preparation.py": {
-      "seconds": 0.202708791999612,
+      "seconds": 0.18903820973355323,
       "tests": 15
     },
+    "tests/func/test_shared_schedule_bindings.py": {
+      "seconds": 8.562955787987448,
+      "tests": 6
+    },
+    "tests/func/test_shared_threshold_callbacks.py": {
+      "seconds": 36.80439504631795,
+      "tests": 29
+    },
+    "tests/func/test_shared_threshold_configuration.py": {
+      "seconds": 43.545247038127854,
+      "tests": 36
+    },
     "tests/func/test_shared_ub_preparation.py": {
-      "seconds": 0.22650449723005295,
+      "seconds": 0.2064748383127153,
       "tests": 13
     },
     "tests/func/test_single_compartment.py": {
-      "seconds": 24.33710195601452,
+      "seconds": 15.717792000272311,
       "tests": 15
     },
+    "tests/func/test_snapshot_frame_completion.py": {
+      "seconds": 0.7690865842159837,
+      "tests": 13
+    },
+    "tests/func/test_source_inspection.py": {
+      "seconds": 0.011432873201556504,
+      "tests": 22
+    },
+    "tests/func/test_source_inspection_runners.py": {
+      "seconds": 6.354574540979229,
+      "tests": 8
+    },
+    "tests/func/test_source_selection.py": {
+      "seconds": 1.9057955369353294,
+      "tests": 48
+    },
     "tests/func/test_spd_solvers.py": {
-      "seconds": 173.47979237826075,
+      "seconds": 199.57050029351376,
       "tests": 22
     },
     "tests/func/test_state_sde_execution.py": {
-      "seconds": 215.3675748448586,
+      "seconds": 125.71421791613102,
       "tests": 19
     },
     "tests/func/test_state_sde_layouts.py": {
-      "seconds": 15.255108373006806,
+      "seconds": 10.243539583985694,
       "tests": 6
     },
     "tests/func/test_state_sde_plan.py": {
-      "seconds": 0.4100715419626795,
+      "seconds": 0.4405215836595744,
       "tests": 16
     },
     "tests/func/test_state_sde_transforms.py": {
-      "seconds": 19.072766705823597,
+      "seconds": 23.858972212066874,
       "tests": 8
     },
     "tests/func/test_state_transition_output_validation.py": {
-      "seconds": 1.8913484158110805,
+      "seconds": 2.351494458853267,
       "tests": 6
     },
+    "tests/func/test_step_input_execution.py": {
+      "seconds": 0.46335574972908944,
+      "tests": 6
+    },
+    "tests/func/test_step_input_indexing.py": {
+      "seconds": 0.011800377280451357,
+      "tests": 24
+    },
     "tests/func/test_stimulation.py": {
-      "seconds": 33.99944508855697,
+      "seconds": 36.58423720684368,
       "tests": 48
     },
     "tests/func/test_stimulation_rng_network_compatibility.py": {
-      "seconds": 1.4114065009634942,
+      "seconds": 1.9038808748591691,
       "tests": 5
     },
     "tests/func/test_stimulation_rng_order_plan.py": {
-      "seconds": 0.9453003319795243,
+      "seconds": 0.9237836257088929,
       "tests": 6
     },
     "tests/func/test_stimulation_rng_population_compatibility.py": {
-      "seconds": 58.14259683404816,
-      "tests": 7
+      "seconds": 68.4883976248093,
+      "tests": 8
     },
     "tests/func/test_stimulation_rng_sampling_diagnostics.py": {
-      "seconds": 0.7589778769761324,
+      "seconds": 0.688676584046334,
       "tests": 3
     },
     "tests/func/test_stimulation_rng_sharing.py": {
-      "seconds": 970.3074089952861,
+      "seconds": 963.5483878786908,
       "tests": 36
     },
     "tests/func/test_stimulation_sources.py": {
-      "seconds": 0.7677972478559241,
+      "seconds": 0.5544927511364222,
       "tests": 8
     },
     "tests/func/test_stochastic_initialization_ordering.py": {
-      "seconds": 236.38265783007955,
+      "seconds": 260.38627883128356,
       "tests": 19
     },
     "tests/func/test_stochastic_initialization_ordering_edges.py": {
-      "seconds": 0.18067079194588587,
+      "seconds": 0.15144679183140397,
       "tests": 2
     },
     "tests/func/test_table_execution.py": {
-      "seconds": 155.53877266618656,
+      "seconds": 160.89194778958336,
       "tests": 41
     },
     "tests/func/test_table_guards.py": {
-      "seconds": 144.14249966404168,
+      "seconds": 92.4570832507452,
       "tests": 21
     },
     "tests/func/test_table_plan.py": {
-      "seconds": 0.5556562921847217,
+      "seconds": 0.5869341287761927,
       "tests": 25
     },
     "tests/func/test_table_transforms.py": {
-      "seconds": 131.5022609179141,
+      "seconds": 162.67653666774277,
       "tests": 12
     },
     "tests/func/test_tensor_queries.py": {
-      "seconds": 0.0735400840640068,
+      "seconds": 0.05412483320105821,
       "tests": 6
     },
     "tests/func/test_tensor_tree_while.py": {
-      "seconds": 20.99998820683686,
+      "seconds": 17.350101119023748,
       "tests": 24
     },
     "tests/func/test_timestep_buffers.py": {
-      "seconds": 14.562501825508662,
+      "seconds": 17.103035467211157,
       "tests": 119
     },
     "tests/func/test_timestep_initialization.py": {
-      "seconds": 443.7959529951331,
+      "seconds": 507.8206614594674,
       "tests": 30
     },
     "tests/func/test_torch_parametrization_guards.py": {
-      "seconds": 10.78994007955771,
+      "seconds": 10.682903498294763,
       "tests": 26
     },
     "tests/func/test_torch_parametrizations.py": {
-      "seconds": 108.64701158512617,
+      "seconds": 50.53051224653609,
       "tests": 28
     },
     "tests/func/test_tree_initialization.py": {
-      "seconds": 21.740233790653292,
+      "seconds": 18.072158876690082,
       "tests": 15
     },
     "tests/func/test_unmyelinated_hh.py": {
-      "seconds": 109.90078333404381,
+      "seconds": 106.53121187747456,
       "tests": 38
     },
     "tests/func/test_voltage_continuation.py": {
-      "seconds": 55.154576539061964,
+      "seconds": 62.5696839162847,
       "tests": 6
     },
     "tests/func/test_voltage_process_guards.py": {
-      "seconds": 6.171832450898364,
+      "seconds": 9.292297837790102,
       "tests": 48
     },
     "tests/func/test_voltage_processes.py": {
-      "seconds": 629.7786871222197,
+      "seconds": 660.5656585871475,
       "tests": 110
     },
     "tests/func/test_voltage_state_updates.py": {
-      "seconds": 8.374244754202664,
+      "seconds": 6.560326581588015,
       "tests": 16
     },
     "tests/func/test_waveform_invocation_profiles.py": {
-      "seconds": 0.03148904297268018,
+      "seconds": 0.03821558377239853,
       "tests": 6
     },
     "tests/func/test_waveform_policy_observations.py": {
-      "seconds": 12.86518741492182,
+      "seconds": 13.888242376968265,
       "tests": 9
     },
     "tests/func/test_waveform_profile_policy.py": {
-      "seconds": 0.5230388308991678,
+      "seconds": 0.5858125853119418,
       "tests": 8
     },
     "tests/func/test_waveform_purity.py": {
-      "seconds": 2.376466579269618,
+      "seconds": 2.604380714823492,
       "tests": 34
     },
     "tests/func/test_while_block_ownership.py": {
-      "seconds": 45.97209258197108,
+      "seconds": 51.24645258311648,
       "tests": 3
     },
     "tests/func/test_while_inductor.py": {
-      "seconds": 435.0559535425273,
+      "seconds": 305.88984638045076,
       "tests": 39
     },
     "tests/func/test_while_packed.py": {
-      "seconds": 25.41321458289167,
+      "seconds": 36.97989995928947,
       "tests": 8
     },
     "tests/networks/test_backend_adversarial_matrix.py": {
-      "seconds": 0.6176552471006289,
+      "seconds": 0.6106155436718836,
       "tests": 15
     },
     "tests/networks/test_backend_equivalence.py": {
-      "seconds": 0.42473300179699436,
+      "seconds": 0.43978178943507373,
       "tests": 24
     },
     "tests/networks/test_connection_parameter_hooks.py": {
-      "seconds": 0.006833411869592965,
+      "seconds": 0.01665962382685393,
       "tests": 10
     },
     "tests/networks/test_connection_sampling.py": {
-      "seconds": 0.29328346683178097,
+      "seconds": 0.22438979428261518,
       "tests": 34
     },
     "tests/networks/test_continuous_delivery_compat.py": {
-      "seconds": 0.3099207498016767,
+      "seconds": 0.2935960404574871,
       "tests": 25
     },
     "tests/networks/test_continuous_semantics.py": {
-      "seconds": 0.4675312469480559,
+      "seconds": 0.5308072051266208,
       "tests": 29
     },
     "tests/networks/test_custom_connection_sampling.py": {
-      "seconds": 0.022366291843354702,
+      "seconds": 0.02076508174650371,
       "tests": 28
     },
     "tests/networks/test_delay_interpolation_compat.py": {
-      "seconds": 2.2027685799985193,
+      "seconds": 10.833645496866666,
       "tests": 20
     },
     "tests/networks/test_event_delivery_contract.py": {
-      "seconds": 0.1382035001879558,
+      "seconds": 0.14326120889745653,
       "tests": 5
     },
     "tests/networks/test_functional_continuous_network.py": {
-      "seconds": 76.22289116802858,
+      "seconds": 71.0626921679359,
       "tests": 4
     },
     "tests/networks/test_functional_delay_network.py": {
-      "seconds": 109.36683658102993,
+      "seconds": 55.066131751053035,
       "tests": 6
     },
     "tests/networks/test_functional_event_delivery.py": {
-      "seconds": 76.92178433592198,
+      "seconds": 51.40901808254421,
       "tests": 6
     },
     "tests/networks/test_heap_calendar.py": {
-      "seconds": 1.5517466634046286,
-      "tests": 40
+      "seconds": 4.289556000032462,
+      "tests": 36
     },
     "tests/networks/test_heap_calendar_compat.py": {
-      "seconds": 0.07348745263880119,
+      "seconds": 0.09079083218239248,
       "tests": 39
     },
     "tests/networks/test_mechanism_rebuild_identity.py": {
-      "seconds": 0.22502391505986452,
+      "seconds": 0.20312279532663524,
       "tests": 10
     },
+    "tests/networks/test_native_network_execution_horizons.py": {
+      "seconds": 8.877760825911537,
+      "tests": 27
+    },
+    "tests/networks/test_native_network_runtime_inputs.py": {
+      "seconds": 12.401632589986548,
+      "tests": 33
+    },
+    "tests/networks/test_native_shared_schedule_bindings.py": {
+      "seconds": 0.5083268327871338,
+      "tests": 14
+    },
     "tests/networks/test_netcon_runtime.py": {
-      "seconds": 0.7208289550617337,
+      "seconds": 0.7210150801111013,
       "tests": 27
     },
     "tests/networks/test_netcon_state_helpers.py": {
-      "seconds": 0.022578623960725963,
+      "seconds": 0.005346335936337709,
       "tests": 11
     },
     "tests/networks/test_netstim.py": {
-      "seconds": 0.7231839600135572,
+      "seconds": 0.5589399560121819,
       "tests": 22
     },
     "tests/networks/test_netstim_runtime.py": {
-      "seconds": 0.01485412404872477,
+      "seconds": 0.020348832942545414,
       "tests": 9
     },
     "tests/networks/test_netstim_schedule_matrix.py": {
-      "seconds": 0.0521260408568196,
+      "seconds": 0.044174290844239295,
       "tests": 34
     },
     "tests/networks/test_network_attach_netstim.py": {
-      "seconds": 0.19603516516508535,
+      "seconds": 0.16609612212050706,
       "tests": 8
     },
     "tests/networks/test_network_clock_ownership.py": {
-      "seconds": 8.333988162921742,
+      "seconds": 3.2567574533168226,
       "tests": 16
     },
     "tests/networks/test_network_concat_correctness.py": {
-      "seconds": 123.5366424191161,
+      "seconds": 26.345252286992036,
       "tests": 17
     },
     "tests/networks/test_network_connectivity_rules.py": {
-      "seconds": 0.49140853894641623,
+      "seconds": 0.46658437652513385,
       "tests": 18
     },
     "tests/networks/test_network_execution_equivalence.py": {
-      "seconds": 2.2625821641413495,
+      "seconds": 2.4603098750812933,
       "tests": 16
     },
     "tests/networks/test_network_lifecycle_hypothesis.py": {
-      "seconds": 22.37191324919695,
+      "seconds": 18.001037545851432,
       "tests": 27
     },
     "tests/networks/test_network_replay_matrix.py": {
-      "seconds": 1.3386078758630902,
+      "seconds": 1.2966343682492152,
       "tests": 46
     },
     "tests/networks/test_network_run_duration_contract.py": {
-      "seconds": 0.8063717951881699,
+      "seconds": 0.8553752477746457,
       "tests": 31
     },
     "tests/networks/test_network_runtime.py": {
-      "seconds": 0.45349499583244324,
+      "seconds": 0.487349538016133,
       "tests": 14
     },
     "tests/networks/test_network_synapse_slots.py": {
-      "seconds": 18.730688873911276,
+      "seconds": 4.226264581782743,
       "tests": 5
     },
     "tests/networks/test_pending_calendar.py": {
-      "seconds": 0.351989165879786,
+      "seconds": 0.38635987520683557,
       "tests": 15
     },
     "tests/networks/test_population_cache_restore.py": {
-      "seconds": 53.51082412595861,
+      "seconds": 25.01265250018332,
       "tests": 6
     },
     "tests/networks/test_pure_continuous_delivery.py": {
-      "seconds": 0.8638432099251077,
+      "seconds": 3.132688249112107,
       "tests": 22
     },
     "tests/networks/test_pure_continuous_receive.py": {
-      "seconds": 0.07632974919397384,
+      "seconds": 0.0873990444233641,
       "tests": 19
     },
     "tests/networks/test_pure_delay_interpolation.py": {
-      "seconds": 0.9655247568152845,
+      "seconds": 5.555090789683163,
       "tests": 82
     },
     "tests/networks/test_pure_event_delivery_core.py": {
-      "seconds": 0.297033165814355,
+      "seconds": 0.2547257833648473,
       "tests": 25
     },
     "tests/networks/test_pure_netstim_renewal.py": {
-      "seconds": 0.4999519158154726,
+      "seconds": 1.5280070847366005,
       "tests": 27
     },
     "tests/networks/test_pure_synapse_event_delivery.py": {
-      "seconds": 0.015748333069495857,
+      "seconds": 0.0189399168593809,
       "tests": 1
     },
     "tests/networks/test_pure_tensor_schedules.py": {
-      "seconds": 0.6331050821463577,
+      "seconds": 0.9437509103445336,
       "tests": 34
     },
     "tests/networks/test_pure_threshold_detection.py": {
-      "seconds": 0.8508144569350407,
+      "seconds": 0.5376100445864722,
       "tests": 34
     },
     "tests/networks/test_source_history_kernels.py": {
-      "seconds": 0.5155087998718955,
+      "seconds": 0.6635795045876876,
       "tests": 64
     },
     "tests/networks/test_state_cache_translation.py": {
-      "seconds": 1.2018394128535874,
+      "seconds": 1.067625452997163,
       "tests": 27
     },
     "tests/simtests/test_active_extcell_layers_against_neuron.py": {
-      "seconds": 2.5877426259685308,
+      "seconds": 2.2310330000473186,
       "tests": 2
     },
     "tests/simtests/test_active_extracellular_against_neuron.py": {
-      "seconds": 1.3848755429498851,
+      "seconds": 0.9895734570454806,
       "tests": 3
     },
     "tests/simtests/test_active_network_against_neuron.py": {
-      "seconds": 2.688989996910095,
+      "seconds": 2.095424875849858,
       "tests": 4
     },
     "tests/simtests/test_against_neuron.py": {
-      "seconds": 10.213673709833529,
+      "seconds": 10.927731001051143,
       "tests": 6
     },
     "tests/simtests/test_axon_propagation_against_neuron.py": {
-      "seconds": 2.5693842081236653,
+      "seconds": 2.870449249865487,
       "tests": 3
     },
     "tests/simtests/test_extcell_layers_against_neuron.py": {
-      "seconds": 0.21030012593837455,
+      "seconds": 0.10201966692693532,
       "tests": 2
     },
     "tests/simtests/test_extracellular_against_neuron.py": {
-      "seconds": 0.2176994999172166,
+      "seconds": 0.24029454216361046,
       "tests": 7
     },
     "tests/simtests/test_hh_temperature_against_neuron.py": {
-      "seconds": 1.7739673749892972,
+      "seconds": 2.439145500655286,
       "tests": 5
     },
     "tests/simtests/test_high_temperature_active_propagation.py": {
-      "seconds": 7.574742958997376,
+      "seconds": 8.073722083005123,
       "tests": 6
     },
     "tests/simtests/test_material_diffusion_imported_morphology.py": {
-      "seconds": 0.10853362508350983,
+      "seconds": 0.11808883305639029,
       "tests": 3
     },
     "tests/simtests/test_native_cable_against_neuron.py": {
-      "seconds": 1.4179647519486025,
+      "seconds": 1.4829250420443714,
       "tests": 3
     },
     "tests/simtests/test_native_morphology_active_against_neuron.py": {
-      "seconds": 0.6679579999763519,
+      "seconds": 0.716208373894915,
       "tests": 2
     },
     "tests/simtests/test_native_morphology_against_neuron.py": {
-      "seconds": 0.011652753106318414,
+      "seconds": 0.02009962499141693,
       "tests": 6
     },
     "tests/simtests/test_native_morphology_generated_against_neuron.py": {
-      "seconds": 0.14933250105241314,
+      "seconds": 0.15813629294279963,
       "tests": 3
     },
     "tests/simtests/test_scalar_multi_holistic.py": {
-      "seconds": 2.5131336700869724,
+      "seconds": 2.415605754009448,
       "tests": 18
     },
     "tests/simtests/test_tapered_tree_against_neuron.py": {
-      "seconds": 0.12485949997790158,
+      "seconds": 0.14715866488404572,
       "tests": 2
     },
     "tests/simtests/test_three_cell_network_convergence.py": {
-      "seconds": 11.780912416987121,
+      "seconds": 11.710039666038938,
       "tests": 1
     },
     "tests/test_accelerator_dispatch_contracts.py": {
-      "seconds": 0.056357623368967324,
+      "seconds": 0.03797945915721357,
       "tests": 20
     },
     "tests/test_activation_witness.py": {
-      "seconds": 0.00610429112566635,
+      "seconds": 0.005054124048911035,
       "tests": 4
     },
+    "tests/test_activity_configuration_sources.py": {
+      "seconds": 0.04752774641383439,
+      "tests": 96
+    },
     "tests/test_affine_current_api.py": {
-      "seconds": 2.962132882210426,
+      "seconds": 2.5912206664215773,
       "tests": 32
     },
     "tests/test_analysis.py": {
-      "seconds": 0.06457641604356468,
+      "seconds": 0.05798354453872889,
       "tests": 44
     },
     "tests/test_analysis_public_api.py": {
-      "seconds": 0.0019212898914702237,
+      "seconds": 0.0036684167571365833,
       "tests": 3
     },
     "tests/test_analysis_reference_matrix.py": {
-      "seconds": 0.0910824139136821,
+      "seconds": 0.09337954607326537,
       "tests": 45
     },
     "tests/test_analysis_training_integration.py": {
-      "seconds": 5.453861416084692,
+      "seconds": 3.655358416843228,
       "tests": 1
     },
     "tests/test_backward_euler_increment_precision.py": {
-      "seconds": 4.2681464101187885,
+      "seconds": 16.175541038624942,
       "tests": 74
     },
     "tests/test_batched_extracellular_contract.py": {
-      "seconds": 58.895207747409586,
+      "seconds": 21.484967159340158,
       "tests": 35
     },
     "tests/test_batched_intracellular_contract.py": {
-      "seconds": 105.55547995812958,
+      "seconds": 27.74179458571598,
       "tests": 34
     },
     "tests/test_batched_threshold_protocol.py": {
-      "seconds": 0.02846024901373312,
+      "seconds": 0.01870766724459827,
       "tests": 7
     },
     "tests/test_block_pcr_solver.py": {
-      "seconds": 1.9092860380769707,
-      "tests": 21
+      "seconds": 0.9014109988929704,
+      "tests": 18
     },
     "tests/test_block_workspace_conversion.py": {
-      "seconds": 0.2752210390754044,
+      "seconds": 0.2986701283371076,
       "tests": 21
     },
     "tests/test_bootstrap.py": {
-      "seconds": 16.059646330948453,
+      "seconds": 18.153498451574706,
       "tests": 17
     },
     "tests/test_branch_conditioned_conduction_velocity.py": {
-      "seconds": 0.045273915806319565,
+      "seconds": 0.04647616937290877,
       "tests": 22
     },
     "tests/test_branch_conditioned_metrics.py": {
-      "seconds": 0.13717829360393807,
+      "seconds": 0.13749058451503515,
       "tests": 28
     },
     "tests/test_builtin_spike_mechanisms.py": {
-      "seconds": 0.05058920686133206,
+      "seconds": 0.05360891972668469,
       "tests": 11
     },
     "tests/test_callback_horizon.py": {
-      "seconds": 0.005182502791285515,
+      "seconds": 0.009665541001595557,
       "tests": 11
     },
     "tests/test_callback_margin.py": {
-      "seconds": 0.022890745953191072,
+      "seconds": 0.020425838651135564,
       "tests": 23
     },
     "tests/test_callbacks.py": {
-      "seconds": 6.73945278202882,
-      "tests": 47
+      "seconds": 2.19787400146015,
+      "tests": 27
     },
     "tests/test_ci_coverage.py": {
-      "seconds": 10.08756842033472,
+      "seconds": 11.117457957821898,
       "tests": 25
     },
     "tests/test_ci_shard.py": {
-      "seconds": 2.511781584005803,
-      "tests": 13
+      "seconds": 5.671795253292657,
+      "tests": 33
     },
     "tests/test_cnexp_authored_rate.py": {
-      "seconds": 0.5318143320037052,
+      "seconds": 2.552889996091835,
       "tests": 103
     },
     "tests/test_cnexp_phi_precision.py": {
-      "seconds": 1.0119956271373667,
+      "seconds": 7.729799499269575,
       "tests": 31
     },
     "tests/test_cnexp_precision.py": {
-      "seconds": 0.05705850420054048,
+      "seconds": 0.06499133363831788,
       "tests": 18
     },
     "tests/test_compartment_id_model_helper.py": {
-      "seconds": 0.024491668096743524,
+      "seconds": 0.01712854707147926,
       "tests": 15
     },
     "tests/test_compile_device_policy.py": {
-      "seconds": 0.0029447510605677962,
+      "seconds": 0.0033364169066771865,
       "tests": 7
     },
     "tests/test_compiler_warning_context.py": {
-      "seconds": 0.022314959147479385,
+      "seconds": 0.022360379924066365,
       "tests": 37
     },
     "tests/test_coverage_policy.py": {
-      "seconds": 0.25789645785698667,
+      "seconds": 0.26358375209383667,
       "tests": 8
     },
     "tests/test_current_expression_robustness.py": {
-      "seconds": 0.6427377549698576,
+      "seconds": 0.6337393696885556,
       "tests": 74
     },
     "tests/test_declared_state_inventory.py": {
-      "seconds": 0.05696362676098943,
+      "seconds": 0.062192335026338696,
       "tests": 8
     },
     "tests/test_delayed_state_metadata_validation.py": {
-      "seconds": 0.05019799817819148,
+      "seconds": 0.054300997173413634,
       "tests": 39
     },
     "tests/test_derivimplicit_robustness.py": {
-      "seconds": 1.6300689947092906,
+      "seconds": 1.9639624520204961,
       "tests": 32
     },
     "tests/test_dhs_owned_plan_integration.py": {
-      "seconds": 0.2537474549608305,
+      "seconds": 0.26656095730140805,
       "tests": 18
     },
     "tests/test_diagnostics.py": {
-      "seconds": 0.32035416702274233,
+      "seconds": 0.24754629202652723,
       "tests": 4
     },
     "tests/test_distribution_checks.py": {
-      "seconds": 0.04521966801257804,
+      "seconds": 0.03446903801523149,
       "tests": 9
     },
     "tests/test_docs_gradient_descent.py": {
-      "seconds": 0.6376244589337148,
+      "seconds": 0.6874110818607733,
       "tests": 1
     },
     "tests/test_dufort_current_frame.py": {
-      "seconds": 486.66225133428816,
+      "seconds": 303.60766559047624,
       "tests": 71
     },
     "tests/test_dufort_pure.py": {
-      "seconds": 1.0398320029489696,
+      "seconds": 1.2045596697134897,
       "tests": 77
     },
     "tests/test_dufort_trajectory_correctness.py": {
-      "seconds": 0.6189937500748783,
+      "seconds": 0.3237435355549678,
       "tests": 23
     },
     "tests/test_euler_pure.py": {
-      "seconds": 0.6162791999522597,
+      "seconds": 0.4676820053718984,
       "tests": 21
     },
     "tests/test_event_margin_training.py": {
-      "seconds": 0.006680957216303796,
+      "seconds": 0.00763004005420953,
       "tests": 8
     },
     "tests/test_exp2syn_normalization.py": {
-      "seconds": 1.0054966221796349,
+      "seconds": 1.0220616650767624,
       "tests": 27
     },
     "tests/test_extended_dhs_plan_integration.py": {
-      "seconds": 1.743511208856944,
+      "seconds": 1.820784415001981,
       "tests": 18
     },
     "tests/test_firing_rate_trajectory.py": {
-      "seconds": 0.0299899181118235,
+      "seconds": 0.011264043394476175,
       "tests": 9
     },
     "tests/test_functional_spd_adapters.py": {
-      "seconds": 1.0351085413713008,
+      "seconds": 3.092616373905912,
       "tests": 18
     },
     "tests/test_h5_persistence.py": {
-      "seconds": 7.5538114590453915,
+      "seconds": 2.816562206367962,
       "tests": 20
     },
+    "tests/test_handler_dynamic_inventory.py": {
+      "seconds": 0.25793275830801576,
+      "tests": 17
+    },
     "tests/test_handler_initialization_transaction.py": {
-      "seconds": 0.03403516596881673,
+      "seconds": 0.22800424881279469,
       "tests": 4
     },
+    "tests/test_handler_state_inventory.py": {
+      "seconds": 0.26162471005227417,
+      "tests": 21
+    },
     "tests/test_hard_threshold_gradient.py": {
-      "seconds": 0.0022327900514937937,
+      "seconds": 0.0034043731866404414,
       "tests": 5
     },
     "tests/test_hard_transition_table.py": {
-      "seconds": 0.0025605009868741035,
+      "seconds": 0.013874876080080867,
       "tests": 5
     },
     "tests/test_hard_transition_validation.py": {
-      "seconds": 0.004213333944790065,
+      "seconds": 0.004420126089826226,
       "tests": 8
     },
     "tests/test_helpers.py": {
-      "seconds": 4.558634002227336,
+      "seconds": 5.027894249069504,
       "tests": 45
     },
     "tests/test_hh_rate_configuration.py": {
-      "seconds": 4.960882710991427,
+      "seconds": 4.828844917938113,
       "tests": 28
     },
     "tests/test_imex_rng_lifecycle.py": {
-      "seconds": 0.08773355087032542,
+      "seconds": 0.08444153831806034,
       "tests": 37
     },
+    "tests/test_indexed_intra_inputs.py": {
+      "seconds": 5.139890330727212,
+      "tests": 28
+    },
     "tests/test_initialization_sources_pure.py": {
-      "seconds": 0.7032477999455296,
+      "seconds": 0.7839999189600348,
       "tests": 34
     },
     "tests/test_initialization_transforms.py": {
-      "seconds": 0.08325245592277497,
+      "seconds": 0.05634220503270626,
       "tests": 8
     },
+    "tests/test_injection_assembly.py": {
+      "seconds": 1.458532999851741,
+      "tests": 20
+    },
+    "tests/test_injection_index_guard.py": {
+      "seconds": 0.019568334915675223,
+      "tests": 4
+    },
     "tests/test_input_binding_protocol.py": {
-      "seconds": 0.5399545781547204,
+      "seconds": 0.571884750155732,
       "tests": 35
     },
     "tests/test_instance_references.py": {
-      "seconds": 34.04248953796923,
+      "seconds": 3.890359955606982,
       "tests": 10
     },
     "tests/test_integrator_cache_lifecycle.py": {
-      "seconds": 1.2213659639237449,
+      "seconds": 1.2317890400299802,
       "tests": 14
     },
     "tests/test_integrator_explicit_implicit.py": {
-      "seconds": 0.04448104795301333,
+      "seconds": 0.059695207281038165,
       "tests": 54
     },
     "tests/test_integrator_krylov.py": {
-      "seconds": 0.01167495915433392,
+      "seconds": 0.015022629173472524,
       "tests": 17
     },
     "tests/test_interpolation_coverage.py": {
-      "seconds": 0.10680671816226095,
+      "seconds": 0.04378624795936048,
       "tests": 29
     },
     "tests/test_interpolation_pure.py": {
-      "seconds": 1.5594981323811226,
+      "seconds": 8.498219210421667,
       "tests": 74
     },
     "tests/test_intrinsic_activity.py": {
-      "seconds": 0.13461420428939164,
+      "seconds": 0.10071108548436314,
       "tests": 20
     },
     "tests/test_io.py": {
-      "seconds": 0.0011657910654321313,
+      "seconds": 0.0009917080169543624,
       "tests": 2
     },
     "tests/test_io_from_neuron_topology.py": {
-      "seconds": 0.17794508481165394,
+      "seconds": 0.16101208270993084,
       "tests": 9
     },
     "tests/test_ion_current_read_synchronization.py": {
-      "seconds": 1.197112960217055,
+      "seconds": 1.4825239969650283,
       "tests": 17
     },
     "tests/test_ion_material_holistic_correctness.py": {
-      "seconds": 0.19158083095680922,
+      "seconds": 0.13309887307696044,
       "tests": 4
     },
     "tests/test_ions.py": {
-      "seconds": 0.08430837380001321,
+      "seconds": 0.8344022069359198,
       "tests": 12
     },
+    "tests/test_lfp_configuration_sources.py": {
+      "seconds": 34.15028383268509,
+      "tests": 49
+    },
     "tests/test_material_concatenation.py": {
-      "seconds": 5.093573295162059,
+      "seconds": 3.5129660819657147,
       "tests": 28
     },
     "tests/test_material_concatenation_contracts.py": {
-      "seconds": 0.4004997889860533,
+      "seconds": 0.38097896543331444,
       "tests": 33
     },
     "tests/test_material_diffusion_pure.py": {
-      "seconds": 0.10790354193886742,
+      "seconds": 0.10577629250474274,
       "tests": 24
     },
     "tests/test_material_extracellular_relaxation.py": {
-      "seconds": 0.023796456109266728,
+      "seconds": 0.032191751059144735,
       "tests": 6
     },
     "tests/test_material_holistic_correctness.py": {
-      "seconds": 0.3833640841767192,
+      "seconds": 0.19958941568620503,
       "tests": 9
     },
     "tests/test_material_initialization_correctness.py": {
-      "seconds": 0.011497750063426793,
+      "seconds": 0.010886127245612442,
       "tests": 12
     },
     "tests/test_material_pointwise_pure.py": {
-      "seconds": 0.7991859622416086,
+      "seconds": 0.5903868292225525,
       "tests": 180
     },
     "tests/test_material_process_author_protocol.py": {
-      "seconds": 0.05052458093268797,
+      "seconds": 0.05005945812445134,
       "tests": 26
     },
     "tests/test_material_process_pure.py": {
-      "seconds": 0.06580503680743277,
+      "seconds": 0.07304996089078486,
       "tests": 25
     },
     "tests/test_material_registry_contracts.py": {
-      "seconds": 0.039536042080726475,
+      "seconds": 0.023573415237478912,
       "tests": 14
     },
     "tests/test_mechanism_checkpoint_support_identity.py": {
-      "seconds": 0.009194834216032177,
+      "seconds": 0.012811497203074396,
       "tests": 6
     },
     "tests/test_mechanism_delays_pure.py": {
-      "seconds": 0.7950088649522513,
+      "seconds": 0.8486750603187829,
       "tests": 132
     },
     "tests/test_mechanism_deletion_contract.py": {
-      "seconds": 0.2068300011451356,
+      "seconds": 0.22900554141961038,
       "tests": 29
     },
     "tests/test_mechanism_injections_pure.py": {
-      "seconds": 0.8900024587055668,
+      "seconds": 0.9393265809630975,
       "tests": 50
     },
     "tests/test_mechanism_lifecycle_matrix.py": {
-      "seconds": 0.5706275878474116,
+      "seconds": 0.655511615332216,
       "tests": 84
     },
     "tests/test_mechanism_ops.py": {
-      "seconds": 0.42742474912665784,
+      "seconds": 0.1613257098942995,
       "tests": 7
     },
     "tests/test_mechanism_ops_precision.py": {
-      "seconds": 0.8988821248640306,
+      "seconds": 8.376527243410237,
       "tests": 55
     },
     "tests/test_mechanism_solver_matrix.py": {
-      "seconds": 1.2011818867176771,
+      "seconds": 0.7346335669280961,
       "tests": 88
     },
     "tests/test_mechanism_spatial_material.py": {
-      "seconds": 0.07924987567821518,
+      "seconds": 0.0935445831855759,
       "tests": 39
     },
     "tests/test_mechanism_support_spec.py": {
-      "seconds": 2.045798168925103,
+      "seconds": 2.4423764176899567,
       "tests": 164
     },
     "tests/test_mechanism_symbolic_correctness_wave.py": {
-      "seconds": 0.21096103079617023,
+      "seconds": 0.20483679417520761,
       "tests": 53
     },
     "tests/test_membrane_assembly_context.py": {
-      "seconds": 28.084673832170665,
+      "seconds": 53.011373459827155,
       "tests": 9
     },
     "tests/test_membrane_assembly_integrators.py": {
-      "seconds": 1264.207531581691,
+      "seconds": 1424.843715629424,
       "tests": 90
     },
     "tests/test_membrane_context_recorder.py": {
-      "seconds": 31.925576249079313,
+      "seconds": 69.86656816594768,
       "tests": 7
     },
     "tests/test_membrane_frame_mechanisms.py": {
-      "seconds": 0.2626800330472179,
+      "seconds": 0.2592742088017985,
       "tests": 64
     },
     "tests/test_modular_parameter_controls.py": {
-      "seconds": 0.00596803892403841,
+      "seconds": 0.005234373151324689,
       "tests": 8
     },
     "tests/test_morphology_asc.py": {
-      "seconds": 28.202706166892312,
+      "seconds": 8.520195081364363,
       "tests": 18
     },
     "tests/test_morphology_composition.py": {
-      "seconds": 0.027411042188759893,
+      "seconds": 0.04438382980879396,
       "tests": 18
     },
     "tests/test_morphology_d_lambda.py": {
-      "seconds": 0.04444162314757705,
+      "seconds": 0.05693541432265192,
       "tests": 22
     },
     "tests/test_morphology_deletion.py": {
-      "seconds": 0.061247914854902774,
+      "seconds": 0.08132696046959609,
       "tests": 19
     },
     "tests/test_morphology_import.py": {
-      "seconds": 0.056774878583382815,
+      "seconds": 0.07424304215237498,
       "tests": 44
     },
     "tests/test_morphology_swc.py": {
-      "seconds": 0.02862620906671509,
+      "seconds": 0.02529803942888975,
       "tests": 21
     },
     "tests/test_morphology_updates.py": {
-      "seconds": 0.05072245356859639,
+      "seconds": 0.049616957432590425,
       "tests": 44
     },
     "tests/test_morphology_visualization.py": {
-      "seconds": 4.716386945452541,
+      "seconds": 4.94846829585731,
       "tests": 149
     },
-    "tests/test_mps_population_runtime.py": {
-      "seconds": 1.5800062529742718,
-      "tests": 9
+    "tests/test_mps_solver_selection.py": {
+      "seconds": 0.0072280848398804665,
+      "tests": 16
     },
     "tests/test_multi_component_label_registry.py": {
-      "seconds": 0.030286498891655356,
+      "seconds": 0.030747210374101996,
       "tests": 7
     },
     "tests/test_native_cable.py": {
-      "seconds": 0.5950214532786049,
+      "seconds": 0.7270032519008964,
       "tests": 65
     },
+    "tests/test_native_checkpoint_context.py": {
+      "seconds": 0.006982329417951405,
+      "tests": 7
+    },
+    "tests/test_native_detach_parameter_graphs.py": {
+      "seconds": 0.14089941524434835,
+      "tests": 8
+    },
     "tests/test_native_morphology.py": {
-      "seconds": 0.04177645483287051,
+      "seconds": 0.03868225228507072,
       "tests": 24
     },
     "tests/test_native_morphology_contract.py": {
-      "seconds": 0.07683367095887661,
+      "seconds": 0.09746036818251014,
       "tests": 29
     },
+    "tests/test_native_runtime_inputs.py": {
+      "seconds": 2.4068254169542342,
+      "tests": 33
+    },
+    "tests/test_network_detach.py": {
+      "seconds": 3.4925815862370655,
+      "tests": 16
+    },
     "tests/test_neuron_required_matrix.py": {
-      "seconds": 0.9252130370005034,
+      "seconds": 0.9230544166639447,
       "tests": 10
     },
     "tests/test_noise_workspace_lifecycle.py": {
-      "seconds": 0.6845205808058381,
+      "seconds": 0.6872791333589703,
       "tests": 30
     },
     "tests/test_numerical_current_contract.py": {
-      "seconds": 0.20895208400906995,
+      "seconds": 0.17251467006281018,
       "tests": 21
     },
     "tests/test_ode.py": {
-      "seconds": 14.358014957921114,
+      "seconds": 14.647756795515306,
       "tests": 8
     },
     "tests/test_ode_symbolic_portability.py": {
-      "seconds": 0.6132656659465283,
+      "seconds": 0.6300189202884212,
       "tests": 21
     },
     "tests/test_opt_sanitize_grad.py": {
-      "seconds": 0.028111039893701673,
+      "seconds": 0.01629679335746914,
       "tests": 18
     },
+    "tests/test_owned_plan_freshness_guard.py": {
+      "seconds": 0.013824499910697341,
+      "tests": 16
+    },
     "tests/test_packaging_policy.py": {
-      "seconds": 0.004065834044013172,
+      "seconds": 0.0044083751272410154,
       "tests": 4
     },
     "tests/test_packed_diffusion_geometry.py": {
-      "seconds": 0.5549309178022668,
+      "seconds": 0.5740337111055851,
       "tests": 20
     },
     "tests/test_parametric.py": {
-      "seconds": 0.3460679160198197,
+      "seconds": 0.1089960407698527,
       "tests": 24
     },
     "tests/test_parametric_contracts.py": {
-      "seconds": 0.05957187880994752,
+      "seconds": 0.05353748786728829,
       "tests": 76
     },
     "tests/test_passive_end_diameter.py": {
-      "seconds": 0.566407086851541,
+      "seconds": 0.825279837124981,
       "tests": 10
     },
     "tests/test_passive_end_nodes.py": {
-      "seconds": 1.9991391619550996,
+      "seconds": 2.2107487039174885,
       "tests": 41
     },
     "tests/test_poisson_checkpoints.py": {
-      "seconds": 0.23160816612653434,
+      "seconds": 0.324137878138572,
       "tests": 13
     },
     "tests/test_poisson_invocation_recipes.py": {
-      "seconds": 14.539392504782882,
+      "seconds": 19.177885874640197,
       "tests": 20
     },
     "tests/test_poisson_schedule_recipes.py": {
-      "seconds": 0.8490048745297827,
+      "seconds": 0.7710518753156066,
       "tests": 64
     },
     "tests/test_population_axis_mechanism_lifecycle.py": {
-      "seconds": 0.21940878906752914,
+      "seconds": 0.1958369193598628,
       "tests": 10
     },
     "tests/test_population_axis_mechanism_storage.py": {
-      "seconds": 1.7340250880806707,
+      "seconds": 1.5418885437538847,
       "tests": 38
     },
+    "tests/test_population_callback_scopes.py": {
+      "seconds": 4.555485788034275,
+      "tests": 30
+    },
     "tests/test_population_compiler_lifecycle.py": {
-      "seconds": 0.8938934169127606,
+      "seconds": 0.8030807053437456,
       "tests": 15
     },
     "tests/test_population_eligibility_cache.py": {
-      "seconds": 1.9700907484511845,
+      "seconds": 2.19373749603983,
       "tests": 38
     },
+    "tests/test_population_execution_horizons.py": {
+      "seconds": 1.2643547093030065,
+      "tests": 28
+    },
     "tests/test_population_explicit_dispatch.py": {
-      "seconds": 0.2667995052761398,
+      "seconds": 0.26100849884096533,
       "tests": 15
     },
     "tests/test_population_find_names.py": {
-      "seconds": 0.061624748981557786,
+      "seconds": 0.09209379379171878,
       "tests": 13
     },
     "tests/test_population_fused_intra.py": {
-      "seconds": 39.762425632739905,
+      "seconds": 171.27080649742857,
       "tests": 35
     },
+    "tests/test_population_hh_lifecycle.py": {
+      "seconds": 3.0739531660219654,
+      "tests": 2
+    },
     "tests/test_population_inference_mode.py": {
-      "seconds": 11.105040290975012,
+      "seconds": 42.36214783415198,
       "tests": 1
     },
     "tests/test_population_lifecycle_state_machine.py": {
-      "seconds": 1.6192102581262589,
+      "seconds": 1.9330263743177056,
       "tests": 49
     },
     "tests/test_population_membrane_guard_plan.py": {
-      "seconds": 1.8600002902094275,
+      "seconds": 1.746072001522407,
       "tests": 44
     },
     "tests/test_population_preserve_multiplicity.py": {
-      "seconds": 0.07490412599872798,
+      "seconds": 0.07775079202838242,
       "tests": 11
     },
     "tests/test_population_run_dispatch.py": {
-      "seconds": 15.050439373473637,
+      "seconds": 43.95625179435592,
       "tests": 46
     },
     "tests/test_population_run_duration_contract.py": {
-      "seconds": 0.37885337427724153,
+      "seconds": 0.42969395511318,
       "tests": 61
     },
     "tests/test_population_runtime.py": {
-      "seconds": 0.24516870925435796,
+      "seconds": 0.2767309205373749,
       "tests": 31
     },
     "tests/test_population_single_pass_initialization.py": {
-      "seconds": 0.0828018359025009,
+      "seconds": 0.06306695798411965,
       "tests": 8
     },
     "tests/test_population_steady_cache_restore.py": {
-      "seconds": 1.455380373110529,
+      "seconds": 5.764296289882623,
       "tests": 11
     },
     "tests/test_pytest_warning_policy.py": {
-      "seconds": 0.014664630638435483,
+      "seconds": 0.012669957126490772,
       "tests": 31
     },
     "tests/test_random_parameter_compatible_loading.py": {
-      "seconds": 0.9272068740683608,
+      "seconds": 0.8851548774400726,
       "tests": 8
     },
     "tests/test_random_parameter_distributions.py": {
-      "seconds": 0.008034209138713777,
+      "seconds": 0.007583625847473741,
       "tests": 5
     },
     "tests/test_random_parameter_pure_sampling.py": {
-      "seconds": 0.14967761799925938,
+      "seconds": 0.15214108023792505,
       "tests": 31
     },
     "tests/test_random_parameters.py": {
-      "seconds": 0.05527637602062896,
+      "seconds": 0.05308045691344887,
       "tests": 8
     },
+    "tests/test_recorder_dispatch_contract.py": {
+      "seconds": 0.1935081669362262,
+      "tests": 7
+    },
     "tests/test_recorder_h5_integration.py": {
-      "seconds": 26.108087125991005,
-      "tests": 10
+      "seconds": 0.11900404025800526,
+      "tests": 21
     },
     "tests/test_regional_material_diffusion.py": {
-      "seconds": 0.2275863349204883,
-      "tests": 16
+      "seconds": 0.14698050217702985,
+      "tests": 15
     },
     "tests/test_repeat_gradients.py": {
-      "seconds": 0.26664053596323356,
+      "seconds": 0.26001954020466655,
       "tests": 15
     },
     "tests/test_repeat_serialization.py": {
-      "seconds": 0.04480874800356105,
+      "seconds": 0.03233762469608337,
       "tests": 18
     },
     "tests/test_restart_replay_matrix.py": {
-      "seconds": 0.25393025524681434,
+      "seconds": 0.26129537785891443,
       "tests": 21
     },
     "tests/test_retained_helper_utilities.py": {
-      "seconds": 0.038599291001446545,
+      "seconds": 0.03622032993007451,
       "tests": 18
     },
     "tests/test_rng_load_policies.py": {
-      "seconds": 0.2929963325150311,
+      "seconds": 0.342990045202896,
       "tests": 26
     },
     "tests/test_runge_kutta_pure.py": {
-      "seconds": 0.9469685358926654,
+      "seconds": 1.3573315404355526,
       "tests": 22
     },
     "tests/test_runtime_noise_and_state_sde.py": {
-      "seconds": 0.07472216576570645,
+      "seconds": 0.05174012575298548,
       "tests": 19
     },
     "tests/test_runtime_noise_pure_sampling.py": {
-      "seconds": 0.21984471112955362,
+      "seconds": 0.22745946154464036,
       "tests": 57
     },
     "tests/test_safe_source_robustness.py": {
-      "seconds": 0.005701916932594031,
+      "seconds": 0.005823499173857272,
       "tests": 12
     },
     "tests/test_scalar_multi_universal.py": {
-      "seconds": 0.09970579197397456,
+      "seconds": 0.10936262633185834,
       "tests": 8
     },
     "tests/test_scaled_waveform_frequency.py": {
-      "seconds": 0.3157390381093137,
+      "seconds": 0.35417008330114186,
       "tests": 9
     },
     "tests/test_scnv_integrator.py": {
-      "seconds": 0.003348417056258768,
+      "seconds": 0.0035232092486694455,
       "tests": 4
     },
     "tests/test_shared_field_inventory.py": {
-      "seconds": 0.13608608930371702,
+      "seconds": 0.1601870369631797,
       "tests": 22
     },
     "tests/test_shared_support_current_aggregation.py": {
-      "seconds": 3.3203527469886467,
+      "seconds": 3.8610762017779052,
       "tests": 50
     },
     "tests/test_shared_support_field_reads.py": {
-      "seconds": 0.013727623969316483,
+      "seconds": 0.014251959859393537,
       "tests": 4
     },
     "tests/test_single_current_hh.py": {
-      "seconds": 14.121595544042066,
+      "seconds": 11.16919479588978,
       "tests": 66
     },
     "tests/test_slice_indexing_contract.py": {
-      "seconds": 0.10252270963974297,
+      "seconds": 0.10275674518197775,
       "tests": 101
     },
     "tests/test_slice_injection_simulation_contract.py": {
-      "seconds": 183.2959870447521,
+      "seconds": 53.94364333443809,
       "tests": 14
     },
     "tests/test_slice_label_propagation.py": {
-      "seconds": 0.3062853731098585,
+      "seconds": 0.8616348354844376,
       "tests": 29
     },
     "tests/test_slice_label_propagation_index_forms.py": {
-      "seconds": 0.09874270902946591,
+      "seconds": 0.193766460288316,
       "tests": 15
     },
     "tests/test_slice_mutation_contract.py": {
-      "seconds": 0.2809501232113689,
+      "seconds": 0.34437120135407895,
       "tests": 65
     },
     "tests/test_slice_state_machine.py": {
-      "seconds": 0.6501382059650496,
+      "seconds": 1.3084548359038308,
       "tests": 2
     },
     "tests/test_slice_structure_simulation_contract.py": {
-      "seconds": 0.1110517909983173,
+      "seconds": 0.14740182785317302,
       "tests": 9
     },
     "tests/test_spatial_material_preparation.py": {
-      "seconds": 2.243903163645882,
+      "seconds": 2.431283416110091,
       "tests": 30
     },
     "tests/test_spatial_solver_selection.py": {
-      "seconds": 0.03476013010367751,
+      "seconds": 0.03890683164354414,
       "tests": 32
     },
     "tests/test_spike_timing.py": {
-      "seconds": 0.02146883320529014,
+      "seconds": 0.012527251383289695,
       "tests": 16
     },
     "tests/test_spiking_and_distributions.py": {
-      "seconds": 0.012690831092186272,
+      "seconds": 0.008187415776774287,
       "tests": 6
     },
     "tests/test_state.py": {
-      "seconds": 0.3357507031178102,
+      "seconds": 1.5111946671968326,
       "tests": 11
     },
     "tests/test_state_author_protocol.py": {
-      "seconds": 0.10131612367695197,
+      "seconds": 0.4491002090508118,
       "tests": 27
     },
     "tests/test_state_sde_pure.py": {
-      "seconds": 4.0510295809363015,
+      "seconds": 5.95195312355645,
       "tests": 39
     },
     "tests/test_state_transition_output_validation.py": {
-      "seconds": 0.15755616506794468,
+      "seconds": 0.17031462385784835,
       "tests": 19
     },
     "tests/test_step_api.py": {
-      "seconds": 0.05551245802780613,
-      "tests": 9
+      "seconds": 0.06449116580188274,
+      "tests": 22
     },
     "tests/test_stim_execution_matrix.py": {
-      "seconds": 0.12959946179762483,
+      "seconds": 0.09579737589228898,
       "tests": 77
     },
     "tests/test_support_registry.py": {
-      "seconds": 0.024296918825712055,
+      "seconds": 0.02362320653628558,
       "tests": 16
     },
     "tests/test_synapse_receive_protocol.py": {
-      "seconds": 2.7585079094278626,
+      "seconds": 9.602317373268306,
       "tests": 47
     },
     "tests/test_temperature_lifecycle_contracts.py": {
-      "seconds": 1.1726901243673638,
+      "seconds": 1.2638291256735101,
       "tests": 18
     },
     "tests/test_test_classification.py": {
-      "seconds": 6.879738206858747,
-      "tests": 3
+      "seconds": 20.351579791866243,
+      "tests": 5
+    },
+    "tests/test_threshold_configuration_sources.py": {
+      "seconds": 0.02321854024194181,
+      "tests": 36
     },
     "tests/test_threshold_descriptor_example.py": {
-      "seconds": 25.9437275819364,
+      "seconds": 29.84587445796933,
       "tests": 1
     },
     "tests/test_threshold_event_root.py": {
-      "seconds": 0.007095750013832003,
+      "seconds": 0.009383498807437718,
       "tests": 9
     },
     "tests/test_threshold_noise_metrics.py": {
-      "seconds": 0.015863878943491727,
+      "seconds": 0.010432001785375178,
       "tests": 4
     },
     "tests/test_threshold_protocol.py": {
-      "seconds": 0.012844542099628597,
+      "seconds": 0.010247671976685524,
       "tests": 6
     },
     "tests/test_threshold_trace_probe.py": {
-      "seconds": 0.00942775426665321,
+      "seconds": 0.009965000441297889,
       "tests": 12
     },
     "tests/test_threshold_trace_tangent.py": {
-      "seconds": 0.012130076938774437,
+      "seconds": 0.0141572110587731,
       "tests": 16
     },
     "tests/test_threshold_transition_jets.py": {
-      "seconds": 0.004404499020893127,
+      "seconds": 0.0033247102983295918,
       "tests": 3
     },
     "tests/test_threshold_transition_metrics.py": {
-      "seconds": 0.02009437809465453,
+      "seconds": 0.01654295634943992,
       "tests": 13
     },
     "tests/test_thresholder.py": {
-      "seconds": 0.033491082896944135,
+      "seconds": 0.037397544365376234,
       "tests": 37
     },
     "tests/test_topology_transformations.py": {
-      "seconds": 0.1709253728040494,
+      "seconds": 0.2032407511724159,
       "tests": 44
     },
     "tests/test_tree_axon_invariant_regressions.py": {
-      "seconds": 0.05176933022448793,
+      "seconds": 0.06067475501913577,
       "tests": 12
     },
     "tests/test_tree_cache_lifecycle.py": {
-      "seconds": 2.4554977520019747,
+      "seconds": 2.8918108760844916,
       "tests": 10
     },
     "tests/test_tree_geometry_dtype_precision.py": {
-      "seconds": 0.029905998962931335,
-      "tests": 4
+      "seconds": 0.04253529151901603,
+      "tests": 20
     },
     "tests/test_tree_integrator_dense_reference.py": {
-      "seconds": 0.05327592010144144,
+      "seconds": 0.06379874655976892,
       "tests": 32
     },
     "tests/test_tree_integrator_reference_matrix.py": {
-      "seconds": 0.031074168975465,
+      "seconds": 0.035416209138929844,
       "tests": 13
     },
     "tests/test_tree_multi_reference_matrix.py": {
-      "seconds": 0.1679568308754824,
+      "seconds": 0.20498295640572906,
       "tests": 11
     },
     "tests/test_tree_named_material_geometry.py": {
-      "seconds": 0.2356190820573829,
+      "seconds": 0.25048562220763415,
       "tests": 18
     },
     "tests/test_units.py": {
-      "seconds": 0.013397004920989275,
+      "seconds": 0.013913788832724094,
       "tests": 37
     },
     "tests/test_utils.py": {
-      "seconds": 0.2128210881492123,
+      "seconds": 0.8137295859633014,
       "tests": 46
     },
     "tests/test_utils_neuron_tree_paths.py": {
-      "seconds": 0.002987624960951507,
+      "seconds": 0.0035340001340955496,
       "tests": 5
     },
     "tests/test_visualization.py": {
-      "seconds": 0.9640383726218715,
+      "seconds": 0.9359993328107521,
       "tests": 42
     },
     "tests/test_voltage_process_pure.py": {
-      "seconds": 0.12430199899245054,
+      "seconds": 0.1378267906839028,
       "tests": 23
     },
     "tests/test_voltage_solvers.py": {
-      "seconds": 0.006661291932687163,
+      "seconds": 0.006147540989331901,
       "tests": 4
     },
     "tests/test_waveform.py": {
-      "seconds": 0.00465574994450435,
+      "seconds": 0.004478916060179472,
       "tests": 3
     },
     "tests/test_waveform_gradients.py": {
-      "seconds": 0.03637416794663295,
+      "seconds": 0.03891621180810034,
       "tests": 14
     },
     "tests/test_waveform_timing.py": {
-      "seconds": 0.9527331666904502,
+      "seconds": 0.8702910008141771,
       "tests": 7
     }
   }

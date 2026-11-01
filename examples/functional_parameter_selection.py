@@ -58,7 +58,7 @@ def population_demo(*, backend="aot_eager"):
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, DTYPE=DTYPE, DEVICE="cpu", IMEM=False):
         model = make_cell()
         model.train()
-        model.initialize(DT)
+        model.initialize()
     # region population-select
     _, tensors = dn.func.make_functional(model, dt=DT)
     conductances = tensors.find_parameters("*.g_param", within="model")

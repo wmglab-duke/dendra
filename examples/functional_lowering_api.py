@@ -33,7 +33,7 @@ def cell(*, initial=-60.0, reversal=-70.0):
 def make_population():
     model = cell()
     model.train()
-    model.initialize(DT)
+    model.initialize()
     return model
 
 

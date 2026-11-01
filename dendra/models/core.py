@@ -9212,7 +9212,7 @@ class Cable(Population):
 
     _supports_native_cable_factory = True
 
-    _CANONICAL_RUNTIME_CONTRACT_TENSORS = (
+    _CANONICAL_GEOMETRY_TENSORS = (
         "diam",
         "dx",
         "rhoa",
@@ -9226,6 +9226,10 @@ class Cable(Population):
         "diff_parent_index",
         "_canonical_morphology_fingerprint",
         "_canonical_geometry_reference",
+    )
+
+    _CANONICAL_RUNTIME_CONTRACT_TENSORS = (
+        *_CANONICAL_GEOMETRY_TENSORS,
         "rhoa_scale",
     )
 
@@ -9245,6 +9249,37 @@ class Cable(Population):
         "area_scale",
         "rhoa_scale",
     )
+
+    def _install_parameter_buffers(self, values):
+        if (
+            not isinstance(values, dict)
+            or getattr(self, "_compartment_graph", None) is None
+        ):
+            return super()._install_parameter_buffers(values)
+        frozen = set()
+        for name, value in values.items():
+            if name not in Cable._CANONICAL_GEOMETRY_TENSORS:
+                continue
+            target = getattr(self, name)
+            if (
+                torch.is_tensor(value)
+                and value.shape == target.shape
+                and value.device == target.device
+                and value.dtype == target.dtype
+                and torch.equal(value, target)
+            ):
+                frozen.add(name)
+        if not frozen:
+            return super()._install_parameter_buffers(values)
+        # These fields describe the immutable morphology, rather than a new
+        # trainable workspace generation. Keeping their bindings also retains
+        # prepared callback and solver topology guards across continuation.
+        # Differing values retain the ordinary installer and canonical geometry
+        # validation, including bounded rhoa's cross-dtype reconstruction tolerance.
+        super()._install_parameter_buffers(
+            {name: value for name, value in values.items() if name not in frozen}
+        )
+        return values
 
     def __init__(self, N, C, graph=None, integrator=None, **kwargs):
         if graph is not None:

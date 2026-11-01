@@ -62,7 +62,10 @@ def make_model(network):
     else:
         model = owner = cell(-60.0, -70.0)
     model.train()
-    model.initialize(DT)
+    if network:
+        model.initialize(DT)
+    else:
+        model.initialize()
     # Fresh initialization replaces this raw source. A checkpoint must retain
     # the effective result rather than the runner's pre-initialization default.
     owner.register_pre_initialize_transform(

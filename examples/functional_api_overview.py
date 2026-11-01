@@ -62,7 +62,7 @@ def make_cable(*, injected=False):
     if injected:
         model[:, 1].inject(dn.sin(amp=0.2 * nA, freq=0.7, phase=0.2))
     model.train()
-    model.initialize(DT)
+    model.initialize()
     return model
 
 
@@ -368,7 +368,7 @@ def transforms_demo(*, backend):
     )
     model.insert(pas, g=0.001, e=-70.0)
     model.train()
-    model.initialize(DT)
+    model.initialize()
     functional, tensors = dn.func.make_functional(model, dt=DT)
     initial = copy_state(tensors.state)
     tape = initial["integrator"]["v"].new_full((STEPS, *model.shape), 0.02 * nA)

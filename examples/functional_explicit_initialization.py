@@ -62,7 +62,10 @@ def make_model(network):
     else:
         model = left
     model.train()
-    model.initialize(DT)
+    if network:
+        model.initialize(DT)
+    else:
+        model.initialize()
     left.register_pre_initialize_transform(
         "scale",
         Scale(),

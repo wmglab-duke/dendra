@@ -39,7 +39,7 @@ def make_model():
     )
     model.insert(hh)
     model.train()
-    model.initialize(DT)
+    model.initialize()
     return model
 
 
