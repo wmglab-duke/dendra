@@ -468,8 +468,9 @@ def test_chain_reversal_or_point_permutation_preserves_physical_solution(kind):
 
 
 def _legacy_absolute(step, *args):
-    """Literal old UB RHS for custom-solver and SPD-policy tests."""
+    """Absolute UB RHS with the native model-dtype timestep policy."""
     v, amplitude, *tail = args
+    dt_s = torch.as_tensor(DT, device=v.device, dtype=v.dtype).reshape(1) * 1e-3
     channels, (cm, area, rhoa, ve) = tail[:6], tail[6:]
     conductance, source = _hh(v, channels)
     edge = (
@@ -493,8 +494,8 @@ def _legacy_absolute(step, *args):
         -1e-9, 2e-9, step.k, dtype=v.dtype, device=v.device
     )
     current_source = current_source + injection * workspace["cm_inv"]
-    rhs = v + (DT * 1e-3) * current_source
-    main = 1 - (DT * 1e-3) * (workspace["diag_base"] - conductance * workspace["scale"])
+    rhs = v + dt_s * current_source
+    main = 1 - dt_s * (workspace["diag_base"] - conductance * workspace["scale"])
     if step.k == 1:
         return rhs / main, rhs
     arguments = (workspace["lower"], main, workspace["upper"], rhs)
@@ -611,7 +612,10 @@ def test_spd_regularized_pivots_keep_legacy_primal_and_rhs_only_gradients(
     # Literal historical absolute-voltage RHS. Zero/negative Cholesky pivots
     # are intentionally regularized by this facade when only RHS gradients
     # are needed; this is not an independent physical inverse oracle.
-    dt_s = DT * 1e-3
+    dt_s = (
+        torch.as_tensor(DT, device=voltage.device, dtype=voltage.dtype).reshape(1)
+        * 1e-3
+    )
     rhs = voltage + dt_s * (source * integrator.scale + injection * integrator.cm_inv)
     main = 1 - dt_s * (integrator.diag_base - conductance * integrator.scale)
     assert (main <= 1e-12).all()

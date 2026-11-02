@@ -5,7 +5,7 @@ from types import MethodType
 import pytest
 import torch
 
-from dendra.func import _stimulation_rng
+from dendra.func import _runtime_sampling
 from dendra.models.rng import RNGModule
 from tests.func.test_stimulation_rng_sharing import _environment as _environment
 from tests.func.test_stimulation_rng_sharing import (
@@ -46,7 +46,7 @@ def test_independent_runtime_streams_follow_native_request_order(monkeypatch, ro
     if not owned_fn:
         delattr(native_pulse, "fn")
 
-    draw = _stimulation_rng.sample_random_parameter_draw
+    draw = _runtime_sampling.sample_random_parameter_draw
     sample_entry = functional._poisson_plan._sample_entry
 
     def sampled_noise(*args, **kwargs):
@@ -59,7 +59,7 @@ def test_independent_runtime_streams_follow_native_request_order(monkeypatch, ro
 
     with monkeypatch.context() as observed:
         observed.setattr(
-            _stimulation_rng, "sample_random_parameter_draw", sampled_noise
+            _runtime_sampling, "sample_random_parameter_draw", sampled_noise
         )
         observed.setattr(functional._poisson_plan, "_sample_entry", sampled_poisson)
         packet = functional.sample_runtime_draws(tensors.state)

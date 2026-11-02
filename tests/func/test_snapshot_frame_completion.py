@@ -9,6 +9,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 import dendra as dn
+from dendra.func import _population as population_module
 from tests.func.test_retained_frame_lifecycle import _TIED_PATHS, DTYPE, _plan
 
 pytestmark = pytest.mark.cpu
@@ -29,16 +30,6 @@ def _environment():
 
 def _key(kind, path):
     return f"materializations.{kind}.{path}"
-
-
-def _partial_constants(error, plan):
-    traceback = error.__traceback__
-    while traceback is not None:
-        frame = traceback.tb_frame
-        if frame.f_code.co_name == "extract" and frame.f_locals.get("self") is plan:
-            return frame.f_locals["constants"]
-        traceback = traceback.tb_next
-    raise AssertionError("failure did not cross the existing extract endpoint")
 
 
 class _SeedOperations(TorchFunctionMode):
@@ -131,11 +122,22 @@ def _case(
         error=RuntimeError(failure),
         events=[],
         constants=None,
+        seed_constants=None,
         seeded=None,
         captured=None,
         different=False,
         lookup_frames=[],
     )
+    seed_snapshot_frame = population_module._seed_snapshot_frame
+
+    def seed_frame(owner, population, constants):
+        if owner is plan:
+            # Observe publication through the actual frame argument, independently
+            # of how the public extract endpoint delegates its implementation.
+            case.seed_constants = constants
+        return seed_snapshot_frame(owner, population, constants)
+
+    monkeypatch.setattr(population_module, "_seed_snapshot_frame", seed_frame)
     getter = source.get_buffer
 
     def get_buffer(path):
@@ -221,7 +223,8 @@ def test_seed_failures_publish_only_preceding_complete_dictionary_phases(
         case.invoke()
     assert caught.value is case.error
     assert case.events == case.seed_events[: case.seed_events.index(case.failure) + 1]
-    constants = _partial_constants(caught.value, case.plan)
+    constants = case.seed_constants
+    assert constants is not None
     groups = () if phase in ("read", "clone") else ("values",)
     if phase == "baseline":
         groups = ("values", "active")
