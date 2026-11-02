@@ -55,10 +55,10 @@ def _close(actual, expected):
     torch.testing.assert_close(actual, expected, rtol=2e-10, atol=2e-11)
 
 
-def _waveform(*, seed=17, generator=None, amp=0.2):
+def _waveform(*, seed=17, generator=None, amp=0.2, n=5):
     return dn.mono_rect(amp=amp, pw=0.045).poisson(
         interval=0.055,
-        n=5,
+        n=n,
         start=-0.035,
         noise=0.7,
         randomize_every_call=True,

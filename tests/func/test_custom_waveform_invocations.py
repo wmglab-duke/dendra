@@ -80,11 +80,11 @@ class _UnmarkedContainer(_OrderedContainer):
 
 
 def _expression(
-    role, *, generator, shared=False, parametrized=False, unused_generator=None
+    role, *, generator, shared=False, parametrized=False, unused_generator=None, n=5
 ):
     unit = nA if role == "intra" else 1.0
-    first = _waveform(generator=generator, amp=0.2 * unit)
-    second = _waveform(generator=generator, amp=0.13 * unit)
+    first = _waveform(generator=generator, amp=0.2 * unit, n=n)
+    second = _waveform(generator=generator, amp=0.13 * unit, n=n)
     # Sharing a raw Parameter between different Poisson nodes must survive
     # their different registration paths and independently generated schedules.
     second.waveform.amp = first.waveform.amp
@@ -93,7 +93,7 @@ def _expression(
         if unused_generator is None
         else unused_generator
     )
-    unused = _waveform(generator=unused_generator, amp=0.17 * unit)
+    unused = _waveform(generator=unused_generator, amp=0.17 * unit, n=n)
     result = _OrderedContainer(first, second, unused, shared=shared)
     if parametrized:
         torch.nn.utils.parametrize.register_parametrization(
@@ -102,10 +102,14 @@ def _expression(
     return result, unused_generator
 
 
-def _case(role="intra", *, shared=False, parametrized=False, twice=False):
+def _case(role="intra", *, shared=False, parametrized=False, twice=False, n=5):
     generator = torch.Generator().manual_seed(149)
     expression, unused_generator = _expression(
-        role, generator=generator, shared=shared, parametrized=parametrized
+        role,
+        generator=generator,
+        shared=shared,
+        parametrized=parametrized,
+        n=n,
     )
     population, _, extra = _population(
         role,
@@ -237,11 +241,20 @@ def test_custom_call_order_replays_native_tapes_chunks_and_keeps_unused_rng(
 def test_custom_gain_and_shared_amplitude_gradients_match_native_initialization(
     initialization, parametrized
 ):
+    # Two events retain overlap and nonzero gradients in this short rollout.
     source, _, _, generator, _ = _case(
-        "mechanism", shared=True, parametrized=parametrized, twice=True
+        "mechanism",
+        shared=True,
+        parametrized=parametrized,
+        twice=True,
+        n=2,
     )
     native, _, expression, _, _ = _case(
-        "mechanism", shared=True, parametrized=parametrized, twice=True
+        "mechanism",
+        shared=True,
+        parametrized=parametrized,
+        twice=True,
+        n=2,
     )
     before = generator.get_state().clone()
     runner = dn.compile(
@@ -341,10 +354,14 @@ def test_custom_runner_records_restarts_and_restores_native_checkpoint(role, exe
     _equal(generator.get_state(), before)
 
 
-def _network_case(sharing):
+def _network_case(sharing, *, n=5):
     generator = torch.Generator().manual_seed(227)
     shared = _expression(
-        "mechanism", generator=generator, shared=True, unused_generator=generator
+        "mechanism",
+        generator=generator,
+        shared=True,
+        unused_generator=generator,
+        n=n,
     )[0]
     populations, contacts = {}, {}
     for name in ("left", "right"):
@@ -356,6 +373,7 @@ def _network_case(sharing):
                 generator=generator,
                 shared=True,
                 unused_generator=generator,
+                n=n,
             )[0]
         )
         population = _population("mechanism", waveform=expression)[0]
@@ -366,7 +384,11 @@ def _network_case(sharing):
         contacts[name] = (
             field,
             _expression(
-                "extra", generator=generator, shared=False, unused_generator=generator
+                "extra",
+                generator=generator,
+                shared=False,
+                unused_generator=generator,
+                n=n,
             )[0],
         )
     network = dn.Network(populations)
@@ -382,8 +404,10 @@ def _network_case(sharing):
 def test_custom_network_orders_extra_and_population_calls_with_one_stream(
     sharing, execution
 ):
-    source, extra, generator = _network_case(sharing)
-    native, native_extra, native_generator = _network_case(sharing)
+    # Generator sharing needs five events to retain overlap through continuation.
+    n = 4 if sharing == "waveform" else 5
+    source, extra, generator = _network_case(sharing, n=n)
+    native, native_extra, native_generator = _network_case(sharing, n=n)
     before = generator.get_state().clone()
     runner = dn.compile(
         source,
@@ -418,8 +442,9 @@ def test_custom_network_orders_extra_and_population_calls_with_one_stream(
 @pytest.mark.parametrize("execution", ("scan", "while"))
 def test_custom_invocations_compile_with_inductor_forward_and_backward(execution):
     role = "mechanism" if execution == "scan" else "intra"
-    source, _, _, generator, _ = _case(role, shared=True)
-    native, _, expression, _, _ = _case(role, shared=True)
+    # Three events preserve overlap in both the scan and while fixtures.
+    source, _, _, generator, _ = _case(role, shared=True, n=3)
+    native, _, expression, _, _ = _case(role, shared=True, n=3)
     before = generator.get_state().clone()
     runner = dn.compile(
         source,

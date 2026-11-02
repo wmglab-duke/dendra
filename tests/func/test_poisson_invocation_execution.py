@@ -47,8 +47,10 @@ class _TwiceInjectedLeak(_InjectedLeak):
         }
 
 
-def _expression(kind, role, generator):
-    pulse = _waveform(generator=generator, amp=0.2 * nA if role == "intra" else 0.2)
+def _expression(kind, role, generator, *, n=5):
+    pulse = _waveform(
+        generator=generator, amp=0.2 * nA if role == "intra" else 0.2, n=n
+    )
     if kind == "repeated":
         expression = pulse + pulse
     else:
@@ -63,9 +65,9 @@ def _expression(kind, role, generator):
     return expression, pulse
 
 
-def _case(kind="repeated", role="intra", *, mechanism=_InjectedLeak):
+def _case(kind="repeated", role="intra", *, mechanism=_InjectedLeak, n=5):
     generator = torch.Generator().manual_seed(73)
-    expression, pulse = _expression(kind, role, generator)
+    expression, pulse = _expression(kind, role, generator, n=n)
     population, _, extra = _population(role, waveform=expression, mechanism=mechanism)
     return population, extra, pulse, generator
 
@@ -241,15 +243,15 @@ def test_shared_amplitude_gradients_match_native_multiple_hook_invocations(
     _close(generator.get_state(), before)
 
 
-def _network_case(sharing):
+def _network_case(sharing, *, n=5):
     generator = torch.Generator().manual_seed(137)
-    shared = _expression("repeated", "mechanism", generator)[0]
+    shared = _expression("repeated", "mechanism", generator, n=n)[0]
     populations = {}
     for name in ("left", "right"):
         expression = (
             shared
             if sharing == "waveform"
-            else _expression("repeated", "mechanism", generator)[0]
+            else _expression("repeated", "mechanism", generator, n=n)[0]
         )
         populations[name] = _population(
             "mechanism", waveform=expression, mechanism=_TwiceInjectedLeak
@@ -267,8 +269,9 @@ def _network_case(sharing):
 def test_network_invocations_keep_one_stream_native_population_order_and_continuation(
     execution, sharing
 ):
-    source, source_generator = _network_case(sharing)
-    native, native_generator = _network_case(sharing)
+    # Keep event traffic and overlap through the native checkpoint suffix.
+    source, source_generator = _network_case(sharing, n=4)
+    native, native_generator = _network_case(sharing, n=4)
     before = source_generator.get_state().clone()
     runner = dn.compile(
         source,
@@ -297,9 +300,9 @@ def test_network_invocations_keep_one_stream_native_population_order_and_continu
     _close(next(iter(final["stimulation_rng"].values())), native_generator.get_state())
     for population in final["populations"].values():
         assert "rng" not in population["stimulation"]
-    committed, _ = _network_case(sharing)
+    committed, _ = _network_case(sharing, n=4)
     runner.functional.commit_state_(committed, final)
-    restored, _ = _network_case(sharing)
+    restored, _ = _network_case(sharing, n=4)
     restored.restore_dict_from_checkpoint(committed.state_dict_for_checkpoint())
     continued, _ = runner(final)
     with torch.no_grad():
@@ -311,8 +314,9 @@ def test_network_invocations_keep_one_stream_native_population_order_and_continu
 @pytest.mark.parametrize("kind", ("repeated", "nested"))
 @pytest.mark.parametrize("execution", ("scan", "while"))
 def test_inductor_poisson_invocations_preserve_native_values_and_rng(kind, execution):
-    source, _, _, generator = _case(kind, "mechanism")
-    native, _, native_pulse, _ = _case(kind, "mechanism")
+    # Two events retain repeated/nested calls and overlap in this short rollout.
+    source, _, _, generator = _case(kind, "mechanism", n=2)
+    native, _, native_pulse, _ = _case(kind, "mechanism", n=2)
     before = generator.get_state().clone()
     steps = STEPS if execution == "while" else 2
     runner = dn.compile(
