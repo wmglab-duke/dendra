@@ -67,7 +67,7 @@ def _packed_tensor_scan(
         # intermediates. No private carry views become public sibling aliases.
         return layout.pack(updated), emitted
 
-    return scan(combine, layout.pack(initial), samples)
+    return scan(combine, initial, samples)
 
 
 def _replace_path(tree, path, value):
@@ -147,6 +147,18 @@ class _CompiledTensorTreeScan:
     def _samples(self, tapes):
         return _tensor_samples(tapes, self._steps, self._device)
 
+    def _pack(self, state, carries, *, grad_enabled):
+        # Own recurrent storage before both the cache key and Dynamo's input
+        # guards. Public continuations can change offsets, aliases, leafness or
+        # inference status without changing the logical recurrence. Unlike the
+        # inference while boundary, these live packs must retain training history.
+        with torch.inference_mode(False), torch.set_grad_enabled(grad_enabled):
+            state = self._clone_state(state)
+            mutable, invariant = self._callback_carry.split(carries)
+            layout = _PackedCarryLayout.from_tree((state, mutable))
+            initial = layout.pack((state, mutable))
+        return layout, initial, invariant
+
     def _capture(
         self,
         parameters,
@@ -208,17 +220,17 @@ class _CompiledTensorTreeScan:
                 prepared_use,
                 invariant_use,
                 pytree.tree_map(lambda _value: True, sample_use),
-            )
+            ),
+            captured_inputs=isinstance(graph, torch.fx.GraphModule),
         )
 
-        def execute(parameters, prepared, state, carries, samples):
-            mutable, invariant = partition.split(carries)
+        def execute(parameters, prepared, initial, invariant, samples):
             return _packed_tensor_scan(
                 graph,
                 layout,
                 parameters,
                 prepared,
-                (clone_state(state), mutable),
+                initial,
                 invariant,
                 samples,
             )
@@ -233,8 +245,12 @@ class _CompiledTensorTreeScan:
     def __call__(self, parameters, prepared, state, carries, input_tape):
         samples, sample_layout = self._samples(input_tape)
         grad_enabled = torch.is_grad_enabled()
+        layout, initial, invariant = self._pack(
+            state, carries, grad_enabled=grad_enabled
+        )
         signature = (
-            _schema((parameters, prepared, state, carries, samples)),
+            layout,
+            _schema((parameters, prepared, initial, invariant, samples)),
             sample_layout,
             MEMBRANE_ASSEMBLY.value,
             grad_enabled,
@@ -251,15 +267,14 @@ class _CompiledTensorTreeScan:
                     grad_enabled=grad_enabled,
                 )
         compiled, layout, isolate_views = self._kernels[signature]
-        mutable, invariant = self._callback_carry.split(carries)
         parameters, prepared, invariant, samples = isolate_views(
             (parameters, prepared, invariant, samples)
         )
         packed, emitted = compiled(
             parameters,
             prepared,
-            state,
-            self._callback_carry.merge(mutable, invariant),
+            initial,
+            invariant,
             samples,
         )
         final, updated = layout.unpack(packed)

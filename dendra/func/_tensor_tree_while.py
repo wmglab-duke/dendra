@@ -22,6 +22,7 @@ from ._hop_inputs import (
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
 )
+from ._state_projection import _can_project_state
 from ._tensor_contracts import _clone_contiguous_tree as _clone_tree
 from ._tensor_contracts import capture_schema as _schema
 from ._while_inductor import _compile_while
@@ -51,6 +52,7 @@ class _CompiledTensorTreeWhile:
         device,
         plans=None,
         clone_state=None,
+        project_state=None,
         tracer=None,
         compiler=None,
     ):
@@ -61,9 +63,11 @@ class _CompiledTensorTreeWhile:
         self._device = torch.device(device)
         self._partition = _CallbackCarryPartition.from_plans(plans)
         self._clone_state = _clone_tree if clone_state is None else clone_state
+        self._project_state = project_state
         self._tracer = make_fx if tracer is None else tracer
         self._compiler = _compile_while if compiler is None else compiler
         self._kernels = {}
+        self._layouts = {}
 
     def _samples(self, tape):
         values, spec = pytree.tree_flatten(tape)
@@ -84,26 +88,98 @@ class _CompiledTensorTreeWhile:
                 tensors.append(value)
         return tuple(tensors), (spec, tuple(positions))
 
-    def kernel_for(self, parameters, prepared, state, carries, tape):
-        samples, sample_layout = self._samples(tape)
+    def _pack(self, state, carries):
+        # The authored graph already sees owned packed views. Establish that
+        # same private boundary before specialization and Dynamo's guards:
+        # public continuation leaves can have different offsets or aliases.
+        project = _can_project_state(
+            self._clone_state,
+            self._project_state,
+            state,
+            carries,
+            self._partition,
+        )
+        with torch.inference_mode(False), torch.no_grad():
+            state = (self._project_state if project else self._clone_state)(state)
+            recurrent, invariant = self._partition.split(carries)
+            if project:
+                values, spec = pytree.tree_flatten((state, recurrent))
+                signature = (
+                    spec,
+                    tuple(
+                        None
+                        if value is None
+                        else (
+                            tuple(value.shape),
+                            value.dtype,
+                            value.device,
+                            value.layout,
+                        )
+                        for value in values
+                    ),
+                )
+                layout = self._layouts.get(signature)
+                if layout is None:
+                    # Use the shared construction contract for a new layout;
+                    # subsequent frames reuse its metadata and flattened leaves.
+                    layout = _PackedCarryLayout.from_tree((state, recurrent))
+                    self._layouts[signature] = layout
+                initial = layout.pack_leaves(values, spec)
+            else:
+                layout = _PackedCarryLayout.from_tree((state, recurrent))
+                initial = layout.pack((state, recurrent))
+        return layout, initial, invariant
+
+    def _kernel_for(
+        self, parameters, prepared, layout, initial, invariant, samples, sample_layout
+    ):
         signature = (
-            _schema((parameters, prepared, state, carries, samples)),
+            layout,
+            _schema((parameters, prepared, initial, invariant, samples)),
             sample_layout,
             MEMBRANE_ASSEMBLY.value,
         )
-        if signature not in self._kernels:
+        kernel = self._kernels.get(signature)
+        if kernel is None:
             with torch.inference_mode(False), torch.no_grad():
-                self._kernels[signature] = self._capture(
-                    parameters, prepared, state, carries, samples, sample_layout
+                kernel = self._capture(
+                    parameters,
+                    prepared,
+                    layout,
+                    initial,
+                    invariant,
+                    samples,
+                    sample_layout,
                 )
-        return self._kernels[signature]
+                self._kernels[signature] = kernel
+        return kernel
 
-    def __call__(self, parameters, prepared, state, carries, tape):
-        return self.kernel_for(parameters, prepared, state, carries, tape)(
-            parameters, prepared, state, carries, tape
+    def kernel_for(self, parameters, prepared, state, carries, tape):
+        # Admission captures eagerly, without retaining these example packs.
+        # The returned raw-operand callable prepares its own current values.
+        samples, sample_layout = self._samples(tape)
+        layout, initial, invariant = self._pack(state, carries)
+        kernel = self._kernel_for(
+            parameters, prepared, layout, initial, invariant, samples, sample_layout
         )
 
-    def _capture(self, parameters, prepared, state, carries, samples, sample_layout):
+        @wraps(kernel)
+        def materialize(parameters, prepared, state, carries, tape):
+            return self(parameters, prepared, state, carries, tape)
+
+        return materialize
+
+    def __call__(self, parameters, prepared, state, carries, tape):
+        samples, sample_layout = self._samples(tape)
+        layout, initial, invariant = self._pack(state, carries)
+        kernel = self._kernel_for(
+            parameters, prepared, layout, initial, invariant, samples, sample_layout
+        )
+        return kernel(parameters, prepared, initial, invariant, samples, carries)
+
+    def _capture(
+        self, parameters, prepared, layout, initial, invariant, samples, sample_layout
+    ):
         body, partition, steps = self._body, self._partition, self._steps
         clone_state = self._clone_state
         block, full_steps = 4, (steps // 4) * 4
@@ -111,12 +187,9 @@ class _CompiledTensorTreeWhile:
         # Trace them directly under no_grad: cloning changes non-dense views,
         # offsets and conjugate/negative bits, while detaching changes is_leaf.
         # FX records argument placeholders, not these values or their graphs.
-        state = clone_state(state)
-        recurrent, invariant = partition.split(carries)
-        layout = _PackedCarryLayout.from_tree((state, recurrent))
         # Capture the logical views actually presented by the inference HOP:
         # packing owns contiguous storage and does not retain AD history.
-        state, recurrent = layout.unpack(layout.pack((state, recurrent)))
+        state, recurrent = layout.unpack(initial)
 
         def authored(parameters, prepared, state, recurrent, invariant, sample):
             spec, positions = sample_layout
@@ -188,8 +261,7 @@ class _CompiledTensorTreeWhile:
         sample_devices = tuple(devices.index(value.device) for value in samples)
         emission_devices = tuple(devices.index(device) for _, _, device in shapes)
 
-        def execute(parameters, prepared, state, carries, samples):
-            recurrent, invariant = partition.split(carries)
+        def execute(parameters, prepared, initial, invariant, samples):
             parameters, prepared, invariant, samples = _isolate_dense_lifted_inputs(
                 (parameters, prepared, invariant, samples)
             )
@@ -197,7 +269,6 @@ class _CompiledTensorTreeWhile:
                 torch.empty((steps, *shape), dtype=dtype, device=device)
                 for shape, dtype, device in shapes
             )
-            initial = layout.pack((clone_state(state), recurrent))
 
             def apply_step(counters, offset, current, current_carries):
                 selectors = tuple((counter + offset).reshape(1) for counter in counters)
@@ -249,17 +320,15 @@ class _CompiledTensorTreeWhile:
         compiled = self._compiler(execute, self._options)
 
         @wraps(compiled)
-        def materialize(parameters, prepared, state, carries, tape):
-            samples, _ = self._samples(tape)
-            recurrent, invariant = partition.split(carries)
+        def materialize(parameters, prepared, initial, invariant, samples, carries):
             parameters, prepared, invariant, samples = isolate_views(
                 (parameters, prepared, invariant, samples)
             )
             packed, emitted = compiled(
                 parameters,
                 prepared,
-                state,
-                partition.merge(recurrent, invariant),
+                initial,
+                invariant,
                 samples,
             )
             final, updated = layout.unpack(packed)

@@ -394,12 +394,12 @@ class _CompiledScanPopulationChunk:
 
                 (final, updated), emitted = scan(
                     combine,
-                    (functional._clone_state_tree(state), _clone(carries)),
+                    (state, carries),
                     flat_samples,
                 )
             else:
                 full_steps = (steps // block) * block
-                carry = (functional._clone_state_tree(state), _clone(carries))
+                carry = (state, carries)
 
                 def combine(carry, samples):
                     emissions = []
@@ -526,6 +526,12 @@ class _CompiledScanPopulationChunk:
                     )
                 )
             )
+            # The recurrence already owns these leaves. Establish ownership
+            # before Dynamo sees their public aliases, offsets or inference
+            # flags, rather than specializing on metadata discarded by clone.
+            with torch.inference_mode(False), torch.no_grad():
+                state = functional._clone_state_tree(state)
+                recurrent = _clone(recurrent)
             result = compiled(
                 parameters,
                 prepared,

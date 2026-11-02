@@ -151,11 +151,12 @@ from ._rng_diagnostics import (
     _restore_global_rng,
     _rng_diagnostic_scope,
 )
-from ._stimuli import (
-    FunctionalExtra,
-    FunctionalIntra,
-    _is_internal_module_state,
+from ._state_projection import (
+    _clone_state_leaf,
+    _identity_state_leaf,
+    _state_projection,
 )
+from ._stimuli import FunctionalExtra, FunctionalIntra, _is_internal_module_state
 from ._tensor_contracts import (
     _clone_tensor,
     _has_inference_tensor_component,
@@ -17162,30 +17163,36 @@ class FunctionalPopulation:
         next_state = {name: next_state[name] for name in self._state_schema}
         return next_state, {"v": next_state["integrator"]["v"]}
 
-    def _clone_state_tree(self, state):
+    def _map_state_tree(self, state, function):
         # while_loop requires the carry's pytree order and every tensor's
         # metadata, including strides, to match the body output exactly.
         # Public state is key-addressed and may arrive with a different Mapping
         # insertion order or valid non-contiguous views. Rebuild it from the
-        # immutable layout so initial and returned carry have one owned,
-        # canonical representation.
+        # immutable layout so initial and returned carry have canonical order.
+        # The leaf transform supplies ownership when cloning is requested.
         cloned = {}
         for leaf in self._state_layout:
-            value = _get_path(state, leaf.public_path).clone(
-                memory_format=torch.contiguous_format
-            )
+            value = function(_get_path(state, leaf.public_path))
             _put_path(cloned, leaf.public_path, value)
         if self._random_plan is not None:
             cloned["random"] = torch.utils._pytree.tree_map(
-                lambda value: value.clone(memory_format=torch.contiguous_format),
+                function,
                 state["random"],
             )
         if self._poisson_plan is not None:
             cloned["stimulation"] = torch.utils._pytree.tree_map(
-                lambda value: value.clone(memory_format=torch.contiguous_format),
+                function,
                 state["stimulation"],
             )
         return {name: cloned[name] for name in self._state_schema}
+
+    def _clone_state_tree(self, state):
+        return self._map_state_tree(state, _clone_state_leaf)
+
+    @_state_projection(_clone_state_tree)
+    def _project_state_tree(self, state):
+        """Read state leaves in canonical order without copying them."""
+        return self._map_state_tree(state, _identity_state_leaf)
 
     def _validate_receive(self, target, payload):
         if not isinstance(target, str):

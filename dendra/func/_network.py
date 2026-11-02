@@ -12,10 +12,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from dendra.models.integrators import _bwd_euler_sc_skip
-from dendra.models.networks.net import (
-    Network,
-    _network_step_schedule,
-)
+from dendra.models.networks.net import Network, _network_step_schedule
 from dendra.models.networks.net import step as _native_step
 
 from . import _network_parameters
@@ -50,6 +47,11 @@ from ._population import (
     make_functional,
 )
 from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
+from ._state_projection import (
+    _clone_state_leaf,
+    _identity_state_leaf,
+    _state_projection,
+)
 from ._tables import network_table_alias_signature
 from ._tree_paths import _get_path as _at
 from ._types import FunctionalizationError, StepInput
@@ -978,22 +980,31 @@ class FunctionalNetwork:
         _validate_tree(state, self._state_schema, "state")
         self.check_overflow(state)
 
-    def _clone_state_tree(self, state):
-        """Own state leaves in the frozen schema's mapping and tuple order."""
+    def _map_state_tree(self, state, function):
+        """Map state leaves in the frozen schema's mapping and tuple order."""
 
-        def clone(value, schema):
+        def visit(value, schema):
             if isinstance(schema, _TensorSchema):
-                return value.clone(memory_format=torch.contiguous_format)
+                return function(value)
             if isinstance(schema, Mapping):
                 return {
-                    name: clone(value[name], child) for name, child in schema.items()
+                    name: visit(value[name], child) for name, child in schema.items()
                 }
             if isinstance(schema, tuple):
-                values = tuple(clone(item, child) for item, child in zip(value, schema))
+                values = tuple(visit(item, child) for item, child in zip(value, schema))
                 return type(schema)(*values) if hasattr(schema, "_fields") else values
             return None
 
-        return clone(state, self._state_schema)
+        return visit(state, self._state_schema)
+
+    def _clone_state_tree(self, state):
+        """Own state leaves in the frozen schema's mapping and tuple order."""
+        return self._map_state_tree(state, _clone_state_leaf)
+
+    @_state_projection(_clone_state_tree)
+    def _project_state_tree(self, state):
+        """Read state leaves in canonical order without copying them."""
+        return self._map_state_tree(state, _identity_state_leaf)
 
     def _extract(self, network, *, snapshots=None):
         owned = snapshots is not None

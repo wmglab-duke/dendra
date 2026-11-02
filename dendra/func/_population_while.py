@@ -41,6 +41,7 @@ class _PopulationWhileExecutor:
         self._plans = plans
         self._options = compile_options
         self._stepwise_stimulation = stepwise_stimulation
+        self._stepwise_engine = None
         self._kernels = {}
         self._capture_errors = {}
 
@@ -160,16 +161,24 @@ class _PopulationWhileExecutor:
                 updated, emitted = current_carries, {}
             return (next_state, updated), emitted or {}
 
-        engine = _CompiledTensorTreeWhile(
-            body,
-            steps=self._steps,
-            compile_options=self._options,
-            device=functional.device,
-            plans=plans,
-            clone_state=functional._clone_state_tree,
-            tracer=make_fx,
-            compiler=_compile_while,
-        )
+        # Stepwise assembly is part of the pure body, so one engine can select
+        # its owned-input specializations across public state/view changes.
+        # Whole-tape assembly retains its existing per-signature capture.
+        engine = self._stepwise_engine if stepwise else None
+        if engine is None:
+            engine = _CompiledTensorTreeWhile(
+                body,
+                steps=self._steps,
+                compile_options=self._options,
+                device=functional.device,
+                plans=plans,
+                clone_state=functional._clone_state_tree,
+                project_state=getattr(functional, "_project_state_tree", None),
+                tracer=make_fx,
+                compiler=_compile_while,
+            )
+            if stepwise:
+                self._stepwise_engine = engine
         kernel = engine.kernel_for(
             parameters, prepared, state, carries, (ve, intra, noise, stimulation, draws)
         )

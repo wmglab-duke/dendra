@@ -301,7 +301,7 @@ class _FunctionalIntegratorSpec:
     critical_methods: tuple[str, ...]
 
 
-def _population_runtime_modes_plain():
+def _population_runtime_modes_plain(*, check_saved_tensors=True):
     """Fail closed when ambient Torch execution can invoke authored code.
 
     This runs outside Dynamo at a segment boundary. The ordinary default-device
@@ -309,6 +309,9 @@ def _population_runtime_modes_plain():
     modes, and saved-tensor hooks keep per-step dynamic validation and sampling.
     Private introspection is feature-detected so unavailable APIs only disable
     this optimization, never ordinary execution.
+
+    Operators that save no tensors may omit the saved-tensor hook check while
+    retaining all dispatch and function-mode checks.
     """
     try:
         dispatch_length = getattr(torch._C, "_len_torch_dispatch_stack", None)
@@ -334,7 +337,7 @@ def _population_runtime_modes_plain():
         ):
             return False
         # Ignore a tracing flag that could otherwise hide active user hooks.
-        if saved_hooks(True) is not None:
+        if check_saved_tensors and saved_hooks(True) is not None:
             return False
         dispatch_count = dispatch_length()
         pre_dispatch_count = pre_dispatch_length()

@@ -33,6 +33,10 @@ class _PackedCarryLayout:
     @classmethod
     def from_tree(cls, tree):
         values, spec = pytree.tree_flatten(tree)
+        return cls.from_leaves(values, spec)
+
+    @classmethod
+    def from_leaves(cls, values, spec):
         groups = []
         group_indices = []
         sizes = []
@@ -64,6 +68,9 @@ class _PackedCarryLayout:
 
     def pack(self, tree):
         values, spec = pytree.tree_flatten(tree)
+        return self.pack_leaves(values, spec)
+
+    def pack_leaves(self, values, spec):
         if spec != self.spec:
             raise ValueError("packed loop carry changed its tensor-tree structure")
         if any(

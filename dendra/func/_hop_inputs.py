@@ -7,6 +7,45 @@ from dataclasses import dataclass
 import torch
 from torch.utils import _pytree as pytree
 
+from ._state_projection import (
+    _CLASS_DICT,
+    _MRO_GET,
+    _NAMES,
+    _TENSOR_DICT,
+    _plain_projection_context,
+    _tensor_descriptor,
+)
+
+_PARAMETER = torch.nn.Parameter
+_PARAMETER_MRO = _MRO_GET(_PARAMETER)
+_PARAMETER_TORCH_FUNCTION = torch._C._disabled_torch_function_impl
+
+
+def _plain_parameter_class():
+    """Keep authored Parameter methods on the original operand path."""
+    if (
+        torch.nn.Parameter is not _PARAMETER
+        or _MRO_GET(_PARAMETER) is not _PARAMETER_MRO
+        or getattr(torch._C, "_disabled_torch_function_impl", None)
+        is not _PARAMETER_TORCH_FUNCTION
+    ):
+        return False
+    namespaces = tuple(_CLASS_DICT(cls) for cls in _PARAMETER_MRO)
+    if any("__getattr__" in namespace for namespace in namespaces):
+        return False
+    for name in _NAMES:
+        actual = next(
+            (namespace[name] for namespace in namespaces if name in namespace), None
+        )
+        expected = (
+            _PARAMETER_TORCH_FUNCTION
+            if name == "__torch_function__"
+            else _tensor_descriptor(name)
+        )
+        if actual is not expected:
+            return False
+    return True
+
 
 def _dense_zero_offset(value):
     return (
@@ -91,11 +130,16 @@ def _input_usage(graph, arguments):
 class _LiftedViewIsolation:
     spec: object
     indices: tuple[int, ...]
+    captured_inputs: bool = False
 
     @classmethod
-    def from_usage(cls, usage):
+    def from_usage(cls, usage, *, captured_inputs=False):
         values, spec = pytree.tree_flatten(usage)
-        return cls(spec, tuple(index for index, used in enumerate(values) if used))
+        return cls(
+            spec,
+            tuple(index for index, used in enumerate(values) if used),
+            captured_inputs,
+        )
 
     def __call__(self, tree):
         # Authored views enter the graph as owned Tensor inputs. Creating them
@@ -118,11 +162,41 @@ class _LiftedViewIsolation:
                 ) from error
             spec = self.spec
         copied = False
+        if self.captured_inputs:
+            # The authored graph has already resolved metadata-dependent
+            # branches against the raw schema. Unused Tensor placeholders need
+            # no runtime operand or compiler guard (e.g. Parameter vs Tensor
+            # after portable restoration). Keep their captured positions.
+            used = set(self.indices)
+            for index, value in enumerate(values):
+                if index not in used and torch.is_tensor(value):
+                    values[index] = None
+                    copied = True
+        parameter_views, plain_modes = {}, None
         for index in self.indices:
             value = values[index]
             if torch.is_tensor(value) and not _dense_zero_offset(value):
                 values[index] = _isolate_lifted_tensor(value)
                 copied = True
+            elif self.captured_inputs and type(value) is _PARAMETER:
+                if plain_modes is None:
+                    # Alias is an identity view and saves no tensors. It is
+                    # safe under checkpoint save hooks, but authored execution
+                    # modes retain the original operand/dispatch behavior.
+                    plain_modes = (
+                        _plain_projection_context(check_saved_tensors=False)
+                        and _plain_parameter_class()
+                    )
+                if plain_modes:
+                    namespace = _TENSOR_DICT.__get__(value)
+                    if type(namespace) is dict and not namespace:
+                        identity = id(value)
+                        if identity not in parameter_views:
+                            parameter_views[identity] = torch.ops.aten.alias.default(
+                                value
+                            )
+                        values[index] = parameter_views[identity]
+                        copied = True
         return pytree.tree_unflatten(values, spec) if copied else tree
 
 

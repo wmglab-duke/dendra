@@ -451,6 +451,7 @@ class CompiledNetworkChunk:
             return ({"network": state, "auxiliary": auxiliary}, carries), emitted or {}
 
         if self._execution == "while":
+            from ._state_projection import _projection_matches, _state_projection
             from ._tensor_tree_while import _CompiledTensorTreeWhile
 
             def clone_loop(loop):
@@ -465,6 +466,19 @@ class CompiledNetworkChunk:
                     ),
                 }
 
+            @_state_projection(
+                clone_loop,
+                guard=lambda: _projection_matches(
+                    functional._clone_state_tree,
+                    getattr(functional, "_project_state_tree", None),
+                ),
+            )
+            def project_loop(loop):
+                return {
+                    "network": functional._project_state_tree(loop["network"]),
+                    "auxiliary": loop["auxiliary"],
+                }
+
             return _CompiledTensorTreeWhile(
                 body,
                 steps=self.steps,
@@ -472,6 +486,7 @@ class CompiledNetworkChunk:
                 device=functional.device,
                 plans=plans,
                 clone_state=clone_loop,
+                project_state=project_loop,
             )
 
         if self._execution == "unrolled":
