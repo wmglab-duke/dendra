@@ -17040,6 +17040,8 @@ class FunctionalPopulation:
         noise=None,
         stimulation=None,
         draws=None,
+        *,
+        poisson_schedules=None,
     ):
         """Execute the established authored transition with a Python loop."""
         runtime_draws = draws
@@ -17080,7 +17082,9 @@ class FunctionalPopulation:
                 packet = torch.utils._pytree.tree_map_only(
                     torch.Tensor, lambda value: value[index], stimulation
                 )
-                for slot, value in self._poisson_plan.mapping(packet).items():
+                for slot, value in self._poisson_plan.mapping(
+                    packet, schedules=poisson_schedules
+                ).items():
                     if index == 0:
                         mapping[slot] = value
                     schedule_values.setdefault(
@@ -17134,7 +17138,10 @@ class FunctionalPopulation:
                 next_state["stimulation"] = state["stimulation"]
             if steps:
                 next_state = self._runtime_draw_plan.publish(
-                    next_state, runtime_draws, tape=True
+                    next_state,
+                    runtime_draws,
+                    tape=True,
+                    schedules=poisson_schedules,
                 )
         else:
             if self._random_plan is not None:
@@ -17153,7 +17160,10 @@ class FunctionalPopulation:
                     state["stimulation"]
                     if stimulation is None or not steps
                     else self._poisson_plan.advance(
-                        state["stimulation"], stimulation, tape=True
+                        state["stimulation"],
+                        stimulation,
+                        tape=True,
+                        schedules=poisson_schedules,
                     )
                 )
             if steps:
@@ -17620,14 +17630,17 @@ class FunctionalPopulation:
                         torch.Tensor, lambda value: value[index], stimulation
                     )
                 )
+                # Keep argument reads and the first parameter copy/validation
+                # in their established order. Share only immutable schedule
+                # stacks; mechanism binding still owns fresh invocation cursors.
+                ve_input = None if ve is None else ve[index : index + 1]
+                intra_input = None if intra is None else intra[index : index + 1]
+                dt = prepared["integrator"]["dt"]
+                bound, poisson_schedules = self._poisson_plan._parameters_and_schedules(
+                    parameters, packet
+                )
                 ve_step, intra_step = self._assemble_bound_inputs(
-                    parameters,
-                    state,
-                    None if ve is None else ve[index : index + 1],
-                    None if intra is None else intra[index : index + 1],
-                    1,
-                    prepared["integrator"]["dt"],
-                    packet,
+                    bound, state, ve_input, intra_input, 1, dt
                 )
                 state, auxiliary = self._transition_rollout_values(
                     parameters,
@@ -17653,6 +17666,7 @@ class FunctionalPopulation:
                     else torch.utils._pytree.tree_map_only(
                         torch.Tensor, lambda value: value[index : index + 1], draws
                     ),
+                    poisson_schedules=poisson_schedules,
                 )
             return state, auxiliary
         ve, intra = self._assemble_bound_inputs(

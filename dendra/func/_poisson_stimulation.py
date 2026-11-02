@@ -777,6 +777,10 @@ class PoissonStimulationPlan:
             raise FunctionalizationError(message)
 
     def parameters(self, parameters, packet):
+        return self._parameters_and_schedules(parameters, packet)[0]
+
+    def _parameters_and_schedules(self, parameters, packet):
+        """Bind banks and retain this step's evaluated invocation stacks."""
         result = dict(parameters)
         schedules = self.schedules(packet)
         for entry in self.entries:
@@ -789,10 +793,12 @@ class PoissonStimulationPlan:
                 result[entry.parameter + ".__invocations"] = stack.reshape(
                     stack.shape + (1,) * entry.source._spike_time_trailing_dims
                 )
-        return result
+        return result, schedules
 
-    def mapping(self, packet):
-        return self._schedule_mapping(self.schedules(packet), self._runtime_keys)
+    def mapping(self, packet, *, schedules=None):
+        if schedules is None:
+            schedules = self.schedules(packet)
+        return self._schedule_mapping(schedules, self._runtime_keys)
 
     def _schedule_mapping(self, schedules, active):
         from dendra.models.stim.waveform._poisson import (
@@ -828,11 +834,19 @@ class PoissonStimulationPlan:
         }
 
     def advance(
-        self, state, packet, *, tape=False, initialization=False, publish_rng=True
+        self,
+        state,
+        packet,
+        *,
+        tape=False,
+        initialization=False,
+        publish_rng=True,
+        schedules=None,
     ):
         if tape:
             packet = _pytree.tree_map(lambda value: value[-1], packet)
-        schedules = self.schedules(packet, initialization=initialization)
+        if schedules is None:
+            schedules = self.schedules(packet, initialization=initialization)
         latest = {}
         positions = Counter()
         for entry in (

@@ -218,7 +218,7 @@ class PopulationRuntimeDrawPlan:
             if _cold_validation():
                 self.poisson._validate_rng(self.legacy(packet)[1].rng, steps=steps)
 
-    def publish(self, state, packet, *, tape=False):
+    def publish(self, state, packet, *, tape=False, schedules=None):
         """Publish each canonical frame once; Poisson advances only schedules."""
         selected = (
             pytree.tree_map_only(torch.Tensor, lambda value: value[-1], packet)
@@ -242,7 +242,10 @@ class PopulationRuntimeDrawPlan:
         if self.poisson is not None:
             stimulation = StimulationDraw(selected.draws["stimulation"], {})
             advanced = self.poisson.advance(
-                state["stimulation"], stimulation, publish_rng=False
+                state["stimulation"],
+                stimulation,
+                publish_rng=False,
+                schedules=schedules,
             )
             rng = {
                 stream: selected.rng["stimulation"][stream].detach().clone()
