@@ -1157,11 +1157,9 @@ def _execute_checkpointed_chunks(
     return state, auxiliary
 
 
-def _bound_runner_dt(functional, prepared_values):
-    """Infer the prepared timestep while preserving nominal float32 durations."""
-    primal, _tangent = torch.autograd.forward_ad.unpack_dual(
-        prepared_values["integrator"]["dt"]
-    )
+def _population_timestep(functional, timestep):
+    """Read an effective timestep while preserving nominal float32 durations."""
+    primal, _tangent = torch.autograd.forward_ad.unpack_dual(timestep)
     value = float(primal.detach().to(device="cpu").to(torch.float64).item())
     nominal = functional.dt
     # Callback sample windows and physical durations use the authored Python
@@ -1169,6 +1167,11 @@ def _bound_runner_dt(functional, prepared_values):
     if float(torch.tensor(nominal, dtype=primal.dtype, device="cpu").item()) == value:
         return nominal
     return value
+
+
+def _bound_runner_dt(functional, prepared_values):
+    """Infer the prepared timestep while preserving nominal float32 durations."""
+    return _population_timestep(functional, prepared_values["integrator"]["dt"])
 
 
 def _run_schedule(
@@ -1415,9 +1418,8 @@ def _execute_schedule(
     )
 
 
-def _network_duration_horizon(state, steps, duration, dt):
-    """Resolve Network duration carry for both host execution interfaces."""
-    remainder = state["clock"]["duration_remainder"]
+def _validate_network_duration_remainder(remainder):
+    """Read host duration carry without staging a new Network frame."""
     if remainder.requires_grad:
         raise FunctionalizationError(
             "Network duration_remainder must not require gradients"
@@ -1430,6 +1432,13 @@ def _network_duration_horizon(state, steps, duration, dt):
     pending = float(remainder.detach().cpu().item())
     if not math.isfinite(pending) or pending < 0:
         raise ValueError("Network duration_remainder must be finite and non-negative")
+    return pending
+
+
+def _network_duration_horizon(state, steps, duration, dt):
+    """Resolve Network duration carry for both host execution interfaces."""
+    remainder = state["clock"]["duration_remainder"]
+    pending = _validate_network_duration_remainder(remainder)
     if duration is not None:
         duration = _validate_time_scalar(duration, name="duration", positive=False)
         steps, pending = _duration_step_budget(duration, dt, pending)

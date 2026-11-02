@@ -6,6 +6,8 @@ from collections.abc import Mapping
 
 import torch
 
+from dendra.models._execution_horizons import execution_call_horizon
+
 from ._continuation import Continuation
 from ._continuation_checkpoints import _cold_boundary
 from ._types import FunctionalizationError
@@ -164,7 +166,33 @@ def _functional_plan(target):
     )
 
 
-def sample_runtime_draws(target, state=None, *, steps=None, dt=None, extra=None):
+def _functional_duration_timestep(target, functional, continuation):
+    """Read execution-owned timestep metadata without binding or preparing."""
+    from ._binding import BoundPopulation
+    from ._convenience import CompiledRunner
+    from ._network import FunctionalNetwork
+    from ._runners import _bound_runner_dt, _population_timestep
+
+    if type(functional) is FunctionalNetwork:
+        return functional.dt
+    if type(target) is BoundPopulation:
+        if target._constants is None:
+            values = functional._validate_prepared(target._prepared, target._parameters)
+            return _bound_runner_dt(functional, values)
+        constants = target._constants
+    elif continuation is not None:
+        constants = continuation.constants
+    elif type(target) is CompiledRunner:
+        constants = target._constants
+    else:
+        return functional.dt
+    functional._validate_constants(constants)
+    return _population_timestep(functional, constants["dt"])
+
+
+def sample_runtime_draws(
+    target, state=None, *, steps=None, duration=None, dt=None, extra=None
+):
     """Sample detached runtime draws without advancing a model or its RNG.
 
     Native initialized Populations and Networks sample from their current logical
@@ -178,15 +206,24 @@ def sample_runtime_draws(target, state=None, *, steps=None, dt=None, extra=None)
 
     Functional Population/Network plans, bindings, compiled chunks and
     ``dn.compile`` runners require explicit ``state`` or a :class:`Continuation`.
-    Only its simulation state is read; parameters, constants and callback carry
-    are not sampled or changed. Their stimulation bindings and timestep belong
-    to the lowered plan. ``extra`` must be omitted, and a supplied ``dt`` must
-    match that plan. Runner snapshot/fresh defaults are not used.
+    Stimulation bindings belong to the lowered plan. ``extra`` must be omitted,
+    and a supplied ``dt`` must match the plan, or the effective execution
+    timestep when sampling a duration. Runner snapshot/fresh initialization
+    policies are not used. Duration sampling reads a Population's timestep from its
+    binding, continuation constants, or runner defaults, in that order. An
+    unbound plan or chunk with plain state uses the plan timestep. Network
+    duration sampling uses its fixed plan timestep. No preparation is performed
+    and source parameters/constants, callback carry and caches are unchanged.
 
-    Omit ``steps`` for one frame, or supply a non-negative integer for a
-    time-leading tape. Zero produces fresh empty leaves without advancing any
-    live or returned stream boundary. The returned :class:`RuntimeDraws` uses
-    runtime-only Poisson invocation rows and replays through native ``draws=`` or
+    Omit ``steps`` and ``duration`` for one frame. Supply a non-negative integer
+    ``steps`` or a non-negative finite ``duration`` in ms for a time-leading
+    tape. They are mutually exclusive. Duration uses the same fractional carry
+    and timestep budgeting as execution, without publishing a new remainder.
+    Replay with the same duration and starting boundary; execution alone updates
+    the carry. A duration accepting no complete steps produces fresh empty
+    leaves without advancing any live or returned stream boundary. Explicit
+    step counts do not spend fractional carry. The returned :class:`RuntimeDraws`
+    uses runtime-only Poisson invocation rows and replays through native ``draws=`` or
     functional execution. Existing plan sampling methods retain their
     initialization-reserved packet layouts.
 
@@ -198,10 +235,7 @@ def sample_runtime_draws(target, state=None, *, steps=None, dt=None, extra=None)
     compilation, function transforms and forward AD.
     """
     _cold_boundary("sample_runtime_draws")
-    if steps is not None and (
-        isinstance(steps, bool) or not isinstance(steps, int) or steps < 0
-    ):
-        raise ValueError("steps must be a non-negative integer")
+    steps, duration = execution_call_horizon(None, None, steps, duration)
 
     from dendra.models import Network, Population
 
@@ -225,6 +259,18 @@ def sample_runtime_draws(target, state=None, *, steps=None, dt=None, extra=None)
                     )
             from ._runtime_sampling import sample_native_runtime_draws
 
+            if duration is not None:
+                import inspect
+
+                owner = Network if isinstance(target, Network) else Population
+                if (
+                    inspect.getattr_static(target, "_duration_budget")
+                    is not owner._duration_budget
+                ):
+                    raise FunctionalizationError(
+                        "Duration draw sampling requires canonical duration budgeting"
+                    )
+                steps, _ = owner._duration_budget(target, duration, selected_dt)
             return sample_native_runtime_draws(
                 target, dt=selected_dt, steps=steps, extra=extra
             )
@@ -236,19 +282,48 @@ def sample_runtime_draws(target, state=None, *, steps=None, dt=None, extra=None)
             )
         if state is None:
             raise TypeError("Functional runtime draw sampling requires explicit state")
-        if dt is not None:
+        if dt is not None and duration is None:
             from dendra.models.core import _validate_time_scalar
 
             if _validate_time_scalar(dt, name="dt", positive=True) != functional.dt:
                 raise ValueError("dt must match the functional plan timestep")
-        state = state.state if isinstance(state, Continuation) else state
+        continuation = state if isinstance(state, Continuation) else None
+        state = continuation.state if continuation is not None else state
         if not isinstance(state, Mapping):
             raise TypeError("state must be a mapping or Continuation")
         from ._network_bindings import _canonicalize_mapping_tree
 
         state, _ = _canonicalize_mapping_tree(state)
+        # Finish public prepared/constant mapping reads before source checks.
+        selected_dt = (
+            _functional_duration_timestep(target, functional, continuation)
+            if duration is not None
+            else None
+        )
         functional._validate_source()
         functional._validate_state(state)
+        if duration is not None:
+            from dendra.models.core import _duration_step_budget, _validate_time_scalar
+
+            from ._network import FunctionalNetwork
+            from ._runners import (
+                _validate_duration_remainder,
+                _validate_network_duration_remainder,
+            )
+
+            if (
+                dt is not None
+                and _validate_time_scalar(dt, name="dt", positive=True) != selected_dt
+            ):
+                raise ValueError("dt must match the functional execution timestep")
+            pending = (
+                _validate_network_duration_remainder(
+                    state["clock"]["duration_remainder"]
+                )
+                if type(functional) is FunctionalNetwork
+                else _validate_duration_remainder(state)
+            )
+            steps, _ = _duration_step_budget(duration, selected_dt, pending)
         return functional._runtime_draw_plan.sample_runtime(state, steps=steps)
 
 

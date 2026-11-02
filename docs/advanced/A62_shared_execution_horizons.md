@@ -95,6 +95,59 @@ Continue with the same prepared collection and pass `callback_state=` from the
 previous result. Functional execution keeps these values in its continuation;
 see {doc}`A57_functional_api_overview`.
 
+(shared-runtime-draw-horizons)=
+## Matching stochastic draw tapes to a duration
+
+`dn.func.sample_runtime_draws` accepts the same `steps=` or `duration=` horizon
+for initialized native models and explicit functional boundaries. Sampling
+uses isolated generators and does not advance the source model, continuation,
+fractional duration or RNG. Pass the same duration to sampling and execution:
+
+```python
+draws = dn.func.sample_runtime_draws(program, trial, duration=10.0)
+state, auxiliary = dn.func.run(program, trial, duration=10.0, draws=draws)
+
+# Native Population execution uses the same explicit timestep for both calls.
+draws = dn.func.sample_runtime_draws(population, duration=10.0, dt=dt)
+population.longrun(duration=10.0, dt=dt, chunklength=32, draws=draws)
+```
+
+For a native Network, omit `dt`; sampling and execution use its initialized
+timestep. Functional plans, bindings, chunks and runners require an explicit
+state or `Continuation`. A Population continuation or binding selects its
+effective timestep sources. Unbound plans and chunks with plain state use
+their nominal timestep; a runner with plain state uses its default sources.
+
+At `dt=0.1`, a boundary with `0.05` ms pending accepts three steps for
+`duration=0.25`. Dividing just the new duration by `dt` would produce the wrong
+tape length. Sampling leaves the `0.05` ms available; replaying the duration
+spends it exactly once and publishes the new remainder. Native and functional
+checkpoints preserve that incoming boundary and reproduce the same tape.
+
+Omitting both horizon arguments keeps the one-frame sampling contract.
+Supplying `steps=` or `duration=` produces a time-leading tape, including a
+fresh empty tape when the resolved count is zero. `duration=0` includes pending
+time without adding to it, so a changed standalone Population timestep can
+make that request accept complete steps. Explicit `steps=0` retains pending
+time. Supplying both `steps` and `duration` raises an error.
+
+The complete
+{download}`shared_runtime_draw_horizons.py <../../examples/shared_runtime_draw_horizons.py>`
+example covers Population and Network models with NOISE/SDE draws and Network
+NetStim. A substep duration establishes pending time, then duration sampling,
+replay and checkpoint restoration preserve that budget and training gradients:
+
+```{literalinclude} ../../examples/shared_runtime_draw_horizons.py
+:language: python
+:start-after: "# region duration"
+:end-before: "# endregion duration"
+:dedent: 4
+```
+
+```console
+python examples/shared_runtime_draw_horizons.py
+```
+
 ## Inputs and registered stimulation
 
 Explicit horizons determine the required length of deterministic input tapes:

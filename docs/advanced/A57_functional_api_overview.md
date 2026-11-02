@@ -826,7 +826,8 @@ independently.
 Use `draws=RuntimeDraws(...)` separately for runtime stochastic values and their
 RNG timeline. Obtain a packet with
 `dn.func.sample_runtime_draws(functional, continuation, steps=N)`, rather than
-constructing its component schema by hand. A step uses the no-`steps` form. The packet
+constructing its component schema by hand. Omit both `steps` and `duration` for
+one frame. The packet
 covers the model's NetStim, NOISE/SDE and randomized Poisson requests and
 preserves shared generator ordering. Runtime base draws and RNG carry are
 detached. Parameter gradients follow each mechanism's native rules, including
@@ -848,6 +849,32 @@ population.longrun(
     steps=100, dt=dt, chunklength=32, inputs=inputs, draws=draws,
 )
 ```
+
+Use `duration=` when execution requests elapsed simulation time:
+
+```python
+draws = dn.func.sample_runtime_draws(program, continuation, duration=10.0)
+state, auxiliary = dn.func.run(
+    program, continuation, duration=10.0, draws=draws,
+)
+```
+
+The sampler resolves complete steps from the same timestep and retained
+fractional duration as execution. It reads that boundary without advancing the
+clock, pending duration or RNG; execution commits the resulting carry once.
+The native form is `sample_runtime_draws(model, duration=..., dt=dt)` for a
+Population, or omit `dt` for an initialized Network. `steps` and `duration`
+are mutually exclusive. Explicit `duration=0` or a substep duration returns a
+time-leading tape for the resolved step count, which can be zero. An exact
+`steps=` request does not spend pending duration.
+
+When a Population's effective timestep differs from the plan's nominal
+timestep, supply its `Continuation` or a binding with the effective sources.
+An unbound plan or chunk with plain state uses its nominal timestep; a runner
+with plain state uses its default sources. See
+{ref}`shared-runtime-draw-horizons` for fractional budgeting and the complete
+{download}`shared_runtime_draw_horizons.py <../../examples/shared_runtime_draw_horizons.py>`
+example.
 
 A Network uses its initialized timestep and a Population-name input mapping;
 omit `dt` from its native run call. Explicit Poisson recipes are replayed once

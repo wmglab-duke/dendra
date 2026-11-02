@@ -107,10 +107,17 @@ ownership, sampling, and compatibility contracts.
    :members: draws, rng
 
 ``RuntimeDraws`` is the canonical runtime stochastic input packet for both
-Populations and Networks. Obtain it with ``functional.sample_runtime_draws``
-and supply it through ``draws=``. See
+Populations and Networks. Obtain it with ``dn.func.sample_runtime_draws``
+and supply it through ``draws=``. Omit ``steps`` and ``duration`` for one frame;
+``steps=N`` or ``duration=T`` returns a time-leading tape. Duration sampling
+uses the execution timestep and retained fractional duration without advancing
+the incoming boundary. Native models supply their current state; functional
+targets require explicit state or a ``Continuation``. See
+:ref:`shared-runtime-draw-horizons` for elapsed-duration replay and
 :ref:`functional-runtime-draws` for sampling, slicing, continuation, and the
 compatibility packet forms.
+
+.. autofunction:: dendra.func.sample_runtime_draws
 
 
 Source inspection

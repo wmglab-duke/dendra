@@ -13,6 +13,10 @@ class RuntimeDraws(NamedTuple):
 
     Obtain a frame with ``dn.func.sample_runtime_draws(model, dt=dt)`` or a
     time-leading tape with ``dn.func.sample_runtime_draws(model, dt=dt, steps=N)``.
+    ``duration=milliseconds`` selects a tape using execution's timestep and
+    retained fractional carry. Sampling leaves that carry unchanged; replay
+    with the same duration so execution publishes its updated remainder once.
+    ``steps`` and ``duration`` are mutually exclusive.
     Native Networks use their initialized timestep. Lowered plans, bindings,
     compiled chunks and runners require an explicit state or ``Continuation``
     as the sampler's second argument. Sampling an initialized native model
