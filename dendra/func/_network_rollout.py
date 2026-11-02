@@ -327,14 +327,15 @@ def rollout(
 
 
 class CompiledNetworkChunk:
-    """A fixed-horizon Network adapter over shared tensor-tree loop engines.
+    """Fixed-width compiled Network execution with explicit sources and state.
 
-    ``execution='scan'`` preserves the existing first-order reverse-mode scan
-    contract. ``execution='unrolled'`` uses the same authored body without a
-    HOP. ``execution='while'`` captures an inference-only bounded loop using
-    Population's packed carry and invocation-local recording machinery.
-    Public calls validate source/schema/preparation before entering the
-    tensor-only kernel. Kernel caches retain no live input/preparation graphs.
+    Construct with :meth:`FunctionalNetwork.compile_rollout_chunk`. Scan supports
+    first-order gradients, unrolled execution expands the fixed-width recurrence,
+    and while selects inference-only looping. Direct calls consume ``steps``
+    time-leading samples. Bind raw sources or a tensor bundle/Continuation, then
+    use :func:`run` for arbitrary horizons and shorter tails. Kernels retain no
+    live input bindings or preparation graphs. ``execution_report()`` describes
+    the most recent completed dispatch.
     """
 
     def bind(self, parameters, constants=_BINDING_UNSET):
@@ -392,6 +393,7 @@ class CompiledNetworkChunk:
 
     @property
     def steps(self):
+        """The fixed number of accepted timesteps consumed by a direct call."""
         return self._steps
 
     @property

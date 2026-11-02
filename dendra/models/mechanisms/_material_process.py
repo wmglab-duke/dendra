@@ -187,10 +187,21 @@ def _unsupported_local_declaration(name: str):
 
 
 class MaterialProcess(Mechanism):
-    """Base class for full-field processes over shared Material objects.
+    """Full-field operator over shared Material objects.
 
-    A MaterialProcess is inserted like a mechanism but scheduled in the material
-    phase.  It binds full population-wide Material fields instead of local views.
+    Insert a process like a Mechanism and select its execution phase with
+    :meth:`PHASE`. Pure implementations expose :attr:`material_fields`, prepare
+    operator data with :meth:`prepare_materials`, and return replacement fields
+    from :meth:`material_updates`. The native :meth:`advance_materials` adapter
+    publishes those replacements; functional execution uses the same pure hooks.
+
+    Notes
+    -----
+    The voltage-local Mechanism lifecycle does not apply: State bundles, CARRY,
+    ``initial_values``, ``advance``, and Mechanism workspace declarations are
+    unsupported. Use :meth:`configure_process` for persistent configuration and
+    :meth:`set_dt` for native timestep setup. Parameter declarations and explicit
+    RAND/NOISE inputs remain available.
     """
 
     _material_process_phase = "post_local"

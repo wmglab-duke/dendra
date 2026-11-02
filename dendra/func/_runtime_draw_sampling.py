@@ -252,44 +252,43 @@ def _functional_steps(target, functional, state, *, steps, duration, dt):
 
 
 def resolve_steps(target, state=None, *, steps=None, duration=None, dt=None):
-    """Return the accepted timestep count without advancing an execution boundary.
+    """Return an explicit request's accepted timestep count without running it.
 
-    Supply exactly one explicit ``steps=`` or ``duration=`` request. ``steps``
-    is a non-negative integer; ``duration`` is non-negative finite time in ms.
-    Runner defaults and compiled chunk widths are not selected implicitly.
-    The returned Python integer sizes deterministic :class:`Inputs` tapes and
-    matches :func:`sample_runtime_draws` for the same boundary and request.
+    Parameters
+    ----------
+    target : native model, functional plan, binding, compiled chunk or runner
+        Native models must be initialized. Functional targets require ``state``.
+    state : tensor tree or Continuation, optional
+        Functional execution boundary; omitted for native models.
+    steps : int, optional
+        Non-negative exact count. Supply exactly one of ``steps`` or ``duration``.
+    duration : float, optional
+        Non-negative elapsed time in ms, combined with retained fractional time.
+    dt : float, optional
+        Native Population timestep; omission uses the native backend default.
+        Native Networks use their initialized timestep. Functional callers normally
+        omit it; an explicit value is validated against the target's timestep.
 
-    Initialized native Populations and Networks use their current boundary and
-    require ``state`` omitted. A Population uses ``dt`` or the native backend
-    default; a Network uses its initialized timestep and requires a supplied
-    ``dt`` to match. Native host scheduling and duration budgeting must retain
-    their canonical implementations. Integrators need not support functional
-    lowering or runtime draw sampling. The query never inspects stochastic
-    distributions, constructs samplers or probes waveforms.
+    Returns
+    -------
+    int
+        Number of complete timesteps. Use it to size time-leading :class:`Inputs`.
+        Runner horizon defaults and compiled widths are not inferred.
 
-    Functional plans, bindings, compiled chunks and ``dn.compile`` runners
-    require explicit state or a :class:`Continuation`. Population durations
-    read the effective timestep from a binding, continuation constants, or
-    runner defaults, in that order. Unbound plans/chunks with plain state use
-    their nominal timestep; Networks use their fixed plan timestep. A supplied
-    ``dt`` validates that timestep rather than overriding it. No preparation,
-    cache refresh, native extraction or initialization is performed.
+    Notes
+    -----
+    Population duration queries use the effective timestep from a binding,
+    Continuation constants or runner defaults. An unbound plan/chunk with plain
+    state uses its nominal timestep. Networks use their fixed plan timestep.
+    Native queries require canonical host duration budgeting but not functional
+    integrator or stochastic-sampler support.
 
-    Durations include retained fractional time using execution's exact budget
-    arithmetic. Zero or substep durations can resolve to zero; existing pending
-    time can also complete a step. Explicit counts do not spend pending time.
-    Pass the original duration to execution so it publishes the updated carry::
-
-        request = {"duration": 10.0}
-        count = dn.func.resolve_steps(program, trial, **request)
-        inputs = dn.func.Inputs(intra=current[:count])
-        state, auxiliary = dn.func.run(program, trial, inputs=inputs, **request)
-
-    The query leaves clocks, fractional carry, RNG, callbacks, parameter
-    ownership and autograd history unchanged. It is a host operation outside
-    compilation, function transforms and forward AD, including in inference
-    mode. Stimulation bindings and their input tapes remain execution inputs.
+    The query leaves state, fractional carry, RNG, callbacks and caches unchanged.
+    It performs no initialization, preparation, lowering or waveform evaluation.
+    Execute with the original ``duration=`` request so execution publishes the
+    updated remainder; replacing it with ``steps=resolved_count`` preserves the old
+    remainder instead. This is a host operation outside compilation, function
+    transforms and forward AD.
     """
     _cold_boundary("resolve_steps")
     steps, duration = execution_call_horizon(None, None, steps, duration)
@@ -320,46 +319,46 @@ def resolve_steps(target, state=None, *, steps=None, duration=None, dt=None):
 def sample_runtime_draws(
     target, state=None, *, steps=None, duration=None, dt=None, extra=None
 ):
-    """Sample detached runtime draws without advancing a model or its RNG.
+    """Sample detached runtime draws without advancing the incoming boundary.
 
-    Native initialized Populations and Networks sample from their current logical
-    RNG boundary. A Population uses ``dt`` or the same backend default as its
-    native execution methods. A Network uses its initialized timestep; a supplied
-    ``dt`` must match. Pass call-local extracellular ``extra`` bindings again when
-    replaying their Poisson draws. Sampling neither initializes nor lowers the
-    native model. Cold invocation profiling uses disposable copies when needed;
-    the source's parameters and numerical state remain unchanged.
-    Compatible subclasses retain the canonical execution and lifecycle hooks.
+    Parameters
+    ----------
+    target : native model, functional plan, binding, compiled chunk or runner
+        Initialized native model or compatible functional execution target.
+    state : tensor tree or Continuation, optional
+        Required for functional targets and omitted for native targets.
+    steps : int, optional
+        Non-negative tape length. Omit both horizon arguments for a single frame.
+    duration : float, optional
+        Non-negative elapsed time in ms. Produces a tape using the same effective
+        timestep and fractional carry as execution. Mutually exclusive with steps.
+    dt : float, optional
+        Native Population timestep, defaulting to the native backend setting.
+        A supplied Native Network or functional timestep must match its target.
+    extra : stimulation specification or mapping, optional
+        Native call-local extracellular bindings whose Poisson draws are sampled.
+        Supply them again during replay. Omit for functional targets, whose
+        stimulation bindings belong to the lowered plan.
 
-    Functional Population/Network plans, bindings, compiled chunks and
-    ``dn.compile`` runners require explicit ``state`` or a :class:`Continuation`.
-    Stimulation bindings belong to the lowered plan. ``extra`` must be omitted,
-    and a supplied ``dt`` must match the plan, or the effective execution
-    timestep when sampling a duration. Runner snapshot/fresh initialization
-    policies are not used. Duration sampling reads a Population's timestep from its
-    binding, continuation constants, or runner defaults, in that order. An
-    unbound plan or chunk with plain state uses the plan timestep. Network
-    duration sampling uses its fixed plan timestep. No preparation is performed
-    and source parameters/constants, callback carry and caches are unchanged.
+    Returns
+    -------
+    RuntimeDraws
+        One draw/RNG frame, or a time-leading tape for an explicit horizon. Zero
+        accepted steps produces fresh empty leaves without advancing RNG carry.
 
-    Omit ``steps`` and ``duration`` for one frame. Supply a non-negative integer
-    ``steps`` or a non-negative finite ``duration`` in ms for a time-leading
-    tape. They are mutually exclusive. Duration uses the same fractional carry
-    and timestep budgeting as execution, without publishing a new remainder.
-    Replay with the same duration and starting boundary; execution alone updates
-    the carry. A duration accepting no complete steps produces fresh empty
-    leaves without advancing any live or returned stream boundary. Explicit
-    step counts do not spend fractional carry. The returned :class:`RuntimeDraws`
-    uses runtime-only Poisson invocation rows and replays through native ``draws=`` or
-    functional execution. Existing plan sampling methods retain their
-    initialization-reserved packet layouts.
+    Notes
+    -----
+    Source state, global/source RNG, waveform schedules and preparation caches are
+    unchanged. Sampling uses isolated generators in native request order and
+    preserves shared streams. Outputs are detached versioned tensors, including
+    when called under inference mode. Replay with the same boundary, duration and
+    stimulation bindings so execution alone updates fractional time and RNG.
 
-    Each physical stream has one isolated generator; requests are sampled in
-    native phase order. Source/global RNG, pending logical boundaries, input tensors,
-    waveform schedules and live parameter aliases remain unchanged. Outputs are
-    detached ordinary tensors with mutation counters, including when called
-    inside ``torch.inference_mode()``. Sampling is a host operation outside
-    compilation, function transforms and forward AD.
+    Native sampling requires compatible canonical scheduling and a single
+    simulation device. Functional runners require explicit state; their restart
+    policy is not applied. This host operation runs outside compilation, function
+    transforms and forward AD. Initialization uses
+    :func:`sample_initialization_draws` and :class:`InitializationDraws` instead.
     """
     _cold_boundary("sample_runtime_draws")
     steps, duration = execution_call_horizon(None, None, steps, duration)

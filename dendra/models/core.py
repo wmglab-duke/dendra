@@ -1286,21 +1286,36 @@ def _time_grid_from_step_count(
 
 
 class Population(P, Sliceable):
-    """
-    Base class for a population of multicompartment neurons.
+    """Population of neurons with a shared compartment layout.
 
     Parameters
     ----------
     N : int, default 1
         Number of population rows (cells).
     C : int, default 1
-        Number of compartments per row.
-    preserve_mechanism_population_axis : bool or None, default None
-        Experimentally store eligible shared-column distributed mechanisms as
-        ``(N, K)`` instead of one packed ``(N * K,)`` slot axis. Ineligible
-        supports retain their legacy representation. ``None`` resolves the
-        construction-time Dendra context/environment policy, then this model
-        family's default.
+        Compartments per row.
+    integrator : integrator class, optional
+        Numerical integrator. Defaults to ``bwd_euler_sc``.
+    v_init : scalar or Tensor, default -65.0
+        Initial membrane voltage in mV, broadcastable to the voltage shape.
+    preserve_mechanism_population_axis : bool or None, optional
+        Preserve separate population and support axes for eligible distributed
+        mechanisms. ``None`` uses the construction context, then the model
+        family's default. This layout policy is fixed at construction.
+    device : str or torch.device, optional
+        Tensor device. Uses the Dendra context, defaulting to CPU.
+    dtype : torch.dtype or str, optional
+        Floating-point dtype. Uses the Dendra context, defaulting to float32.
+    **kwargs
+        Declared model parameters, including ``cm`` in µF/cm², ``rhoa`` in Ω·cm,
+        and ``celsius`` in °C.
+
+    Notes
+    -----
+    Insert mechanisms and configure geometry before calling :meth:`initialize`.
+    Use :meth:`run` for a single host chunk or :meth:`longrun` for bounded
+    stimulation preparation. Functional execution uses the same model definition
+    through :func:`dendra.compile` or :func:`dendra.func.make_functional`.
     """
 
     # ---------- repr knobs (safe defaults) ----------
@@ -4127,8 +4142,7 @@ class Population(P, Sliceable):
         functional_callbacks=None,
         functional_callback_state=None,
     ):
-        """
-        Run the Population simulation.
+        """Run the Population simulation.
 
         Parameters
         ----------
@@ -4141,10 +4155,10 @@ class Population(P, Sliceable):
             shared input. The number of time steps is inferred from
             ``ve.shape[0]``.
         inputs : dendra.func.Inputs, optional
-            Strict time-first Tensor tapes. With ``tstop``, both tapes must match
-            its accepted complete steps; without it, their common leading length
-            determines the horizon. Existing ``ve=`` remains authoritative when
-            supplied. Explicit voltage cannot duplicate ``ve=`` or ``extra=``;
+            Strict time-first Tensor tapes. With an explicit horizon, tapes must
+            match its accepted complete steps; otherwise their common leading
+            length determines the horizon. The legacy ``ve=``/``tstop`` combination
+            retains the voltage tape's authoritative length. Explicit voltage cannot duplicate ``ve=`` or ``extra=``;
             explicit current cannot replace registered solver-level Slice injections.
         draws : dendra.func.RuntimeDraws, optional
             Explicit time-leading draw and RNG tapes matching the accepted steps.
@@ -4598,8 +4612,7 @@ class Population(P, Sliceable):
         functional_callbacks=None,
         functional_callback_state=None,
     ):
-        r"""
-        Run a long simulation by dividing it into multiple smaller chunks.
+        """Run a long simulation by dividing it into multiple smaller chunks.
 
         This method splits the overall simulation into chunks of a given length,
         allowing for more efficient memory management during long simulations.
@@ -4626,7 +4639,7 @@ class Population(P, Sliceable):
             from the backend will be used.
         inputs : dendra.func.Inputs, optional
             Strict time-first voltage/current tapes matching the accepted steps
-            for ``tstop``. Tapes are indexed at actual chunk boundaries. Omitted
+            for the selected horizon. Tapes are indexed at actual chunk boundaries. Omitted
             current retains Slice injections; explicit current conflicts with
             those injections. Explicit voltage conflicts with ``extra``.
         extra : tuple or sequence of tuples, optional
@@ -5008,20 +5021,33 @@ class Population(P, Sliceable):
                     return observer.finish(observed_state, observed_parts)
 
     def steady_state(self, dt=0.2, tstop=200.0, with_ve=True, with_intra=True):
-        """
-        Run the model until it reaches a steady state and cache the result.
+        """Relax the model for a fixed duration and cache its resulting state.
 
         Parameters
         ----------
-        dt : float, optional
-            Time step size in milliseconds. Default is 0.2 ms.
-        t : float, optional
-            Time in milliseconds to run the simulation. Default is 200 ms.
+        dt : float, default 0.2
+            Positive integration timestep in milliseconds.
+        tstop : float, default 200.0
+            Relaxation duration in milliseconds. Executes ``int(tstop / dt)`` steps.
+        with_ve : bool, default True
+            Supply an explicit zero extracellular-voltage tensor to the solver.
+            If False, pass no explicit extracellular drive.
+        with_intra : bool, default True
+            Supply an explicit zero intracellular-current tensor to the solver.
+            If False, pass no explicit intracellular drive.
+
+        Returns
+        -------
+        Population
+            This population, with its clock reset to zero and its state cached for
+            subsequent :meth:`initialize` calls.
 
         Notes
         -----
-        This method clears any previous steady state cache before creating a new one.
-        The steady state can be restored later by calling model.initialize().
+        This is fixed-duration relaxation under ``torch.no_grad()``, not a
+        convergence test. It clears an earlier steady-state cache and initializes
+        before integrating. The explicit drives above do not evaluate solver-level
+        Slice injections. Mechanism-owned dynamics and injections still run.
         """
 
         dt_f = _validate_time_scalar(dt, name="dt", positive=True)
@@ -5222,14 +5248,16 @@ class Population(P, Sliceable):
     def initialize(
         self, force_rebuild=False, populate_parameter_buffers=True, *, draws=None
     ):
-        """
-        Build, populate, and initialize mechanisms for simulation.
+        """Build, populate, and initialize mechanisms for simulation.
 
         Parameters
         ----------
         force_rebuild : bool, optional
             If True, force rebuilding of mechanisms even if a built graph
             already exists.
+        populate_parameter_buffers : bool, default True
+            Materialize parameter buffers before fresh initialization. Cached
+            restoration follows its own parameter and RNG policy.
         draws : dendra.func.InitializationDraws, optional
             Replay explicit initialization draws on a compatible initialized
             population. Capture a packet with

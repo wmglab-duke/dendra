@@ -1,6 +1,8 @@
 dendra.models.mod
 =================
 
+.. py:module:: dendra.mod
+
 Built-in mechanisms. Distributed ``hh`` and ``pas`` use conductance density in
 S/cm² and return current density in mA/cm². Point-process ``alphasynapse``,
 ``alphasynapse_d``, ``expsyn``, and ``exp2syn`` use conductance in µS and return
@@ -10,6 +12,7 @@ multiply it by ``dendra.units.uS``. See :doc:`../units` for the complete
 contract.
 
 .. autoclass:: dendra.models.mod.alphasynapse
+.. autofunction:: dendra.models.mod.alpha_d
 .. autoclass:: dendra.models.mod.alphasynapse_d
 .. autoclass:: dendra.models.mod.apcount
    :members:
@@ -40,3 +43,13 @@ Graded / continuous synapses
    :exclude-members: __init__, forward
    :show-inheritance:
    :no-inherited-members:
+
+Loading external mechanisms
+---------------------------
+
+.. autofunction:: dendra.load_mechanisms
+
+.. autoclass:: dendra.models.mod.MechanismContainer
+   :members: available
+   :special-members: __getitem__
+   :undoc-members:

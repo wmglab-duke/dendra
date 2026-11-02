@@ -63,29 +63,51 @@ Precomputed
 .. autoclass:: dendra.models.fields.PreComputedInterpolate1D
    :members:
    :exclude-members: forward
-.. autoclass:: dendra.models.fields.precomputed_interpolate_1d
-   :members:
+.. py:class:: dendra.models.fields.precomputed_interpolate_1d
+
+   Alias of :class:`dendra.models.fields.PreComputedInterpolate1D`.
 
 .. autoclass:: dendra.models.fields.PreComputedInterpolate3DRect
    :members:
    :exclude-members: forward
-.. autoclass:: dendra.models.fields.precomputed_interpolate_3d_rect
-   :members:
+.. py:class:: dendra.models.fields.precomputed_interpolate_3d_rect
+
+   Alias of :class:`dendra.models.fields.PreComputedInterpolate3DRect`.
 
 .. autoclass:: dendra.models.fields.PreComputedInterpolate3DScattered
    :members:
    :exclude-members: forward
-.. autoclass:: dendra.models.fields.precomputed_interpolate_3d_scattered
-   :members:
+.. py:class:: dendra.models.fields.precomputed_interpolate_3d_scattered
+
+   Alias of :class:`dendra.models.fields.PreComputedInterpolate3DScattered`.
 
 .. autoclass:: dendra.models.fields.EfieldInterpolate3DRect
    :members:
    :exclude-members: forward
-.. autoclass:: dendra.models.fields.efield_interpolate_3d_rect
-   :members:
+.. py:class:: dendra.models.fields.efield_interpolate_3d_rect
+
+   Alias of :class:`dendra.models.fields.EfieldInterpolate3DRect`.
 
 .. autoclass:: dendra.models.fields.EfieldInterpolate3DScattered
    :members:
    :exclude-members: forward
-.. autoclass:: dendra.models.fields.efield_interpolate_3d_scattered
+.. py:class:: dendra.models.fields.efield_interpolate_3d_scattered
+
+   Alias of :class:`dendra.models.fields.EfieldInterpolate3DScattered`.
+
+Unstructured meshes
+-------------------
+
+.. autoclass:: dendra.models.fields.EfieldInterpolate3DMesh
    :members:
+
+.. py:class:: dendra.models.fields.efield_interpolate_3d_mesh
+
+   Alias of :class:`dendra.models.fields.EfieldInterpolate3DMesh`.
+
+.. autoclass:: dendra.models.fields.PreComputedInterpolate3DMesh
+   :members:
+
+.. py:class:: dendra.models.fields.precomputed_interpolate_3d_mesh
+
+   Alias of :class:`dendra.models.fields.PreComputedInterpolate3DMesh`.

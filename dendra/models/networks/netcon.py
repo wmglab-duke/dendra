@@ -912,6 +912,7 @@ class ContinuousCon(Referency):
         self.delivery_mask.copy_(presence)
 
     def n_connections(self):
+        """Return the number of directed continuous connections as a Python integer."""
         return int(self.n.item())
 
     def state_cache(self):
@@ -997,6 +998,14 @@ class ContinuousCon(Referency):
         return self
 
     def state_dict_for_checkpoint(self):
+        """Return the live delay queue, masks, and clock tensors for exact continuation.
+
+        Returns
+        -------
+        dict
+            Runtime tensors retained by reference. Use :meth:`state_cache` for a
+            detached initialization cache instead.
+        """
         return {
             "delivery_buffer": self.delivery_buffer,
             "delivery_mask": self.delivery_mask,
@@ -1005,6 +1014,13 @@ class ContinuousCon(Referency):
         }
 
     def restore_dict_from_checkpoint(self, state_dict):
+        """Validate and restore an exact runtime checkpoint in place.
+
+        Parameters
+        ----------
+        state_dict : dict
+            Runtime queue and clock tensors compatible with this connection's layout.
+        """
         if not isinstance(state_dict, dict):
             raise TypeError("ContinuousCon checkpoint state must be a dict.")
         delivery = _require_checkpoint_tensor(

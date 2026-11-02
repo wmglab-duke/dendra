@@ -662,31 +662,27 @@ class Recorder(Callback):
             self.save_every = _recorder_stride(self.save_dt, self.dt)
 
     def set_hdf5(self, hdf5: str, cache_every: int = 10000) -> "Recorder":
-        """
-        Enables caching of recorded data to an HDF5 file.
-
-        This method configures the recorder to periodically save recorded data to an HDF5 file
-        instead of keeping everything in memory. This is particularly useful for large-scale
-        simulations where memory usage would otherwise become prohibitive.
+        """Write recorded samples to HDF5 with bounded host buffering.
 
         Parameters
         ----------
         hdf5 : str
-            File path where the HDF5 data will be stored.
-        cache_every : int, optional
-            Number of simulation steps between cache operations. Controls how
-            frequently data is written to the HDF5 file. Default is 10000 steps.
+            Destination file path.
+        cache_every : int, default 10000
+            Positive number of solver iterations between flushes. A fresh recording
+            session also counts its initial boundary. Recorder ``dt`` selects which
+            samples are retained independently of this flush interval.
 
         Returns
         -------
         Recorder
-            Returns the recorder instance for method chaining.
+            This recorder for method chaining.
 
         Notes
         -----
-        This method starts a separate process for writing data to the HDF5 file to avoid
-        blocking the main simulation. The process will continue running until the recorder's
-        close() method is called.
+        Call :meth:`close` to finish writing before reading the file with
+        :class:`dendra.data.H5Reader`. HDF5 storage detaches samples from autograd;
+        use in-memory results when the recorded values must retain gradients.
         """
         if isinstance(cache_every, bool) or not isinstance(cache_every, Integral):
             raise TypeError("cache_every must be a positive integer.")
@@ -979,25 +975,27 @@ class Recorder(Callback):
                     self._native_hdf5_active = False
 
     def stack(self, var: str = None) -> torch.Tensor:
-        """
-        Stack recorded tensors into a single tensor.
-
-        This method combines the recorded state tensors into a single tensor. If a specific
-        state name is provided, only that state's data is stacked. Otherwise, all recorded
-        states are stacked and concatenated.
+        """Stack retained in-memory samples.
 
         Parameters
         ----------
         var : str, optional
-            Name of the specific state to stack. If None, all states
-            are stacked on an axis immediately before the final recorded-node
-            or partition axis. Default is None.
+            Recorded field name, such as ``"v"`` or ``"mech.hh.m"``. When omitted,
+            stack all fields on an axis immediately before the final recorded-site
+            or partition axis; the fields must have compatible shapes.
 
         Returns
         -------
         torch.Tensor
-            A tensor containing the stacked recorded data. If max_only is True,
-            returns the maximum value along the time dimension.
+            With ``var`` supplied, samples retain their leading time axis, including
+            when ``max_only=True``. With ``var=None``, the legacy ``max_only=True``
+            form additionally takes the maximum over time; otherwise time is retained.
+
+        Notes
+        -----
+        ``max_only`` already reduces the selected spatial sites or partitions when
+        samples are recorded. :meth:`numpy` uses the same stacking convention and
+        then detaches and moves the result to CPU.
         """
         if var is not None:
             return torch.stack(self.rec[var])
@@ -1432,8 +1430,7 @@ class LFP(Callback):
 
 
 class ThresholdCallback(Callback):
-    """
-    Base class for callbacks that detect threshold crossings in membrane potential.
+    """Base class for callbacks that detect threshold crossings in membrane potential.
 
     This class provides common functionality for action potential detection by
     monitoring when membrane potential crosses a specified threshold at selected nodes.
@@ -1452,6 +1449,10 @@ class ThresholdCallback(Callback):
     t_start_check : float, optional
         Time in ms after which to start checking for threshold crossings.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to check for threshold crossings. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
@@ -1473,7 +1474,6 @@ class ThresholdCallback(Callback):
         Indices of nodes being monitored.
     i : int
         Time step counter.
-
     """
 
     def __setattr__(self, name, value):
@@ -1654,8 +1654,7 @@ def _bind_callback_dt(callback, value):
 
 
 class APCount(ThresholdCallback):
-    """
-    Callback for counting action potentials during axon model simulation.
+    """Callback for counting action potentials during axon model simulation.
 
     This class detects and counts the number of times membrane potential crosses above
     a specified voltage threshold at selected nodes. Each crossing is counted as an
@@ -1668,6 +1667,10 @@ class APCount(ThresholdCallback):
     t_start_check : float, optional
         Time in ms after which to start checking for APs.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to monitor for AP detection. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
@@ -1751,8 +1754,7 @@ class APCount(ThresholdCallback):
 
 
 class ActiveAL(APCount):
-    """
-    Detect activity in at least a specified number of checked slots.
+    """Detect activity in at least a specified number of checked slots.
 
     A checked slot qualifies after any upward voltage-threshold crossing.
     Repeated crossings at one slot contribute only once to this criterion;
@@ -1765,6 +1767,10 @@ class ActiveAL(APCount):
     t_start_check : float, optional
         Time in ms after which to start checking for threshold crossings.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to monitor for spike detection. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
@@ -1861,8 +1867,7 @@ class ActiveAL(APCount):
 
 
 class ActiveALCount(APCount):
-    """
-    Callback for determining whether an axon fired based on the total spike count.
+    """Callback for determining whether an axon fired based on the total spike count.
 
     This class extends APCount to determine if an axon is "active" based on whether
     the total number of threshold crossings across all monitored nodes meets or
@@ -1877,6 +1882,10 @@ class ActiveALCount(APCount):
     t_start_check : float, optional
         Time in ms after which to start checking for threshold crossings.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to monitor for spike detection. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
@@ -1934,8 +1943,7 @@ class ActiveALCount(APCount):
 
 
 class Active(ActiveAL):
-    """
-    Callback for detecting if axons fire at any point during simulation.
+    """Callback for detecting if axons fire at any point during simulation.
 
     This class detects if the membrane potential crosses above a specified
     voltage threshold at selected nodes at any point during the simulation.
@@ -1949,6 +1957,10 @@ class Active(ActiveAL):
     t_start_check : float, optional
         Time in ms after which to start checking for threshold crossings.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to monitor for spike detection. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).

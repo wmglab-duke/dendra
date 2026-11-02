@@ -69,83 +69,31 @@ def _initialization_writes_parameters(functional):
 
 
 class CompiledRunner:
-    """Reusable scan or inference-only while execution with horizon defaults.
+    """Compiled Population execution with explicit inputs and continuations.
 
-    Construct with ``steps`` or ``duration``. A call uses that default unless
-    ``steps=`` or ``duration=`` selects another horizon. Durations are elapsed
-    simulation time in ms; fractional-step remainder travels in explicit state.
-    The two horizon options are mutually exclusive at each boundary.
+    Construct with :func:`compile`, usually exposed as ``dn.compile``. Calling the
+    runner returns ``(state, auxiliary)`` and does not advance its native source.
+    Omitting state restarts the configured snapshot/fresh initialization policy;
+    passing ``auxiliary["continuation"]`` continues effective parameters,
+    constants, simulation state and callback carry together.
 
-    Construct with :func:`dendra.func.compile`. A call returns ``(state, aux)``
-    and never commits state or parameters to the source Population. With no
-    state argument, the default ``initialization='snapshot'`` restarts from
-    :attr:`initial_state`. Opt in to ``initialization='fresh'`` to recompute
-    differentiable initial state from current parameters and
-    :attr:`initialization_inputs` instead. A bound Population-owned steady-state
-    cache is restored through ``initialization_inputs.cache``; its saved
-    materializations are detached. Explicit state always continues
-    without reinitializing. Parameters
-    are independent copies; select differentiable leaves with ``trainable``
-    and ``inference=False``, or pass an explicit parameter mapping per call.
-    Selectors accept exact or unique partial names, glob patterns, and ``re:``
-    or compiled regular expressions. :attr:`named_parameters` lists the
-    runner-owned defaults; :attr:`trainable_parameters` shows their current
-    ``requires_grad`` leaves. Per-call overrides are not retained for inspection.
-    ``inference=True`` suppresses execution gradients regardless of selection.
+    ``steps=`` or ``duration=`` overrides a call's default horizon without changing
+    ``chunk_steps``. ``inputs=Inputs(...)`` supplies deterministic tapes and
+    ``draws=RuntimeDraws(...)`` replays stochastic tapes. Named callbacks return
+    results under ``auxiliary["callbacks"]``. Per-call source overrides retain
+    their Tensor identities and gradients but do not replace runner defaults.
 
-    ``callbacks`` is a named mapping of functional callback configurations.
-    Recording is explicit: use ``callbacks={'trace': dn.func.Recorder(('v',))}``
-    to retain voltage at ``aux['callbacks']['trace']['v']``. Omitting callbacks
-    or passing an empty mapping records no trajectory. Callback names have no
-    special meaning. Scan and while accept capture-compatible pure callbacks;
-    while is inference-only. Omitted callbacks or
-    an empty mapping produce no recording or callback continuation carry.
+    Set ``inference=False`` for training. Scan supports first-order gradients;
+    while is inference-only. ``checkpoint_every`` trades recomputation for saved
+    activations while retaining full-run gradients and requested recordings.
+    Independent training forwards own their preparation graphs; safe snapshot
+    inference may reuse preparation.
 
-    Compilation is lazy. Snapshot inference reuses preparation with version
-    checks; fresh initialization, training, and explicit parameter overrides
-    receive fresh preparation. No
-    output, live binding, or training preparation is retained between calls.
-    For training scan, ``checkpoint_every=H`` recomputes compiled spans of at
-    most H steps during backward to reduce saved activation storage. This
-    preserves full-horizon gradients and callback history; requested recordings
-    remain retained. Callbacks must be pure, deterministic, and replay-safe.
-    This is a host-side convenience object, not a torch.compile/torch.func
-    transform target; those uses retain the lower-level functional API.
-
-    ``chunk_steps`` selects a compiled width from the default horizon's nominal
-    step count. Duration defaults plan at least one step for scan or four for
-    Population while execution. The default width is that nominal horizon, or
-    at most 64 steps for runtime ``extra`` slots. Per-call horizons reuse this
-    width and cached shorter tails. Ordinary calls group execution by that
-    width; training checkpoints retain their separate ``checkpoint_every`` boundaries. Compiled
-    scan/while kernels execute within each span, with cached shorter tails.
-    Neither span has to divide the other. Recording retains the full requested
-    trajectory, regardless of kernel width.
-
-    ``extra`` binds one ``(field, Waveform)`` pair or a sequence of contacts.
-    Field and waveform leaves become independent ``stimulation.extra.*``
-    parameters, selectable with ``trainable`` like model parameters. Bound
-    waveforms follow the accepted simulation clock across continuation and
-    checkpoint replay. Explicit ``Inputs.ve`` cannot be combined with
-    bound ``extra``; use it instead for already assembled time-first voltages.
-
-    ``extra=VarInput()`` declares a required call-local stimulation input.
-    Supply ``extra=(field, waveform)`` or a contact sequence to each invocation;
-    deterministic waveform recipes and contact counts may differ between calls.
-    Explicit ``extra=None`` supplies zero drive. ``chunk_steps`` also bounds the
-    assembled voltage block independently of the complete ``steps`` horizon.
-    Runtime-extra checkpoint spans are bounded
-    by both ``checkpoint_every`` and ``chunk_steps``. Runtime waveforms are not
-    retained by the runner or included in its default parameter mappings.
-    Runtime randomized Poisson stimulation is currently unsupported.
-
-    Fresh calls accept an ``initialization=InitializationInput(...)`` override;
-    it cannot be combined with explicit state. Fresh-policy outputs include
-    ``aux['parameters']`` and ``aux['constants']``, the effective mappings after
-    initialization. Continue parameter-writing initialization with the returned
-    parameters; cached initialization also requires the returned constants.
-    Neither mapping nor its autograd graph is retained by the
-    runner. Initialization-only inputs remain separate from runtime parameters.
+    ``extra=VarInput()`` requires call-local ``extra=`` on every invocation;
+    ``extra=None`` selects zero drive. Waveform types and contact counts may vary.
+    These slots accept deterministic waveforms. Bind randomized Poisson waveforms
+    when compiling. See :func:`compile` for construction options and
+    :meth:`__call__` for invocation arguments.
     """
 
     def __init__(
@@ -322,6 +270,7 @@ class CompiledRunner:
 
     @property
     def functional(self):
+        """The lowered execution plan owned by this runner."""
         return self._functional
 
     @property
@@ -361,6 +310,7 @@ class CompiledRunner:
 
     @property
     def kernel(self):
+        """The fixed-width compiled kernel used by this runner."""
         return self._kernel
 
     def execution_report(self):
@@ -511,6 +461,37 @@ class CompiledRunner:
         extra=_MISSING_RUNTIME_EXTRA,
         draws=None,
     ):
+        """Run from a restart snapshot, explicit state or Continuation.
+
+        Parameters
+        ----------
+        state : tensor tree or Continuation, optional
+            Omission/None restarts the configured initialization policy. A Continuation
+            also supplies effective parameters/constants and callback carry.
+        steps, duration : int or float, optional
+            Override the default horizon with an exact count or elapsed time in ms.
+            They are mutually exclusive; per-call values may be zero.
+        parameters, constants : mapping, optional
+            Call-local source overrides. They cannot accompany a Continuation.
+        inputs : Inputs or mapping, optional
+            Deterministic time-leading tapes. Networks use Population-name mappings.
+        draws : RuntimeDraws, optional
+            Explicit stochastic tape; omission retains automatic sampling.
+        callback_state : FunctionalCallbackState, optional
+            Carry for an explicit-state call. A Continuation includes this already.
+        initialization : InitializationInput or NetworkInitializationInput, optional
+            Fresh-policy initialization override; incompatible with explicit state.
+        extra : stimulation specification or mapping, optional
+            Required when runtime ``VarInput`` slots were declared. None is zero drive.
+
+        Returns
+        -------
+        state : tensor tree
+            Final explicit simulation state.
+        auxiliary : dict
+            Contains ``continuation`` and, when configured, callback results. Fresh
+            initialization also publishes effective ``parameters`` and ``constants``.
+        """
         return _execute_population_runner(
             self,
             state,
@@ -807,78 +788,74 @@ def compile(
     options=None,
     **compile_options,
 ):
-    """Create a reusable Population or Network runner (scan by default).
+    """Create a compiled runner for an initialized Population or Network.
 
-    Supply ``steps`` or ``duration`` for the default horizon. Calls may override
-    it with ``steps=`` or ``duration=`` without changing the compiled width.
-    Durations are elapsed time in ms and retain fractional-step remainder in
-    the returned continuation. The two options are mutually exclusive at each
-    boundary; per-call step counts and durations may be zero.
+    Parameters
+    ----------
+    population : Population or Network
+        Initialized source model. A Network's timestep and training mode must
+        match its initialized configuration.
+    dt : float
+        Positive solver timestep in ms. For a Network it must match initialization.
+    steps : int, optional
+        Positive default timestep count. Supply either ``steps`` or ``duration``.
+    duration : float, optional
+        Non-negative default elapsed time in ms. Fractional time is retained in
+        the returned continuation until a complete timestep can be accepted.
+    extra : stimulation specification, mapping, or VarInput, optional
+        Extracellular ``(field, waveform)`` pair or contact sequence. Networks use
+        a Population-name mapping. ``VarInput()`` declares call-local deterministic
+        stimulation; each call then supplies ``extra=``. Explicit ``Inputs.ve``
+        cannot drive a Population that also has bound extracellular stimulation.
+    chunk_steps : int, optional
+        Compiled kernel width. Calls may use other horizons and shorter tails.
+        The default is the nominal default horizon, capped at 64 for runtime-extra
+        slots. This width does not limit recording history.
+    execution : {"scan", "while"}, default "scan"
+        Scan supports first-order training. While is inference-only; Population
+        while runners require a compiled width of at least four steps.
+    callbacks : mapping, optional
+        Named built-in or pure custom callback configurations. For example,
+        ``{"trace": dn.Recorder(("v", "t"))}`` records a Population trajectory.
+    inference : bool, default True
+        Suppress execution gradients. Set False for training and select sources
+        with ``trainable``.
+    initialization : {"snapshot", "fresh"}, default "snapshot"
+        No-state calls restart the captured snapshot or run fresh initialization.
+        Explicit state or a Continuation always continues without initialization.
+    checkpoint_every : int, optional
+        Training-scan activation-checkpoint span. Backward recomputes these spans;
+        gradients still cover the whole run. This is independent of kernel width.
+    trainable : selector or iterable of selectors, optional
+        Exact/unique partial names, full-name globs, or ``re:``/compiled regular
+        expressions selecting independent runner-owned parameter leaves.
+    pending_capacity : int or mapping, optional
+        Network pending-event calendar capacities. A full calendar raises before
+        publishing a result. Lower again with more capacity from the pre-call native
+        boundary; calendar tensor shapes belong to that plan.
+    backend : str or callable, default "inductor"
+        Backend passed to ``torch.compile``.
+    options : dict, optional
+        Backend options. Explicit choices override Dendra's inference defaults.
+    **compile_options
+        Additional ``torch.compile`` options, such as ``fullgraph`` or ``disable``.
 
-    Initialized canonical Networks return :class:`CompiledNetworkRunner` with
-    their existing timestep/mode. Their inputs map Population names to
-    :class:`~dendra.func.Inputs`; :class:`~dendra.func.RuntimeDraws` supplies explicit stochastic tapes
-    through ``draws=``. :class:`NetworkRolloutInput` remains supported.
-    Recordings use qualified names such as ``cell.v``, and parameters retain
-    shared tensor identities. See
-    :class:`CompiledNetworkRunner` for its restart and continuation contract.
-    Population and Network inference support ``execution='while'`` with pure
-    callbacks, including custom ``FunctionalCallback`` implementations and
-    Network ``PopulationCallback`` scopes, or without callbacks. Use scan for
-    gradients. Population while inference requires a compiled chunk width of
-    at least four steps. Omitted
-    callbacks and empty mappings return no recording or callback carry.
-    ``pending_capacity`` configures Network pending-event calendars with one
-    positive entry count or a mapping from connection names to counts. Overflow
-    raises before a result is returned; increase capacity and retry from a valid
-    checkpoint. Population runners do not accept this option.
+    Returns
+    -------
+    CompiledRunner or CompiledNetworkRunner
+        Callable returning ``(state, auxiliary)``. Continue with
+        ``dn.func.run(program, auxiliary["continuation"])``. Callback results are
+        available at ``auxiliary["callbacks"]``.
 
-    Recording and reductions are configured only through named ``callbacks``.
-    For example, ``callbacks={'trace': dn.func.Recorder(('v',))}`` records
-    voltage at ``aux['callbacks']['trace']['v']`` after ``state, aux = runner()``.
-    Omit callbacks to return the final state without a trajectory. Select
-    compartments with ``dn.func.Recorder(..., node_indices=[...])``, not a
-    runner argument. CPU inference with ordinary Inductor defaults to
-    ``options={'cpp_wrapper': True}``; explicit compiler choices win. Use
-    ``inference=False, trainable=(...)`` for scan gradients. Supply
-    exact/unique partial names, glob patterns, or ``re:``/compiled regex selectors
-    to ``trainable``; inspect ``runner.trainable_parameters`` for the live named
-    defaults selected for gradients. Inference execution still suppresses gradients.
-    Add ``checkpoint_every=H`` to trade backward recomputation of H-step compiled
-    scans for lower activation memory, without truncating gradients. This is
-    valid only for training scan; requested recording storage remains.
-    By default, calls without state restart the captured initialized snapshot.
-    Population and Network runners accept ``initialization='fresh'`` to initialize
-    from current parameters on each such call; explicit state still continues
-    without reinitialization. Bound steady-state caches restore their explicit
-    saved state and detached materializations on fresh calls. Edit
-    ``runner.initialization_inputs`` or pass an ``InitializationInput`` (Population)
-    or ``NetworkInitializationInput`` (Network) as the
-    call's ``initialization=`` override. Fresh-policy results expose effective
-    mappings at ``aux['parameters']`` and ``aux['constants']``. Parameter-writing
-    initialization requires the returned parameters for continuation; cached
-    initialization also requires the returned constants. Resume with
-    ``runner(aux['continuation'])`` to carry effective parameters, constants,
-    state and callback carry together.
-    For Populations, ``extra=(field, waveform)`` or a sequence of such pairs
-    binds extracellular stimulation. For Networks, ``extra`` maps Population
-    names to those same bindings. Select independent fields and waveform leaves
-    through ``trainable``; inspect ``runner.parameters`` for canonical names.
-    ``extra=VarInput()`` declares call-local deterministic stimulation instead
-    of binding a concrete recipe. Calls require an ``extra=`` specification;
-    use ``None`` for zero drive. Waveform types and contact counts may differ
-    between calls. ``chunk_steps`` selects a compiled width from the default
-    horizon's nominal step count for either runner. Its default is that horizon
-    for ordinary runners,
-    or at most 64 steps with runtime-extra slots, where it also bounds
-    stimulation assembly. Ordinary activation-checkpoint spans remain
-    independent of the kernel width; runtime-extra spans retain the additional
-    assembly bound. Short tails are cached without a divisibility requirement.
-    Networks also accept ``extra={name: VarInput(), ...}`` to declare selected
-    Population inputs alongside other bound stimulation. Runtime overrides map
-    only those declared names to specs; omitted names receive zero drive.
-    See :class:`CompiledRunner` and :class:`CompiledNetworkRunner` for all
-    constructor options.
+    Notes
+    -----
+    Compilation is lazy. Execution leaves the native model unchanged and preserves
+    shared parameter aliases. Use :func:`inspect_sources` to inspect effective
+    sources, :func:`resolve_steps` to size deterministic inputs, and
+    :func:`initialize` for an explicit fresh trial. Call-local ``VarInput`` slots
+    accept deterministic waveforms; randomized Poisson waveforms must be bound
+    when compiling. Host runners run outside ``torch.compile`` and ``torch.func``;
+    use :func:`make_functional` for explicit tensor transforms.
     """
     from dendra.models.networks.net import Network
 

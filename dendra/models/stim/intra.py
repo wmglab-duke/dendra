@@ -154,13 +154,16 @@ def _expand_stimulus_to_selection(stim, selection_shape, batch_shape=()):
 
 class Intra(torch.nn.Module):
     def __init__(self, model, stims):
-        """
-        Initialize intracellular stimulation handler.
+        """Build an intracellular-current handler from registered waveform injections.
 
         Parameters
         ----------
-        model : Axon
-            The axon model to which this stimulation will be applied.
+        model : Population
+            Receiver whose voltage shape, device, and dtype define the current layout.
+        stims : sequence of tuple
+            Registered ``(waveform, label, indices)`` triples supplying current in mA.
+            Overlapping injections add. Most users configure these through
+            :meth:`dendra.models.slice.Slice.inject`.
         """
         super(Intra, self).__init__()
         self.shape = model.v.shape

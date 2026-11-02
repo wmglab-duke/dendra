@@ -318,6 +318,6 @@ See also
 --------
 
 * :doc:`mechanisms`
-* :doc:`advanced/A0_mechanisms_and_ions_materials`
+* :doc:`advanced/mechanisms_and_materials`
 * :doc:`api/dendra.models.mechanisms`
 * :ref:`native-morphologies`

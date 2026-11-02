@@ -16,39 +16,35 @@ from ._continuation_checkpoints import (
 
 
 def detach_continuation(functional, continuation, *, callbacks=None):
-    """Truncate recurrent history for a lowered plan or ``dn.compile`` runner.
+    """Cut recurrent autograd history while retaining live source ownership.
 
-    ``functional`` accepts the same Population/Network plans and compiled
-    runners as :func:`export_continuation`. Lowered plans require their bound
-    callback collection when the packet carries callback state. Runners use
-    their constructor-configured callbacks and require ``callbacks`` omitted.
+    Parameters
+    ----------
+    functional : FunctionalPopulation, FunctionalNetwork or compiled runner
+        Plan/runner defining simulation and callback roles.
+    continuation : Continuation
+        Packet whose simulation state and recurrent callback carry are detached.
+    callbacks : FunctionalCallbacks, optional
+        Explicit plan's prepared collection when callback carry is present.
+        Runners select their configured callbacks and require this omitted.
 
-    Returns a new :class:`Continuation` with detached simulation state and
-    recurrent callback carry. Parameter and constant Tensor objects, aliases,
-    trainability and upstream graphs remain untouched. Callback plan identity,
-    emission metadata, cumulative values, cadence, clocks, RNG and lifecycle
-    are retained. Initialization, sampling, execution and storage are not run.
-    Unstarted packets remain unstarted and do not initialize callbacks.
+    Returns
+    -------
+    Continuation
+        Detached recurrent state with unchanged parameters/constants, aliases,
+        trainability, RNG, clocks, accumulated reductions and recording phase.
 
-    Built-in LFP carry holds observation inputs rather than recurrent history.
-    Its field stack is rematerialized from the bound current field sources,
-    retaining fresh suffix gradients when called with gradients enabled.
-    All custom callback carry is recurrent and is detached. Refresh follows
-    the caller's gradient mode, including ``no_grad`` and ``inference_mode``.
+    Notes
+    -----
+    Detachment shares storage like ``Tensor.detach``; it is not an owned snapshot.
+    Use :func:`export_continuation` for portable owned storage. Source graphs and
+    previous outputs remain caller-owned. Rebuild externally computed nonleaf
+    source/field expressions when their upstream graph has been consumed.
 
-    Detachment shares storage like :meth:`torch.Tensor.detach`; it is not a
-    snapshot. Tensor identity aliases across state and callback carry are
-    retained, and distinct views retain their storage and strides. A Tensor
-    shared between raw sources and recurrent data is detached only in its
-    recurrent role. Aliases to an LFP invariant use its refreshed field stack;
-    conflicting field sources for one aliased stack are rejected.
-
-    This operation cuts recurrent history, not every graph in the packet.
-    Externally computed nonleaf sources and callback field expressions remain
-    caller-owned and must be rebuilt when their upstream graph is consumed.
-    Previous outputs are also caller-owned. Use portable export/restore for
-    detached owned checkpoint storage. Construction runs outside compilation,
-    function transforms and forward AD.
+    Built-in LFP observation fields are refreshed under the caller's gradient
+    mode, preserving fresh suffix gradients. Other custom callback carry is
+    recurrent. This operation does not initialize callbacks, sample, execute or
+    write storage. Call outside compilation, function transforms and forward AD.
     """
     _cold_boundary("detach_continuation")
     if not isinstance(continuation, Continuation):

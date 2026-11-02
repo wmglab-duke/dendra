@@ -6,7 +6,6 @@ Interpolation
 
 .. autoclass:: dendra.utils.PreparedInterp1d
    :members:
-   :special-members: __init__
 .. autoclass:: dendra.utils.PreparedInterp1dUniform
    :members:
 .. autoclass:: dendra.utils.PreparedInterp3dRect
@@ -37,3 +36,9 @@ sections in traversal order and return ``None`` when no qualifying path exists.
 
 .. autofunction:: dendra.utils.neuron.path_sections
 .. autofunction:: dendra.utils.neuron.path_via
+
+Finite-element interpolation
+----------------------------
+
+.. autoclass:: dendra.utils.PreparedInterp3dFEM
+   :members:

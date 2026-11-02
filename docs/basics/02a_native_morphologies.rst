@@ -1220,7 +1220,7 @@ Dendra checks these geometry and solver-workspace invariants at public
 execution boundaries. The default policy is appropriate for normal
 simulations. Advanced validation modes, trusted-loop performance tuning,
 aliasing and callback caveats, and owner reinitialization rules are documented
-in :doc:`../advanced/A5_runtime_contracts`.
+in :doc:`../advanced/diagnostics`.
 
 The canonical compartment graph
 --------------------------------

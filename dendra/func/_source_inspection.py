@@ -71,26 +71,27 @@ class SourceReport:
     def select(
         self, queries: ParameterQuery | Iterable[ParameterQuery]
     ) -> SourceReport:
-        """Return a source view selected by full-path parameter-query syntax.
+        """Filter paths while retaining complete identity-alias groups.
 
-        Accept an exact path, unique partial name, glob, ``glob:`` expression,
-        ``re:`` expression, compiled string regex or iterable of selectors.
-        Each selector must match; ambiguous partial names raise. An empty
-        iterable returns an empty report. Matching uses the current report's
-        ``parameters.``/``constants.`` paths, in their original order.
+        Parameters
+        ----------
+        queries : selector or iterable of selectors
+            Exact/unique partial path, glob (optionally ``glob:``), or ``re:``/compiled
+            regex. Paths include their ``parameters.``/``constants.`` prefix. Each
+            selector must match; an empty iterable returns an empty report.
 
-        Selecting any path retains every entry for that Tensor identity,
-        including aliases in the other domain. Entries and captured flags are
-        reused. The returned ``trainable_leaves`` filters this report's captured
-        leaf view, once per identity and in its original order. Selection never
-        reads current Tensor flags, clones sources or traverses their graphs.
-        Reinspect after changing source bindings or gradient flags.
+        Returns
+        -------
+        SourceReport
+            Entries in original report order, including every alias of any selected
+            Tensor. Captured flags and deduplicated optimizer-leaf membership are reused.
 
-        These leaf tuples can define optimizer groups or separate optimizers.
-        Deduplication applies within each selection; overlapping selections can
-        contain the same Tensor. Parameter groups in one PyTorch optimizer must
-        be disjoint by Tensor identity. Selection is a host inspection operation
-        outside ``torch.compile`` and does not alter trainability.
+        Notes
+        -----
+        Selection does not change trainability or reread Tensor flags. Reinspect after
+        changing sources. Optimizer groups built from separate selections must be
+        disjoint by Tensor identity; overlapping selections can contain the same leaf.
+        Call outside ``torch.compile``.
         """
         if torch.compiler.is_compiling():
             raise FunctionalizationError(
@@ -260,39 +261,33 @@ def _source_frames(subject):
 
 
 def inspect_sources(subject) -> SourceReport:
-    """Inspect native sources or explicit runner, binding and packet frames.
+    """Inspect live parameter/constant sources and their identity aliases.
 
-    Native Populations and Networks expose their registered raw parameters and
-    known configuration sources using native registration paths. Owned waveform
-    injections also expose their source routes. Aliases retain every path while
-    optimizer leaves are deduplicated by Tensor identity. Runtime state, sampled
-    histories and derived workspaces are excluded from native constant sources.
-    Inspection does not build the model: pending unregistered declarations are
-    visible only after the normal native build lifecycle registers them.
+    Parameters
+    ----------
+    subject : native model, compiled runner, raw binding, tensor bundle or Continuation
+        Populations and Networks expose registered raw parameters and known
+        configuration sources, including owned waveform sources. Runner inspection
+        reads defaults; inspect a returned Continuation for one call's effective
+        overrides. Raw bindings and tensor bundles expose their stored frames.
+        Prepared-only Population bindings are currently unsupported.
 
-    Both Population and Network runners returned by ``dn.compile`` are
-    accepted. To inspect overrides or fresh/cache replacements from a particular
-    call, pass ``auxiliary['continuation']`` instead of the runner. Existing
-    runner parameter selectors continue to describe their defaults only.
+    Returns
+    -------
+    SourceReport
+        Captured metadata with live Tensor references. Paths begin with
+        ``parameters.`` or ``constants.``; all identity aliases are retained and
+        ``trainable_leaves`` deduplicates gradient-requiring leaves for optimizers.
 
-    ``PopulationTensors`` and ``NetworkTensors`` expose their stored parameter
-    and constant frames exactly. Raw ``BoundPopulation``/``BoundNetwork``
-    bindings expose their owned sources, with Network shared readers resolved
-    against canonical parameter objects. This does not mutate authored binding
-    maps. Binding types must be exact; prepared Population bindings do not own
-    raw constants and are currently unsupported.
-
-    Paths start with ``parameters.`` or ``constants.``. Mapping order and named
-    tuple fields are preserved, including all Tensor identity aliases. The
-    shared parameter-path walker rejects ambiguous dotted paths or unsupported
-    source containers. This is metadata inspection, not execution validation.
-
-    Inspection performs no Tensor arithmetic, cloning, graph traversal,
-    model lowering, initialization, preparation, RNG sampling or source lifecycle
-    validation. Native source discovery reads registered slots and declaration
-    metadata without invoking model getters or numerical hooks.
-    It is a host operation outside ``torch.compile``. Reports retain Tensor
-    references, so discard them when their source graphs are no longer needed.
+    Notes
+    -----
+    Inspection performs no Tensor arithmetic, cloning, graph traversal, lowering,
+    preparation or sampling. Native declarations become visible after the normal
+    build lifecycle registers them. Runtime state, sampled histories, derived
+    workspaces, callback carry and call-local input packets are not inventoried.
+    Inspection does not validate execution or prove that a source affects output.
+    Reinspect after changing bindings/gradient flags. Reports retain source graph
+    references until discarded. Call outside ``torch.compile``.
     """
     if torch.compiler.is_compiling():
         raise FunctionalizationError(

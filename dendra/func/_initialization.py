@@ -203,66 +203,48 @@ def initialize(
     constants=_UNSET,
     draws=None,
 ):
-    """Initialize a runner or lowered model and return a Continuation.
+    """Create a fresh functional execution boundary.
 
-    ``initialize(program)`` uses either compiled runner's raw defaults and
-    initial clock/RNG snapshot. Optional ``parameters=`` and ``constants=``
-    mappings override those sources; ``None`` retains the corresponding
-    defaults. ``initialization=`` overrides its initialization-input packet.
-    This explicit operation always runs fresh initialization, including bound
-    caches and their RNG policies. The runner's snapshot/fresh policy continues
-    to control ordinary no-state calls. Runner defaults, prepared caches and
-    execution reports remain unchanged.
+    Parameters
+    ----------
+    functional : compiled runner, FunctionalPopulation or FunctionalNetwork
+        Receiving runner or lowered plan. Initialization does not advance its
+        native source or update runner defaults.
+    tensors : PopulationTensors, NetworkTensors or Continuation, optional
+        Explicit source/state boundary. Plans require a matching tensor bundle or
+        Continuation. A runner uses its captured defaults when omitted; a supplied
+        Continuation supplies effective sources and current RNG carry instead.
+    initialization : InitializationInput or NetworkInitializationInput, optional
+        Initialization recipe override. Runners and Network plans retain defaults;
+        a Population bundle supplies ``tensors.initialization``. A Population plan
+        with a Continuation requires this argument explicitly.
+    parameters, constants : mapping, optional
+        Runner-only source overrides. Non-None overrides cannot accompany a
+        Continuation, whose sources are already explicit.
+    draws : InitializationDraws, optional
+        Replay complete initialization draws. Omission samples missing draws from
+        explicit RNG carry. Cannot be combined with component draw fields retained
+        in an initialization recipe.
 
-    ``initialize(program, continuation)`` starts fresh from the packet's
-    effective parameters/constants and current RNG carry instead of runner
-    defaults. The runner supplies its initialization recipe unless overridden
-    with ``initialization=``. Non-None ``parameters=`` or ``constants=`` cannot
-    accompany a continuation. Existing samples, reseeding and cache restoration
-    follow the selected recipe and native initialization policies. Transforms
-    run on the supplied effective sources; an earlier raw baseline is not
-    reconstructed. Callback carry is discarded for the fresh trial.
+    Returns
+    -------
+    Continuation
+        Fresh simulation state and effective parameter/constant mappings, with no
+        callback carry. The first run starts fresh recordings and reductions.
 
-    For a lowered model, ``tensors`` is the matching ``PopulationTensors`` or
-    ``NetworkTensors`` bundle returned by ``make_functional``. Its explicit
-    state, parameters and constants
-    supply the starting clock/RNG carry and raw sources; no native extraction is
-    performed. A ``Continuation`` also supplies these three frames. With a
-    Population plan and continuation, ``initialization=`` is required because
-    neither stores the initialization recipe. A Network plan supplies its
-    ``initialization_inputs`` by default. The result retains effective
-    initialization replacements, aliases and gradient history without copying
-    or detaching Tensor leaves.
+    Notes
+    -----
+    Native initialization ordering, retained samples, reseeding and bound
+    steady-state cache policies apply. Parameter-writing transforms operate on the
+    supplied effective sources; initialization does not recover an earlier raw
+    baseline. Tensor aliases and gradient history are retained without detaching
+    sources. Use :func:`detach_continuation` between independent training trials
+    when recurrent history should be cut.
 
-    ``initialization`` overrides the existing model-specific initialization
-    packet. Omission uses ``tensors.initialization`` for a Population or
-    ``functional.initialization_inputs`` for a Network. Bound caches and native
-    ordering follow the existing initialization machinery. Missing draws are
-    sampled from independent explicit RNG carry. Supplied draws are replayed,
-    including draws retained in an already initialized Population bundle.
-    ``draws=InitializationDraws(...)`` supplies the complete stochastic input
-    separately from deterministic initialization values and replays without
-    automatic sampling. It cannot be combined with legacy draw fields.
-    Use :func:`sample_initialization_draws` to capture packets in native order.
-
-    This host entry point runs outside ``torch.compile``, ``torch.func`` and
-    forward AD. The pure ``functional.initialize`` methods and their existing
-    result types remain available for transforms. Initialization creates ordinary
-    Tensors even inside inference mode, while respecting the caller's gradient
-    mode and the model's native training policy. For explicit runner
-    initialization, the caller's gradient mode also applies independently of
-    the runner's inference flag; that flag controls subsequent execution.
-
-    The returned packet has no callback carry or recording history and advances
-    no accepted timestep. Bind its effective sources, then start callbacks on the
-    first run::
-
-        initial = dn.func.initialize(functional, tensors)
-        bound = kernel.bind(initial.parameters, constants=initial.constants)
-        state, aux = dn.func.run(bound, initial, steps=100, callbacks=callbacks)
-
-    Source models, bundle containers and initialization defaults are unchanged.
-    Runtime ``Inputs``, ``RuntimeDraws`` and waveform recipes remain run inputs.
+    This host operation runs outside compilation, ``torch.func`` and forward AD.
+    It follows the caller's gradient mode even for an inference-configured runner
+    and creates versioned outputs inside inference mode. The lower-level pure
+    plan ``initialize`` methods remain available for tensor transforms.
     """
     return _initialize_target(
         functional,
@@ -395,32 +377,40 @@ def sample_initialization_draws(
     parameters=_UNSET,
     constants=_UNSET,
 ):
-    """Capture replayable initialization draws from native or functional models.
+    """Capture replayable stochastic inputs for one fresh initialization.
 
-    Initialized native Populations and Networks use their default initialization
-    options and current sources. A Network retains its initialized timestep.
-    Native capture executes an isolated copy, without lowering, building a fresh
-    source model or publishing initialized values. Extra tensor bundles, source
-    overrides and deterministic initialization packets belong to functional
-    targets. Explicit draw replay does not support native forced rebuilds.
+    Parameters
+    ----------
+    functional : initialized Population/Network, compiled runner or lowered plan
+        Target whose initialization protocol determines draw ordering.
+    tensors : PopulationTensors, NetworkTensors or Continuation, optional
+        Required for a lowered plan, optional for a runner, and omitted for native
+        targets. A Continuation supplies its current effective sources and RNG.
+    initialization : InitializationInput or NetworkInitializationInput, optional
+        Functional recipe override. A Population plan with a Continuation requires
+        it. Native capture uses the model's default initialization options.
+    parameters, constants : mapping, optional
+        Runner-only source overrides, incompatible with a supplied Continuation.
 
-    Functional targets accept the same tensor bundles, continuations and source
-    overrides as :func:`initialize`. With a continuation, capture observes its
-    current effective sources and RNG carry without advancing the packet.
-    Sampling runs the existing host initializer under ``no_grad``, including
-    pure transforms and cache restoration, to observe each sampling boundary
-    in native order. The resulting packet includes the actual draw selections
-    and intermediate RNG frames. Initialized model values are not published.
-    Source modules, input tensors, runner defaults and global RNG are unchanged.
-    Newly sampled tensors are detached. Supplied legacy draw fields are
-    captured as provided, preserving their tensor identities and gradient flags.
+    Returns
+    -------
+    InitializationDraws
+        Base draws and resulting RNG states for replay with native
+        ``model.initialize(draws=packet)`` or :func:`initialize`.
 
-    Replay native packets with ``target.initialize(..., draws=packet)`` and
-    functional packets with ``dn.func.initialize(target, ..., draws=packet)``.
-    Functional capture and replay are separate initialization executions; each
-    invokes authored transforms once. Native capture can run cold invocation
-    probes on disposable copies. Ordinary automatic initialization does not
-    perform a capture pass.
+    Notes
+    -----
+    Capture leaves the source boundary, global RNG and runner caches unchanged.
+    It follows initialization transforms and cache restoration under ``no_grad``
+    to observe draw ordering; initialized values are discarded. Native capture
+    uses an isolated model copy and requires an initialized compatible model.
+    Newly sampled draws are detached. Explicit component draw values already in
+    the recipe retain their Tensor identities and gradient flags.
+
+    Capture and replay are separate initialization executions; each invokes
+    authored transforms. Automatic initialization samples within a single call.
+    Forced native rebuilding is unsupported with explicit draw replay. This host
+    operation runs outside compilation, function transforms and forward AD.
     """
     from dendra.models import Network, Population
 

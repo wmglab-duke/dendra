@@ -1549,74 +1549,74 @@ def run(
     constants=_MISSING,
     initialization=_MISSING,
 ):
-    """Execute a runner, a packet-bound plan/kernel, or explicit transitions.
+    """Execute a compiled runner or an explicit functional boundary.
 
-    ``run(program)`` and ``run(program, state_or_continuation, ...)`` use a
-    compiled Population or Network runner's existing execution policy, just
-    like ``program(...)``. ``state=`` is also supported. Omission or ``None``
-    restarts according to its snapshot/fresh policy. ``steps``, ``duration``,
-    ``parameters``, ``constants``, ``inputs``, ``draws``, ``initialization``,
-    ``callback_state`` and runtime ``extra`` have the same meaning as on the
-    runner. Its configured horizon remains the default even when input tapes
-    are supplied. A ``VarInput`` slot requires an explicit ``extra`` argument;
-    ``extra=None`` supplies zero stimulation.
+    The preferred forms are ``run(program, continuation=None, ...)``,
+    ``run(plan_or_kernel, continuation, ...)`` and
+    ``run(bound, state_or_continuation, ...)``. A compiled runner owns its timestep,
+    callbacks, kernel width, initialization policy and checkpoint configuration.
+    An explicit plan/kernel binds the Continuation's sources for that invocation.
+    A raw binding instead owns its sources, which must match a supplied packet.
 
-    Runners own their callbacks, inference mode, timestep, kernel width and
-    activation checkpoint policy. Non-None ``callbacks``, ``dt``, ``tstop``,
-    ``host_span_steps`` and ``checkpoint_every`` overrides require the explicit
-    binding form below. ``parameters``, ``constants`` and ``initialization``
-    arguments are only available for runner targets.
+    Parameters
+    ----------
+    functional : compiled runner, functional plan, compiled chunk or binding
+        Execution target. Runner calls without state restart their configured
+        snapshot/fresh policy. Explicit plans/kernels require a Continuation.
+    step, state : tensor tree or Continuation
+        The second positional argument is the boundary for preferred calls;
+        ``state=`` is also supported. A Continuation includes effective sources and
+        callback carry. Prepared Population bindings accept explicit state/carry.
+    inputs : Inputs or mapping, optional
+        Deterministic time-leading voltage/current tapes. Networks use Population
+        names as keys. Supplied tapes must match the selected accepted step count.
+    steps, duration : int or float, optional
+        Exact count or elapsed time in ms; mutually exclusive. Durations include
+        fractional carry and publish its new remainder. Explicit counts leave it
+        unchanged. Runners retain their default horizon when neither is supplied;
+        explicit bindings can infer length from supplied tapes.
+    draws : RuntimeDraws, optional
+        Stochastic tape. Omission retains automatic host sampling.
+    callbacks : FunctionalCallbacks, optional
+        Prepared collection for explicit plans/bindings. Runners use their own
+        configured collection. Results are in ``auxiliary["callbacks"]``.
+    callback_state : FunctionalCallbackState, optional
+        Carry for an explicit-state continuation. Incompatible with a Continuation,
+        which already contains it.
+    checkpoint_every, host_span_steps : int, optional
+        Explicit-binding training-checkpoint or ordinary host span. They are
+        mutually exclusive and independent of compiled kernel width. Runners use
+        their construction-time checkpoint policy.
+    parameters, constants, initialization : optional
+        Runner-only call overrides. A Continuation already owns its sources;
+        initialization overrides require a fresh no-state call.
+    extra : stimulation specification or mapping, optional
+        Call-local stimulation. Runners accept it only for declared VarInput slots;
+        None supplies zero drive.
+    dt : float, optional
+        Explicit-binding timestep override, validated against prepared execution.
+        Runners use their configured timestep.
+    tstop : float, optional
+        Duration in the supported four-positional compatibility form described below.
 
-    ``run(functional_or_kernel, continuation, ...)`` binds an exact lowered
-    Population/Network plan or compiled chunk to the packet's effective raw
-    sources for this invocation. ``state=continuation`` is also supported.
-    The packet supplies simulation state and callback carry; initialization
-    remains explicit through ``initialize``. Tensor bundles and omitted state
-    do not imply initialization. Horizons, callbacks, inputs/draws and span
-    options follow the explicit binding contract below. Sources and gradient
-    history are not cloned or detached. No binding, packet or preparation
-    graph is retained in the plan/kernel. Use a persistent raw Population
-    binding to retain safe inference preparation across separate calls.
+    Returns
+    -------
+    tuple
+        ``(state, auxiliary)``. The final explicit state does not advance the
+        native model. The auxiliary mapping contains callback results and,
+        for runners/raw bindings/packet execution, a ``continuation`` carrying
+        effective sources, state and callback phase.
 
-    For explicit bindings, use ``run(bound, state, inputs=..., steps=N)`` or
-    ``run(bound, state, duration=..., checkpoint_every=H)``. Create ``bound``
-    with ``functional.bind(parameters, constants=constants)`` for either model.
-    Population ``bind(parameters, prepared)`` remains available for explicit
-    preparation ownership. Compiled kernels
-    expose the corresponding ``bind(...)`` method. ``Inputs(ve=..., intra=...)``
-    supplies Population drive tapes; Networks accept a mapping from Population
-    names to the same packets. Legacy input tuple forms remain supported. Inputs
-    alone infer the horizon; an explicit step count or duration must match
-    their time axis. ``steps`` and ``duration`` are mutually exclusive.
-
-    ``duration`` is an amount to advance, including the state's retained
-    fractional remainder. Explicit or input-inferred steps leave that remainder
-    unchanged. The default timestep comes from validated Population preparation
-    or the Network's fixed clock. Raw Population bindings prepare once for the
-    complete invocation, with safe inference reuse. Networks retain their
-    native inner materialization order.
-    ``checkpoint_every`` sets the number of steps between activation checkpoints;
-    ``host_span_steps`` instead groups an ordinary run. These mutually exclusive
-    options are independent of the compiled kernel width. Shorter kernel tails
-    are cached, and gradients span the complete run.
-
-    The legacy form ``run(functional, step, state, inputs, tstop=...)`` remains
-    supported. Its explicit drive horizon takes precedence over ``tstop`` and
-    its default timestep is the functional plan's nominal timestep. New horizon
-    and span options require the preferred binding form. Legacy steps may be
-    generic one-step callables, explicit bindings, or exact partial bindings.
-
-    Callbacks observe every accepted state, including within compiled chunks.
-    Results are returned under ``auxiliary["callbacks"]``; pass their explicit
-    ``state`` as ``callback_state`` when resuming to avoid duplicate frames.
-    Runners, packet execution and raw bindings return
-    ``auxiliary['continuation']``. Pass it to the corresponding ``run`` form
-    to continue state and callback carry together.
-    For raw bindings, the packet must reference the binding's parameter/constant
-    Tensor objects; different sources require an explicit new raw binding. A
-    packet cannot be combined with non-None ``callback_state``. Prepared Population bindings and
-    the legacy form keep their explicit state/carry contract.
-    This host scheduler stays outside torch.compile and torch.func boundaries.
+    Notes
+    -----
+    ``run(functional, step_callable, state, inputs, tstop=...)`` remains supported.
+    In that compatibility form supplied drive length takes precedence over tstop.
+    Use :func:`initialize` for an explicit fresh boundary; execution from a packet
+    never implicitly initializes it. Raw Population bindings own each forward's
+    preparation graph and can reuse safe inference preparation. Gradients span
+    all chunks and activation checkpoints. This host scheduler runs outside
+    ``torch.compile`` and ``torch.func``; use combined plan tensor methods inside
+    those transforms.
     """
     from ._convenience import CompiledRunner, _execute_population_runner
     from ._network_compile import CompiledNetworkRunner, _execute_network_runner
@@ -1846,13 +1846,42 @@ def longrun(
     callbacks: FunctionalCallbacks | None = None,
     callback_state=None,
 ):
-    """Run a duration in host spans, preserving the legacy calling convention.
+    """Run an explicit Population binding for a duration in host spans.
 
-    ``tstop`` is a duration to advance; supplied drives must match the resolved
-    number of steps. ``chunklength`` sets host grouping independently of compiled
-    kernel width. Exact bindings from ``bind`` and existing partial forms are
-    accepted. The default timestep is the functional plan's nominal timestep.
-    New code can use ``run(bound, state, duration=..., host_span_steps=...)``.
+    Parameters
+    ----------
+    functional : FunctionalPopulation
+        Lowered Population owning the binding and state schema.
+    step : callable
+        Exact binding returned by ``bind``, or a supported preparation/step partial.
+    state : dict
+        Initial explicit Population state.
+    tstop : float
+        Duration to advance from the supplied state, in milliseconds.
+    chunklength : int
+        Positive number of steps per host span, independent of compiled kernel width.
+    inputs : Inputs or RolloutInput, optional
+        Time-leading deterministic tapes and optional draw packets. Their length
+        must match the resolved horizon.
+    dt : float, optional
+        Timestep in milliseconds; defaults to the plan's nominal timestep.
+    extra : object, optional
+        Extracellular field/Waveform bindings evaluated over the execution spans.
+    callbacks : FunctionalCallbacks, optional
+        Prepared callback collection for this Population.
+    callback_state : FunctionalCallbackState, optional
+        Matching carry to resume without duplicating the initial sample.
+
+    Returns
+    -------
+    tuple
+        ``(state, outputs)``: final explicit state and transition outputs, including
+        callback results when configured. Gradients span all host spans.
+
+    See Also
+    --------
+    run : Shared interface using ``run(bound, state, duration=...,
+        host_span_steps=...)``.
     """
     from ._runner_compat import run_legacy_schedule
 
@@ -1883,13 +1912,18 @@ def longrun_checkpointed(
     callbacks: FunctionalCallbacks | None = None,
     callback_state=None,
 ):
-    """Run a duration with non-reentrant activation checkpointing.
+    """Run an explicit Population binding with activation checkpointing.
 
-    This preserves the legacy horizon, timestep and chunklength conventions.
-    New code can use ``run(bound, state, duration=..., checkpoint_every=...)``.
-    Steps and callbacks must be pure, deterministic and replay-safe. Gradients
-    span the full simulation; replay reuses and revalidates prepared inputs.
-    With gradients disabled, ordinary execution uses the same host spans.
+    Accepts the same arguments and returns as :func:`longrun`. ``tstop`` is the
+    relative duration to advance; ``chunklength`` sets the number of steps per
+    checkpoint span. Non-reentrant checkpointing retains gradients through the
+    full simulation while replaying spans during backward.
+
+    Steps and callbacks must be pure, deterministic and replay-safe. Replay
+    reuses and validates prepared inputs; automatic sampling occurs outside the
+    replayed transition. With gradients disabled, execution uses ordinary host
+    spans. The shared spelling is
+    ``run(bound, state, duration=..., checkpoint_every=...)``.
     """
     from ._runner_compat import run_legacy_schedule
 

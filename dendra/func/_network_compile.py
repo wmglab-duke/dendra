@@ -41,83 +41,35 @@ from ._types import FunctionalizationError
 
 
 class CompiledNetworkRunner:
-    """``dn.compile(Network)`` execution with explicit restart and horizon defaults.
+    """Compiled Network execution with shared parameters and explicit continuation.
 
-    Construct with either ``steps`` or ``duration``. Calls use that default
-    unless ``steps=`` or ``duration=`` selects another horizon; the two options
-    are mutually exclusive at each boundary. Durations are elapsed simulation
-    time in ms, and fractional-step remainder travels in the simulation state.
-    Per-call horizons reuse the configured compiled width and cached tails.
+    Create with :func:`compile`. Calls return ``(state, auxiliary)`` without
+    advancing the native Network. A no-state call restarts the configured
+    snapshot/fresh policy, including its RNG and delivery state. Pass the returned
+    ``auxiliary["continuation"]`` to continue sources, state and callback phase.
 
-    No-state calls restart :attr:`initial_state`, including delivery queues and
-    NetStim clock/RNG carry. ``initialization='fresh'`` instead constructs state
-    from current parameters and :attr:`initialization_inputs`. An explicit
-    state continues without initialization;
-    continue recordings with ``callback_state=aux['callbacks'].state``. Calls
-    return ``(state, aux)`` and leave the native Network and restart snapshot
-    unchanged. Use :meth:`FunctionalNetwork.commit_state_` to publish carry.
+    Parameters are independent nested Tensor mappings with shared aliases
+    preserved. ``named_parameters`` provides dotted names; ``trainable_parameters``
+    lists live defaults requiring gradients. Per-call overrides remain local.
+    Training requires a Network initialized in training mode and
+    ``inference=False``. Scan supports gradients; while is inference-only.
 
-    :attr:`parameters` is a nested read-only view with editable, independent
-    Tensor leaves. :attr:`named_parameters` exposes dotted query names. Select
-    exact or unique partial names, glob patterns, or ``re:``/compiled regular
-    expressions with ``trainable`` and ``inference=False``.
-    Every alias of a selected shared Tensor remains the same trainable leaf.
-    :attr:`trainable_parameters` reports every named default currently requiring
-    gradients, including aliases. Per-call overrides are not retained for
-    inspection. Inference execution suppresses gradients regardless of selection.
-    Per-call parameter overrides preserve their Tensor objects and autograd
-    history, and must retain the Network's parameter ties and component schema.
+    Inputs map Population names to :class:`Inputs`; :class:`RuntimeDraws` supplies
+    stochastic tapes. Recorders use qualified paths such as ``left.v`` or
+    :class:`PopulationCallback` for a local callback. ``steps``/``duration``
+    overrides reuse the configured kernel width and cached tails. Activation
+    checkpointing preserves whole-run gradients, RNG and callback continuation.
 
-    Runtime inputs map Population names to :class:`Inputs`; legacy
-    :class:`NetworkRolloutInput` packets remain supported. Supplied draw/RNG tapes
-    are replayed explicitly; omitted NetStim tapes are sampled by the shared
-    host scheduler from the supplied state's RNG carry. Qualified Recorders and
-    pure callback reducers use the existing Network callback binding.
+    ``extra`` maps Population names to extracellular field/waveform bindings.
+    ``VarInput()`` declares deterministic runtime slots; omitted names in a supplied
+    runtime mapping receive zero drive. Bind randomized Poisson waveforms during
+    compilation. ``pending_capacity`` controls event-calendar capacity; overflow
+    raises without publishing an incomplete result.
 
-    Preparation and output graphs are invocation-local; only compiled kernels
-    are cached. ``chunk_steps`` selects the compiled kernel width using the
-    default horizon; omission uses its nominal step count, or at most 64 steps
-    with runtime ``extra`` slots. Per-call horizons leave that width unchanged;
-    a previously unseen tail width may require compilation.
-    ``checkpoint_every`` preserves gradients
-    across independent activation-checkpoint spans. Each span executes compiled
-    scan/while chunks and cached shorter tails, without a divisibility
-    requirement. Requested recordings remain retained across the complete run.
-    The initialized Network's mode and timestep are frozen. Gradient execution
-    requires a Network initialized in training mode. Fresh calls accept a
-    :class:`NetworkInitializationInput` override and return effective parameters
-    and constants in ``aux['parameters']`` and ``aux['constants']``. Continue
-    those packets explicitly when initialization replaces them. A captured
-    Network-wide steady-state cache supplies detached Population
-    materializations and rebuilds connection carry using the shared cache
-    restoration helpers. Without that global cache, each Population restores
-    its own bound cache or runs its fresh initializer in authored order.
-    Initialization runs once before
-    rollout/checkpoint spans; its graph is never cached. Inference while-loop
-    execution uses ``execution='while', inference=True`` with the same pure
-    Network timestep and the Population packed loop engine. Pure callbacks,
-    including custom implementations and ``PopulationCallback`` scopes, and
-    execution without callbacks are supported; use scan for gradients. Short chunks
-    contain only the bounded unrolled tail. ``extra`` maps Population names to
-    ``(field, Waveform)`` pairs or contact sequences, using the Population
-    stimulation machinery. Its fields and waveform leaves are independent
-    parameters selected through ``trainable``, with shared aliases preserved.
-    Binding stimulation and supplying explicit ``ve`` inputs to the same
-    Population cannot be combined. ``extra=VarInput()`` instead declares
-    call-time slots for every Population. A mapping can declare selected slots
-    with ``VarInput()`` alongside static bindings. Every call then requires
-    an ``extra`` mapping (or ``None``); omitted declared names receive zero
-    stimulation. Recipe types and contact counts may vary between calls.
-    ``chunk_steps`` bounds call-local assembly and compiled kernel width,
-    with runtime-extra checkpoint spans capped to that width as well.
-    Runtime stimulation is deterministic;
-    bind randomized Poisson waveforms when compiling.
-
-    ``pending_capacity`` sets the entry count for packed scheduled traffic and
-    sparse inference calendars. It accepts one positive integer or a mapping
-    keyed by event-connection name. A full calendar raises without changing
-    the input state, restart snapshot, native model, or execution report. Compile
-    with a larger capacity and retry from a valid checkpoint.
+    Use :func:`capture_continuation` to snapshot a native boundary and
+    :func:`commit_continuation_` to transfer detached effective sources and state
+    back to a compatible native model. See :func:`compile` and :meth:`__call__` for
+    construction and invocation arguments.
     """
 
     def __init__(
@@ -310,6 +262,7 @@ class CompiledNetworkRunner:
 
     @property
     def functional(self):
+        """The lowered execution plan owned by this runner."""
         return self._functional
 
     @property
@@ -348,6 +301,7 @@ class CompiledNetworkRunner:
 
     @property
     def kernel(self):
+        """The fixed-width compiled kernel used by this runner."""
         return self._kernel
 
     def parameter_name(self, query):
@@ -380,6 +334,37 @@ class CompiledNetworkRunner:
         extra=_MISSING_RUNTIME_EXTRA,
         draws=None,
     ):
+        """Run from a restart snapshot, explicit state or Continuation.
+
+        Parameters
+        ----------
+        state : tensor tree or Continuation, optional
+            Omission/None restarts the configured initialization policy. A Continuation
+            also supplies effective parameters/constants and callback carry.
+        steps, duration : int or float, optional
+            Override the default horizon with an exact count or elapsed time in ms.
+            They are mutually exclusive; per-call values may be zero.
+        parameters, constants : mapping, optional
+            Call-local source overrides. They cannot accompany a Continuation.
+        inputs : Inputs or mapping, optional
+            Deterministic time-leading tapes. Networks use Population-name mappings.
+        draws : RuntimeDraws, optional
+            Explicit stochastic tape; omission retains automatic sampling.
+        callback_state : FunctionalCallbackState, optional
+            Carry for an explicit-state call. A Continuation includes this already.
+        initialization : InitializationInput or NetworkInitializationInput, optional
+            Fresh-policy initialization override; incompatible with explicit state.
+        extra : stimulation specification or mapping, optional
+            Required when runtime ``VarInput`` slots were declared. None is zero drive.
+
+        Returns
+        -------
+        state : tensor tree
+            Final explicit simulation state.
+        auxiliary : dict
+            Contains ``continuation`` and, when configured, callback results. Fresh
+            initialization also publishes effective ``parameters`` and ``constants``.
+        """
         return _execute_network_runner(
             self,
             state,

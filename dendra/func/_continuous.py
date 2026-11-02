@@ -524,7 +524,13 @@ class FunctionalContinuousCon:
 
 
 def make_functional_continuous_con(con):
-    """Lower initialized ContinuousCon routing and extract independent tensors."""
+    """Return an explicit continuous projection and independent Tensor snapshot.
+
+    ``con`` must be an initialized compatible ContinuousCon. Returns
+    ``(FunctionalContinuousCon, ContinuousConTensors)``. Routing, delay quantization
+    and stateless transform configuration are fixed; transform Tensor parameters
+    remain explicit. Network lowering constructs these projections automatically.
+    """
     plan = FunctionalContinuousCon(con)
     return plan, plan.extract()
 

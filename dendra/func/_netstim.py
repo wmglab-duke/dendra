@@ -549,7 +549,12 @@ class FunctionalNetStim:
 
 
 def make_functional_netstim(source) -> tuple[FunctionalNetStim, NetStimTensors]:
-    """Lower NetStim using explicit clocks, RNG, calendar cursors, and event tensors."""
+    """Return a pure renewal plan and independent state/parameter snapshots.
+
+    ``source`` is an initialized NetStim with its timestep/schedules configured.
+    Returns ``(FunctionalNetStim, NetStimTensors)``. Initialization and step draws
+    remain explicit; full Network lowering binds this component automatically.
+    """
     plan = FunctionalNetStim(source)
     return plan, plan.extract()
 

@@ -42,31 +42,28 @@ if TYPE_CHECKING:
 
 
 class FunctionalCallback(ABC):
-    """Base contract for a pure functional callback.
+    """Pure observation/reduction protocol shared by native and functional execution.
 
-    Callback objects are immutable configuration. All values that evolve
-    during execution must be returned in ``carry``. Carry, emissions, and the
-    finalized result must be tensor PyTrees with stable structure, leaf shape,
-    dtype, and device. An emission may be ``None`` when a callback is a
-    constant-memory reducer.
+    Callback objects hold static configuration. Every evolving value must be
+    returned in ``carry``. Carry and per-step emissions are Tensor PyTrees with
+    stable structure, leaf shapes, dtype and device. A constant-memory reducer
+    can emit None. Final results are Tensor PyTrees; a recording's leading sample
+    length can vary with the execution horizon and sampling selection.
 
-    ``initialize`` runs exactly once for a fresh callback execution. Its
-    ``auxiliary`` argument is ``None`` because no transition has occurred.
-    ``update`` runs after each successful model step and receives that step's
-    auxiliary mapping. Dendra stacks non-``None`` emissions on a leading
-    sample axis before calling ``finalize`` once for each public runner result.
-    If a segment has no samples and no initial emission schema, ``finalize``
-    receives ``None`` and must still return its normal result PyTree (for
-    example, an explicitly shaped empty recording).
+    ``initialize(state, None)`` runs once for fresh callback state and returns
+    ``(carry, initial_emission_or_none)``. ``update(carry, state, auxiliary)`` runs
+    after every accepted model step and returns the next pair. Per-step emissions
+    are stacked on a leading time axis before ``finalize(carry, emissions)`` runs
+    for each public execution result. Continued calls reuse carry without another
+    initial sample. Finalize must handle None when a segment has no emissions or
+    known initial emission layout, returning a correctly shaped empty result if
+    appropriate.
 
-    Implementations must be deterministic and side-effect-free: do not mutate
-    callback objects, perform I/O, consume hidden randomness, call ``.item()``,
-    or branch in Python on tensor values. These constraints make callbacks
-    safe for autograd, ``torch.func``, compilation, and checkpoint replay.
-    The same implementation supports scan and inference-only while execution
-    when its tensor operations can be captured. Both engines require stable
-    carry and emission schemas; sparse observations use fixed tensors and
-    masks rather than changing the emitted structure between steps.
+    Implement tensor-only, deterministic, side-effect-free methods: do not mutate
+    the callback, perform I/O, consume hidden randomness or branch in Python on
+    Tensor values. This makes the same callback usable with gradients, compiled
+    scan, inference-only while and checkpoint replay. Sparse per-step observations
+    use fixed tensors/masks rather than changing emission structure.
     """
 
     @abstractmethod
@@ -82,26 +79,20 @@ class FunctionalCallback(ABC):
         """Return the public tensor result for this execution segment."""
 
     def checkpoint_configuration(self):
-        """Declare compatibility metadata for portable callback checkpoints.
+        """Describe static compatibility for portable callback checkpoints.
 
-        Custom bound implementations opt in by returning an exact dict with
-        ``kind`` (a nonempty stable string), ``version`` (a positive integer),
-        and ``fields`` (an exact dict with string keys). Fields contain only
-        plain scalars, acyclic dict/list/tuple containers and ordinary Tensor
-        or Parameter values. Tensor metadata is frozen into detached owned
-        CPU values with dtype/device descriptors during export and comparison.
+        Return a plain dict with ``kind`` (a nonempty stable string), ``version`` (a
+        positive integer), and ``fields`` (a string-keyed dict). Fields may contain
+        plain scalars, acyclic dict/list/tuple containers and ordinary Tensor/Parameter
+        values. Include every static setting affecting carry, emissions or results.
+        Change the version when their interpretation changes.
 
-        Include all static configuration that affects carry, emissions or
-        results. Use a distinct kind and increment the version when their
-        interpretation changes. The receiving application constructs its own
-        callback; checkpoint metadata never reconstructs objects or imports
-        implementations. Carry and emission schemas retain their normal checks.
-
-        This deterministic, side-effect-free hook is called only during host
-        export/restore, not binding, numerical execution or checkpoint replay.
-        It belongs to the bound callback returned by ``_bind``. The default
-        retains built-in checkpoint formats and rejects other implementations;
-        overriding it is optional for execution and in-memory continuation.
+        The receiving application constructs a compatible callback; checkpoint data
+        does not instantiate or import implementations. This deterministic,
+        side-effect-free hook runs only during host export/restore. If a custom binding
+        hook returns a prepared callback, implement this declaration on that returned
+        object. It is optional for execution/in-memory continuation; custom portable
+        export requires it. The default handles built-in callback configurations.
         """
         from ._callback_checkpoints import _builtin_callback_configuration
 
@@ -258,23 +249,24 @@ def _coerce_callback_configuration(callback):
 
 @dataclass(frozen=True)
 class PopulationCallback(FunctionalCallback):
-    """Apply an existing pure callback to one Population in a Network.
+    """Apply one callback configuration to a named Population in a Network.
 
-    ``PopulationCallback("left", LFP(lead_fields))`` binds the inner callback
-    against the Network's ``left`` Population. Its state, auxiliary values,
-    result names, shapes, sampling phase, and continuation carry follow the
-    ordinary Population callback contract. The callback mapping's key names
-    the result stream. Use relative state names inside a scoped Recorder.
+    Parameters
+    ----------
+    population : str
+        Exact top-level Population name. A concatenated MultiPopulation is one
+        owner; a scoped Recorder can select its named Slice regions.
+    callback : FunctionalCallback or supported built-in configuration
+        Observation configured against that Population. Recorder state names are
+        local, for example ``v`` or ``hh.m``. The outer callback mapping's key names
+        the returned result stream.
 
-    ``population`` is an exact top-level Network Population name. A concatenated
-    MultiPopulation is one such owner: use its packed coordinates for threshold
-    selections and lead fields, or named Slice regions in a scoped Recorder.
-    Pure custom callbacks use the same contract in scan and inference while
-    execution, including this Population scope.
-
-    ``dn.callbacks.PopulationCallback`` supplies the shared scope configuration
-    for native and functional Networks. This functional entry point retains its
-    immutable configuration and pure callback contract.
+    Notes
+    -----
+    Local result shape, gradients, cadence and carry follow the ordinary Population
+    callback contract. Scopes cannot be nested. ``dn.callbacks.PopulationCallback``
+    is the shared configuration accepted by native and functional Networks; this
+    functional class is also supported.
     """
 
     population: str
@@ -357,34 +349,42 @@ class _BoundPopulationCallback(FunctionalCallback):
 
 
 class Recorder(_PreparedCallback):
-    """Record explicit functional state with optional native sampling cadence.
+    """Record selected state tensors at an optional sampling cadence.
 
-    The constructor mirrors the ordinary :class:`dendra.callbacks.Recorder`
-    where the pure in-memory semantics overlap. ``dt=None`` records the initial
-    boundary and every post-step value. ``dt`` selects the native integer stride
-    ``int(dt / simulation_dt)``. A fresh recording retains its initial frame,
-    then accepted steps stride, 2 * stride, and so on. Explicit counter carry keeps
-    that phase across chunks and continuation, without another initial sample.
+    Parameters
+    ----------
+    states : sequence of str
+        Population-local state names such as ``v`` or ``hh.m``. A Network Recorder
+        uses qualified names such as ``left.v``; a PopulationCallback scope uses
+        local names.
+    max_only : bool, default False
+        Record the maximum over the final compartment/support axis.
+    node_indices : sequence of int, optional
+        Select entries on that final axis when max_only is False.
+    partition : sequence of int, optional
+        With max_only, reduce contiguous final-axis groups separately. Positive
+        lengths must cover that axis completely.
+    dt : float, optional
+        Positive recording interval in ms, spanning at least one solver step.
+        Omission records the initial boundary and every
+        accepted post-step state. An interval uses stride
+        ``int(dt / simulation_dt)``; the initial sample is retained and continuation
+        preserves the stride phase without another initial sample.
+    region : Slice, optional
+        Physical selection belonging to the source Population, including named
+        regions of a concatenated MultiPopulation. Regions select voltage,
+        extracellular voltage and membrane current; mechanism-local state region
+        selection is currently unsupported. Mutually exclusive with
+        ``node_indices``, ``max_only`` and ``partition``.
 
-    Host schedules retain selected frames between chunks; each tensor kernel
-    still emits dense data. Atomic rollouts and direct chunk calls select
-    cadence during finalization. Compiling an atomic callback rollout that
-    includes finalization requires the PyTorch backend to support dynamic
-    output shapes.
-
-    ``region`` accepts a physical Slice belonging to the exact source
-    Population, including a named child selection such as
-    ``packed.cell_a`` or ``getattr(packed, name)``. It selects voltage, extracellular layer
-    voltage, or membrane-current coordinates without collapsing explicit
-    batch dimensions or extracellular layers. Clock ``t`` remains scalar.
-    Mechanism-local state has separate support maps and cannot yet be selected
-    with ``region``. Region selection is mutually exclusive with ``node_indices``,
-    ``max_only``, and ``partition``; without a region those retain their
-    existing final-axis semantics. Network selections use qualified names such
-    as ``cells.v`` and a region rooted at that Network's source Population,
-    including ``network.packed.cell_a.soma`` after concatenation. Each regional
-    recorder selects one Population; the Network or selected Population clock
-    may be recorded alongside physical fields.
+    Notes
+    -----
+    Other selection arguments follow :class:`dendra.models.callbacks.Recorder`.
+    In-memory recordings retain gradients. For HDF5 output, configure
+    ``dn.Recorder(...).set_hdf5(...)`` and pass that shared configuration. Host
+    execution writes detached samples and retains callback carry; direct tensor
+    kernels do not support HDF5 storage. Bind with
+    :func:`make_callbacks` or supply the configuration to :func:`compile`.
     """
 
     _preparation_error = (
@@ -635,31 +635,27 @@ class _BoundCadencedRecorder(FunctionalCallback):
 
 
 class LFP(_PreparedCallback):
-    """Record lead-field projections of absolute membrane current.
+    """Record extracellular potentials from reciprocal lead fields.
 
-    ``v_unit`` is a non-empty list of equally shaped reciprocal lead-field
-    tensors, one per recording contact. Membrane current is in mA, so fields
-    in mV/mA (numerically equivalent to ohms) yield potentials in mV. Fields
-    are converted to the functional plan's dtype and device without detaching
-    their gradients.
+    Parameters
+    ----------
+    v_unit : sequence of Tensor
+        Non-empty, equally shaped lead fields, one per contact. Fields in mV/mA
+        (numerically ohms) project absolute membrane current in mA to mV. Conversion
+        to the model dtype/device preserves field gradients.
+    rule : str, optional
+        Explicit ``torch.einsum`` reduction. Without a rule, fields broadcast to
+        Population voltage shape and cell/compartment axes are summed, preserving
+        explicit batch axes.
 
-    By default each field must broadcast to the Population voltage shape.
-    The projection sums its physical cell and compartment axes, preserving
-    any explicit batch axes: results have shape ``(samples, *batch, contacts)``.
-    Native and functional execution use this same default projection. An
-    explicit ``rule`` uses ``torch.einsum(rule, current,
-    stacked_fields)`` exactly, with fields stacked on their leading contact
-    axis, and permits custom reductions.
-
-    Construct the source Population inside ``dn.ctx(IMEM=1)`` to enable
-    membrane-current output. The initial
-    boundary and every accepted post-step value are emitted, including resumed
-    executions' normal callback continuation semantics. Only the electrode
-    projections are emitted as recordings, not a full membrane-current history;
-    autograd may still save or recompute current intermediates. Lead fields
-    are explicit constant-valued callback carry, so they remain
-    differentiable through compiled scan and checkpoint replay. Compiled loops
-    lift those fields as invariant operands instead of copying them each step.
+    Notes
+    -----
+    Construct the source model under ``dn.ctx(IMEM=1)`` to enable membrane current.
+    Default results have shape ``(samples, *batch, contacts)`` and include the
+    initial boundary. Native and functional projection conventions match.
+    Continuation retains callback phase; :func:`detach_continuation` preserves
+    fresh suffix gradients to bound fields. Only electrode projections are
+    recorded, although autograd can retain current intermediates for backward.
     """
 
     _preparation_error = "dn.func.LFP must be bound with functional.make_callbacks(...)"
@@ -945,13 +941,15 @@ def _threshold_crossing(
 
 
 class Raster(_ThresholdCallback):
-    """Record post-step upward threshold crossings as a Boolean trajectory.
+    """Record post-step threshold crossings inside a time window.
 
-    The constructor mirrors :class:`dendra.callbacks.Raster`. The result has
-    shape ``(samples, *batch, N, K)`` for ``K`` selected compartments. Only
-    accepted post-step samples inside the checked window are returned. Initial
-    model state is not sampled. Numerical loop emissions keep a fixed shape;
-    host collection and finalization select the checked rows.
+    The Boolean result has shape ``(samples, *batch, N, K)`` for ``K`` selected
+    compartments. Only accepted samples inside the checked window are returned;
+    the initial model state is not sampled. Constructor arguments follow
+    :class:`dendra.models.callbacks.Raster`: ``threshold`` is a voltage threshold,
+    ``t_start_check``/``t_end_check`` bound the window in ms, ``node_check`` selects
+    compartments and ``dt`` sets the solver timing used for that window.
+    Continuation preserves crossing and window phase.
     """
 
     def initialize(self, state, auxiliary):
@@ -996,11 +994,13 @@ class Raster(_ThresholdCallback):
 
 
 class APCount(_ThresholdCallback):
-    """Count upward voltage-threshold crossings in constant callback memory.
+    """Count post-step threshold crossings without retaining a trajectory.
 
-    The returned int32 tensor has shape ``(*batch, N, K)`` for ``K``
-    selected compartments. Crossing state, counts, and timestep phase all live
-    in explicit carry, so segmented and checkpointed execution resume exactly.
+    The int32 result has shape ``(*batch, N, K)`` for ``K`` checked compartments.
+    ``threshold``, ``t_start_check``, ``t_end_check``, ``node_check`` and ``dt`` use
+    the same meanings as :class:`Raster`. Crossing state, cumulative counts and
+    window phase continue through returned callback carry. Hard counts are
+    nondifferentiable; recording them does not detach model state or other outputs.
     """
 
     def initialize(self, state, auxiliary):
@@ -1210,12 +1210,13 @@ def _is_builtin_callback(callback):
 
 @dataclass(frozen=True)
 class FunctionalCallbackResults(Mapping[str, object]):
-    """Immutable finalized result envelope for one callback execution segment.
+    """Finalized named callback outputs and carry for one execution segment.
 
-    Functional runners place it under ``auxiliary["callbacks"]``; the
-    imperative checkpoint bridge returns it directly. ``state`` is the
-    explicit callback carry to pass when continuing. Mapping access forwards
-    to finalized ``outputs``.
+    Functional execution returns this mapping at ``auxiliary["callbacks"]``.
+    Native pure-callback execution returns it directly. ``results[name]`` reads
+    that callback's finalized output; ``results.state`` is the carry for the next
+    call's ``callback_state=``. Recording outputs contain this segment's samples;
+    the carry retains cumulative reductions and sampling phase.
     """
 
     state: FunctionalCallbackState
@@ -1246,10 +1247,12 @@ class FunctionalCallbackState(Mapping[str, object]):
 
     @property
     def plan_token(self) -> object:
+        """Collection identity used to validate live callback continuation."""
         return self._token
 
     @property
     def emission_schemas(self):
+        """Recorded emission layouts used to validate continued callback results."""
         return self._emission_schemas
 
     def __getitem__(self, key: str):
@@ -1718,11 +1721,17 @@ def _native_population_readers(functional, population):
 
 
 class FunctionalCallbacks:
-    """An immutable named collection of native functional callbacks.
+    """Prepared named observations with explicit callback state.
 
-    Construct a collection with the functional Population or Network plan's
-    ``make_callbacks`` method.
-    Callback objects supply static configuration only and are never mutated.
+    Create with :func:`dendra.func.make_callbacks` for a native model or functional
+    plan, or with a plan's ``make_callbacks`` method. The collection binds callback
+    configuration, scopes and state selections; execution stores evolving values
+    in returned :class:`FunctionalCallbackState`, not in callback objects.
+
+    Reuse a collection and its state to preserve recording cadence and reductions.
+    Portable ``export_state``/``restore_state`` transfers carry between equivalent
+    independently prepared collections. Recording payloads themselves are not part
+    of callback-state checkpoints.
     """
 
     def detach_state(self, state: FunctionalCallbackState) -> FunctionalCallbackState:

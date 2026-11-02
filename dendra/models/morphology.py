@@ -729,6 +729,9 @@ class CompartmentGraph:
 class Section:
     """One named cable section in a native :class:`Morphology`.
 
+    Obtain sections through :meth:`Morphology.section`. Each section is a handle
+    owned by its Morphology; users do not construct Section objects directly.
+
     ``name`` is the Section's unique authored identity. ``labels`` is its
     read-only set of structural region tags and always includes ``name``.
     Attribute assignment is disabled; :meth:`update` performs a validated,

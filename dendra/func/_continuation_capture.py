@@ -20,37 +20,37 @@ from ._types import FunctionalizationError
 def capture_continuation(
     functional, native_model=None, *, callbacks=None, callback_state=None
 ):
-    """Snapshot a native Population or Network at its current boundary.
+    """Capture an initialized native model's current boundary as owned tensors.
 
-    ``functional`` is a lowered Population/Network plan or a ``dn.compile``
-    runner. ``native_model`` defaults to that plan's native source; an explicit
-    model must match the plan's structure and configured timestep. Capturing
-    does not initialize, advance, or sample the model. Existing extraction
-    evaluates deterministic materializations needed to represent native
-    prepared workspaces faithfully.
+    Parameters
+    ----------
+    functional : FunctionalPopulation, FunctionalNetwork or compiled runner
+        Receiving plan/runner defining the compatible model schema.
+    native_model : Population or Network, optional
+        Compatible initialized source; omission uses the plan's native model.
+    callbacks : FunctionalCallbacks, optional
+        Explicit plan's prepared callback collection. Runners use their configured
+        collection and require this argument omitted.
+    callback_state : FunctionalCallbackState, optional
+        Carry from that collection, retaining reductions and recording phase.
 
-    Return a :class:`Continuation` with owned detached Tensor leaves, current
-    raw parameters/constants, clock, solver history and RNG carry. Source
-    identity ties and current trainability are retained; distinct Tensor views
-    are independent leaves. Runner defaults, trainable selectors and fresh
-    initialization policy do not affect capture. Gradients through captured
-    model sources belong to their owned leaves rather than the native prefix.
+    Returns
+    -------
+    Continuation
+        Detached owned sources/state with aliases and source trainability retained.
+        Omitted callback carry starts fresh observations at the captured boundary.
 
-    Supply ``callback_state`` from the same prepared callback collection to
-    retain its cadence, accumulated results and emission metadata. Runners use
-    their configured callbacks and require ``callbacks`` omitted; explicit
-    plans accept their bound ``callbacks`` collection. Carry is copied without
-    initialization, updates, storage I/O or portable checkpoint hooks. Custom
-    registered carry PyTrees and Tensor identity ties are retained.
+    Notes
+    -----
+    No initialization, timestep or random sampling runs. Current native
+    materializations are represented in the snapshot; the native model and runner
+    defaults are unchanged. Captured leaves own subsequent gradients, cutting the
+    native prefix graph. Recording payloads are not captured.
 
-    Recurrent callback history is detached. Built-in LFP fields are refreshed
-    from current bound field inputs with the caller's gradient mode, retaining
-    suffix field gradients and owning their materialized storage. External
-    nonleaf field expressions remain caller-owned. Omitted callback carry
-    starts fresh callbacks at the captured boundary. Recording history is not
-    captured; distinct collections use the callback export/restore bridge.
-    Inputs, draw tapes and runtime ``extra`` remain invocation arguments.
-    Capture runs outside compilation, function transforms and forward AD.
+    Callback recurrent history is detached. Bound LFP fields are refreshed with
+    the caller's gradient mode so suffix field gradients remain available.
+    External nonleaf expressions remain caller-owned. Call outside compilation,
+    function transforms and forward AD.
     """
     _cold_boundary("capture_continuation")
     runner = functional if _is_runner_target(functional, callbacks) else None

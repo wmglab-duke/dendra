@@ -495,13 +495,13 @@ def ste_clamp(y, *, lo=None, hi=None, alpha_lo: float = 1.0, alpha_hi: float = 1
 
 # --- modules ---
 class Bounded(cacheable):
-    """
-    Trainable tensor constrained by optional lower and upper bounds.
+    """Trainable tensor constrained by optional lower and upper bounds.
 
     Parameters
     ----------
     init : array_like
-        Initial value for the unconstrained parameter ``rho``.
+        Initial constrained value. The raw parameter ``rho`` is initialized
+        by inverting the selected transform.
     min_val : float, optional
         Lower bound. When ``None``, no lower constraint is enforced.
     max_val : float, optional
@@ -518,6 +518,10 @@ class Bounded(cacheable):
         Strategy for enforcing the upper bound.
     cap_beta : float, optional
         Softcap temperature. Defaults to ``beta`` when ``None``.
+
+    requires_grad : bool or None, optional
+        Whether the raw parameter tracks gradients. ``None`` uses the
+        ``REQUIRE_GRAD`` context setting.
 
     Notes
     -----
@@ -857,8 +861,7 @@ class Bounded(cacheable):
 
 
 class PositiveParam(Bounded):
-    """
-    Bounded parameter constrained to non-negative values.
+    """Bounded parameter constrained to non-negative values.
 
     Parameters
     ----------
@@ -878,6 +881,9 @@ class PositiveParam(Bounded):
         Strategy for the optional upper bound.
     cap_beta : float, optional
         Softcap temperature. Defaults to ``beta`` when ``None``.
+    requires_grad : bool or None, optional
+        Whether the raw parameter tracks gradients. ``None`` uses the
+        ``REQUIRE_GRAD`` context setting.
     """
 
     def __init__(
@@ -919,8 +925,7 @@ class PositiveParam(Bounded):
 
 
 class NegativeParam(Bounded):
-    """
-    Bounded parameter constrained to non-positive values.
+    """Bounded parameter constrained to non-positive values.
 
     Parameters
     ----------
@@ -940,6 +945,9 @@ class NegativeParam(Bounded):
         Strategy for the optional lower bound.
     cap_beta : float, optional
         Softcap temperature. Defaults to ``beta`` when ``None``.
+    requires_grad : bool or None, optional
+        Whether the raw parameter tracks gradients. ``None`` uses the
+        ``REQUIRE_GRAD`` context setting.
     """
 
     def __init__(

@@ -33,37 +33,18 @@ if TYPE_CHECKING:
 
 
 class CompiledPopulationChunk:
-    """A fixed-length compiled rollout with preparation hoisted by the caller.
+    """Fixed-width compiled Population execution with explicit sources and state.
 
-    Construct this object with :meth:`FunctionalPopulation.compile_rollout_chunk`.
-    The outer Python call retains source, schema, and prepared-plan freshness
-    checks. Only explicit tensor trees are passed to the internal
-    :func:`torch.compile` boundary, so one prepared plan can be reused across
-    multiple differentiable chunk calls without rebuilding its workspaces.
+    Construct with :meth:`FunctionalPopulation.compile_rollout_chunk`. Direct calls
+    consume exactly ``steps`` time-leading input/draw samples. Bind a tensor bundle
+    or Continuation with ``kernel.bind(packet)`` and use :func:`run` to schedule
+    other horizons while preserving the configured kernel width.
 
-    Source structure is checked when this immutable lowered-plan wrapper is
-    constructed. Later edits to the imperative source Population do not alter
-    the compiled kernel; create a new functional plan after structural edits.
-
-    ``inputs=Inputs(...)`` supplies exactly ``steps`` time-leading samples;
-    ``draws=RuntimeDraws(...)`` supplies explicit stochastic tapes. Optional
-    ``callbacks`` from ``functional.make_callbacks(...)`` use the same
-    stimulation clock and return results in ``auxiliary['callbacks']``.
-    Continue with the returned simulation state and
-    ``callback_state=auxiliary['callbacks'].state``; resumed recording contains
-    only samples produced by the new call.
-
-    Bind raw sources with ``kernel.bind(tensors_or_continuation)`` and schedule
-    arbitrary horizons with ``dn.func.run(bound, state_or_continuation, ...)``.
-    Direct chunk calls retain the explicit parameters/prepared/state contract
-    and return callback carry separately.
-
-    ``execution="while"`` explicitly selects the shared inference loop. Enabled
-    ordinary calls require ``torch.no_grad()`` or ``torch.inference_mode()``;
-    chunks of at least four steps reject unavailable capture, while shorter
-    chunks use the bounded unrolled tail. ``execution="default"`` retains its
-    gradient and fallback behavior. Explicitly disabled compilation and active
-    functional transforms or forward AD retain their eager paths.
+    Scan supports first-order gradients; while is inference-only. Source schemas
+    and prepared values are validated before execution. Kernels retain no live
+    parameter bindings or preparation graphs. Explicit ``torch.func``/forward-AD
+    calls use the supported eager fallback. Use ``execution_report()`` to inspect
+    the dispatch selected by the most recent completed call.
     """
 
     def __init__(

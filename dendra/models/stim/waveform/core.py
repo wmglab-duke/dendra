@@ -22,73 +22,31 @@ from ._poisson import (
 
 
 class Waveform(SimpleParameterized):
-    """
-    Base class for creating waveform generators.
+    """A parameterized temporal waveform evaluated at times in milliseconds.
 
-    This abstract class provides the foundation for implementing various types of
-    waveforms (like sine waves, rectangular pulses, etc.) that can be used for
-    neural stimulation. It inherits from torch.nn.Module.
+    Declare subclass parameters with ``Waveform.PARAMETER`` and implement
+    :meth:`fn`. Call the instance, for example ``waveform(t)``, so registered
+    PyTorch hooks are honored. Waveform outputs use time as the final axis;
+    parameters can add leading batch or stimulus dimensions through broadcasting.
 
     Parameters
     ----------
-    **kwargs : dict
-        Parameter values to initialize the waveform. These are passed to
-        the Parameterized class's instantiate_parameters method. These parameters
-        should be defined in subclasses using the PARAMETER class method. These parameters
-        can be scalars or tensors, allowing for flexible waveform definitions. They will
-        be automatically broadcasted to match the shape of the input time tensor `t`
-        when the waveform is evaluated. All parameters are accessible as attributes of the waveform instance.
+    **kwargs
+        Values for parameters declared by the concrete waveform class.
 
     Notes
     -----
-    When subclassing Waveform, you need to:
-        1. Define parameters using the PARAMETER class method
-        2. Implement the fn(t) method to define the waveform's behavior
+    Waveforms support addition, subtraction, multiplication, and division with
+    other waveforms or numerical constants. :meth:`repeat` and :meth:`poisson`
+    create repeated event trains without changing the original waveform.
+    Amplitude units follow the target: intracellular current in mA, or the
+    amplitude that makes an extracellular field-waveform product mV.
 
-    Custom subclasses used by :mod:`dendra.func` must evaluate deterministically
-    without mutating registered tensors, Python instance state, or random-number
-    generators. Functional execution trusts this contract by default. Optional
-    diagnostics enabled with ``dn.ctx(CHECK_PURITY=True)`` require each concrete
-    class to declare ``FUNCTIONAL_PURE = True`` and audit its evaluation. The
-    marker defaults to ``False`` and diagnostics do not inherit a parent's
-    declaration when a subclass changes behavior.
-
-    Examples
-    --------
-    Creating a custom triangular wave:
-
-    >>> import torch
-    >>> from dendra.models.stim.waveform.core import Waveform
-    >>>
-    >>> class triangle(Waveform):
-    ...     '''Triangular waveform generator'''
-    ...     FUNCTIONAL_PURE = True
-    ...     Waveform.PARAMETER(amp=1.0, freq=1.0, delay=0.0)
-    ...
-    ...     def fn(self, t):
-    ...         t_adjusted = t - self.delay
-    ...         period = 1.0 / self.freq
-    ...         phase = torch.fmod(t_adjusted, period) / period
-    ...         tri = 2 * torch.abs(2 * phase - 1) - 1
-    ...         return self.amp * torch.where(t >= self.delay, tri, 0.0)
-    >>>
-    >>> # Using the custom waveform
-    >>> waveform = triangle(amp=2.0, freq=5.0)
-    >>> t = torch.linspace(0, 1, 100)
-    >>> values = waveform(t)
-
-    Waveform arithmetic:
-
-    You can perform arithmetic operations with waveforms. For example, you can add two waveforms together or add a constant to a waveform:
-
-    >>> w1 = triangle(amp=1.0, freq=2.0)
-    >>> w2 = triangle(amp=0.5, freq=2.0)
-    >>> w_sum = w1 + w2
-    >>> w_const = w1 + 3.0
-
-    This will create new waveform instances representing the sum of the two waveforms and the waveform with a constant added, respectively.
-    Arithmetic operations supported include addition (+), subtraction (-), multiplication (*), and division (/).
-
+    Custom deterministic waveforms used in functional execution must not mutate
+    module state or consume implicit randomness. This contract is trusted by
+    default. ``dn.ctx(CHECK_PURITY=True)`` enables diagnostics and requires an
+    explicit ``FUNCTIONAL_PURE = True`` declaration on each authored concrete
+    class. Poisson wrappers use Dendra's explicit sampling protocol.
     """
 
     FUNCTIONAL_PURE = False
@@ -129,6 +87,19 @@ class Waveform(SimpleParameterized):
 
     def forward(self, t):
         # An ambient default-device context must not relocate a supplied grid.
+        """Evaluate :meth:`fn` on a Tensor time grid in milliseconds.
+
+        Parameters
+        ----------
+        t : Tensor or array-like
+            Evaluation times. A Tensor keeps its device; broadcasting within ``fn``
+            determines the result's leading dimensions.
+
+        Returns
+        -------
+        torch.Tensor
+            Waveform samples with time on the final axis.
+        """
         device = t.device if torch.is_tensor(t) else None
         return self.fn(torch.as_tensor(t, device=device))
 
@@ -207,6 +178,20 @@ class Waveform(SimpleParameterized):
         )
 
     def assemble(self, start, end, dt):
+        """Evaluate this waveform on the endpoint-exclusive grid ``[start, end)``.
+
+        Parameters
+        ----------
+        start, end : float
+            Time bounds in milliseconds.
+        dt : float
+            Time spacing in milliseconds.
+
+        Returns
+        -------
+        torch.Tensor
+            Samples on a grid using the waveform's parameter or buffer device/dtype.
+        """
         ref = next(self.parameters(), None)
         if ref is None:
             ref = next(self.buffers(), torch.empty(()))

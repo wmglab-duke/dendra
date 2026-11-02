@@ -1,82 +1,49 @@
 # Examples
 
-Network implementation examples in ./net/
+Start with the [simulation guides](../docs/advanced.rst) for a walkthrough.
+Each script below runs from the repository root; use `--help` where available
+for compiler and simulation options.
+
+## Simulation, training and recording
+
+| Goal | Example |
+| --- | --- |
+| Population and Network runners, explicit bindings, replay and gradients | [`functional_api_overview.py`](functional_api_overview.py) |
+| Fit a recorded response with a pure objective | [`functional_gradient_descent.py`](functional_gradient_descent.py) |
+| Select shared parameters for optimizer groups | [`functional_source_selection.py`](functional_source_selection.py) |
+| Change extracellular contacts and waveforms between calls | [`functional_runtime_extra.py`](functional_runtime_extra.py) |
+| Record LFP from a Population or scoped Network | [`functional_lfp_configuration.py`](functional_lfp_configuration.py) |
+| Stream observations to HDF5 | [`native_callback_storage.py`](native_callback_storage.py) |
+| Initialize independent optimizer trials | [`functional_packet_initialization.py`](functional_packet_initialization.py) |
+| Save and restore a portable continuation | [`functional_continuation_checkpoints.py`](functional_continuation_checkpoints.py) |
+| Continue between native and functional execution | [`functional_native_handoff.py`](functional_native_handoff.py) |
+| Replay runtime draws across execution styles | [`shared_runtime_draw_horizons.py`](shared_runtime_draw_horizons.py) |
+| Train live indexed event schedules | [`shared_schedule_bindings.py`](shared_schedule_bindings.py) |
+
+For example:
+
+```bash
+python examples/functional_api_overview.py --backend eager
+python examples/functional_runtime_extra.py --backend eager
+```
+
+See the [functional execution guide](../docs/advanced/functional_execution.md)
+for the lifecycle and the [model-authoring guide](../docs/advanced/custom_models.md)
+for specialized examples including SDEs, tables, delay histories and constrained
+parameters. Network construction examples also live in [`net/`](net/).
 
 ## Write a custom synapse
 
-The [synapse authoring tutorial](../docs/synapse_authoring.md) explains two
-complete examples that also run as standalone scripts:
+The [synapse authoring tutorial](../docs/synapse_authoring.md) explains complete
+event-driven and continuous examples. Each script defines the mechanism, runs a
+Network and checks its outputs and gradients:
 
 ```bash
 python examples/custom_event_synapse.py
 python examples/custom_continuous_synapse.py
 ```
 
-The event example defines conductance state, ODE decay, a current, and a pure
-receive hook, then uses it through a Network and functional receive/step with
-gradients. The continuous example defines an analog input and connects a
-presynaptic gate to its current. Both scripts check their numerical results;
-the documentation build executes the same files.
-
-## Simulate and fit models
-
-[`functional_event_delivery.py`](functional_event_delivery.py) starts from an
-ordinary Network, lowers one existing dense fixed-delay NetCon, and composes
-its shared transport core with functional synapse reception and population
-stepping. It checks native/functional queue and voltage parity and weight
-gradients. See the [delivery guide](../docs/advanced/A12_functional_event_delivery.md).
-
-```bash
-python examples/functional_event_delivery.py
-```
-
-[`functional_threshold_detection.py`](functional_threshold_detection.py) lowers
-a recurrent thresholded connection, receives before observing its source, and
-checks hard/surrogate state, queues, and gradients against ordinary Network
-execution. See the [threshold guide](../docs/advanced/A13_functional_threshold_detection.md).
-
-```bash
-python examples/functional_threshold_detection.py
-```
-
-[`functional_netstim_renewal.py`](functional_netstim_renewal.py) lowers one
-seeded noisy NetStim, samples explicit draw packets, and shares its output
-between two functional projections. It checks native trajectories, gradients,
-and checkpoint continuation after restoring clocks and both RNG streams.
-See the [NetStim guide](../docs/advanced/A14_functional_netstim_renewal.md).
-
-```bash
-python examples/functional_netstim_renewal.py
-```
-
-[`functional_tensor_schedules.py`](functional_tensor_schedules.py) lowers value,
-amplitude-reference, and time-reference schedules on a standard NetStim and
-NetCon. It shares explicit source vectors across both packets and checks native
-voltages, queues, RNG continuation, and gradients. See the
-[tensor schedule guide](../docs/advanced/A15_functional_tensor_schedules.md).
-
-```bash
-python examples/functional_tensor_schedules.py
-```
-
-[`functional_heap_schedules.py`](functional_heap_schedules.py) lowers consuming
-NetStim calendars alongside renewal and tensor schedules. It resumes cloned
-source, queue, and population carry through functional and native execution,
-checking clocks, cursors, RNG state, voltages, and interval/weight gradients.
-See the [heap calendar guide](../docs/advanced/A16_functional_heap_schedules.md).
-
-```bash
-python examples/functional_heap_schedules.py
-```
-
-[`functional_delay_interpolation.py`](functional_delay_interpolation.py) compares
-shared two-/three-tap NetCon interpolation with native connected execution,
-including delay/weight/source gradients and saved-state replay. See the
-[delay interpolation guide](../docs/advanced/A17_functional_delay_interpolation.md).
-
-```bash
-python examples/functional_delay_interpolation.py
-```
+## Fit stimulation parameters
 
 [`fit_sinusoid_voltage.py`](fit_sinusoid_voltage.py) fits an injected sine's
 frequency, delay, and duration from simulated voltage recordings, optionally
@@ -141,7 +108,7 @@ plots. `--checkpointed` exercises activation-checkpointed autograd, while
 recommended performance-oriented mode for this first-order optimization. It is
 the fairer comparison with the imperative tutorial's JIT-enabled step.
 The functional API and its current limits are described in
-[`A8_functional_populations`](../docs/advanced/A8_functional_populations.rst).
+[functional execution guide](../docs/advanced/functional_execution.md).
 Run a short smoke example with:
 
 ```bash
@@ -181,7 +148,7 @@ python examples/macroscopic_descriptor_training.py
 ```
 
 See the
-[macroscopic descriptor training guide](../docs/advanced/A9_macroscopic_descriptor_training.rst)
+[macroscopic descriptor training guide](../docs/advanced/descriptor_training.rst)
 for the common optimization pattern and the other analysis interfaces.
 
 ## Differentiate threshold and chronaxie
@@ -203,6 +170,6 @@ python examples/threshold_descriptor_gradients.py
 The script checks exact hard-forward value parity and fails if a trace-derived
 slope differs from its hard finite difference by more than 2%. Its default CPU
 run normally finishes in about 15 seconds. The
-[threshold-derived descriptor guide](../docs/advanced/A9_macroscopic_descriptor_training.rst#threshold-derived-descriptors)
+[threshold-derived descriptor guide](../docs/advanced/descriptor_training.rst#threshold-derived-descriptors)
 explains the amplitude JVP, stateful replay ordering, probe checks, and
 chronaxie composition used by the script.

@@ -434,22 +434,32 @@ def _validate_callbacks(functional, callbacks):
 
 
 def export_continuation(functional, continuation, *, callbacks=None):
-    """Export a portable continuation for a lowered plan or compiled runner.
+    """Export detached owned data for a portable functional checkpoint.
 
-    ``functional`` is a lowered Population/Network plan or a ``dn.compile``
-    runner. Supply a lowered plan's bound ``FunctionalCallbacks`` collection
-    when carry is present; runners select their configured callbacks and do not
-    accept a non-None ``callbacks`` argument. Packets from ``initialize`` have
-    no callback carry and begin callbacks on their first execution. Executed
-    packets require matching callback configuration.
+    Parameters
+    ----------
+    functional : FunctionalPopulation, FunctionalNetwork or compiled runner
+        Plan/runner that validates the packet's sources, state and callbacks.
+    continuation : Continuation
+        Execution boundary to save.
+    callbacks : FunctionalCallbacks, optional
+        Explicit plan's collection when carry is present. Runners use their own
+        configured callbacks and require this argument omitted.
 
-    The versioned plain data/Tensor packet supports ``torch.save`` and
-    ``torch.load(..., weights_only=True)`` and the runner methods.
+    Returns
+    -------
+    dict
+        Plain data/Tensor packet for ``torch.save`` and
+        ``torch.load(..., weights_only=True)``. Source identity aliases and
+        trainability are retained as owned detached leaves.
 
-    Tensor identity ties and trainability are preserved as owned detached leaves;
-    upstream graphs, recording history, input/draw tapes and optimizer state are
-    excluded. Distinct views become independent snapshots. Export runs outside
-    compilation, function transforms and forward AD.
+    Notes
+    -----
+    The checkpoint excludes optimizer state, upstream graphs, recording payloads,
+    input tapes and draw tapes. Distinct Tensor views become independent snapshots.
+    Active callback configuration must match when restored; a packet exported
+    before execution starts callbacks on its first run. Call outside compilation,
+    function transforms and forward AD.
     """
     _cold_boundary()
     if not isinstance(continuation, Continuation):
@@ -474,26 +484,32 @@ def export_continuation(functional, continuation, *, callbacks=None):
 
 
 def restore_continuation(functional, packet, *, callbacks=None):
-    """Restore portable data against a compatible lowered plan or runner.
+    """Restore a portable checkpoint into a compatible plan or runner.
 
-    The existing receiving plan supplies trusted shape, dtype, device and
-    container metadata. Lowered plans accept their bound ``callbacks`` collection;
-    compiled runners select their configured callbacks. Model configuration and
-    active callback carry must match the checkpoint. Packets exported before
-    execution begin callbacks on their first run. Version-1 and manually
-    constructed packets retain strict callback matching when carry is absent.
-    Restore does not extract native values, initialize, prepare, sample, execute
-    or change plan defaults.
+    Parameters
+    ----------
+    functional : FunctionalPopulation, FunctionalNetwork or compiled runner
+        Initialized receiving plan/runner supplying trusted tensor schemas and
+        callback configuration.
+    packet : dict
+        Data returned by :func:`export_continuation`.
+    callbacks : FunctionalCallbacks, optional
+        Prepared collection for an explicit plan. Runners use their configured
+        collection and require this omitted.
 
-    The returned ``Continuation`` owns detached ordinary Tensor leaves with saved
-    identity ties and trainability. Bind those leaves before resuming with
-    ``dn.func.run``::
+    Returns
+    -------
+    Continuation
+        Independent detached Tensor leaves retaining saved identity aliases and
+        trainability. Use its restored leaves for a new optimizer or raw binding.
 
-        bound = kernel.bind(restored.parameters, constants=restored.constants)
-        state, aux = dn.func.run(bound, restored, steps=100, callbacks=callbacks)
-
-    Saved retained initialization values are independent effective sources after
-    restore; their former dependencies on raw parameters are not reconstructed.
+    Notes
+    -----
+    Restore validates configuration, tensor schemas and callback compatibility.
+    It does not read current native values, initialize, prepare, sample or execute.
+    Saved materialized sources remain independent effective values; prior upstream
+    dependencies are not reconstructed. Call outside compilation, function
+    transforms and forward AD.
     """
     _cold_boundary()
     with torch.inference_mode(False), torch.no_grad():

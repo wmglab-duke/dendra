@@ -112,7 +112,7 @@ Canonical returned-value hooks
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 For a full authoring walkthrough, see the
-:doc:`mechanism guide <advanced/A0_mechanisms_and_ions_materials>` and
+:doc:`mechanism guide <advanced/mechanisms_and_materials>` and
 :doc:`synapse_authoring`. The latter demonstrates the pure synaptic receive
 hook alongside ordinary State equations and continuous inputs.
 
@@ -135,7 +135,7 @@ The canonical hooks are:
   on ``ContinuousSynapse`` for custom analog reception. Its default implementation
   handles declared ``INPUT`` buffers and the standard reductions. Keep the
   canonical reset/receive adapters for functional delivery; see
-  :doc:`advanced/A18_functional_continuous_connectivity`.
+  :doc:`advanced/functional_execution`.
 
 Treat all arguments as read-only and return a mapping of Tensors. Dendra checks
 the declared names, shapes, dtypes, and devices on the first eager evaluation.

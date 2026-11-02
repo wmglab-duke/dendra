@@ -795,19 +795,20 @@ class PreComputedInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Modul
     This wrapper is the tetrahedral-mesh analogue of
     :class:`PreComputedInterpolate3DRect` and
     :class:`PreComputedInterpolate3DScattered`.  It delegates the actual
-    mesh-guided FEM interpolation to :class:`PreparedInterpolate3dFEM`, which
+    mesh-guided FEM interpolation to :class:`PreparedInterp3dFEM`, which
     reproduces SimNIBS ``NodeData.interpolate_scattered`` behavior.
 
     Parameters
     ----------
-    interpolator : PreparedInterpolate3dFEM
+    interpolator : PreparedInterp3dFEM
         Prepared FEM interpolator, normally created with :meth:`from_NodeData`.
     coordinate_scale : float, optional
         Multiplicative conversion from model coordinates to mesh coordinates before
         interpolation.  Use ``1e-3`` when model coordinates are in micrometers and
         the SimNIBS mesh is in millimeters.  Default is ``1.0``.
-    coordinate_offset : array-like of shape (3,), optional
-        Additive offset applied after scaling, in mesh-coordinate units.
+    coordinate_offset : array-like, optional
+        Three-element offset with shape ``(3,)``, applied after scaling in
+        mesh-coordinate units.
 
     Notes
     -----
@@ -816,7 +817,7 @@ class PreComputedInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Modul
       the supplied ``NodeData``.  For extracellular stimulation, the
       interpolated field multiplied by its temporal waveform must be in mV.
     * The SimNIBS mesh point-location step remains CPU/NumPy/Cython based inside
-      ``PreparedInterpolate3dFEM``; value gathering/blending runs in torch on the
+      ``PreparedInterp3dFEM``; value gathering/blending runs in torch on the
       interpolator device.
     * Gradients may flow to learnable field values when the prepared interpolator
       was constructed with ``learnable_values=True``.  Gradients do not flow
@@ -1028,14 +1029,15 @@ class EfieldInterpolate3DMesh(_MeshCoordinateTransformMixin, torch.nn.Module):
 
     Parameters
     ----------
-    interpolator : PreparedInterpolate3dFEM
+    interpolator : PreparedInterp3dFEM
         Prepared FEM interpolator created from vector ``ElementData``.
     coordinate_scale : float, optional
         Multiplicative conversion from model coordinates to mesh coordinates before
         interpolation.  Use ``1e-3`` when model coordinates are in micrometers and
         the SimNIBS mesh is in millimeters.  Default is ``1.0``.
-    coordinate_offset : array-like of shape (3,), optional
-        Additive offset applied after scaling, in mesh-coordinate units.
+    coordinate_offset : array-like, optional
+        Three-element offset with shape ``(3,)``, applied after scaling in
+        mesh-coordinate units.
 
     Notes
     -----

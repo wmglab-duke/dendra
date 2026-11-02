@@ -447,7 +447,7 @@ The following operations record the Slice's logical locations:
    Select mechanism-local point-process slots supported by the physical Slice.
    A :class:`dendra.models.slice.SynapseSlots` target is required when several
    independent synapse slots share one physical compartment.  See
-   :doc:`advanced/A3_synapse_banks_and_slots`.
+   :doc:`advanced/synapse_banks`.
 
 Mechanism attribute access requires a built mechanism hierarchy.  It is valid
 to retain a population Slice before insertion, but access ``selection.mech``

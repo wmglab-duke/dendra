@@ -25,45 +25,33 @@ def _snapshot_sources(tree):
 
 @dataclass(frozen=True, eq=False, init=False)
 class Continuation:
-    """Explicit in-memory state and effective sources for functional execution.
+    """In-memory simulation state, effective sources and callback carry.
 
-    Both ``dn.compile`` runners publish this packet at
-    ``auxiliary['continuation']``. Pass it as ``program(packet)`` to continue
-    simulation state, raw parameters/constants and callback carry together.
-    The packet captures the sources used by that call, including per-call
-    overrides and fresh/cache initialization replacements.
+    Attributes
+    ----------
+    state : tensor tree
+        Explicit simulation state, including clocks, solver/delivery histories and
+        RNG carry.
+    parameters, constants : mapping
+        Effective sources used by the producing execution, including per-call
+        overrides and initialization replacements.
+    callback_state : FunctionalCallbackState or None
+        Observation carry. Fresh initialization leaves it None; the first run
+        starts callbacks.
 
-    Raw-bound ``run(bound, state, ...)`` calls also publish this packet. Resume
-    with ``run(bound, packet, ...)`` when its parameter/constant Tensor objects
-    match the binding's sources. Different sources require an explicit new raw
-    binding. Prepared Population bindings retain explicit state/carry calls.
+    Notes
+    -----
+    Pass to :func:`run` with a runner, lowered plan/kernel or matching raw binding.
+    Bindings retain source ownership; continuing through one requires the same
+    parameter/constant Tensor objects. ``bind(packet)`` selects sources but does
+    not implicitly adopt its state or callback carry.
 
-    ``dn.func.initialize(functional, tensors)`` returns the same packet with
-    effective initialized sources and no callback carry. Pass it directly to
-    ``run(functional_or_kernel, packet, ...)`` and supply callbacks to begin
-    fresh recording and reductions. This host form creates a raw binding for
-    the invocation without retaining sources or preparation in the plan/kernel.
-
-    ``dn.func.initialize(program_or_plan, packet, ...)`` starts a fresh trial
-    from its effective sources and RNG carry, discarding callback carry. A
-    runner retains its initialization recipe; an explicit Population plan
-    requires ``initialization=`` because the packet does not store a recipe.
-
-    Eager plans and compiled chunks accept ``bind(packet)`` to select its raw
-    parameter/constant sources. Binding does not retain the packet or adopt
-    state/callback carry; continue with ``run(bound, packet, ...)`` explicitly.
-
-    Fields cannot be reassigned. Ordinary containers are independent snapshots
-    and remain editable, like explicit simulation state. Tensor objects, views,
-    aliases and autograd history are retained without cloning or detachment.
-    The packet contains no runner, opaque prepared frame or recording history.
-    It is an in-memory continuation, not a portable detached checkpoint.
-
-    Parameters/constants and callback carry follow the existing receiving
-    execution's validation and ownership rules. For ``dn.compile`` runners,
-    packet sources are explicit overrides and are not retained in the runner's
-    inference preparation cache. Raw bindings validate matching sources.
-    ``inputs``, ``draws`` and runtime ``extra`` remain call-local arguments.
+    Containers are snapshots, but Tensor identities, views and autograd history
+    are preserved without cloning. Use :func:`detach_continuation` to truncate
+    recurrent gradients and :func:`export_continuation` for detached portable
+    storage. ``initialize(target, packet)`` starts a fresh trial from its sources
+    and RNG with callback carry reset; a Population plan also requires a recipe.
+    Inputs, draw tapes and runtime extra remain per-call arguments.
     """
 
     state: object

@@ -46,27 +46,23 @@ class StimulationDraw(NamedTuple):
 
 
 class InitializationInput(NamedTuple):
-    """Explicit tensor inputs consumed only while constructing initial state.
+    """Population initialization values, separate from runtime inputs.
 
-    ``v_init`` is the fully expanded initial membrane voltage. ``states``
-    contains only insertion-time ``ic`` leaves, keyed by their canonical
-    functional state names. Their
-    shapes, dtypes, and devices must match the corresponding support-local
-    state leaves. ``transforms`` contains the explicitly registered tensor
-    inputs of pure Population initialization transforms. Keeping
-    initialization-only values separate from runtime constants makes batching
-    and differentiation explicit without invalidating prepared transition
-    workspaces.
+    ``v_init`` is the fully expanded initial membrane voltage. ``states`` maps
+    insertion-time initial conditions to canonical state names; shapes, dtypes and
+    devices must match their support-local state. ``transforms`` contains explicit
+    Tensor inputs of registered initialization transforms.
 
-    ``cache`` contains a Population-owned steady-state snapshot when one was
-    bound during lowering. Cached initialization restores this mapping,
-    skips fresh initialization hooks, and returns effective constants with
-    the initialized parameter and state packet. ``random_draw`` supplies RAND
-    and NOISE base draws and resulting stream state from
-    ``sample_initialization_draw``.
-    Host runners sample an independent packet when this field is omitted.
-    ``stimulation`` supplies Poisson draws and generator carry for mechanism
-    currents evaluated during fresh initialization.
+    ``cache`` is a bound Population steady-state snapshot. When native cache policy
+    permits restoration, cached state/materializations replace fresh hooks and
+    produce effective initialized sources. Reseeding, retained samples and cache
+    invalidation follow the model's native initialization policy.
+
+    ``random_draw`` and ``stimulation`` are supported component draw fields. Prefer
+    the separate ``draws=InitializationDraws(...)`` argument for complete replay;
+    it cannot be combined with these fields. Host initialization samples missing
+    draws automatically; pure plan initialization requires explicit stochastic
+    inputs. These fields do not supply runtime stimulation tapes.
     """
 
     v_init: torch.Tensor
@@ -78,7 +74,14 @@ class InitializationInput(NamedTuple):
 
 
 class PopulationTensors(NamedTuple):
-    """Explicit tensors extracted from or initialized for one Population."""
+    """Explicit parameter, constant, state and initialization inputs for a Population.
+
+    Native extraction retains raw parameter identities and snapshots state and
+    constants. Fresh initialization can replace effective source entries while
+    preserving their gradients. Use :meth:`independent_parameters` to own separate
+    optimization leaves, or :func:`inspect_sources` to inspect aliases and select
+    deduplicated trainable leaves.
+    """
 
     parameters: dict[str, torch.Tensor]
     constants: dict[str, torch.Tensor]
@@ -87,10 +90,11 @@ class PopulationTensors(NamedTuple):
 
     @property
     def trainable_parameters(self) -> dict[str, torch.Tensor]:
-        """Named parameter leaves with live ``requires_grad=True`` flags.
+        """Named parameter entries with live ``requires_grad=True`` flags.
 
-        Shared aliases remain visible. Deduplicate values by identity before
-        passing them to an optimizer.
+        Aliases and gradient-bearing nonleaf expressions remain visible. Use
+        ``dn.func.inspect_sources(tensors).trainable_leaves`` for deduplicated leaf
+        Tensors suitable for a PyTorch optimizer.
         """
         return {
             name: value

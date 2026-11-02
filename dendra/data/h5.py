@@ -6,6 +6,20 @@ from natsort import natsorted
 
 
 class H5Reader:
+    """Read a Recorder HDF5 file as lazily concatenated Dask arrays.
+
+    Parameters
+    ----------
+    path : str or path-like
+        Existing HDF5 recording file. Finish and close the recorder before reading.
+
+    Notes
+    -----
+    Use as a context manager. ``reader[variable][run_index]`` selects a run;
+    indexing that run returns a lazy Dask array. Compute the array while the
+    reader is open. Access through a closed reader raises ``ValueError``.
+    """
+
     def __init__(self, path):
         self.path = path
         # Assign before opening so finalization is safe when h5py raises while
@@ -23,6 +37,7 @@ class H5Reader:
             raise ValueError("H5Reader is closed.")
 
     def __getitem__(self, key):
+        """Return the named recorded variable as an :class:`H5Var` handle."""
         self._ensure_open()
         value = self.file[key]
         if not isinstance(value, h5py.Group):
@@ -49,6 +64,7 @@ class H5Reader:
         self.close()
 
     def vars(self):
+        """Return recorded variable names in natural sort order."""
         self._ensure_open()
         return natsorted(self.file.keys())
 
@@ -57,12 +73,19 @@ class H5Reader:
 
 
 class H5Var:
+    """Variable handle returned by :class:`H5Reader`.
+
+    Index with a non-negative integer to select ``run_0``, ``run_1``, and so on.
+    The parent reader must remain open while reading a run.
+    """
+
     def __init__(self, group, reader, name):
         self.group = group
         self.reader = reader
         self.name = name
 
     def __getitem__(self, key: int):
+        """Return the numbered run as an :class:`H5Rec` handle."""
         self.reader._ensure_open()
         if isinstance(key, bool):
             raise TypeError(f"Run index must be a non-negative integer, got {key!r}.")
@@ -82,9 +105,11 @@ class H5Var:
         return H5Rec(value, self.reader, self.name, key)
 
     def n(self):
+        """Return the number of stored runs for this variable."""
         return len(self.keys())
 
     def keys(self):
+        """Return stored run names in natural sort order."""
         self.reader._ensure_open()
         return natsorted(self.group.keys())
 
@@ -93,6 +118,20 @@ class H5Var:
 
 
 class H5Rec:
+    """One run returned by indexing an :class:`H5Var` handle.
+
+    Attributes
+    ----------
+    data : dask.array.Array
+        Recording chunks concatenated along the leading time axis in natural
+        chunk order. Other axes preserve the Recorder's selected layout.
+
+    Notes
+    -----
+    Indexing this handle returns a lazy slice of ``data``. Compute it before
+    closing the parent :class:`H5Reader`.
+    """
+
     def __init__(self, group, reader, name, run):
         self.group = group
         self.reader = reader
@@ -138,6 +177,7 @@ class H5Rec:
         self.data = da.concatenate(arrays, axis=0)
 
     def __getitem__(self, key):
+        """Return a lazy slice of the concatenated recording."""
         self.reader._ensure_open()
         return self.data[key]
 

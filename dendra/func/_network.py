@@ -56,14 +56,13 @@ from ._types import FunctionalizationError, StepInput
 
 
 class NetworkTensors(NamedTuple):
-    """Aggregate parameters, constants, and complete-boundary carry.
+    """Explicit parameters, constants and runtime state for a Network plan.
 
-    Extraction produces independent snapshots retaining genuine shared
-    parameter identities. Fresh initialization returns the resulting raw parameters,
-    preserving unchanged explicit leaves and their gradient history. Component
-    names match the ordinary Network's collections. Clock and RNG byte tensors
-    retain their native devices, including CPU clock metadata in an otherwise
-    accelerator-resident Network.
+    Extraction owns detached Tensor snapshots and preserves shared parameter
+    identities across component mappings. Collection/component names match the
+    native Network. Initialization can replace effective sources while preserving
+    unchanged explicit leaves and their gradient history. Use
+    :func:`inspect_sources` to inspect aliases and deduplicated optimizer leaves.
     """
 
     parameters: dict
@@ -77,9 +76,10 @@ class NetworkTensors(NamedTuple):
 
     @property
     def trainable_parameters(self):
-        """Return named leaves currently requiring gradients, including shared aliases.
+        """Named gradient-requiring parameter entries, including aliases and nonleaves.
 
-        Deduplicate values by identity before passing them to an optimizer.
+        Use ``dn.func.inspect_sources(tensors).trainable_leaves`` for deduplicated
+        optimizer leaves.
         """
         return {
             name: value
@@ -400,46 +400,28 @@ def _eligible(network):
 
 
 class FunctionalNetwork:
-    """A frozen canonical graph composing the existing pure component plans.
+    """Explicit-state execution plan for a compatible initialized Network.
 
-    The phase order is shared with native Network execution: NetStim, connected
-    continuous-target resets, continuous projections, event projections, then
-    population solves. Sources bind automatically to the current explicit
-    population frame, including updates from preceding receives.
+    Create with :func:`make_functional`. The plan preserves native ordering for
+    NetStim, continuous delivery, event delivery and Population solves. Structure,
+    timestep, training mode and source routing are fixed; parameters, constants,
+    delivery histories and RNG state remain explicit execution inputs.
 
-    ``step`` consumes opaque reusable preparation; ``prepare_and_step`` derives
-    it within one compile-safe invocation. Both return ``(state, aux)`` without
-    changing the native model or input trees. Sample NetStim draw packets with
-    ``sample_step_draw`` outside compiled/transformed code, then supply one per
-    timestep. Complete-boundary carry contains clocks, queues and RNG state;
-    receiver scratch is local to a single invocation.
+    :meth:`extract` creates detached snapshots preserving shared parameter aliases.
+    Use :meth:`bind` and :func:`run` for host scheduling, or
+    :meth:`prepare_and_step`/:meth:`prepare_and_rollout` for combined tensor
+    operations. None of these advances the native Network. A compatible
+    single-device Network supports event and continuous connections, declared
+    stochastic mechanisms, schedules and the selected Population solvers.
 
-    Parameters/constants follow the component adapters' conventions. Population
-    and connection parameters retain their raw source coordinates and shared
-    identities, including NetStim renewal sources. Snapshot extraction is detached and does
-    not perform fresh initialization. ``commit_state_`` publishes runtime carry
-    only; align native parameters/schedules separately before continuation.
-    Topology, source bindings, mode, timestep, and native phase ordering are
-    frozen. Canonical single-device Networks use dense, source-history training,
-    packed-history, or sparse-calendar inference event runtimes and integer
-    continuous delays supported by the component plans. ``dn.compile`` uses this
-    plan for snapshot or fresh Network initialization; the lower-level methods support
-    explicit preparation and functional transforms.
+    ``extra`` maps Population names to extracellular field/waveform bindings.
+    Explicit ``Inputs.ve`` cannot drive the same Population as bound ``extra``.
+    ``pending_capacity`` sets event-calendar capacities; overflow raises before
+    publishing a result. Change fixed model configuration by lowering again.
 
-    ``extra`` maps Population names to extracellular stimulation bindings,
-    each using one ``(field, Waveform)`` pair or a sequence of contacts. Fields
-    and waveform leaves appear in the selected Population's explicit
-    ``stimulation.extra.*`` parameters. Shared authored Tensor objects retain
-    their aliases across the Network. Bound stimulation uses the Network clock
-    before each timestep; explicit ``ve`` inputs for the same Population cannot
-    be combined with it.
-
-    ``pending_capacity`` bounds each sparse pending calendar independently of
-    delay depth. Supply one positive integer or a connection-name mapping.
-    Active-calendar defaults cover at least 16 entries, twice the edge count,
-    and the imported pending count. Intrinsic-only packed plans with no pending
-    traffic omit unused calendar storage. Host execution checks overflow before
-    returning a result.
+    Use :func:`commit_continuation_` to transfer detached sources and runtime state
+    to a native model. The lower-level :meth:`commit_state_` transfers state only
+    and requires the native sources to match separately.
     """
 
     def __init__(self, network, *, extra=None, pending_capacity=None):
@@ -1145,7 +1127,14 @@ class FunctionalNetwork:
         return NetworkTensors(parameters, constants, state)
 
     def extract(self, network=None):
-        """Take independent detached snapshots from a compatible initialized graph."""
+        """Snapshot sources and complete-boundary state from a compatible Network.
+
+        ``network`` defaults to the native source used during lowering. The returned
+        :class:`NetworkTensors` owns detached parameter, constant and state snapshots;
+        genuine source aliases remain shared within that packet. Extraction performs
+        no fresh initialization or accepted timestep. Use :func:`capture_continuation`
+        when a native boundary should be returned directly as a Continuation.
+        """
         if torch.compiler.is_compiling():
             raise FunctionalizationError(
                 "Extract Network tensors outside torch.compile."
@@ -2321,21 +2310,34 @@ class FunctionalNetwork:
 
 
 def make_functional_network(network, *, extra=None, pending_capacity=None):
-    """Lower a Network with independent explicit tensors and bounded pending carry.
+    """Lower an initialized Network to a pure plan and independent Tensor snapshots.
 
-    ``extra`` maps Population names to one ``(field, Waveform)`` pair or a
-    sequence of contacts, using the same stimulation bindings as
-    :func:`make_functional`. Omitted Populations have no bound extracellular
-    stimulation. Fields and waveform leaves are explicit parameters, with
-    shared Tensor aliases preserved across components.
+    Parameters
+    ----------
+    network : Network
+        Initialized single-device Network. Its initialized timestep is retained.
+    extra : mapping, optional
+        Population names mapped to ``(field, Waveform)`` pairs or sequences of
+        contacts. Omitted Populations have no bound extracellular stimulation.
+    pending_capacity : int or mapping, optional
+        Positive calendar capacity, either shared across event connections or
+        mapped by connection name. Defaults accommodate existing queued events
+        and use at least twice each connection's edge count where required.
 
-    ``pending_capacity`` is a positive entry count per calendar, or a mapping
-    from event-connection names to counts. Omitted capacities use at least
-    twice the connection count and accommodate existing checkpoint traffic;
-    intrinsic-only packed connections with no pending traffic need no calendar
-    allocation.
-    Overflow raises at host execution boundaries; retry from the input state
-    with a larger-capacity plan.
+    Returns
+    -------
+    functional : FunctionalNetwork
+        Immutable configuration plan using shared native numerical/event policies.
+    tensors : NetworkTensors
+        Independent detached state, raw parameter and constant snapshots. Shared
+        Tensor aliases are preserved across components.
+
+    Notes
+    -----
+    Intrinsic-only packed connections without pending traffic need no calendar
+    allocation. Calendar overflow raises at host execution boundaries; retry from
+    the pre-call native boundary after lowering with a larger capacity. Calendar
+    tensor shapes are fixed by each plan.
     """
     from ._lowering import _lower_network
 

@@ -168,6 +168,7 @@ class BoundPopulation:
 
     @property
     def functional(self) -> FunctionalPopulation:
+        """The lowered model plan that owns this binding."""
         return self._functional
 
     @property
@@ -262,6 +263,7 @@ class BoundPopulation:
 
     @property
     def compiled_chunk(self) -> CompiledPopulationChunk | None:
+        """The bound fixed-width kernel, or None for an eager binding."""
         return self._compiled_chunk
 
     @property

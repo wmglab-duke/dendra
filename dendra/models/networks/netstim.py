@@ -106,8 +106,7 @@ def _matching_heap_configuration(previous, current):
 
 
 class NetStim(DNModule, Sliceable):
-    r"""
-    Differentiable spike generator modeled after NEURON's NetStim.
+    """Differentiable spike generator modeled after NEURON's NetStim.
 
     The last tensor dimension indexes the ``N`` independent NetStim generators.
     Any leading dimensions are treated as batch dimensions. For example, an
@@ -121,7 +120,7 @@ class NetStim(DNModule, Sliceable):
 
     .. math::
 
-        T_{k+1} = T_k + (1 - \eta)\,\Delta + \eta\,\Delta\,E,
+        T_{k+1} = T_k + (1 - \\eta)\\,\\Delta + \\eta\\,\\Delta\\,E,
 
     where ``Delta = interval``, ``eta = noise`` in ``[0,1]``, and ``E`` is
     unit-rate exponential. When ``eta=0`` firing is periodic; when ``eta=1``
@@ -152,6 +151,10 @@ class NetStim(DNModule, Sliceable):
         Sigmoid temperature for the straight-through gate (ms). Default is 0.1.
     seed : int, optional
         Seed for reproducible randomness. Default is None.
+    device : str or torch.device, optional
+        Tensor device. Uses the Dendra context, defaulting to CPU.
+    dtype : torch.dtype or str, optional
+        Floating-point dtype. Uses the Dendra context, defaulting to float32.
     """
 
     __constants__ = ["seed"]

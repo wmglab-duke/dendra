@@ -71,7 +71,7 @@ The two scopes of `advance` have different jobs:
 
 `assigned_values` and current methods may be evaluated several times during
 one step. Keep timers and counters out of them. See the
-{doc}`mechanism authoring guide <advanced/A0_mechanisms_and_ions_materials>`
+{doc}`mechanism authoring guide <advanced/mechanisms_and_materials>`
 and {doc}`API reference <api/dendra.models.mechanisms>` for the complete hook
 contracts and worked preparation/initialization examples.
 
@@ -165,17 +165,17 @@ shape; a returned replacement must have the exact declared shape.
 The gradient of the next conductance with respect to its payload is
 $\exp(-0.1/2) \approx 0.95122942$. Functional reception handles this local
 transition. A shared dense fixed-delay NetCon core supplies explicit queued
-payloads as described in {doc}`advanced/A12_functional_event_delivery`.
+payloads as described in {doc}`advanced/functional_execution`.
 Shared threshold detection and ordered source observation are described in
-{doc}`advanced/A13_functional_threshold_detection`. Shared NetStim generation
+{doc}`advanced/functional_execution`. Shared NetStim generation
 with explicit draws and clock/RNG state is described in
-{doc}`advanced/A14_functional_netstim_renewal`. Shared tensor schedules and
-indexed bindings are described in {doc}`advanced/A15_functional_tensor_schedules`.
-Consuming heap calendars are described in {doc}`advanced/A16_functional_heap_schedules`.
+{doc}`advanced/functional_execution`. Shared tensor schedules and
+indexed bindings are described in {doc}`advanced/functional_execution`.
+Consuming heap calendars are described in {doc}`advanced/functional_execution`.
 Construct connected Networks with the ordinary Network API, then execute them
 natively or with `dn.compile(network)`. See
-{doc}`advanced/A21_functional_network_compile` for compiled execution and
-{ref}`functional-event-receive` for the full functional receive contract.
+{doc}`advanced/functional_execution` for compiled execution and
+{ref}`functional-execution` for the full functional receive contract.
 
 The complete event example runs here:
 
@@ -197,7 +197,7 @@ Put continuous conductance decay in a State equation, as above, and use
 timestep of decay inside each receive call would multiply the decay when
 several connections target the same synapse. For independent contacts at the
 same compartment, use separate local slots as described in
-{doc}`advanced/A3_synapse_banks_and_slots`.
+{doc}`advanced/synapse_banks`.
 
 (custom-continuous-synapse)=
 ## A continuous conductance synapse
@@ -253,7 +253,7 @@ declares persistent, checkpointed delivery buffers managed by the Network.
 The latter exposes a read-only, ephemeral value to a nested State equation;
 `Population.bind_input` supplies it from a declared field within the same
 Population. Declaring `State.INPUT` alone creates no intercellular connection.
-See {ref}`functional-input-bindings` for the binding contract.
+See {ref}`functional-execution` for the binding contract.
 
 ### Connect and verify the analog projection
 
@@ -293,10 +293,10 @@ The complete continuous example runs here:
 The ordinary Network owns continuous input resets, sampling, reductions, and
 delays. These operations share pure tensor cores with the explicit functional
 projection and receiver APIs. See
-{doc}`advanced/A18_functional_continuous_connectivity` for a complete connected
+{doc}`advanced/functional_execution` for a complete connected
 example, differentiable weights and source values, and checkpoint continuation.
 Custom reception uses `continuous_receive_values`; leave the standard reset
-and receive adapters in place. See {doc}`advanced/A19_functional_network_lowering`
+and receive adapters in place. See {doc}`advanced/functional_execution`
 for automatic canonical single-device Network composition with the same
 component plans and native ordering.
 
@@ -319,5 +319,5 @@ prove purity for every payload or state.
 
 For migration from the earlier mutation-based hook API, see
 {doc}`upgrading`. Initialization precedence and workspace timing are detailed
-in {doc}`advanced/A7_model_initialization` and the
+in {doc}`advanced/model_initialization` and the
 {doc}`mechanism API reference <api/dendra.models.mechanisms>`.

@@ -473,28 +473,36 @@ def _workspace_completion(target):
 
 
 def commit_continuation_(functional, target, continuation):
-    """Transfer detached sources, runtime carry and RNG to a native model.
+    """Publish detached effective sources and runtime state to a native model.
 
-    Accept a lowered Population/Network plan or a runner from ``dn.compile``.
-    ``target`` must be a compatible initialized native model. Return that model.
-    Existing native Parameter objects, their trainability, gradients and source
-    aliases are retained. Incoming source and state Tensor graphs are detached;
-    subsequent native gradients belong to the receiving model's raw sources.
+    Parameters
+    ----------
+    functional : FunctionalPopulation, FunctionalNetwork or compiled runner
+        Plan/runner describing the incoming packet.
+    target : Population or Network
+        Compatible initialized receiving native model.
+    continuation : Continuation
+        Effective sources, simulation state and RNG position to transfer.
 
-    Validate and materialize on an isolated model before publication. Unsupported
-    source layouts, changed fixed configuration and effective overrides without
-    an equivalent native recipe reject without changing the receiving model.
-    No initialization or random sampling is performed. Ordinary state-only
-    ``plan.commit_state_`` methods retain their existing graph-preserving API.
+    Returns
+    -------
+    Population or Network
+        The updated target. Existing native Parameter objects, trainability,
+        gradients and source aliases are retained. Subsequent gradients belong to
+        the receiving native sources, not the detached incoming prefix.
 
-    Callback carry is separate: this operation neither installs callbacks nor
-    opens storage. Reuse its prepared collection and explicit carry, or use
-    export/restore between collections. Inputs and call-local extracellular
-    ``extra`` remain invocation arguments. Native ``step`` accepts one
-    ``RuntimeDraws`` frame for NOISE/SDE, Network NetStim and Population/Network
-    mechanism-owned injections and solver-owned intra/call-local extra Poisson
-    banks. Native ``run``,
-    ``longrun`` and ``longrun_checkpointed`` accept time-leading draw tapes.
+    Notes
+    -----
+    Compatibility and equivalent source materialization are checked before
+    publication. Unsupported layouts/configuration/overrides reject without
+    changing the target. No fresh initialization or random sampling runs.
+    State-only plan ``commit_state_`` methods remain available when sources are
+    already aligned and graph-preserving state transfer is required.
+
+    Callback carry is separate: reuse a compatible prepared collection/carry or
+    transfer it with callback export/restore. Inputs, draw tapes and call-local
+    extra remain execution arguments. Call outside compilation, function transforms
+    and forward AD.
     """
     _cold_boundary("commit_continuation_")
     if type(continuation) is not Continuation:

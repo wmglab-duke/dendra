@@ -11191,10 +11191,19 @@ def _compiled_initialization_structure_matches(functional) -> bool:
 
 
 class FunctionalPopulation:
-    """Immutable execution plan for supported deterministic scalar models.
+    """Explicit-state execution plan for a compatible initialized Population.
 
-    Construct instances with :func:`make_functional`. Existing Population
-    execution is not redirected through this reference path.
+    Create with :func:`make_functional`. The plan fixes model structure, tensor
+    schemas and a nominal timestep; parameters, constants and evolving state are
+    explicit arguments. Supported models include point, cable, tree and packed
+    Populations, with deterministic or declared stochastic mechanisms.
+
+    :meth:`extract` reads native sources, :meth:`bind` creates a raw binding, and
+    :func:`run` schedules it. Use :meth:`prepare_and_step` or
+    :meth:`prepare_and_rollout` to keep preparation inside a compiled or transformed
+    tensor function. Execution never redirects or advances the native Population.
+    Unsupported model hooks or configurations raise :class:`FunctionalizationError`
+    when lowered or validated.
     """
 
     @property
@@ -12561,12 +12570,13 @@ class FunctionalPopulation:
         return FunctionalExtra(self._population, extra)
 
     def make_callbacks(self, callbacks):
-        """Bind named native functional callbacks into an immutable plan.
+        """Bind a named mapping of callback configurations to this plan.
 
-        Callbacks execute in functional rollouts and host runners. A bound
-        compiled chunk fuses each callback update with its model transition.
-        Values must implement :class:`dendra.func.FunctionalCallback`; built-ins
-        such as :class:`dendra.func.Recorder` provide familiar common behavior.
+        Accepts supported built-in Dendra callbacks and pure
+        :class:`FunctionalCallback` implementations. Returns :class:`FunctionalCallbacks`
+        for native/functional execution on compatible models. Live callback carry
+        belongs to the returned collection; use callback export/restore to transfer
+        carry between independently prepared collections.
         """
         from ._callbacks import FunctionalCallbacks
 
@@ -13493,7 +13503,21 @@ class FunctionalPopulation:
         return state
 
     def extract(self, population: Population | None = None) -> PopulationTensors:
-        """Extract explicit initialization, constants/state, and raw parameters."""
+        """Read explicit sources and state from a compatible initialized Population.
+
+        ``population`` defaults to the source used during lowering. Raw parameter
+        Tensors retain their native identities; constants, runtime state and
+        initialization values are snapshots. Registered stimulation leaves are included
+        in the source mappings. Use ``tensors.independent_parameters(...)`` for owned
+        optimization leaves, or :func:`capture_continuation` for an owned detached
+        snapshot of the complete execution boundary.
+
+        Returns
+        -------
+        PopulationTensors
+            Parameter, constant, state and initialization-input mappings accepted by
+            this plan. Extraction does not initialize or advance the native model.
+        """
         return self._extract(population)
 
     def _extract(self, population=None, *, snapshots=None):
@@ -13828,7 +13852,19 @@ class FunctionalPopulation:
         )
 
     def prepare(self, parameters, constants):
-        """Materialize an eagerly reusable, freshness-checked tensor plan."""
+        """Materialize reusable coefficients from raw parameters and constants.
+
+        Returns an opaque plan-bound prepared value for :meth:`step` and
+        :meth:`rollout`. Input identities and mutation versions are checked when it is
+        used; changing its sources requires preparing again. Inference tensors without
+        version counters are not accepted as preparation inputs.
+
+        Preparation records gradients under the caller's gradient mode. Recreate it
+        for independent training forwards. For automatic per-invocation ownership use
+        ``bind(parameters, constants=constants)``. Inside ``torch.compile`` use
+        :meth:`prepare_and_step` or :meth:`prepare_and_rollout` instead of transporting
+        an opaque prepared value across the compiled boundary.
+        """
         self._validate_source()
         return self._prepare_source_validated(parameters, constants)
 
@@ -17839,11 +17875,18 @@ class FunctionalPopulation:
         callback_state=None,
         draws=None,
     ):
-        """Run an eager/torch.func rollout from an opaque prepared plan.
+        """Advance explicit state using a prepared Population and time-leading inputs.
 
-        A plan from :meth:`make_callbacks` returns finalized callback values
-        under ``auxiliary["callbacks"]``. Its explicit result state may be
-        supplied as ``callback_state`` when continuing without reinitializing.
+        ``parameters`` and ``prepared`` must match the identities/versions used by
+        :meth:`prepare`. ``steps`` selects the accepted count; supplied input/draw
+        tapes must have that leading length. Omitted inputs retain registered
+        stimulation. Stochastic values are explicit through ``draws=RuntimeDraws(...)``.
+
+        Returns ``(state, auxiliary)`` without mutating its inputs or native model.
+        Named callbacks produce ``auxiliary["callbacks"]``; pass their returned state
+        as ``callback_state`` to continue without another initial sample. This is the
+        explicit prepared form for eager execution and supported ``torch.func``
+        transforms. Use :func:`run` for duration scheduling and automatic host sampling.
         """
         if draws is not None:
             inputs = _with_runtime_draws(inputs, draws)
@@ -17875,7 +17918,14 @@ class FunctionalPopulation:
         callback_state=None,
         draws=None,
     ):
-        """Derive and consume coefficients atomically, including under compile."""
+        """Prepare raw sources and execute an explicit Population rollout in one call.
+
+        Arguments and results follow :meth:`rollout`, with raw ``constants`` replacing
+        the opaque prepared value. Preparation belongs to this invocation, preserving
+        its source gradients. This combined tensor operation can be used inside
+        ``torch.compile`` or supported ``torch.func`` transforms. Draws must be explicit;
+        use :func:`run` for host-side automatic sampling and duration scheduling.
+        """
         if draws is not None:
             inputs = _with_runtime_draws(inputs, draws)
         self._validate_source()
@@ -17906,7 +17956,13 @@ class FunctionalPopulation:
         callback_state=None,
         draws=None,
     ):
-        """Advance one functional timestep without mutating the Population."""
+        """Advance one timestep from explicit state and one input/draw frame.
+
+        Uses the parameters and opaque value returned by :meth:`prepare`. ``inputs``
+        is one :class:`Inputs` frame; ``draws`` is one :class:`RuntimeDraws` frame.
+        Returns ``(state, auxiliary)`` using the same callback contract as
+        :meth:`rollout`, without changing native model state or supplied tensor values.
+        """
         inputs = _with_runtime_draws(inputs, draws, step=True)
         inputs = _population_inputs(inputs, step=True)
         for name, value in zip(("ve", "intra"), inputs):
@@ -17955,7 +18011,13 @@ class FunctionalPopulation:
         callback_state=None,
         draws=None,
     ):
-        """Derive coefficients and advance one atomic, compile-safe step."""
+        """Prepare raw sources and advance one pure Population timestep.
+
+        This is :meth:`step` with raw constants in place of an opaque prepared value.
+        It returns ``(state, auxiliary)`` and preserves gradients through both
+        preparation and execution. Use this combined form inside ``torch.compile`` or
+        supported ``torch.func`` transforms; supply stochastic draws explicitly.
+        """
         inputs = _with_runtime_draws(inputs, draws, step=True)
         inputs = _population_inputs(inputs, step=True)
         for name, value in zip(("ve", "intra"), inputs):
@@ -18097,42 +18159,33 @@ class FunctionalPopulation:
     def compile_rollout_chunk(
         self, steps: int, *, execution: str = "default", **compile_options
     ):
-        """Create a freshness-checked fixed-length compiled rollout.
+        """Create a fixed-width compiled Population kernel.
 
-        Preparation remains outside the compiled boundary and can therefore be
-        reused across calls. The default, scan and unrolled modes support
-        ordinary autograd, allowing a Python loop over this callable to build
-        exact BPTT without statically compiling the complete time horizon.
+        Parameters
+        ----------
+        steps : int
+            Positive number of accepted steps in each direct kernel invocation.
+        execution : {"default", "scan", "unrolled", "while"}, default "default"
+            Scan supports first-order training; while is inference-only. Unrolled
+            execution expands the fixed-width recurrence. Default selects inference
+            looping when supported and otherwise retains the differentiable recurrence.
+        **compile_options
+            Options for ``torch.compile``, including ``backend``, ``fullgraph`` and
+            ``disable``.
 
-        ``execution="scan"`` opts into a horizon-independent loop graph on
-        PyTorch 2.14 or newer. Dendra qualifies the compiler's correctness
-        interfaces and installs a narrowly scoped process-local repair when
-        this mode is selected; an incompatible contract raises explicitly.
-        Ordinary
-        backward is supported; ``create_graph=True`` raises explicitly. Calls
-        inside ``torch.func`` or forward AD use the ordinary eager recurrence.
+        Returns
+        -------
+        CompiledPopulationChunk
+            Bind raw sources with ``kernel.bind(tensors_or_continuation)`` and call
+            :func:`run` for arbitrary horizons, cached shorter tails and callbacks.
 
-        With ordinary Inductor, CPU scan calls under ``torch.no_grad()`` or
-        ``torch.inference_mode()`` use a bounded timestep block and default to a
-        C++ loop wrapper. Pass ``options={"cpp_wrapper": False}`` to select the
-        Python wrapper. Explicit compiler choices take precedence. Gradient-
-        enabled scan and accelerator scan retain their one-step bodies and
-        original compiler settings.
-
-        The default uses a bounded inference loop when available, including
-        capture-compatible pure functional callbacks. Gradient-enabled calls
-        and unavailable capture retain the unrolled recurrence. Select
-        ``execution="unrolled"`` to require that recurrence in inference too.
-        Inspect ``execution_report()`` after a call for its actual dispatch.
-
-        ``execution="while"`` explicitly requests the shared inference loop,
-        with capture-compatible pure callbacks or no callbacks. Enabled compiled
-        calls require ``torch.no_grad()`` or ``torch.inference_mode()``. Chunks
-        of at least four steps raise if their loop cannot be captured; shorter
-        chunks and host-run tails use the bounded unrolled path. This does not
-        change the default mode's gradient or automatic fallback behavior.
-        ``disable=True`` retains eager diagnostic execution, and active
-        ``torch.func`` transforms or forward AD retain their eager fallback.
+        Notes
+        -----
+        Population while kernels of at least four steps require capturable inference
+        loops; smaller widths/tails use bounded unrolled execution. Transform and
+        forward-AD calls use eager fallback. Higher-order reverse-mode differentiation
+        through compiled scan/while is unsupported. Inspect ``execution_report()``
+        after execution to see the actual dispatch.
         """
         from ._compiled import CompiledPopulationChunk
 

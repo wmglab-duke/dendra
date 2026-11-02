@@ -132,6 +132,7 @@ class BoundNetwork:
 
     @property
     def functional(self) -> FunctionalNetwork:
+        """The lowered model plan that owns this binding."""
         return self._functional
 
     @property
@@ -146,6 +147,7 @@ class BoundNetwork:
 
     @property
     def compiled_chunk(self) -> CompiledNetworkChunk | None:
+        """The bound fixed-width kernel, or None for an eager binding."""
         return self._compiled_chunk
 
     @property

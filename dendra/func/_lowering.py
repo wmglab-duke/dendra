@@ -35,32 +35,39 @@ def make_functional(
     tuple[FunctionalPopulation, PopulationTensors]
     | tuple[FunctionalNetwork, NetworkTensors]
 ):
-    """Lower an initialized Population or Network into an explicit-state plan.
+    """Lower an initialized Population or Network into explicit tensor execution.
 
-    ``dt`` is required. For a Network it must match the initialized timestep;
-    lowering does not initialize the model or change its timestep. The returned
-    pair is a :class:`FunctionalPopulation` and :class:`PopulationTensors`, or
-    a :class:`FunctionalNetwork` and :class:`NetworkTensors`, respectively.
+    Parameters
+    ----------
+    population : Population or Network
+        Initialized compatible source model. Unsupported hooks/configurations raise
+        FunctionalizationError; lowering does not initialize or advance the source.
+    dt : float
+        Positive solver timestep in ms. A Network must already use that timestep.
+    extra : stimulation specification or mapping, optional
+        Extracellular field/waveform pair or contact sequence; Networks use
+        Population-name mappings. Stimulation Tensor identities and aliases are
+        retained in the returned source mappings.
+    pending_capacity : int or mapping, optional
+        Network event-calendar capacities. Overflow raises during host execution;
+        retry from the input boundary with a larger-capacity plan.
 
-    Population extraction retains native raw parameter Tensor references.
-    Network extraction owns detached snapshots and preserves shared parameter
-    aliases. Both expose ``parameters``, ``constants`` and ``state`` for raw
-    binding with ``plan.bind(parameters, constants=constants)`` and execution
-    with :func:`run`. Lowering leaves native simulation state unchanged.
+    Returns
+    -------
+    functional : FunctionalPopulation or FunctionalNetwork
+        Immutable model plan accepting explicit sources and state.
+    tensors : PopulationTensors or NetworkTensors
+        Raw parameters, constants, runtime state and model-specific initialization
+        inputs. Population raw parameters retain native Tensor references; Network
+        extraction owns detached snapshots preserving aliases.
 
-    ``extra`` binds extracellular stimulation: one ``(field, Waveform)`` pair
-    or a sequence of contacts for a Population, or a mapping from Population
-    names to those bindings for a Network. Shared field and waveform parameter
-    aliases are preserved within the returned mapping.
-
-    ``pending_capacity`` applies only to Network pending-event calendars. It is
-    a positive entry count per calendar, or a connection-name mapping. Omitted
-    capacities accommodate existing traffic and at least twice the edge count
-    for active calendars. Overflow raises at host execution boundaries; retry
-    from the input state with a larger-capacity plan.
-
-    :func:`make_functional_network` is a compatibility entry point that uses the
-    initialized Network timestep without a separate ``dt`` argument.
+    Notes
+    -----
+    Use ``tensors.independent_parameters(...)`` for independent optimization leaves.
+    Bind raw sources with ``functional.bind(tensors)`` and execute with :func:`run`,
+    or use combined preparation/transition methods inside tensor transforms.
+    :func:`make_functional_network` is the Network-specific entry point using its
+    initialized timestep without a separate dt argument.
     """
     if isinstance(population, Network):
         if (

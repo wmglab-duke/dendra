@@ -5308,16 +5308,56 @@ class Network(RNGMixin):
         self._syn_cache["continuous"] = continuous_cache
 
     def clear_state_cache(self):
+        """Clear Network-owned Population and connection initialization caches.
+
+        Returns
+        -------
+        None
+            The running model state is unchanged. Later initialization no longer
+            restores Network-owned caches. Individual Populations' steady-state
+            caches are retained and can still restore during initialization;
+            clear those separately with ``population.clear_steady_state()``.
+        """
         self._state_cache.clear()
         self._syn_cache.clear()
 
     def load_state_cache(self, state_cache=None, syn_cache=None):
+        """Install initialization caches without restoring running state immediately.
+
+        Parameters
+        ----------
+        state_cache : mapping, optional
+            Population-state cache assigned directly. Omission retains the current
+            Population cache.
+        syn_cache : mapping, optional
+            Event/continuous connection cache assigned directly. Omission retains the
+            current connection cache.
+
+        Notes
+        -----
+        The supplied mappings are retained by identity. :meth:`initialize` performs
+        restoration using the active parameter and cache policies.
+        """
         if state_cache is not None:
             self._state_cache = state_cache
         if syn_cache is not None:
             self._syn_cache = syn_cache
 
     def set_synaptic_diff_config(self, **kwargs):
+        """Configure differentiation for existing event connections and NetStim schedules.
+
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments forwarded to :meth:`NetCon.set_diff_config`. Only
+            ``diff_scheduled_times`` and ``sched_width`` are forwarded to an attached
+            NetStim; omitted values for those controls use True and 1.0 respectively.
+
+        Notes
+        -----
+        This changes connection differentiation controls, not the Network's
+        training/evaluation mode.
+        """
         for syn in self.synapses.values():
             syn.set_diff_config(**kwargs)
         if self.netstim is not None and hasattr(self.netstim, "set_diff_config"):

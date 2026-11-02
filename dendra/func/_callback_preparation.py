@@ -11,51 +11,38 @@ from ._types import FunctionalizationError
 def make_callbacks(
     target, callbacks, *, dt: float | None = None
 ) -> FunctionalCallbacks:
-    """Prepare named pure observations for a native model or functional plan.
+    """Prepare named observations for a native model or functional plan.
 
     Parameters
     ----------
     target : Population, Network, FunctionalPopulation or FunctionalNetwork
-        Initialized native model or existing functional plan. Existing plans
-        retain their exact owner and authoritative ``make_callbacks`` method.
-        Native models are lowered once using the existing lowering machinery;
-        preparation does not initialize, advance or resample the model.
+        Initialized native model or existing lowered plan. Native targets are
+        lowered once to bind selections; preparation does not initialize, advance
+        or resample the source.
     callbacks : mapping of str to callback configurations
-        Named pure callbacks or supported built-in configurations, including
-        Recorders, HDF5 storage and Network ``PopulationCallback`` scopes.
+        Supported built-in callbacks or pure FunctionalCallback objects. Recorder
+        HDF5 settings and Network PopulationCallback scopes are supported.
     dt : float, optional
         Required for a native Population. A native Network uses its initialized
-        timestep when omitted. For Networks and existing functional plans, a
-        supplied timestep must match the target's timestep.
+        timestep; any explicit Network/functional timestep must match the plan.
 
     Returns
     -------
     FunctionalCallbacks
-        Bound observations with explicit results and continuation carry. Reuse
-        this collection across native calls on compatible initialized receivers;
-        observations read the receiving model with fixed prepared paths, scopes
-        and selections. Ordinary preparation creates a new carry token. Use
-        portable callback checkpoints to transfer carry between equivalent
-        independently prepared collections.
+        Bound collection with explicit result/carry state. Reuse with compatible
+        native receivers, or its exact owning functional plan.
 
     Notes
     -----
-    Preparation runs outside compilation, function transforms and forward AD.
-    Native targets retain the existing functional lowering cost and supported
-    model restrictions. Existing plans are reused without lowering again.
-    Storage sessions open during host execution, rather than preparation.
-    The existing plan methods and compile-time callback configuration remain
-    supported. Runners, bindings and tensor packets are not preparation targets;
-    use an owning functional plan when one is available.
+    Carry belongs to this collection. Use export_state/restore_state to transfer
+    it between equivalent independently prepared collections. Slice selections
+    refer to the original source during preparation; native reuse applies their
+    resolved indices to the receiver. LFP fields retain their bound sources.
 
-    Functional execution requires this collection's exact owning plan, and live
-    carry requires the same collection. Physical Slice and region configurations
-    must refer to the original source model during preparation; native reuse
-    applies their resolved indices to the receiver. Population execution checks
-    its requested timestep against prepared Recorder cadence and threshold
-    timing. A receiving Network's initialized timestep and mode must match the
-    plan. Callback-bound LFP fields and plan-bound ``extra`` retain their existing
-    sources.
+    This host operation runs outside compilation, function transforms and forward
+    AD. Native preparation has functional lowering's supported-model restrictions.
+    Storage opens during host execution, not preparation. Runners, bindings and
+    tensor bundles are not preparation targets; use their owning functional plan.
     """
     if (
         torch.compiler.is_compiling()

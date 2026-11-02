@@ -42,7 +42,7 @@ Synaptic events
 For complete custom event-driven and continuous synapses, including their
 declarations, equations, initialization, and Network connections, follow
 :doc:`synapse_authoring`. The
-:doc:`mechanism authoring guide <advanced/A0_mechanisms_and_ions_materials>`
+:doc:`mechanism authoring guide <advanced/mechanisms_and_materials>`
 explains the general State and Mechanism lifecycle.
 
 ``expsyn`` and ``exp2syn`` receive weighted events through ``net_receive``.
@@ -51,7 +51,8 @@ the shared adapter applies its returned state and carry updates during
 ordinary Network execution. Functional callers use
 ``FunctionalPopulation.receive`` to apply the same equations to explicit
 state before advancing the population. See
-:ref:`functional-event-receive` for the payload and update contract.
+:meth:`dendra.func.FunctionalPopulation.receive` for the payload and update
+contract.
 
 ``alphasynapse`` and ``alphasynapse_d`` instead prescribe a conductance
 waveform from their ``onset``, ``tau``, and ``gmax`` parameters. They do not
@@ -155,5 +156,5 @@ See :ref:`slice-contract` for the complete deletion, batching,
 parameter-projection, rebuild, optimizer, and network-lifecycle contract.
 
 See :doc:`units` for the complete numerical-unit contract,
-:doc:`advanced/A0_mechanisms_and_ions_materials` for mechanism authoring, and
+:doc:`advanced/mechanisms_and_materials` for mechanism authoring, and
 :doc:`api/dendra.models.mechanisms` for the API reference.

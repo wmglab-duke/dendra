@@ -301,71 +301,27 @@ def _eligible(netcon):
 
 
 class FunctionalNetCon:
-    """A frozen routing plan using the same pure transport core as NetCon.
+    """Explicit event projection using the initialized native NetCon policy.
 
-    Supply full source-shaped numerical values and effective per-connection
-    weights. Values use ``source_dtype``/``source_device`` (the initialized NetCon's
-    presynaptic floating dtype/device), including when a NetStim stores hard
-    spikes as booleans. Weights use the target ``dtype``/``device``.
-    Training with ``diff_delays=True`` also requires explicit per-connection
-    ``delays=`` in milliseconds using that target dtype/device. Interpolation
-    uses the initialized two- or three-tap policy and ring capacity. The native
-    minimum delay and modulo behavior are preserved as delay values change.
-    Finite thresholds detect rising edges using explicit detector carry.
-    Dense raw projections and differentiable source-history gates retain signed
-    values and gradients for NaN thresholds; hard compact histories use binary
-    source events. Training preserves
-    the initialized hard or surrogate detector configuration. The surrogate
-    temperature ``tau`` is scalar real metadata, rather than an explicit
-    differentiable Tensor input.
+    Normally :class:`FunctionalNetwork` constructs and orders these projections.
+    For explicit composition, supply full source-shaped values using
+    ``source_dtype``/``source_device`` and per-edge weights using target
+    ``dtype``/``device``. Differentiable delays are explicit per-edge milliseconds;
+    their initialized two-/three-tap policy and capacity remain fixed. Threshold
+    detectors retain native hard/surrogate semantics.
 
-    Tensor schedule routing and reference indices are frozen in the plan.
-    Pass the extracted :class:`~dendra.func.TensorScheduleTensors` as ``schedule=`` on each
-    advance. Floating times, dimensionless amplitudes, and bound source vectors
-    are explicit independent values. Their hard or triangular timing policy
-    matches the initialized native configuration. Evaluation uses the carry's
-    absolute ``global_step`` and does not consume events.
+    Preserve receive-before-observe order: call ``read_due``, deliver its payload
+    with a Population receive operation, then observe the source and ``advance``.
+    ``step`` combines phases when source values are already chosen. Projection
+    methods do not advance a Population clock. Tensor schedule values are supplied
+    as :class:`TensorScheduleTensors`; routing/source indices remain fixed.
 
-    Call :meth:`read_due`, deliver its payload with one Population ``receive``
-    call (including zero payloads), then observe the source and call
-    :meth:`advance`. This preserves native receive-before-observe ordering,
-    including recurrent sources changed by reception. :meth:`step` combines
-    these phases when the supplied source values have already been chosen.
-    Neither phase generates source activity or advances any Population clock.
-
-    Source-history training stores one gate per unique source in a compact
-    history ring. Surrogate gates use floating history; hard spikes use packed
-    bits. These plans require current weights/delays in :meth:`read_due`, and
-    :meth:`advance` records only source activity. Parameter edits between calls
-    therefore affect historical events at delivery, matching native source
-    history. Dense and sparse-calendar plans retain weighted payloads from
-    enqueue time instead.
-    Functional source-history carry exposes history/latch tensors directly;
-    extraction and commit translate the native checkpoint's ``backend_state``.
-    Source-history training with scheduled traffic follows native policy and
-    uses the dense fallback.
-
-    Bitpacked-history inference uses hard source events, fixed initialized delay
-    offsets, and the same packed history kernels. Supply current weights to
-    :meth:`read_due`; its returned carry publishes the native delivery scratch
-    row. NetStim's own schedules are source activity. Per-connection NetCon
-    schedules use a shared pending calendar with enqueue-time weights and fixed
-    delay offsets. Sparse-calendar inference uses that calendar for intrinsic
-    and scheduled traffic, with independent tracked event counts. These
-    runtimes retain compact delivery storage. Lower-level explicit weights
-    retain their gradient flags; inference runner execution suppresses simulation
-    gradients. Pending capacity is fixed at lowering; :meth:`check_overflow`
-    validates the explicit status before using a lower-level result.
-
-    Routing, fixed quantized delays, timestep, and tensor schemas are copied at
-    lowering. Reinitialization, calling ``set_diff_config``, mode changes, or
-    changing schedule topology or bindings invalidates source-bound calls.
-    Direct edits to source topology or detector buffers do not alter this frozen
-    plan; extraction and commit reject incompatible metadata. Lower again to adopt changed routing,
-    fixed delays, or thresholds. Differentiable delay values may change without
-    lowering again; changing capacity requires initialization and lowering.
-    Explicit Population batch axes are part of the source/target shapes;
-    additional ``vmap`` axes stay implicit.
+    Transport follows the selected native backend: source-history delivery reads
+    current weights/delays, while queued weighted payloads retain enqueue-time
+    values. Fixed routing, timestep, thresholds, mode, schedule topology and
+    capacity require lowering again when changed. Runtime state is explicit and
+    extraction owns detached snapshots. Direct low-level loops must call
+    ``check_overflow`` before using results from a bounded pending calendar.
     """
 
     def __init__(self, netcon, *, pending_capacity=None):
@@ -1311,7 +1267,12 @@ class FunctionalNetCon:
 def make_functional_netcon(
     netcon, *, pending_capacity=None
 ) -> tuple[FunctionalNetCon, NetConTensors]:
-    """Lower an initialized NetCon with explicit numerical source values."""
+    """Return an explicit event-projection plan and independent Tensor snapshot.
+
+    ``netcon`` must be initialized. Optional ``pending_capacity`` sets bounded
+    calendar capacity. The result is ``(FunctionalNetCon, NetConTensors)``;
+    complete Network lowering constructs these projections automatically.
+    """
     projection = FunctionalNetCon(netcon, pending_capacity=pending_capacity)
     return projection, projection.extract()
 
