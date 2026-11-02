@@ -18,7 +18,7 @@ from tests.func.test_lowering_api import (
     _target,
 )
 from tests.func.test_recorder_cadence import _inputs
-from tests.func.test_runner_chunking import _kernel_cache, _stochastic_runner
+from tests.func.test_runner_chunking import _kernel_cache
 from tests.func.test_stimulation_rng_sharing import DT as RANDOM_DT
 from tests.func.test_stimulation_rng_sharing import _slice
 
@@ -144,6 +144,8 @@ def test_step_default_and_call_overrides_reuse_chunks_without_changing_default(
     )
     kernel = program.kernel
     with torch.no_grad():
+        # Keep a cold explicit-step override without another stochastic runner.
+        _same(program(steps=7), _reference(program, steps=7))
         _same(program(), _reference(program, steps=7))
         _same(program(steps=13), _reference(program, steps=13))
         _same(program(duration=2.4 * DT), _reference(program, duration=2.4 * DT))
@@ -375,9 +377,7 @@ def test_population_duration_uses_the_effective_prepared_timestep():
         assert _pending(resumed[0], False) == pytest.approx(1.3 * DT)
 
 
-@pytest.mark.parametrize("network", (False, True), ids=("population", "network"))
-def test_variable_while_horizons_preserve_shared_runtime_draws_and_rng(network):
-    program, pulses = _stochastic_runner(network, 4)
+def _assert_stochastic_while_horizons(program, pulses):
     global_rng = torch.get_rng_state().clone()
     native_rng = [pulse.generator.get_state().clone() for pulse in pulses]
     tape = program.functional.sample_runtime_draws(program.initial_state, steps=9)

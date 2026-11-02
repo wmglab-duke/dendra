@@ -5,7 +5,6 @@ from __future__ import annotations
 import inspect
 import io
 import os
-import sys
 from contextlib import contextmanager
 
 import pytest
@@ -16,6 +15,7 @@ from dendra._bootstrap import torch_compiler_warning_context
 from dendra.func._network import FunctionalNetwork
 from dendra.func._population import FunctionalPopulation
 from dendra.func._population_while import _PopulationWhileExecutor
+from tests._call_observer import observe_calls
 from tests.func.test_runtime_extra import DT, _field
 from tests.func.test_runtime_extra import _model as _passive
 from tests.func.test_stimulation_rng_sharing import DT as RANDOM_DT
@@ -287,22 +287,16 @@ def _observe_while_boundaries():
         )
     }
     samples, loops = [], []
-    previous = sys.getprofile()
+    loop_code = _PopulationWhileExecutor.kernel_for.__code__
 
-    def observe(frame, event, arg):
-        if event == "call":
-            if frame.f_code in sampling_codes:
-                samples.append(frame.f_locals.get("steps"))
-            elif frame.f_code is _PopulationWhileExecutor.kernel_for.__code__:
-                loops.append(frame.f_locals["self"]._steps)
-        if callable(previous):
-            previous(frame, event, arg)
+    def observe(frame):
+        if frame.f_code in sampling_codes:
+            samples.append(frame.f_locals.get("steps"))
+        elif frame.f_code is loop_code:
+            loops.append(frame.f_locals["self"]._steps)
 
-    sys.setprofile(observe)
-    try:
+    with observe_calls(sampling_codes | {loop_code}, observe):
         yield samples, loops
-    finally:
-        sys.setprofile(previous)
 
 
 @pytest.mark.parametrize("network", (False, True), ids=("population", "network"))
@@ -338,6 +332,15 @@ def test_bounded_while_shared_rng_draws_recording_and_portable_continuation(netw
         suffix = _trace(resumed)[name]
         assert prefix.shape[0] == 10 and suffix.shape[0] == 9
         _close(torch.cat((prefix, suffix)), _trace(expected)[name])
+    _close(runner.initial_state, initial)
+    _close(runner.functional.extract(), source)
+    _close(pulses[0].generator.get_state(), source_rng)
+    _close(torch.get_rng_state(), global_rng)
+
+    # Reuse this runner for the horizon scenarios after its cold-call checks.
+    from tests.func.test_runner_horizons import _assert_stochastic_while_horizons
+
+    _assert_stochastic_while_horizons(runner, pulses)
     _close(runner.initial_state, initial)
     _close(runner.functional.extract(), source)
     _close(pulses[0].generator.get_state(), source_rng)
