@@ -823,6 +823,28 @@ an error; supplying explicit `ve` alongside bound extracellular `extra` for
 the same Population is also an error. Other Populations can use either source
 independently.
 
+Use `dn.func.resolve_steps` to size a deterministic tape for a duration request:
+
+```python
+request = {"duration": 10.0}
+steps = dn.func.resolve_steps(program, continuation, **request)
+population = program.functional
+inputs = dn.func.Inputs(intra=torch.zeros(
+    (steps, *population.shape), dtype=population.dtype, device=population.device,
+))
+state, auxiliary = dn.func.run(program, continuation, inputs=inputs, **request)
+```
+
+This Population example allocates the time axis from the effective timestep
+and retained fractional duration. For a Network, allocate one `Inputs` packet
+per Population using the same step count and that Population's shape, dtype
+and device. Resolution returns an integer without advancing state, RNG or
+caches. Supply one explicit `steps=` or `duration=`; runner horizon defaults
+are not inferred. Keep `duration=` on execution so it publishes the updated
+remainder. See {ref}`shared-step-resolution` and the complete
+{download}`shared_step_resolution.py <../../examples/shared_step_resolution.py>`
+example for native and functional models, gradients and checkpoint continuation.
+
 Use `draws=RuntimeDraws(...)` separately for runtime stochastic values and their
 RNG timeline. Obtain a packet with
 `dn.func.sample_runtime_draws(functional, continuation, steps=N)`, rather than

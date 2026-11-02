@@ -103,6 +103,17 @@ Networks accept mappings from Population names to the same packet. Stochastic
 inputs use ``draws=`` separately. See :ref:`functional-runtime-inputs` for shape,
 ownership, sampling, and compatibility contracts.
 
+``dn.func.resolve_steps`` returns the accepted timestep count for one explicit
+``steps=`` or ``duration=`` request. Use it to size deterministic input tapes
+before execution, including retained fractional duration. Native models supply
+their current boundary; functional targets require explicit state or a
+``Continuation``. The query leaves state, RNG, preparation and caches unchanged.
+It does not infer runner horizon defaults. Preserve the original ``duration=``
+request on execution so it commits the resulting remainder. See
+:ref:`shared-step-resolution` for complete Population and Network examples.
+
+.. autofunction:: dendra.func.resolve_steps
+
 .. autoclass:: dendra.func.RuntimeDraws
    :members: draws, rng
 

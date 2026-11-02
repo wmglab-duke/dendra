@@ -201,6 +201,7 @@ def test_func_namespace_exports_the_functional_population_api():
         "make_functional_netcon",
         "make_functional_netstim",
         "make_functional_network",
+        "resolve_steps",
         "restore_continuation",
         "run",
         "sample_initialization_draws",

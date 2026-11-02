@@ -54,7 +54,7 @@ from ._network_initialization import (
 from ._network_rollout import CompiledNetworkChunk, NetworkRolloutInput
 from ._population import FunctionalPopulation
 from ._runners import longrun, longrun_checkpointed, run
-from ._runtime_draw_sampling import sample_runtime_draws
+from ._runtime_draw_sampling import resolve_steps, sample_runtime_draws
 from ._runtime_extra import VarInput
 from ._schedules import TensorScheduleTensors
 from ._source_inspection import SourceEntry, SourceReport, inspect_sources
@@ -141,6 +141,7 @@ __all__ = [
     "make_functional_netcon",
     "make_functional_netstim",
     "make_functional_network",
+    "resolve_steps",
     "restore_continuation",
     "run",
     "sample_initialization_draws",

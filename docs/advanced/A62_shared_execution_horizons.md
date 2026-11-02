@@ -95,6 +95,68 @@ Continue with the same prepared collection and pass `callback_state=` from the
 previous result. Functional execution keeps these values in its continuation;
 see {doc}`A57_functional_api_overview`.
 
+(shared-step-resolution)=
+## Resolve the input tape length
+
+Use `dn.func.resolve_steps` to obtain the accepted timestep count before
+allocating a deterministic input tape. It returns a Python integer and uses
+the same timestep and retained fractional duration as execution:
+
+```python
+request = {"duration": 10.0}
+steps = dn.func.resolve_steps(program, trial, **request)
+population = program.functional
+current = torch.zeros(
+    (steps, *population.shape),
+    dtype=population.dtype,
+    device=population.device,
+)
+inputs = dn.func.Inputs(intra=current)
+state, auxiliary = dn.func.run(program, trial, inputs=inputs, **request)
+```
+
+This example uses a Population runner. A Network uses the same resolved count
+for each Population's tape, with its own shape, dtype and device. The complete
+example below constructs both forms.
+
+The query requires one explicit `steps=` or `duration=` request; the two are
+mutually exclusive. It does not infer a runner's configured default horizon or
+a chunk's width. `steps=0` returns zero, and exact step requests do not spend
+pending duration. A duration query includes the incoming fractional time, so
+`duration=0` can accept steps if that boundary already contains a complete
+timestep. A result of zero is suitable for an empty time-leading input tape.
+
+Initialized native Populations and Networks supply their current boundary.
+For a Population, pass the same `dt` used by execution or omit it to use the
+native backend default. A Network uses its initialized timestep. Functional
+plans, bindings, compiled chunks and runners require explicit state or a
+`Continuation`; their effective timestep sources follow
+{ref}`shared-runtime-draw-horizons`. Native queries require canonical duration
+budgeting but do not require stochastic draw-sampler support.
+
+Resolution does not advance the clock, commit a remainder, sample RNG,
+evaluate mechanisms or waveforms, lower a model, prepare workspaces, or refresh
+caches. Keep the original request on execution. Replacing `duration=T` with
+`steps=resolved_steps` would execute the same number of numerical steps but
+leave the old fractional remainder in place.
+
+The complete
+{download}`shared_step_resolution.py <../../examples/shared_step_resolution.py>`
+example allocates Population and Network inputs from the resolved count,
+compares gradients with native checkpointed execution, and restores native and
+portable functional checkpoints before resolving another duration:
+
+```{literalinclude} ../../examples/shared_step_resolution.py
+:language: python
+:start-after: "# region resolution"
+:end-before: "# endregion resolution"
+:dedent: 4
+```
+
+```console
+python examples/shared_step_resolution.py
+```
+
 (shared-runtime-draw-horizons)=
 ## Matching stochastic draw tapes to a duration
 
@@ -153,7 +215,9 @@ python examples/shared_runtime_draw_horizons.py
 Explicit horizons determine the required length of deterministic input tapes:
 `Inputs(ve=..., intra=...)` must contain exactly the steps accepted by that call.
 For a duration request, that includes any retained fractional duration. Empty
-tapes are valid when the call accepts no steps.
+tapes are valid when the call accepts no steps. Use
+`dn.func.resolve_steps(target, ..., duration=T)` to obtain that length without
+advancing the incoming boundary; see {ref}`shared-step-resolution`.
 
 `Slice.inject` keeps its waveform binding semantics. Omitting `intra` from an
 input packet leaves registered intracellular stimulation active:
