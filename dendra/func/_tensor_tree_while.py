@@ -8,6 +8,7 @@ remain explicit operands. No example values or preparation graphs are cached.
 from __future__ import annotations
 
 from functools import wraps
+from types import MethodDescriptorType
 
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
@@ -22,10 +23,45 @@ from ._hop_inputs import (
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
 )
-from ._state_projection import _can_project_state
+from ._state_projection import (
+    _can_project_state,
+    _plain_projection_context,
+    _plain_state_tree,
+    _tensor_descriptor,
+)
 from ._tensor_contracts import _clone_contiguous_tree as _clone_tree
 from ._tensor_contracts import capture_schema as _schema
 from ._while_inductor import _compile_while
+
+_SAMPLE_METHODS = ("index_select", "squeeze", "stride")
+_SAMPLE_DESCRIPTORS = tuple(_tensor_descriptor(name) for name in _SAMPLE_METHODS)
+
+
+def _own_samples(samples):
+    # Authored steps receive fresh index_select results, independent of the
+    # tape's view layout or inference status. Establish that same private
+    # boundary before specialization and Dynamo's input guards. Keep observable
+    # Tensor methods, subclasses and execution modes on their existing path.
+    if (
+        not samples
+        or not _plain_projection_context()
+        or not all(
+            type(descriptor) is MethodDescriptorType
+            and _tensor_descriptor(name) is descriptor
+            for name, descriptor in zip(
+                _SAMPLE_METHODS, _SAMPLE_DESCRIPTORS, strict=True
+            )
+        )
+        or not _plain_state_tree(samples)
+    ):
+        return samples, False
+    with torch.inference_mode(False), torch.no_grad():
+        return (
+            tuple(
+                value.clone(memory_format=torch.contiguous_format) for value in samples
+            ),
+            True,
+        )
 
 
 class _CompiledTensorTreeWhile:
@@ -131,13 +167,23 @@ class _CompiledTensorTreeWhile:
         return layout, initial, invariant
 
     def _kernel_for(
-        self, parameters, prepared, layout, initial, invariant, samples, sample_layout
+        self,
+        parameters,
+        prepared,
+        layout,
+        initial,
+        invariant,
+        samples,
+        sample_layout,
+        *,
+        owned_samples=False,
     ):
         signature = (
             layout,
             _schema((parameters, prepared, initial, invariant, samples)),
             sample_layout,
             MEMBRANE_ASSEMBLY.value,
+            owned_samples,
         )
         kernel = self._kernels.get(signature)
         if kernel is None:
@@ -150,6 +196,7 @@ class _CompiledTensorTreeWhile:
                     invariant,
                     samples,
                     sample_layout,
+                    owned_samples=owned_samples,
                 )
                 self._kernels[signature] = kernel
         return kernel
@@ -159,8 +206,16 @@ class _CompiledTensorTreeWhile:
         # The returned raw-operand callable prepares its own current values.
         samples, sample_layout = self._samples(tape)
         layout, initial, invariant = self._pack(state, carries)
+        samples, owned_samples = _own_samples(samples)
         kernel = self._kernel_for(
-            parameters, prepared, layout, initial, invariant, samples, sample_layout
+            parameters,
+            prepared,
+            layout,
+            initial,
+            invariant,
+            samples,
+            sample_layout,
+            owned_samples=owned_samples,
         )
 
         @wraps(kernel)
@@ -172,13 +227,30 @@ class _CompiledTensorTreeWhile:
     def __call__(self, parameters, prepared, state, carries, tape):
         samples, sample_layout = self._samples(tape)
         layout, initial, invariant = self._pack(state, carries)
+        samples, owned_samples = _own_samples(samples)
         kernel = self._kernel_for(
-            parameters, prepared, layout, initial, invariant, samples, sample_layout
+            parameters,
+            prepared,
+            layout,
+            initial,
+            invariant,
+            samples,
+            sample_layout,
+            owned_samples=owned_samples,
         )
         return kernel(parameters, prepared, initial, invariant, samples, carries)
 
     def _capture(
-        self, parameters, prepared, layout, initial, invariant, samples, sample_layout
+        self,
+        parameters,
+        prepared,
+        layout,
+        initial,
+        invariant,
+        samples,
+        sample_layout,
+        *,
+        owned_samples=False,
     ):
         body, partition, steps = self._body, self._partition, self._steps
         clone_state = self._clone_state
@@ -262,9 +334,14 @@ class _CompiledTensorTreeWhile:
         emission_devices = tuple(devices.index(device) for _, _, device in shapes)
 
         def execute(parameters, prepared, initial, invariant, samples):
-            parameters, prepared, invariant, samples = _isolate_dense_lifted_inputs(
-                (parameters, prepared, invariant, samples)
-            )
+            if owned_samples:
+                parameters, prepared, invariant = _isolate_dense_lifted_inputs(
+                    (parameters, prepared, invariant)
+                )
+            else:
+                parameters, prepared, invariant, samples = _isolate_dense_lifted_inputs(
+                    (parameters, prepared, invariant, samples)
+                )
             buffers = tuple(
                 torch.empty((steps, *shape), dtype=dtype, device=device)
                 for shape, dtype, device in shapes
