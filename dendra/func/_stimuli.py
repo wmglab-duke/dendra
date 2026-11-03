@@ -21,7 +21,7 @@ import torch
 from torch.func import functional_call
 
 from dendra.helpers import current_check_purity, op_mc, op_sc
-from dendra.models.core import Population
+from dendra.models.core import Population, _time_tensor_to
 from dendra.models.parametric import SimpleParameterized, cacheable
 from dendra.models.stim._assembly import _assemble_currents, _current_groups
 from dendra.models.stim.intra import (
@@ -1032,7 +1032,7 @@ class _FunctionalStimulus:
 
     def _times(self, times: Any) -> torch.Tensor:
         if torch.is_tensor(times):
-            result = times.to(device=self.device, dtype=self.dtype)
+            result = _time_tensor_to(times, device=self.device, dtype=self.dtype)
         else:
             result = torch.as_tensor(times, device=self.device, dtype=self.dtype)
         if result.ndim == 0:

@@ -1257,6 +1257,18 @@ def _duration_step_count(duration: float, dt: float) -> int:
     return _duration_step_budget(duration, dt, 0.0)[0]
 
 
+def _time_tensor_to(value: torch.Tensor, *, device, dtype) -> torch.Tensor:
+    """Transfer times without requesting unsupported binary64 work on MPS."""
+    device = torch.device(device)
+    if value.device.type == "cpu" and device.type == "mps":
+        # Casting on CPU also makes backward transfer the supported dtype
+        # before widening the cotangent on CPU.
+        return value.to(dtype=dtype).to(device=device)
+    if value.device.type == "mps" and device.type == "cpu":
+        return value.to(device=device).to(dtype=dtype)
+    return value.to(device=device, dtype=dtype)
+
+
 def _time_grid_from_step_count(
     start: torch.Tensor,
     n_steps: int,
@@ -1268,7 +1280,7 @@ def _time_grid_from_step_count(
 
     MPS does not support binary64 tensors. Preserve the established binary64
     timestamp calculation there by staging it on CPU, then cast once to the
-    caller's supported dtype while transferring the finished grid.
+    caller's supported dtype on CPU before transferring the finished grid.
     """
     device = torch.device(device)
     if device.type == "mps":
@@ -1279,7 +1291,7 @@ def _time_grid_from_step_count(
         # both are requested in one `.to(...)`, which still asks MPS to perform
         # unsupported binary64 work. Move first, then widen on CPU.
         grid = start.to(device="cpu").to(dtype=torch.double) + offsets * dt
-        return grid.to(device=device, dtype=start.dtype)
+        return _time_tensor_to(grid, device=device, dtype=start.dtype)
 
     offsets = torch.arange(n_steps, device=device, dtype=torch.double)
     return start.to(device=device, dtype=torch.double) + offsets * dt
