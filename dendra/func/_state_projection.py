@@ -151,7 +151,7 @@ def _plain_projection_context(*, check_saved_tensors=True):
         return False
 
 
-def _plain_state_tree(tree, active=None):
+def _plain_state_tree(tree, active=None, *, allow_parameters=False):
     """Inspect only builtin containers and unmodified ordinary tensor leaves."""
     if tree is None:
         return True
@@ -164,6 +164,17 @@ def _plain_state_tree(tree, active=None):
             and not tree.is_nested
         )
     kind = type(tree)
+    if allow_parameters and kind is torch.nn.Parameter:
+        from ._hop_inputs import _plain_parameter_class
+
+        return (
+            _plain_parameter_class()
+            and not _TENSOR_DICT.__get__(tree)
+            and not _IS_FUNCTIONAL(tree)
+            and not _IS_WRAPPED(tree)
+            and tree.layout is torch.strided
+            and not tree.is_nested
+        )
     if kind not in (dict, tuple, list):
         return False
     if active is None:
@@ -175,9 +186,13 @@ def _plain_state_tree(tree, active=None):
     try:
         if kind is dict:
             return all(type(key) in (str, int) for key in tree) and all(
-                _plain_state_tree(value, active) for value in tree.values()
+                _plain_state_tree(value, active, allow_parameters=allow_parameters)
+                for value in tree.values()
             )
-        return all(_plain_state_tree(value, active) for value in tree)
+        return all(
+            _plain_state_tree(value, active, allow_parameters=allow_parameters)
+            for value in tree
+        )
     finally:
         active.remove(identity)
 

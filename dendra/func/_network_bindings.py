@@ -143,18 +143,39 @@ class SourceBinding:
             "parameter, or prepared-buffer binding."
         )
 
-    def resolve(self, parameters, prepared, state):
+    def resolve(self, parameters, prepared, state, *, _prepared_only=False):
         if self._kind == "state":
             return _tree_value(state, self._key)
         if self._kind == "parameter":
             return parameters[self._key]
-        mapping, *_ = self._plan._mapping(
-            parameters, prepared, state, isolate_read_only=False
-        )
+        if _prepared_only:
+            # Network execution admits ordinary state before graph capture.
+            # Prepared sources need the canonical read-only bindings, without
+            # acquiring an independent writable copy of every state slot.
+            mapping, *_ = self._plan._read_only_mapping(
+                parameters, prepared, isolate_read_only=False
+            )
+            if self._plan._poisson_plan is not None and "stimulation" in state:
+                mapping.update(
+                    self._plan._poisson_plan.state_mapping(state["stimulation"])
+                )
+        else:
+            mapping, *_ = self._plan._mapping(
+                parameters, prepared, state, isolate_read_only=False
+            )
         value = mapping[self.slot]
         # Prepared scalar coefficients intentionally retain their logical rank;
         # ordinary native parameter buffers expose their broadcast field shape.
-        return value if tuple(value.shape) == self.shape else value.expand(self.shape)
+        # Execution may add leading singleton axes even to a native scalar.
+        # Remove those views before expanding to the registered source shape.
+        shape = tuple(value.shape)
+        if shape == self.shape:
+            return value
+        extra = len(shape) - len(self.shape)
+        if extra > 0 and all(size == 1 for size in shape[:extra]):
+            shape = shape[extra:]
+            value = value.reshape(shape)
+        return value if shape == self.shape else value.expand(self.shape)
 
 
 def _bind_materializer_aliases(mapping, canonical, aliases, values):

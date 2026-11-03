@@ -7746,6 +7746,15 @@ class _PopulationTransition(torch.nn.Module):
         return tuple(outputs)
 
 
+def _receiver_state_path(path, target):
+    """Identify the declared state and carry a receive hook can replace."""
+    return (
+        len(path) > 2
+        and path[1] == target
+        and path[0] in {"mechanisms", "mechanism_buffers", "state_buffers"}
+    )
+
+
 class _PopulationReceive(torch.nn.Module):
     """Apply one synaptic transaction to an explicitly rebound Population."""
 
@@ -7755,6 +7764,53 @@ class _PopulationReceive(torch.nn.Module):
         self.target = target
         self.layout = layout
         self.continuous = continuous
+        self._state_indices = frozenset(
+            index
+            for index, entry in enumerate(layout)
+            if _receiver_state_path(entry.public_path, target)
+        )
+
+        def registered_owner(path):
+            owner = population
+            for name in path.split(".") if path else ():
+                modules = object.__getattribute__(owner, "__dict__").get("_modules")
+                if type(modules) is not dict:
+                    return None
+                owner = modules.get(name)
+                if owner is None:
+                    return None
+            return owner
+
+        mechanism_path = f"integrator.mech.mechanisms.{target}"
+        mechanism = registered_owner(mechanism_path)
+        states = registered_owner(f"{mechanism_path}.DE")
+        state_modules = (
+            None
+            if states is None
+            else object.__getattribute__(states, "__dict__").get("_modules")
+        )
+        alias_owners = tuple(
+            tuple(registered_owner(path) for path, _name in entry.mapping_slots)
+            for entry in layout
+        )
+        self._copy_indices = None
+        if (
+            mechanism is not None
+            and type(state_modules) is dict
+            and all(owner is not None for owners in alias_owners for owner in owners)
+        ):
+            writable_owners = {
+                id(mechanism),
+                *(id(state) for state in state_modules.values()),
+            }
+            # A checkpoint leaf can also bind a target-owned slot under a
+            # different canonical public path. Copy that whole alias group,
+            # while retaining the existing publication selection below.
+            self._copy_indices = self._state_indices | frozenset(
+                index
+                for index, owners in enumerate(alias_owners)
+                if any(id(owner) in writable_owners for owner in owners)
+            )
         object.__setattr__(
             self,
             "_state_owners",
@@ -7814,10 +7870,12 @@ class _PopulationReceive(torch.nn.Module):
                 )
                 mechanism._apply_net_receive_updates(updates)
         outputs = []
-        for entry, previous in zip(self.layout, incoming, strict=True):
+        for index, (entry, previous) in enumerate(
+            zip(self.layout, incoming, strict=True)
+        ):
             path = entry.public_path
             value = previous
-            if len(path) > 2 and path[1] == self.target:
+            if index in self._state_indices:
                 if path[0] == "mechanisms":
                     value = updates.get("states", {}).get(path[2], previous)
                 elif path[0] == "mechanism_buffers":
@@ -11688,6 +11746,17 @@ class FunctionalPopulation:
             )
             for name, failures in self._continuous_receiver_failures.items()
             if not failures
+        }
+        self._receiver_state_indices = {
+            name: (
+                receiver._state_indices
+                if receiver._copy_indices is None
+                else receiver._copy_indices
+            )
+            for name, receiver in {
+                **self._receivers,
+                **self._continuous_receivers,
+            }.items()
         }
         self._continuous_receiver_inputs = {
             name: tuple(execution_population.mech.mechanisms[name]._continuous_inputs)
@@ -15813,11 +15882,10 @@ class FunctionalPopulation:
             _validate_retained_prepared(self, values)
         return values
 
-    def _mapping(
+    def _read_only_mapping(
         self,
         parameters,
         prepared,
-        state,
         *,
         isolate_read_only: bool | None = None,
         mechanism_dt=None,
@@ -15908,8 +15976,38 @@ class FunctionalPopulation:
                 prepared["integrator"][name]
             )
 
+        return mapping, dt, celsius
+
+    def _mapping(
+        self,
+        parameters,
+        prepared,
+        state,
+        *,
+        isolate_read_only: bool | None = None,
+        mechanism_dt=None,
+    ):
+        mapping, dt, celsius = self._read_only_mapping(
+            parameters,
+            prepared,
+            isolate_read_only=isolate_read_only,
+            mechanism_dt=mechanism_dt,
+        )
+        return self._state_mapping(mapping, dt, celsius, state)
+
+    def _receiver_mapping(self, parameters, prepared, state, indices):
+        # The Network's first receive already owns every logical state leaf.
+        # Subsequent transactions copy the current and previously updated
+        # targets, preserving their version boundaries and view normalization.
+        mapping, dt, celsius = self._read_only_mapping(parameters, prepared)
+        return self._state_mapping(
+            mapping, dt, celsius, state, receiver_indices=indices
+        )
+
+    def _state_mapping(self, mapping, dt, celsius, state, *, receiver_indices=None):
+        prefix = "population."
         state_positionals = {}
-        for leaf in self._state_layout:
+        for index, leaf in enumerate(self._state_layout):
             if (
                 leaf.public_path[0] == "noise_workspaces"
                 and ".buffer." in leaf.public_path[2]
@@ -15925,7 +16023,9 @@ class FunctionalPopulation:
             # differentiable working copy, shared by every registered alias, so
             # those updates become output carry without modifying (or
             # leaf-in-place invalidating) the caller's explicit state tensor.
-            value = _get_path(state, leaf.public_path).clone()
+            value = _get_path(state, leaf.public_path)
+            if receiver_indices is None or index in receiver_indices:
+                value = value.clone()
             state_positionals[leaf.public_path] = value
             for module_path, buffer_name in leaf.mapping_slots:
                 path = f"{module_path}." if module_path else ""
@@ -17394,10 +17494,23 @@ class FunctionalPopulation:
         return result, scratch
 
     def _continuous_receive_values(
-        self, parameters, prepared, state, scratch, target, payload, input, reduce, mask
+        self,
+        parameters,
+        prepared,
+        state,
+        scratch,
+        target,
+        payload,
+        input,
+        reduce,
+        mask,
+        *,
+        _binding_indices=None,
     ):
-        mapping, dt, _celsius, v, t, remainder = self._mapping(
-            parameters, prepared, state
+        mapping, dt, _celsius, v, t, remainder = (
+            self._mapping(parameters, prepared, state)
+            if _binding_indices is None
+            else self._receiver_mapping(parameters, prepared, state, _binding_indices)
         )
         outputs = functional_call(
             self._continuous_receivers[target],
@@ -17423,9 +17536,13 @@ class FunctionalPopulation:
         next_scratch[target][input] = outputs[-1]
         return result, next_scratch
 
-    def _receive_values(self, parameters, prepared, state, target, payload):
-        mapping, dt, _celsius, v, t, duration_remainder = self._mapping(
-            parameters, prepared, state
+    def _receive_values(
+        self, parameters, prepared, state, target, payload, *, _binding_indices=None
+    ):
+        mapping, dt, _celsius, v, t, duration_remainder = (
+            self._mapping(parameters, prepared, state)
+            if _binding_indices is None
+            else self._receiver_mapping(parameters, prepared, state, _binding_indices)
         )
         outputs = functional_call(
             self._receivers[target],
@@ -18569,3 +18686,60 @@ def make_functional(
 __all__ = ["FunctionalPopulation", "make_functional"]
 
 _OWNED_POPULATION_PREPARE = FunctionalPopulation.prepare
+
+_RECEIVER_FRAME_METHODS = tuple(
+    (name, method, method.__code__)
+    for name in (
+        "_mapping",
+        "_read_only_mapping",
+        "_state_mapping",
+        "_receiver_mapping",
+        "_receive_values",
+        "_continuous_receive_values",
+    )
+    for method in (getattr(FunctionalPopulation, name),)
+)
+_RECEIVER_FORWARD = _PopulationReceive.forward
+_RECEIVER_FORWARD_CODE = _RECEIVER_FORWARD.__code__
+_RECEIVER_HANDLER_METHODS = tuple(
+    (name, method, method.__code__)
+    for name in ("read_from_ions", "read_from_materials", "_bind_ion_current_fields")
+    for method in (inspect.getattr_static(MechanismHandler, name),)
+)
+
+
+def _receiver_binding_frame_supported(plan):
+    """Admit canonical receive binding without invoking authored overrides."""
+    if type(plan) is not FunctionalPopulation or not plan._lowering_audit_complete:
+        return False
+    for name, method, code in _RECEIVER_FRAME_METHODS:
+        if (
+            name in plan.__dict__
+            or inspect.getattr_static(type(plan), name) is not method
+            or method.__code__ is not code
+        ):
+            return False
+    for handler in (plan._population.mech, plan._transition.population.mech):
+        for name, method, code in _RECEIVER_HANDLER_METHODS:
+            if method.__code__ is not code:
+                return False
+            if name != "_bind_ion_current_fields":
+                if not _handler_initialization_hook_is_standard(handler, name):
+                    return False
+            elif (
+                name in handler.__dict__
+                or inspect.getattr_static(type(handler), name) is not method
+            ):
+                return False
+    for receiver in (*plan._receivers.values(), *plan._continuous_receivers.values()):
+        if (
+            type(receiver) is not _PopulationReceive
+            or "forward" in receiver.__dict__
+            or inspect.getattr_static(type(receiver), "forward")
+            is not _RECEIVER_FORWARD
+            or _RECEIVER_FORWARD.__code__ is not _RECEIVER_FORWARD_CODE
+            or receiver._copy_indices is None
+            or _module_autograd_hook_signature(receiver)
+        ):
+            return False
+    return True

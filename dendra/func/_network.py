@@ -39,6 +39,7 @@ from ._network_initialization import (
     NetworkInitializationInput,
 )
 from ._population import (
+    _receiver_binding_frame_supported,
     _subclass_contract_failures,
     _subclass_contract_matches,
     _subclass_slot_contract,
@@ -50,6 +51,8 @@ from ._schedules import TensorScheduleTensors, _TensorSchedulePlan
 from ._state_projection import (
     _clone_state_leaf,
     _identity_state_leaf,
+    _plain_projection_context,
+    _plain_state_tree,
     _state_projection,
 )
 from ._tables import network_table_alias_signature
@@ -581,6 +584,25 @@ class FunctionalNetwork:
             self._locate_target(target)
             for _, target in self._schedule.continuous_targets
         )
+        # Delivery order is structural. The first receive owns the full
+        # Population frame; later receives copy the current and previous target
+        # so authored replacements cannot retain aliases or stale view metadata.
+        previous_targets = {}
+        self._receiver_binding_indices = {}
+        for collection, plans in (
+            ("continuous_synapses", self.continuous_synapses),
+            ("synapses", self.synapses),
+        ):
+            for name, plan in plans.items():
+                if collection == "continuous_synapses" and not plan.has_connections:
+                    continue
+                post, target = self._targets[collection, name]
+                previous = previous_targets.get(post)
+                indices = self.populations[post]._receiver_state_indices
+                self._receiver_binding_indices[collection, name] = (
+                    None if previous is None else indices[previous] | indices[target]
+                )
+                previous_targets[post] = target
         tensors = self._extract(network)
         self._parameter_schema, self._constant_schema, self._state_schema = map(
             _schema, tensors
@@ -1821,7 +1843,53 @@ class FunctionalNetwork:
             compiled_chunk=compiled_chunk,
         )
 
-    def _source_value(self, collection, name, parameters, prepared, states, stimulus):
+    def _binding_frame_admitted(self, state):
+        # Admission belongs to the host, before make_fx/Dynamo establishes its
+        # own dispatch modes. Direct transformed/compiled steps retain the
+        # ordinary transaction path; compiled chunks freeze this host decision.
+        if torch.compiler.is_compiling() or type(self) is not FunctionalNetwork:
+            return False
+        if not _plain_projection_context():
+            return False
+        if not _plain_state_tree(state) and not _plain_state_tree(
+            state, allow_parameters=True
+        ):
+            return False
+        for name, method, code in _NETWORK_BINDING_FRAME_METHODS:
+            if (
+                name in self.__dict__
+                or inspect.getattr_static(type(self), name) is not method
+                or method.__code__ is not code
+            ):
+                return False
+        for binding in self._bindings.values():
+            if binding is None:
+                continue
+            source = binding[1]
+            if (
+                type(source) is not SourceBinding
+                or "resolve" in source.__dict__
+                or inspect.getattr_static(type(source), "resolve")
+                is not _SOURCE_BINDING_RESOLVE
+                or _SOURCE_BINDING_RESOLVE.__code__ is not _SOURCE_BINDING_RESOLVE_CODE
+            ):
+                return False
+        return all(
+            _receiver_binding_frame_supported(plan)
+            for plan in self.populations.values()
+        )
+
+    def _source_value(
+        self,
+        collection,
+        name,
+        parameters,
+        prepared,
+        states,
+        stimulus,
+        *,
+        _binding_frame=False,
+    ):
         binding = self._bindings[collection, name]
         if binding is None:
             plan = self.synapses[name]
@@ -1833,6 +1901,7 @@ class FunctionalNetwork:
             parameters["populations"][population],
             prepared["populations"][population],
             states[population],
+            **({"_prepared_only": True} if _binding_frame else {}),
         )
         plan = (
             self.synapses[name]
@@ -1852,6 +1921,7 @@ class FunctionalNetwork:
         inputs=None,
         extra=None,
         intra=None,
+        _binding_frame=False,
     ):
         for label, values in (("inputs", inputs), ("extra", extra), ("intra", intra)):
             if values is not None and (
@@ -1949,6 +2019,11 @@ class FunctionalNetwork:
             receiver = self.populations[post]
             if plan.has_connections and plan.receive_before_source:
                 _, payload, mask = plan._read_due_values(queue)
+                indices = (
+                    self._receiver_binding_indices["continuous_synapses", name]
+                    if _binding_frame
+                    else None
+                )
                 states[post], scratch[post] = receiver._continuous_receive_values(
                     parameters["populations"][post],
                     prepared["populations"][post],
@@ -1959,9 +2034,16 @@ class FunctionalNetwork:
                     self._continuous_inputs[name],
                     plan.reduce,
                     mask,
+                    **({"_binding_indices": indices} if indices is not None else {}),
                 )
             source = self._source_value(
-                "continuous_synapses", name, parameters, prepared, states, stimulus
+                "continuous_synapses",
+                name,
+                parameters,
+                prepared,
+                states,
+                stimulus,
+                **({"_binding_frame": True} if _binding_frame else {}),
             )
             queue, payload, mask = plan._advance_values(
                 prepared["connections"]["continuous_synapses"][name]["weights"],
@@ -1970,6 +2052,11 @@ class FunctionalNetwork:
                 transform_parameters=value["transform_parameters"],
             )
             if plan.has_connections and not plan.receive_before_source:
+                indices = (
+                    self._receiver_binding_indices["continuous_synapses", name]
+                    if _binding_frame
+                    else None
+                )
                 states[post], scratch[post] = receiver._continuous_receive_values(
                     parameters["populations"][post],
                     prepared["populations"][post],
@@ -1980,6 +2067,7 @@ class FunctionalNetwork:
                     self._continuous_inputs[name],
                     plan.reduce,
                     mask,
+                    **({"_binding_indices": indices} if indices is not None else {}),
                 )
             continuous[name] = queue
         events = {}
@@ -1994,15 +2082,27 @@ class FunctionalNetwork:
             post, target = self._targets["synapses", name]
             receiver = self.populations[post]
             receiver._validate_receiver_hooks(target)
+            indices = (
+                self._receiver_binding_indices["synapses", name]
+                if _binding_frame
+                else None
+            )
             states[post] = receiver._receive_values(
                 parameters["populations"][post],
                 prepared["populations"][post],
                 states[post],
                 target,
                 payload,
+                **({"_binding_indices": indices} if indices is not None else {}),
             )
             source = self._source_value(
-                "synapses", name, parameters, prepared, states, stimulus
+                "synapses",
+                name,
+                parameters,
+                prepared,
+                states,
+                stimulus,
+                **({"_binding_frame": True} if _binding_frame else {}),
             )
             events[name] = plan.advance(
                 effective["weights"],
@@ -2145,6 +2245,7 @@ class FunctionalNetwork:
                 self._validate_state(state)
                 values = self._validate_prepared(prepared, parameters)
         with nullcontext() if self.training else torch.no_grad():
+            binding_frame = self._binding_frame_admitted(state)
             result = self._step_values(
                 parameters,
                 values,
@@ -2154,6 +2255,7 @@ class FunctionalNetwork:
                 inputs=inputs,
                 extra=extra,
                 intra=intra,
+                **({"_binding_frame": True} if binding_frame else {}),
             )
         self.check_overflow(result[0])
         return result
@@ -2193,6 +2295,7 @@ class FunctionalNetwork:
                     _validate_tree(constants, self._constant_schema, "constants")
                     self._validate_state(state)
             values = self._prepare_values(parameters, constants)
+            binding_frame = self._binding_frame_admitted(state)
             result = self._step_values(
                 parameters,
                 values,
@@ -2202,6 +2305,7 @@ class FunctionalNetwork:
                 inputs=inputs,
                 extra=extra,
                 intra=intra,
+                **({"_binding_frame": True} if binding_frame else {}),
             )
         self.check_overflow(result[0])
         return result
@@ -2360,3 +2464,11 @@ __all__ = ["FunctionalNetwork", "NetworkTensors", "make_functional_network"]
 _OWNED_NETWORK_NOISE_TAPES = FunctionalNetwork.sample_population_noise_tapes
 _OWNED_NETWORK_STIMULATION_TAPES = FunctionalNetwork.sample_population_stimulation_tapes
 _OWNED_NETWORK_NETSTIM_TAPE = FunctionalNetwork.sample_draw_tape
+
+_NETWORK_BINDING_FRAME_METHODS = tuple(
+    (name, method, method.__code__)
+    for name in ("_step_values", "_source_value")
+    for method in (getattr(FunctionalNetwork, name),)
+)
+_SOURCE_BINDING_RESOLVE = SourceBinding.resolve
+_SOURCE_BINDING_RESOLVE_CODE = _SOURCE_BINDING_RESOLVE.__code__

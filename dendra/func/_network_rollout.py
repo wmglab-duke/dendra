@@ -238,7 +238,7 @@ def _auxiliary(functional, state, *, scan=False):
     }
 
 
-def _step(functional, parameters, prepared, state, sample):
+def _step(functional, parameters, prepared, state, sample, *, _binding_frame=False):
     inputs = sample.get("populations", {})
     return functional._step_values(
         parameters,
@@ -247,6 +247,7 @@ def _step(functional, parameters, prepared, state, sample):
         inputs=inputs,
         netstim_draw=sample.get("netstim"),
         **({"draws": sample["draws"]} if "draws" in sample else {}),
+        **({"_binding_frame": True} if _binding_frame else {}),
     )
 
 
@@ -257,7 +258,12 @@ def _eager_values(
     emissions = []
     for index in range(steps):
         state, auxiliary = _step(
-            functional, parameters, prepared, state, _sample(tape, index)
+            functional,
+            parameters,
+            prepared,
+            state,
+            _sample(tape, index),
+            _binding_frame=functional._binding_frame_admitted(state),
         )
         if callbacks is not None:
             callback_state, emitted = callbacks._update(
@@ -389,6 +395,8 @@ class CompiledNetworkChunk:
         self._options.setdefault("dynamic", False)
         self._plain_kernel = None
         self._callback_kernels = weakref.WeakKeyDictionary()
+        self._legacy_plain_kernel = None
+        self._legacy_callback_kernels = weakref.WeakKeyDictionary()
         self._tails = {}
 
     @property
@@ -435,13 +443,18 @@ class CompiledNetworkChunk:
             )
         return self._tails[steps]
 
-    def _make_kernel(self, callbacks):
+    def _make_kernel(self, callbacks, *, binding_frame=False):
         functional = self._functional
         plans = None if callbacks is None else callbacks._plans
 
         def body(parameters, prepared, loop, carries, sample):
             state, auxiliary = _step(
-                functional, parameters, prepared, loop["network"], sample
+                functional,
+                parameters,
+                prepared,
+                loop["network"],
+                sample,
+                _binding_frame=binding_frame,
             )
             emitted = {}
             if plans is not None:
@@ -586,14 +599,24 @@ class CompiledNetworkChunk:
                 "Network execution='while' is inference-only; use torch.no_grad() "
                 "or scan for gradients."
             )
+        binding_frame = self._functional._binding_frame_admitted(state)
         if callbacks is None:
-            if self._plain_kernel is None:
-                self._plain_kernel = self._make_kernel(None)
-            kernel = self._plain_kernel
+            attribute = "_plain_kernel" if binding_frame else "_legacy_plain_kernel"
+            kernel = getattr(self, attribute)
+            if kernel is None:
+                kernel = self._make_kernel(None, binding_frame=binding_frame)
+                setattr(self, attribute, kernel)
         else:
-            if callbacks not in self._callback_kernels:
-                self._callback_kernels[callbacks] = self._make_kernel(callbacks)
-            kernel = self._callback_kernels[callbacks]
+            kernels = (
+                self._callback_kernels
+                if binding_frame
+                else self._legacy_callback_kernels
+            )
+            if callbacks not in kernels:
+                kernels[callbacks] = self._make_kernel(
+                    callbacks, binding_frame=binding_frame
+                )
+            kernel = kernels[callbacks]
         loop = {
             "network": state,
             "auxiliary": _auxiliary(self._functional, state, scan=True),
