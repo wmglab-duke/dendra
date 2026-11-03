@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import Counter
 from dataclasses import dataclass
+from types import BuiltinFunctionType, GetSetDescriptorType
 
 import torch
 from torch.utils import _pytree
@@ -13,7 +14,54 @@ from dendra.models.random_parameters import sample_random_parameter_draw
 from ._draws import RuntimeDraws
 from ._rng_diagnostics import _rng_diagnostic_scope
 from ._rng_frames import _rng_values, _sampler_from_frame
+from ._state_projection import (
+    _plain_projection_context,
+    _plain_state_tree,
+    _tensor_descriptor,
+)
 from ._types import FunctionalizationError
+
+_STACK = torch.stack
+_REQUIRES_GRAD = _tensor_descriptor("requires_grad")
+
+
+def _stack_runtime_packets(packets):
+    """Allocate detached host tapes independently of the caller's inference mode.
+
+    Sampling requests retain their original context and ordering. Only the final
+    owned stack uses ordinary tensors, matching explicit replay and allowing its
+    short compiled tails to reuse the same input guards. Observable tensors and
+    execution modes keep the original allocation path.
+    """
+
+    def stack():
+        return _pytree.tree_map(
+            lambda *values: None if values[0] is None else torch.stack(values),
+            *packets,
+        )
+
+    if (
+        torch.is_inference_mode_enabled()
+        and not torch.is_grad_enabled()
+        and type(_STACK) is BuiltinFunctionType
+        and torch.stack is _STACK
+        and _plain_projection_context()
+        and type(_REQUIRES_GRAD) is GetSetDescriptorType
+        and _tensor_descriptor("requires_grad") is _REQUIRES_GRAD
+        and all(
+            type(packet) is RuntimeDraws
+            and _plain_state_tree(packet.draws)
+            and _plain_state_tree(packet.rng)
+            for packet in packets
+        )
+        and all(
+            value is None or not value.requires_grad
+            for value in _pytree.tree_leaves(packets)
+        )
+    ):
+        with torch.inference_mode(False), torch.no_grad():
+            return stack()
+    return stack()
 
 
 def sample_runtime_request(poisson, kind, entry, context, *, device, check_purity):
@@ -306,10 +354,7 @@ class RuntimeSamplingProgram:
             )
         if steps is None:
             return packets[0]
-        return _pytree.tree_map(
-            lambda *values: None if values[0] is None else torch.stack(values),
-            *packets,
-        )
+        return _stack_runtime_packets(packets)
 
 
 def sample_native_runtime_draws(model, *, dt, steps=None, extra=None):
