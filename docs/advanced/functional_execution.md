@@ -183,6 +183,9 @@ recordings still require storage for their retained samples.
 
 Compilation is lazy, so the first call includes compilation work. Inspect
 `program.execution_report()` after a call when diagnosing its selected strategy.
+On recognized CPU compiler builds, large `execution="while"` timestep graphs
+compile as separate functions to reduce startup cost. Numerical kernels retain
+their configured optimization level.
 Source structure and connectivity are captured at compilation: after structural
 model changes, construct a new program.
 

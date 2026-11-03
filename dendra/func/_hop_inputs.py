@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MethodDescriptorType
 
 import torch
 from torch.utils import _pytree as pytree
@@ -13,6 +14,7 @@ from ._state_projection import (
     _NAMES,
     _TENSOR_DICT,
     _plain_projection_context,
+    _plain_state_tree,
     _tensor_descriptor,
 )
 
@@ -45,6 +47,83 @@ def _plain_parameter_class():
         if actual is not expected:
             return False
     return True
+
+
+_DRAW_STRIDE_DESCRIPTOR = _tensor_descriptor("stride")
+
+
+def _own_runtime_draw_packets(tree):
+    """Own only canonical plain runtime draw tapes before scan specialization.
+
+    Base draws reach authored distribution transforms through existing owned
+    per-frame clones. Their leading tape offsets do not describe authored
+    state. Ordinary deterministic inputs and observable tensor layouts retain
+    their original objects, metadata, gradients and dispatch behavior.
+    """
+    from ._draws import RuntimeDraws
+    from ._inputs import Inputs, _RuntimeInputs
+    from ._netstim import NetStimDraw
+    from ._types import RolloutInput, StepInput
+
+    if not (
+        _plain_projection_context()
+        and type(_DRAW_STRIDE_DESCRIPTOR) is MethodDescriptorType
+        and _tensor_descriptor("stride") is _DRAW_STRIDE_DESCRIPTOR
+    ):
+        return tree
+
+    packets = (RuntimeDraws, NetStimDraw)
+    envelopes = (Inputs, _RuntimeInputs, StepInput, RolloutInput)
+
+    def visit(value):
+        kind = type(value)
+        if kind in packets:
+            fields = tuple(value)
+            if not _plain_state_tree(fields):
+                return value
+            leaves = pytree.tree_leaves(fields)
+            if not any(leaf is not None for leaf in leaves):
+                return value
+            for leaf in leaves:
+                if leaf is None:
+                    continue
+                # Preserve every visible frame stride, including singleton
+                # dimensions. A contiguous clone of other layouts could change
+                # a custom registered distribution's preserve_format clone.
+                stride = 1
+                for length, actual in zip(
+                    reversed(leaf.shape), reversed(leaf.stride()), strict=True
+                ):
+                    if actual != stride:
+                        return value
+                    stride *= max(length, 1)
+            # Retain gradients on live explicit operands. Inference tensors
+            # become ordinary owned tensors, matching disposable capture data.
+            with torch.inference_mode(False):
+                return pytree.tree_map_only(
+                    torch.Tensor,
+                    lambda leaf: leaf.clone(memory_format=torch.contiguous_format),
+                    value,
+                )
+        if kind is dict:
+            if any(type(name) is not str for name in value):
+                return value
+            updated = {name: visit(child) for name, child in value.items()}
+            return (
+                updated
+                if any(updated[name] is not child for name, child in value.items())
+                else value
+            )
+        if kind in (tuple, list) or kind in envelopes:
+            updated = tuple(visit(child) for child in value)
+            if all(left is right for left, right in zip(updated, value, strict=True)):
+                return value
+            if kind in envelopes:
+                return kind(*updated)
+            return list(updated) if kind is list else updated
+        return value
+
+    return visit(tree)
 
 
 def _dense_zero_offset(value):

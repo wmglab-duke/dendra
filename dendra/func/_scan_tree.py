@@ -18,6 +18,7 @@ from ._hop_inputs import (
     _input_usage,
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
+    _own_runtime_draw_packets,
 )
 from ._scan_autograd import guard_scan_outputs
 from ._scan_compat import (
@@ -243,6 +244,7 @@ class _CompiledTensorTreeScan:
         return compiled, layout, isolate_views
 
     def __call__(self, parameters, prepared, state, carries, input_tape):
+        input_tape = _own_runtime_draw_packets(input_tape)
         samples, sample_layout = self._samples(input_tape)
         grad_enabled = torch.is_grad_enabled()
         layout, initial, invariant = self._pack(

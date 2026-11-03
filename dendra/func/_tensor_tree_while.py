@@ -31,7 +31,7 @@ from ._state_projection import (
 )
 from ._tensor_contracts import _clone_contiguous_tree as _clone_tree
 from ._tensor_contracts import capture_schema as _schema
-from ._while_inductor import _compile_while
+from ._while_inductor import _STANDARD_COMPILER, _compile_while
 
 _SAMPLE_METHODS = ("index_select", "squeeze", "stride")
 _SAMPLE_DESCRIPTORS = tuple(_tensor_descriptor(name) for name in _SAMPLE_METHODS)
@@ -398,7 +398,10 @@ class _CompiledTensorTreeWhile:
                 packed = layout.pack((final, final_carries))
             return packed, pytree.tree_unflatten(list(buffers), emission_spec)
 
-        compiled = self._compiler(execute, self._options)
+        if self._compiler is _STANDARD_COMPILER:
+            compiled = self._compiler(execute, self._options, device=self._device)
+        else:
+            compiled = self._compiler(execute, self._options)
 
         @wraps(compiled)
         def materialize(parameters, prepared, initial, invariant, samples, carries):

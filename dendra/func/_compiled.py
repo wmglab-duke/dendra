@@ -113,9 +113,14 @@ class CompiledPopulationChunk:
                 stepwise_stimulation=_stepwise_stimulation,
             )
         elif execution in ("default", "while"):
-            from ._while_inductor import _compile_while
+            from ._while_inductor import _STANDARD_COMPILER, _compile_while
 
-            self._compiled = _compile_while(self._lowered.__call__, options)
+            if _compile_while is _STANDARD_COMPILER:
+                self._compiled = _compile_while(
+                    self._lowered.__call__, options, device=functional.device
+                )
+            else:
+                self._compiled = _compile_while(self._lowered.__call__, options)
         else:
             self._compiled = compile_owned(
                 isolate_compilation_callable(self._lowered.__call__), **options
