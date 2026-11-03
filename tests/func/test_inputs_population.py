@@ -242,12 +242,23 @@ def test_inputs_keep_canonical_noise_sde_and_poisson_authority_separate(monkeypa
         noise=None,
         stimulation=None,
         draws=None,
+        *,
+        poisson_schedules=None,
     ):
         assert noise is None and stimulation is None
         assert isinstance(draws, dn.func.RuntimeDraws)
         observed.append(draws)
         return original(
-            parameters, prepared, state, ve, intra, steps, noise, stimulation, draws
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            steps,
+            noise,
+            stimulation,
+            draws,
+            poisson_schedules=poisson_schedules,
         )
 
     monkeypatch.setattr(functional, "_transition_rollout_values", transition)

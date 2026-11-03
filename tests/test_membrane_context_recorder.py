@@ -86,8 +86,10 @@ def test_scan_graph_cache_is_partitioned_by_policy_without_executing_scan(monkey
         assert grad_enabled
         policy = dn.current_membrane_assembly()
         captured.append(policy)
+        layout = scan_tree_module._PackedCarryLayout.from_tree((state, carries))
 
-        def execute(parameters, prepared, current, carries, samples):
+        def execute(parameters, prepared, current, invariant, samples):
+            current, carries = layout.unpack(current)
             final = {
                 "integrator": {
                     "v": current["integrator"]["v"].new_tensor(
@@ -96,9 +98,8 @@ def test_scan_graph_cache_is_partitioned_by_policy_without_executing_scan(monkey
                 },
                 "control": current["control"],
             }
-            return (final, carries), {}
+            return layout.pack((final, carries)), {}
 
-        layout = SimpleNamespace(unpack=lambda packed: packed)
         return execute, layout, lambda operands: operands
 
     monkeypatch.setattr(scan_tree_module._CompiledTensorTreeScan, "_capture", capture)
