@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import torch
-
-from dendra._bootstrap import isolate_compilation_callable
+from dendra._bootstrap import compile_owned, isolate_compilation_callable
 
 
 def _compile_while(function, compile_options):
@@ -17,4 +15,4 @@ def _compile_while(function, compile_options):
     options = dict(compile_options)
     if options.get("options") is not None:
         options["options"] = dict(options["options"])
-    return torch.compile(isolate_compilation_callable(function), **options)
+    return compile_owned(isolate_compilation_callable(function), **options)

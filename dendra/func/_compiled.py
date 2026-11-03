@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from dendra._bootstrap import isolate_compilation_callable
+from dendra._bootstrap import compile_owned, isolate_compilation_callable
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._binding import _BINDING_UNSET
@@ -117,7 +117,7 @@ class CompiledPopulationChunk:
 
             self._compiled = _compile_while(self._lowered.__call__, options)
         else:
-            self._compiled = torch.compile(
+            self._compiled = compile_owned(
                 isolate_compilation_callable(self._lowered.__call__), **options
             )
 
@@ -608,7 +608,7 @@ class _CompiledCallbackPopulationChunk:
                 stepwise_stimulation=stepwise_stimulation,
             )
         else:
-            self._compiled = torch.compile(
+            self._compiled = compile_owned(
                 isolate_compilation_callable(self._lowered.__call__), **compile_options
             )
 

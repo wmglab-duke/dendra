@@ -34,7 +34,11 @@ import pandas as pd
 import torch
 from tqdm.auto import tqdm
 
-from dendra._bootstrap import reset_torch_compiler, torch_compiler_warning_context
+from dendra._bootstrap import (
+    compile_owned,
+    reset_torch_compiler,
+    torch_compiler_warning_context,
+)
 from dendra.helpers import (
     BACKEND,
     COMPILE_MODE,
@@ -1637,7 +1641,7 @@ class Population(P, Sliceable):
                 if effective_compile_options is not None:
                     kwargs["options"] = dict(effective_compile_options)
                 with torch_compiler_warning_context():
-                    self.make_intra = torch.compile(make_intra, **kwargs)
+                    self.make_intra = compile_owned(make_intra, **kwargs)
             else:
                 self.make_intra = make_intra
             self._make_intra_config = make_intra_config

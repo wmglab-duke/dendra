@@ -17,7 +17,7 @@ from torch._inductor.custom_graph_pass import (
     get_hash_for_files,
 )
 
-from dendra._bootstrap import isolate_compilation_callable
+from dendra._bootstrap import compile_owned, isolate_compilation_callable
 
 
 class _CopyViewLowering(CustomGraphPass):
@@ -123,7 +123,7 @@ def _compile_scan(function, compile_options, *, prefer_cpp_wrapper=False):
         or options.get("disable", False)
         or inductor_options.get("use_aoti", False)
     ):
-        return torch.compile(function, **options)
+        return compile_owned(function, **options)
     mode = options.pop("mode", None)
     if mode is not None and options.get("options") is not None:
         raise RuntimeError(
@@ -157,7 +157,7 @@ def _compile_scan(function, compile_options, *, prefer_cpp_wrapper=False):
         ):
             backend.config.setdefault("cpp_wrapper", True)
     options["backend"] = backend
-    compiled = torch.compile(function, **options)
+    compiled = compile_owned(function, **options)
     # Torch's generic callable-backend wrapper forwards reset(), but not the
     # compiler-config provider. Preserve the standard compiled function API.
     compiled.get_compiler_config = backend.get_compiler_config

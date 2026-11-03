@@ -159,6 +159,21 @@ def isolate_compilation_callable(function):
     return MethodType(isolated, owner) if owner is not None else isolated
 
 
+def compile_owned(function, **compile_options):
+    """Compile a Dendra-owned root with qualified compiler compatibility.
+
+    Callable isolation and option validation remain with their existing owners.
+    Compatibility is selected lazily and leaves disabled compilation untouched.
+    """
+    import torch
+
+    if not compile_options.get("disable", False):
+        from ._tensorify_compat import install_tensorify_compatibility
+
+        install_tensorify_compatibility()
+    return torch.compile(function, **compile_options)
+
+
 def _truthy(x: str | None) -> bool:
     return str(x).lower() in {"1", "true", "yes", "on"}
 

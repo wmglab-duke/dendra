@@ -9,6 +9,7 @@ from typing import Optional, Sequence, Tuple
 import torch
 
 from dendra._bootstrap import (
+    compile_owned,
     isolate_compilation_callable,
     reset_torch_compiler,
     torch_compiler_warning_context,
@@ -1052,7 +1053,7 @@ class Integrator(torch.nn.Module):
             ):
                 # A cached bound method otherwise keeps calling its original
                 # body after an instance/class method replacement.
-                compiled = torch.compile(
+                compiled = compile_owned(
                     isolate_compilation_callable(fn), **self._compile_kwargs()
                 )
                 self._compiled_kernels[key] = compiled

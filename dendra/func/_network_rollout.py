@@ -503,7 +503,7 @@ class CompiledNetworkChunk:
             )
 
         if self._execution == "unrolled":
-            from dendra._bootstrap import isolate_compilation_callable
+            from dendra._bootstrap import compile_owned, isolate_compilation_callable
 
             steps = self.steps
 
@@ -519,7 +519,7 @@ class CompiledNetworkChunk:
                 )
                 return loop, carries, stacked
 
-            return torch.compile(isolate_compilation_callable(execute), **self._options)
+            return compile_owned(isolate_compilation_callable(execute), **self._options)
         from ._scan_tree import _CompiledTensorTreeScan
 
         static = [

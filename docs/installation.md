@@ -161,6 +161,17 @@ Upgrade Dendra while retaining the recommended solver extra with:
 python -m pip install --upgrade --only-binary=dendra-solvers "dendra[solvers]"
 ```
 
+### Compiler compatibility
+
+For recognized affected PyTorch implementations, Dendra applies a compiler
+repair when it first constructs a compiled program. This avoids unnecessary
+compilation retries while retaining guards for scalar values. The repair adds
+a process-wide compatibility marker to compiler cache keys, preserving any
+user-supplied cache tag and leaving PyTorch's compiler settings unchanged.
+The first repaired compilation creates fresh artifacts; later processes can
+reuse those artifacts. Fixed or unrecognized implementations retain PyTorch's
+behavior.
+
 ### Optional TorchInductor cache isolation
 
 Importing Dendra leaves TorchInductor's cache behavior at PyTorch's defaults.
