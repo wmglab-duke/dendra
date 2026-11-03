@@ -37,12 +37,8 @@ _SAMPLE_METHODS = ("index_select", "squeeze", "stride")
 _SAMPLE_DESCRIPTORS = tuple(_tensor_descriptor(name) for name in _SAMPLE_METHODS)
 
 
-def _own_samples(samples):
-    # Authored steps receive fresh index_select results, independent of the
-    # tape's view layout or inference status. Establish that same private
-    # boundary before specialization and Dynamo's input guards. Keep observable
-    # Tensor methods, subclasses and execution modes on their existing path.
-    if (
+def _can_own_samples(samples):
+    return not (
         not samples
         or not _plain_projection_context()
         or not all(
@@ -53,7 +49,15 @@ def _own_samples(samples):
             )
         )
         or not _plain_state_tree(samples)
-    ):
+    )
+
+
+def _own_samples(samples):
+    # Authored steps receive fresh index_select results, independent of the
+    # tape's view layout or inference status. Establish that same private
+    # boundary before specialization and Dynamo's input guards. Keep observable
+    # Tensor methods, subclasses and execution modes on their existing path.
+    if not _can_own_samples(samples):
         return samples, False
     with torch.inference_mode(False), torch.no_grad():
         return (
