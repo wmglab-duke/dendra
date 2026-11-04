@@ -1,4 +1,4 @@
-"""Qualified per-compilation outlining of large CPU inference while bodies.
+"""Qualified per-compilation outlining of large CPU while and scan bodies.
 
 This private module is inert until an owned CPU compile requests it.
 Unknown compiler contracts keep ordinary code generation. No Torch class,
@@ -22,6 +22,9 @@ from dendra._tensorify_compat import _code_fingerprint
 # Compact bodies benefit from staying inline. Large bodies can make LLVM
 # spend minutes optimizing loop-local tensor-handle lifetimes.
 _MIN_BODY_FX_NODES = 4096
+# AD scans carry saved intermediates through a wide owning-handle interface,
+# which can be expensive even with a compact arithmetic graph.
+_MIN_BODY_TENSOR_INPUTS = 128
 _STATE = "_dendra_while_body_outline"
 _SOURCES = {
     "codegen/cpp_wrapper_cpu.py": "d5225aad881a688d25bcfd5f3ae68e014a0818c4ff7032c079a5910a62a7700c",
@@ -46,6 +49,8 @@ _METHODS = {
             "_codegen_int_array_var_impl",
             "push_kernel_profile_scope_state",
             "pop_kernel_profile_scope_state",
+            "codegen_tensor_item",
+            "_codegen_dynamic_scalar",
         ),
     },
     "codegen/wrapper.py": {
@@ -53,11 +58,16 @@ _METHODS = {
         "ExitSubgraphLine": ("__post_init__", "codegen"),
         "EnterKernelProfileScopeLine": ("__post_init__", "codegen"),
         "ExitKernelProfileScopeLine": ("__post_init__", "codegen"),
+        "DynamicScalarLine": ("codegen",),
+        "UnbackedSymbolDefsLine": ("codegen",),
         "PythonWrapperCodegen": (
             "memory_plan_reuse",
             "_generate",
             "generate_workspace_allocation",
             "writeline",
+            "codegen_dynamic_scalar",
+            "codegen_unbacked_symbol_decl",
+            "_codegen_unbacked_symbol_defs_for_outputs",
         ),
     },
     "graph.py": {
@@ -73,6 +83,8 @@ _METHODS = {
         "FallbackKernel": ("codegen",),
         "NopKernel": ("is_no_op",),
         "ConcatKernel": ("create",),
+        "DynamicScalar": ("__init__", "should_allocate", "codegen"),
+        "AssertScalar": ("__init__", "should_allocate", "has_side_effects", "codegen"),
     },
 }
 _HOOKS = (
@@ -132,7 +144,7 @@ def _current(guards):
     return True
 
 
-def _config_eligible(config, values, *, active_pass=None):
+def _config_eligible(config, values, *, active_pass=None, scan_owned=False):
     def effective(name):
         if name in values:
             return values[name]
@@ -140,6 +152,26 @@ def _config_eligible(config, values, *, active_pass=None):
         for component in name.split("."):
             current = getattr(current, component)
         return current
+
+    hooks = {"_post_fusion_custom_pass": active_pass}
+    if scan_owned:
+        # These two passes are part of scan's ownership and AD contract. They
+        # must remain intact; arbitrary caller callbacks retain stock codegen.
+        from ._scan_donation import _ScanDonationPass
+        from ._scan_inductor import _CopyViewLowering
+
+        donation = effective("_pre_fusion_custom_pass")
+        post_grad = effective("post_grad_custom_post_pass")
+        if (
+            type(donation) is not _ScanDonationPass
+            or donation.previous is not None
+            or type(post_grad) is not tuple
+            or len(post_grad) != 1
+            or type(post_grad[0]) is not _CopyViewLowering
+        ):
+            return False
+        hooks["_pre_fusion_custom_pass"] = donation
+        hooks["post_grad_custom_post_pass"] = post_grad
 
     backend = effective("cpu_backend")
     return (
@@ -152,11 +184,7 @@ def _config_eligible(config, values, *, active_pass=None):
         and backend == "cpp"
         and effective("aot_inductor.allow_stack_allocation") is False
         and effective("aot_inductor.debug_compile") is False
-        and all(
-            effective(name)
-            is (active_pass if name == "_post_fusion_custom_pass" else None)
-            for name in _HOOKS
-        )
+        and all(effective(name) is hooks.get(name) for name in _HOOKS)
     )
 
 
@@ -246,6 +274,8 @@ def _support():
         computed_type, fallback_type = ir.ComputedBuffer, ir.FallbackKernel
         concat_type, nop_is_noop = ir.ConcatKernel, ir.NopKernel.is_no_op
         loop_types = (ir.Pointwise, ir.Reduction, ir.Scatter)
+        scalar_types = (ir.DynamicScalar, ir.AssertScalar)
+        tensor_box_type = ir.TensorBox
         cat = torch.ops.aten.cat.default
         original_writer = wrapper.PythonWrapperCodegen.writeline
         device_codegen_type = common.DeviceCodegen
@@ -287,16 +317,40 @@ def _support():
             elif type(operation) is concat_type:
                 if type(operation).is_no_op is not nop_is_noop:
                     return False
+            elif type(operation) in scalar_types:
+                # Scan's loop index extraction and bounds assertions emit
+                # scalar declarations / checks without persistent workspaces.
+                pass
             else:
                 return False
         return True
+
+    def large_body(graph):
+        return (
+            len(graph.orig_gm.graph.nodes) >= _MIN_BODY_FX_NODES
+            or sum(
+                isinstance(value, tensor_box_type)
+                for value in graph.graph_inputs.values()
+            )
+            >= _MIN_BODY_TENSOR_INPUTS
+        )
+
+    def push_scope(owner):
+        owner.push_kernel_profile_scope_state()
+        state = vars(owner)[_STATE]
+        state.setdefault("scalar_decls", []).append(owner.unbacked_symbol_decls)
+        owner.unbacked_symbol_decls = owner.unbacked_symbol_decls.copy()
+
+    def pop_scope(owner):
+        owner.unbacked_symbol_decls = vars(owner)[_STATE]["scalar_decls"].pop()
+        owner.pop_kernel_profile_scope_state()
 
     @dataclasses.dataclass
     class EnterBody(wrapper.EnterKernelProfileScopeLine):
         name: str
 
         def codegen(self, code):
-            self.wrapper.push_kernel_profile_scope_state()
+            push_scope(self.wrapper)
             code.writeline(f"auto {self.name} = [&]() __attribute__((noinline)) {{")
             code.do_indent()
 
@@ -305,7 +359,7 @@ def _support():
         name: str
 
         def codegen(self, code):
-            self.wrapper.pop_kernel_profile_scope_state()
+            pop_scope(self.wrapper)
             code.do_unindent()
             code.writeline("};")
             code.writeline(f"{self.name}();")
@@ -319,7 +373,7 @@ def _support():
                 and _current(guards)
                 and stock_backend()
                 and not owner.allocated_workspaces
-                and len(body.orig_gm.graph.nodes) >= _MIN_BODY_FX_NODES
+                and large_body(body)
                 and workspace_free(body)
                 and workspace_free(while_loop.cond_subgraph.graph)
                 and owner.writeline.__func__ is original_writer
@@ -340,9 +394,9 @@ def _support():
             return state["subgraph"](subgraph, outer_inputs, outer_outputs)
         name = "dendra_while_body_" + str(state["next"])
         state["next"] += 1
-        # The admitted stock C++ loops / aten.cat paths cannot allocate a
-        # persistent wrapper workspace. Unknown IR declines before this point.
-        owner.push_kernel_profile_scope_state()
+        # Admitted loops, scalar checks and aten.cat cannot allocate persistent
+        # wrapper workspaces. Unknown IR declines before this point.
+        push_scope(owner)
         try:
             owner.writeline(EnterBody(owner, name))
             try:
@@ -350,10 +404,11 @@ def _support():
             finally:
                 owner.writeline(ExitBody(owner, name))
         finally:
-            owner.pop_kernel_profile_scope_state()
+            pop_scope(owner)
 
     def apply(custom_pass, nodes):
         graph, owner = V.graph, V.graph.wrapper_code
+        scan_owned = type(custom_pass) is _OutlineScanBodyPass
         try:
             eligible = (
                 _current(guards)
@@ -361,10 +416,19 @@ def _support():
                 and type(owner) is cpu_type
                 and owner.device == "cpu"
                 and graph.device_type == "cpu"
-                and graph.is_inference
+                and (
+                    graph.is_inference
+                    or (
+                        scan_owned
+                        and type(graph.is_inference) is bool
+                        and type(graph.is_backward) is bool
+                    )
+                )
                 and not graph.aot_mode
                 and not graph.is_dual_wrapper_mode
-                and _config_eligible(config, {}, active_pass=custom_pass)
+                and _config_eligible(
+                    config, {}, active_pass=custom_pass, scan_owned=scan_owned
+                )
                 and cpp.CppScheduling.kernel_proxy_cls is cpp.CppKernelProxy
                 and cpp.CppKernelProxy.kernel_cls is cpp.CppKernel
                 and cpp.CppKernelProxy.vec_kernel_cls is cpp.CppVecKernel
@@ -403,12 +467,27 @@ class _OutlineWhileBodyPass(CustomSchedulerPass):
         from torch._inductor.custom_graph_pass import get_hash_for_files
 
         root = Path(sys.modules["torch"].__file__).resolve().parent / "_inductor"
+        scan_owned = type(self) is _OutlineScanBodyPass
+        local_sources = (Path(__file__).resolve(),)
+        if scan_owned:
+            local_sources += tuple(
+                Path(__file__).with_name(name).resolve()
+                for name in (
+                    "_scan_inductor.py",
+                    "_scan_donation.py",
+                    "_scan_compat.py",
+                )
+            )
         return get_hash_for_files(
             (
-                str(Path(__file__).resolve()),
+                *(str(path) for path in local_sources),
                 *(str(root / name) for name in sorted(_SOURCES)),
             ),
-            extra="dendra-cpu-while-body-4096-v1",
+            extra=(
+                "dendra-cpu-scan-body-4096fx-or-128inputs-v2"
+                if scan_owned
+                else "dendra-cpu-while-body-4096fx-or-128inputs-v2"
+            ),
         )
 
     def __call__(self, nodes):
@@ -457,3 +536,32 @@ def _while_outlining_options(options, *, device):
         "_post_fusion_custom_pass": _OutlineWhileBodyPass(),
     }
     return result
+
+
+class _OutlineScanBodyPass(_OutlineWhileBodyPass):
+    """Reuse the body boundary for scan-owned inference and first-order AD."""
+
+
+def _scan_outlining_patches(patches):
+    """Add local outlining only for the exact scan-owned compiler pass bundle."""
+    if sys.platform not in ("darwin", "linux"):
+        return patches
+    try:
+        from torch._inductor import config
+
+        if not _config_eligible(config, patches, scan_owned=True):
+            return patches
+    except Exception:
+        return patches
+    support = _support()
+    if support is None:
+        return patches
+    config, _apply, guards = support
+    try:
+        if not _current(guards) or not _config_eligible(
+            config, patches, scan_owned=True
+        ):
+            return patches
+    except Exception:
+        return patches
+    return {**patches, "_post_fusion_custom_pass": _OutlineScanBodyPass()}

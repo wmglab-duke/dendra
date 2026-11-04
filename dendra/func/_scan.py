@@ -22,6 +22,7 @@ from ._hop_inputs import (
     _input_usage,
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
+    _own_runtime_draw_packets,
 )
 from ._inputs import _RuntimeInputs
 from ._scan_compat import install_scan_compatibility
@@ -605,6 +606,7 @@ class _CompiledScanPopulationChunk:
                 draws,
             )
         else:
+            draws = _own_runtime_draw_packets(draws)
             # Preserve the measured CPU inference block/phase-recording path.
             block = _FORWARD_SCAN_BLOCK if self._functional.device.type == "cpu" else 1
             if type(block) is not int or block not in (1, 2, 4):

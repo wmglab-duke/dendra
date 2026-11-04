@@ -281,6 +281,15 @@ def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(fa
     body = object()
     original_error = RuntimeError("Original body failure")
 
+    class ScalarLine:
+        def __init__(self, owner):
+            self.owner = owner
+
+        def codegen(self, code):
+            assert self.owner.unbacked_symbol_decls == {"outer-scalar"}
+            self.owner.unbacked_symbol_decls.add("inner-scalar")
+            code.writeline("declare scalar")
+
     class Owner:
         def __init__(self):
             self.lines = []
@@ -288,6 +297,7 @@ def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(fa
             self.computed_sizes_stack = []
             self.codegen_int_array_var_cache = {"outer": "outer-array"}
             self._kernel_profile_scope_state = []
+            self.unbacked_symbol_decls = {"outer-scalar"}
             self.counter = 0
 
         def push_computed_sizes(self, values):
@@ -302,6 +312,9 @@ def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(fa
         def original(self, subgraph, inputs, outputs):
             assert subgraph is body and inputs is operands and outputs is operands
             assert "inner" not in self.codegen_int_array_var_cache
+            assert self.unbacked_symbol_decls == {"outer-scalar"}
+            self.unbacked_symbol_decls.add("inner-scalar")
+            self.writeline(ScalarLine(self))
             self.counter += 1
             self.codegen_int_array_var_cache["inner"] = "array_" + str(self.counter)
             self.computed_sizes["inner"] = True
@@ -311,6 +324,7 @@ def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(fa
             return marker
 
     owner = Owner()
+    outer_scalar_decls = owner.unbacked_symbol_decls
     owner.push_kernel_profile_scope_state = MethodType(
         CppWrapperCpu.push_kernel_profile_scope_state, owner
     )
@@ -331,6 +345,9 @@ def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(fa
         else:
             assert function(owner, body, operands, operands) is marker
         assert owner.codegen_int_array_var_cache == {"outer": "outer-array"}
+        assert owner.unbacked_symbol_decls is outer_scalar_decls
+        assert owner.unbacked_symbol_decls == {"outer-scalar"}
+        assert not getattr(owner, module._STATE)["scalar_decls"]
         assert owner.computed_sizes == {"outer": True}
         assert not owner.computed_sizes_stack and not owner._kernel_profile_scope_state
     assert owner.counter == 2
@@ -350,17 +367,29 @@ def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(fa
     assert code.getvalue().count("dendra_while_body_") == 4
     assert not owner._kernel_profile_scope_state
     assert owner.codegen_int_array_var_cache == {"outer": "outer-array"}
+    assert owner.unbacked_symbol_decls is outer_scalar_decls
+    assert owner.unbacked_symbol_decls == {"outer-scalar"}
+    assert not getattr(owner, module._STATE)["scalar_decls"]
 
 
-def _run_inductor_case(network, reader):
+def _run_inductor_case(network, reader, execution="while"):
     """Fresh child: exactly one four-step compilation per model, then resume."""
     from torch._dynamo import utils as compiler_utils
     from torch._inductor.codecache import CppWrapperCodeCache
+    from torch._inductor.cpp_builder import CppBuilder
 
     from dendra.func._tensor_tree_while import _CompiledTensorTreeWhile
     from tests.func.test_poisson_stimulation import DT
     from tests.func.test_stimulation_rng_sharing import _network, _population
 
+    capture_code = _CompiledTensorTreeWhile._capture.__code__
+    if execution == "scan":
+        from dendra.func._scan import _CompiledScanPopulationChunk
+        from dendra.func._scan_tree import _CompiledTensorTreeScan
+
+        capture_code = (
+            _CompiledTensorTreeScan if network else _CompiledScanPopulationChunk
+        )._capture.__code__
     torch.set_num_threads(1)
     with (
         torch_compiler_warning_context(),
@@ -382,7 +411,7 @@ def _run_inductor_case(network, reader):
             dt=DT,
             steps=4,
             chunk_steps=4,
-            execution="while",
+            execution=execution,
             inference=True,
             callbacks={"trace": dn.func.Recorder(fields)},
             backend="inductor",
@@ -425,6 +454,22 @@ def _run_inductor_case(network, reader):
             )
         entries = []
         admissions = []
+        native_builds = []
+        native_loads = {}
+        cache_root = Path(os.environ["TORCHINDUCTOR_CACHE_DIR"]).resolve()
+
+        def native_wrappers():
+            return {
+                path.relative_to(cache_root).as_posix(): hashlib.sha256(
+                    path.read_bytes()
+                ).hexdigest()
+                for path in sorted(cache_root.rglob("*.main.so"))
+                if path.is_file()
+                and not any(component.endswith(".dSYM") for component in path.parts)
+            }
+
+        before_native = native_wrappers() if execution == "scan" else {}
+        native_load_code = CppWrapperCodeCache._load_library_inner.__func__.__code__
         original_loader = CppWrapperCodeCache.load_pybinding
 
         def checked_loader(cls, *arguments, **keywords):
@@ -439,19 +484,40 @@ def _run_inductor_case(network, reader):
             return original_loader(*arguments, **keywords)
 
         def observed(frame):
+            if execution == "scan" and frame.f_code is CppBuilder.build.__code__:
+                sources = frame.f_locals["self"]._sources_args
+                if sources.endswith(".main.cpp"):
+                    native_builds.append(sources)
+                    assert not reader, (
+                        "Reader attempted to rebuild an existing native wrapper"
+                    )
+                return
+            if execution == "scan" and frame.f_code is native_load_code:
+                path = Path(frame.f_locals["path"]).resolve()
+                if path.name.endswith(".main.so"):
+                    name = path.relative_to(cache_root).as_posix()
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                    if reader:
+                        assert before_native.get(name) == digest
+                    native_loads[name] = digest
+                return
             entries.append(frame.f_code)
 
         before_fx_hits = compiler_utils.counters["inductor"]["fxgraph_cache_hit"]
         before_aot_hits = compiler_utils.counters["aot_autograd"]["autograd_cache_hit"]
+        before_fx_bypasses = compiler_utils.counters["inductor"]["fxgraph_cache_bypass"]
+        before_aot_bypasses = compiler_utils.counters["aot_autograd"][
+            "autograd_cache_bypass"
+        ]
+        observed_codes = {capture_code, enter_body.codegen.__code__}
+        if execution == "scan":
+            observed_codes.update((CppBuilder.build.__code__, native_load_code))
         with (
             patch.object(
                 CppWrapperCodeCache, "load_pybinding", classmethod(checked_loader)
             ),
             observe_calls(
-                {
-                    _CompiledTensorTreeWhile._capture.__code__,
-                    enter_body.codegen.__code__,
-                },
+                observed_codes,
                 observed,
             ),
         ):
@@ -459,16 +525,23 @@ def _run_inductor_case(network, reader):
             _assert_tree_close(prefix[0], eager_prefix[0])
             _assert_tree_close(prefix[1]["callbacks"], eager_prefix[1]["callbacks"])
             first_entries = list(entries)
-            assert first_entries.count(_CompiledTensorTreeWhile._capture.__code__) == 1
+            assert first_entries.count(capture_code) == 1
             assert admissions
-            if reader:
+            if reader and execution == "while":
                 assert first_entries.count(enter_body.codegen.__code__) == 0
                 assert (
                     compiler_utils.counters["inductor"]["fxgraph_cache_hit"]
                     > before_fx_hits
                 )
-            else:
+            elif not reader:
                 assert first_entries.count(enter_body.codegen.__code__) >= 1
+            if execution == "scan":
+                assert native_loads
+                if reader:
+                    assert before_native and not native_builds
+                    assert native_wrappers() == before_native
+                else:
+                    assert native_builds
             counters = deepcopy(compiler_utils.counters)
             metrics = list(compiler_utils.get_compilation_metrics())
             returned = prefix[1]["continuation"]
@@ -503,6 +576,14 @@ def _run_inductor_case(network, reader):
         - before_fx_hits,
         "aot_hits": compiler_utils.counters["aot_autograd"]["autograd_cache_hit"]
         - before_aot_hits,
+        "fx_bypasses": compiler_utils.counters["inductor"]["fxgraph_cache_bypass"]
+        - before_fx_bypasses,
+        "aot_bypasses": compiler_utils.counters["aot_autograd"]["autograd_cache_bypass"]
+        - before_aot_bypasses,
+        "native_wrapper_builds": native_builds,
+        "native_wrapper_loads": native_loads,
+        "native_wrappers": native_wrappers() if execution == "scan" else {},
+        "body_renders": first_entries.count(enter_body.codegen.__code__),
     }
 
 
@@ -633,3 +714,390 @@ def test_unknown_compiler_lock_declines_before_warning_scope(
     )
     assert module._support.__wrapped__() is None
     assert calls == []
+
+
+def _owned_scan_patches():
+    from dendra.func._scan_donation import _ScanDonationPass
+    from dendra.func._scan_inductor import _CopyViewLowering
+
+    return {
+        **_eligible_options()["options"],
+        "_pre_fusion_custom_pass": _ScanDonationPass(),
+        "post_grad_custom_post_pass": (_CopyViewLowering(),),
+    }
+
+
+def test_scan_outlining_preserves_owned_hook_objects_order_and_global_configuration():
+    module = _module()
+    config, _, _ = _known_support()
+    patches = _owned_scan_patches()
+    originals = tuple(patches.items())
+    ambient = {name: getattr(config, name) for name in module._HOOKS}
+    result = module._scan_outlining_patches(patches)
+    if sys.platform not in ("darwin", "linux"):
+        assert result is patches
+        return
+    assert result is not patches
+    assert tuple(result) == (*patches, "_post_fusion_custom_pass")
+    assert type(result["_post_fusion_custom_pass"]) is module._OutlineScanBodyPass
+    assert tuple(patches.items()) == originals
+    assert all(result[name] is value for name, value in originals)
+    assert {name: getattr(config, name) for name in ambient} == ambient
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "chained_donation",
+        "foreign_donation",
+        "donation_subclass",
+        "copy_list",
+        "copy_subclass",
+        "copy_missing",
+        "extra_copy",
+        "foreign_post_grad",
+        "foreign_post_fusion",
+        "foreign_pre_grad",
+    ],
+)
+def test_foreign_scan_hooks_decline_before_qualification(monkeypatch, kind):
+    module = _module()
+    from dendra.func._scan_donation import _ScanDonationPass
+    from dendra.func._scan_inductor import _CopyViewLowering
+
+    patches = _owned_scan_patches()
+    donation = patches["_pre_fusion_custom_pass"]
+    copy_pass = patches["post_grad_custom_post_pass"][0]
+
+    def foreign(nodes):
+        return nodes
+
+    class DonationSubclass(_ScanDonationPass):
+        pass
+
+    class CopySubclass(_CopyViewLowering):
+        pass
+
+    if kind == "chained_donation":
+        donation.previous = foreign
+    elif kind == "foreign_donation":
+        patches["_pre_fusion_custom_pass"] = foreign
+    elif kind == "donation_subclass":
+        patches["_pre_fusion_custom_pass"] = DonationSubclass()
+    elif kind == "copy_list":
+        patches["post_grad_custom_post_pass"] = [copy_pass]
+    elif kind == "copy_subclass":
+        patches["post_grad_custom_post_pass"] = (CopySubclass(),)
+    elif kind == "copy_missing":
+        patches["post_grad_custom_post_pass"] = ()
+    elif kind == "extra_copy":
+        patches["post_grad_custom_post_pass"] = (copy_pass, _CopyViewLowering())
+    elif kind == "foreign_post_grad":
+        patches["post_grad_custom_post_pass"] = (copy_pass, foreign)
+    elif kind == "foreign_post_fusion":
+        patches["_post_fusion_custom_pass"] = foreign
+    else:
+        patches["pre_grad_custom_pass"] = foreign
+    originals = tuple(patches.items())
+
+    def unexpected_support():
+        raise AssertionError("Foreign scan hooks must retain ordinary codegen")
+
+    monkeypatch.setattr(module, "_support", unexpected_support)
+    assert module._scan_outlining_patches(patches) is patches
+    assert tuple(patches.items()) == originals
+
+
+@pytest.mark.parametrize(
+    "devices", [("cpu",), ("cpu", "cpu"), ("cpu", "meta"), ("meta",), ()]
+)
+def test_scan_backend_attaches_outlining_only_for_nonempty_cpu_operands(
+    monkeypatch, devices
+):
+    module = _module()
+    from torch._inductor import compile_fx as compile_module
+
+    from dendra.func._scan_inductor import _ScanInductorBackend
+
+    calls = []
+    marker = object()
+
+    def attachment(patches):
+        calls.append(patches)
+        return patches
+
+    monkeypatch.setattr(module, "_scan_outlining_patches", attachment)
+    monkeypatch.setattr(compile_module, "compile_fx", lambda *args, **kwargs: marker)
+    inputs = [torch.empty(0, device=device) for device in devices]
+    inputs.extend((7, None))
+    backend = _ScanInductorBackend(None, {"cpp_wrapper": True}, False, "outline_device")
+    assert backend(object(), inputs) is marker
+    assert bool(calls) is (bool(devices) and all(device == "cpu" for device in devices))
+
+
+def test_scan_outline_cache_identity_is_portable_stable_and_distinct_from_while():
+    module = _module()
+    _known_support()
+    from torch._inductor.codecache import FxGraphCachePickler
+
+    first = module._OutlineScanBodyPass()
+    other = module._OutlineScanBodyPass()
+    ordinary = module._OutlineWhileBodyPass()
+    assert first.uuid() == other.uuid()
+    assert first.uuid() != ordinary.uuid()
+    graph = torch.fx.Graph()
+    value = graph.placeholder("value")
+    graph.output(value)
+    pickler = FxGraphCachePickler(torch.fx.GraphModule(torch.nn.Module(), graph))
+    encoded = pickler.dumps({"_post_fusion_custom_pass": first})
+    assert encoded == pickler.dumps({"_post_fusion_custom_pass": other})
+    assert encoded != pickler.dumps({"_post_fusion_custom_pass": ordinary})
+
+
+@pytest.mark.parametrize(
+    "nodes,tensors,metadata,expected",
+    [(4095, 127, 500, False), (4096, 0, 0, True), (1, 128, 0, True)],
+)
+def test_body_budget_counts_arithmetic_or_owning_tensor_inputs(
+    nodes, tensors, metadata, expected
+):
+    from types import SimpleNamespace
+
+    from torch._inductor import ir
+
+    _, apply_pass, _ = _known_support()
+    loop = _closure(apply_pass)["codegen_while"].cell_contents
+    budget = _closure(loop)["large_body"].cell_contents
+    inputs = {name: object.__new__(ir.TensorBox) for name in range(tensors)}
+    inputs.update({tensors + name: object() for name in range(metadata)})
+    graph = SimpleNamespace(
+        orig_gm=SimpleNamespace(graph=SimpleNamespace(nodes=range(nodes))),
+        graph_inputs=inputs,
+    )
+    assert budget(graph) is expected
+
+
+def _run_scan_ad_case():
+    """Fresh isolated child: exercise outlined forward and reverse scan bodies."""
+    from itertools import combinations
+
+    from torch._dynamo import utils as compiler_utils
+    from torch._inductor.codecache import CppWrapperCodeCache
+
+    from dendra.func._scan_compat import install_scan_compatibility
+    from dendra.func._scan_inductor import _compile_scan
+    from tests.func.test_scan_donation import _inputs, _loss, _program, _reference
+
+    torch.set_num_threads(1)
+    module = _module()
+    _, apply_pass, _ = _known_support()
+    adapter = _closure(apply_pass)["codegen_subgraph"].cell_contents
+    enter_body = _closure(adapter)["EnterBody"].cell_contents
+    original_budget = module._MIN_BODY_FX_NODES
+    # This child has its own compiler cache. Force only the scope-mechanics
+    # fixture through the boundary; production retains its normal 4096 budget.
+    module._MIN_BODY_FX_NODES = 1
+    observed_modes = []
+    admissions = []
+    original_loader = CppWrapperCodeCache.load_pybinding
+
+    def checked_loader(cls, *arguments, **keywords):
+        code = keywords.get("main_code")
+        assert type(code) is str
+        if "while (1)" in code:
+            assert "dendra_while_body_" in code
+            assert "__attribute__((noinline))" in code
+            admissions.append(True)
+        return original_loader(*arguments, **keywords)
+
+    def observed(frame):
+        owner = frame.f_locals["self"].wrapper
+        observed_modes.append(owner.get_codegened_graph().is_backward)
+
+    install_scan_compatibility()
+    compiled = _compile_scan(
+        _program("shared", 2),
+        {
+            "backend": "inductor",
+            "fullgraph": True,
+            "dynamic": False,
+            "options": {"cpp_wrapper": True, "compile_threads": 1},
+        },
+    )
+    first_activity = None
+    prior_output = prior_values = None
+    try:
+        with (
+            torch_compiler_warning_context(),
+            patch.object(
+                CppWrapperCodeCache, "load_pybinding", classmethod(checked_loader)
+            ),
+            observe_calls({enter_body.codegen.__code__}, observed),
+        ):
+            for offset in (0.0, 0.07):
+                values = _inputs(4, offset)
+                actual = tuple(value.clone().requires_grad_() for value in values)
+                expected = tuple(value.clone().requires_grad_() for value in values)
+                frozen = _copy_tree(actual)
+                versions = tuple(value._version for value in actual)
+                output = compiled(*actual)
+                reference = _reference(*expected)
+                gradients = torch.autograd.grad(_loss(output), actual)
+                wanted = torch.autograd.grad(_loss(reference), expected)
+                assert output[1].shape == (5, 8)
+                for value, correct in zip(output, reference, strict=True):
+                    torch.testing.assert_close(value, correct, rtol=2e-11, atol=2e-12)
+                for value, correct in zip(gradients, wanted, strict=True):
+                    assert (
+                        torch.isfinite(value).all() and torch.count_nonzero(correct) > 0
+                    )
+                    torch.testing.assert_close(value, correct, rtol=2e-10, atol=2e-11)
+                torch.testing.assert_close(actual, frozen, rtol=0, atol=0)
+                assert tuple(value._version for value in actual) == versions
+                for left, right in combinations(output, 2):
+                    assert not torch._C._is_alias_of(left, right)
+                assert all(
+                    not torch._C._is_alias_of(value, operand)
+                    for value in output
+                    for operand in actual
+                )
+                if prior_output is not None:
+                    torch.testing.assert_close(
+                        prior_output, prior_values, rtol=0, atol=0
+                    )
+                prior_output, prior_values = output, _copy_tree(output)
+                activity = (
+                    deepcopy(compiler_utils.counters),
+                    list(compiler_utils.get_compilation_metrics()),
+                    tuple(observed_modes),
+                )
+                if first_activity is None:
+                    assert (
+                        admissions
+                        and False in observed_modes
+                        and True in observed_modes
+                    )
+                    first_activity = activity
+                else:
+                    assert activity == first_activity
+                protected = [
+                    item
+                    for item in compiled._dendra_scan_donation_diagnostics()
+                    if item.get("guard_applied")
+                ]
+                assert protected and all(
+                    item["is_backward"]
+                    and item["is_subgraph"]
+                    and item["protected_input_count"] == item["input_count"]
+                    and all(value["is_never_reuse"] for value in item["inputs"])
+                    for item in protected
+                )
+        config, _, _ = _known_support()
+        assert config._pre_fusion_custom_pass is None
+        assert config._post_fusion_custom_pass is None
+    finally:
+        module._MIN_BODY_FX_NODES = original_budget
+    return {
+        "qualified": True,
+        "forward": True,
+        "backward": True,
+        "owned_recording": True,
+    }
+
+
+def test_cpp_scan_outline_scope_preserves_reverse_gradients_and_owned_recordings(
+    tmp_path,
+):
+    _known_support()
+    if sys.platform not in ("darwin", "linux"):
+        pytest.skip("The qualified native CPU wrapper is unavailable")
+    environment = dict(os.environ)
+    environment.update(
+        PYTHONDONTWRITEBYTECODE="1",
+        OMP_NUM_THREADS="1",
+        MKL_NUM_THREADS="1",
+        TORCHINDUCTOR_CACHE_DIR=os.fspath(tmp_path / "inductor"),
+    )
+    script = (
+        "import json, runpy, sys; "
+        "result = runpy.run_path(sys.argv[1])['_run_scan_ad_case'](); "
+        "print('DENDRA_SCAN_OUTLINE_AD=' + json.dumps(result))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", script, __file__],
+        cwd=Path(dn.__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=300,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    rows = [
+        json.loads(line.removeprefix("DENDRA_SCAN_OUTLINE_AD="))
+        for line in completed.stdout.splitlines()
+        if line.startswith("DENDRA_SCAN_OUTLINE_AD=")
+    ]
+    assert rows == [
+        {"qualified": True, "forward": True, "backward": True, "owned_recording": True}
+    ]
+
+
+def test_inductor_population_scan_preserves_portable_resume_and_native_wrapper_reuse(
+    tmp_path,
+):
+    _known_support()
+    if sys.platform not in ("darwin", "linux"):
+        pytest.skip("The qualified native CPU wrapper is unavailable")
+    environment = dict(os.environ)
+    environment.update(
+        PYTHONDONTWRITEBYTECODE="1",
+        OMP_NUM_THREADS="1",
+        MKL_NUM_THREADS="1",
+        TORCHINDUCTOR_CACHE_DIR=os.fspath(tmp_path / "inductor"),
+    )
+    script = (
+        "import json, runpy, sys; "
+        "result = runpy.run_path(sys.argv[1])['_run_inductor_case'](False, sys.argv[2] == 'reader', 'scan'); "
+        "print('DENDRA_SCAN_OUTLINE=' + json.dumps(result))"
+    )
+    writer_wrappers = None
+    for mode in ("writer", "reader"):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-B",
+                "-c",
+                script,
+                __file__,
+                mode,
+            ],
+            cwd=Path(dn.__file__).resolve().parents[1],
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=300,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        rows = [
+            json.loads(line.removeprefix("DENDRA_SCAN_OUTLINE="))
+            for line in completed.stdout.splitlines()
+            if line.startswith("DENDRA_SCAN_OUTLINE=")
+        ]
+        assert len(rows) == 1
+        row = rows[0]
+        assert row["qualified"] and row["network"] is False
+        assert row["captures"] == 1 and row["portable"]
+        assert row["reader"] is (mode == "reader")
+        assert row["native_wrappers"] and row["native_wrapper_loads"]
+        assert all(
+            row["native_wrappers"][name] == digest
+            for name, digest in row["native_wrapper_loads"].items()
+        )
+        if mode == "reader":
+            assert not row["native_wrapper_builds"]
+            assert row["native_wrappers"] == writer_wrappers
+        else:
+            assert row["native_wrapper_builds"]
+            writer_wrappers = row["native_wrappers"]

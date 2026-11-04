@@ -84,6 +84,20 @@ class _ScanInductorBackend(torch._TorchCompileInductorWrapper):
                 *get_custom_graph_passes(previous),
                 _CopyViewLowering(),
             )
+            # CPU outlining must remain dormant for GPU/mixed-device graphs.
+            # Scalar and symbolic operands carry no model-device ownership.
+            try:
+                tensor_devices = tuple(
+                    value.device.type
+                    for value in inputs
+                    if isinstance(value, torch.Tensor)
+                )
+            except Exception:
+                tensor_devices = ()
+            if tensor_devices and all(device == "cpu" for device in tensor_devices):
+                from ._while_outlining import _scan_outlining_patches
+
+                patches = _scan_outlining_patches(patches)
         from ._dufort_autograd import _inductor_decompositions
 
         decompositions.update(_inductor_decompositions())

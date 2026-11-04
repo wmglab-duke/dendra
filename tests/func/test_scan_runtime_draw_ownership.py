@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from contextlib import nullcontext
+from copy import deepcopy
 
 import pytest
 import torch
@@ -17,8 +18,10 @@ from dendra.func._draws import RuntimeDraws
 from dendra.func._hop_inputs import _own_runtime_draw_packets
 from dendra.func._inputs import _RuntimeInputs
 from dendra.func._netstim import NetStimDraw
+from dendra.func._scan import _CompiledScanPopulationChunk
 from dendra.func._scan_tree import _CompiledTensorTreeScan
 from tests.func.test_network import DT, _stim_network
+from tests.func.test_stimulation_rng_sharing import _population
 
 pytestmark = pytest.mark.cpu
 
@@ -214,19 +217,34 @@ def test_empty_draw_packets_keep_their_original_identity(packet):
     assert _own_runtime_draw_packets(packet) is packet
 
 
-def test_network_scan_reuses_captures_for_returned_and_portable_draw_continuations(
-    monkeypatch,
+@pytest.mark.parametrize("network", [False, True], ids=["population", "network"])
+def test_scan_reuses_captures_for_returned_and_portable_draw_continuations(
+    monkeypatch, network
 ):
-    model = _stim_network()
+    if network:
+        model = _stim_network()
+        generator = model.netstim._rng
+        fields = ("cell.v", "t")
+        engine = _CompiledTensorTreeScan
+    else:
+        model, _, pulse = _population()
+        generator = pulse.generator
+        fields = ("v", "t")
+        engine = _CompiledScanPopulationChunk
     model.eval()
     captures = []
-    original = _CompiledTensorTreeScan._capture
+    graphs = []
+    original = engine._capture
+
+    def backend(graph, _inputs):
+        graphs.append(graph.code)
+        return graph.forward
 
     def capture(self, *args, **kwargs):
         captures.append(self._steps)
         return original(self, *args, **kwargs)
 
-    monkeypatch.setattr(_CompiledTensorTreeScan, "_capture", capture)
+    monkeypatch.setattr(engine, "_capture", capture)
     runner = dn.compile(
         model,
         dt=DT,
@@ -234,13 +252,13 @@ def test_network_scan_reuses_captures_for_returned_and_portable_draw_continuatio
         chunk_steps=4,
         execution="scan",
         inference=True,
-        backend="eager",
-        callbacks={"trace": dn.func.Recorder(("cell.v", "t"))},
+        backend=backend,
+        callbacks={"trace": dn.func.Recorder(fields)},
     )
     initial = _copy(runner.initial_state)
     source = _copy(runner.functional.extract())
     global_rng = torch.get_rng_state().clone()
-    native_rng = model.netstim._rng.get_state().clone()
+    native_rng = generator.get_state().clone()
     tape = runner.functional.sample_runtime_draws(initial, steps=18)
     frozen = _copy(tape)
     with torch.no_grad():
@@ -254,11 +272,20 @@ def test_network_scan_reuses_captures_for_returned_and_portable_draw_continuatio
         )
     first = runner(draws=_slice(tape, 0, 9))
     admitted = tuple(captures)
+    admitted_graphs = tuple(graphs)
     assert sorted(admitted) == [1, 4]
+    assert admitted_graphs
     returned = first[1]["continuation"]
     portable = runner.restore_continuation(runner.export_continuation(returned))
+    # Inference-created explicit tapes have the same values and logical schema
+    # as ordinary sampled tapes, but must not specialize a second scan kernel.
+    with torch.inference_mode():
+        suffix_tape = pytree.tree_map_only(
+            torch.Tensor, lambda value: value.clone(), _slice(tape, 9, 18)
+        )
+    assert all(torch.is_inference(value) for value in _tensors(suffix_tape))
     for continuation in (returned, portable):
-        actual = runner(continuation, draws=_slice(tape, 9, 18))
+        actual = runner(continuation, draws=suffix_tape)
         torch.testing.assert_close(actual[0], expected[0], rtol=2e-10, atol=2e-11)
         for name, beginning in first[1]["callbacks"]["trace"].items():
             suffix = actual[1]["callbacks"]["trace"][name]
@@ -270,8 +297,93 @@ def test_network_scan_reuses_captures_for_returned_and_portable_draw_continuatio
                 atol=2e-11,
             )
         assert tuple(captures) == admitted
+        assert tuple(graphs) == admitted_graphs
     torch.testing.assert_close(runner.initial_state, initial)
     torch.testing.assert_close(runner.functional.extract(), source)
     torch.testing.assert_close(tape, frozen)
-    torch.testing.assert_close(model.netstim._rng.get_state(), native_rng)
+    torch.testing.assert_close(generator.get_state(), native_rng)
+    torch.testing.assert_close(torch.get_rng_state(), global_rng)
+
+
+def _compiler_activity():
+    from torch._dynamo import utils as compiler_utils
+
+    return (
+        deepcopy(compiler_utils.counters),
+        list(compiler_utils.get_compilation_metrics()),
+        {
+            name: len(values)
+            for name, values in compiler_utils.compilation_time_metrics.items()
+        },
+    )
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"], ids=["aot-eager", "cpp"])
+def test_scan_inference_draw_dispatch_keys_do_not_recompile(backend):
+    from tests.func.test_runtime_noise import DT as NOISE_DT
+    from tests.func.test_runtime_noise import _population as noisy_population
+
+    model = noisy_population()
+    model.eval()
+    options = (
+        {"cpp_wrapper": True, "compile_threads": 1} if backend == "inductor" else None
+    )
+    runner = dn.compile(
+        model,
+        dt=NOISE_DT,
+        steps=9,
+        chunk_steps=8,
+        execution="scan",
+        inference=True,
+        backend=backend,
+        options=options,
+        callbacks={"trace": dn.func.Recorder(("v", "t"))},
+    )
+    initial = _copy(runner.initial_state)
+    native = _copy(runner.functional.extract())
+    global_rng = torch.get_rng_state().clone()
+    tape = runner.functional.sample_runtime_draws(initial, steps=18)
+    sources = (runner.parameters, runner.constants, runner.initial_state, tape)
+    frozen = _copy(sources)
+    versioned = [value for value in _tensors(sources) if not torch.is_inference(value)]
+    versions = tuple(value._version for value in versioned)
+    with torch.no_grad():
+        expected = runner.functional.prepare_and_rollout(
+            runner.parameters,
+            runner.constants,
+            initial,
+            steps=18,
+            draws=tape,
+            callbacks=runner.callbacks,
+        )
+    first = runner(draws=_slice(tape, 0, 9))
+    returned = first[1]["continuation"]
+    portable = runner.restore_continuation(runner.export_continuation(returned))
+    with torch.inference_mode():
+        suffix = pytree.tree_map_only(
+            torch.Tensor, lambda value: value.clone(), _slice(tape, 9, 18)
+        )
+    suffix_leaves = _tensors(suffix)
+    assert suffix_leaves and all(torch.is_inference(value) for value in suffix_leaves)
+    before = _compiler_activity()
+    assert before[1], "The positive control must compile its scan kernels"
+    for continuation in (returned, portable):
+        actual = runner(continuation, draws=suffix)
+        torch.testing.assert_close(actual[0], expected[0], rtol=2e-10, atol=2e-11)
+        for name, prefix in first[1]["callbacks"]["trace"].items():
+            tail = actual[1]["callbacks"]["trace"][name]
+            assert prefix.shape[0] == 10 and tail.shape[0] == 9
+            torch.testing.assert_close(
+                torch.cat((prefix, tail)),
+                expected[1]["callbacks"]["trace"][name],
+                rtol=2e-10,
+                atol=2e-11,
+            )
+        assert _compiler_activity() == before, (
+            "Inference draw dispatch keys triggered compilation"
+        )
+    torch.testing.assert_close(sources, frozen)
+    assert tuple(value._version for value in versioned) == versions
+    torch.testing.assert_close(suffix, _slice(tape, 9, 18))
+    torch.testing.assert_close(runner.functional.extract(), native)
     torch.testing.assert_close(torch.get_rng_state(), global_rng)

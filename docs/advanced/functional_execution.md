@@ -183,9 +183,11 @@ recordings still require storage for their retained samples.
 
 Compilation is lazy, so the first call includes compilation work. Inspect
 `program.execution_report()` after a call when diagnosing its selected strategy.
-On recognized CPU compiler builds, large `execution="while"` timestep graphs
-compile as separate functions to reduce startup cost. Numerical kernels retain
-their configured optimization level.
+On recognized CPU compiler builds, large timestep loops in C++ wrappers compile
+as separate functions to reduce startup cost. This applies to `execution="while"`
+and C++-wrapped scan forward/backward graphs. Numerical kernels retain their
+configured optimization level. Training scans keep their default Python wrapper;
+explicit C++ wrappers can have different cold-start and warm-runtime costs.
 Source structure and connectivity are captured at compilation: after structural
 model changes, construct a new program.
 
