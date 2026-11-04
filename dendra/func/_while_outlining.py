@@ -275,7 +275,10 @@ def _support():
         concat_type, nop_is_noop = ir.ConcatKernel, ir.NopKernel.is_no_op
         loop_types = (ir.Pointwise, ir.Reduction, ir.Scatter)
         scalar_types = (ir.DynamicScalar, ir.AssertScalar)
-        tensor_box_type = ir.TensorBox
+        tensor_box_type, storage_box_type = ir.TensorBox, ir.StorageBox
+        scalar_layout_types = (ir.FixedLayout, ir.FlexibleLayout)
+        condition_loop_types = (ir.Pointwise, ir.Reduction)
+        bool_dtype = torch.bool
         cat = torch.ops.aten.cat.default
         original_writer = wrapper.PythonWrapperCodegen.writeline
         device_codegen_type = common.DeviceCodegen
@@ -335,6 +338,46 @@ def _support():
             >= _MIN_BODY_TENSOR_INPUTS
         )
 
+    def _owning_scalar_condition(graph):
+        # A tensor predicate escapes through the normal output handle. Scalar
+        # expressions and input aliases need different lifetime reasoning.
+        if (
+            type(graph) not in (GraphLowering, SubgraphLowering)
+            or not graph.graph_inputs
+            or any(
+                type(value) is not tensor_box_type
+                for value in graph.graph_inputs.values()
+            )
+            or len(graph.graph_outputs) != 1
+        ):
+            return False
+        for operation in graph.operations:
+            if (
+                type(operation) is not computed_type
+                or type(operation.data) not in condition_loop_types
+                or type(vars(operation).get("layout")) not in scalar_layout_types
+            ):
+                return False
+        output = graph.graph_outputs[0]
+        if type(output) is storage_box_type:
+            output = vars(output).get("data")
+        if type(output) is not computed_type or not any(
+            output is operation for operation in graph.operations
+        ):
+            return False
+        layout = vars(output).get("layout")
+        if type(layout) not in scalar_layout_types:
+            return False
+        # Qualified Layout stores these fields directly; Buffer's get_dtype /
+        # get_size methods read the same metadata through its properties.
+        fields = vars(layout)
+        size = fields.get("_size")
+        return (
+            fields.get("dtype") is bool_dtype
+            and type(size) in (list, tuple)
+            and not size
+        )
+
     def push_scope(owner):
         owner.push_kernel_profile_scope_state()
         state = vars(owner)[_STATE]
@@ -382,15 +425,26 @@ def _support():
             eligible = False
         if not eligible:
             return state["while"](while_loop, stack_output=stack_output)
-        state["bodies"].append(while_loop.body_subgraph)
+        subgraphs = [while_loop.body_subgraph]
+        condition = while_loop.cond_subgraph
+        try:
+            outline_condition = large_body(
+                condition.graph
+            ) and _owning_scalar_condition(condition.graph)
+        except Exception:
+            outline_condition = False
+        if outline_condition:
+            subgraphs.append(condition)
+        previous = len(state["bodies"])
+        state["bodies"].extend(subgraphs)
         try:
             return state["while"](while_loop, stack_output=stack_output)
         finally:
-            state["bodies"].pop()
+            del state["bodies"][previous:]
 
     def codegen_subgraph(owner, subgraph, outer_inputs, outer_outputs):
         state = vars(owner)[_STATE]
-        if not state["bodies"] or subgraph is not state["bodies"][-1]:
+        if not any(subgraph is selected for selected in state["bodies"]):
             return state["subgraph"](subgraph, outer_inputs, outer_outputs)
         name = "dendra_while_body_" + str(state["next"])
         state["next"] += 1
@@ -484,9 +538,9 @@ class _OutlineWhileBodyPass(CustomSchedulerPass):
                 *(str(root / name) for name in sorted(_SOURCES)),
             ),
             extra=(
-                "dendra-cpu-scan-body-4096fx-or-128inputs-v2"
+                "dendra-cpu-scan-subgraphs-4096fx-or-128inputs-v3"
                 if scan_owned
-                else "dendra-cpu-while-body-4096fx-or-128inputs-v2"
+                else "dendra-cpu-while-subgraphs-4096fx-or-128inputs-v3"
             ),
         )
 

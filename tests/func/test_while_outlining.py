@@ -267,7 +267,12 @@ def test_stateless_pass_instances_have_stable_actual_fx_cache_pickle_bytes():
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(fail):
+@pytest.mark.parametrize(
+    "active_index", [0, 1], ids=["first-active-subgraph", "last-active-subgraph"]
+)
+def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(
+    fail, active_index
+):
     module = _module()
     _, apply_pass, _ = _known_support()
     from torch._inductor.codegen.common import IndentedBuffer
@@ -335,7 +340,13 @@ def test_actual_body_adapter_preserves_both_declaration_scopes_and_exceptions(fa
     setattr(
         owner,
         module._STATE,
-        {"subgraph": owner.original, "bodies": [body], "next": 0},
+        {
+            "subgraph": owner.original,
+            # A selected condition and body share one active scope inventory.
+            # Exercise both positions without changing the rollback assertions.
+            "bodies": [body, object()] if active_index == 0 else [object(), body],
+            "next": 0,
+        },
     )
     for _ in range(2):
         if fail:
@@ -1101,3 +1112,212 @@ def test_inductor_population_scan_preserves_portable_resume_and_native_wrapper_r
         else:
             assert row["native_wrapper_builds"]
             writer_wrappers = row["native_wrappers"]
+
+
+@pytest.mark.parametrize(
+    "kind,expected",
+    [
+        ("plain", True),
+        ("boxed_reduction", True),
+        ("foreign_graph", False),
+        ("no_inputs", False),
+        ("scalar_input", False),
+        ("two_outputs", False),
+        ("input_alias_output", False),
+        ("foreign_output", False),
+        ("scalar_ir", False),
+        ("scatter", False),
+        ("foreign_layout", False),
+        ("non_bool", False),
+        ("non_scalar", False),
+    ],
+)
+def test_condition_scope_requires_a_fresh_owning_scalar_bool(kind, expected):
+    from types import SimpleNamespace
+
+    from torch._inductor import ir
+    from torch._inductor.graph import GraphLowering
+
+    _, apply_pass, _ = _known_support()
+    loop = _closure(apply_pass)["codegen_while"].cell_contents
+    predicate = _closure(loop)["_owning_scalar_condition"].cell_contents
+    layout = object.__new__(
+        ir.FlexibleLayout if kind == "boxed_reduction" else ir.FixedLayout
+    )
+    layout.dtype, layout._size = torch.bool, []
+    operation = object.__new__(ir.ComputedBuffer)
+    operation.data = object.__new__(
+        ir.Reduction if kind == "boxed_reduction" else ir.Pointwise
+    )
+    operation.layout = layout
+    graph = object.__new__(GraphLowering)
+    graph.graph_inputs = {"value": object.__new__(ir.TensorBox)}
+    graph.operations, graph.graph_outputs = [operation], [operation]
+    if kind == "boxed_reduction":
+        output = object.__new__(ir.StorageBox)
+        output.data = operation
+        graph.graph_outputs = [output]
+    elif kind == "foreign_graph":
+        graph = SimpleNamespace(**vars(graph))
+    elif kind == "no_inputs":
+        graph.graph_inputs = {}
+    elif kind == "scalar_input":
+        graph.graph_inputs["scalar"] = 1
+    elif kind == "two_outputs":
+        graph.graph_outputs = [operation, operation]
+    elif kind == "input_alias_output":
+        graph.graph_outputs = [object.__new__(ir.InputBuffer)]
+    elif kind == "foreign_output":
+        other = object.__new__(ir.ComputedBuffer)
+        other.data, other.layout = operation.data, layout
+        graph.graph_outputs = [other]
+    elif kind == "scalar_ir":
+        graph.operations.append(object.__new__(ir.DynamicScalar))
+    elif kind == "scatter":
+        operation.data = object.__new__(ir.Scatter)
+    elif kind == "foreign_layout":
+        operation.layout = SimpleNamespace(dtype=torch.bool, _size=[])
+    elif kind == "non_bool":
+        layout.dtype = torch.float64
+    elif kind == "non_scalar":
+        layout._size = [1]
+    assert predicate(graph) is expected
+
+
+def _run_condition_false_first_case():
+    """Fresh child: a wide predicate escapes its scope before bool extraction."""
+    import re
+
+    from torch._dynamo import utils as compiler_utils
+    from torch._inductor.codecache import CppWrapperCodeCache
+
+    from dendra.func._while_inductor import _compile_while
+
+    torch.set_num_threads(1)
+    _known_support()
+    source_checks = []
+    loader_code = CppWrapperCodeCache.load_pybinding.__func__.__code__
+
+    def observed(frame):
+        code = frame.f_locals["kwargs"].get("main_code")
+        assert type(code) is str
+        if "while (1)" not in code:
+            return
+        condition = code.index("// subgraph: while_loop_cond")
+        body = code.index("// subgraph: while_loop_body")
+        definition = code.rfind("auto dendra_while_body_", 0, condition)
+        assert definition >= 0
+        name = re.match(r"auto (dendra_while_body_\d+)", code[definition:]).group(1)
+        call = code.index(name + "();", condition)
+        extraction = code.index("aoti_torch_item_bool", call)
+        stop = code.index(" break;", extraction)
+        assert definition < condition < call < extraction < stop < body
+        predicate = re.search(r"RAIIAtenTensorHandle (\w+_cond_result);", code)
+        assert predicate is not None and predicate.start() < code.index("while (1)")
+        assert re.search(
+            re.escape(predicate.group(1)) + r" = std::move\(", code[condition:call]
+        )
+        assert code.count("auto dendra_while_body_") >= 2
+        source_checks.append(True)
+
+    def program(*values):
+        def condition(counter, *state):
+            del state
+            return counter < 0
+
+        def body(counter, *state):
+            return (counter + 1, *(value + 1 for value in state))
+
+        return torch.while_loop(condition, body, values)
+
+    # The real 128-Tensor interface selects the existing generic width budget;
+    # this fixture does not lower a production admission threshold.
+    inputs = (
+        torch.tensor(0, dtype=torch.int64),
+        *(torch.tensor(float(index), dtype=torch.float64) for index in range(127)),
+    )
+    frozen = tuple(value.clone() for value in inputs)
+    versions = tuple(value._version for value in inputs)
+    rng = torch.get_rng_state().clone()
+    compiled = _compile_while(
+        program,
+        {
+            "backend": "inductor",
+            "fullgraph": True,
+            "dynamic": False,
+            "options": {"cpp_wrapper": True, "compile_threads": 1},
+        },
+        device=torch.device("cpu"),
+    )
+    with (
+        torch_compiler_warning_context(),
+        torch.no_grad(),
+        observe_calls({loader_code}, observed),
+    ):
+        zero = compiled(*inputs)
+        assert source_checks
+        torch.testing.assert_close(zero, frozen, rtol=0, atol=0)
+        counters = deepcopy(compiler_utils.counters)
+        metrics = list(compiler_utils.get_compilation_metrics())
+        for count in (2, 1, 0):
+            values = (torch.tensor(-count, dtype=torch.int64), *inputs[1:])
+            actual = compiled(*values)
+            torch.testing.assert_close(actual[0], inputs[0], rtol=0, atol=0)
+            for value, original in zip(actual[1:], inputs[1:], strict=True):
+                torch.testing.assert_close(value, original + count, rtol=0, atol=0)
+        assert compiler_utils.counters == counters
+        assert list(compiler_utils.get_compilation_metrics()) == metrics
+    torch.testing.assert_close(inputs, frozen, rtol=0, atol=0)
+    assert tuple(value._version for value in inputs) == versions
+    torch.testing.assert_close(torch.get_rng_state(), rng, rtol=0, atol=0)
+    return {
+        "qualified": True,
+        "zero_body_skipped": True,
+        "two_one_zero_iterations": True,
+        "predicate_survives_scope": True,
+        "cached_reuse": True,
+    }
+
+
+def test_wide_condition_scope_preserves_false_first_and_cached_nonzero_execution(
+    tmp_path,
+):
+    _known_support()
+    if sys.platform not in ("darwin", "linux"):
+        pytest.skip("The qualified native CPU wrapper is unavailable")
+    environment = dict(os.environ)
+    environment.update(
+        PYTHONDONTWRITEBYTECODE="1",
+        OMP_NUM_THREADS="1",
+        MKL_NUM_THREADS="1",
+        TORCHINDUCTOR_CACHE_DIR=os.fspath(tmp_path / "inductor"),
+    )
+    script = (
+        "import json, runpy, sys; "
+        "result = runpy.run_path(sys.argv[1])['_run_condition_false_first_case'](); "
+        "print('DENDRA_CONDITION_FALSE_FIRST=' + json.dumps(result))"
+    )
+    completed = subprocess.run(
+        [sys.executable, "-B", "-c", script, __file__],
+        cwd=Path(dn.__file__).resolve().parents[1],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=180,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    rows = [
+        json.loads(line.removeprefix("DENDRA_CONDITION_FALSE_FIRST="))
+        for line in completed.stdout.splitlines()
+        if line.startswith("DENDRA_CONDITION_FALSE_FIRST=")
+    ]
+    assert rows == [
+        {
+            "qualified": True,
+            "zero_body_skipped": True,
+            "two_one_zero_iterations": True,
+            "predicate_survives_scope": True,
+            "cached_reuse": True,
+        }
+    ]
