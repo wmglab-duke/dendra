@@ -7596,6 +7596,9 @@ class _PopulationTransition(torch.nn.Module):
     def __init__(self, population: Population, solver, layout):
         super().__init__()
         self.population = population
+        from dendra.models.mechanisms._solver_grouping import _install_solver_grouping
+
+        _install_solver_grouping(population)
         self.solver = solver
         self.layout = layout
         self.block_voltage_state = _functional_voltage_state_names(

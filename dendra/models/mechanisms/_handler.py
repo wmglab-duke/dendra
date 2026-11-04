@@ -2224,12 +2224,30 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._pre_state_support_entries,
         )
-        for mech, support_index in self._pre_state_advance_plan:
-            inputs = self._resolve_state_inputs(mech.name)
-            if inputs:
-                mech._advance_states(local_voltages[support_index], dt, inputs)
+        self._execute_state_advance_plan(
+            "pre", self._pre_state_advance_plan, local_voltages, dt
+        )
+
+    def _execute_state_advance_plan(self, phase, plan, local_voltages, dt):
+        """Execute the phase's original calls or its prepared solver groups."""
+        grouped = getattr(self, "_solver_grouping_plans", None)
+        if grouped is not None:
+            from ._solver_grouping import _solver_grouping_runtime_plain, _SolverGroup
+
+            if not _solver_grouping_runtime_plain():
+                grouped = None
+
+        actions = plan if grouped is None else grouped[phase]
+        for action in actions:
+            if grouped is not None and isinstance(action, _SolverGroup):
+                action.advance(local_voltages, dt)
             else:
-                mech._advance_states(local_voltages[support_index], dt)
+                mech, support_index = action
+                inputs = self._resolve_state_inputs(mech.name)
+                if inputs:
+                    mech._advance_states(local_voltages[support_index], dt, inputs)
+                else:
+                    mech._advance_states(local_voltages[support_index], dt)
 
     def advance_post_current(self, v, dt, temp, current_frame):
         """Publish the accepted current, advance its readers, and commit state.
@@ -2250,13 +2268,9 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._post_state_support_entries,
         )
-        for mech, support_index in self._post_state_advance_plan:
-            local_v = local_voltages[support_index]
-            inputs = self._resolve_state_inputs(mech.name)
-            if inputs:
-                mech._advance_states(local_v, dt, inputs)
-            else:
-                mech._advance_states(local_v, dt)
+        self._execute_state_advance_plan(
+            "post", self._post_state_advance_plan, local_voltages, dt
+        )
 
         self._finish_advance(v, dt, temp)
 
@@ -2273,12 +2287,9 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._state_support_entries,
         )
-        for mech, support_index in self._state_advance_plan:
-            inputs = self._resolve_state_inputs(mech.name)
-            if inputs:
-                mech._advance_states(local_voltages[support_index], dt, inputs)
-            else:
-                mech._advance_states(local_voltages[support_index], dt)
+        self._execute_state_advance_plan(
+            "all", self._state_advance_plan, local_voltages, dt
+        )
 
         self._finish_advance(v, dt, temp)
 
