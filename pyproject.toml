@@ -7,8 +7,8 @@ name = "dendra"
 description = "Differentiable neuronal simulation and macroscopic descriptor optimization"
 requires-python = ">=3.11"
 readme = "README.md"
-license = "LicenseRef-Duke-Research-NonCommercial"
-license-files = ["LICENSE.md"]
+license = "LicenseRef-Duke-Research-NonCommercial AND BSD-3-Clause"
+license-files = ["LICENSE.md", "THIRD_PARTY_NOTICES.md", "LICENSES/PyTorch.txt", "LICENSES/NEURON.txt"]
 
 dynamic = ["version", "dependencies"]
 

@@ -373,6 +373,8 @@ def validate_inductor_scan_contract():
 
 def _make_value_preserving_materializer(utils):
     """Isolate scan examples, retaining view metadata and fake op dispatch."""
+    # Functional-tensor unwrapping below is adapted from PyTorch's _from_fun.
+    # See THIRD_PARTY_NOTICES.md and the upstream license in LICENSES/PyTorch.txt.
     from ._hop_inputs import _copy_view
 
     original_from_fun = utils._from_fun
@@ -468,6 +470,8 @@ def _capture_saved_tensor_identity(tensor):
 
 
 def _make_full_output_backward(utils, aot_config_type, create_joint):
+    # Adapted from PyTorch's torch/_higher_order_ops/utils.py:create_bw_fn.
+    # See THIRD_PARTY_NOTICES.md and the upstream license in LICENSES/PyTorch.txt.
     prepare_original = utils.prepare_fw_with_masks_all_requires_grad
     clone_aliases = utils._clone_aliasing_output
 

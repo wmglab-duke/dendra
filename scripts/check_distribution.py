@@ -46,7 +46,34 @@ def source_version(root: Path) -> str:
     return versions[0]
 
 
-def check_metadata(data: bytes, version: str, artifact: Path) -> None:
+def source_licenses(root: Path) -> tuple[str, dict[str, bytes]]:
+    """Read the declared expression and expanded license-file inventory."""
+    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))[
+        "project"
+    ]
+    expression = project["license"]
+    if not isinstance(expression, str) or not expression.strip():
+        raise ValueError("The configured project license must be an expression.")
+    files = {}
+    for pattern in project["license-files"]:
+        matches = sorted(path for path in root.glob(pattern) if path.is_file())
+        if not matches:
+            raise ValueError(f"License-file pattern {pattern!r} matches no files.")
+        for path in matches:
+            files[path.relative_to(root).as_posix()] = path.read_bytes()
+    if "LICENSE.md" not in files:
+        raise ValueError("The original Duke license must be declared in license-files.")
+    return expression, files
+
+
+def check_metadata(
+    data: bytes,
+    version: str,
+    artifact: Path,
+    *,
+    license_expression: str,
+    license_files: dict[str, bytes],
+) -> None:
     metadata = BytesParser().parsebytes(data)
     if metadata["Name"] != "dendra" or metadata["Version"] != version:
         raise ValueError(
@@ -63,6 +90,33 @@ def check_metadata(data: bytes, version: str, artifact: Path) -> None:
         )
     if "solvers" not in metadata.get_all("Provides-Extra", []):
         raise ValueError(f"{artifact.name}: the solvers extra is missing.")
+    if metadata.get_all("License-Expression", []) != [license_expression]:
+        raise ValueError(
+            f"{artifact.name}: License-Expression is missing or differs from source."
+        )
+    declared = metadata.get_all("License-File", [])
+    if set(declared) != license_files.keys() or len(declared) != len(license_files):
+        raise ValueError(
+            f"{artifact.name}: License-File headers differ from declared license-files."
+        )
+
+
+def check_license_contents(
+    contents: dict[str, bytes],
+    license_files: dict[str, bytes],
+    artifact: Path,
+    *,
+    prefix: str = "",
+) -> None:
+    for name, expected in license_files.items():
+        if contents.get(prefix + name) != expected:
+            if name == "LICENSE.md" and prefix:
+                raise ValueError(
+                    f"{artifact.name}: the original Duke license is missing or changed."
+                )
+            raise ValueError(
+                f"{artifact.name}: {name} is missing or differs from source."
+            )
 
 
 def check_package_contents(
@@ -99,6 +153,7 @@ def check_distributions(directory: Path, root: Path, ref: str = "") -> str:
     version = source_version(root)
     if ref.startswith("refs/tags/") and ref != f"refs/tags/v{version}":
         raise ValueError(f"Release tag {ref} must be refs/tags/v{version}.")
+    license_expression, license_files = source_licenses(root)
 
     wheel = directory / f"dendra-{version}-py3-none-any.whl"
     sdist = directory / f"dendra-{version}.tar.gz"
@@ -118,15 +173,20 @@ def check_distributions(directory: Path, root: Path, ref: str = "") -> str:
             if not name.endswith("/")
         }
     dist_info = f"dendra-{version}.dist-info"
-    check_metadata(wheel_contents[f"{dist_info}/METADATA"], version, wheel)
+    check_metadata(
+        wheel_contents[f"{dist_info}/METADATA"],
+        version,
+        wheel,
+        license_expression=license_expression,
+        license_files=license_files,
+    )
     check_package_contents(wheel_contents, root, wheel)
-    if (
-        wheel_contents.get(f"{dist_info}/licenses/LICENSE.md")
-        != (root / "LICENSE.md").read_bytes()
-    ):
-        raise ValueError(
-            f"{wheel.name}: the original Duke license is missing or changed."
-        )
+    check_license_contents(
+        wheel_contents,
+        license_files,
+        wheel,
+        prefix=f"{dist_info}/licenses/",
+    )
 
     with tarfile.open(sdist) as archive:
         members = [member for member in archive.getmembers() if member.isfile()]
@@ -143,9 +203,16 @@ def check_distributions(directory: Path, root: Path, ref: str = "") -> str:
             if stream is None:
                 raise ValueError(f"{sdist.name}: unreadable member {member.name}.")
             sdist_contents[member.name.removeprefix(prefix)] = stream.read()
-    check_metadata(sdist_contents["PKG-INFO"], version, sdist)
+    check_metadata(
+        sdist_contents["PKG-INFO"],
+        version,
+        sdist,
+        license_expression=license_expression,
+        license_files=license_files,
+    )
     check_package_contents(sdist_contents, root, sdist)
-    for name in ("LICENSE.md", "README.md", "pyproject.toml", "setup.py"):
+    check_license_contents(sdist_contents, license_files, sdist)
+    for name in ("README.md", "pyproject.toml", "setup.py"):
         if sdist_contents.get(name) != (root / name).read_bytes():
             raise ValueError(f"{sdist.name}: {name} is missing or differs from source.")
     return version

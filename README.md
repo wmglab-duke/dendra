@@ -97,10 +97,12 @@ stimulation." *Nature Communications.* 2024.
 
 ## License
 
-Dendra is distributed under Duke University's custom license for non-commercial
-research and academic testing. Commercial use, including industrially
-sponsored research, requires a separate agreement with Duke's Office for
+Dendra's original code is distributed under Duke University's custom license
+for non-commercial research and academic testing. Commercial use, including
+industrially sponsored research, requires a separate agreement with Duke's Office for
 Translation and Commercialization. The
-[license](https://github.com/wmglab-duke/dendra/blob/main/LICENSE.md) governs
-all use; downloading, cloning, or forking the software constitutes acceptance
-of those terms.
+[license](https://github.com/wmglab-duke/dendra/blob/main/LICENSE.md) sets out
+those terms; downloading, cloning, or forking the software constitutes acceptance
+of the agreement. Identified third-party portions retain their upstream terms;
+see the
+[third-party notices](https://github.com/wmglab-duke/dendra/blob/main/THIRD_PARTY_NOTICES.md).
