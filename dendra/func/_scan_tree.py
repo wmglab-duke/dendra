@@ -25,7 +25,9 @@ from ._scan_compat import (
     _capture_saved_tensor_identity,
     install_scan_compatibility,
 )
+from ._scan_executor import _executor_key
 from ._scan_inductor import _compile_scan
+from ._state_projection import _plain_projection_context, _plain_state_tree
 from ._tensor_contracts import _clone_contiguous_tree as _clone_tree
 from ._tensor_contracts import capture_schema as _schema
 from ._tree_paths import _get_path
@@ -116,6 +118,10 @@ class _CompiledTensorTreeScan:
     a bound parameter/preparation graph. Public calls own fresh materialized
     carry leaves outside compilation and share Population's first-order scan
     differentiation contract.
+
+    Raw sample views retain separate authored captures. Eligible identical
+    programs share a compiled executor, with each raw entry retaining its own
+    view-isolation policy and ordinary Dynamo guards.
     """
 
     def __init__(
@@ -144,6 +150,7 @@ class _CompiledTensorTreeScan:
         self._clone_state = _clone_tree if clone_state is None else clone_state
         self._capture_examples = capture_examples
         self._kernels = {}
+        self._executors = {}
 
     def _samples(self, tapes):
         return _tensor_samples(tapes, self._steps, self._device)
@@ -170,6 +177,7 @@ class _CompiledTensorTreeScan:
         sample_layout,
         *,
         grad_enabled,
+        executor_signature=None,
     ):
         body = self._body
         partition = self._callback_carry
@@ -236,11 +244,26 @@ class _CompiledTensorTreeScan:
                 samples,
             )
 
-        compiled = _compile_scan(
-            execute,
-            self._options,
-            prefer_cpp_wrapper=not grad_enabled and self._device.type == "cpu",
+        executor_key = _executor_key(graph, executor_signature, self._options)
+        existing = (
+            self._executors.get(executor_key) if executor_key is not None else None
         )
+        if existing is not None:
+            compiled, retained_graph = existing
+            if (
+                _executor_key(retained_graph, executor_signature, self._options)
+                != executor_key
+            ):
+                existing = None
+                del self._executors[executor_key]
+        if existing is None:
+            compiled = _compile_scan(
+                execute,
+                self._options,
+                prefer_cpp_wrapper=not grad_enabled and self._device.type == "cpu",
+            )
+            if executor_key is not None:
+                self._executors[executor_key] = compiled, graph
         return compiled, layout, isolate_views
 
     def __call__(self, parameters, prepared, state, carries, input_tape):
@@ -258,6 +281,11 @@ class _CompiledTensorTreeScan:
             grad_enabled,
         )
         if signature not in self._kernels:
+            pool = _plain_projection_context(
+                check_saved_tensors=False
+            ) and _plain_state_tree(
+                (parameters, prepared, state, carries, samples), allow_parameters=True
+            )
             with torch.inference_mode(False), torch.no_grad():
                 self._kernels[signature] = self._capture(
                     parameters,
@@ -267,6 +295,7 @@ class _CompiledTensorTreeScan:
                     samples,
                     sample_layout,
                     grad_enabled=grad_enabled,
+                    executor_signature=signature if pool else None,
                 )
         compiled, layout, isolate_views = self._kernels[signature]
         parameters, prepared, invariant, samples = isolate_views(
