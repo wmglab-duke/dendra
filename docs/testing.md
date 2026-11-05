@@ -39,6 +39,12 @@ that require neither an accelerator nor the NEURON simulator, while `neuron and 
 cuda` adds the required simulator-backed CPU tests without selecting GPU
 comparisons.
 
+The full GitLab lane, base-install check and documentation build use the
+PyTorch 2.15.0 CPU wheel. Compiler compatibility jobs cover the supported
+minimum (2.14.0), the pinned release (2.15.0), and the newest available 2.x
+release. Job constraints retain the selected wheel during later dependency
+installation.
+
 Mark tests that inspect device metadata or mock compiler behavior with
 `@pytest.mark.cpu` when they do not allocate or execute on an accelerator. This prevents a
 parameter such as `device="cuda"` or `device="mps"` from assigning them to an accelerator lane.

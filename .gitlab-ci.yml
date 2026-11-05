@@ -17,7 +17,7 @@ workflow:
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
   DEBIAN_FRONTEND: noninteractive
-  TORCH_SPEC: "torch==2.14.0"
+  TORCH_SPEC: "torch==2.15.0"
 
 cache:
   # Parallel job names contain '/', which is not allowed in cache keys.
@@ -40,6 +40,8 @@ before_script:
 
   # 1) Install PyTorch first
   - python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
+  # Retain the selected CPU build through subsequent dependency resolution.
+  - python -c 'from importlib.metadata import version; print("torch==" + version("torch"))' >> "$PIP_CONSTRAINT"
 
   # 2) Include optional native solvers for the full test and documentation lanes.
   # Require the published wheel so CI exercises the distributed artifact.
@@ -107,6 +109,7 @@ test_base_install:
     - python -m pip install --upgrade pip
     - python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
     - printf "numpy<2\ndendra-solvers==0\n" > "$CI_PROJECT_DIR/base-constraints.txt"
+    - python -c 'from importlib.metadata import version; print("torch==" + version("torch"))' >> "$CI_PROJECT_DIR/base-constraints.txt"
     - python -m pip install --constraint "$CI_PROJECT_DIR/base-constraints.txt" .
   script:
     # Isolated mode imports the installed distribution, not the source checkout.
@@ -209,7 +212,8 @@ test_functional_compatibility:
   stage: test
   parallel:
     matrix:
-      - TORCH_SPEC: ["torch==2.14.0", "torch>=2.14,<2.15", "torch>=2.14,<3"]
+      # Supported minimum, pinned current release, and rolling PyTorch 2.x.
+      - TORCH_SPEC: ["torch==2.14.0", "torch==2.15.0", "torch>=2.15,<3"]
   variables:
     OMP_NUM_THREADS: "1"
     MKL_NUM_THREADS: "1"
