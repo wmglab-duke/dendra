@@ -23,6 +23,7 @@ from ._hop_inputs import (
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
     _own_runtime_draw_packets,
+    _parameter_input_isolation,
 )
 from ._inputs import _RuntimeInputs
 from ._scan_compat import install_scan_compatibility
@@ -203,6 +204,9 @@ class _CompiledScanPopulationChunk:
         phase_emissions = (
             block > 1 and plans is not None and functional.device.type == "cpu"
         )
+        # Detaching capture examples erases the source's Parameter class.
+        # Retain it only until the cold operand policy has been selected.
+        raw_parameters, raw_prepared = parameters, prepared
         state = functional._clone_state_tree(state)
         parameters, prepared, state, ve, intra, carries, noise, stimulation, draws = (
             _detach(
@@ -323,6 +327,20 @@ class _CompiledScanPopulationChunk:
                 sample_use.get("draws", False),
             )
         )
+        if isinstance(graph, torch.fx.GraphModule):
+            isolate_views = _parameter_input_isolation(
+                isolate_views,
+                (
+                    raw_parameters,
+                    raw_prepared,
+                    invariant_carries,
+                    ve,
+                    intra,
+                    noise,
+                    stimulation,
+                    draws,
+                ),
+            )
 
         def execute(
             parameters,

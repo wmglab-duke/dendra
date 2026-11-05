@@ -279,6 +279,47 @@ class _LiftedViewIsolation:
         return pytree.tree_unflatten(values, spec) if copied else tree
 
 
+@dataclass(frozen=True)
+class _ParameterInputIsolation:
+    base: _LiftedViewIsolation
+    indices: tuple[int, ...]
+
+    def __call__(self, tree):
+        # Preserve the original isolation and validation order. Its authored
+        # view operations can also change the context inspected below.
+        owned = self.base(tree)
+        values = self.base.spec.flatten_up_to(owned)
+        if not any(type(values[index]) is _PARAMETER for index in self.indices):
+            return owned
+        if not (
+            _plain_projection_context(check_saved_tensors=False)
+            and _plain_state_tree(
+                [value for value in values if torch.is_tensor(value)],
+                allow_parameters=True,
+            )
+        ):
+            return owned
+
+        aliases = {}
+        for index in self.indices:
+            value = values[index]
+            if type(value) is _PARAMETER:
+                identity = id(value)
+                if identity not in aliases:
+                    aliases[identity] = torch.ops.aten.alias.default(value)
+                values[index] = aliases[identity]
+        return pytree.tree_unflatten(values, self.base.spec)
+
+
+def _parameter_input_isolation(base, raw_arguments):
+    """Normalize captured Parameter slots without changing ordinary frames."""
+    values = base.spec.flatten_up_to(raw_arguments)
+    indices = tuple(
+        index for index, value in enumerate(values) if type(value) is _PARAMETER
+    )
+    return _ParameterInputIsolation(base, indices) if indices else base
+
+
 @torch.compiler.allow_in_graph
 def _isolate_dense_lifted_tensor(value):
     # AOT traces static view metadata; Dynamo cannot inline storage_offset().

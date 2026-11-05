@@ -22,6 +22,7 @@ from ._hop_inputs import (
     _input_usage,
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
+    _parameter_input_isolation,
 )
 from ._state_projection import (
     _can_project_state,
@@ -308,6 +309,10 @@ class _CompiledTensorTreeWhile:
                 pytree.tree_map(lambda _value: True, sample_use),
             )
         )
+        if isinstance(graph, torch.fx.GraphModule):
+            isolate_views = _parameter_input_isolation(
+                isolate_views, (parameters, prepared, invariant, samples)
+            )
         # FX already recorded the emission tensors' metadata. Discover their
         # schema without executing another numerical model transition.
         output = next(node for node in graph.graph.nodes if node.op == "output")
