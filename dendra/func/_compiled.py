@@ -290,26 +290,15 @@ class CompiledPopulationChunk:
                     raise FunctionalizationError(
                         f"execution='while' is unavailable: {reason}"
                     )
-        if (
-            self._execution == "default"
-            and operands.noise is None
-            and operands.stimulation is None
-            and operands.draws is None
-            and prewarm_structured
-            and not torch.is_grad_enabled()
-        ):
-            functional = self._functional
-            functional._ensure_structured_step_graph(
-                operands.ve is not None or functional.extra.enabled,
-                operands.intra is not None or functional.intra.enabled,
-            )
-        strategy, reason = self._compiled_strategy(operands, grad_enabled)
+        strategy, reason = self._resolve_compiled_route(
+            operands, grad_enabled, prewarm_structured=prewarm_structured
+        )
         result = self._compiled(*operands)
         self._record_execution(strategy, grad_enabled=grad_enabled, reason=reason)
         return result
 
-    def _compiled_strategy(self, operands, grad_enabled):
-        """Mirror the lowered inference dispatch without inspecting live graphs."""
+    def _resolve_compiled_route(self, operands, grad_enabled, *, prewarm_structured):
+        """Resolve the route report and prepare its inference graph when needed."""
         if self._compile_options.get("disable", False):
             return "eager_disabled", "Compilation was explicitly disabled."
         if self._execution == "scan":
@@ -335,16 +324,26 @@ class CompiledPopulationChunk:
         # one-/two-/three-step call executes only the unrolled tail.
         from ._population import _STRUCTURED_ROLLOUT_CHUNK
 
+        stochastic = (
+            operands.noise is not None
+            or operands.stimulation is not None
+            or operands.draws is not None
+        )
+        if prewarm_structured and not stochastic:
+            # Short chunks also use this graph as a straight-line recurrence.
+            # Retain their existing capture and ownership policy; stepwise and
+            # disabled execution have already selected routes that cannot use it.
+            functional = self._functional
+            functional._ensure_structured_step_graph(
+                operands.ve is not None or functional.extra.enabled,
+                operands.intra is not None or functional.intra.enabled,
+            )
         if self._steps < _STRUCTURED_ROLLOUT_CHUNK:
             return (
                 "compiled_unrolled",
                 "The chunk is shorter than one inference loop block.",
             )
-        if (
-            operands.noise is not None
-            or operands.stimulation is not None
-            or operands.draws is not None
-        ):
+        if stochastic:
             return (
                 "compiled_unrolled",
                 "No captured stochastic inference step graph is available.",
