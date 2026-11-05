@@ -25,11 +25,11 @@ Compilation and execution
 .. autofunction:: dendra.func.longrun_checkpointed
 
 .. autoclass:: dendra.func.CompiledRunner
-   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, find_parameters, parameter_name, get_parameter, constants, functional, callbacks, kernel, execution_report, export_continuation, restore_continuation
+   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, find_parameters, parameter_name, get_parameter, constants, functional, callbacks, kernel, execution_report, warm, export_continuation, restore_continuation
    :special-members: __call__
 
 .. autoclass:: dendra.func.CompiledNetworkRunner
-   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, find_parameters, parameter_name, get_parameter, constants, functional, callbacks, kernel, execution_report, export_continuation, restore_continuation
+   :members: initial_state, initialization_inputs, parameters, named_parameters, trainable_parameters, find_parameters, parameter_name, get_parameter, constants, functional, callbacks, kernel, execution_report, warm, export_continuation, restore_continuation
    :special-members: __call__
 
 Runtime inputs and randomness

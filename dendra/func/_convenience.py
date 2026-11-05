@@ -317,6 +317,40 @@ class CompiledRunner:
         """Return the underlying kernel's latest successful execution report."""
         return self._kernel.execution_report()
 
+    def warm(self, state=None, *, verbose=False, **call_kwargs):
+        """Warm forward execution with a discarded representative run.
+
+        Parameters
+        ----------
+        state : tensor tree or Continuation, optional
+            Select the same restart or continuation as :meth:`__call__`.
+        verbose : bool, optional
+            Print start, elapsed-time updates and completion to standard error.
+            Defaults to False. Progress describes the warm-up call, not a
+            compiler percentage.
+        **call_kwargs
+            Invocation arguments accepted by :meth:`__call__`, including
+            inputs, draws, runtime extra, source overrides and the horizon.
+
+        Returns
+        -------
+        CompiledRunner
+            This runner, with the encountered execution variants warmed.
+
+        Notes
+        -----
+        Executes the selected simulation and discards its results. Model/source
+        state, RNG carry and parameter gradients retain their values. Recorder
+        file publication is suppressed while its numerical callback and chunk
+        schedule are preserved. Compilation and safe preparation caches remain.
+        Accelerator work completes before return.
+        Training warms the forward path only; a subsequent backward may compile.
+        Different shapes, gradient flags or horizons can require other variants.
+        """
+        from ._warm import _warm_runner
+
+        return _warm_runner(self, state, verbose=verbose, **call_kwargs)
+
     def _prepare(self, parameters, *, cache, constants=None):
         return self._prepare_with(
             parameters,

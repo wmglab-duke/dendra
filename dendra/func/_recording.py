@@ -3,10 +3,41 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 
 from ._callbacks import FunctionalCallbacks, _BoundCadencedRecorder, _CallbackCollector
 from ._types import FunctionalizationError
+
+_DISCARD_PUBLICATION = ContextVar("dendra_discard_recording_publication", default=False)
+
+
+@contextmanager
+def _discard_recording_publication():
+    """Keep numerical Recorder plans and spans while discarding host publication."""
+    token = _DISCARD_PUBLICATION.set(True)
+    try:
+        yield
+    finally:
+        _DISCARD_PUBLICATION.reset(token)
+
+
+class _DiscardRecordingSession:
+    """Keep bounded collection without opening or validating an I/O session.
+
+    Warm-up validates the callback binding metadata, but does not qualify file
+    writer availability or native writer state. Ordinary execution retains the
+    real session's checks. No recorder, queue or history is retained or changed.
+    """
+
+    def append(self, values, *, steps, positions):
+        pass
+
+    def finish(self):
+        pass
+
+    def abort(self):
+        pass
 
 
 def _storage_bindings(callbacks):
@@ -24,6 +55,7 @@ def _recording_sessions(callbacks):
         return
     from dendra.models._recorder_storage import _RecorderHDF5Session
 
+    discard = _DISCARD_PUBLICATION.get()
     sessions = {}
     try:
         for name, (recorder, queue, path, interval, states) in storage.items():
@@ -37,7 +69,11 @@ def _recording_sessions(callbacks):
                 raise FunctionalizationError(
                     "HDF5 Recorder storage changed after binding; bind a new callback collection"
                 )
-            sessions[name] = _RecorderHDF5Session(recorder)
+            sessions[name] = (
+                _DiscardRecordingSession()
+                if discard
+                else _RecorderHDF5Session(recorder)
+            )
         yield sessions
         for session in sessions.values():
             session.finish()

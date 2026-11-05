@@ -61,6 +61,40 @@ The continuation carries the effective parameters, constants, simulation/RNG
 state and callback phase together. Continued recordings contain only the new
 samples, without repeating the joining boundary.
 
+## Warm a program before its first timed call
+
+`warm()` executes and discards a representative forward run, retaining the
+compiled kernels and returning the same program:
+
+```python
+program = dn.compile(model, dt=DT, steps=40).warm(verbose=True)
+state, auxiliary = program()
+```
+
+It accepts the same invocation arguments as `program(...)`. Supply representative
+inputs or runtime `extra` bindings when those are needed, or pass a continuation
+to warm that execution boundary:
+
+```python
+example_inputs = dn.func.Inputs(ve=torch.zeros(
+    (40, *model.v.shape), dtype=model.v.dtype, device=model.v.device
+))
+program.warm(inputs=example_inputs, verbose=True)
+program.warm(auxiliary["continuation"], inputs=example_inputs, verbose=True)
+```
+
+The selected run uses the configured initialization policy and horizon. Its
+simulation results are discarded; source/model state, RNG carry and parameter
+gradients retain their values. Recorder callbacks follow their usual cadence
+and chunk schedule, with recording-file publication suppressed. Verbose mode
+prints to standard error, including elapsed-time updates during long calls.
+Accelerator work completes before `warm()` returns.
+
+Warming covers the encountered execution variants. Different input shapes,
+gradient flags or horizons can require more compilation. Training programs warm
+their forward path; the first backward pass can still compile. `warm()` executes
+the simulation, so its cost includes execution as well as compilation.
+
 ## Compile a connected Network
 
 Connections are configured before compilation using the ordinary Network API.
