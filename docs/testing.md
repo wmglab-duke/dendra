@@ -168,74 +168,78 @@ those floors locally with:
 python scripts/check_coverage_floors.py coverage.json
 ```
 
-## Run the full lane as CI shards
+## Run the full lane as CI units
 
-GitLab CI splits the required CPU/NEURON lane across ten jobs so that each job
-has its own timeout. Together they execute the same selected test set as the
-single-process command above. All ten jobs and the coverage aggregation job
-must pass before merging. The functional compiler compatibility matrix remains
+GitLab keeps ten physical jobs and installs dependencies once per job. The
+required CPU/NEURON lane is divided into forty duration-balanced logical units,
+with complete test modules kept together. Each job runs four units serially;
+job 1 owns units 1, 11, 21 and 31. All forty units and the coverage aggregation
+must qualify before merging. The functional compiler compatibility matrix is
 an additional required check.
+
+To run the same full lane locally with two concurrent unit processes:
+
+```sh
+python scripts/run_ci_shards.py --workers 2 --output-dir ci-results
+```
+
+`--workers` controls process concurrency independently of the forty logical
+units. Keep it small enough for compiler memory use. Output and its sibling
+runner directory must be Gitignored or outside the checkout, so generated
+artifacts cannot change the source fingerprint. To run the four units
+owned by GitLab job 1, add `--job-index=1`; its default worker count is one.
+
+Every unit records its full selected inventory, assignments, outcomes, source
+fingerprints and timings in `ci-results/<unit>/manifest.json`. Its command,
+pytest log, JUnit report and raw branch coverage are retained alongside that
+manifest. Runner and module-recovery evidence lives in `ci-results-runner/`.
+
+The runner collects the current full lane before deciding whether previous
+artifacts are reusable. Resume requires matching runtime, configuration,
+environment and native-code fingerprints, unchanged assigned module hashes,
+identical test inventory and assignments, successful execution of all assigned
+IDs, and intact artifact hashes. Missing or invalid evidence reruns the unit.
+
+With unchanged globals and test inventory, a recorded failure or an isolated
+plain top-level test-function body edit reruns the complete affected module.
+Checked recovery replaces its outcomes and coverage contexts; it does not rerun
+only the failed ID or union stale coverage. Module-level, collection, helper and
+class changes conservatively invalidate all units, as do runtime, shared test
+support, conftest/configuration and other project changes. Added/removed tests
+or changed assignments can require fresh units. Tests must restore shared state
+and remain independent across modules; eligibility checks are not a Python
+purity proof.
+
+CI retains unit evidence in a branch/job cache, separately from the pip cache.
+An eligible test-fix commit can reuse unchanged units even though its commit ID has
+changed. Cache transport is best-effort: a missing cache causes normal execution,
+and cache presence alone never proves correctness. Failed-attempt and recovery
+provenance remain visible. The same restrictions apply to local resume.
+
+Reuse is scoped to the same configured CPU/NEURON lane, image and device class.
+Fingerprints cover Python/packages, native sources and binaries, and runner
+options; they do not probe arbitrary environment variables or hardware.
+
+After all forty units finish, validate their exact disjoint selected-ID
+partition and combine raw statement/branch coverage with:
+
+```sh
+python scripts/combine_ci_coverage.py --shards 40 --input-dir ci-results --fail-under=84
+```
+
+The aggregator enforces the unchanged 84% global minimum and module floors in
+`coverage-floors.toml`. Reports are written to `coverage.json`, `coverage.xml`
+and `htmlcov/`. Per-unit coverage percentages are not qualification thresholds.
 
 Merge-request pipelines and pushes to `develop` or `main` always run the full
 checks. Feature-branch push pipelines select them when runtime, tests, build,
 or CI files change. Documentation-only feature-branch pushes run the executable
-documentation build; set the CI/CD variable `RUN_FULL_TESTS=1` to request the
-full checks on those pushes too.
-When a feature branch has an open merge request, its merge-request pipeline
-replaces the duplicate push pipeline.
+documentation build; set `RUN_FULL_TESTS=1` to request full checks there too.
+An open merge request replaces the duplicate feature push pipeline.
 
-Each `test_shards` job records its test inventory and durations in
-`ci-results/<index>/manifest.json`, JUnit results in `junit.xml`, and raw coverage
-data in `.coverage` in the same directory. These are retained as CI artifacts.
-The `test_coverage` aggregator verifies that the ten inventories form a complete,
-disjoint partition of the selected tests before combining
-coverage. It enforces the same 84% global minimum and the module floors from
-`coverage-floors.toml` against the combined report. Per-shard coverage percentages
-are not meaningful thresholds: each shard exercises only part of the suite.
-
-To reproduce shard 1 locally, use:
-
-```sh
-mkdir -p ci-results/1
-COVERAGE_FILE=ci-results/1/.coverage \
-python -m pytest -p scripts.ci_shard tests -W error \
-  -m "cpu or (neuron and not cuda)" \
-  --ci-shard-index=1 --ci-shard-total=10 --ci-shard-output=ci-results/1 \
-  --ci-shard-durations=scripts/ci_durations.json \
-  --junitxml=ci-results/1/junit.xml --durations=25 \
-  --cov=dendra --cov-branch --cov-config=.coveragerc.cpu --cov-report=
-```
-
-Repeat with shard indices 2 through 10, changing each output path to match its
-index. Preserve the same checkout, dependencies, marker expression, and coverage
-configuration, including the same duration profile, across all ten runs. Then
-validate the inventories, combine raw coverage data, and generate the reports
-with:
-
-```sh
-python scripts/combine_ci_coverage.py --shards 10 --input-dir ci-results --fail-under=84
-```
-
-The combined reports are written to `coverage.json`, `coverage.xml`, and
-`htmlcov/` at the checkout root.
-
-Coverage uses relative source paths so data collected in separate CI workspaces
-can be combined. Combining the data preserves statement and branch coverage
-across the entire lane; averaging shard percentages would not.
-
-Sharding does not shorten or remove tests. Modules stay together to preserve
-module-scoped fixture reuse. CI supplies the measured module-duration profile
-in `scripts/ci_durations.json`: each module's estimate uses its measured time
-per test multiplied by its currently selected case count. Modules are assigned
-largest estimate first to the shard with the lowest estimated load. A module
-absent from the profile uses the profile's total measured time divided by its
-total measured test count as the fallback time per test. Omitting the optional
-`--ci-shard-durations` argument balances selected case counts instead.
-
-Shard manifests record the profile path, hash, and provenance alongside actual
-test durations, so measurements from successful complete runs can inform later
-profile updates. These estimates exclude installation and collection time.
-Runner availability, hardware, compilation caches, and workload changes affect
-wall-clock time; ten shards do not guarantee a particular speedup or maximum
-job duration. The shorter development pass remains useful while iterating, but
-the full CI lane remains mandatory.
+Unit estimates come from `scripts/ci_durations.json`; new modules use its mean
+time per test. Manifests preserve profile hashes and actual duration records.
+Forty units reduce retry scope, without pruning tests or changing the coverage
+requirement. Module size, host speed, compilation caches, process contention,
+collection and installation overhead still affect duration; this is not a
+cold-CI timing prediction or a two-hour guarantee.

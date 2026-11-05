@@ -147,6 +147,16 @@ test_shards:
   extends: .full_test_rules
   stage: test
   parallel: 10
+  # Keep dependency downloads separate from branch/job-scoped unit evidence.
+  cache:
+    - key: "$CI_JOB_NAME_SLUG"
+      paths:
+        - .cache/pip
+    - key: "ci-units-v1-$CI_COMMIT_REF_SLUG-$CI_NODE_INDEX"
+      paths:
+        - ci-results/
+      policy: pull-push
+      when: always
   variables:
     OMP_NUM_THREADS: "1"
     MKL_NUM_THREADS: "1"
@@ -155,25 +165,18 @@ test_shards:
     TORCHINDUCTOR_COMPILE_THREADS: "1"
   script:
     - python -m pip install pytest pytest-cov hypothesis neuron
-    - mkdir -p "ci-results/$CI_NODE_INDEX"
-    - export COVERAGE_FILE="$CI_PROJECT_DIR/ci-results/$CI_NODE_INDEX/.coverage"
-    # Shard after marker selection, keeping every selected test in exactly one
-    # job. Keep raw data separate: full-suite floors belong to the union.
-    - >-
-      python -m pytest -p scripts.ci_shard tests -W error
-      -m "cpu or (neuron and not cuda)"
-      --ci-shard-index="$CI_NODE_INDEX" --ci-shard-total="$CI_NODE_TOTAL"
-      --ci-shard-output="ci-results/$CI_NODE_INDEX"
-      --ci-shard-durations=scripts/ci_durations.json
-      --junitxml="ci-results/$CI_NODE_INDEX/junit.xml" --durations=25
-      --cov=dendra --cov-branch --cov-config=.coveragerc.cpu --cov-report=
+    # Forty complete module-preserving logical units, four per physical job.
+    # Valid branch-cache units resume; eligible test-body changes recover with
+    # complete module reruns and provenance-checked coverage replacement.
+    - python scripts/run_ci_shards.py --job-index="$CI_NODE_INDEX" --workers=1 --output-dir=ci-results
   artifacts:
     when: always
     name: "cpu-neuron-$CI_NODE_INDEX"
     paths:
       - ci-results/
+      - ci-results-runner/
     reports:
-      junit: "ci-results/$CI_NODE_INDEX/junit.xml"
+      junit: "ci-results/*/junit.xml"
     expire_in: 1 week
 
 test_coverage:
@@ -188,7 +191,7 @@ test_coverage:
     - python -m pip install --upgrade pip
     - python -m pip install coverage
   script:
-    - python scripts/combine_ci_coverage.py --shards 10 --input-dir ci-results --fail-under=84
+    - python scripts/combine_ci_coverage.py --shards 40 --input-dir ci-results --fail-under=84
   coverage: '/TOTAL.*\s+(\d+%)$/'
   artifacts:
     when: always
