@@ -82,6 +82,7 @@ def test_scan_graph_cache_is_partitioned_by_policy_without_executing_scan(monkey
         sample_layout,
         *,
         grad_enabled,
+        executor_signature=None,
     ):
         assert grad_enabled
         policy = dn.current_membrane_assembly()
