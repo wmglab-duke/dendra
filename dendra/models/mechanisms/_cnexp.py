@@ -10,10 +10,8 @@ from ._solve_utils import (
     add_underscore_to_states,
     extract_vars,
     match_derivative_to_states,
-    modify_operations,
-    replace,
 )
-from .ode import integrate2c
+from .ode import integrate2torch
 from .ops import expinv
 
 # -- helpers --
@@ -135,36 +133,21 @@ def _linear_exact_step(state, rate, source, coefficient, dt):
 
 
 def convert(deriv, state, states, assigned, use_pade_approx=False):
-    """
-    Convert a derivative expression into a form suitable for numerical integration.
-
-    Parameters
-    ----------
-    deriv : str
-        The derivative expression to be converted.
-    state : str
-        The state variable involved in the derivative.
-    assigned : set
-        A set of variables that are assigned values.
-    use_pade_approx : bool, optional
-        Whether to use Pade approximation for integration. Defaults to False.
-    diffusion : Tuple[float, str], optional
-        The diffusion to be added, if any. Defaults to None.
-    model : object, optional
-        The model object (subclass of Axon). Defaults to None.
-
-    Returns
-    -------
-    str
-        The modified derivative expression after integration and optional diffusion addition.
-    """
+    """Emit a CNEXP assignment with unbound parameters read through ``self``."""
 
     exclude = set([state]) | set(states) | set(assigned)
     v = extract_vars(deriv, exclude)
-    f = integrate2c(deriv, "dt", v, use_pade_approx=use_pade_approx, stable_linear=True)
+    f = integrate2torch(
+        deriv,
+        "dt",
+        v,
+        use_pade_approx=use_pade_approx,
+        stable_linear=True,
+        parameter_names=v,
+    )
     if DEBUG:
         logger.debug(f"Integrated function:\n{f}")
-    return add_underscore_to_lhs(modify_operations(replace(f, v)))
+    return add_underscore_to_lhs(f)
 
 
 def build_cnexp(

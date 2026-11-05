@@ -1,208 +1,174 @@
-# -- adapted from now defunct bluebrain/nmodl repository --
+"""Symbolic scalar ODE updates and tensor-safe code generation."""
+
 import math
 import re
-from importlib import import_module
 from numbers import Real
 from typing import Optional
 
 import sympy as sp
+from sympy.core.function import AppliedUndef
 from sympy.printing.pycode import PythonCodePrinter
 
-# import known_functions through low-level mechanism because the ccode
-# module is overwritten in sympy and contents of that submodule cannot be
-# accessed through regular imports
-major, minor = (int(v) for v in sp.__version__.split(".")[:2])
-if major >= 1 and minor >= 7:
-    known_functions = import_module("sympy.printing.c").known_functions_C99
-else:
-    known_functions = import_module("sympy.printing.ccode").known_functions_C99
-
-if "Abs" in known_functions:
-    known_functions.pop("Abs")
-    known_functions["abs"] = "abs"
+_DECLARATION = re.compile(r"([A-Za-z_]\w*)\s*(?:\[\s*(\d+)\s*\])?\Z")
+_CALL_NAME = re.compile(r"\b([A-Za-z_]\w*)\s*\(")
 
 
-if not ((major >= 1) and (minor >= 2)):
-    raise ImportError(f"Requires SympPy version >= 1.2, found {major}.{minor}")
+def _var_to_sympy(declaration):
+    """Resolve a scalar name or a one-dimensional array declaration.
 
-
-def _var_to_sympy(var_str):
-    """Return sympy variable from string representing variable
-
-    If string contains "[" it is assumed to be an array variable
-    of the form "variable_name[N]", where N is the size of the array
-
-    Args:
-        var_str: variable as string
-
-    Returns:
-        (variable_name_as_string, variable_as_sympy_object)
+    ``x[3]`` declares an array of length three; it does not name element three.
+    Element references are resolved separately when parsing an expression.
     """
-    if "[" in var_str:
-        # var is an array variable with defined size, e.g. X[5]
-        var_name = var_str.split("[", 1)[0].strip()
-        var_len = int(var_str.split("[", 1)[1].split("]", 1)[0].strip())
-        # SymPy equivalent of an array is IndexedBase:
-        return var_name, sp.IndexedBase(var_name, shape=(var_len,), real=True)
+    match = _DECLARATION.fullmatch(declaration.strip())
+    if match is None:
+        raise ValueError(f"Invalid variable declaration: {declaration!r}")
+    name, length = match.groups()
+    if length is None:
+        value = sp.Symbol(name, real=True)
     else:
-        # otherwise can use a standard SymPy symbol:
-        return var_str, sp.symbols(var_str, real=True)
+        value = sp.IndexedBase(name, shape=(int(length),), real=True)
+    return name, value
 
 
-def _sympify_diff_eq(diff_string, vars):
-    """Parse differential equation into sympy expression
+def _parse_equation(diff_string, variables):
+    """Parse ``state' = rhs`` using an equation-local symbol environment."""
+    lhs, separator, rhs = diff_string.partition("=")
+    target = lhs.strip()
+    if not separator or not target.endswith("'") or not rhs.strip():
+        raise ValueError(f"Expected a derivative equation, got {diff_string!r}")
+    environment = _build_locals(variables)
+    # Token inventories used by mechanism builders also include function names.
+    # Keep those names available to SymPy's function parser, rather than treating
+    # exp(...) (for example) as a call to a scalar parameter named exp.
+    for name in _CALL_NAME.findall(rhs):
+        environment.pop(name, None)
+    state = sp.sympify(target[:-1].strip(), locals=environment)
+    if not isinstance(state, (sp.Symbol, sp.Indexed)):
+        raise ValueError(f"Invalid derivative target: {target!r}")
+    return state, sp.sympify(_nmodl_preprocess(rhs), locals=environment)
 
-    Given eq_string of the form "x' = df/dx", return sympy
-    objects representing x and df/dx
 
-    If x is an array, then it should be declared in vars
-    as "x[N]", where N is the size of the array, and an
-    IndexedBase sympy object will be returned
+def _symbolic_update(state, rhs, dt, *, use_pade_approx=False, stable_linear=False):
+    """Construct a frozen-coefficient scalar flow as a SymPy expression.
 
-    Args:
-        eq_string: string containing differential equation
-        vars: list of strings containing vars used in equation
-
-    Returns:
-        x: sympy object representing x
-        dxdt: sympy expression representing df/dx
+    Other states and parameters are held at their start-of-step values. Affine
+    and integer-power equations use closed forms; other nonlinear equations
+    use SymPy's explicit initial-value solutions. The stable affine form
+    retains the authored RHS for the numerical runtime helper instead of
+    reconstructing it from rounded coefficients.
     """
-    sympy_vars = {}
-    for var in vars:
-        var_name, sympy_object = _var_to_sympy(var)
-        sympy_vars[var_name] = sympy_object
+    slope = sp.simplify(sp.diff(rhs, state))
+    if use_pade_approx:
+        # For an autonomous scalar flow, y'(0)=f(y) and y''(0)=f'(y)f(y).
+        # Matching these coefficients gives a (1,1) rational step directly,
+        # without first solving the ODE or expanding its exact solution.
+        return sp.simplify(state + dt * rhs / (1 - dt * slope / 2))
+    if slope == 0:
+        return sp.simplify(state + dt * rhs)
+    if not slope.has(state):
+        source = sp.simplify(rhs - slope * state)
+        if stable_linear and source != 0:
+            return sp.Function("_linear_exact_step")(state, rhs, source, slope, dt)
+        equilibrium = sp.simplify(-source / slope)
+        return equilibrium + sp.simplify(state - equilibrium) * sp.exp(slope * dt)
 
-    diff_string_lhs, diff_string_rhs = diff_string.split("=", 1)
+    coefficient, monomial = rhs.as_independent(state, as_Add=False)
+    if monomial.is_Pow and monomial.base == state and monomial.exp.is_Integer:
+        # For y'=a*y**p, keep the initial state outside the root. Solving for
+        # y**(1-p) and taking a principal root can discard its initial sign.
+        order = 1 - monomial.exp
+        return state * (1 + order * coefficient * state ** (-order) * dt) ** (1 / order)
 
-    # parse dependent variable from LHS of equation:
-    x = sp.sympify(diff_string_lhs.replace("'", ""), locals=sympy_vars)
-
-    # parse RHS of equation into SymPy expression
-    dxdt = sp.sympify(diff_string_rhs, locals=sympy_vars)
-
-    return x, dxdt
+    elapsed = sp.Dummy("elapsed", real=True, positive=True)
+    dependent = sp.Function("_ode_state")(elapsed)
+    equation = sp.Eq(sp.diff(dependent, elapsed), rhs.subs(state, dependent))
+    # Limit the fallback to first-order separable equations, avoiding unrelated
+    # general solver strategies and preserving the scalar analytic contract.
+    if "separable" not in sp.classify_ode(equation, dependent):
+        raise NotImplementedError("ODE too hard")
+    solved = sp.dsolve(
+        equation, dependent, hint="separable", ics={dependent.subs(elapsed, 0): state}
+    )
+    if not isinstance(solved, sp.Equality) or solved.lhs != dependent:
+        raise NotImplementedError("ODE has no unique explicit scalar solution")
+    if any(call.func == dependent.func for call in solved.rhs.atoms(AppliedUndef)):
+        raise NotImplementedError("ODE has no explicit scalar solution")
+    result = sp.simplify(solved.rhs.subs(elapsed, dt))
+    if result.has(sp.Integral, sp.Derivative):
+        raise NotImplementedError("ODE has no explicit scalar solution")
+    return result
 
 
 def integrate2c(
     diff_string, dt_var, vars, use_pade_approx=False, *, stable_linear=False
 ):
-    """Analytically integrate supplied derivative, return solution as C code.
+    """Return a scalar ODE update as a C assignment.
 
-    Given a differential equation of the form x' = f(x), the value of
-    x at time t+dt is found in terms of the value of x at time t:
-    x(t + dt) = g( x(t), dt )
-    and this equation is returned in the format NEURON expects:
-    x = g( x, dt ),
-    where the x on the right is the current value of x at time t,
-    and the x on the left is the new value of x at time t+dt
+    Parameters
+    ----------
+    diff_string : str
+        Equation such as ``"x' = drive-rate*x"``.
+    dt_var : str
+        Name of the timestep variable in the generated expression.
+    vars : iterable of str
+        Scalar names and array declarations, for example ``["drive", "x[3]"]``.
+    use_pade_approx : bool, optional
+        Emit a second-order (1,1) Padé step instead of an exact scalar flow.
+    stable_linear : bool, optional
+        Emit ``_linear_exact_step`` for inhomogeneous affine equations. The
+        generated namespace must supply that helper.
 
-    The derivative should be of the form "x' = f(x)",
-    and vars should contain the set of all the variables
-    referenced by f(x), for example:
+    Returns
+    -------
+    str
+        An assignment whose right-hand side uses the start-of-step state.
 
-    -``integrate2c("x' = a*x", "dt", {"a"})``
-    -``integrate2c("x' = a + b*x - sin(3.2)", "dt", {"a","b"})``
+    Raises
+    ------
+    NotImplementedError
+        An exact explicit scalar solution could not be constructed.
 
-    Optionally, the analytic result can be expanded in powers of dt,
-    and the (1,1) Pade approximant to the solution returned.
-    This approximate solution is correct to second order in dt.
-
-    With ``stable_linear=True``, an inhomogeneous linear exact solution is
-    emitted through the tensor-safe ``_linear_exact_step`` helper, which the
-    caller must provide in the generated namespace. This avoids cancellation
-    near equilibrium, at small rates, and under stiff decay;
-    constant, homogeneous, nonlinear and Pade solutions retain their forms.
-
-    Args:
-        diff_string: Derivative to be integrated e.g. "x' = a*x + b"
-        t_var: name of time variable t in NEURON
-        dt_var: name of timestep variable dt in NEURON
-        vars: set of variables used in expression, e.g. {"a", "b"}
-        use_pade_approx: if False, return exact solution
-                         if True, return (1,1) Pade approx to solution
-                         correct to second order in dt_var
-
-    Returns:
-        string containing analytic integral of derivative as C code
-    Raises:
-        NotImplementedError: if the ODE is too hard, or if it fails to solve it.
+    Notes
+    -----
+    This adapter retains C output for callers that need it. Mechanism CNEXP
+    solvers emit Torch code directly through :func:`integrate2torch`.
     """
+    state, rhs = _parse_equation(diff_string, vars)
+    dt = sp.Symbol(dt_var, real=True, positive=True)
+    update = _symbolic_update(
+        state, rhs, dt, use_pade_approx=use_pade_approx, stable_linear=stable_linear
+    )
+    functions = {str(call.func): str(call.func) for call in update.atoms(AppliedUndef)}
+    return f"{sp.ccode(state)} = {sp.ccode(update.evalf(), user_functions=functions)}"
 
-    # only try to solve ODEs that are not too hard
-    ode_properties_require_all = {"separable"}
-    ode_properties_require_one_of = {
-        "1st_exact",
-        "1st_linear",
-        "almost_linear",
-        "nth_linear_constant_coeff_homogeneous",
-        "1st_exact_Integral",
-        "1st_linear_Integral",
-    }
 
-    x, dxdt = _sympify_diff_eq(diff_string, vars)
-    # set up differential equation d(x(t))/dt = ...
-    # where the function x_t = x(t) is substituted for the symbol x
-    # the dependent variable is a function of t
-    t = sp.Dummy("t", real=True, positive=True)
-    x_t = sp.Function("x(t)", real=True)(t)
-    diffeq = sp.Eq(x_t.diff(t), dxdt.subs({x: x_t}))
+def integrate2torch(
+    diff_string,
+    dt_var,
+    vars,
+    use_pade_approx=False,
+    *,
+    stable_linear=False,
+    parameter_names=(),
+):
+    """Return a Torch assignment, optionally reading named parameters from self.
 
-    # for simple linear case write down solution in preferred form:
-    dt = sp.symbols(dt_var, real=True, positive=True)
-    solution = None
-    c1 = dxdt.diff(x).simplify()
-    if c1 == 0:
-        # constant equation:
-        # x' = c0
-        # x(t+dt) = x(t) + c0 * dt
-        solution = (x + dt * dxdt).simplify()
-    elif c1.diff(x) == 0:
-        # linear equation:
-        # x' = c0 + c1*x
-        # x(t+dt) = (-c0 + (c0 + c1*x(t))*exp(c1*dt))/c1
-        c0 = (dxdt - c1 * x).simplify()
-        if stable_linear and not use_pade_approx and c0 != 0:
-            # Preserve the authored rate: expanding (x_inf-x)/tau into
-            # separately rounded terms would spoil its exact equilibrium.
-            solution = sp.Function("_linear_exact_step")(x, dxdt, c0, c1, dt)
-        else:
-            solution = (-c0 / c1).simplify() + (c0 + c1 * x).simplify() * sp.exp(
-                c1 * dt
-            ) / c1
-    else:
-        # otherwise try to solve ODE with sympy:
-        # first classify ODE, if it is too hard then exit
-        ode_properties = set(sp.classify_ode(diffeq))
-        if not ode_properties_require_all <= ode_properties:
-            raise NotImplementedError("ODE too hard")
-        if len(ode_properties_require_one_of & ode_properties) == 0:
-            raise NotImplementedError("ODE too hard")
-        # try to find analytic solution, with initial condition x_t(t=0) = x
-        # (note dsolve can return a list of solutions, in which case this currently fails)
-        solution = sp.dsolve(diffeq, x_t, ics={x_t.subs({t: 0}): x})
-        # evaluate solution at x(dt), extract rhs of expression
-        solution = solution.subs({t: dt}).rhs.simplify()
-
-    if use_pade_approx:
-        # (1,1) order Pade approximant, correct to 2nd order in dt,
-        # constructed from the coefficients of 2nd order Taylor expansion
-        taylor_series = sp.Poly(sp.series(solution, dt, 0, 3).removeO(), dt)
-        _a0 = taylor_series.nth(0)
-        _a1 = taylor_series.nth(1)
-        _a2 = taylor_series.nth(2)
-        solution = (
-            (_a0 * _a1 + (_a1 * _a1 - _a0 * _a2) * dt) / (_a1 - _a2 * dt)
-        ).simplify()
-        # special case where above form gives 0/0 = NaN
-        if _a1 == 0 and _a2 == 0:
-            solution = _a0
-
-    custom_fcts = {str(f.func): str(f.func) for f in solution.atoms(sp.Function)}
-
-    # return result as C code in NEURON format:
-    #   - in the lhs x_0 refers to the state var at time (t+dt)
-    #   - in the rhs x_0 refers to the state var at time t
-    return f"{sp.ccode(x)} = {sp.ccode(solution.evalf(), user_functions=custom_fcts)}"
+    The symbolic update shares the C adapter's mathematical contract. Parameter
+    binding applies only to symbol and array nodes, so function names and Torch
+    namespaces remain independent of mechanism field names.
+    """
+    state, rhs = _parse_equation(diff_string, vars)
+    dt = sp.Symbol(dt_var, real=True, positive=True)
+    update = _symbolic_update(
+        state, rhs, dt, use_pade_approx=use_pade_approx, stable_linear=stable_linear
+    )
+    functions = {str(call.func): str(call.func) for call in update.atoms(AppliedUndef)}
+    bindings = {name: f"self.{name}" for name in parameter_names if name != dt_var}
+    printer = TorchCodePrinter(extra_user_functions=functions, symbol_names=bindings)
+    expression = printer.doprint(_piecewise_to_where(update.evalf()))
+    if not _validate_torch_expression(expression, allowed_callables=functions):
+        raise NotImplementedError(f"Cannot emit a Torch ODE update: {expression}")
+    return f"{TorchCodePrinter().doprint(state)} = {expression}"
 
 
 # -- differentiate --
@@ -245,7 +211,8 @@ def _piecewise_to_where(expr: sp.Expr) -> sp.Expr:
 class TorchCodePrinter(PythonCodePrinter):
     """Printer that emits torch.* calls and tensor-safe boolean logic."""
 
-    def __init__(self, settings=None, extra_user_functions=None):
+    def __init__(self, settings=None, extra_user_functions=None, *, symbol_names=None):
+        self._symbol_names = dict(symbol_names or {})
         settings = dict(settings or {})
         settings.setdefault("fully_qualified_modules", True)
 
@@ -284,6 +251,33 @@ class TorchCodePrinter(PythonCodePrinter):
 
         settings["user_functions"] = uf
         super().__init__(settings)
+
+    def doprint(self, expr, assign_to=None):
+        # Fold constants even inside undefined runtime helpers: evalf alone
+        # can leave their numeric arguments unchanged. Tensor functions such
+        # as torch.sin and torch.sqrt cannot consume Python numeric arguments.
+        expr = sp.sympify(expr).replace(
+            lambda term: isinstance(term, sp.Expr)
+            and term.is_number
+            and not term.is_Atom,
+            lambda term: term.evalf(),
+        )
+        return super().doprint(expr, assign_to)
+
+    def _print_Symbol(self, expr):
+        if expr.name in self._symbol_names:
+            return self._symbol_names[expr.name]
+        return super()._print_Symbol(expr)
+
+    def _print_IndexedBase(self, expr):
+        return self._symbol_names.get(expr.name, expr.name)
+
+    def _print_Indexed(self, expr):
+        indices = ", ".join(self._print(index) for index in expr.indices)
+        return f"{self._print(expr.base)}[{indices}]"
+
+    def _print_Pow(self, expr, rational=False):
+        return self._hprint_Pow(expr, rational=rational, sqrt="torch.sqrt")
 
     # tensor-safe boolean ops
     def _print_And(self, expr):
