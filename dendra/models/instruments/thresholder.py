@@ -4,16 +4,17 @@ import numpy.typing as npt
 import torch
 from torch import Tensor
 
-from dendra.models import Population
-from dendra.models.callbacks import Recorder, ThresholdCallback
+from dendra.models.callbacks import ThresholdCallback
 from dendra.models.stim import Waveform
+
+from ._threshold_trials import _threshold_trials
 
 
 class Thresholder:
-    r"""Compute activation thresholds for a :class:`Population` model.
+    r"""Compute activation thresholds for a native or compiled Population.
 
     This helper class wraps a :class:`~dendra.models.Population` together with
-    a :class:`~dendra.models.callbacks.ThresholdCallback` and computes, for
+    an activity criterion and computes, for
     each element in the population, the stimulus amplitude at which an action
     potential (or some other binary state, as reported by the callback) is first
     detected.
@@ -22,7 +23,7 @@ class Thresholder:
     unknown scalar *amplitude* per population element. The shape can be
     specified in one of two ways:
 
-    * By providing ``space`` and ``time`` (functional mode), where
+    * By providing ``space`` and ``time`` (space/waveform mode), where
       ``space`` encodes the spatial distribution of extracellular potential and ``time`` is a
       :class:`Waveform` describing the temporal profile; or
     * By providing precomputed spatiotemporal ``bases`` (basis mode), in
@@ -42,7 +43,7 @@ class Thresholder:
        adjusted so that they produce a suprathreshold response for each
        element. If ``block_possible=True`` is passed to
        :meth:`calculate_thresholds`, the bound-fixing stage uses both the
-       activity callback and a :class:`Recorder` trace to distinguish
+       activity callback and a :class:`~dendra.models.callbacks.Recorder` trace to distinguish
        between purely subthreshold responses and putative conduction block
        (large depolarisation without a successful spike as reported by the
        callback). In that case, ``ub`` may be either increased
@@ -72,17 +73,18 @@ class Thresholder:
 
     All heavy computations are performed in ``torch.no_grad()`` mode and
     on the same device and dtype as the underlying model. Convenience methods
-    :meth:`float` and :meth:`double` convert the thresholder, model, and
-    internal buffers between single- and double-precision.
+    :meth:`float` and :meth:`double` convert native models and internal buffers.
+    A compiled runner has a fixed dtype; compile another runner to change it.
 
     Parameters
     ----------
-    model : dendra.models.Population
-        The population model to compute thresholds for.
-    active : ThresholdCallback
-        Callback used to decide whether an action potential was generated for
-        each population element. Must implement :meth:`is_active`, which returns
-        a boolean tensor indicating activity for each element.
+    model : dendra.models.Population or dendra.func.CompiledRunner
+        Native Population or the Population runner returned by ``dn.compile``.
+        Compiled Network runners are currently unsupported.
+    active : ThresholdCallback or str
+        Native activity callback implementing ``is_active(partition=...)``, or
+        the name of a compiled callback returning one Boolean Tensor entry per
+        search lane. Compiled callbacks are configured in ``dn.compile``.
     space : Optional[Union[npt.NDArray, Tensor]], optional
         Spatial extracellular potential distribution of the stimulus. It must
         be broadcastable to ``model.shape == (*batch, model.np, model.nc)``.
@@ -91,8 +93,8 @@ class Thresholder:
         Temporal waveform of the stimulus. When used with ``space``, the
         effective extracellular potential passed to the model is ``space * amp``,
         with a final singleton compartment axis added to ``amp``. Thus one
-        independently searched amplitude is maintained for every entry of
-        ``model.shape[:-1]`` (all batch and population lanes).
+        independently searched amplitude is maintained for every batch and
+        population lane. Compiled runners require ``extra=dn.VarInput()``.
     bases : Optional[Union[npt.NDArray, Tensor]], optional
         Precomputed spatiotemporal bases for the extracellular potential. The
         canonical layout is time-first, ``(nt, *model.shape)``; payload axes
@@ -100,13 +102,15 @@ class Thresholder:
         layout ``(model.np, nt, model.nc)`` is accepted when the canonical
         interpretation is not possible. Ambiguous layouts are rejected.
         When ``bases`` is provided, ``space`` and ``time`` are ignored and
-        ``chunklength`` cannot be used.
+        ``chunklength`` cannot be used. A compiled runner must have no bound
+        extracellular stimulus; the basis length supplies its trial step count.
     ub : optional
         Initial upper bound(s) on threshold amplitudes, broadcastable to
         ``model.shape[:-1]``. If ``None``, upper
         bounds are initialised heuristically from ``model.diameters`` using
         ``0.2 / (diameter / 5)**2`` per element. Either ``ub`` must be
-        provided or ``model.diameters`` must be set.
+        provided or ``model.diameters`` must be set. Compiled runners require
+        an explicit ``ub`` instead of reading native geometry.
     lb : optional
         Initial lower bound(s) on threshold amplitudes, broadcastable to
         ``model.shape[:-1]``. If ``None``, lower bounds are initialised to zero.
@@ -134,8 +138,19 @@ class Thresholder:
         satisfied).
     chunklength : optional
         Chunk length (in time steps) to use when calling
-        :meth:`Population.longrun` instead of :meth:`Population.run` for
-        long simulations, by default ``None``.
+        :meth:`~dendra.models.Population.longrun` instead of
+        :meth:`~dendra.models.Population.run` for
+        long native simulations, by default ``None``. Configure compiled kernel
+        width with ``chunk_steps`` in ``dn.compile`` instead.
+    peak : str, optional
+        Compiled callback result used by ``block_possible=True``. Supply a
+        ``Recorder(("v",), max_only=True)`` recording every solver step, or a
+        custom pure callback returning a floating-point peak voltage per search
+        lane. The Recorder's partition must match the model partition.
+    block_threshold : float, optional
+        Voltage cutoff for compiled conduction-block diagnostics. Omission uses
+        the selected built-in activity callback's voltage threshold. Custom
+        activity callbacks require an explicit cutoff when block checking is used.
 
     Examples
     --------
@@ -190,6 +205,20 @@ class Thresholder:
 
     Notes
     -----
+    ``model.shape`` denotes the underlying Population payload shape throughout
+    these descriptions. Read it from ``program.functional.shape`` on a compiled
+    runner. Every configured runner callback executes on each amplitude trial.
+
+    Every amplitude trial starts independently. Native models are initialized
+    before each run. A compiled runner uses its configured snapshot/fresh policy
+    without passing a preceding trial's state or callback carry. Snapshot policy
+    repeats the captured RNG boundary as well as neural state. Fresh policy
+    preserves the runner's initialization and resampling behavior. The hard
+    threshold search does not differentiate through bisection.
+
+    Compiled activity partitions must be configured before ``dn.compile`` and
+    agree with :meth:`set_partition`; the search does not rebind callbacks.
+
     Either ``atol`` or ``rtol`` (or both) must be provided. If neither
     tolerance can be satisfied within ``max_tries_thresh`` iterations,
     the corresponding thresholds are returned as ``NaN`` and the indices
@@ -211,8 +240,8 @@ class Thresholder:
 
     def __init__(
         self,
-        model: Population,
-        active: ThresholdCallback,
+        model,
+        active: Union[ThresholdCallback, str],
         space: Optional[Union[npt.NDArray, Tensor]] = None,
         time: Optional[Waveform] = None,
         bases: Optional[Union[npt.NDArray, Tensor]] = None,
@@ -226,21 +255,26 @@ class Thresholder:
         rtol=None,
         chunklength=None,
         mode="arithmetic",
+        *,
+        peak=None,
+        block_threshold=None,
     ):
         self.model = model
-        self.model_shape = tuple(
-            int(size) for size in getattr(model, "shape", (model.np, model.nc))
+        self._trial = _threshold_trials(
+            model, active, peak=peak, block_threshold=block_threshold
         )
+        metadata = self._trial
+        self.model_shape = tuple(int(size) for size in metadata.shape)
         if len(self.model_shape) < 2:
             raise ValueError(
                 "model.shape must include population and compartment axes; "
                 f"got {self.model_shape}."
             )
-        if self.model_shape[-2:] != (int(model.np), int(model.nc)):
+        if self.model_shape[-2:] != (int(metadata.np), int(metadata.nc)):
             raise ValueError(
                 "The final axes of model.shape must be (model.np, model.nc); "
-                f"got model.shape={self.model_shape}, model.np={model.np}, "
-                f"and model.nc={model.nc}."
+                f"got model.shape={self.model_shape}, model.np={metadata.np}, "
+                f"and model.nc={metadata.nc}."
             )
         self.lane_shape = self.model_shape[:-1]
         self.chunklength = chunklength
@@ -274,19 +308,20 @@ class Thresholder:
                 raise ValueError(
                     "Cannot use chunklength with bases. Supply space and time instead."
                 )
-            bases = torch.as_tensor(bases, device=model.device(), dtype=model.dtype())
+            bases = torch.as_tensor(bases, device=metadata.device, dtype=metadata.dtype)
             self.bases = self._normalize_bases(bases)
             self.check_active = self._check_active_bases
             self.functional = False
         else:
             self.space = self._normalize_space(
-                torch.as_tensor(space, device=model.device(), dtype=model.dtype())
+                torch.as_tensor(space, device=metadata.device, dtype=metadata.dtype)
             )
-            self.time = time.to(device=model.device(), dtype=model.dtype())
+            self.time = time.to(device=metadata.device, dtype=metadata.dtype)
             self.check_active = self._check_active_space_time
             self.functional = True
 
-        diams = getattr(model, "diameters", None)
+        self._trial.configure(self)
+        diams = metadata.diameters
 
         if diams is not None:
             self.diams = self._normalize_lane_value(diams, "model.diameters")
@@ -307,6 +342,10 @@ class Thresholder:
                 self.ub = self._normalize_lane_value(ub, "ub")
             else:
                 if self.diams is None:
+                    if self._trial.compiled:
+                        raise ValueError(
+                            "ub must be provided for compiled thresholding"
+                        )
                     raise ValueError(
                         "Either ub must be provided or model.diameters must be set."
                     )
@@ -331,8 +370,8 @@ class Thresholder:
         self.max_tries_thresh = max_tries_thresh
 
         self.active = active
-        self.threshold = active.threshold
-        self.rec = Recorder(["v"], max_only=True)
+        self.threshold = self._trial.threshold
+        self.rec = self._trial.recorder
 
     def _normalize_lane_value(self, value, name: str) -> Tensor:
         """Broadcast one threshold value to ``model.shape[:-1]``.
@@ -342,7 +381,7 @@ class Thresholder:
         per-batch values should include a final singleton population axis.
         """
         value = torch.as_tensor(
-            value, device=self.model.device(), dtype=self.model.dtype()
+            value, device=self._trial.device, dtype=self._trial.dtype
         )
         try:
             return torch.broadcast_to(value, self.lane_shape).clone()
@@ -389,9 +428,9 @@ class Thresholder:
         # The historical contract was explicit population-first, rather than
         # population-broadcastable. Requiring the exact population length also
         # keeps canonical one-step bases shaped ``(1, N, C)`` unambiguous.
-        if int(bases.shape[0]) != int(self.model.np):
+        if int(bases.shape[0]) != self.model_shape[-2]:
             return None
-        if int(bases.shape[-1]) not in (1, int(self.model.nc)):
+        if int(bases.shape[-1]) not in (1, self.model_shape[-1]):
             return None
         return self._time_first_bases_candidate(bases.movedim(1, 0))
 
@@ -425,12 +464,20 @@ class Thresholder:
         )
 
     def set_partition(self, model_partition, active_partition=None):
+        """Append a search axis for contiguous compartment groups.
+
+        ``model_partition`` gives positive group lengths covering the complete
+        compartment axis. ``active_partition`` gives the corresponding lengths
+        in the activity callback's checked-node axis; omission uses the model
+        lengths. Compiled callback partitions must already match these groups.
+        Bound configuration is validated without changing the runner.
+        """
         if self.model_partition is not None:
             raise RuntimeError("A model partition has already been configured.")
         model_partition = tuple(int(length) for length in model_partition)
         if not model_partition or any(length <= 0 for length in model_partition):
             raise ValueError("model_partition must contain positive lengths.")
-        if sum(model_partition) != self.model.nc:
+        if sum(model_partition) != self.model_shape[-1]:
             raise ValueError(
                 "Sum of partition lengths must equal number of population compartments."
             )
@@ -449,6 +496,8 @@ class Thresholder:
                 )
         else:
             active_partition = model_partition
+        if self._trial.compiled:
+            self._trial.partition(model_partition, active_partition)
         with torch.no_grad():
             self.model_partition = model_partition
             self.active_partition = active_partition
@@ -463,7 +512,8 @@ class Thresholder:
             self.lb_initial = expand_partition(self.lb_initial)
             # Recorder observes the complete model, not the callback's selected
             # nodes, so its partition is defined in model-compartment space.
-            self.rec.set_partition(model_partition)
+            if not self._trial.compiled:
+                self._trial.partition(model_partition, active_partition)
 
     def reset_bounds(self):
         """Reset upper and lower bounds to initial values."""
@@ -495,8 +545,8 @@ class Thresholder:
         return awindow / self.ub
 
     def ve_from_s_t(self, ve_s, ve_t, device, multicontact=False):
-        ve_s = torch.as_tensor(ve_s, device=device, dtype=self.model.dtype())
-        ve_t = torch.as_tensor(ve_t, device=device, dtype=self.model.dtype())
+        ve_s = torch.as_tensor(ve_s, device=device, dtype=self._trial.dtype)
+        ve_t = torch.as_tensor(ve_t, device=device, dtype=self._trial.dtype)
 
         if not multicontact:
             ve_s = self._normalize_space(ve_s)
@@ -551,8 +601,9 @@ class Thresholder:
         return op_mc(ve_s, ve_t)
 
     def float(self):
+        """Use float32 for native thresholding; compiled dtype must already match."""
+        self.model = self._trial.cast(torch.float32)
         self.fp32 = True
-        self.model = self.model.float()
         if self.bases is not None:
             self.bases = self.bases.float()
         if self.diams is not None:
@@ -572,8 +623,9 @@ class Thresholder:
         return self
 
     def double(self):
+        """Use float64 for native thresholding; compiled dtype must already match."""
+        self.model = self._trial.cast(torch.float64)
         self.fp32 = False
-        self.model = self.model.double()
         if self.bases is not None:
             self.bases = self.bases.double()
         if self.diams is not None:
@@ -608,7 +660,7 @@ class Thresholder:
     def _bound_as_spatial(self, bound: Tensor) -> Tensor:
         """Broadcast lane or compartment-expanded amplitudes to model shape."""
         bound = torch.as_tensor(
-            bound, device=self.model.device(), dtype=self.model.dtype()
+            bound, device=self._trial.device, dtype=self._trial.dtype
         )
         if tuple(bound.shape) == self.lane_shape:
             bound = bound.unsqueeze(-1)
@@ -695,15 +747,17 @@ class Thresholder:
 
     def _normalize_activity(self, activity: Tensor) -> Tensor:
         """Validate the callback's one-result-per-search-lane contract."""
+        label = (
+            "compiled activity result"
+            if self._trial.compiled
+            else "ThresholdCallback.is_active"
+        )
         if activity is None:
-            raise TypeError(
-                "ThresholdCallback.is_active must return a boolean tensor, not None."
-            )
+            raise TypeError(f"{label} must return a boolean tensor, not None.")
         activity = torch.as_tensor(activity, device=self.ub.device)
         if activity.dtype != torch.bool:
             raise TypeError(
-                "ThresholdCallback.is_active must return a boolean tensor; "
-                f"got dtype {activity.dtype}."
+                f"{label} must return a boolean tensor; got dtype {activity.dtype}."
             )
         expected = tuple(self.ub.shape)
         if tuple(activity.shape) != expected:
@@ -713,7 +767,7 @@ class Thresholder:
                 else f" (including {len(self.model_partition)} partitions)"
             )
             raise ValueError(
-                "ThresholdCallback.is_active returned shape "
+                f"{label} returned shape "
                 f"{tuple(activity.shape)}, but Thresholder requires {expected}"
                 f"{partition_note}. Callbacks must preserve every batch and "
                 "population axis; implicit broadcasting of activity is not allowed."
@@ -809,18 +863,7 @@ class Thresholder:
         Tensor
             boolean
         """
-        self.active.reset()
-        with torch.no_grad():
-            ve = self._scaled_bases_field(bound)
-            self.model.initialize()
-            self.model.run(
-                ve=ve,
-                dt=dt,
-                callbacks=[self.active],
-            )
-        return self._normalize_activity(
-            self.active.is_active(partition=self.active_partition)
-        )
+        return self._evaluate_trial(tstop, dt, bound, with_peak=False)[0]
 
     def _check_active_space_time(self, tstop, dt, bound: Tensor):
         """Check whether stimulus amplitudes generates APs.
@@ -835,67 +878,26 @@ class Thresholder:
         Tensor
             boolean
         """
-        self.active.reset()
-        with torch.no_grad():
-            ve = self._space_for_run() * self._bound_as_spatial(bound)
-            self.model.initialize()
-            if self.chunklength is not None:
-                self.model.longrun(
-                    extra=(ve, self.time),
-                    tstop=tstop,
-                    dt=dt,
-                    callbacks=[self.active],
-                    chunklength=self.chunklength,
-                )
-            else:
-                self.model.run(
-                    extra=(ve, self.time),
-                    tstop=tstop,
-                    dt=dt,
-                    callbacks=[self.active],
-                )
-        return self._normalize_activity(
-            self.active.is_active(partition=self.active_partition)
-        )
+        return self._evaluate_trial(tstop, dt, bound, with_peak=False)[0]
 
     def check_active_with_rec(self, tstop, dt, bound: Tensor):
-        self.active.reset()
-        self.rec.reset()
-        with torch.no_grad():
-            self.model.initialize()
-            if not self.functional:
-                ve = self._scaled_bases_field(bound)
-                self.model.run(
-                    ve,
-                    callbacks=[self.active, self.rec],
-                    dt=dt,
-                )
-            else:
-                if self.chunklength is not None:
-                    ve = self._space_for_run() * self._bound_as_spatial(bound)
-                    self.model.longrun(
-                        extra=(ve, self.time),
-                        tstop=tstop,
-                        dt=dt,
-                        callbacks=[self.active, self.rec],
-                        chunklength=self.chunklength,
-                    )
-                else:
-                    ve = self._space_for_run() * self._bound_as_spatial(bound)
-                    self.model.run(
-                        extra=(ve, self.time),
-                        tstop=tstop,
-                        dt=dt,
-                        callbacks=[self.active, self.rec],
-                    )
-        activity = self._normalize_activity(
-            self.active.is_active(partition=self.active_partition)
+        """Return activity and peak voltage for an independent amplitude trial."""
+        return self._evaluate_trial(tstop, dt, bound, with_peak=True)
+
+    def _evaluate_trial(self, tstop, dt, bound, *, with_peak):
+        tstop, dt = self._trial.horizon(tstop, dt, basis=self.bases is not None)
+        self._trial.validate(self, block_possible=with_peak)
+        activity, recorded = self._trial.evaluate(
+            self, bound, tstop, dt, with_peak=with_peak
         )
-        # ``stack("v")`` is time-first and avoids the additional state axis
-        # introduced by ``stack()``. Recorder already reduces compartments (or
-        # each compartment partition) per sample; reduce only the time axis here.
-        recorded = self.rec.stack("v").amax(dim=0)
-        return activity, self._normalize_recorder_metric(recorded)
+        return self._normalize_activity(activity), (
+            self._normalize_recorder_metric(recorded) if with_peak else None
+        )
+
+    def _trial_stimulus(self, bound):
+        if self.bases is not None:
+            return self._scaled_bases_field(bound), None
+        return self._space_for_run() * self._bound_as_spatial(bound), self.time
 
     def _fix_bounds(self, tstop, dt, block_possible=True):
         """Make sure upper bound generates AP."""
@@ -936,20 +938,32 @@ class Thresholder:
             self.lb[failed] = 1
 
     def calculate_thresholds(
-        self, tstop, dt, block_possible=False, reset_bounds=True, atol=None, rtol=None
+        self,
+        tstop=None,
+        dt=None,
+        block_possible=False,
+        reset_bounds=True,
+        atol=None,
+        rtol=None,
     ) -> Tuple[Tensor, Tensor]:
         """Calculate thresholds. If bases were provided on Thresholder
         construction, they are used and tstop is ignored.
 
         Parameters
         ----------
-        tstop : float
-            Simulation stop time in milliseconds.
-        dt : float
-            Simulation time step in milliseconds.
+        tstop : float, optional
+            Absolute simulation stop time in milliseconds. Omission on a
+            compiled runner uses its configured horizon. An explicit stop is
+            measured from its snapshot clock, or zero for fresh initialization.
+            Basis trials use their tape length and ignore this argument.
+        dt : float, optional
+            Simulation time step in milliseconds. Compiled runners use their
+            effective timestep; an explicit value must match it. Native calls
+            retain the timestep behavior of ``Population.run``.
         block_possible : bool, optional
             Whether to consider conduction block when fixing upper bounds,
-            by default ``False``.
+            by default ``False``. Compiled execution requires a named ``peak``
+            diagnostic and a built-in activity threshold or ``block_threshold``.
         reset_bounds : bool, optional
             Whether to reset upper and lower bounds to initial values before
             calculation, by default ``True``. Set to ``False`` to continue
@@ -968,6 +982,8 @@ class Thresholder:
             ``model.shape[:-1]`` without a model partition, or
             ``(*model.shape[:-1], n_partitions)`` after :meth:`set_partition`.
         """
+        tstop, dt = self._trial.horizon(tstop, dt, basis=self.bases is not None)
+        self._trial.validate(self, block_possible=block_possible)
         if reset_bounds:
             self.reset_bounds()
 
@@ -981,8 +997,7 @@ class Thresholder:
             self._apply_field_nan_ignore()
 
         self._fix_bounds(tstop, dt, block_possible=block_possible)
-        self.rec.reset()
-        self.active.reset()
+        self._trial.reset(self)
 
         # check no active in lb
         act = self.check_active(

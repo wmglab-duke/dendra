@@ -95,6 +95,72 @@ gradient flags or horizons can require more compilation. Training programs warm
 their forward path; the first backward pass can still compile. `warm()` executes
 the simulation, so its cost includes execution as well as compilation.
 
+## Find activation thresholds
+
+`Thresholder` searches for the stimulus amplitude that satisfies an activity
+criterion for each independent Population lane. Pass a native Population and
+its activity callback, or pass a compiled Population runner and the name of its
+Boolean callback result. The same bound fixing and bisection search applies to
+both interfaces.
+
+For an initialized `model`, a spatial `field` and a `waveform`, compile the
+activity criterion with a runtime stimulation slot:
+
+```python
+from dendra.models.instruments import Thresholder
+
+program = dn.compile(
+    model,
+    dt=DT,
+    duration=5.0,
+    extra=dn.VarInput(),
+    callbacks={
+        "activation": dn.callbacks.Active(
+            threshold=0.0, node_check=[5, -5],
+        ),
+    },
+    inference=True,
+    initialization="snapshot",
+)
+search = Thresholder(
+    program, active="activation", space=field, time=waveform,
+    ub=0.2, rtol=0.01,
+)
+upper, lower = search.calculate_thresholds()
+```
+
+The search inherits the program's timestep and default horizon. Supply `ub`
+explicitly for a compiled runner. An explicit `dt` must match its timestep;
+`tstop` selects an absolute simulation stop time. The search scales the spatial
+field by each candidate amplitude and supplies the field/waveform pair through
+`extra`.
+Amplitudes remain tensor data while the callback configuration and compiled
+kernel shapes stay fixed. Precomputed time-first `bases` use `Inputs.ve` and
+their own tape length, ignoring `tstop`; compile that program without an
+extracellular `extra` binding. Choose dtype and device before compilation.
+
+Every amplitude starts an independent trial with fresh callback history. A
+snapshot program restarts the same simulation and RNG state. A program configured
+with `initialization="fresh"` runs its fresh initialization policy on each trial.
+Returned continuations are not chained between amplitudes. Threshold search is
+a hard inference measurement and runs without gradients.
+
+For `block_possible=True`, configure a second callback before compiling:
+`"peak_voltage": dn.Recorder(("v",), max_only=True)`. Supply
+`peak="peak_voltage"` to `Thresholder`. Its full-cadence voltage maximum helps
+bound fixing distinguish a subthreshold response from suspected conduction
+block. The voltage cutoff comes from a built-in activity callback; custom pure
+activity callbacks also need an explicit `block_threshold=`. A custom activity
+result must be Boolean and have exactly one value per searched lane, including
+any configured partitions. Configure compiled callback partitions before
+binding; `set_partition` validates that they match the search partitions.
+
+The complete
+{download}`functional_thresholding.py <../../examples/functional_thresholding.py>`
+example compares native and compiled threshold brackets on short passive cables,
+including the peak-voltage diagnostic. It supports scan and while inference.
+Compiled Network threshold searches are currently unsupported.
+
 ## Compile a connected Network
 
 Connections are configured before compilation using the ordinary Network API.
