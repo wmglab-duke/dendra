@@ -30,9 +30,27 @@ compartment graphs, and :doc:`../basics/02a_native_morphologies` for examples.
 .. autoclass:: dendra.models.core.Myelinated
    :members: length, deltax
 .. autoclass:: dendra.models.tree.Tree
-   :members: from_morphology, from_compartment_graph, compartment_graph, material_volume
+   :members: from_graph, from_compartment_graph, from_morphology, from_NEURON, from_swc, from_neurolucida, from_asc, graph, compartment_graph, area, edge_resistance_ohm, material_volume, material_edge_index, material_edges, recentre, shift, move_to, rotate_into_direction, rotate_azimuthal, reset_rotations, reset_directions, reset_azimuthal_rotations
+   :undoc-members:
 .. autoclass:: dendra.models.extcell.ExtCellAxon
+   :members: assemble_graphs
 .. autoclass:: dendra.models.extcell.ExtCellTree
+   :members: from_graph, from_NEURON, load_extcell, load_morphology, load_diffusion_edges, assemble_graphs
+   :undoc-members:
+
+Tree file constructors select compartment counts through native Morphology
+declarations. ``from_NEURON`` instead captures the source Section tree's existing
+grid. Spatial methods translate or rotate the constructed model's coordinates
+in place. See :doc:`../basics/02_branched_morphologies` for placement examples.
+
+Morphology graph helpers
+------------------------
+
+These helpers measure length-weighted paths through a morphology graph in
+either direction, treating its directed edges as undirected connections.
+
+.. autofunction:: dendra.models.utils.distance
+.. autofunction:: dendra.models.utils.undirected_weighted_lengths
 
 Packing independent models
 --------------------------

@@ -32,7 +32,7 @@ and development installations.
    Conda users can instead run
    `conda create -n dendra python=3.12 && conda activate dendra`.
 
-2. Install Dendra with the recommended native CPU solvers:
+2. Install Dendra with the recommended native CPU and Apple Metal solvers:
 
    ```sh
    python -m pip install --upgrade pip
@@ -41,7 +41,8 @@ and development installations.
 
    The `solvers` extra installs
    [`dendra-solvers`](https://pypi.org/project/dendra-solvers/), which provides
-   native CPU solvers for block and tree models.
+   native CPU solvers and the Apple Metal backend for supported implicit
+   solvers on MPS.
 
 3. If no compatible `dendra-solvers` distribution is available for your
    platform, install the base package instead:
@@ -51,7 +52,8 @@ and development installations.
    ```
 
    The base package retains Dendra's PyTorch CPU solver for unbranched cables
-   and all GPU solvers. CPU block and tree methods require `dendra-solvers`.
+   and its CUDA/Triton solvers. CPU block and tree methods, and native MPS
+   tree methods, require `dendra-solvers`.
 
 (choose-pytorch-build)=
 ## Choose a PyTorch build
@@ -77,7 +79,7 @@ python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
 
 On Windows hosts, run this inside WSL2.
 
-## CPU implicit solvers
+## Native CPU and MPS implicit solvers
 
 The quick start includes [`dendra-solvers`](https://pypi.org/project/dendra-solvers/)
 through the optional `solvers` extra.
@@ -87,10 +89,19 @@ prevent you from installing Dendra.
 
 Without this package, CPU unbranched cable integration falls back to Dendra's
 PyTorch parallel cyclic reduction (PCR) solver. CPU block and tree methods
-require `dendra-solvers`. GPU solvers are included with Dendra and do not
-depend on this package.
+require `dendra-solvers`. CUDA/Triton solvers are included with Dendra and do
+not depend on this package.
 
-To add a prebuilt native CPU solver to an existing installation:
+On Apple Silicon, an MPS-enabled `dendra-solvers` installation supplies native
+Metal Thomas/PCR cable solvers and scalar, block and packed DHS tree solvers.
+These kernels require macOS 14 or newer, an available Apple GPU and float32
+model tensors. Select `device="mps"` and `dtype=torch.float32` before
+constructing or compiling the model. Cable solvers can use PyTorch fallbacks
+without the native backend; DHS tree solvers require it. Scalar SPD solving
+is currently unsupported on MPS; select Thomas or PCR instead. See
+{doc}`testing` for a backend availability check and MPS tests.
+
+To add prebuilt native solvers to an existing installation:
 
 ```sh
 python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
@@ -116,7 +127,7 @@ Prebuilt solver wheels are available for:
 - macOS 14 or newer on Apple Silicon.
 
 When a matching wheel is available, pip selects it automatically, so installing
-the CPU solvers does not require a C++ compiler. For other platforms or
+the native solvers does not require a C++ compiler. For other platforms or
 custom PyTorch builds, see the source-build instructions on the
 [`dendra-solvers` package page](https://pypi.org/project/dendra-solvers/).
 The standalone Windows solver wheel supports CPU kernels, but it does not
