@@ -10,10 +10,8 @@ import pytest
 from neuron import h
 
 from dendra.models.io import (
-    apply_d_lambda,
     edge_diff_geom_um,
     edge_inv_area_integral_um_inv,
-    lambda_f,
     neuron_to_dendra_graph,
     r_ohm,
     read_neurolucida,
@@ -60,30 +58,31 @@ def _assert_physical_tree(graph):
         assert float(attrs["diff_geom_um"]) > 0.0
 
 
-def test_lambda_rule_validates_inputs_and_selects_an_odd_compartment_grid():
-    section = _section("lambda", L=100.0, diam=2.0, Ra=100.0, cm=1.0)
+def test_native_lambda_rule_validates_inputs_and_selects_an_odd_compartment_grid():
+    morphology = Morphology(rhoa=100.0, cm=1.0)
+    section = morphology.section("cable", L=100.0, diam=2.0)
     expected_lambda = 1.0e5 * math.sqrt(2.0 / (4.0 * math.pi * 100 * 100 * 1))
 
-    actual_lambda = lambda_f(section, 100.0)
+    actual_lambda = section.lambda_f(freq_hz=100.0)
     assert actual_lambda == pytest.approx(expected_lambda, rel=1e-12)
 
-    apply_d_lambda([section], d_lambda=0.1, freq=100.0)
+    morphology.apply_d_lambda(d_lambda=0.1, freq_hz=100.0)
     expected_nseg = int((section.L / (0.1 * actual_lambda) + 0.9) / 2) * 2 + 1
     assert int(section.nseg) == max(1, expected_nseg)
     assert int(section.nseg) % 2 == 1
 
     for invalid in (0.0, -1.0, math.nan, math.inf):
-        with pytest.raises(ValueError, match="freq_hz must be positive and finite"):
-            lambda_f(section, invalid)
-        with pytest.raises(ValueError, match="d_lambda must be positive and finite"):
-            apply_d_lambda([section], d_lambda=invalid, freq=100.0)
-        with pytest.raises(ValueError, match="freq must be positive and finite"):
-            apply_d_lambda([section], d_lambda=0.1, freq=invalid)
+        with pytest.raises(ValueError, match="freq_hz must be (positive|finite)"):
+            section.lambda_f(freq_hz=invalid)
+        with pytest.raises(ValueError, match="d_lambda must be (positive|finite)"):
+            morphology.apply_d_lambda(d_lambda=invalid, freq_hz=100.0)
+        with pytest.raises(ValueError, match="freq_hz must be (positive|finite)"):
+            morphology.apply_d_lambda(d_lambda=0.1, freq_hz=invalid)
 
     with pytest.raises(TypeError, match="freq_hz.*boolean"):
-        lambda_f(section, True)
+        section.lambda_f(freq_hz=True)
     with pytest.raises(TypeError, match="d_lambda.*boolean"):
-        apply_d_lambda([section], d_lambda=True)
+        morphology.apply_d_lambda(d_lambda=True)
 
 
 def test_pt3d_coordinates_extracellular_layers_volume_and_diffusion_geometry():
@@ -305,8 +304,6 @@ def test_swc_pathlike_import_preserves_parameters_and_branch_topology(tmp_path):
 
     graph, id2seg = read_swc(
         swc_path,
-        d_lambda=0.5,
-        freq=100.0,
         rhoa=123.0,
         cm=2.0,
         data_func=lambda seg: {"source_location": str(seg)},
@@ -314,6 +311,7 @@ def test_swc_pathlike_import_preserves_parameters_and_branch_topology(tmp_path):
 
     _assert_physical_tree(graph)
     assert set(id2seg) == set(graph)
+    assert all(int(segment.sec.nseg) == 1 for segment in id2seg.values())
     assert graph.number_of_nodes() == 5
     assert all(
         attrs["Ra"] == pytest.approx(123.0) for _, attrs in graph.nodes(data=True)
@@ -351,7 +349,7 @@ def test_native_morphology_swc_export_is_neuron_importable(tmp_path):
         swc_path,
         section_types={"soma": 1, "dendrite_a": 3, "dendrite_b": 3},
     )
-    graph, id2seg = read_swc(swc_path, d_lambda=0.5, freq=100.0)
+    graph, id2seg = read_swc(swc_path)
 
     _assert_physical_tree(graph)
     assert set(id2seg) == set(graph)
@@ -363,14 +361,13 @@ def test_neurolucida_pathlike_import_applies_electrical_overrides():
     asc_path = Path(__file__).parent / "simtests" / "111200A.asc"
     graph, id2seg = read_neurolucida(
         asc_path,
-        d_lambda=1.0,
-        freq=100.0,
         rhoa=117.0,
         cm=1.75,
     )
 
     _assert_physical_tree(graph)
     assert set(id2seg) == set(graph)
+    assert all(int(segment.sec.nseg) == 1 for segment in id2seg.values())
     material_attrs = [
         attrs
         for _, attrs in graph.nodes(data=True)
@@ -379,6 +376,13 @@ def test_neurolucida_pathlike_import_applies_electrical_overrides():
     assert material_attrs
     assert all(attrs["Ra"] == pytest.approx(117.0) for attrs in material_attrs)
     assert all(attrs["cm"] == pytest.approx(1.75) for attrs in material_attrs)
+
+
+@pytest.mark.parametrize("reader", [read_swc, read_neurolucida])
+@pytest.mark.parametrize("argument", ["d_lambda", "freq"])
+def test_geometry_readers_reject_compartment_grid_selection(reader, argument, tmp_path):
+    with pytest.raises(TypeError, match=argument):
+        reader(tmp_path / "unused-morphology", **{argument: 0.1})
 
 
 def test_subtree_import_prunes_exclusions_and_supports_metadata_free_graphs():

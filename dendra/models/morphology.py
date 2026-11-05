@@ -1237,9 +1237,9 @@ class Morphology:
         compiled graphs and instantiated models remain independent snapshots;
         compile or construct a new model to use the new discretization.
 
-        The calculation and odd-count rounding rule match Dendra's
-        NEURON-backed ``apply_d_lambda`` helper, but operate directly on native
-        stylized or pt3d geometry and require no NEURON objects.
+        The calculation uses the standard AC space-constant estimate and
+        odd-count rounding rule on native stylized or pt3d geometry. It requires
+        no NEURON objects.
         """
         d_lambda = _positive(d_lambda, name="d_lambda")
         freq_hz = _positive(freq_hz, name="freq_hz")

@@ -450,9 +450,7 @@ def test_reported_nseg_matches_the_independent_analytic_rule():
 def test_native_d_lambda_matches_neuron_oracle(case, points, length, diameter):
     from neuron import h
 
-    from dendra.models.io import apply_d_lambda as apply_neuron_d_lambda
-    from dendra.models.io import lambda_f as neuron_lambda_f
-
+    h.load_file("stdlib.hoc")
     rhoa = 87.0
     cm = 1.3
     freq_hz = 173.0
@@ -476,7 +474,8 @@ def test_native_d_lambda_matches_neuron_oracle(case, points, length, diameter):
             for x, y, z, diam in points:
                 h.pt3dadd(x, y, z, diam, sec=neuron_section)
 
-        expected_lambda = neuron_lambda_f(neuron_section, freq_hz)
+        h.define_shape()
+        expected_lambda = float(h.lambda_f(freq_hz, sec=neuron_section))
         assert native.lambda_f(freq_hz=freq_hz) == pytest.approx(
             expected_lambda,
             rel=1e-12,
@@ -486,10 +485,10 @@ def test_native_d_lambda_matches_neuron_oracle(case, points, length, diameter):
             d_lambda=d_lambda,
             freq_hz=freq_hz,
         )
-        apply_neuron_d_lambda(
-            [neuron_section],
-            d_lambda=d_lambda,
-            freq=freq_hz,
+        neuron_section.nseg = max(
+            1,
+            int((float(neuron_section.L) / (d_lambda * expected_lambda) + 0.9) / 2) * 2
+            + 1,
         )
         assert native_result == {"cable": int(neuron_section.nseg)}
         assert native.nseg == int(neuron_section.nseg)

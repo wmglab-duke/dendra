@@ -14,19 +14,6 @@ import numpy as np
 from ..helpers import requires_packages
 
 
-def _positive_finite(value, *, name: str) -> float:
-    """Normalize a positive finite scalar used by morphology discretization."""
-    if isinstance(value, (bool, np.bool_)):
-        raise TypeError(f"{name} must be a real number, not a boolean.")
-    try:
-        value = float(value)
-    except (TypeError, ValueError) as error:
-        raise TypeError(f"{name} must be a real number.") from error
-    if not np.isfinite(value) or value <= 0.0:
-        raise ValueError(f"{name} must be positive and finite, got {value!r}.")
-    return value
-
-
 def xyz(seg, extcell=None):
     """
     Return interpolated 3-D coordinates for a NEURON segment.
@@ -81,92 +68,28 @@ def xyz(seg, extcell=None):
 
 
 @requires_packages("neuron")
-def lambda_f(sec, freq_hz):
-    """
-    Python clone of the HOC function `lambda_f()`.
-
-    Parameters
-    ----------
-    sec      : h.Section   -- NEURON section for which λ is computed
-    freq_hz  : float       -- frequency [Hz]
-
-    Returns
-    -------
-    float  -- space constant λ (microns) for `sec` at `freq_hz`
-    """
-    from math import pi, sqrt
-
-    freq_hz = _positive_finite(freq_hz, name="freq_hz")
-    rhoa = _positive_finite(sec.Ra, name="section Ra")
-    cm = _positive_finite(sec.cm, name="section cm")
-    section_length = _positive_finite(sec.L, name="section L")
-
-    # make sure diam/3‑D info are up to date
-    h.define_shape()
-
-    n3d = int(h.n3d(sec=sec))
-    if n3d < 2:  # no 3‑D points → uniform cylinder shortcut
-        diameter = _positive_finite(sec.diam, name="section diameter")
-        return 1e5 * sqrt(diameter / (4 * pi * freq_hz * rhoa * cm))
-
-    # --- piecewise integration along 3‑D centre line ------------------------
-    x1 = h.arc3d(0, sec=sec)
-    d1 = h.diam3d(0, sec=sec)
-    lam = 0.0
-    for i in range(1, n3d):
-        x2 = h.arc3d(i, sec=sec)
-        d2 = h.diam3d(i, sec=sec)
-        diameter_sum = _positive_finite(
-            d1 + d2, name=f"section diameter sum at pt3d interval {i - 1}:{i}"
-        )
-        lam += (x2 - x1) / sqrt(diameter_sum)
-        x1, d1 = x2, d2
-
-    # convert to “length‑in‑units‑of‑λ”
-    lam *= sqrt(2.0) * 1e-5 * sqrt(4 * pi * freq_hz * rhoa * cm)
-    lam = _positive_finite(lam, name="section electrotonic length")
-
-    # return the actual λ (µm)
-    return section_length / lam
-
-
-@requires_packages("neuron")
-def apply_d_lambda(all_sections: List, d_lambda: float = 0.1, freq: float = 100.0):
-    """
-    Apply a d_lambda value to all sections in the NEURON model.
-
-    Parameters:
-        all_sections (List[nrn.Section]): List of all sections in the NEURON model.
-        d_lambda (float): The d_lambda value to apply.
-        freq (float): The frequency for the d_lambda application.
-    """
-    d_lambda = _positive_finite(d_lambda, name="d_lambda")
-    freq = _positive_finite(freq, name="freq")
-    h.define_shape()
-
-    for sec in all_sections:
-        lam = lambda_f(sec, freq)  # λ(freq) in this section
-        nseg = int((sec.L / (d_lambda * lam) + 0.9) / 2) * 2 + 1
-        sec.nseg = max(1, nseg)  # safeguard: nseg must be ≥ 1
-
-
-@requires_packages("neuron")
 def read_swc(
     file_path: str | PathLike[str],
-    d_lambda=0.1,
-    freq=100.0,
+    *,
     data_func=None,
-    **kwargs,
+    rhoa=None,
+    cm=None,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
-    """Read an SWC file and return the contents."""
+    """Capture an SWC file as a compartment graph and NEURON segment map.
+
+    NEURON parses and instantiates the geometry. No spatial-discretization
+    policy is applied. Optional ``rhoa`` (Ω·cm) and ``cm`` (µF/cm²) values set
+    the electrical properties captured with that geometry; ``data_func`` adds
+    per-segment metadata. The returned map retains the imported NEURON objects.
+
+    For an editable native declaration, use :meth:`~dendra.Morphology.from_swc`
+    and :meth:`~dendra.Morphology.apply_d_lambda` before constructing a Tree.
+    """
 
     if data_func is None:
         data_func = xyz
 
     h.load_file("import3d.hoc")
-
-    rhoa = kwargs.get("rhoa", None)  # intracellular resistivity (Ω·cm)
-    cm = kwargs.get("cm", None)  # specific membrane capacitance (µF/cm²)
 
     class Cell:
         def __init__(self, importer):
@@ -188,26 +111,29 @@ def read_swc(
         for sec in cell.all:
             sec.cm = cm
 
-    apply_d_lambda(cell.all, d_lambda, freq)
-
     return neuron_to_dendra_graph(root_sec=cell.all[0], data_func=data_func)
 
 
 @requires_packages("neuron")
 def read_neurolucida(
     file_path: str | PathLike[str],
-    d_lambda=0.1,
-    freq=100.0,
+    *,
     data_func=None,
-    **kwargs,
+    rhoa=None,
+    cm=None,
 ) -> Tuple[nx.DiGraph, Dict[int, "nrn.Segment"]]:
-    """Read a Neurolucida file and return the contents."""
+    """Capture Neurolucida geometry as a graph and NEURON segment map.
+
+    The imported NEURON grid is retained without d-lambda selection. Optional
+    ``rhoa`` (Ω·cm), ``cm`` (µF/cm²), and ``data_func`` configure the captured
+    electrical properties and per-segment metadata. The map retains the
+    imported NEURON objects.
+
+    Use :meth:`~dendra.Morphology.from_asc` for native editing and discretization.
+    """
 
     if data_func is None:
         data_func = xyz
-
-    rhoa = kwargs.get("rhoa", None)  # intracellular resistivity (Ω·cm)
-    cm = kwargs.get("cm", None)  # specific membrane capacitance (µF/cm²)
 
     h.load_file("import3d.hoc")
 
@@ -230,8 +156,6 @@ def read_neurolucida(
     if cm is not None:
         for sec in cell.all:
             sec.cm = cm
-
-    apply_d_lambda(cell.all, d_lambda, freq)
 
     return neuron_to_dendra_graph(root_sec=cell.all[0], data_func=data_func)
 

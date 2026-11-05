@@ -3,6 +3,71 @@
 Upgrading Dendra
 ================
 
+Morphology loading and spatial discretization
+---------------------------------------------
+
+``Tree.from_swc``, ``Tree.from_asc``, and ``Tree.from_neurolucida`` construct
+models through native Morphology declarations. They load geometry, apply
+``Morphology.apply_d_lambda``, and pass the resulting declaration to
+``Tree.from_morphology``. Their ``d_lambda`` and ``freq`` arguments retain
+their meanings: ``d_lambda`` is dimensionless and ``freq`` is a raw frequency
+in Hz. Their electrical defaults remain ``rhoa=35.4`` Ω·cm and
+``cm=1.0`` µF/cm².
+
+For control over editing and discretization, use the explicit native workflow:
+
+.. code-block:: python
+
+   import dendra as dn
+
+   morphology = dn.Morphology.from_swc("cell.swc", rhoa=35.4, cm=1.0)
+   # Inspect or edit the declaration before choosing compartment counts.
+   morphology.apply_d_lambda(d_lambda=0.1, freq_hz=100.0)
+   tree = dn.Tree.from_morphology(morphology, N=128)
+
+Use ``Morphology.from_asc`` for Neurolucida ASC files in the same workflow.
+``Tree.from_asc``, ``Tree.from_neurolucida``, and ``Morphology.from_asc`` require
+an explicit ``root`` when a file contains several disconnected cable trees.
+Pass an exact generated root name, for example
+``dn.Tree.from_asc("reconstruction.asc", root="soma[0]")``. Omitting ``root``
+reports the available roots rather than selecting the first and silently
+discarding other components.
+
+Standalone Morphology loaders default to ``rhoa=100.0`` rather than the Tree
+convenience constructors' ``35.4``; specify ``rhoa`` explicitly to reproduce
+the latter's discretization. Their ``nseg`` argument sets a uniform initial
+count and does not apply d-lambda. See :ref:`native-morphologies` for editing,
+geometry validation, and the discretization contract.
+
+SWC imports follow ``Morphology.from_swc`` naming and validation rather than
+NEURON's SWC importer. Generated exact names include ``soma_0``,
+``basal_dendrite_0``, and ``apical_dendrite_0``. ``Tree.from_swc`` retains the
+shared ``soma``, ``axon``, ``dend``, and ``apic`` labels where applicable, along
+with the native labels and raw ``swc_type_<id>`` provenance. Code that selects
+an exact generated Section name should use the native names. Malformed or
+ambiguous SWC topology is rejected according to the native loader's strict
+rules rather than repaired silently.
+
+The NEURON-object helpers ``dendra.models.io.lambda_f`` and
+``dendra.models.io.apply_d_lambda`` are removed. For native declarations, use
+``Section.lambda_f(freq_hz=...)`` to estimate an AC space constant and
+``Morphology.apply_d_lambda(d_lambda=..., freq_hz=...)`` to select odd
+compartment counts. These methods operate on Dendra's native objects.
+
+``Tree.from_NEURON`` and ``dendra.models.io.neuron_to_dendra_graph`` capture
+the source NEURON model's existing grid without changing ``nseg``. Set any
+desired NEURON compartment counts before capture. This path remains useful
+when NEURON Section objects are the model's source of truth.
+
+The low-level ``io.read_swc``, ``io.read_neurolucida``, and ``io.read_asc``
+helpers return a geometry graph and live NEURON ``id2seg`` map without
+applying d-lambda. They accept ``file_path`` and keyword-only ``data_func``,
+``rhoa``, and ``cm``; remove ``d_lambda`` and ``freq`` arguments from these
+calls. Use the native workflow above for discretization. To attach
+NEURON-specific segment metadata, use ``data_func`` with a low-level reader
+and pass its graph to ``Tree.from_graph``; Tree file constructors do not
+accept ``data_func``.
+
 Gradient-clipped Thomas
 -----------------------
 
