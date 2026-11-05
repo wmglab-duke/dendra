@@ -6,7 +6,6 @@ from contextlib import nullcontext
 
 import pytest
 import torch
-from torch._dynamo.backends.debugging import aot_eager
 from torch.overrides import TorchFunctionMode
 from torch.utils import _pytree as pytree
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -133,18 +132,20 @@ def _targets(source):
 
 
 def _engine(monkeypatch, body=_body):
-    graphs, captures = [], []
+    from torch._dynamo import utils
 
-    def backend(graph, examples):
-        graphs.append(graph)
-        return aot_eager(graph, examples)
-
+    captures = []
     engine = _CompiledTensorTreeScan(
         body,
         steps=2,
-        compile_options={"backend": backend, "fullgraph": True},
+        compile_options={"backend": "aot_eager", "fullgraph": True},
         device="cpu",
     )
+    before = utils.counters["stats"]["unique_graphs"]
+
+    def compilation_count():
+        return utils.counters["stats"]["unique_graphs"] - before
+
     original = engine._capture
 
     def capture(*args, **kwargs):
@@ -152,7 +153,7 @@ def _engine(monkeypatch, body=_body):
         return original(*args, **kwargs)
 
     monkeypatch.setattr(engine, "_capture", capture)
-    return engine, graphs, captures
+    return engine, compilation_count, captures
 
 
 @pytest.mark.parametrize("boundary", ("raw", "clone"))
@@ -164,7 +165,7 @@ def test_training_continuations_reuse_compilation_and_preserve_full_bptt(
     leaves = _leaves(source)
     versions = [value._version for value in leaves]
     flags = [(value.requires_grad, value.is_leaf) for value in leaves]
-    engine, graphs, captures = _engine(monkeypatch)
+    engine, compilation_count, captures = _engine(monkeypatch)
     state, carries = source["state"], source["carries"]
     parts = []
     backend_count = None
@@ -173,9 +174,9 @@ def test_training_continuations_reuse_compilation_and_preserve_full_bptt(
             state, carries = _history_clone((state, carries))
         actual = engine(source["parameters"], {}, state, carries, tape)
         if backend_count is None:
-            backend_count = len(graphs)
+            backend_count = compilation_count()
             assert backend_count > 0
-        assert len(graphs) == backend_count
+        assert compilation_count() == backend_count
         assert len(captures) == len(engine._kernels) == 1
         _owned(actual, (source, parts))
         parts.append(actual)
@@ -195,7 +196,7 @@ def test_training_continuations_reuse_compilation_and_preserve_full_bptt(
     for value, wanted in zip(gradients, oracle, strict=True):
         assert torch.isfinite(value).all() and torch.count_nonzero(wanted) > 0
         torch.testing.assert_close(value, wanted, rtol=2e-10, atol=2e-11)
-    assert len(graphs) == backend_count
+    assert compilation_count() == backend_count
     assert len(captures) == len(engine._kernels) == 1
     torch.testing.assert_close(source, before, rtol=0, atol=0)
     torch.testing.assert_close(parts, saved, rtol=0, atol=0)
@@ -284,7 +285,7 @@ def test_no_grad_scan_normalizes_offset_alias_inference_and_continued_inputs(
     monkeypatch,
 ):
     source = _source(train=False)
-    engine, graphs, captures = _engine(monkeypatch)
+    engine, compilation_count, captures = _engine(monkeypatch)
     previous = []
     backend_count = None
     with torch.no_grad():
@@ -312,9 +313,9 @@ def test_no_grad_scan_normalizes_offset_alias_inference_and_continued_inputs(
             versions = [value._version for value in versioned]
             actual = engine(*operands)
             if backend_count is None:
-                backend_count = len(graphs)
+                backend_count = compilation_count()
                 assert backend_count > 0
-            assert len(graphs) == backend_count, kind
+            assert compilation_count() == backend_count, kind
             assert len(captures) == len(engine._kernels) == 1, kind
             expected = _oracle(
                 source["parameters"], state, carries, source["tapes"][:1]
@@ -324,7 +325,7 @@ def test_no_grad_scan_normalizes_offset_alias_inference_and_continued_inputs(
             torch.testing.assert_close(operands, saved, rtol=0, atol=0)
             assert [value._version for value in versioned] == versions
             previous.append(actual)
-    assert len(graphs) == backend_count
+    assert compilation_count() == backend_count
     assert len(captures) == len(engine._kernels) == 1
 
 
@@ -336,7 +337,7 @@ def test_scan_retains_raw_invariant_view_metadata_specialization_and_gradients(
         updated = {"x": state["x"] + value.sum() + value.storage_offset()}
         return (updated, carries), updated
 
-    engine, graphs, captures = _engine(monkeypatch, body)
+    engine, compilation_count, captures = _engine(monkeypatch, body)
     upstream = torch.ones(8, dtype=torch.float64, requires_grad=True)
     initial = torch.tensor(0.7, dtype=torch.float64, requires_grad=True)
     tape = {"u": torch.zeros(2, dtype=torch.float64)}
@@ -358,7 +359,7 @@ def test_scan_retains_raw_invariant_view_metadata_specialization_and_gradients(
         torch.testing.assert_close(gradients, oracle, rtol=2e-10, atol=2e-11)
         assert value.stride() == (2,) and value.storage_offset() == offset
         assert value.requires_grad and not value.is_leaf
-    assert len(captures) == len(graphs) == 2
+    assert len(captures) == compilation_count() == 2
 
 
 def test_scan_host_pack_honors_custom_clone_values_and_autograd():
@@ -472,7 +473,7 @@ def test_restored_unused_parameter_reuses_compilation_and_keeps_suffix_gradients
     def objective(result):
         return result[0]["x"].square() + result[2]["x"].square().sum()
 
-    engine, graphs, captures = _engine(monkeypatch, body)
+    engine, compilation_count, captures = _engine(monkeypatch, body)
     parameter = torch.nn.Parameter(torch.tensor(0.7, dtype=torch.float64))
     initial = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
     prefix_drive = torch.tensor([0.1, 0.2], dtype=torch.float64, requires_grad=True)
@@ -482,7 +483,7 @@ def test_restored_unused_parameter_reuses_compilation_and_keeps_suffix_gradients
     inputs = _leaves((parameter, initial, prefix_drive, suffix_drive))
     versions = [value._version for value in inputs]
     first = engine(parameters, prepared, {"x": initial}, {}, {"u": prefix_drive})
-    backend_count = len(graphs)
+    backend_count = compilation_count()
     assert backend_count > 0 and len(captures) == len(engine._kernels) == 1
     oracle_parameter = parameter.detach().clone().requires_grad_()
     oracle_initial = initial.detach().clone().requires_grad_()
@@ -501,7 +502,7 @@ def test_restored_unused_parameter_reuses_compilation_and_keeps_suffix_gradients
         torch.isfinite(value).all() and torch.count_nonzero(value) > 0
         for value in gradients
     )
-    assert len(graphs) == backend_count
+    assert compilation_count() == backend_count
 
     # Portable restoration supplies new regular leaves with saved trainability.
     restored_parameter = parameter.detach().clone().requires_grad_()
@@ -515,8 +516,10 @@ def test_restored_unused_parameter_reuses_compilation_and_keeps_suffix_gradients
         {},
         {"u": suffix_drive},
     )
-    assert len(graphs) == backend_count
-    assert len(captures) == len(engine._kernels) == 1
+    assert compilation_count() == backend_count
+    # The restored Tensor has a distinct raw authored capture, while its
+    # identical numerical FX program reuses the compiled Parameter executor.
+    assert len(captures) == len(engine._kernels) == 2
     ref_parameter = restored_parameter.detach().clone().requires_grad_()
     ref_initial = restored_initial.detach().clone().requires_grad_()
     ref_drive = suffix_drive.detach().clone().requires_grad_()
@@ -543,8 +546,8 @@ def test_restored_unused_parameter_reuses_compilation_and_keeps_suffix_gradients
         torch.isfinite(value).all() and torch.count_nonzero(value) > 0
         for value in observed[:3]
     )
-    assert len(graphs) == backend_count
-    assert len(captures) == len(engine._kernels) == 1
+    assert compilation_count() == backend_count
+    assert len(captures) == len(engine._kernels) == 2
     torch.testing.assert_close(
         (parameters, prepared, initial, prefix_drive, suffix_drive),
         before,
@@ -578,7 +581,7 @@ def test_restored_used_parameter_aliases_reuse_compilation_and_preserve_raw_poli
     def objective(result):
         return result[0]["x"].square() + result[2]["x"].square().sum()
 
-    (engine, graphs, captures) = _engine(monkeypatch, body)
+    (engine, compilation_count, captures) = _engine(monkeypatch, body)
     parameter = torch.nn.Parameter(torch.tensor(0.7, dtype=torch.float64))
     initial = torch.tensor(0.5, dtype=torch.float64, requires_grad=True)
     prefix_drive = torch.tensor([0.1, 0.2], dtype=torch.float64, requires_grad=True)
@@ -589,7 +592,7 @@ def test_restored_used_parameter_aliases_reuse_compilation_and_preserve_raw_poli
     versions = [value._version for value in _leaves(inputs)]
     first = engine(parameters, prepared, {"x": initial}, {}, {"u": prefix_drive})
     _owned(first, inputs)
-    first_backend_count = len(graphs)
+    first_backend_count = compilation_count()
     assert first_backend_count > 0 and len(captures) == len(engine._kernels) == 1
     ref_parameter = parameter.detach().clone().requires_grad_()
     ref_initial = initial.detach().clone().requires_grad_()
@@ -628,9 +631,9 @@ def test_restored_used_parameter_aliases_reuse_compilation_and_preserve_raw_poli
         {"u": suffix_drive},
     )
     _owned(final, (inputs, first, restored_parameter, restored_initial))
-    restored_backend_count = len(graphs)
+    restored_backend_count = compilation_count()
     assert restored_backend_count == first_backend_count
-    assert len(captures) == len(engine._kernels) == 1
+    assert len(captures) == len(engine._kernels) == 2
     ref_parameter = restored_parameter.detach().clone().requires_grad_()
     ref_initial = restored_initial.detach().clone().requires_grad_()
     ref_drive = suffix_drive.detach().clone().requires_grad_()
@@ -659,7 +662,7 @@ def test_restored_used_parameter_aliases_reuse_compilation_and_preserve_raw_poli
             for value in observed[:3]
         )
     )
-    assert len(graphs) == restored_backend_count
+    assert compilation_count() == restored_backend_count
     upstream = torch.tensor(0.4, dtype=torch.float64, requires_grad=True)
     nonleaf = 1.3 * upstream
     (nonleaf_parameters, nonleaf_prepared) = bindings(nonleaf)
@@ -684,7 +687,7 @@ def test_restored_used_parameter_aliases_reuse_compilation_and_preserve_raw_poli
         objective(expected), (ref_upstream, ref_initial, ref_drive)
     )
     torch.testing.assert_close(observed, wanted, rtol=2e-10, atol=2e-11)
-    assert len(captures) == len(engine._kernels) == 2
+    assert len(captures) == len(engine._kernels) == 3
     torch.testing.assert_close(inputs, saved, rtol=0, atol=0)
     assert [value._version for value in _leaves(inputs)] == versions
     assert parameter.requires_grad and parameter.is_leaf

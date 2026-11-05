@@ -221,7 +221,21 @@ def _sample_contract(signature):
     if len(children) != 5:
         raise TypeError
     count = children[-1].num_leaves
-    rows = list(metadata)
+    rows = []
+    for row in metadata:
+        if type(row) is tuple and len(row) == 11:
+            # Raw authored captures can distinguish Parameter from Tensor.
+            # Pooling happens only after those captures have produced the same
+            # FX program, and runtime isolation normalizes plain Parameters.
+            # Ignore that class distinction here without weakening capture.
+            tensor_type = row[-1]
+            if (
+                tensor_type is not torch.Tensor
+                and tensor_type is not torch.nn.Parameter
+            ):
+                raise TypeError
+            row = row[:-1]
+        rows.append(row)
     for index in range(len(rows) - count, len(rows)):
         row = rows[index]
         if type(row) is not tuple or len(row) != 10:

@@ -13,6 +13,74 @@ from dendra.func._tensor_tree_while import _CompiledTensorTreeWhile
 pytestmark = pytest.mark.cpu
 
 
+@pytest.mark.parametrize("parameter_first", [True, False])
+def test_raw_while_recaptures_parameter_class_policy(parameter_first):
+    def body(parameters, prepared, state, carries, sample):
+        scale = parameters["scale"]
+        gain = 2.0 if isinstance(scale, torch.nn.Parameter) else 11.0
+        value = state["v"] + gain * scale
+        return ({"v": value}, carries), {"v": value}
+
+    engine = _CompiledTensorTreeWhile(
+        body,
+        steps=4,
+        compile_options={"backend": "eager", "fullgraph": True},
+        device="cpu",
+    )
+    parameter = torch.nn.Parameter(torch.tensor(0.5, dtype=torch.float64))
+    restored = parameter.detach().clone().requires_grad_()
+    values = (parameter, restored) if parameter_first else (restored, parameter)
+    with torch.no_grad():
+        for scale in values:
+            initial = torch.tensor([-0.2, 0.3], dtype=torch.float64)
+            final, _, emitted = engine({"scale": scale}, {}, {"v": initial}, {}, None)
+            gain = 2.0 if isinstance(scale, torch.nn.Parameter) else 11.0
+            expected = initial + torch.arange(1, 5, dtype=torch.float64)[:, None] * (
+                gain * scale
+            )
+            torch.testing.assert_close(final["v"], expected[-1])
+            torch.testing.assert_close(emitted["v"], expected)
+            assert not final["v"].requires_grad
+    assert len(engine._kernels) == 2
+
+
+def test_custom_while_tracer_keeps_independent_executor_ownership():
+    from torch.fx.experimental.proxy_tensor import make_fx
+
+    captures = []
+
+    def tracer(*args, **kwargs):
+        captures.append(None)
+        return make_fx(*args, **kwargs)
+
+    def body(parameters, prepared, state, carries, sample):
+        value = state["v"] + parameters["gain"]
+        return ({"v": value}, carries), {"v": value}
+
+    engine = _CompiledTensorTreeWhile(
+        body,
+        steps=4,
+        compile_options={"backend": "eager", "fullgraph": True},
+        device="cpu",
+        tracer=tracer,
+    )
+    parameter = torch.nn.Parameter(torch.tensor(0.5, dtype=torch.float64))
+    with torch.no_grad():
+        for gain in (parameter, parameter.detach().clone().requires_grad_()):
+            final, _, emitted = engine(
+                {"gain": gain},
+                {},
+                {"v": torch.zeros((), dtype=torch.float64)},
+                {},
+                None,
+            )
+            expected = torch.arange(1, 5, dtype=torch.float64) * gain
+            torch.testing.assert_close(final["v"], expected[-1])
+            torch.testing.assert_close(emitted["v"], expected)
+    assert len(captures) == len(engine._kernels) == 2
+    assert not engine._executors
+
+
 @pytest.fixture(autouse=True)
 def _warnings():
     with torch_compiler_warning_context():

@@ -15,6 +15,43 @@ from dendra.func._scan_tree import _CompiledTensorTreeScan
 pytestmark = pytest.mark.cpu
 
 
+@pytest.mark.parametrize("parameter_first", [True, False])
+def test_raw_scan_recaptures_parameter_class_policy_and_gradients(parameter_first):
+    def body(parameters, prepared, state, carries, sample):
+        scale = parameters["scale"]
+        gain = 2.0 if isinstance(scale, torch.nn.Parameter) else 11.0
+        value = state["v"] + gain * scale
+        return ({"v": value}, carries), {"v": value}
+
+    engine = _CompiledTensorTreeScan(
+        body,
+        steps=2,
+        compile_options={"backend": "aot_eager", "fullgraph": True},
+        device="cpu",
+    )
+    parameter = torch.nn.Parameter(torch.tensor(0.5, dtype=torch.float64))
+    restored = parameter.detach().clone().requires_grad_()
+    values = (parameter, restored) if parameter_first else (restored, parameter)
+    with torch_compiler_warning_context():
+        for scale in values:
+            initial = torch.tensor([-0.2, 0.3], dtype=torch.float64, requires_grad=True)
+            final, _, emitted = engine({"scale": scale}, {}, {"v": initial}, {}, None)
+            gain = 2.0 if isinstance(scale, torch.nn.Parameter) else 11.0
+            expected = initial + torch.arange(1, 3, dtype=torch.float64)[:, None] * (
+                gain * scale
+            )
+            torch.testing.assert_close(final["v"], expected[-1])
+            torch.testing.assert_close(emitted["v"], expected)
+            actual_gradients = torch.autograd.grad(
+                final["v"].sum() + emitted["v"].sum(), (scale, initial)
+            )
+            reference_gradients = torch.autograd.grad(
+                expected[-1].sum() + expected.sum(), (scale, initial)
+            )
+            torch.testing.assert_close(actual_gradients, reference_gradients)
+    assert len(engine._kernels) == 2
+
+
 def test_packed_carry_preserves_static_none_without_tensor_slots():
     state = {
         "v": torch.tensor([1.0, 2.0], dtype=torch.float64),

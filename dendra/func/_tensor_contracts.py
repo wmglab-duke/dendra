@@ -13,6 +13,28 @@ import torch
 from torch.utils import _pytree as pytree
 
 
+class _CaptureTensorType:
+    """Retain a subclass identity without invoking its authored metaclass."""
+
+    __slots__ = ("kind",)
+
+    def __init__(self, kind):
+        self.kind = kind
+
+    def __hash__(self):
+        return id(self.kind)
+
+    def __eq__(self, other):
+        return type(other) is _CaptureTensorType and self.kind is other.kind
+
+
+def _capture_tensor_type(value):
+    kind = type(value)
+    if kind is torch.Tensor or kind is torch.nn.Parameter:
+        return kind
+    return _CaptureTensorType(kind)
+
+
 def _clone_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.detach().clone(memory_format=torch.preserve_format)
 
@@ -94,7 +116,7 @@ def _tensor_tree_binding(values) -> tuple:
 
 
 def capture_schema(tree):
-    """Describe logical views and metadata used to specialize a captured loop."""
+    """Describe authored tensor classes and views used to capture a loop."""
     values, spec = pytree.tree_flatten(tree)
     return spec, tuple(
         (
@@ -108,6 +130,7 @@ def capture_schema(tree):
             value.is_conj(),
             value.is_neg(),
             torch.is_inference(value),
+            _capture_tensor_type(value),
         )
         if torch.is_tensor(value)
         else (type(value), value)

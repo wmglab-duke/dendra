@@ -24,6 +24,7 @@ from ._hop_inputs import (
     _LiftedViewIsolation,
     _parameter_input_isolation,
 )
+from ._scan_executor import _executor_key
 from ._state_projection import (
     _can_project_state,
     _plain_projection_context,
@@ -36,6 +37,7 @@ from ._while_inductor import _STANDARD_COMPILER, _compile_while
 
 _SAMPLE_METHODS = ("index_select", "squeeze", "stride")
 _SAMPLE_DESCRIPTORS = tuple(_tensor_descriptor(name) for name in _SAMPLE_METHODS)
+_STANDARD_TRACER = make_fx
 
 
 def _can_own_samples(samples):
@@ -109,6 +111,7 @@ class _CompiledTensorTreeWhile:
         self._compiler = _compile_while if compiler is None else compiler
         self._kernels = {}
         self._layouts = {}
+        self._executors = {}
 
     def _samples(self, tape):
         values, spec = pytree.tree_flatten(tape)
@@ -192,6 +195,15 @@ class _CompiledTensorTreeWhile:
         )
         kernel = self._kernels.get(signature)
         if kernel is None:
+            pool = (
+                self._compiler is _STANDARD_COMPILER
+                and self._tracer is _STANDARD_TRACER
+                and _plain_projection_context(check_saved_tensors=False)
+                and _plain_state_tree(
+                    (parameters, prepared, initial, invariant, samples),
+                    allow_parameters=True,
+                )
+            )
             with torch.inference_mode(False), torch.no_grad():
                 kernel = self._capture(
                     parameters,
@@ -202,6 +214,7 @@ class _CompiledTensorTreeWhile:
                     samples,
                     sample_layout,
                     owned_samples=owned_samples,
+                    executor_signature=(*signature[:4], False) if pool else None,
                 )
                 self._kernels[signature] = kernel
         return kernel
@@ -256,6 +269,7 @@ class _CompiledTensorTreeWhile:
         sample_layout,
         *,
         owned_samples=False,
+        executor_signature=None,
     ):
         body, partition, steps = self._body, self._partition, self._steps
         clone_state = self._clone_state
@@ -403,10 +417,26 @@ class _CompiledTensorTreeWhile:
                 packed = layout.pack((final, final_carries))
             return packed, pytree.tree_unflatten(list(buffers), emission_spec)
 
-        if self._compiler is _STANDARD_COMPILER:
-            compiled = self._compiler(execute, self._options, device=self._device)
-        else:
-            compiled = self._compiler(execute, self._options)
+        program_key = _executor_key(graph, executor_signature, self._options)
+        executor_key = (owned_samples, program_key) if program_key is not None else None
+        existing = (
+            self._executors.get(executor_key) if executor_key is not None else None
+        )
+        if existing is not None:
+            compiled, retained_graph = existing
+            if (
+                _executor_key(retained_graph, executor_signature, self._options)
+                != program_key
+            ):
+                existing = None
+                del self._executors[executor_key]
+        if existing is None:
+            if self._compiler is _STANDARD_COMPILER:
+                compiled = self._compiler(execute, self._options, device=self._device)
+            else:
+                compiled = self._compiler(execute, self._options)
+            if executor_key is not None:
+                self._executors[executor_key] = compiled, graph
 
         @wraps(compiled)
         def materialize(parameters, prepared, initial, invariant, samples, carries):

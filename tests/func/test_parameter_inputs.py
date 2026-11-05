@@ -153,7 +153,7 @@ def test_while_restored_parameter_reuses_backend_and_keeps_raw_capture_policy(us
     global_rng = torch.get_rng_state().clone()
     with torch.no_grad():
         first_bindings, second_bindings = _bindings(parameter), _bindings(restored)
-        assert capture_schema(first_bindings) == capture_schema(second_bindings)
+        assert capture_schema(first_bindings) != capture_schema(second_bindings)
         arguments = (*first_bindings, initial, carries, tape)
         frozen = _snapshot(arguments)
         first = engine(*arguments)
@@ -184,7 +184,7 @@ def test_while_restored_parameter_reuses_backend_and_keeps_raw_capture_policy(us
         _unchanged(arguments, frozen)
         _owned(actual, (arguments, first))
         assert _activity() == admitted
-        assert len(engine._kernels) == 1
+        assert len(engine._kernels) == 2
         repeated = engine(*arguments)
         torch.testing.assert_close(repeated, expected, rtol=2e-11, atol=2e-12)
         assert _activity() == admitted
@@ -198,7 +198,7 @@ def test_while_restored_parameter_reuses_backend_and_keeps_raw_capture_policy(us
         )
         _unchanged(arguments, frozen)
         assert _activity() == admitted
-        assert len(engine._kernels) == 1
+        assert len(engine._kernels) == 2
 
     # A different authored leafness policy must still receive a new capture.
     with torch.enable_grad():
@@ -210,7 +210,7 @@ def test_while_restored_parameter_reuses_backend_and_keeps_raw_capture_policy(us
         torch.testing.assert_close(
             actual, _scalar_oracle(used, *arguments, leaf=False), rtol=2e-11, atol=2e-12
         )
-        assert len(engine._kernels) == 2
+        assert len(engine._kernels) == 3
     torch.testing.assert_close(torch.get_rng_state(), global_rng, rtol=0, atol=0)
 
 
@@ -263,7 +263,7 @@ def test_population_inference_scan_reuses_restored_captured_operands(slot):
     with torch.no_grad():
         first_arguments = arguments(parameter, tensors.state)
         second_arguments = arguments(restored, tensors.state)
-        assert capture_schema(first_arguments) == capture_schema(second_arguments)
+        assert capture_schema(first_arguments) != capture_schema(second_arguments)
         admitted = None
         for source in (parameter, restored, restored):
             current = arguments(source, tensors.state)

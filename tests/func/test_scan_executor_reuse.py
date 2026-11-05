@@ -25,6 +25,64 @@ from dendra.helpers import MEMBRANE_ASSEMBLY
 pytestmark = pytest.mark.cpu
 
 
+def test_capture_types_do_not_call_authored_metaclass_hash_or_equality():
+    observations = []
+
+    class Meta(type(torch.Tensor)):
+        def __hash__(cls):
+            observations.append("hash")
+            return type.__hash__(cls)
+
+        def __eq__(cls, other):
+            observations.append("equality")
+            return cls is other
+
+    class Subclass(torch.Tensor, metaclass=Meta):
+        pass
+
+    value = torch.ones((), dtype=torch.float64).as_subclass(Subclass)
+    observations.clear()
+    first = capture_schema({"value": value})
+    second = capture_schema({"value": value})
+    # Existing tensor-property dispatch can inspect its class. Constructed
+    # capture keys must not add authored metaclass operations during lookup.
+    observations.clear()
+    assert first == second
+    assert hash(first) == hash(second)
+    assert observations == []
+
+
+def test_parameter_class_recapture_reuses_a_type_independent_executor():
+    def body(parameters, prepared, state, carries, sample):
+        value = state["v"] + parameters["p"].square() * sample["drive"]
+        return ({"v": value}, carries), {"v": value}
+
+    engine = _engine(body)
+    parameter = torch.nn.Parameter(torch.tensor(0.5, dtype=torch.float64))
+    restored = parameter.detach().clone().requires_grad_()
+    for source in (parameter, restored):
+        initial = torch.tensor(-0.2, dtype=torch.float64, requires_grad=True)
+        tape = torch.tensor([0.2, 0.7], dtype=torch.float64, requires_grad=True)
+        final, _, emitted = engine(
+            {"p": source}, {}, {"v": initial}, {}, {"drive": tape}
+        )
+        expected = initial + source.square() * tape.cumsum(0)
+        torch.testing.assert_close(final["v"], expected[-1])
+        torch.testing.assert_close(emitted["v"], expected)
+        actual_gradients = torch.autograd.grad(
+            final["v"].square() + emitted["v"].square().sum(),
+            (source, initial, tape),
+        )
+        reference_gradients = torch.autograd.grad(
+            expected[-1].square() + expected.square().sum(), (source, initial, tape)
+        )
+        torch.testing.assert_close(actual_gradients, reference_gradients)
+    # Authored class observations require separate raw captures. Equivalent
+    # numerical FX programs still share the expensive compiled boundary.
+    assert len(engine._kernels) == 2
+    assert len(_executables(engine)) == 1
+
+
 @pytest.fixture(autouse=True)
 def _environment():
     previous = torch.get_num_threads()
