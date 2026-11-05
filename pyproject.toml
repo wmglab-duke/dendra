@@ -8,7 +8,14 @@ description = "Differentiable neuronal simulation and macroscopic descriptor opt
 requires-python = ">=3.11"
 readme = "README.md"
 license = "LicenseRef-Duke-Research-NonCommercial AND BSD-3-Clause"
-license-files = ["LICENSE.md", "THIRD_PARTY_NOTICES.md", "LICENSES/PyTorch.txt", "LICENSES/NEURON.txt"]
+license-files = [
+    "LICENSE.md",
+    "THIRD_PARTY_NOTICES.md",
+    "LICENSES/PyTorch.txt",
+    "LICENSES/NEURON.txt",
+    "LICENSES/BlueBrain.txt",
+    "LICENSES/CC-BY-NC-SA-4.0.txt",
+]
 
 dynamic = ["version", "dependencies"]
 

@@ -19,7 +19,9 @@ _MIXED_ASC = _MORPHOLOGY_DATA / "neurolucida_mixed.asc"
 _REPAIRED_ASC = _MORPHOLOGY_DATA / "neurolucida_repaired.asc"
 _TWO_ROOTS_ASC = _MORPHOLOGY_DATA / "neurolucida_two_roots.asc"
 _REAL_WORLD_ASC = Path(__file__).parent / "simtests" / "111200A.asc"
-_DOCS_EXAMPLE_ASC = Path(__file__).parents[1] / "docs" / "basics" / "example.asc"
+_DOCS_EXAMPLE_ASC = (
+    Path(__file__).parents[1] / "docs" / "basics" / "L23_PC_cADpyr229_1.asc"
+)
 
 
 def _section_map(morphology: dn.Morphology):

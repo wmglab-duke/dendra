@@ -9,4 +9,11 @@ portions. The complete {download}`PyTorch license <../LICENSES/PyTorch.txt>` and
 {download}`NEURON license <../LICENSES/NEURON.txt>` contain their copyright
 notices and redistribution conditions.
 
+The Blue Brain example morphology, `L23_PC_cADpyr229_1.asc` (Copyright © 2015
+EPFL-BBP), is licensed under
+[CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/).
+Its {download}`upstream notice <../LICENSES/BlueBrain.txt>` and
+{download}`complete license <../LICENSES/CC-BY-NC-SA-4.0.txt>` are available
+here; the third-party notices identify its source and file changes.
+
 {{ license_text }}

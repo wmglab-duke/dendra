@@ -238,7 +238,7 @@ def test_native_decimal_boundary_diameter_step_matches_neuron_geometry():
 
 
 def test_bundled_neurolucida_diameter_step_matches_neuron_geometry():
-    asc_path = Path(__file__).parents[1] / "docs" / "basics" / "example.asc"
+    asc_path = Path(__file__).parents[1] / "docs" / "basics" / "L23_PC_cADpyr229_1.asc"
     h.load_file("import3d.hoc")
     reader = h.Import3d_Neurolucida3()
     reader.quiet = 1
