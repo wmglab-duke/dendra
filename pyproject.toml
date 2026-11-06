@@ -25,7 +25,7 @@ Repository = "https://github.com/wmglab-duke/dendra"
 
 [project.optional-dependencies]
 solvers = [
-    "dendra-solvers>=0.3.1",
+    "dendra-solvers>=0.5.1",
 ]
 jupyter = [
     "ipympl >= 0.9.5",

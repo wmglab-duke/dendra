@@ -786,7 +786,7 @@ class _dhs(Integrator):
                     "DHS integrator requires the dendra-solvers package for CPU "
                     "execution. Install it with "
                     "`python -m pip install --upgrade "
-                    '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                    '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                 )
             self._solve = torch.ops.dendra_solvers.dhs_solve
         elif device.type == "mps":
@@ -842,7 +842,7 @@ class _dhs(Integrator):
                 "The selected native CPU solver requires a dendra-solvers build "
                 "that exports the torch.func-compatible dhs_solve facade. Upgrade "
                 "it with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
         raise RuntimeError(
             "The selected DHS solver is not yet transform-compatible. "
@@ -1326,7 +1326,7 @@ class _dhs_multi(MultiIntegrator):
                     "DHS integrator requires the dendra-solvers package for CPU "
                     "execution. Install it with "
                     "`python -m pip install --upgrade "
-                    '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                    '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                 )
             self._solve = _dhs_multi_solve_cpu
         elif device.type == "mps":
@@ -1390,7 +1390,7 @@ class _dhs_multi(MultiIntegrator):
                 "The selected native CPU solver requires a dendra-solvers build "
                 "that exports the torch.func-compatible dhs_multi_solve facade. "
                 "Upgrade it with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
         raise RuntimeError(
             "The selected packed DHS solver is not yet transform-compatible. "

@@ -82,7 +82,7 @@ On Windows hosts, run this inside WSL2.
 ## Native CPU and MPS implicit solvers
 
 The quick start includes [`dendra-solvers`](https://pypi.org/project/dendra-solvers/)
-through the optional `solvers` extra.
+through the optional `solvers` extra, which requires version 0.5.1 or newer.
 The base installation (`python -m pip install dendra`) does not download or
 build it, so an unavailable solver wheel or failed solver build does not
 prevent you from installing Dendra.
@@ -111,7 +111,7 @@ Or add the package to an existing Dendra installation, allowing only prebuilt
 wheels:
 
 ```sh
-python -m pip install --only-binary=dendra-solvers "dendra-solvers>=0.3.1"
+python -m pip install --only-binary=dendra-solvers "dendra-solvers>=0.5.1"
 ```
 
 The wheel-only command fails if there is no compatible wheel, leaving your

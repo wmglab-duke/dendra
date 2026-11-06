@@ -54,6 +54,7 @@ class DistributionChecks(unittest.TestCase):
             "Metadata-Version: 2.4\nName: dendra\nVersion: 0.27.0\n"
             "Requires-Python: >=3.11\nRequires-Dist: torch>=2.14.0\n"
             "Provides-Extra: solvers\n"
+            'Requires-Dist: dendra-solvers>=0.5.1; extra == "solvers"\n'
             f"License-Expression: {LICENSE_EXPRESSION}\n"
             + "".join(f"License-File: {name}\n" for name in self.license_files)
             + "\n"
@@ -150,6 +151,35 @@ class DistributionChecks(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "expected runtime dependency torch"):
             check_distributions(self.dist, self.root)
+
+    def test_reject_missing_stale_unconditional_or_duplicate_solver_requirement(self):
+        line = b'Requires-Dist: dendra-solvers>=0.5.1; extra == "solvers"\n'
+        for artifact, name in (
+            ("wheel", "dendra-0.27.0.dist-info/METADATA"),
+            ("sdist", "PKG-INFO"),
+        ):
+            for replacement in (
+                b"",
+                line.replace(b">=0.5.1", b">=0.3.1"),
+                b"Requires-Dist: dendra-solvers>=0.5.1\n",
+                line.replace(b'"solvers"', b'"dev"'),
+                line + line,
+            ):
+                with self.subTest(artifact=artifact, requirement=replacement):
+                    self.build_archives(
+                        **{
+                            f"{artifact}_changes": {
+                                name: self.metadata.replace(line, replacement)
+                            }
+                        }
+                    )
+                    with self.assertRaisesRegex(ValueError, "optional dependency"):
+                        check_distributions(self.dist, self.root)
+
+    def test_accept_equivalent_optional_solver_marker_quotes(self):
+        metadata = self.metadata.replace(b'extra == "solvers"', b"extra == 'solvers'")
+        self.build_archives(metadata=metadata, sdist_changes={"PKG-INFO": metadata})
+        self.assertEqual(check_distributions(self.dist, self.root), "0.27.0")
 
     def test_reject_extra_distribution(self):
         self.build_archives()

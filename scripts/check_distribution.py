@@ -22,6 +22,7 @@ NATIVE_SOURCES = (
     "dendra/models/networks/netcon_bitpack_kernel.cu",
 )
 TORCH_REQUIREMENT = "torch>=2.14.0"
+SOLVER_REQUIREMENT = 'dendra-solvers>=0.5.1;extra=="solvers"'
 
 
 def source_version(root: Path) -> str:
@@ -90,6 +91,15 @@ def check_metadata(
         )
     if "solvers" not in metadata.get_all("Provides-Extra", []):
         raise ValueError(f"{artifact.name}: the solvers extra is missing.")
+    solver_dependencies = [
+        item.replace(" ", "").replace("'", '"')
+        for item in dependencies
+        if item.startswith("dendra-solvers")
+    ]
+    if solver_dependencies != [SOLVER_REQUIREMENT]:
+        raise ValueError(
+            f"{artifact.name}: expected optional dependency {SOLVER_REQUIREMENT}."
+        )
     if metadata.get_all("License-Expression", []) != [license_expression]:
         raise ValueError(
             f"{artifact.name}: License-Expression is missing or differs from source."

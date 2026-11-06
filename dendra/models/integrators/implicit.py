@@ -435,7 +435,7 @@ class _bwd_euler_ub(Integrator):
                     "Using `bwd_euler_ub` on CPU without dendra-solvers installed. "
                     "Falling back to PCR solver. Install the native package with "
                     "`python -m pip install --upgrade "
-                    '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                    '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                 )
                 self._solve = pcr_solve_t
 
@@ -467,7 +467,7 @@ class _bwd_euler_ub(Integrator):
                 "The selected native CPU solver requires a dendra-solvers build "
                 "that exports torch.func-compatible tridiagonal facades. Upgrade "
                 "it with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
 
         if solver_name in {"pcr_solve_t", "pcr_solve_parallel_t"} and solver_module == (
@@ -716,7 +716,7 @@ class _bwd_euler_bt(Integrator):
                 "Native CPU block solvers are unavailable. CUDA will use Triton "
                 "and MPS will use pure-PyTorch block PCR; install dendra-solvers "
                 "for CPU support with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
         super().__init__(model, mech, imem)
 
@@ -927,7 +927,7 @@ class _bwd_euler_bt(Integrator):
                         "_bwd_euler_bt(method='spd') requires the dendra-solvers "
                         "package for CPU execution. Use CUDA or run "
                         "`python -m pip install --upgrade "
-                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                     )
                 try:
                     from dendra_solvers import solve_bt_spd_consume_unchecked
@@ -936,7 +936,7 @@ class _bwd_euler_bt(Integrator):
                         "_bwd_euler_bt(method='spd') requires the dendra-solvers "
                         "package for CPU execution. Use CUDA or run "
                         "`python -m pip install --upgrade "
-                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                     ) from err
                 else:
                     # _step constructs fresh B_work/D_work buffers, so use the
@@ -953,7 +953,7 @@ class _bwd_euler_bt(Integrator):
                         "_bwd_euler_bt(method='thomas') requires the dendra-solvers "
                         "package for CPU execution. Use CUDA or run "
                         "`python -m pip install --upgrade "
-                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                     )
 
     def initialize(self, model, dt):

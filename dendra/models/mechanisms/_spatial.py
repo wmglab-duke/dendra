@@ -265,7 +265,7 @@ def select_tridiagonal_solver(solver: str | None, device: torch.device | str):
                 "Using material diffusion on CPU without dendra-solvers installed; "
                 "falling back to the PyTorch PCR/Thomas solver. Install the native "
                 "package with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
             return pcr_solve_t, "pcr_cpu"
         return None, "dense"
@@ -1278,13 +1278,13 @@ def _select_dhs_solver(solver: str | None, device: torch.device | str, *, thread
                 "Tree material diffusion solver='thomas' on CPU requires the "
                 "dendra-solvers package. Install it with `python -m pip install "
                 "--upgrade --only-binary=dendra-solvers "
-                '"dendra-solvers>=0.3.1"`.'
+                '"dendra-solvers>=0.5.1"`.'
             )
         warnings.warn(
             "Using tree material diffusion on CPU without dendra-solvers installed; "
             "falling back to dense torch.linalg.solve. Install the native package "
             "with `python -m pip install --upgrade "
-            '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+            '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
         )
         return None, "dense"
 

@@ -209,7 +209,7 @@ class _dhs_bt(Integrator):
                     "DHS_BT integrator requires the dendra-solvers package for CPU "
                     "execution. Install it with "
                     "`python -m pip install --upgrade "
-                    '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                    '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                 )
             self._solve = torch.ops.dendra_solvers.dhs_bt_solve
         elif device.type == "mps":
@@ -266,7 +266,7 @@ class _dhs_bt(Integrator):
                 "The selected native CPU solver requires a dendra-solvers build "
                 "that exports the torch.func-compatible dhs_bt_solve facade. "
                 "Upgrade it with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
         raise RuntimeError(
             "The selected block-DHS solver is not yet transform-compatible. "
