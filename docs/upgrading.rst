@@ -3,8 +3,102 @@
 Upgrading Dendra
 ================
 
+Dendra 0.28: upgrading from 0.27.x
+----------------------------------
+
+Dependencies
+~~~~~~~~~~~~
+
+Dendra requires PyTorch 2.14 or newer. Choose a PyTorch build appropriate for
+your CPU or accelerator; see :doc:`installation`. The optional
+``dendra[solvers]`` extra requires ``dendra-solvers>=0.5.1``. Upgrade that
+package alongside Dendra if you install the solver backend separately.
+
+Recording and callback results
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``Recorder`` and ``dn.func.Recorder`` do not accept ``sliding_window``;
+``dendra.models.callbacks.sliding_window_average`` is also removed. Apply
+temporal filtering to recorded tensors as a separate postprocessing step.
+For example, a five-sample average without edge padding is:
+
+.. code-block:: python
+
+   voltage = recorder.stack("v")
+   moving_mean = voltage.unfold(0, 5, 1).mean(dim=-1)
+
+The filter preserves any gradients carried by the recorded tensors and returns
+four fewer samples. Choose padding explicitly if you need an output at every
+original sample. If a native ``Recorder`` call
+passed ``partition`` positionally after ``sliding_window``, remove the obsolete
+argument and pass ``partition=...`` by keyword.
+
+In-memory native ``Recorder(dt=...)`` uses the same sampling phase as HDF5
+recording. A fresh recording includes the initial boundary, then accepted
+timesteps ``k, 2*k, ...``, where ``k = int(recording_dt / solver_dt)``. Older
+in-memory recordings could have a different phase. Record ``"t"`` alongside
+your variables and use those timestamps when comparing runs. Recording cadence
+does not change the solver timestep; ``dt=None`` records every accepted step
+and the initial boundary.
+
+Callback outputs also have consistent native and functional conventions:
+
+* ``APCount`` uses ``torch.int32`` counters instead of native ``float32`` or
+  functional ``int64`` counters. Cast explicitly if subsequent analysis needs
+  floating-point tensors. These hard threshold-crossing counts are not
+  differentiable spike surrogates.
+* ``ActiveAL`` and ``ActiveALCount`` require a positive integer ``at_least``;
+  fractional values and booleans are rejected.
+* Functional ``Raster`` returns only the rows inside its configured checking
+  window, matching native ``Raster``. It does not return a full timeline with
+  zeros outside the window. Code that assumed one row per simulated step must
+  account for the selected window. Neither path records the initial boundary
+  as a spike sample.
+* The default ``LFP`` projection preserves batch axes and sums over cells and
+  compartments. Its result has shape ``(samples, *batch, contacts)`` in both
+  execution modes, including the initial boundary. Lead fields in mV/mA and
+  membrane currents in mA produce values in mV. Older native defaults also
+  summed batch axes; pass ``rule="...,n...->n"`` explicitly if that reduction
+  is intentional.
+
+Supported callback checkpoint restoration validates legacy ``float32`` and
+``int64`` count tensors before converting them to ``int32``. Counts must be
+finite, non-negative integers within the representable range. This conversion
+does not make an otherwise incompatible callback configuration or checkpoint
+compatible. See :doc:`advanced/recording_and_callbacks` for configuration,
+storage, and continuation examples.
+
+Built-in Hodgkin-Huxley mechanism
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The built-in ``hh`` mechanism exposes one total current, ``i(v)``. The separate
+``ina(v)``, ``ik(v)``, and ``il(v)`` methods are removed. For component-current
+diagnostics on an initialized model with ``hh`` inserted over all compartments:
+
+.. code-block:: python
+
+   channel = model.mech.hh
+   v = model.v
+   ina = channel.gnabar * channel.m**3 * channel.h * (v - channel.ena)
+   ik = channel.gkbar * channel.n**4 * (v - channel.ek)
+   il = channel.gl * (v - channel.el)
+   total = channel.i(v)
+
+These are outward-positive current densities in mA/cm². Subclasses that changed
+the component methods must instead override ``i_affine_terms(v)``, returning
+``(G, J)`` for ``i = G*v - J``, and redeclare ``Mechanism.AFFINE("i")``; see
+:doc:`advanced/custom_models` for current declarations.
+
+The gates ``m``, ``h``, and ``n`` and their parameters are retained. Their
+assigned fields are rate coefficients ``m_a``, ``m_b``, ``h_a``, ``h_b``,
+``n_a``, and ``n_b`` for ``x' = x_a - x_b*x``. Replace diagnostic uses of
+``minf`` and ``mtau`` with ``m_a / m_b`` and ``1 / m_b`` from an evaluated
+assigned-value frame, respectively. Apply the same mapping to ``hinf``/``htau``
+and ``ninf``/``ntau``. The rate coefficients include temperature scaling; do
+not apply Q10 a second time. The former assigned field names are not retained.
+
 Morphology loading and spatial discretization
----------------------------------------------
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``Tree.from_swc``, ``Tree.from_asc``, and ``Tree.from_neurolucida`` construct
 models through native Morphology declarations. They load geometry, apply
@@ -39,6 +133,11 @@ the latter's discretization. Their ``nseg`` argument sets a uniform initial
 count and does not apply d-lambda. See :ref:`native-morphologies` for editing,
 geometry validation, and the discretization contract.
 
+Native Sections have an explicit positive ``nseg`` (default ``1``); loading
+geometry alone does not select a frequency-dependent grid. Reapply
+``Morphology.apply_d_lambda`` after geometry edits when you want to recompute
+compartment counts, then rebuild the Tree from the updated declaration.
+
 SWC imports follow ``Morphology.from_swc`` naming and validation rather than
 NEURON's SWC importer. Generated exact names include ``soma_0``,
 ``basal_dendrite_0``, and ``apical_dendrite_0``. ``Tree.from_swc`` retains the
@@ -68,8 +167,12 @@ NEURON-specific segment metadata, use ``data_func`` with a low-level reader
 and pass its graph to ``Tree.from_graph``; Tree file constructors do not
 accept ``data_func``.
 
+The documentation's ASC reconstruction is named
+``docs/basics/L23_PC_cADpyr229_1.asc``. Update references to the former
+``docs/basics/example.asc`` path in local copies of the tutorials.
+
 Gradient-clipped Thomas
------------------------
+~~~~~~~~~~~~~~~~~~~~~~~
 
 Remove ``clip_scale_backward`` from ``bwd_euler_ub(...)`` calls. The option is
 unsupported and raises ``TypeError``; ordinary Thomas execution uses the
@@ -77,12 +180,20 @@ unmodified solve derivatives. The low-level ``thomas_solve_t_gc`` operator is
 also unavailable.
 
 Strict state-dictionary loading rejects the obsolete ``integrator.clip_scale``
-buffer from a clipped configuration. Reconstruct an ordinary model when
-loading compatible parameters. Native runtime checkpoints store simulation
-state rather than clipping configuration and remain compatible with an
-otherwise matching model, but do not reproduce the former clipped gradients.
-Rebuild models saved as full-object pickles that reference the removed
-operator or constructor option.
+buffer from a clipped configuration. Reconstruct the model without the removed
+option. If migrating a state dictionary, remove that one known obsolete buffer
+only after checking that the model configuration and all other keys match;
+keep strict loading enabled. Do not discard arbitrary unexpected keys or use
+``strict=False`` to hide a schema mismatch.
+
+Native runtime checkpoints store simulation state rather than clipping
+configuration. Restore them with ``restore_dict_from_checkpoint`` on a matching
+model and check any schema or configuration errors explicitly. They do not
+reproduce the former clipped gradients. Models saved as full-object pickles
+that reference removed operators, helpers, or constructor options must be
+rebuilt. Keep the original environment available to export known parameters
+and simulation state before migrating such files. See
+:doc:`advanced/initialization_and_checkpoints` for supported checkpoint APIs.
 
 Dendra 0.25: custom Mechanism and State classes
 -----------------------------------------------
@@ -117,7 +228,7 @@ Declaration and hook mapping
      - Select the declaration from the value's lifetime; see below.
    * - Legacy ``Mechanism.ASSIGNED("x")`` used as mutable storage
      - Select the role from the same four declarations
-     - ``Mechanism.ASSIGNED`` now has the same pure, ephemeral meaning as
+     - ``Mechanism.ASSIGNED`` has the same pure, ephemeral meaning as
        ``State.ASSIGNED``.
    * - ``Mechanism.SAVE("i")``
      - ``Mechanism.SAVE_CURRENT("i")``
@@ -208,7 +319,7 @@ Hooks must not mutate registered or hidden state, consume implicit randomness,
 or depend on undeclared mutable globals if they are to participate in
 ``dendra.func`` transforms.
 
-This is a minimal State and Mechanism using the new protocol:
+This is a minimal State and Mechanism using this protocol:
 
 .. code-block:: python
 
@@ -251,19 +362,32 @@ the mirror.
 Material processes
 ~~~~~~~~~~~~~~~~~~
 
-``MaterialProcess`` uses a separate population-wide scheduler. Its extension
-points remain ``configure_process(population)``, ``set_dt(dt)``, and
-``advance_materials(dt)`` together with the concrete process-family
-declarations. Ordinary local Mechanism roles and lifecycle hooks are rejected
-on a ``MaterialProcess`` subclass.
+``MaterialProcess`` uses a separate population-wide scheduler. To share a
+custom process between native and functional execution, expose the affected
+``(material, field)`` pairs through ``material_fields``, prepare tensor-only
+workspace with ``prepare_materials(fields, dt)``, and return replacement fields
+from ``material_updates(fields, prepared)``. The inherited
+``advance_materials`` adapter publishes those replacements during native
+execution.
+
+``configure_process(population)`` and ``set_dt(dt)`` remain available for
+persistent configuration and native timestep setup. A process that implements
+only a custom mutable ``advance_materials`` does not supply the pure hooks
+required for functional lowering. Ordinary local Mechanism roles and lifecycle
+hooks, including State bundles, ``CARRY``, and ``advance``, are rejected on a
+``MaterialProcess`` subclass. See the
+:doc:`mechanism and material guide <advanced/mechanisms_and_materials>` for
+process authoring.
 
 Functional compatibility
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
 The same declared protocol drives imperative execution and ``dendra.func``.
-The imperative API remains the permissive foundation for model-specific Python
-hooks and unusual mutable behavior. Functional lowering is stricter: it accepts
-only state, dependencies, and effects that Dendra can represent explicitly.
+Functional lowering accepts state, dependencies, and effects that Dendra can
+represent explicitly; custom implementations should use the shared pure hooks
+described above. Optional purity diagnostics can be enabled with
+``dn.ctx(CHECK_PURITY=True)`` during lowering; they are disabled by default.
 Use an eager initialization or transition while developing a mechanism so
 schema errors are reported before wrapping it in ``torch.compile`` or a
-``torch.func`` transform.
+``torch.func`` transform. See :doc:`advanced/functional_execution` for supported
+components and complete execution examples.

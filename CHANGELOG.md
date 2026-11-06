@@ -1,3 +1,74 @@
+## v0.28.0 (unreleased)
+
+### Simulate and train connected models
+
+- Compile ordinary Populations and single-device Networks with `dn.compile`,
+  including event-driven and continuous connections, NetStim, schedules and
+  shared parameters. Use scan for training, while-loop inference, bounded
+  chunks and activation checkpointing for longer simulations.
+- Use `dn.func.run` and `dn.func.initialize` with runners or explicit functional
+  plans. Choose snapshot restarts or fresh initialization, and specify execution
+  horizons with `steps=` or `duration=`.
+- Supply current and extracellular-voltage tapes through `dn.func.Inputs` in native or
+  functional execution. Compile with `extra=dn.VarInput()` to change deterministic
+  waveforms and contact counts between calls while retaining input gradients.
+- Inspect native models, runners, bindings and continuations with
+  `dn.func.inspect_sources`. Glob and regex selectors simplify trainable-parameter
+  selection; reports expose aliases and deduplicated leaves for optimizer groups.
+- Run `Thresholder` searches with compiled Population runners and named activity
+  results, reusing compiled kernels across stimulus amplitudes.
+
+### Record, replay and continue experiments
+
+- Share Recorder, LFP, activity and spike-analysis configurations across native
+  and functional execution. Scope callbacks to Network Populations, select
+  Recorder Slice regions and cadence, and stream recordings to HDF5.
+- Carry simulation state, effective sources, RNG position and callback phase in
+  a `Continuation`. Continue differentiably in memory, save portable checkpoints,
+  or transfer compatible state between native and functional execution.
+- Capture and replay initialization and runtime draws for sampled parameters,
+  NOISE, State SDEs, NetStim and Poisson waveforms. Shared generators retain one
+  logical stream across components and checkpoint continuation.
+
+### Author models and choose execution backends
+
+- Reuse pure Mechanism, State, synapse and MaterialProcess hooks across native
+  and functional execution. Supported components include TABLE values,
+  parametrized Ion/Material initializers, PyTorch parametrizations, delay
+  histories and mechanism-owned waveform injections.
+- Functional execution supports Euler/RK1, RK2/RK4, DF/DFH and scalar/block SPD
+  integrators alongside implicit cable and tree methods. Constructor-defined
+  Population and Network subclasses can reuse the inherited functional machinery.
+- The optional `dendra[solvers]` extra requires `dendra-solvers>=0.5.1` and provides
+  native CPU and Apple Metal solvers. Supported MPS cable and tree models use
+  float32 tensors; solver availability depends on geometry and device.
+- Compiled execution reuses compatible loop kernels, reducing redundant
+  captures and recompilation. `program.warm(verbose=True)`
+  prepares a representative forward run before timing or serving simulations.
+- User guides and runnable examples are organized by task, with complete
+  workflows for model authoring, training, recording and continuation.
+
+### Compatibility and upgrade notes
+
+- PyTorch 2.14 or newer is required.
+- Recorder and `dn.func.Recorder` no longer accept `sliding_window`, and
+  `callbacks.sliding_window_average` is removed. Apply temporal filtering to
+  recorded samples as a separate postprocessing step.
+- Recording and analysis results share native and functional conventions:
+  Recorder sampling phases align, APCount uses `int32`, Raster returns only
+  rows within its observation window, and LFP preserves batch axes.
+- Gradient-clipped Thomas solving and `bwd_euler_ub(clip_scale_backward=...)` are
+  removed. Strict `state_dict` loading rejects the retired `integrator.clip_scale`
+  buffer.
+- The built-in HH mechanism no longer exposes separate `ina`, `ik` and `il`
+  methods or the `minf`/`mtau`, `hinf`/`htau` and `ninf`/`ntau` assigned fields.
+- Morphology file constructors use native geometry and grid selection. The
+  NEURON-object helpers `io.lambda_f` and `io.apply_d_lambda` are removed;
+  imported NEURON models retain their existing compartment grid.
+
+See the [upgrade notes](docs/upgrading.rst) for replacements and migration guidance,
+including recording results, callback checkpoints and morphology imports.
+
 ## v0.27.2 (2026-10-02)
 
 ### Fix

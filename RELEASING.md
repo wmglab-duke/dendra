@@ -8,9 +8,37 @@ public-facing
 external contributions and for GitHub Actions to build, test, and publish.
 Internal GitLab versions can be skipped when choosing public releases.
 
-GitLab CI updates the version, changelog, and version tag after the required
-checks pass on `main`. GitHub validates promoted source and publishes selected
-releases; it does not bump versions or edit the changelog.
+GitLab CI updates the version and creates its tag after the required checks
+pass on `main`. Maintainers curate the changelog before release integration.
+GitHub validates promoted source and publishes selected releases; it does not
+bump versions or edit the changelog.
+
+## Curate release notes
+
+Keep one section in `CHANGELOG.md` for each release. During preparation, mark
+the planned version as unreleased, for example `## v0.28.0 (unreleased)`.
+Describe final capabilities and fixes in terms of user workflows. Consolidate
+related implementation commits into a small number of entries, and link to
+the relevant guides and runnable examples. Put compatibility changes and
+migration instructions in `docs/upgrading.rst`, with a concise summary in the
+release entry. Preserve earlier release sections and the full Git history.
+
+Preview the version selected from Conventional Commits before integrating a
+release into `main`:
+
+```sh
+cz -nr NO_INCREMENT bump --dry-run --major-version-zero
+```
+
+Confirm that the preview matches the prepared changelog section. Once the
+release is ready, replace `(unreleased)` with its release date before merging.
+Do not change package versions or create the version tag manually; the gated
+GitLab `release_bump` job performs those steps.
+
+`update_changelog_on_bump = false` keeps `cz bump` from rewriting the curated
+file. The CI bump commands omit `--changelog`. Running `cz changelog` or adding
+`--changelog` to `cz bump` regenerates commit-derived text and is outside this
+curated release workflow.
 
 ## GitLab validation scope
 
@@ -20,7 +48,7 @@ strict documentation job still installs Dendra and its pinned model package,
 executes every notebook, treats warnings and cell errors as failures, and gates
 Pages and the release job. Runtime, tests, scripts, examples, packaging,
 GitLab CI, and the internal `dendra-models` revision are treated as
-test-impacting and run both test lanes. New-branch, scheduled, tagged, and
+test-impacting and run all required test lanes. New-branch, scheduled, tagged, and
 project-level manual pipelines also run the full suite. The release job waits
 for every test lane selected for that pipeline. Set the `RUN_FULL_TESTS=1`
 CI/CD variable to override the changed-path filter for a branch pipeline.

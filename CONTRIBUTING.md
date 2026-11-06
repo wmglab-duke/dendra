@@ -83,8 +83,8 @@ pre-commit run --all-files
 ```
 
 Use a [Conventional Commit](https://www.conventionalcommits.org/) message in
-the form `type(optional-scope): summary` so the automated release process can
-classify the change. For example:
+the form `type(optional-scope): summary` so continuous integration can select
+the next version. For example:
 
 ```text
 fix(analysis): retain events inside the requested window
@@ -93,8 +93,10 @@ docs: clarify CPU solver installation
 ```
 
 `cz commit` can guide you through this format. Do not edit the package version
-or changelog manually; continuous integration handles both after changes reach
-`main`.
+manually; continuous integration updates it and creates the version tag after
+changes reach `main`. Maintainers curate `CHANGELOG.md`: summarize related
+changes as user-facing capabilities, fixes and upgrade notes rather than
+listing every implementation commit. See [release preparation](RELEASING.md#curate-release-notes).
 
 ## Write user documentation
 
