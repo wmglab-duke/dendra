@@ -9,7 +9,7 @@ SPECS = ("torch==2.14.0", "torch==2.15.0", "torch>=2.15,<3")
 
 def test_compiler_selection_is_shared_and_preserves_the_serial_alias_check():
     selections = (ROOT / SELECTION).read_text().splitlines()
-    assert len(selections) == len(set(selections)) == 29
+    assert len(selections) == len(set(selections)) == 32
     assert all(
         value.startswith("tests/func/") and ".py" in value for value in selections
     )
@@ -17,6 +17,11 @@ def test_compiler_selection_is_shared_and_preserves_the_serial_alias_check():
         "tests/func/test_convenience_runner.py::"
         "test_top_level_compile_is_the_exported_functional_compile_alias"
     )
+    assert {
+        "tests/func/test_stimulation_clock.py",
+        "tests/func/test_network_stimulation_clock.py",
+        "tests/func/test_primary_range_sources.py",
+    } <= set(selections)
     for name in (".gitlab-ci.yml", ".github/workflows/publish.yml"):
         text = (ROOT / name).read_text()
         assert "@" + SELECTION in text

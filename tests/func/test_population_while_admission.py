@@ -57,6 +57,7 @@ def _arguments(case, ve=None, intra=None, *, noise=None, stimulation=None, draws
         noise,
         stimulation,
         draws,
+        None,
     )
 
 

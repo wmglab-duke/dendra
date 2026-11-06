@@ -37,7 +37,8 @@ def _case(endpoint, monkeypatch, *, mode="emitting", failures=()):
         if name in errors:
             raise errors[name]
 
-    def assemble(*args):
+    def assemble(*args, sampling_times=None):
+        assert sampling_times is None
         phase("assemble")
         return None, None
 

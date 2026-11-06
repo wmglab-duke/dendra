@@ -106,7 +106,14 @@ def _case(endpoint, monkeypatch, *, auxiliary="mapping", first_failure=None):
                 case.auxiliary, callbacks, carry, parts
             )
         population = SimpleNamespace(
-            _assemble_bound_inputs=lambda parameters, state, ve, intra, steps, dt: (
+            _assemble_bound_inputs=lambda parameters,
+            state,
+            ve,
+            intra,
+            steps,
+            dt,
+            *,
+            sampling_times=None: (
                 ve,
                 intra,
             ),

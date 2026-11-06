@@ -1,4 +1,4 @@
-"""Call-local extracellular drives share the host runner's accepted clocks."""
+"""Call-local extracellular drives retain native grids across host chunks."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ SPAN = 3
 pytestmark = pytest.mark.cpu
 
 
-def _case():
+def _model():
     with dn.ctx(JIT=0, REQUIRE_GRAD=1, DTYPE=torch.float32):
         model = dn.Unmyelinated(
             [2.0],
@@ -26,11 +26,17 @@ def _case():
             integrator=dn.bwd_euler_ub(method="pcr", imem=False),
         )
         model.insert(pas, g=1.0e-4, e=-65.0)
-        # Only the repeatedly added float32 clock reaches this final-step pulse.
-        waveform = dn.mono_rect(amp=1.0, delay=1000.070068359375, pw=0.001)
         model.initialize()
         model.t.fill_(1000.0)
         model.train()
+    return model
+
+
+def _case():
+    model = _model()
+    with dn.ctx(REQUIRE_GRAD=1, DTYPE=torch.float32):
+        # Only the repeatedly added float32 clock reaches this final-step pulse.
+        waveform = dn.mono_rect(amp=1.0, delay=1000.070068359375, pw=0.001)
     field = torch.linspace(-1.0, 1.0, model.v.numel()).reshape(model.shape)
     field.requires_grad_()
     functional, tensors = dn.func.make_functional(model, dt=DT)
@@ -42,18 +48,27 @@ def _case():
 
 
 @pytest.mark.parametrize("checkpointed", (False, True))
-def test_runtime_extra_uses_accepted_clocks_and_bounded_checkpoint_assembly(
+def test_runtime_extra_matches_native_grid_and_bounded_checkpoint_assembly(
     checkpointed, monkeypatch
 ):
     bound, state, extra, targets = _case()
     field, waveform = extra
-    expected = state
+    stepped = state
     for _ in range(STEPS):
-        ve = field * waveform(expected["clock"]["t"])
-        expected, _ = bound(expected, dn.func.StepInput(ve=ve))
-    expected_v = expected["integrator"]["v"]
+        ve = field * waveform(stepped["clock"]["t"])
+        stepped, _ = bound(stepped, dn.func.StepInput(ve=ve))
+    stepped_v = stepped["integrator"]["v"]
+    stepped_gradients = torch.autograd.grad(stepped_v.square().mean(), targets)
+    assert all(gradient.abs().max().item() > 0 for gradient in stepped_gradients)
+
+    # Native whole-run sampling excludes this unchanged edge, while explicit
+    # accepted-step evaluation above includes it and retains nonzero gradients.
+    native = _model()
+    native.run(steps=STEPS, dt=DT, extra=extra)
+    expected_v = native.v
     expected_gradients = torch.autograd.grad(expected_v.square().mean(), targets)
-    assert all(gradient.abs().max().item() > 0 for gradient in expected_gradients)
+    assert not torch.equal(expected_v, stepped_v)
+    assert all(torch.count_nonzero(gradient) == 0 for gradient in expected_gradients)
 
     assembled = []
     assemble = _runners._assemble_extra_chunk
@@ -70,7 +85,7 @@ def test_runtime_extra_uses_accepted_clocks_and_bounded_checkpoint_assembly(
     actual_gradients = torch.autograd.grad(actual_v.square().mean(), targets)
 
     torch.testing.assert_close(actual_v, expected_v, rtol=0, atol=0)
-    torch.testing.assert_close(actual["clock"]["t"], expected["clock"]["t"])
+    torch.testing.assert_close(actual["clock"]["t"], native.t)
     for actual_gradient, expected_gradient in zip(
         actual_gradients, expected_gradients, strict=True
     ):

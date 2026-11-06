@@ -14,6 +14,7 @@ from dendra._bootstrap import torch_compiler_warning_context
 from tests.func.test_runner_stimulation_clock import DT as PULSE_DT
 from tests.func.test_runner_stimulation_clock import STEPS as PULSE_STEPS
 from tests.func.test_runner_stimulation_clock import _case as _pulse_case
+from tests.func.test_runner_stimulation_clock import _source_case as _native_pulse_case
 from tests.func.test_runtime_extra import DT, _close
 from tests.func.test_runtime_extra import _model as _passive
 
@@ -167,9 +168,12 @@ def test_stepwise_bound_waveforms_skip_legacy_capture_and_keep_accepted_clock(
     captures = _observe_structured_captures(monkeypatch, functional)
     kernel = functional.compile_rollout_chunk(PULSE_STEPS, backend="aot_eager")
     with torch.no_grad():
-        expected = tensors.state
+        stepped = tensors.state
         for _ in range(PULSE_STEPS):
-            expected, _ = functional.step(parameters, prepared, expected)
+            stepped, _ = functional.step(parameters, prepared, stepped)
+        native, extra, _waveform = _native_pulse_case(stimulus_kind)
+        native.run(steps=PULSE_STEPS, dt=PULSE_DT, extra=extra)
+        expected = functional.extract(native).state
         actual, _ = dn.func.run(
             functional,
             partial(kernel, parameters, prepared),
@@ -177,6 +181,7 @@ def test_stepwise_bound_waveforms_skip_legacy_capture_and_keep_accepted_clock(
             tstop=PULSE_STEPS * PULSE_DT,
         )
     torch.testing.assert_close(actual, expected)
+    assert not torch.equal(actual["integrator"]["v"], stepped["integrator"]["v"])
     report = kernel.execution_report()
     assert report.strategy == "compiled_unrolled"
     assert report.reason == "Bound waveforms are sampled at each accepted timestep."

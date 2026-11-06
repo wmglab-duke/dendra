@@ -158,6 +158,8 @@ def _case(monkeypatch, *, callbacks, steps=5, extra="tensor", failure=None):
         dt=_DT,
         device=torch.device("cpu"),
         dtype=torch.float64,
+        intra=SimpleNamespace(enabled=False),
+        extra=SimpleNamespace(enabled=False),
         _noise_plan=SimpleNamespace(runtime=(object(),)),
         _poisson_plan=object(),
         _sample_missing_runtime_draws=autodraw,

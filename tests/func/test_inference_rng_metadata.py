@@ -374,9 +374,10 @@ def test_compiled_tail_keeps_authored_packet_and_arithmetic_draw_identity(
             _close(actual, _reference(case, packet))
         operands = seen[0]
         assert operands[0] is tensors.parameters and operands[1] is prepared.values
-        assert operands[-1] is packet
-        assert operands[-1].draws is packet.draws
-        assert operands[-1].rng is packet.rng
+        assert operands[-1] is None
+        assert operands[-2] is packet
+        assert operands[-2].draws is packet.draws
+        assert operands[-2].rng is packet.rng
 
 
 def test_custom_callback_observes_native_published_rng_metadata(monkeypatch):
@@ -443,7 +444,8 @@ def test_custom_callback_observes_native_published_rng_metadata(monkeypatch):
     observed = []
 
     def eager(*operands):
-        observed.append(operands[-1])
+        assert operands[-1] is None
+        observed.append(operands[-2])
         return selected._lowered(*operands)
 
     monkeypatch.setattr(selected, "_compiled", eager)

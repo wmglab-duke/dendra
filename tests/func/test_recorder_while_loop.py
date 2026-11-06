@@ -76,6 +76,7 @@ def _case(*, stimulus_kind=None, narrow_pulse=False):
         tensors=tensors,
         parameters=parameters,
         prepared=prepared,
+        extra=extra,
     )
 
 
@@ -257,12 +258,23 @@ def test_recorder_resume_does_not_duplicate_initial_or_chunk_boundary_samples(ca
 
 
 @pytest.mark.parametrize("stimulus_kind", ["intra", "extra"])
-def test_bound_pulse_uses_recurrent_accepted_clock_inside_recorded_while(stimulus_kind):
+def test_bound_pulse_matches_native_invocation_grid_inside_recorded_while(
+    stimulus_kind,
+):
     case = _case(stimulus_kind=stimulus_kind, narrow_pulse=True)
     callbacks = case.functional.make_callbacks({"trace": dn.func.Recorder(["v", "t"])})
     graphs = []
     kernel = case.functional.compile_rollout_chunk(8, backend=_backend(graphs))
     with torch.no_grad():
+        native = _case(stimulus_kind=stimulus_kind, narrow_pulse=True)
+        recorder = dn.Recorder(("v", "t"))
+        native.model.run(steps=8, dt=DT, extra=native.extra, callbacks=[recorder])
+        native_trace = {
+            name: torch.from_numpy(recorder.numpy(name)).clone() for name in ("v", "t")
+        }
+        stepped = _case(stimulus_kind=stimulus_kind, narrow_pulse=True)
+        for _ in range(8):
+            stepped.model.step(dt=DT, extra=stepped.extra)
         expected = _run(case, callbacks, 8)
         actual = _run(case, callbacks, 8, kernel=kernel)
         amplitude_name = next(
@@ -284,7 +296,12 @@ def test_bound_pulse_uses_recurrent_accepted_clock_inside_recorded_while(stimulu
     reference = expected[1]["callbacks"]["trace"]
     torch.testing.assert_close(trace["t"], reference["t"], rtol=0.0, atol=0.0)
     torch.testing.assert_close(trace["v"], reference["v"])
-    assert not torch.equal(reference["v"][-1], absent[1]["callbacks"]["trace"]["v"][-1])
+    torch.testing.assert_close(trace["t"], native_trace["t"], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(trace["v"], native_trace["v"])
+    torch.testing.assert_close(
+        reference["v"][-1], absent[1]["callbacks"]["trace"]["v"][-1]
+    )
+    assert not torch.equal(stepped.model.v, absent[1]["callbacks"]["trace"]["v"][-1])
     _close(dict(compiled_absent[1]["callbacks"]), dict(absent[1]["callbacks"]))
     assert graphs and all(_has_while(graph) for graph in graphs)
     assert kernel.execution_report().strategy == "compiled_while_loop"
