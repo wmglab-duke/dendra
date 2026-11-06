@@ -406,7 +406,15 @@ def test_low_precision_device_calendar_avoids_double_rounding_and_restores_origi
 ):
     from dendra.func import make_functional_netstim
 
-    direct = torch.tensor(event, dtype=dtype)
+    if dtype == torch.float16:
+        import struct
+
+        def half(value):
+            return struct.unpack("<e", struct.pack("<e", value))[0]
+
+        direct = torch.tensor(half(event), dtype=dtype)
+    else:
+        direct = torch.tensor(event, dtype=dtype)
     if dtype == torch.float16:
         assert direct > torch.tensor(event, dtype=torch.float32).to(dtype)
     assert direct > 1.0
@@ -414,6 +422,24 @@ def test_low_precision_device_calendar_avoids_double_rounding_and_restores_origi
     source.schedule(0, event)
     with monkeypatch.context() as context:
         _use_simulation_dtype_runtime(context)
+        if dtype == torch.float16:
+            # SSE-only CPUs construct half scalars through float32. Emulate
+            # MPS's direct construction as well as its calendar dtype policy.
+            class MPSConstruction:
+                def __getattr__(self, name):
+                    return getattr(torch, name)
+
+                def tensor(self, values, *args, **kwargs):
+                    if kwargs.get("dtype") == torch.float16:
+                        if isinstance(values, float):
+                            values = half(values)
+                        elif isinstance(values, (list, tuple)) and all(
+                            isinstance(value, float) for value in values
+                        ):
+                            values = [half(value) for value in values]
+                    return torch.tensor(values, *args, **kwargs)
+
+            context.setattr(calendar_module, "torch", MPSConstruction())
         source.to(dtype=dtype)
         assert source.heap_times.dtype == dtype
         assert source.next_sched_time.item() == direct.item()
