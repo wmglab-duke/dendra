@@ -132,7 +132,7 @@ trusts the authored purity contract; required structural/schema checks remain.
   `prepare_materials`, and return full-field replacements from
   `material_updates`. These are separate from Mechanism `advance` and carry
   phases. The complete {download}`functional_material_processes.py
-  <../../examples/functional_material_processes.py>` example implements a
+  <../../examples/models/functional_material_processes.py>` example implements a
   conservative exchange process.
 
 Lookup tables, parameterized initializers, registered PyTorch parametrizations,
@@ -173,7 +173,7 @@ the pure plan preparation/transition methods with explicit tensors and draws.
 Supported transform combinations depend on the model and tensor operations;
 compiled first-order scan and inference-only while have their own execution
 contracts. The complete {download}`functional_api_overview.py
-<../../examples/functional_api_overview.py>` example includes an eager
+<../../examples/getting_started/functional_api_overview.py>` example includes an eager
 `torch.func.grad`/`vmap` comparison.
 
 ## Supported model boundaries
@@ -204,10 +204,10 @@ different simulation lifecycle:
 
 | Modeling task | Runnable example |
 | --- | --- |
-| Train SDE drift or diffusion along a sampled path | {download}`functional_state_sde.py <../../examples/functional_state_sde.py>` |
-| Learn a tabulated nonlinear response | {download}`functional_tables.py <../../examples/functional_tables.py>` |
-| Retain single-stream or multistream mechanism delays | {download}`functional_mechanism_delays.py <../../examples/functional_mechanism_delays.py>` |
-| Give a mechanism its own waveform injection | {download}`functional_mechanism_injections.py <../../examples/functional_mechanism_injections.py>` |
-| Train constrained Ion or Material initial values | {download}`functional_initialization_sources.py <../../examples/functional_initialization_sources.py>` |
-| Constrain parameters with PyTorch parametrizations | {download}`functional_torch_parametrizations.py <../../examples/functional_torch_parametrizations.py>` |
-| Define an explicit-draw connection distribution | {download}`functional_distribution_sampling.py <../../examples/functional_distribution_sampling.py>` |
+| Train SDE drift or diffusion along a sampled path | {download}`functional_state_sde.py <../../examples/stochastic/functional_state_sde.py>` |
+| Learn a tabulated nonlinear response | {download}`functional_tables.py <../../examples/models/functional_tables.py>` |
+| Retain single-stream or multistream mechanism delays | {download}`functional_mechanism_delays.py <../../examples/models/functional_mechanism_delays.py>` |
+| Give a mechanism its own waveform injection | {download}`functional_mechanism_injections.py <../../examples/models/functional_mechanism_injections.py>` |
+| Train constrained Ion or Material initial values | {download}`functional_initialization_sources.py <../../examples/initialization/functional_initialization_sources.py>` |
+| Constrain parameters with PyTorch parametrizations | {download}`functional_torch_parametrizations.py <../../examples/models/functional_torch_parametrizations.py>` |
+| Define an explicit-draw connection distribution | {download}`functional_distribution_sampling.py <../../examples/stochastic/functional_distribution_sampling.py>` |

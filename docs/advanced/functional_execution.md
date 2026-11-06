@@ -156,7 +156,7 @@ any configured partitions. Configure compiled callback partitions before
 binding; `set_partition` validates that they match the search partitions.
 
 The complete
-{download}`functional_thresholding.py <../../examples/functional_thresholding.py>`
+{download}`functional_thresholding.py <../../examples/training/functional_thresholding.py>`
 example compares native and compiled threshold brackets on short passive cables,
 including the peak-voltage diagnostic. It supports scan and while inference.
 Compiled Network threshold searches are currently unsupported.
@@ -228,7 +228,7 @@ Bind shared Tensor leaves with `bind_time_source(times)` and
 `bind_weight_source(amplitudes)`, then schedule using `time_idx=` and
 `weight_idx=`. The live indexed form is useful across repeated optimizer
 segments because each execution reads the current leaves. See the complete
-{download}`shared_schedule_bindings.py <../../examples/shared_schedule_bindings.py>`
+{download}`shared_schedule_bindings.py <../../examples/inputs/shared_schedule_bindings.py>`
 example for native and functional training. Continuous transforms can contain
 trainable parameters, so an optimizer can fit a release curve or another
 conversion of the presynaptic signal.
@@ -302,7 +302,7 @@ native receiver with `commit_continuation_`, then compile that receiver with the
 larger capacity. Calendar shapes belong to the plan; a small-plan packet is not
 directly interchangeable with a larger-plan packet. Do not continue from a
 partial result. The complete
-{download}`functional_pending_calendar.py <../../examples/functional_pending_calendar.py>`
+{download}`functional_pending_calendar.py <../../examples/networks/functional_pending_calendar.py>`
 example demonstrates this recovery. Delivery and parameter-lookup timing follow
 the Network's selected connection policy.
 
@@ -315,6 +315,6 @@ the Network's selected connection policy.
 - {doc}`custom_models`: model hooks, supported components and explicit lowering.
 
 The complete
-{download}`functional_api_overview.py <../../examples/functional_api_overview.py>`
+{download}`functional_api_overview.py <../../examples/getting_started/functional_api_overview.py>`
 example combines Population inference, connected-Network training, explicit
 bindings, stochastic replay and runtime extracellular stimulation.

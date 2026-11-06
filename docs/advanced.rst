@@ -7,6 +7,10 @@ Start with a workflow, then use the API reference for detailed signatures and
 contracts. Define an ordinary Population or Network once and choose how to
 execute it.
 
+The `examples directory <https://github.com/wmglab-duke/dendra/tree/main/examples>`_
+groups runnable scripts by task, with a guide in each folder. Start with
+``examples/getting_started`` for small Population and Network workflows.
+
 Simulation, training and observations
 -------------------------------------
 

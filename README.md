@@ -19,6 +19,8 @@ The complete documentation is published at
 with the [installation guide](https://wmglab-duke.github.io/dendra/installation.html),
 then see the tutorials and the
 [unit conventions](https://wmglab-duke.github.io/dendra/units.html).
+The [examples](examples/README.md) provide runnable scripts grouped by task,
+from simulation and recording to training and custom model components.
 
 ## Installation
 

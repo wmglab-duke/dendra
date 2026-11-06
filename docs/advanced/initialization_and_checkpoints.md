@@ -39,7 +39,7 @@ model and callback state while retaining the effective source ownership and
 incoming RNG position. This is useful for independently differentiated trials
 without resetting every stochastic stream to the runner's original snapshot.
 
-```{literalinclude} ../../examples/functional_packet_initialization.py
+```{literalinclude} ../../examples/initialization/functional_packet_initialization.py
 :language: python
 :start-after: "# region training"
 :end-before: "# endregion training"
@@ -47,7 +47,7 @@ without resetting every stochastic stream to the runner's original snapshot.
 ```
 
 The complete
-{download}`functional_packet_initialization.py <../../examples/functional_packet_initialization.py>`
+{download}`functional_packet_initialization.py <../../examples/initialization/functional_packet_initialization.py>`
 example defines both Population and Network models, shares optimizer leaves and
 checks that each trial records from its initialized boundary.
 
@@ -65,11 +65,11 @@ than initialized simulation state. Capturing and replaying are separate
 initialization executions; use the same sources and deterministic recipe.
 
 The complete
-{download}`functional_initialization_draws.py <../../examples/functional_initialization_draws.py>`
+{download}`functional_initialization_draws.py <../../examples/stochastic/functional_initialization_draws.py>`
 example defines a randomized leak and compiles a `program`, then captures and
 replays its initialization draws:
 
-```{literalinclude} ../../examples/functional_initialization_draws.py
+```{literalinclude} ../../examples/stochastic/functional_initialization_draws.py
 :language: python
 :start-after: "# region draws"
 :end-before: "# endregion draws"
@@ -81,7 +81,7 @@ The same sampler accepts an initialized native model. Replay its packet with
 `network.initialize(dt, draws=packet)` for a Network. Native capture does not
 lower the model; explicit native replay does not support forced rebuilds. See the
 complete
-{download}`shared_initialization_draws.py <../../examples/shared_initialization_draws.py>`
+{download}`shared_initialization_draws.py <../../examples/stochastic/shared_initialization_draws.py>`
 example for cross-interface replay.
 
 For another trial from current functional RNG carry, pass its continuation to
@@ -116,7 +116,7 @@ Cache presence and structure are fixed by the lowered plan. To switch between
 cached and uncached initialization, clear the native cache and lower a new plan;
 compatible cache data can be replaced through the initialization recipe.
 The complete
-{download}`functional_network_cache_initialization.py <../../examples/functional_network_cache_initialization.py>`
+{download}`functional_network_cache_initialization.py <../../examples/initialization/functional_network_cache_initialization.py>`
 example demonstrates Network and Population caches, current connection parameters
 and recording continuation.
 
@@ -172,7 +172,7 @@ refresh those bindings. Custom callbacks provide a checkpoint configuration hook
 
 For an in-memory differentiable continuation, pass the original packet directly
 to `run`; portable export deliberately cuts the prefix graph. The complete
-{download}`functional_continuation_checkpoints.py <../../examples/functional_continuation_checkpoints.py>`
+{download}`functional_continuation_checkpoints.py <../../examples/continuation/functional_continuation_checkpoints.py>`
 example checks aliases, restored trainability and suffix optimization.
 
 ## Move between native and functional execution
@@ -192,10 +192,10 @@ Transfer callback carry through compatible prepared collections when continuing
 their analysis or recording phase.
 
 The complete
-{download}`functional_native_handoff.py <../../examples/functional_native_handoff.py>`
+{download}`functional_native_handoff.py <../../examples/continuation/functional_native_handoff.py>`
 example demonstrates value transfer, preserved receiver ownership and suffix
 gradients. The
-{download}`shared_api_conformance.py <../../examples/shared_api_conformance.py>`
+{download}`shared_api_conformance.py <../../examples/continuation/shared_api_conformance.py>`
 example joins native, compiled, saved and native execution with continued
 recording. For signatures and compatibility checks, see the
 {doc}`functional API reference <../api/dendra.func>`.

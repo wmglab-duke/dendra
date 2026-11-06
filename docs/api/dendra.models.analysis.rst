@@ -62,7 +62,7 @@ replay supplies a validated local direction. The composition helpers preserve
 the hard threshold values on the forward pass and propagate their directions
 through activation probability, a strength-duration fit, or a paired-pulse
 ratio. The :download:`complete threshold and chronaxie example
-<../../examples/threshold_descriptor_gradients.py>` shows the required hard
+<../../examples/training/threshold_descriptor_gradients.py>` shows the required hard
 search, amplitude JVP, replay ordering, parameter gradients, and independent
 hard finite-difference checks.
 

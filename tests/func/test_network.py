@@ -461,7 +461,7 @@ def test_netstim_surrogate_gradients_reach_connected_population(compiled):
 def test_multiple_population_source_bindings_use_explicit_state_and_keep_gradients(
     compiled,
 ):
-    from examples.functional_continuous_connectivity import make_network
+    from examples.networks.functional_continuous_connectivity import make_network
 
     model, native = make_network(), make_network()
     functional, tensors = dn.func.make_functional_network(model)

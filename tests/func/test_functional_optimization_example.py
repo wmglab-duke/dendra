@@ -7,7 +7,12 @@ import torch
 
 from dendra._bootstrap import torch_compiler_warning_context
 
-EXAMPLE = Path(__file__).parents[2] / "examples" / "functional_gradient_descent.py"
+EXAMPLE = (
+    Path(__file__).parents[2]
+    / "examples"
+    / "training"
+    / "functional_gradient_descent.py"
+)
 
 
 def _load_example_module():

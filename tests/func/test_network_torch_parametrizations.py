@@ -10,7 +10,7 @@ import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.mod import graded_syn, hh
 from dendra.units import nA
-from examples.scaled_waveform_frequency import FrequencyFromCycles
+from examples.training.scaled_waveform_frequency import FrequencyFromCycles
 from tests.func.test_extcell_multi_population import _seed_circuit
 from tests.func.test_mechanism_injection_plan import _population as _injected_population
 from tests.func.test_membrane_current import _inputs as _membrane_inputs

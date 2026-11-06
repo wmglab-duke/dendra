@@ -65,7 +65,7 @@ between Populations or components.
 Report paths include their source domain, such as `parameters.`. Use
 `report.select(...)` to make optimizer groups:
 
-```{literalinclude} ../../examples/functional_source_selection.py
+```{literalinclude} ../../examples/training/functional_source_selection.py
 :language: python
 :start-after: "# region selection"
 :end-before: "# endregion selection"
@@ -73,7 +73,7 @@ Report paths include their source domain, such as `parameters.`. Use
 ```
 
 This excerpt comes from the complete
-{download}`functional_source_selection.py <../../examples/functional_source_selection.py>`
+{download}`functional_source_selection.py <../../examples/training/functional_source_selection.py>`
 example, which defines the model and selectors and demonstrates both optimizer
 groups and separate optimizers. Selection preserves full alias groups and report
 order. Ensure groups assigned to different optimizers are identity-disjoint when
@@ -128,7 +128,7 @@ backward pass.
 
 For independent trials that also reset the model state, follow detachment with
 `dn.func.initialize(program, detached)`; the
-{download}`functional_packet_initialization.py <../../examples/functional_packet_initialization.py>`
+{download}`functional_packet_initialization.py <../../examples/initialization/functional_packet_initialization.py>`
 example demonstrates repeated optimizer updates with continued RNG and fresh
 recording.
 
@@ -137,7 +137,7 @@ Native segmented training also has two histories to detach: use `model.detach()`
 `callbacks.detach_state(results.state)` for a prepared callback collection.
 Resume with the detached callback state through `callback_state=`. Callback-only
 detachment leaves model and connection histories intact. See the complete
-{download}`shared_network_detach.py <../../examples/shared_network_detach.py>`
+{download}`shared_network_detach.py <../../examples/training/shared_network_detach.py>`
 example.
 
 ## Train connections and stimulation
@@ -170,12 +170,12 @@ and initial state explicit, and put preparation inside the transformed function.
 Host runners and automatic sampling do not execute inside those transforms.
 
 The complete
-{download}`functional_api_overview.py <../../examples/functional_api_overview.py>`
+{download}`functional_api_overview.py <../../examples/getting_started/functional_api_overview.py>`
 example includes a pure eager objective whose current multiplier is differentiated
 and batched, with results checked against ordinary autograd and separate runs:
 
 ```console
-python examples/functional_api_overview.py --section transforms
+python examples/getting_started/functional_api_overview.py --section transforms
 ```
 
 Eager pure functions and compiled loops have different transform support.

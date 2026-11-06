@@ -96,7 +96,7 @@ of a concatenated model. After `network.concat()`, a Recorder can select a
 named child region with
 `dn.Recorder(("all_populations.v",), region=network.all_populations.exc.soma)`
 when the model defines an `exc` component with a `soma` region. The complete
-{download}`functional_network_regions.py <../../examples/functional_network_regions.py>`
+{download}`functional_network_regions.py <../../examples/callbacks/functional_network_regions.py>`
 example defines and records these concatenated regions.
 
 ## Use the same observations in native execution
@@ -148,7 +148,7 @@ LFP requires membrane-current output, for example an integrator constructed
 with `imem=True`. Supply one unit-current field per recording contact. In a
 Network, wrap LFP with `PopulationCallback` to choose its source Population.
 The complete {download}`functional_lfp_configuration.py
-<../../examples/functional_lfp_configuration.py>` example shows contact and
+<../../examples/callbacks/functional_lfp_configuration.py>` example shows contact and
 batch dimensions, field gradients and continued recordings.
 
 ## Stream long recordings to HDF5
@@ -180,7 +180,7 @@ by host execution rather than returned as an in-memory trajectory. Their
 callback carry still supports continuation. Native pure collections use the
 same storage configuration. Stored samples are detached: use in-memory
 observations for gradient-based losses. See the complete
-{download}`native_callback_storage.py <../../examples/native_callback_storage.py>`
+{download}`native_callback_storage.py <../../examples/callbacks/native_callback_storage.py>`
 example for readback and checkpointed execution.
 
 ## Write a pure callback

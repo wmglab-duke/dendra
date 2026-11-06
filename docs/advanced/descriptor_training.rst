@@ -137,7 +137,7 @@ Example: make an HH neuron fire faster
 --------------------------------------
 
 The :download:`complete example
-<../../examples/macroscopic_descriptor_training.py>` trains Dendra's built-in
+<../../examples/training/macroscopic_descriptor_training.py>` trains Dendra's built-in
 single-compartment HH model under a fixed current. It changes two log
 coordinates that jointly scale the forward and backward rates of sodium
 activation and inactivation. Scaling both rates preserves each gate's
@@ -161,13 +161,13 @@ Run it from the repository root:
 
 .. code-block:: console
 
-   python examples/macroscopic_descriptor_training.py
+   python examples/training/macroscopic_descriptor_training.py
 
 To try one update with a shorter observation window:
 
 .. code-block:: console
 
-   python examples/macroscopic_descriptor_training.py \
+   python examples/training/macroscopic_descriptor_training.py \
        --updates 1 --tstop-ms 60 --objective-start-ms 20 \
        --skip-holdout --no-jit
 
@@ -246,7 +246,7 @@ training instead:
   direction for moving that boundary.
 
 The :download:`complete threshold and chronaxie example
-<../../examples/threshold_descriptor_gradients.py>` implements both parts for
+<../../examples/training/threshold_descriptor_gradients.py>` implements both parts for
 Dendra's built-in myelinated HH model. It differentiates every threshold and
 the fitted chronaxie with respect to the logarithm of sodium conductance, then
 checks those derivatives with fresh complete hard searches at perturbed
@@ -254,7 +254,7 @@ conductances. Run it from the repository root:
 
 .. code-block:: console
 
-   python examples/threshold_descriptor_gradients.py
+   python examples/training/threshold_descriptor_gradients.py
 
 The model contains one independent population lane per pulse width. All lanes
 share the scalar sodium conductance. Batching the widths matters because one

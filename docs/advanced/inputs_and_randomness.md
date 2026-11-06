@@ -94,7 +94,7 @@ net_state, net_auxiliary = dn.func.run(
 ```
 
 The complete {download}`shared_step_resolution.py
-<../../examples/shared_step_resolution.py>` example also checks native
+<../../examples/inputs/shared_step_resolution.py>` example also checks native
 execution, gradients and checkpoint continuation with these input lengths.
 
 ## Extracellular fields and call-time contacts
@@ -134,7 +134,7 @@ gradients in training execution; see {doc}`training_and_parameters`.
 Runtime slots currently support deterministic waveform recipes. Registered
 or compile-time-bound Poisson waveforms use their explicit random-state
 support. The complete {download}`functional_runtime_extra.py
-<../../examples/functional_runtime_extra.py>` example covers changing contact
+<../../examples/inputs/functional_runtime_extra.py>` example covers changing contact
 counts, gradients and continuation.
 
 ## Choose the stochastic model you mean
@@ -192,5 +192,5 @@ horizon produces a time-leading tape. Initialization uses the separate
 
 See the {doc}`functional API reference <../api/dendra.func>` and the complete
 {download}`shared_runtime_draw_horizons.py
-<../../examples/shared_runtime_draw_horizons.py>` example for replay across
+<../../examples/stochastic/shared_runtime_draw_horizons.py>` example for replay across
 native, compiled and saved execution.

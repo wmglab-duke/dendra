@@ -20,8 +20,8 @@ This tutorial implements both kinds of connected synapse from scratch. The
 examples use CPU float64 and disable compilation so the first run is quick.
 They run with the installed Dendra package and require no companion models or
 NEURON simulation. Download the complete scripts:
-{download}`custom_event_synapse.py <../examples/custom_event_synapse.py>` and
-{download}`custom_continuous_synapse.py <../examples/custom_continuous_synapse.py>`.
+{download}`custom_event_synapse.py <../examples/models/custom_event_synapse.py>` and
+{download}`custom_continuous_synapse.py <../examples/models/custom_continuous_synapse.py>`.
 Run them with `python custom_event_synapse.py` and
 `python custom_continuous_synapse.py`. The documentation executes these same
 files and checks their numerical results.
@@ -95,13 +95,13 @@ in nA. Thus `weight=0.05` means 0.05 µS; do not multiply that weight by
 
 ### Declare the state and current
 
-```{literalinclude} ../examples/custom_event_synapse.py
+```{literalinclude} ../examples/models/custom_event_synapse.py
 :language: python
 :start-after: "# region imports"
 :end-before: "# endregion imports"
 ```
 
-```{literalinclude} ../examples/custom_event_synapse.py
+```{literalinclude} ../examples/models/custom_event_synapse.py
 :language: python
 :start-after: "# region custom-synapse"
 :end-before: "# endregion custom-synapse"
@@ -122,7 +122,7 @@ returned updates during ordinary Network execution.
 
 ### Insert it and deliver a Network event
 
-```{literalinclude} ../examples/custom_event_synapse.py
+```{literalinclude} ../examples/models/custom_event_synapse.py
 :language: python
 :start-after: "# region population"
 :end-before: "# endregion population"
@@ -133,7 +133,7 @@ uses µS. Each mechanism keeps its own unit contract. The helper initializes
 the population for standalone use; `Network.initialize` subsequently
 establishes the complete network starting state.
 
-```{literalinclude} ../examples/custom_event_synapse.py
+```{literalinclude} ../examples/models/custom_event_synapse.py
 :language: python
 :start-after: "# region network"
 :end-before: "# endregion network"
@@ -149,7 +149,7 @@ is backward Euler.
 
 ### Use the same receiver with explicit functional state
 
-```{literalinclude} ../examples/custom_event_synapse.py
+```{literalinclude} ../examples/models/custom_event_synapse.py
 :language: python
 :start-after: "# region functional"
 :end-before: "# endregion functional"
@@ -180,7 +180,7 @@ natively or with `dn.compile(network)`. See
 The complete event example runs here:
 
 ```{code-cell} python
-:load: ../examples/custom_event_synapse.py
+:load: ../examples/models/custom_event_synapse.py
 :tags: [remove-input]
 ```
 
@@ -220,13 +220,13 @@ weights in µS and current in nA.
 
 ### Declare a source gate and a receiving current
 
-```{literalinclude} ../examples/custom_continuous_synapse.py
+```{literalinclude} ../examples/models/custom_continuous_synapse.py
 :language: python
 :start-after: "# region imports"
 :end-before: "# endregion imports"
 ```
 
-```{literalinclude} ../examples/custom_continuous_synapse.py
+```{literalinclude} ../examples/models/custom_continuous_synapse.py
 :language: python
 :start-after: "# region declarations"
 :end-before: "# endregion declarations"
@@ -257,7 +257,7 @@ See {ref}`functional-execution` for the binding contract.
 
 ### Connect and verify the analog projection
 
-```{literalinclude} ../examples/custom_continuous_synapse.py
+```{literalinclude} ../examples/models/custom_continuous_synapse.py
 :language: python
 :start-after: "# region network"
 :end-before: "# endregion network"
@@ -270,7 +270,7 @@ dimensionless gate multiplied by this weight produces the conductance density
 expected by `g_pre`. The source voltage is held at its passive reversal, so
 the gate trajectory has a simple analytic reference.
 
-```{literalinclude} ../examples/custom_continuous_synapse.py
+```{literalinclude} ../examples/models/custom_continuous_synapse.py
 :language: python
 :start-after: "# region simulation"
 :end-before: "# endregion simulation"
@@ -286,7 +286,7 @@ and the current's inward sign below reversal.
 The complete continuous example runs here:
 
 ```{code-cell} python
-:load: ../examples/custom_continuous_synapse.py
+:load: ../examples/models/custom_continuous_synapse.py
 :tags: [remove-input]
 ```
 
