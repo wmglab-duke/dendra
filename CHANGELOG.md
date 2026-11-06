@@ -1,3 +1,9 @@
+## v0.27.2 (2026-10-02)
+
+### Fix
+
+- **ci**: separate model pins and gate releases
+
 ## v0.27.1 (2026-10-01)
 
 ### Fix
