@@ -16,6 +16,7 @@ from ._heap_calendar import (
     heap_calendar_consume,
     heap_calendar_dtype,
     heap_calendar_head,
+    heap_calendar_matches_layout,
     pack_heap_calendar,
     validate_heap_calendar,
 )
@@ -1774,12 +1775,7 @@ class NetStim(DNModule, Sliceable):
                 raise ValueError(
                     "Checkpoint heap layout must satisfy min-heap ordering."
                 )
-            layout_times, layout_offsets, _, _ = pack_heap_calendar(
-                layout, device="cpu", dtype=times.dtype
-            )
-            if not torch.equal(layout_times, times) or not torch.equal(
-                layout_offsets, offsets
-            ):
+            if not heap_calendar_matches_layout(times, offsets, layout):
                 raise ValueError("Checkpoint heap layout does not match its calendar.")
             self.heap_times, self.heap_row_offsets, _, self.heap_depth = (
                 pack_heap_calendar(layout, device=device, simulation_dtype=dtype)

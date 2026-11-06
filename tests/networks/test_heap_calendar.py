@@ -466,6 +466,98 @@ def test_low_precision_device_calendar_avoids_double_rounding_and_restores_origi
         assert current.heap_cursor.item() == 0
 
 
+@pytest.mark.parametrize(
+    "half_events",
+    [(1 + 2**-10, 1 + 2**-10), (1.0, 1 + 2**-9)],
+    ids=("direct", "float32-staged"),
+)
+def test_half_checkpoint_accepts_both_complete_source_encodings(half_events):
+    events = [0.25, 1 + 2**-11 + 2**-30, 1 + 3 * 2**-11 - 2**-30, 1e40]
+    source = NetStim(start=100.0, noise=0.0, dtype=torch.float64).initialize()
+    source.schedule(0, events)
+    source(0.25)
+    checkpoint = source.state_dict_for_checkpoint()
+    # These exact half values encode the same original layout on backends
+    # that round directly and those that first round Python floats to float32.
+    checkpoint["heap_times"] = torch.tensor(
+        [0.25, *half_events, float("inf"), float("inf")], dtype=torch.float16
+    )
+
+    target = NetStim(start=100.0, noise=0.0, dtype=torch.float64).initialize()
+    target.restore_dict_from_checkpoint(checkpoint)
+    assert target.heap_times.tolist() == events + [float("inf")]
+    assert target.state_dict_for_checkpoint()["heap_layout"] == (tuple(events),)
+    torch.testing.assert_close(target.heap_cursor, checkpoint["heap_cursor"])
+    torch.testing.assert_close(target._rng.get_state(), checkpoint["rng_state"])
+    assert target.next_sched_time.item() == events[1]
+    assert not target(1.0).any()
+    assert target.heap_cursor.item() == 1
+    assert target(events[1]).all()
+    assert target.heap_cursor.item() == 2
+    assert target.next_sched_time.item() == events[2]
+
+
+@pytest.mark.parametrize(
+    "half_events",
+    [
+        (1 + 2**-10, 1 + 3 * 2**-10),
+        (1 + 2**-10, 1 + 2**-9),
+        (1.0, 1 + 2**-10),
+    ],
+    ids=("neighbor", "direct-then-staged", "staged-then-direct"),
+)
+def test_half_checkpoint_rejects_other_or_mixed_encodings_atomically(half_events):
+    events = [1 + 2**-11 + 2**-30, 1 + 3 * 2**-11 - 2**-30]
+    source = NetStim(start=100.0, noise=0.0, dtype=torch.float64).initialize()
+    source.schedule(0, events)
+    checkpoint = source.state_dict_for_checkpoint()
+    checkpoint["heap_times"] = torch.tensor(
+        [*half_events, float("inf")], dtype=torch.float16
+    )
+    target = NetStim(start=100.0, noise=0.0, dtype=torch.float64).initialize()
+    target.schedule(0, [0.125, 0.75])
+    target(0.125)
+    previous = target.state_dict_for_checkpoint()
+    previous_head = target.next_sched_time.clone()
+
+    with pytest.raises(ValueError, match="Checkpoint heap layout does not match"):
+        target.restore_dict_from_checkpoint(checkpoint)
+    restored = target.state_dict_for_checkpoint()
+    assert restored["heap_layout"] == previous["heap_layout"]
+    for name in ("heap_times", "heap_row_offsets", "heap_cursor", "rng_state"):
+        torch.testing.assert_close(restored[name], previous[name], rtol=0, atol=0)
+    torch.testing.assert_close(target.next_sched_time, previous_head, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("mismatch", ("encoding", "offsets"))
+def test_half_checkpoint_rejects_cross_row_mismatches(mismatch):
+    source = NetStim(N=2, start=100.0, noise=0.0, dtype=torch.float64).initialize()
+    source.schedule(0, 1 + 2**-11 + 2**-30)
+    source.schedule(1, 1 + 3 * 2**-11 - 2**-30)
+    checkpoint = source.state_dict_for_checkpoint()
+    checkpoint["heap_times"] = torch.tensor(
+        [1 + 2**-10, 1 + 2**-9, float("inf")], dtype=torch.float16
+    )
+    if mismatch == "offsets":
+        checkpoint["heap_times"][1] = 1 + 2**-10
+        checkpoint["heap_row_offsets"] = torch.tensor([0, 0, 2], dtype=torch.long)
+    target = NetStim(N=2, start=100.0, noise=0.0, dtype=torch.float64).initialize()
+    with pytest.raises(ValueError, match="Checkpoint heap layout does not match"):
+        target.restore_dict_from_checkpoint(checkpoint)
+
+
+def test_half_checkpoint_retains_nan_validation_error():
+    source = NetStim(start=100.0, noise=0.0, dtype=torch.float64).initialize()
+    source.schedule(0, 1.25)
+    checkpoint = source.state_dict_for_checkpoint()
+    checkpoint["heap_times"] = torch.tensor(
+        [float("nan"), float("inf")], dtype=torch.float16
+    )
+    target = NetStim(start=100.0, noise=0.0, dtype=torch.float64).initialize()
+    with pytest.raises(ValueError, match="NaN heap calendars require native heapq"):
+        target.restore_dict_from_checkpoint(checkpoint)
+
+
 @pytest.mark.parametrize("nan_heap", (False, True))
 def test_device_representation_move_keeps_legacy_head_override(monkeypatch, nan_heap):
     source = NetStim(start=100.0, noise=0.0, dtype=torch.float64).initialize()

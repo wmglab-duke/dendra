@@ -8,6 +8,7 @@ cold heap layouts; comparisons cast selected times to the simulation dtype.
 """
 
 import math
+import struct
 
 import torch
 
@@ -34,6 +35,43 @@ def pack_heap_calendar(heaps, *, device, dtype=None, simulation_dtype=torch.floa
     times = torch.tensor(values + [float("inf")], device=device, dtype=dtype)
     row_offsets = torch.tensor(offsets, device=device, dtype=torch.long)
     return times, row_offsets, row_offsets[:-1].clone(), longest.bit_length()
+
+
+def heap_calendar_matches_layout(times, row_offsets, layout):
+    """Match a saved representation independently of the receiving CPU's casts.
+
+    PyTorch half constructors use direct rounding on some backends and an
+    intermediate float32 on others. Accept either complete encoding, without
+    tolerances or mixing the two encodings between individual events.
+    """
+    layout_times, layout_offsets, _, _ = pack_heap_calendar(
+        layout, device="cpu", dtype=times.dtype
+    )
+    if torch.equal(layout_times, times):
+        return torch.equal(layout_offsets, row_offsets)
+    if times.dtype != torch.float16 or not torch.equal(layout_offsets, row_offsets):
+        return False
+
+    values = [value for row in layout for value in sorted(row)] + [float("inf")]
+
+    def rounded(value, precision):
+        format_code = "<" + precision
+        try:
+            return struct.unpack(format_code, struct.pack(format_code, value))[0]
+        except OverflowError:
+            return math.copysign(float("inf"), value)
+
+    for via_float32 in (False, True):
+        encoded = [
+            rounded(rounded(value, "f") if via_float32 else value, "e")
+            for value in values
+        ]
+        # Every value is already exactly representable in half, so the local
+        # Torch constructor cannot introduce another rounding difference.
+        candidate = torch.tensor(encoded, device="cpu", dtype=torch.float16)
+        if torch.equal(candidate, times):
+            return True
+    return False
 
 
 def validate_heap_calendar(
