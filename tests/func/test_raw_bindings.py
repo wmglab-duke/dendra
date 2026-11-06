@@ -89,6 +89,10 @@ def test_raw_population_binding_reuses_live_leaves_across_backward_and_optimizer
     compiled,
 ):
     _, functional, parameters, constants, state, name = _case()
+    # Break spatial symmetry so every diameter derivative is observable;
+    # a linear ramp makes the center geometry VJP cancel nearly to zero.
+    voltage = state["integrator"]["v"]
+    voltage[..., voltage.shape[-1] // 2].add_(1.0)
     constants["diam"].requires_grad_()
     targets = (parameters[name], constants["diam"])
     optimizer = torch.optim.SGD(targets, lr=1.0e-7)
