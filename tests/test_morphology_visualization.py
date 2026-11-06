@@ -1189,13 +1189,10 @@ def test_plot_shape_3d_axis_indicator_is_screen_fixed_and_tracks_camera():
     assert indicator.get_gid() == "morphology-shape-axis-indicator"
     assert ax._axis3don is False
     assert [label.get_text() for label in indicator.labels] == ["x", "y", "z"]
-    assert [arrow.get_edgecolor() for arrow in indicator.arrows] == pytest.approx(
-        [
-            matplotlib.colors.to_rgba("#d62728"),
-            matplotlib.colors.to_rgba("#2ca02c"),
-            matplotlib.colors.to_rgba("#1f77b4"),
-        ]
-    )
+    for arrow, color in zip(
+        indicator.arrows, ("#d62728", "#2ca02c", "#1f77b4"), strict=True
+    ):
+        assert arrow.get_edgecolor() == pytest.approx(matplotlib.colors.to_rgba(color))
     assert np.isfinite(indicator.projected_endpoints).all()
     assert np.all(indicator.projected_endpoints >= 0.0)
     assert np.all(indicator.projected_endpoints <= 0.16)
