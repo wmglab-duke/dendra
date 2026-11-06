@@ -1,4 +1,4 @@
-## v0.28.0 (unreleased)
+## v0.28.0 (2026-11-06)
 
 ### Simulate and train connected models
 
