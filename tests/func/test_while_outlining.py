@@ -623,6 +623,9 @@ def test_inductor_large_noisy_while_default_matches_eager_and_portable_resume(
         "print('DENDRA_WHILE_OUTLINE=' + json.dumps(result))"
     )
     for mode in ("writer", "reader"):
+        # Cold Network compilation needs headroom on shared CI runners. Keep
+        # the cache-reading process and local runs under their existing limit.
+        timeout = 600 if os.environ.get("CI") and network and mode == "writer" else 300
         completed = subprocess.run(
             [
                 sys.executable,
@@ -638,7 +641,7 @@ def test_inductor_large_noisy_while_default_matches_eager_and_portable_resume(
             capture_output=True,
             text=True,
             check=False,
-            timeout=300,
+            timeout=timeout,
         )
         assert completed.returncode == 0, completed.stdout + completed.stderr
         rows = [
