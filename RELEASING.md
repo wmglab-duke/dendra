@@ -191,10 +191,29 @@ git push --no-follow-tags github refs/tags/vX.Y.Z:refs/tags/vX.Y.Z
 
 **This tag push starts production publication.** GitHub rebuilds and tests
 that exact revision before its PyPI job uploads the checked wheel and source
-archive. GitHub's `main` does not need to move to publish the selected tag.
+archive. After the PyPI upload succeeds, the workflow publishes the matching
+GitHub Release with those same distributions attached. Its notes come from the
+exact version's curated `CHANGELOG.md` section, with documentation links pinned
+to the release tag. Keep that section in the tagged source; a missing section
+fails release creation rather than generating a commit list.
+
+GitHub's `main` does not need to move to publish the selected tag.
 Manual dispatch with `publish_target=pypi` is also a production publication
 action; select the intended `v*` release tag. A production dispatch from a
 branch fails before building.
+
+The release job uses the workflow's `GITHUB_TOKEN` with job-scoped
+`contents: write`; no additional release token is required. PyPI continues to
+use its configured trusted publisher and environment. Branch validation,
+pull requests, TestPyPI uploads and validation-only dispatches do not create
+GitHub Releases.
+
+If GitHub Release creation fails after PyPI publication, rerun only the failed
+release job in that workflow run. It uploads missing files to an existing draft
+or verifies an already-published release against the checked distribution bytes.
+Incomplete or conflicting assets require review; the job does not replace them
+or move tags. Do not rerun the successful PyPI
+upload: production uploads intentionally reject files that already exist.
 
 Verify the version on [PyPI](https://pypi.org/project/dendra/) and install it in
 a fresh environment with:

@@ -48,9 +48,11 @@ jobs:
             exit 1
           fi
       - name: Install packaging tools
-        run: python -m pip install --upgrade build twine
+        run: python -m pip install --upgrade build packaging twine
       - name: Test publication safeguards
-        run: python -m unittest discover -s tests -p test_distribution_checks.py
+        run: |
+          python -m unittest discover -s tests -p test_distribution_checks.py
+          python -m unittest discover -s scripts/tests -p test_github_release.py
       - name: Build wheel from source distribution
         run: python -m build
       - name: Check metadata and archive contents
@@ -287,3 +289,35 @@ jobs:
           name: checked-dists
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github_release:
+    needs: publish_pypi
+    if: needs.publish_pypi.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: checked-dists
+          path: dist
+      - name: Install release metadata tools
+        run: python -m pip install packaging
+      - name: Publish the tagged GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/github_release.py
+          --repository "$GITHUB_REPOSITORY"
+          --tag "$GITHUB_REF_NAME"
+          --commit "$(git rev-parse HEAD)"
+          --dist-dir dist
+          --changelog CHANGELOG.md
