@@ -273,3 +273,176 @@ def test_failed_gate_still_writes_all_combined_reports(shard_artifacts, gate):
     )
     for report in ("coverage.json", "coverage.xml", "htmlcov/index.html"):
         assert (checkout / report).is_file()
+
+
+def _fingerprint(record):
+    import hashlib
+
+    return {
+        **record,
+        "sha256": hashlib.sha256(
+            json.dumps(record, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+
+
+@pytest.fixture
+def partition_artifacts(tmp_path):
+    import hashlib
+    from copy import deepcopy
+
+    root = tmp_path / "partition-checkout"
+    (root / "scripts").mkdir(parents=True)
+    (root / "scripts" / "ci_shard.py").write_text("# selected shard plugin\n")
+    (root / "dendra").mkdir()
+    (root / "dendra" / "__init__.py").write_text("VALUE = 1\n")
+    (root / "tests").mkdir()
+    modules = [f"tests/test_branch_{index}.py" for index in range(1, 5)]
+    for module in modules:
+        (root / module).write_text("def test_one(): pass\ndef test_two(): pass\n")
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    files = {
+        path.relative_to(root).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in root.rglob("*.py")
+    }
+    runtime = _fingerprint(
+        {
+            "files": {"dendra/__init__.py": files["dendra/__init__.py"]},
+            "environment": {"packages": [["torch", "2.15.0+cpu"]]},
+        }
+    )
+    config_files = {name: value for name, value in files.items() if name not in modules}
+    config_files["@ci_shard_plugin"] = files["scripts/ci_shard.py"]
+    config = _fingerprint({"files": config_files})
+    selected = [
+        f"{module}::test_{name}" for module in modules for name in ("one", "two")
+    ]
+    artifacts = root / "ci-results"
+    for index, module in enumerate(modules, 1):
+        assigned = [node for node in selected if node.startswith(module + "::")]
+        initial = {
+            "modules": {module: files[module]},
+            "runtime": runtime,
+            "config": config,
+        }
+        snapshot = {**initial, "final": deepcopy(initial), "unchanged": True}
+        manifest = {
+            "schema_version": 1,
+            "index": index,
+            "total": 4,
+            "selected_nodeids": selected,
+            "assigned_nodeids": assigned,
+            "executed_nodeids": assigned,
+            "collect_only": False,
+            "exitstatus": 0,
+            "module_assignments": {
+                name: position for position, name in enumerate(modules, 1)
+            },
+            "source_snapshot": snapshot,
+        }
+        directory = artifacts / str(index)
+        directory.mkdir(parents=True)
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+    return root, artifacts
+
+
+def _partition_change(artifacts, index, change):
+    from copy import deepcopy
+
+    path = artifacts / str(index) / "manifest.json"
+    manifest = json.loads(path.read_text())
+    change(manifest)
+    snapshot = manifest["source_snapshot"]
+    for domain in ("runtime", "config"):
+        record = snapshot[domain]
+        snapshot[domain] = _fingerprint(
+            {k: v for k, v in record.items() if k != "sha256"}
+        )
+    snapshot["final"] = deepcopy(
+        {name: snapshot[name] for name in ("modules", "runtime", "config")}
+    )
+    path.write_text(json.dumps(manifest))
+
+
+def test_partition_only_validates_sources_without_weakening_default_coverage(
+    partition_artifacts,
+):
+    root, artifacts = partition_artifacts
+    assert validate_shards(artifacts, 4, require_coverage=False, source_root=root) == []
+    with pytest.raises(ValueError, match="raw coverage data is missing"):
+        validate_shards(artifacts, 4)
+    result = _aggregate(root, "--partition-only", "--torch-spec=torch==2.15.0")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "Verified 8 tests across 4 shards with Torch 2.15.0+cpu" in result.stdout
+    assert not (root / ".coverage").exists()
+    assert not (root / "coverage.json").exists()
+
+
+@pytest.mark.parametrize("spec", ["torch==2.14.0", "torch>=2.16,<3"])
+def test_partition_only_rejects_wrong_actual_torch_version(partition_artifacts, spec):
+    root, _artifacts = partition_artifacts
+    result = _aggregate(root, "--partition-only", f"--torch-spec={spec}")
+    assert result.returncode == 2
+    assert "does not satisfy" in result.stderr
+
+
+@pytest.mark.parametrize("domain", ["runtime", "config"])
+def test_partition_only_rejects_mixed_fingerprints(partition_artifacts, domain):
+    root, artifacts = partition_artifacts
+
+    def change(manifest):
+        record = manifest["source_snapshot"][domain]
+        if domain == "runtime":
+            record["environment"]["packages"] = [["torch", "2.16.0"]]
+        else:
+            record["extra_configuration"] = "another worker configuration"
+
+    _partition_change(artifacts, 4, change)
+    with pytest.raises(
+        ValueError, match="runtime, configuration or module assignments disagree"
+    ):
+        validate_shards(artifacts, 4, require_coverage=False, source_root=root)
+
+
+@pytest.mark.parametrize(
+    "filename", ["tests/test_branch_4.py", "scripts/ci_shard.py", "dendra/__init__.py"]
+)
+def test_partition_only_rejects_stale_current_source(partition_artifacts, filename):
+    root, artifacts = partition_artifacts
+    with (root / filename).open("a") as stream:
+        stream.write("# changed after worker execution\n")
+    with pytest.raises(ValueError, match="current .*source differs"):
+        validate_shards(artifacts, 4, require_coverage=False, source_root=root)
+
+
+@pytest.mark.parametrize("change", ["missing", "changed", "digest"])
+def test_partition_only_rejects_missing_or_invalid_attestation(
+    partition_artifacts, change
+):
+    root, artifacts = partition_artifacts
+    path = artifacts / "4" / "manifest.json"
+    manifest = json.loads(path.read_text())
+    if change == "missing":
+        manifest.pop("source_snapshot")
+    elif change == "changed":
+        manifest["source_snapshot"]["unchanged"] = False
+    else:
+        manifest["source_snapshot"]["runtime"]["sha256"] = "invalid"
+        manifest["source_snapshot"]["final"]["runtime"]["sha256"] = "invalid"
+    path.write_text(json.dumps(manifest))
+    with pytest.raises(
+        ValueError, match="attestation|sources changed|source fingerprint"
+    ):
+        validate_shards(artifacts, 4, require_coverage=False, source_root=root)
+
+
+def test_partition_only_rejects_split_module_assignments(partition_artifacts):
+    root, artifacts = partition_artifacts
+
+    def change(manifest):
+        manifest["module_assignments"]["tests/test_branch_4.py"] = 3
+
+    _partition_change(artifacts, 4, change)
+    with pytest.raises(ValueError, match="whole-module assignment disagrees"):
+        validate_shards(artifacts, 4, require_coverage=False, source_root=root)

@@ -42,8 +42,34 @@ comparisons.
 The full GitLab lane, base-install check and documentation build use the
 PyTorch 2.15.0 CPU wheel. Compiler compatibility jobs cover the supported
 minimum (2.14.0), the pinned release (2.15.0), and the newest available 2.x
-release. Job constraints retain the selected wheel during later dependency
-installation.
+release. GitLab job constraints retain the selected wheel during later
+dependency installation.
+
+GitHub and GitLab use the same compiler compatibility selection in
+`scripts/functional_compatibility_tests.txt`. Each PyTorch version runs four
+duration-balanced shards, keeping complete selected modules together. A
+separate gate verifies the exact disjoint test partition, current sources and
+matching runtime fingerprints before release jobs proceed. All forty full-lane
+units and their coverage floors remain required alongside this matrix.
+
+To reproduce one compatibility shard with the current PyTorch environment:
+
+```sh
+python -m pytest -q -p scripts.ci_shard \
+  --ci-shard-index=1 --ci-shard-total=4 \
+  --ci-shard-durations=scripts/ci_durations.json \
+  --ci-shard-output=ci-results/functional-compatibility/local/1 \
+  @scripts/functional_compatibility_tests.txt
+```
+
+Repeat with indices 2, 3 and 4 in the same unchanged environment, then validate
+the four successful manifests. Set `--torch-spec` to the version being checked:
+
+```sh
+python scripts/combine_ci_coverage.py --partition-only --shards=4 \
+  --input-dir=ci-results/functional-compatibility/local \
+  --torch-spec="torch==2.15.0"
+```
 
 Mark tests that inspect device metadata or mock compiler behavior with
 `@pytest.mark.cpu` when they do not allocate or execute on an accelerator. This prevents a

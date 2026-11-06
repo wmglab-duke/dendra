@@ -85,11 +85,16 @@ jobs:
             torch: "torch>=2.14,<3"
             distribution: wheel
             solvers: absent
-          - os: macos-14
+          - os: macos-15
             python: "3.12"
             torch: "torch==2.14.0"
             distribution: wheel
             solvers: absent
+          - os: macos-15
+            python: "3.12"
+            torch: "torch==2.15.0"
+            distribution: wheel
+            solvers: present
           - os: ubuntu-24.04
             python: "3.12"
             torch: "torch==2.14.0"
@@ -141,15 +146,18 @@ jobs:
           cd "$RUNNER_TEMP"
           python -I "$GITHUB_WORKSPACE/scripts/distribution_smoke.py" --expect-solvers "$SOLVERS"
 
-  test_functional_cpu:
-    # Exercise the source's real compiler boundary, not just an install smoke.
-    # No patch-specific skip is allowed to hide a broken scan/while route.
+  test_functional_cpu_shards:
+    # Retain the complete compiler selection, split only at module boundaries.
     strategy:
       fail-fast: false
       matrix:
-        torch: ["torch==2.14.0", "torch>=2.14,<2.15", "torch>=2.14,<3"]
+        torch:
+          - {spec: "torch==2.14.0", label: minimum}
+          - {spec: "torch==2.15.0", label: current}
+          - {spec: "torch>=2.15,<3", label: rolling}
+        shard: [1, 2, 3, 4]
     runs-on: ubuntu-24.04
-    timeout-minutes: 35
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -159,53 +167,70 @@ jobs:
           python-version: "3.12"
       - name: Install CPU compiler baseline or latest compatible release
         env:
-          TORCH_SPEC: ${{ matrix.torch }}
+          TORCH_SPEC: ${{ matrix.torch.spec }}
         run: python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
       - name: Install source, test tools and required native solvers
         run: python -m pip install --only-binary=dendra-solvers ".[dev,solvers]"
       - name: Require native DHS before running all-eight-gradient checks
         run: |
-          python - <<'PY'
+          python - <<'PYCODE'
           import torch
           import dendra_solvers._ext
           from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE
           assert DENDRA_SOLVERS_AVAILABLE, "Native DHS coverage must not be skipped"
           print("Functional compiler lane:", torch.__version__)
-          PY
+          PYCODE
       - name: Check real scan and while-loop traces, gradients and ownership
         env:
           TORCHINDUCTOR_COMPILE_THREADS: "1"
         run: >-
-          python -m pytest -q
-          tests/func/test_scan_chunk.py
-          tests/func/test_scan_capture_hooks.py
-          tests/func/test_scan_cpp_policy.py
-          tests/func/test_scan_discrete_materialization.py
-          tests/func/test_scan_donation.py
-          tests/func/test_scan_donation_workflows.py
-          tests/func/test_scan_recording.py
-          tests/func/test_scan_hh_validation.py
-          tests/func/test_while_inductor.py
-          tests/func/test_membrane_current.py
-          tests/func/test_lfp.py
-          tests/func/test_recorder_regions.py
-          tests/func/test_initialization_parity.py
-          tests/func/test_population_initialization_transforms.py
-          tests/func/test_convenience_extra.py
-          tests/func/test_convenience_initialization.py
-          tests/func/test_timestep_initialization.py
-          tests/func/test_clearance_process.py
-          tests/func/test_material_processes.py
-          tests/func/test_material_diffusion.py
-          tests/func/test_material_preparation_guards.py
-          tests/func/test_material_concatenation.py
-          tests/func/test_extcell_material_concatenation.py
-          tests/func/test_voltage_processes.py
-          tests/func/test_voltage_process_guards.py
-          tests/func/test_voltage_continuation.py
-          tests/func/test_scnv.py
-          tests/func/test_scnv_guards.py
-          tests/func/test_convenience_runner.py::test_top_level_compile_is_the_exported_functional_compile_alias
+          python -m pytest -q -p scripts.ci_shard
+          --ci-shard-index=${{ matrix.shard }} --ci-shard-total=4
+          --ci-shard-output=ci-results/functional-compatibility/${{ matrix.torch.label }}/${{ matrix.shard }}
+          --ci-shard-durations=scripts/ci_durations.json
+          --junitxml=ci-results/functional-compatibility/${{ matrix.torch.label }}/${{ matrix.shard }}/junit.xml
+          @scripts/functional_compatibility_tests.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: functional-compatibility-${{ matrix.torch.label }}-${{ matrix.shard }}
+          path: ci-results/functional-compatibility/${{ matrix.torch.label }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  test_functional_cpu:
+    # This gate runs only after every shard succeeds. Validate each actual
+    # Torch environment separately rather than stitching twelve jobs together.
+    needs: test_functional_cpu_shards
+    strategy:
+      fail-fast: false
+      matrix:
+        torch:
+          - {spec: "torch==2.14.0", label: minimum}
+          - {spec: "torch==2.15.0", label: current}
+          - {spec: "torch>=2.15,<3", label: rolling}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: functional-compatibility-${{ matrix.torch.label }}-*
+          path: ci-results/functional-compatibility/${{ matrix.torch.label }}
+          merge-multiple: true
+      - name: Validate the complete compiler test partition
+        env:
+          TORCH_SPEC: ${{ matrix.torch.spec }}
+        run: |
+          python -m pip install coverage packaging
+          python scripts/combine_ci_coverage.py --partition-only --shards=4 \
+            --input-dir=ci-results/functional-compatibility/${{ matrix.torch.label }} \
+            --torch-spec="$TORCH_SPEC"
 
   check_dist:
     needs: [build, test_install, test_functional_cpu]

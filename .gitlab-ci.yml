@@ -207,13 +207,21 @@ test_coverage:
         path: coverage.xml
     expire_in: 1 week
 
-test_functional_compatibility:
+test_functional_compatibility_shards:
   extends: .full_test_rules
   stage: test
+  timeout: 90 minutes
   parallel:
     matrix:
-      # Supported minimum, pinned current release, and rolling PyTorch 2.x.
-      - TORCH_SPEC: ["torch==2.14.0", "torch==2.15.0", "torch>=2.15,<3"]
+      - TORCH_SPEC: "torch==2.14.0"
+        TORCH_LABEL: minimum
+        COMPAT_SHARD: ["1", "2", "3", "4"]
+      - TORCH_SPEC: "torch==2.15.0"
+        TORCH_LABEL: current
+        COMPAT_SHARD: ["1", "2", "3", "4"]
+      - TORCH_SPEC: "torch>=2.15,<3"
+        TORCH_LABEL: rolling
+        COMPAT_SHARD: ["1", "2", "3", "4"]
   variables:
     OMP_NUM_THREADS: "1"
     MKL_NUM_THREADS: "1"
@@ -223,44 +231,52 @@ test_functional_compatibility:
     - python -m pip install pytest hypothesis
     # Do not let a missing optional dependency silently skip DHS gradients.
     - |
-      python - <<'PY'
+      python - <<'PYCODE'
       import torch
       import dendra_solvers._ext
       from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE
       assert DENDRA_SOLVERS_AVAILABLE, "Native DHS coverage must not be skipped"
       print("Functional compiler lane:", torch.__version__)
-      PY
+      PYCODE
     - >-
-      python -m pytest -q
-      tests/func/test_scan_chunk.py
-      tests/func/test_scan_capture_hooks.py
-      tests/func/test_scan_cpp_policy.py
-      tests/func/test_scan_discrete_materialization.py
-      tests/func/test_scan_donation.py
-      tests/func/test_scan_donation_workflows.py
-      tests/func/test_scan_recording.py
-      tests/func/test_scan_hh_validation.py
-      tests/func/test_while_inductor.py
-      tests/func/test_membrane_current.py
-      tests/func/test_lfp.py
-      tests/func/test_recorder_regions.py
-      tests/func/test_initialization_parity.py
-      tests/func/test_population_initialization_transforms.py
-      tests/func/test_convenience_extra.py
-      tests/func/test_convenience_initialization.py
-      tests/func/test_timestep_initialization.py
-      tests/func/test_clearance_process.py
-      tests/func/test_material_processes.py
-      tests/func/test_material_diffusion.py
-      tests/func/test_material_preparation_guards.py
-      tests/func/test_material_concatenation.py
-      tests/func/test_extcell_material_concatenation.py
-      tests/func/test_voltage_processes.py
-      tests/func/test_voltage_process_guards.py
-      tests/func/test_voltage_continuation.py
-      tests/func/test_scnv.py
-      tests/func/test_scnv_guards.py
-      tests/func/test_convenience_runner.py::test_top_level_compile_is_the_exported_functional_compile_alias
+      python -m pytest -q -p scripts.ci_shard
+      --ci-shard-index="$COMPAT_SHARD" --ci-shard-total=4
+      --ci-shard-output="ci-results/functional-compatibility/$TORCH_LABEL/$COMPAT_SHARD"
+      --ci-shard-durations=scripts/ci_durations.json
+      --junitxml="ci-results/functional-compatibility/$TORCH_LABEL/$COMPAT_SHARD/junit.xml"
+      @scripts/functional_compatibility_tests.txt
+  artifacts:
+    when: always
+    name: "functional-$TORCH_LABEL-$COMPAT_SHARD"
+    paths:
+      - ci-results/functional-compatibility/
+    reports:
+      junit: "ci-results/functional-compatibility/*/*/junit.xml"
+    expire_in: 1 week
+
+test_functional_compatibility:
+  extends: .full_test_rules
+  stage: coverage
+  needs:
+    - job: test_functional_compatibility_shards
+      artifacts: true
+  parallel:
+    matrix:
+      - TORCH_SPEC: "torch==2.14.0"
+        TORCH_LABEL: minimum
+      - TORCH_SPEC: "torch==2.15.0"
+        TORCH_LABEL: current
+      - TORCH_SPEC: "torch>=2.15,<3"
+        TORCH_LABEL: rolling
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
+    - rm -rf /var/lib/apt/lists/*
+    - python -m pip install coverage packaging
+  script:
+    - >-
+      python scripts/combine_ci_coverage.py --partition-only --shards=4
+      --input-dir="ci-results/functional-compatibility/$TORCH_LABEL"
+      --torch-spec="$TORCH_SPEC"
 
 build_docs:
   stage: build
