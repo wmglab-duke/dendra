@@ -57,6 +57,25 @@ def _source_files(directory: Path, suffixes: set[str]):
                 yield path
 
 
+def _metadata_search_paths() -> list[str]:
+    """Inventory each physical metadata root once, including lazy vendoring."""
+    paths = {
+        str(Path(path or ".").resolve()) for path in sys.path if isinstance(path, str)
+    }
+    try:
+        spec = importlib.util.find_spec("setuptools")
+    except (ImportError, ValueError, AttributeError):
+        spec = None
+    if spec is not None:
+        # Setuptools can append this existing directory to sys.path on import.
+        # Inventory it upfront without executing setuptools or its import hooks.
+        for location in spec.submodule_search_locations or ():
+            vendor = Path(location) / "_vendor"
+            if vendor.is_dir():
+                paths.add(str(vendor.resolve()))
+    return sorted(paths)
+
+
 def _runtime_snapshot(root: Path) -> dict:
     """Hash runtime sources, the native solver installation and environment."""
     root = Path(root).resolve()
@@ -96,7 +115,9 @@ def _runtime_snapshot(root: Path) -> dict:
             (distribution.metadata.get("Name") or "").lower().replace("_", "-"),
             distribution.version,
         ]
-        for distribution in importlib.metadata.distributions()
+        for distribution in importlib.metadata.distributions(
+            path=_metadata_search_paths()
+        )
     )
     environment = {
         "python": sys.version,
@@ -366,6 +387,22 @@ def _module_snapshot(root: Path, modules) -> dict:
     return {name: _hash_file(root / name) for name in sorted(modules)}
 
 
+def _source_differences(before: dict, after: dict, path=()) -> list[dict]:
+    """Name changed snapshot components without putting their values in logs."""
+    changes = []
+    for name in sorted(before.keys() | after.keys()):
+        location = (*path, name)
+        if name not in before:
+            changes.append({"path": list(location), "change": "added"})
+        elif name not in after:
+            changes.append({"path": list(location), "change": "removed"})
+        elif isinstance(before[name], dict) and isinstance(after[name], dict):
+            changes.extend(_source_differences(before[name], after[name], location))
+        elif before[name] != after[name]:
+            changes.append({"path": list(location), "change": "modified"})
+    return changes
+
+
 def _report_reason(report) -> str | None:
     representation = report.longrepr
     if not representation:
@@ -591,6 +628,33 @@ class _ShardPlugin:
         self.coverage_active = False
         self.collection_snapshot = None
 
+    def _source_drift(self, phase, before, after):
+        changes = _source_differences(before, after)
+        details = self.output / f"source-drift-{phase}.json"
+        report = {
+            "schema_version": 1,
+            "phase": phase,
+            "changes": changes,
+            "before": before,
+            "after": after,
+        }
+        try:
+            self.output.mkdir(parents=True, exist_ok=True)
+            temporary = details.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(details)
+            evidence = f"snapshots: {details}"
+        except OSError as error:
+            # Diagnostics must not replace the existing UsageError/exit policy.
+            evidence = f"unable to write snapshots {details}: {error}"
+        labels = [
+            f"{'.'.join(change['path'])[:200]} ({change['change']})"
+            for change in changes[:8]
+        ]
+        if len(changes) > 8:
+            labels.append(f"{len(changes) - 8} more changes")
+        return f"{'; '.join(labels)}; {evidence}"
+
     def _switch(self, label):
         self.context = label
         actual = _coverage_context(label)
@@ -635,8 +699,12 @@ class _ShardPlugin:
             "config": _config_snapshot(self.root),
         }
         if after_collection != self.collection_snapshot:
+            details = self._source_drift(
+                "collection", self.collection_snapshot, after_collection
+            )
             raise pytest.UsageError(
-                "CI sources changed during collection; recollect before execution"
+                "CI sources changed during collection; recollect before execution. "
+                + details
             )
         if len(selected) != len(set(selected)):
             raise pytest.UsageError(
@@ -878,7 +946,12 @@ class _ShardPlugin:
                 snapshot[key] == value for key, value in final.items()
             )
             if not snapshot["unchanged"]:
-                snapshot["error"] = "Sources changed during execution"
+                before = {
+                    key: snapshot[key] for key in ("modules", "runtime", "config")
+                }
+                details = self._source_drift("execution", before, final)
+                snapshot["error"] = "Sources changed during execution. " + details
+                print(snapshot["error"], file=sys.stderr)
                 session.exitstatus = exitstatus = pytest.ExitCode.USAGE_ERROR
         except (OSError, ValueError, pytest.UsageError) as exc:
             snapshot["error"] = str(exc)

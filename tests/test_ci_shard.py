@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -561,6 +563,16 @@ def test_source_change_during_execution_is_not_reusable(shard_suite):
         snapshot["modules"]["test_mutator.py"]
         != snapshot["final"]["modules"]["test_mutator.py"]
     )
+    assert "modules.test_mutator.py (modified)" in snapshot["error"]
+    evidence = output / "source-drift-execution.json"
+    diagnostic = json.loads(evidence.read_text())
+    assert diagnostic["phase"] == "execution"
+    assert diagnostic["before"]["modules"] == snapshot["modules"]
+    assert diagnostic["after"]["modules"] == snapshot["final"]["modules"]
+    assert {"path": ["modules", "test_mutator.py"], "change": "modified"} in diagnostic[
+        "changes"
+    ]
+    assert str(evidence) in result.stdout + result.stderr
 
 
 def test_snapshots_are_json_stable_and_global_git_inventory_is_complete(tmp_path):
@@ -602,6 +614,82 @@ def test_sources_changed_during_collection_fail_before_execution(shard_suite):
     assert "sources changed during collection" in result.stdout + result.stderr
     assert "execution must not start" not in result.stdout + result.stderr
     assert not (shard_suite / "artifacts" / "manifest.json").exists()
+    assert (
+        "config.files.test_collection_mutation.py (modified)"
+        in result.stdout + result.stderr
+    )
+    evidence = shard_suite / "artifacts" / "source-drift-collection.json"
+    diagnostic = json.loads(evidence.read_text())
+    assert diagnostic["phase"] == "collection"
+    assert (
+        diagnostic["before"]["config"]["files"]["test_collection_mutation.py"]
+        != diagnostic["after"]["config"]["files"]["test_collection_mutation.py"]
+    )
+    assert {
+        "path": ["config", "files", "test_collection_mutation.py"],
+        "change": "modified",
+    } in diagnostic["changes"]
+
+
+def test_source_difference_diagnostics_name_files_and_environment_fields():
+    before = {
+        "runtime": {
+            "files": {"old.py": "a", "kept.py": "same"},
+            "environment": {"packages": [["torch", "2.14.0"]]},
+        },
+        "config": {"files": {"modified.asc": "before"}},
+    }
+    after = {
+        "runtime": {
+            "files": {"new.py": "b", "kept.py": "same"},
+            "environment": {"packages": [["torch", "2.15.0"]]},
+        },
+        "config": {"files": {"modified.asc": "after"}},
+    }
+    changes = ci_shard._source_differences(before, after)
+    assert changes == [
+        {"path": ["config", "files", "modified.asc"], "change": "modified"},
+        {"path": ["runtime", "environment", "packages"], "change": "modified"},
+        {"path": ["runtime", "files", "new.py"], "change": "added"},
+        {"path": ["runtime", "files", "old.py"], "change": "removed"},
+    ]
+
+
+def test_source_drift_messages_are_bounded_and_complete_snapshots_are_saved(tmp_path):
+    plugin = ci_shard._ShardPlugin(1, 1, tmp_path / "artifacts")
+    before = {
+        "config": {"files": {f"file_{index:03}.py": "before" for index in range(100)}}
+    }
+    after = {
+        "config": {"files": {f"file_{index:03}.py": "after" for index in range(100)}}
+    }
+    message = plugin._source_drift("collection", before, after)
+    assert "config.files.file_000.py (modified)" in message
+    assert "file_099.py" not in message
+    assert "more changes" in message
+    assert len(message) < 2_000
+    report = json.loads((plugin.output / "source-drift-collection.json").read_text())
+    assert len(report["changes"]) == 100
+    assert report["before"] == before
+    assert report["after"] == after
+
+
+def test_source_drift_diagnostic_write_failure_keeps_primary_failure_detail(
+    tmp_path, monkeypatch
+):
+    plugin = ci_shard._ShardPlugin(1, 1, tmp_path / "artifacts")
+
+    def denied(*args, **kwargs):
+        raise OSError("diagnostic output unavailable")
+
+    monkeypatch.setattr(Path, "mkdir", denied)
+    message = plugin._source_drift(
+        "collection",
+        {"modules": {"test_a.py": "before"}},
+        {"modules": {"test_a.py": "after"}},
+    )
+    assert "modules.test_a.py (modified)" in message
+    assert "unable to write snapshots" in message
 
 
 def test_untracked_bytecode_does_not_change_git_source_snapshot(tmp_path):
@@ -755,3 +843,105 @@ def test_only_plain_top_level_test_bodies_are_locally_reusable(
     changed_collection = ci_shard._config_snapshot(shard_suite, ["test_isolation.py"])
     assert changed_collection["collection_sources"] != original["collection_sources"]
     assert changed_collection["sha256"] != original["sha256"]
+
+
+@pytest.fixture
+def metadata_site(tmp_path, monkeypatch):
+    site = tmp_path / "site"
+    vendor = site / "setuptools" / "_vendor"
+    vendor.mkdir(parents=True)
+    monkeypatch.setattr(sys, "path", [str(site)])
+    monkeypatch.setattr(
+        ci_shard.importlib.util,
+        "find_spec",
+        lambda name: SimpleNamespace(submodule_search_locations=[str(vendor.parent)])
+        if name == "setuptools"
+        else None,
+    )
+    return site, vendor
+
+
+def _write_metadata(root, name, version):
+    directory = root / f"{name}-{version}.dist-info"
+    directory.mkdir()
+    (directory / "METADATA").write_text(f"Name: {name}\nVersion: {version}\n")
+    return directory
+
+
+def test_metadata_roots_are_physical_and_include_lazy_vendoring_without_imports(
+    tmp_path, monkeypatch, metadata_site
+):
+    import builtins
+
+    site, vendor = metadata_site
+    _write_metadata(site, "installed", "1.0")
+    _write_metadata(vendor, "bundled", "2.0")
+    alias = tmp_path / "site_alias"
+    alias.symlink_to(site, target_is_directory=True)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "path",
+        ["", str(tmp_path), str(site), str(site / ".." / "site"), str(alias)],
+    )
+    original_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        assert name != "setuptools", "metadata discovery must not execute setuptools"
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    assert ci_shard._metadata_search_paths() == sorted(
+        map(str, [tmp_path.resolve(), site.resolve(), vendor.resolve()])
+    )
+    before = ci_shard._runtime_snapshot(tmp_path)
+    assert before["environment"]["packages"] == [
+        ["bundled", "2.0"],
+        ["installed", "1.0"],
+    ]
+    # Both pytest's duplicate root insertion and setuptools's lazy vendor path
+    # publication leave the same physical metadata inventory.
+    sys.path.extend([str(site), str(vendor), str(alias)])
+    assert ci_shard._runtime_snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("location", ["installed", "vendored"])
+@pytest.mark.parametrize("mutation", ["add", "remove", "version"])
+def test_runtime_inventory_detects_real_installed_and_vendored_metadata_changes(
+    tmp_path, metadata_site, location, mutation
+):
+    site, vendor = metadata_site
+    root = site if location == "installed" else vendor
+    distribution = _write_metadata(root, "tracked", "1.0")
+    before = ci_shard._runtime_snapshot(tmp_path)
+    if mutation == "add":
+        _write_metadata(root, "new-package", "2.0")
+    elif mutation == "remove":
+        shutil.rmtree(distribution)
+    else:
+        (distribution / "METADATA").write_text("Name: tracked\nVersion: 2.0\n")
+    after = ci_shard._runtime_snapshot(tmp_path)
+    assert after["environment"]["packages"] != before["environment"]["packages"]
+    assert after["sha256"] != before["sha256"]
+    assert after["files"] == before["files"]
+
+
+def test_distinct_metadata_roots_preserve_duplicate_distribution_records(
+    tmp_path, metadata_site
+):
+    site, vendor = metadata_site
+    for root in (site, vendor):
+        _write_metadata(root, "shared-name", "1.0")
+    assert ci_shard._runtime_snapshot(tmp_path)["environment"]["packages"] == [
+        ["shared-name", "1.0"],
+        ["shared-name", "1.0"],
+    ]
+
+
+def test_lazy_setuptools_import_does_not_look_like_collection_source_drift(shard_suite):
+    (shard_suite / "test_vendor.py").write_text(
+        "import setuptools\ndef test_vendor(): pass\n"
+    )
+    manifest = _shard(shard_suite, 1, 1, "--collect-only")
+    assert "test_vendor.py::test_vendor" in manifest["selected_nodeids"]
+    assert manifest["source_snapshot"]["unchanged"] is True

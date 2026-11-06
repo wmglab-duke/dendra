@@ -176,6 +176,24 @@ def execute(repo, output, cmd, context):
     return status
 
 
+def collection_failure(log_path, status):
+    """Expose a bounded diagnostic tail while retaining the complete artifact."""
+    message = f"Full-suite collection failed (pytest exit {status}); see {log_path}"
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            offset = max(0, stream.tell() - 16_384)
+            stream.seek(offset)
+            lines = stream.read(16_384).decode("utf-8", errors="replace").splitlines()
+    except OSError as error:
+        return f"{message}\nUnable to read collection log: {error}"
+    omitted = (
+        "[earlier collection output omitted]\n" if offset or len(lines) > 80 else ""
+    )
+    excerpt = "\n".join(lines[-80:]) or "[collection log is empty]"
+    return f"{message}\n{omitted}{excerpt}"
+
+
 def seal(directory):
     write(
         directory / "artifact-hashes.json",
@@ -548,9 +566,7 @@ def main():
             {"action": "collect"},
         )
         if status:
-            raise ValueError(
-                f"Full-suite collection failed; see {collection / 'pytest.log'}"
-            )
+            raise ValueError(collection_failure(collection / "pytest.log", status))
         current = context(repo, read(collection / "manifest.json"))
         records = []
         with ThreadPoolExecutor(max_workers=args.workers) as workers:

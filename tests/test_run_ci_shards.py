@@ -5,7 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -154,6 +154,97 @@ class ShardRunnerTests(unittest.TestCase):
         (self.repo / ".gitignore").write_text("ci-results/\nci-results-runner/\n")
         runner.validate_output(self.repo, self.output)
         runner.validate_output(self.repo, self.repo.parent / "outside-results")
+
+    def test_collection_failure_exposes_bounded_traceback_and_stops_execution(self):
+        log_content = (
+            "".join(f"<Function test_collected_{index}>\n" for index in range(10_000))
+            + "Traceback (most recent call last):\n"
+            + '  File "tests/test_example.py", line 3, in <module>\n'
+            + "ImportError: cannot import name 'expected_hook'\n"
+            + "Interrupted: 1 error during collection\n"
+        )
+
+        def execute(repo, output, command, context):
+            self.assertIn("--collect-only", command)
+            self.assertIn("--cov-branch", command)
+            self.assertEqual(command[command.index("-W") + 1], "error")
+            output.mkdir()
+            (output / "pytest.log").write_text(log_content)
+            return 2
+
+        error = io.StringIO()
+        with (
+            patch.object(sys, "argv", [str(SCRIPT), "--output-dir", str(self.output)]),
+            patch.dict(
+                runner.os.environ, {"CI_NODE_INDEX": "1", "CI_NODE_TOTAL": "10"}
+            ),
+            patch.object(runner, "repository", return_value=self.repo),
+            patch.object(runner, "validate_output"),
+            patch.object(runner, "execute", side_effect=execute) as called,
+            patch.object(
+                runner, "run_unit", side_effect=AssertionError("No test execution")
+            ),
+            redirect_stderr(error),
+            self.assertRaises(SystemExit) as failure,
+        ):
+            runner.main()
+        self.assertEqual(failure.exception.code, 2)
+        self.assertEqual(called.call_count, 1)
+        log_path = called.call_args.args[1] / "pytest.log"
+        self.assertEqual(log_path.read_text(), log_content)
+        message = error.getvalue()
+        self.assertIn("Full-suite collection failed (pytest exit 2)", message)
+        self.assertIn(str(log_path), message)
+        self.assertIn("ImportError: cannot import name 'expected_hook'", message)
+        self.assertIn("Interrupted: 1 error during collection", message)
+        self.assertIn("earlier collection output omitted", message)
+        self.assertNotIn("<Function test_collected_0>", message)
+        self.assertLessEqual(len(message.splitlines()), 83)
+        self.assertLess(len(message), 17_000)
+
+    def test_successful_collection_does_not_echo_its_log(self):
+        def execute(repo, output, command, context):
+            output.mkdir()
+            (output / "pytest.log").write_text("Successful collection detail\n")
+            runner.write(output / "manifest.json", {})
+            return 0
+
+        error, output = io.StringIO(), io.StringIO()
+        with (
+            patch.object(sys, "argv", [str(SCRIPT), "--output-dir", str(self.output)]),
+            patch.dict(
+                runner.os.environ, {"CI_NODE_INDEX": "1", "CI_NODE_TOTAL": "10"}
+            ),
+            patch.object(runner, "repository", return_value=self.repo),
+            patch.object(runner, "validate_output"),
+            patch.object(runner, "execute", side_effect=execute),
+            patch.object(runner, "context", return_value=self.current),
+            patch.object(runner, "units_for_job", return_value=[1]),
+            patch.object(
+                runner, "run_unit", return_value={"unit": 1, "status": "passed"}
+            ),
+            redirect_stderr(error),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(runner.main(), 0)
+        self.assertEqual(error.getvalue(), "")
+        self.assertNotIn("Successful collection detail", output.getvalue())
+
+    def test_collection_diagnostics_handle_missing_empty_and_non_utf8_logs(self):
+        log = self.state / "pytest.log"
+        missing = runner.collection_failure(log, 3)
+        self.assertIn("pytest exit 3", missing)
+        self.assertIn("Unable to read collection log", missing)
+        log.write_bytes(b"")
+        self.assertIn("collection log is empty", runner.collection_failure(log, 2))
+        log.write_bytes(b"invalid output: \xff\nRuntimeError: collection failed\n")
+        self.assertIn(
+            "RuntimeError: collection failed", runner.collection_failure(log, 2)
+        )
+        log.write_bytes(b"x" * 100_000 + b"\nRuntimeError: final error\n")
+        bounded = runner.collection_failure(log, 2)
+        self.assertLess(len(bounded), 17_000)
+        self.assertIn("RuntimeError: final error", bounded)
 
     def test_valid_unit_resumes_without_invoking_tests(self):
         self.artifact(self.output / "1")
