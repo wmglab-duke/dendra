@@ -83,12 +83,21 @@ class _PopulationWhileExecutor:
             or _compile_while is not _STANDARD_COMPILER
         ):
             return signature
-        parameters, prepared, state, ve, intra, carries, noise, stimulation, draws = (
-            operands
-        )
+        (
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            carries,
+            noise,
+            stimulation,
+            draws,
+            sampling_times,
+        ) = operands
         spec, metadata = signature[0]
         children = spec.children()
-        tape_fields = (3, 4, 6, 7, 8)
+        tape_fields = (3, 4, 6, 7, 8, 9)
         if not all(_ordinary_tape_spec(child) for child in children):
             return signature
         leaves = spec.flatten_up_to(operands)
@@ -139,6 +148,7 @@ class _PopulationWhileExecutor:
         noise=None,
         stimulation=None,
         draws=None,
+        sampling_times=None,
     ):
         from ._population import _STRUCTURED_ROLLOUT_CHUNK
 
@@ -157,6 +167,7 @@ class _PopulationWhileExecutor:
             noise,
             stimulation,
             draws,
+            sampling_times,
         )
         signature = (_schema(operands), MEMBRANE_ASSEMBLY.value)
         if signature in self._capture_errors:
@@ -177,6 +188,7 @@ class _PopulationWhileExecutor:
                         noise,
                         stimulation,
                         draws,
+                        sampling_times,
                     )
             except Exception as error:
                 reason = (
@@ -198,6 +210,7 @@ class _PopulationWhileExecutor:
         noise,
         stimulation,
         draws=None,
+        sampling_times=None,
     ):
         functional, plans = self._functional, self._plans
         stepwise = self._stepwise_stimulation or _has_runtime_stimulation(
@@ -206,7 +219,7 @@ class _PopulationWhileExecutor:
         assembly = None
         if not stepwise and (functional.intra.enabled or functional.extra.enabled):
 
-            def assemble(parameters, prepared, state, ve, intra):
+            def assemble(parameters, prepared, state, ve, intra, sampling_times):
                 return functional._assemble_bound_inputs(
                     parameters,
                     state,
@@ -214,15 +227,23 @@ class _PopulationWhileExecutor:
                     intra,
                     self._steps,
                     prepared["integrator"]["dt"],
+                    sampling_times=sampling_times,
                 )
 
             examples = pytree.tree_map_only(
                 torch.Tensor,
                 lambda value: value.detach(),
-                (parameters, prepared, functional._clone_state_tree(state), ve, intra),
+                (
+                    parameters,
+                    prepared,
+                    functional._clone_state_tree(state),
+                    ve,
+                    intra,
+                    sampling_times,
+                ),
             )
             assembly = make_fx(assemble, pre_dispatch=False)(*examples)
-            ve, intra = assembly(parameters, prepared, state, ve, intra)
+            ve, intra = assembly(parameters, prepared, state, ve, intra, sampling_times)
 
         # Stepwise assembly is part of the pure body, so one engine can select
         # its owned-input specializations across public state/view changes.
@@ -261,7 +282,11 @@ class _PopulationWhileExecutor:
             if stepwise:
                 self._stepwise_engine = engine
         kernel = engine.kernel_for(
-            parameters, prepared, state, carries, (ve, intra, noise, stimulation, draws)
+            parameters,
+            prepared,
+            state,
+            carries,
+            (ve, intra, noise, stimulation, draws, sampling_times),
         )
 
         @wraps(kernel)
@@ -275,15 +300,18 @@ class _PopulationWhileExecutor:
             noise=None,
             stimulation=None,
             draws=None,
+            sampling_times=None,
         ):
             if assembly is not None:
-                ve, intra = assembly(parameters, prepared, state, ve, intra)
+                ve, intra = assembly(
+                    parameters, prepared, state, ve, intra, sampling_times
+                )
             final, final_carries, observed = kernel(
                 parameters,
                 prepared,
                 state,
                 carries,
-                (ve, intra, noise, stimulation, draws),
+                (ve, intra, noise, stimulation, draws, sampling_times),
             )
             emitted = {plan.name: observed.get(plan.name) for plan in plans}
             return final, {"v": final["integrator"]["v"]}, final_carries, emitted

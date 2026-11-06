@@ -469,18 +469,41 @@ def test_runtime_waveform_uses_the_accepted_float32_clock_at_a_pulse_edge(execut
     )
     expected = _reference(runner, extra=extra)
     actual = runner(extra=extra)
+    native = _model(dtype=torch.float32, batch=None)
+    native.t.fill_(1000.0)
+    recorder = dn.Recorder(("v", "t"))
+    native.run(steps=STEPS, dt=DT, extra=extra, callbacks=[recorder])
+    native_trace = {
+        name: torch.from_numpy(recorder.numpy(name)).clone() for name in ("v", "t")
+    }
     torch.testing.assert_close(actual[0], expected[0])
     torch.testing.assert_close(_trace(actual), _trace(expected))
+    torch.testing.assert_close(_trace(actual), native_trace)
+    torch.testing.assert_close(actual[0]["integrator"]["v"], native.v)
+    torch.testing.assert_close(actual[0]["clock"]["t"], native.t)
     if execution == "scan":
         expected_gradient = torch.autograd.grad(_loss(expected), waveform.amp)[0]
         actual_gradient = torch.autograd.grad(_loss(actual), waveform.amp)[0]
         assert torch.isfinite(actual_gradient).all()
-        assert torch.count_nonzero(actual_gradient) > 0
+        assert torch.count_nonzero(actual_gradient) == 0
         torch.testing.assert_close(actual_gradient, expected_gradient)
     unstimulated = runner(extra=None)
-    assert not torch.equal(
-        actual[0]["integrator"]["v"], unstimulated[0]["integrator"]["v"]
+    torch.testing.assert_close(
+        actual[0]["integrator"]["v"], unstimulated[0]["integrator"]["v"], rtol=0, atol=0
     )
+    # Native.step intentionally samples at its accepted clock instead of the
+    # whole-run invocation grid. This same pulse remains active there.
+    stepped = _model(dtype=torch.float32, batch=None)
+    stepped.t.fill_(1000.0)
+    for _ in range(STEPS):
+        stepped.step(dt=DT, extra=extra)
+    assert not torch.equal(stepped.v, unstimulated[0]["integrator"]["v"])
+    if execution == "scan":
+        stepped_gradient = torch.autograd.grad(stepped.v.square().mean(), waveform.amp)[
+            0
+        ]
+        assert torch.isfinite(stepped_gradient).all()
+        assert torch.count_nonzero(stepped_gradient) > 0
 
 
 def test_randomized_runtime_poisson_is_rejected_without_consuming_rng():

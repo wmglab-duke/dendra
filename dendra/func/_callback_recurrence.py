@@ -58,12 +58,19 @@ def _execute_callback_steps(
     draws=None,
     *,
     stepwise_stimulation=False,
+    sampling_times=None,
 ):
     """Execute a tensor recurrence with caller-owned callback carry wrappers."""
     stochastic_stimulation = _has_runtime_stimulation(stimulation, draws)
     if not stepwise_stimulation and not stochastic_stimulation:
         ve, intra = functional._assemble_bound_inputs(
-            parameters, state, ve, intra, steps, prepared["integrator"]["dt"]
+            parameters,
+            state,
+            ve,
+            intra,
+            steps,
+            prepared["integrator"]["dt"],
+            sampling_times=sampling_times,
         )
     emissions = []
     auxiliary = {"v": state["integrator"]["v"]}
@@ -77,18 +84,27 @@ def _execute_callback_steps(
                 parameters,
                 prepared,
                 state,
-                _index_runtime_inputs(ve, intra, noise, stimulation, index, draws),
+                _index_runtime_inputs(
+                    ve, intra, noise, stimulation, index, draws, sampling_times
+                ),
             )
         else:
             # Atomic callbacks consume tape slices, retaining their Tensor
             # dispatch and the legacy packet's tensor-only leaf selection.
             sample = _slice_runtime_inputs(
-                _RuntimeInputs(ve, intra, noise, stimulation, draws), index, index + 1
+                _RuntimeInputs(ve, intra, noise, stimulation, draws, sampling_times),
+                index,
+                index + 1,
             )
             execute = (
                 functional._execute_rollout_values
                 if stochastic_stimulation
                 else functional._transition_rollout_values
+            )
+            kwargs = (
+                {"sampling_times": sample.sampling_time}
+                if stochastic_stimulation
+                else {}
             )
             state, auxiliary = execute(
                 parameters,
@@ -100,6 +116,7 @@ def _execute_callback_steps(
                 sample.noise,
                 sample.stimulation,
                 sample.draws,
+                **kwargs,
             )
         carries, emitted = update(carries, state, auxiliary)
         if emitted is not None:

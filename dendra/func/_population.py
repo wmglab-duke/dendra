@@ -8906,8 +8906,8 @@ def _shared_initial_parameter_target_shapes(
     """Map direct Ion/Material initial Parameters to their runtime frames.
 
     These sources are allowed to carry any visible shape that broadcasts
-    exactly to the corresponding shared field. Other raw Parameters retain the
-    deliberately narrower scalar-or-explicit-regional lowering contract.
+    exactly to the corresponding shared field. Other raw Parameters follow
+    their declaration-specific lowering contracts.
     """
 
     target_shapes: dict[str, set[tuple[int, ...]]] = {}
@@ -10180,6 +10180,39 @@ def _functionalization_failures(
         population,
         parameter_name_by_identity,
     )
+    primary_range_targets = {}
+    non_range_sources = set()
+    for owner in _parameterized_owners(population):
+        for category in (
+            "_global",
+            "_range",
+            "_batch",
+            "_global_p",
+            "_range_p",
+            "_batch_p",
+            "_global_n",
+            "_range_n",
+            "_batch_n",
+        ):
+            for field_name in getattr(type(owner), category):
+                target = getattr(owner, field_name, None)
+                if not torch.is_tensor(target):
+                    continue
+                source = getattr(owner, f"{field_name}_param", None)
+                if not isinstance(source, torch.nn.Parameter):
+                    if isinstance(source, torch.nn.Module):
+                        non_range_sources.update(
+                            parameter_name_by_identity[id(parameter)]
+                            for parameter in source.parameters()
+                        )
+                    continue
+                source_name = parameter_name_by_identity[id(source)]
+                if category == "_range" and isinstance(owner, (Mechanism, State)):
+                    primary_range_targets.setdefault(source_name, []).append(
+                        _shape_tuple(target)
+                    )
+                else:
+                    non_range_sources.add(source_name)
     shape_checked_parameters = (
         {
             name: parameter
@@ -10196,6 +10229,14 @@ def _functionalization_failures(
         actual_shape = _shape_tuple(parameter)
         if name in shared_initial_targets:
             target_shapes = shared_initial_targets[name]
+            if _shape_broadcasts_to_targets(actual_shape, target_shapes):
+                continue
+            expected = f"broadcastable to {target_shapes}"
+        elif name in primary_range_targets and name not in non_range_sources:
+            # The shared raw-to-effective materializer already broadcasts
+            # primary RANGE sources to their support-local buffers. Preserve
+            # every target when a raw leaf is shared by several declarations.
+            target_shapes = tuple(primary_range_targets[name])
             if _shape_broadcasts_to_targets(actual_shape, target_shapes):
                 continue
             expected = f"broadcastable to {target_shapes}"
@@ -17085,6 +17126,8 @@ class FunctionalPopulation:
         steps: int,
         dt,
         stimulation=None,
+        *,
+        sampling_times=None,
     ):
         if stimulation is not None:
             parameters = self._poisson_plan.parameters(parameters, stimulation)
@@ -17097,7 +17140,11 @@ class FunctionalPopulation:
         if not self._intra.enabled and not self._extra.enabled:
             return ve, intra
 
-        times = self._stimulation_times(state, steps, dt)
+        times = (
+            self._stimulation_times(state, steps, dt)
+            if sampling_times is None
+            else sampling_times
+        )
         if self._intra.enabled:
             stimulus_parameters, stimulus_constants = self._stimulus_values(
                 self._intra,
@@ -17721,7 +17768,9 @@ class FunctionalPopulation:
             self._validate_noise_draw(noise, steps=resolved_steps)
             self._validate_stimulation_draw(stimulation, steps=resolved_steps)
             self._stimulation_rng_plan.validate_packets(noise, stimulation)
-        return _RuntimeInputs(ve, intra, noise, stimulation, draws), resolved_steps
+        return _RuntimeInputs(
+            ve, intra, noise, stimulation, draws, inputs.sampling_time
+        ), resolved_steps
 
     def _execute_rollout_values(
         self,
@@ -17734,6 +17783,7 @@ class FunctionalPopulation:
         noise=None,
         stimulation=None,
         draws=None,
+        sampling_times=None,
     ):
         """Execute already validated tensor inputs through the selected path."""
         if _has_runtime_stimulation(stimulation, draws):
@@ -17760,7 +17810,17 @@ class FunctionalPopulation:
                     parameters, packet
                 )
                 ve_step, intra_step = self._assemble_bound_inputs(
-                    bound, state, ve_input, intra_input, 1, dt
+                    bound,
+                    state,
+                    ve_input,
+                    intra_input,
+                    1,
+                    dt,
+                    sampling_times=(
+                        None
+                        if sampling_times is None
+                        else sampling_times[index : index + 1]
+                    ),
                 )
                 state, auxiliary = self._transition_rollout_values(
                     parameters,
@@ -17796,6 +17856,7 @@ class FunctionalPopulation:
             intra,
             steps,
             prepared["integrator"]["dt"],
+            sampling_times=sampling_times,
         )
         structured_signature = (
             ve is not None,
@@ -17844,6 +17905,7 @@ class FunctionalPopulation:
         noise=None,
         stimulation=None,
         draws=None,
+        sampling_times=None,
     ):
         """Execute a fixed-step rollout while threading pure callback carry."""
 
@@ -17872,6 +17934,7 @@ class FunctionalPopulation:
             noise,
             stimulation,
             draws,
+            sampling_times=sampling_times,
         )
         if callbacks._has_emissions(emitted_part):
             parts.append(emitted_part)
@@ -17927,6 +17990,7 @@ class FunctionalPopulation:
             else torch.utils._pytree.tree_map_only(
                 torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
             ),
+            None if inputs.sampling_time is None else inputs.sampling_time.unsqueeze(0),
         )
 
     def _rollout_values(
@@ -17944,7 +18008,7 @@ class FunctionalPopulation:
     ):
         inputs = _with_runtime_draws(inputs, draws)
         resolved, resolved_steps = self._resolve_rollout_input_packets(inputs, steps)
-        ve, intra, noise, stimulation, draws = resolved
+        ve, intra, noise, stimulation, draws, sampling_times = resolved
         if extra is not None:
             if self._extra.enabled:
                 raise ValueError(
@@ -17981,6 +18045,7 @@ class FunctionalPopulation:
                 noise,
                 stimulation,
                 draws,
+                sampling_times,
             )
         from ._callbacks import FunctionalCallbacks
 
@@ -18001,6 +18066,7 @@ class FunctionalPopulation:
             noise,
             stimulation,
             draws,
+            sampling_times,
         )
 
     def rollout(

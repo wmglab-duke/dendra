@@ -22,6 +22,11 @@ Do not use a buffer or `ASSIGNED` value as an undeclared timer. Current and
 assigned-value methods can be evaluated several times during one accepted
 step. Carry is the place for values that must survive steps and checkpoints.
 
+An ordinary unbounded `RANGE` parameter on a Mechanism or State can use a scalar
+or a Tensor that broadcasts exactly to its local runtime shape. This supports
+spatially varying values without inserting separate mechanisms. If a raw
+parameter is shared across declarations, its shape must fit every target.
+
 ## Implement one mechanism for both execution styles
 
 This small example combines a solver-evolved gate with a step counter. The

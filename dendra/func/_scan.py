@@ -83,6 +83,7 @@ class _CompiledScanPopulationChunk:
         noise,
         stimulation,
         draws=None,
+        sampling_times=None,
     ):
         functional = self._functional
         plans = self._plans
@@ -91,11 +92,16 @@ class _CompiledScanPopulationChunk:
         parameters = {name: parameters[name] for name in sorted(parameters)}
         stepwise = self._stepwise or _has_runtime_stimulation(stimulation, draws)
         if not stepwise and (functional.intra.enabled or functional.extra.enabled):
-            signature = (ve is not None, intra is not None, MEMBRANE_ASSEMBLY.value)
+            signature = (
+                ve is not None,
+                intra is not None,
+                sampling_times is not None,
+                MEMBRANE_ASSEMBLY.value,
+            )
             if signature not in self._assemblies:
                 steps = self._steps
 
-                def assemble(parameters, prepared, state, ve, intra):
+                def assemble(parameters, prepared, state, ve, intra, sampling_times):
                     return functional._assemble_bound_inputs(
                         parameters,
                         state,
@@ -103,6 +109,7 @@ class _CompiledScanPopulationChunk:
                         intra,
                         steps,
                         prepared["integrator"]["dt"],
+                        sampling_times=sampling_times,
                     )
 
                 with torch.inference_mode(False), torch.no_grad():
@@ -113,13 +120,14 @@ class _CompiledScanPopulationChunk:
                             functional._clone_state_tree(state),
                             ve,
                             intra,
+                            sampling_times,
                         )
                     )
                     self._assemblies[signature] = make_fx(assemble, pre_dispatch=True)(
                         *examples
                     )
             ve, intra = self._assemblies[signature](
-                parameters, prepared, state, ve, intra
+                parameters, prepared, state, ve, intra, sampling_times
             )
 
         if self._training is None:
@@ -137,6 +145,7 @@ class _CompiledScanPopulationChunk:
                         sample["noise"],
                         sample["stimulation"],
                         sample["draws"],
+                        sample["sampling_time"],
                     ),
                     stepwise_stimulation=stepwise_stimulation,
                 )
@@ -168,6 +177,7 @@ class _CompiledScanPopulationChunk:
                 "noise": noise,
                 "stimulation": stimulation,
                 "draws": draws,
+                "sampling_time": sampling_times,
             },
         )
         auxiliary = {"v": final["integrator"]["v"]}
@@ -191,6 +201,7 @@ class _CompiledScanPopulationChunk:
         noise,
         stimulation=None,
         draws=None,
+        sampling_times=None,
         *,
         block=1,
     ):
@@ -208,31 +219,41 @@ class _CompiledScanPopulationChunk:
         # Retain it only until the cold operand policy has been selected.
         raw_parameters, raw_prepared = parameters, prepared
         state = functional._clone_state_tree(state)
-        parameters, prepared, state, ve, intra, carries, noise, stimulation, draws = (
-            _detach(
-                (
-                    parameters,
-                    prepared,
-                    state,
-                    ve,
-                    intra,
-                    carries,
-                    noise,
-                    stimulation,
-                    draws,
-                )
+        (
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            carries,
+            noise,
+            stimulation,
+            draws,
+            sampling_times,
+        ) = _detach(
+            (
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                carries,
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
             )
         )
         callback_carry = _CallbackCarryPartition.from_plans(plans)
         carries, invariant_carries = callback_carry.split(carries)
 
-        # Atomic rollout samples a bound waveform on start + arange * dt;
-        # host runners sample it at each accepted, repeatedly added clock.
-        # Preserve both established contracts instead of changing pulse edges.
+        # Host schedules provide their invocation-local sampling tape. Atomic
+        # rollout retains its own grid; single-step replay can omit the tape
+        # to evaluate at the accepted solver clock.
         assembly = None
         if not stepwise and (functional.intra.enabled or functional.extra.enabled):
 
-            def assemble(parameters, prepared, state, ve, intra):
+            def assemble(parameters, prepared, state, ve, intra, sampling_times):
                 return functional._assemble_bound_inputs(
                     parameters,
                     state,
@@ -240,12 +261,13 @@ class _CompiledScanPopulationChunk:
                     intra,
                     steps,
                     prepared["integrator"]["dt"],
+                    sampling_times=sampling_times,
                 )
 
             assembly = make_fx(assemble, pre_dispatch=False)(
-                parameters, prepared, state, ve, intra
+                parameters, prepared, state, ve, intra, sampling_times
             )
-            ve, intra = assembly(parameters, prepared, state, ve, intra)
+            ve, intra = assembly(parameters, prepared, state, ve, intra, sampling_times)
 
         sample = {}
         if ve is not None:
@@ -264,6 +286,8 @@ class _CompiledScanPopulationChunk:
             sample["draws"] = pytree.tree_map_only(
                 torch.Tensor, lambda value: value[0], draws
             )
+        if sampling_times is not None:
+            sample["sampling_time"] = sampling_times[0]
         if not any(torch.is_tensor(value) for value in pytree.tree_leaves(sample)):
             # Scan requires a leading iteration axis even without input drives.
             sample["index"] = torch.zeros(
@@ -282,6 +306,7 @@ class _CompiledScanPopulationChunk:
                     sample.get("noise"),
                     sample.get("stimulation"),
                     sample.get("draws"),
+                    sample.get("sampling_time"),
                 ),
                 stepwise_stimulation=stepwise,
             )
@@ -325,6 +350,7 @@ class _CompiledScanPopulationChunk:
                 sample_use.get("noise", False),
                 sample_use.get("stimulation", False),
                 sample_use.get("draws", False),
+                sample_use.get("sampling_time", False),
             )
         )
         if isinstance(graph, torch.fx.GraphModule):
@@ -339,6 +365,7 @@ class _CompiledScanPopulationChunk:
                     noise,
                     stimulation,
                     draws,
+                    sampling_times,
                 ),
             )
 
@@ -352,6 +379,7 @@ class _CompiledScanPopulationChunk:
             noise,
             stimulation=None,
             draws=None,
+            sampling_times=None,
         ):
             carries, invariant_carries = callback_carry.split(carries)
             (
@@ -363,6 +391,7 @@ class _CompiledScanPopulationChunk:
                 noise,
                 stimulation,
                 draws,
+                sampling_times,
             ) = _isolate_dense_lifted_inputs(
                 (
                     parameters,
@@ -373,6 +402,7 @@ class _CompiledScanPopulationChunk:
                     noise,
                     stimulation,
                     draws,
+                    sampling_times,
                 )
             )
             samples = {}
@@ -386,6 +416,8 @@ class _CompiledScanPopulationChunk:
                 samples["stimulation"] = stimulation
             if draws is not None:
                 samples["draws"] = draws
+            if sampling_times is not None:
+                samples["sampling_time"] = sampling_times
             if not any(torch.is_tensor(value) for value in pytree.tree_leaves(samples)):
                 samples["index"] = torch.arange(
                     steps, dtype=torch.int64, device=functional.device
@@ -527,22 +559,34 @@ class _CompiledScanPopulationChunk:
             noise,
             stimulation=None,
             draws=None,
+            sampling_times=None,
         ):
             if assembly is not None:
-                ve, intra = assembly(parameters, prepared, state, ve, intra)
+                ve, intra = assembly(
+                    parameters, prepared, state, ve, intra, sampling_times
+                )
             recurrent, invariant = callback_carry.split(carries)
-            parameters, prepared, invariant, ve, intra, noise, stimulation, draws = (
-                isolate_views(
-                    (
-                        parameters,
-                        prepared,
-                        invariant,
-                        ve,
-                        intra,
-                        noise,
-                        stimulation,
-                        draws,
-                    )
+            (
+                parameters,
+                prepared,
+                invariant,
+                ve,
+                intra,
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
+            ) = isolate_views(
+                (
+                    parameters,
+                    prepared,
+                    invariant,
+                    ve,
+                    intra,
+                    noise,
+                    stimulation,
+                    draws,
+                    sampling_times,
                 )
             )
             # The recurrence already owns these leaves. Establish ownership
@@ -561,6 +605,7 @@ class _CompiledScanPopulationChunk:
                 noise,
                 stimulation,
                 draws,
+                sampling_times,
             )
             if not phase_emissions and not callback_carry.invariant_names:
                 return result
@@ -609,6 +654,7 @@ class _CompiledScanPopulationChunk:
         noise=None,
         stimulation=None,
         draws=None,
+        sampling_times=None,
     ):
         carries = {} if carries is None else carries
         if torch.is_grad_enabled():
@@ -622,6 +668,7 @@ class _CompiledScanPopulationChunk:
                 noise,
                 stimulation,
                 draws,
+                sampling_times,
             )
         else:
             draws = _own_runtime_draw_packets(draws)
@@ -636,6 +683,7 @@ class _CompiledScanPopulationChunk:
                 noise is not None,
                 stimulation is not None,
                 draws is not None,
+                sampling_times is not None,
                 _has_runtime_stimulation(stimulation, draws),
                 MEMBRANE_ASSEMBLY.value,
                 block,
@@ -652,6 +700,7 @@ class _CompiledScanPopulationChunk:
                         noise,
                         stimulation,
                         draws,
+                        sampling_times,
                         block=block,
                     )
             result = self._kernels[signature](
@@ -664,6 +713,7 @@ class _CompiledScanPopulationChunk:
                 noise,
                 stimulation,
                 draws,
+                sampling_times,
             )
         # Scan's AD wrapper marks floating carry outputs differentiable even
         # when their authored update is detached. Runtime NOISE retains its

@@ -39,6 +39,13 @@ Times are in milliseconds. Intracellular current inputs use absolute current
 in mA: `0.1 * nA` supplies the conversion. Mechanism current densities and
 point-process currents have different units; see {doc}`../units`.
 
+Native runs and compiled runners sample deterministic registered intracellular
+and extracellular waveforms at `start + n * dt`, with `start` taken from that
+call's simulation boundary. Internal chunks do not restart this sampling grid.
+A continued call starts its grid at the continued clock; a manual `step`
+evaluates the drive at its current accepted clock. Custom step callables passed
+to low-level scan functions control their own waveform evaluation.
+
 Omitting `Inputs.intra` retains registered `Slice.inject` stimulation.
 An explicit intracellular tape conflicts with solver-level registered
 injections on that Population. Choose one of those input sources.

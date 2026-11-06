@@ -417,6 +417,7 @@ class CompiledPopulationChunk:
             else torch.utils._pytree.tree_map_only(
                 torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
             ),
+            None if inputs.sampling_time is None else inputs.sampling_time.unsqueeze(0),
         )
         # A one-step kernel has no large rollout graph to bound, so the
         # inference-only structured prewarm is unnecessary in this hot path.
@@ -435,6 +436,7 @@ class CompiledPopulationChunk:
             inputs.noise,
             inputs.stimulation,
             inputs.draws,
+            inputs.sampling_time,
         )
         return self._execute_operands(
             operands,
@@ -560,6 +562,7 @@ class CompiledPopulationChunk:
             resolved.noise,
             resolved.stimulation,
             resolved.draws,
+            resolved.sampling_time,
         )
         return self._execute_operands(operands, prewarm_structured=True)
 
@@ -628,6 +631,7 @@ class _CompiledCallbackPopulationChunk:
             inputs.noise,
             inputs.stimulation,
             inputs.draws,
+            inputs.sampling_time,
         )
         transform_active = torch._C._are_functorch_transforms_active()
         forward_ad_active = torch.autograd.forward_ad._current_level >= 0
@@ -662,6 +666,7 @@ class _CompiledCallbackPopulationChunk:
                     inputs.noise,
                     inputs.stimulation,
                     inputs.draws,
+                    inputs.sampling_time,
                 )
             while_kernel = None
             if self._callback_while is not None and not grad_enabled:

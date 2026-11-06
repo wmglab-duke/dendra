@@ -40,6 +40,7 @@ from ._runners import (
     _runtime_extra_checkpoint_binding,
     _validate_chunklength,
 )
+from ._stimulation_clock import _accepted_bank_clock, _sampling_time_tape
 from ._stimuli import StimulusTensors
 from ._tensor_contracts import _tensor_tree_binding
 from ._types import FunctionalizationError, RolloutInput
@@ -193,6 +194,46 @@ def _resolve_inputs(
     return tape, steps
 
 
+def _sampling_populations(functional, tape, extra_names=()):
+    """Select invocation-grid banks before automatic draws are supplied."""
+    extra_names = frozenset(extra_names)
+    result = []
+    for name, plan in functional.populations.items():
+        if not (plan.intra.enabled or plan.extra.enabled or name in extra_names):
+            continue
+        selected = tape["populations"].get(name)
+        explicit = tape.get("draws") is not None or (
+            selected is not None
+            and (selected.draws is not None or selected.stimulation is not None)
+        )
+        if not _accepted_bank_clock(plan, explicit):
+            result.append(name)
+    return tuple(result)
+
+
+def _with_sampling_times(
+    functional, tape, state, steps, *, origin=None, start=0, names=None
+):
+    """Attach bounded per-Population timestamps without changing neural clocks."""
+    if names is None:
+        names = _sampling_populations(functional, tape)
+    if not names:
+        return tape
+    origin = state["clock"]["t"] if origin is None else origin
+    populations = dict(tape["populations"])
+    changed = False
+    for name in names:
+        selected = populations.get(name, _RuntimeInputs())
+        if selected.sampling_time is None:
+            populations[name] = selected._replace(
+                sampling_time=_sampling_time_tape(
+                    functional.populations[name], origin, start, steps, functional.dt
+                )
+            )
+            changed = True
+    return {**tape, "populations": populations} if changed else tape
+
+
 def sample_draw_tape(functional, state, steps):
     """Sample sequentially from an independent generator, never a batched rand."""
     if torch.compiler.is_compiling():
@@ -316,6 +357,7 @@ def rollout(
         _validate_tree(constants, functional._constant_schema, "constants")
         values = functional._prepare_values(parameters, constants)
     with nullcontext() if functional.training else torch.no_grad():
+        tape = _with_sampling_times(functional, tape, state, steps)
         state, auxiliary, callback_state, emitted = _eager_values(
             functional,
             parameters,
@@ -689,6 +731,7 @@ class CompiledNetworkChunk:
             tape, _ = _resolve_inputs(functional, inputs, self.steps, draws=draws)
             values = functional._validate_prepared(prepared, parameters)
             with nullcontext() if functional.training else torch.no_grad():
+                tape = _with_sampling_times(functional, tape, state, self.steps)
                 state, auxiliary, callback_state, emitted = self._values(
                     parameters, values, state, tape, callbacks, callback_state
                 )
@@ -838,6 +881,22 @@ def run(
         runtime_extra_binding() if checkpoint_active and extra_plans else None
     )
     auxiliary = _auxiliary(functional, state)
+    sampling_names = _sampling_populations(
+        functional,
+        tape,
+        (
+            name
+            for name, plan in extra_plans.items()
+            if plan is not None and plan.uses_waveforms
+        ),
+    )
+    sampling_origin = state["clock"]["t"] if sampling_names else None
+    bound_sampling_names = tuple(
+        name
+        for name in sampling_names
+        if functional.populations[name].intra.enabled
+        or functional.populations[name].extra.enabled
+    )
 
     def span(
         parameters_in,
@@ -846,6 +905,7 @@ def run(
         tape_in,
         callback_in,
         extra_in,
+        sampling_origin_in,
         span_steps,
         span_start,
     ):
@@ -875,20 +935,47 @@ def run(
         )
         auxiliary_in = _auxiliary(functional, state_in)
         for start, stop in _execution_spans(span_steps, kernel_width):
-            selected = _slice(tape_in, start, stop)
+            selected = _with_sampling_times(
+                functional,
+                _slice(tape_in, start, stop),
+                state_in,
+                stop - start,
+                origin=sampling_origin_in,
+                start=span_start + start,
+                names=bound_sampling_names,
+            )
             if extra_plans:
                 populations = dict(selected["populations"])
-                clock = state_in["clock"]
-                indices = clock["step"] + torch.arange(
-                    stop - start,
-                    device=clock["step"].device,
-                    dtype=clock["step"].dtype,
-                )
-                times = (
-                    clock["origin"] + indices.to(clock["origin"].dtype) * functional.dt
-                ).detach()
                 for name, extra_plan in extra_plans.items():
                     plan = functional.populations[name]
+                    times = populations.get(name, _RuntimeInputs()).sampling_time
+                    if times is None and name in sampling_names:
+                        # Runtime-only slots produce explicit voltage inputs;
+                        # do not add unused timing operands to their kernel schema.
+                        times = _sampling_time_tape(
+                            plan,
+                            sampling_origin_in,
+                            span_start + start,
+                            stop - start,
+                            functional.dt,
+                        )
+                    if times is None:
+                        # Explicit Poisson-bank replay retains the authoritative
+                        # Network clock accepted at each numerical transition.
+                        clock = state_in["clock"]
+                        indices = clock["step"] + torch.arange(
+                            stop - start,
+                            device=clock["step"].device,
+                            dtype=clock["step"].dtype,
+                        )
+                        times = (
+                            (
+                                clock["origin"]
+                                + indices.to(clock["origin"].dtype) * functional.dt
+                            )
+                            .detach()
+                            .to(device=plan.device, dtype=plan.dtype)
+                        )
                     packet = extra_in[name]
                     tensors = (
                         None
@@ -1031,6 +1118,7 @@ def run(
                 tape_in,
                 callback_in,
                 extra_in,
+                sampling_origin_in,
                 span_steps=span_steps,
                 span_start=start,
                 packet_source=packet_source,
@@ -1049,6 +1137,7 @@ def run(
                     tape_in,
                     callback_in,
                     extra_in,
+                    sampling_origin_in,
                     span_steps,
                     span_start,
                 )
@@ -1060,6 +1149,7 @@ def run(
                 selected,
                 callback_state,
                 extra_values,
+                sampling_origin,
             )
             if not checkpoint_active:
                 state, auxiliary, callback_state, emitted = execute(*operands)

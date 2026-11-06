@@ -27,3 +27,6 @@ tests/func/test_voltage_continuation.py
 tests/func/test_scnv.py
 tests/func/test_scnv_guards.py
 tests/func/test_convenience_runner.py::test_top_level_compile_is_the_exported_functional_compile_alias
+tests/func/test_stimulation_clock.py
+tests/func/test_network_stimulation_clock.py
+tests/func/test_primary_range_sources.py

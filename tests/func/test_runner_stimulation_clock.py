@@ -1,4 +1,4 @@
-"""Compiled host chunks must sample bound waveforms at the recurrent clock."""
+"""Host invocation grids and atomic accepted-step clocks remain distinct."""
 
 from functools import partial
 
@@ -14,7 +14,7 @@ DT = 0.01
 STEPS = 8
 
 
-def _case(stimulus_kind):
+def _source_case(stimulus_kind):
     # Repeated float32 additions reach this pulse; start + arange * dt misses
     # it. A pulse at the final step also makes the extracellular effect visible
     # before subsequent axial relaxation can hide a sampling error.
@@ -42,6 +42,11 @@ def _case(stimulus_kind):
         model.initialize()
         model.t.fill_(1000.0)
         model.train()
+    return model, extra, waveform
+
+
+def _case(stimulus_kind):
+    model, extra, _waveform = _source_case(stimulus_kind)
     functional, tensors = dn.func.make_functional(model, dt=DT, extra=extra)
     parameters = {
         name: value.detach().clone() for name, value in tensors.parameters.items()
@@ -54,6 +59,16 @@ def _case(stimulus_kind):
     amplitude = parameters[amplitude_name].requires_grad_()
     prepared = functional.prepare(parameters, tensors.constants)
     return functional, tensors, parameters, prepared, amplitude
+
+
+def _native_invocation(stimulus_kind, runner, *, chunklength=STEPS):
+    """Execute the corresponding native caller, including its grid arithmetic."""
+    model, extra, waveform = _source_case(stimulus_kind)
+    options = {} if runner is dn.func.run else {"chunklength": chunklength}
+    getattr(model, runner.__name__)(steps=STEPS, dt=DT, extra=extra, **options)
+    voltage = model.v
+    gradient = torch.autograd.grad(voltage.square().mean(), waveform.amp)[0]
+    return voltage, model.t, gradient
 
 
 @pytest.mark.parametrize("stimulus_kind", ["intra", "extra"])
@@ -72,6 +87,15 @@ def test_compiled_runner_bound_waveforms_preserve_clock_and_gradients(stimulus_k
     chunk = functional.compile_rollout_chunk(STEPS, backend="aot_eager")
     step = partial(chunk, parameters, prepared)
     with torch_compiler_warning_context():
+        accepted_chunk = functional.compile_rollout_chunk(1, backend="aot_eager")
+        accepted = tensors.state
+        for _ in range(STEPS):
+            accepted, _ = accepted_chunk(parameters, prepared, accepted)
+        accepted_gradient = torch.autograd.grad(
+            accepted["integrator"]["v"].square().mean(), amplitude
+        )[0]
+        torch.testing.assert_close(accepted["integrator"]["v"], expected_voltage)
+        torch.testing.assert_close(accepted_gradient, expected_gradient)
         for runner in (dn.func.run, dn.func.longrun, dn.func.longrun_checkpointed):
             if runner is dn.func.run:
                 actual, _auxiliary = runner(
@@ -81,13 +105,20 @@ def test_compiled_runner_bound_waveforms_preserve_clock_and_gradients(stimulus_k
                 actual, _auxiliary = runner(
                     functional, step, tensors.state, STEPS * DT, STEPS
                 )
+            native_voltage, native_time, native_gradient = _native_invocation(
+                stimulus_kind, runner
+            )
             actual_voltage = actual["integrator"]["v"]
             actual_gradient = torch.autograd.grad(
                 actual_voltage.square().mean(), amplitude
             )[0]
-            torch.testing.assert_close(actual_voltage, expected_voltage)
-            torch.testing.assert_close(actual_gradient, expected_gradient)
-            torch.testing.assert_close(actual["clock"]["t"], expected["clock"]["t"])
+            torch.testing.assert_close(actual_voltage, native_voltage)
+            torch.testing.assert_close(actual_gradient, native_gradient)
+            torch.testing.assert_close(actual["clock"]["t"], native_time)
+            # This exact edge is active only on the repeatedly added clock.
+            # Whole-run callers precompute an invocation-local arange grid.
+            assert not torch.equal(actual_voltage, expected_voltage)
+            assert torch.count_nonzero(actual_gradient) == 0
 
 
 @pytest.mark.parametrize("stimulus_kind", ["intra", "extra"])

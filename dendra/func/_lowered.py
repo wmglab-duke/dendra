@@ -36,6 +36,7 @@ class _PopulationChunkOperands(NamedTuple):
     noise: object = None
     stimulation: object = None
     draws: object = None
+    sampling_times: torch.Tensor | None = None
 
 
 class _LoweredPopulationChunk:
@@ -101,6 +102,7 @@ class _LoweredPopulationChunk:
             resolved.noise,
             resolved.stimulation,
             resolved.draws,
+            resolved.sampling_time,
         )
 
     def __call__(
@@ -114,19 +116,20 @@ class _LoweredPopulationChunk:
         noise=None,
         stimulation=None,
         draws=None,
+        sampling_times=None,
     ):
         """Execute the pure tensor transition for exactly ``steps`` steps."""
         if self._stepwise_stimulation or _has_runtime_stimulation(stimulation, draws):
-            # A host step samples bound Waveforms at its accepted clock. A
-            # vector start + arange * dt can round differently from repeated
-            # clock additions and miss narrow pulses. Preserve that recurrence
-            # inside the fixed compiled chunk; compiler size is bounded by C.
+            # Each evaluation retains its authored order; the host can supply
+            # native invocation-grid times independently of accepted clocks.
             for index in range(self._steps):
                 state, auxiliary = self._functional._step_values(
                     parameters,
                     prepared,
                     state,
-                    _index_runtime_inputs(ve, intra, noise, stimulation, index, draws),
+                    _index_runtime_inputs(
+                        ve, intra, noise, stimulation, index, draws, sampling_times
+                    ),
                 )
             return state, auxiliary
         if self._force_unrolled:
@@ -137,6 +140,7 @@ class _LoweredPopulationChunk:
                 intra,
                 self._steps,
                 prepared["integrator"]["dt"],
+                sampling_times=sampling_times,
             )
             return self._functional._transition_rollout_values(
                 parameters,
@@ -159,6 +163,7 @@ class _LoweredPopulationChunk:
             noise,
             stimulation,
             draws,
+            sampling_times,
         )
 
 
@@ -189,6 +194,7 @@ class _LoweredCallbackPopulationChunk:
         noise=None,
         stimulation=None,
         draws=None,
+        sampling_times=None,
     ):
         def update(carries, state, auxiliary):
             return _update_callback_values(self._plans, carries, state, auxiliary)
@@ -211,6 +217,7 @@ class _LoweredCallbackPopulationChunk:
             stimulation,
             draws,
             stepwise_stimulation=self._stepwise_stimulation,
+            sampling_times=sampling_times,
         )
 
 

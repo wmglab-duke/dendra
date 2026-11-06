@@ -46,6 +46,7 @@ from ._runtime_extra import (
     VarInput,
 )
 from ._snapshot import _snapshot_frames
+from ._stimulation_clock import _accepted_bank_clock, _sampling_time_tape
 from ._types import FunctionalizationError
 
 _OWNED_PREPARE = FunctionalPopulation.prepare
@@ -389,6 +390,9 @@ class CompiledRunner:
         if self._callbacks is None and callback_state is not None:
             raise ValueError("callback_state requires callbacks")
         functional = self._functional
+        explicit_stimulation = inputs is not None and (
+            inputs.draws is not None or inputs.stimulation is not None
+        )
         functional._validate_state(state)
         values = functional._validate_prepared(prepared, parameters)
         steps = min(self._kernel.steps, horizon)
@@ -465,6 +469,20 @@ class CompiledRunner:
             raise FunctionalizationError(
                 "execution='while' has no functional callback loop executor"
             )
+        sampling_times = None if inputs is None else inputs.sampling_time
+        if (
+            sampling_times is None
+            and (functional.intra.enabled or functional.extra.enabled)
+            and not _accepted_bank_clock(functional, explicit_stimulation)
+        ):
+            sampling_times = _sampling_time_tape(
+                functional,
+                state["clock"]["t"],
+                0,
+                steps,
+                _bound_runner_dt(functional, values),
+                clock_dt=values["integrator"]["dt"],
+            )
         kernel, reason = executor.kernel_for(
             parameters,
             values,
@@ -475,6 +493,7 @@ class CompiledRunner:
             None if inputs is None else inputs.noise,
             None if inputs is None else inputs.stimulation,
             None if inputs is None else inputs.draws,
+            sampling_times,
         )
         if kernel is None:
             raise FunctionalizationError(f"execution='while' is unavailable: {reason}")
@@ -692,6 +711,27 @@ def _execute_population_runner(
             or self._chunk_steps < selected_steps
             or bool(getattr(self._callbacks, "_storage", None))
         )
+        if (
+            self._execution == "while"
+            and not bounded_while
+            and (self._functional.intra.enabled or self._functional.extra.enabled)
+            and not _accepted_bank_clock(
+                self._functional,
+                inputs.draws is not None or inputs.stimulation is not None,
+            )
+        ):
+            # Freeze the caller's bank policy before automatic sampling fills
+            # draw packets; generated packets do not select native replay mode.
+            inputs = inputs._replace(
+                sampling_time=_sampling_time_tape(
+                    self._functional,
+                    selected_state["clock"]["t"],
+                    0,
+                    selected_steps,
+                    _bound_runner_dt(self._functional, prepared.values),
+                    clock_dt=prepared.values["integrator"]["dt"],
+                )
+            )
         if self._runtime_extra and inputs.ve is not None:
             raise ValueError("explicit ve cannot be combined with runtime extra")
         if inputs.draws is not None:

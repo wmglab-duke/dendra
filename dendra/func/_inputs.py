@@ -44,6 +44,8 @@ class _RuntimeInputs(NamedTuple):
     noise: object = None
     stimulation: object = None
     draws: RuntimeDraws | None = None
+    # Bank sampling coordinates are independent of the accepted solver clock.
+    sampling_time: torch.Tensor | None = None
 
 
 def _population_inputs(inputs, *, step=False):
@@ -76,7 +78,9 @@ def _slice_runtime_inputs(inputs, start, stop):
     return pytree.tree_map_only(torch.Tensor, lambda value: value[start:stop], inputs)
 
 
-def _index_runtime_inputs(ve, intra, noise, stimulation, index, draws=None):
+def _index_runtime_inputs(
+    ve, intra, noise, stimulation, index, draws=None, sampling_time=None
+):
     """Select one frame in deterministic, legacy, then canonical packet order."""
     return _RuntimeInputs(
         None if ve is None else ve[index],
@@ -88,6 +92,7 @@ def _index_runtime_inputs(ve, intra, noise, stimulation, index, draws=None):
         None
         if draws is None
         else pytree.tree_map_only(torch.Tensor, lambda value: value[index], draws),
+        None if sampling_time is None else sampling_time[index],
     )
 
 

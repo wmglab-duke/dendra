@@ -11,6 +11,7 @@ from test_runner_compiled_callbacks import _TraceMSE
 from test_runner_compiled_chunks import _run
 from test_runner_stimulation_clock import STEPS as CLOCK_STEPS
 from test_runner_stimulation_clock import _case as _clock_case
+from test_runner_stimulation_clock import _native_invocation
 from test_runners import (
     DT,
     _assert_tree_close,
@@ -223,12 +224,25 @@ def test_forward_scan_blocks_sample_bound_pulse_on_each_accepted_clock(
         atomic, _ = functional.rollout(
             parameters, prepared, tensors.state, steps=CLOCK_STEPS
         )
+        accepted = tensors.state
+        for _ in range(CLOCK_STEPS):
+            accepted, _ = functional.step(parameters, prepared, accepted)
     _assert_tree_close(actual, expected, rtol=0, atol=0)
+    with torch.enable_grad():
+        native_voltage, native_time, _gradient = _native_invocation(
+            stimulus_kind, dn.func.run
+        )
+    torch.testing.assert_close(
+        actual[0]["integrator"]["v"], native_voltage, rtol=0, atol=0
+    )
+    torch.testing.assert_close(actual[0]["clock"]["t"], native_time, rtol=0, atol=0)
     assert actual[1]["callbacks"]["trace"]["v"].shape[0] == CLOCK_STEPS + 1
-    # This pulse lies between the float32 vector clock and the repeatedly
-    # added accepted clock. A fixture without that difference would miss a
-    # block implementation that incorrectly precomputes all waveform times.
-    assert not torch.equal(actual[0]["integrator"]["v"], atomic["integrator"]["v"])
+    # Both vector grids miss this unchanged pulse; repeated accepted-step
+    # sampling reaches it. Keep both lower-level contracts explicit.
+    torch.testing.assert_close(
+        actual[0]["integrator"]["v"], atomic["integrator"]["v"], rtol=0, atol=0
+    )
+    assert not torch.equal(actual[0]["integrator"]["v"], accepted["integrator"]["v"])
 
 
 def _gradient_evaluation(functional, tensors, ve, intra, chunk=None):

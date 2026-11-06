@@ -45,6 +45,7 @@ from ._inputs import (
 from ._network_binding import BoundNetwork
 from ._population import FunctionalPopulation
 from ._recording import _host_recording, _recording_span
+from ._stimulation_clock import _accepted_bank_clock, _sampling_time_tape
 from ._stimuli import FunctionalExtra, StimulusTensors
 from ._tensor_contracts import _tensor_binding
 from ._types import FunctionalizationError, RolloutInput, StepInput
@@ -672,6 +673,7 @@ def _execute_steps(step, state, inputs: RolloutInput, steps: int):
                 inputs.stimulation,
                 index,
                 draws=inputs.draws,
+                sampling_time=inputs.sampling_time,
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -733,6 +735,7 @@ def _execute_steps_with_callbacks(
                 inputs.stimulation,
                 index,
                 draws=inputs.draws,
+                sampling_time=inputs.sampling_time,
             ),
         )
         if not isinstance(result, tuple) or len(result) != 2:
@@ -896,6 +899,20 @@ def _execute_chunks(
     runtime_extra_slot: bool = False,
 ):
     auxiliary = None
+    sampling_origin = state["clock"]["t"]
+    if functional.device.type == "mps" and (
+        functional.intra.enabled
+        or functional.extra.enabled
+        or extra_plan is not None
+        and extra_plan.uses_waveforms
+    ):
+        sampling_origin = sampling_origin.to(device="cpu")
+    accepted_bank_clock = (
+        _accepted_bank_clock(
+            functional, inputs.draws is not None or inputs.stimulation is not None
+        )
+        and inputs.sampling_time is None
+    )
     for start, stop in _execution_spans(steps, chunklength):
         start_clock = _capture_clock(state)
         chunk_inputs = _prepare_chunk_inputs(
@@ -910,6 +927,32 @@ def _execute_chunks(
         )
         if chunk_inputs.draws is not None and inputs.draws is None:
             step = _refresh_checkpoint_execution(step, state, source_validated=True)
+        clock_dt = (
+            step.prepared_values["integrator"]["dt"]
+            if isinstance(step, _StepExecution) and step.prepared_values is not None
+            else None
+        )
+        sampling_times = chunk_inputs.sampling_time
+        if (
+            sampling_times is None
+            and not accepted_bank_clock
+            and (
+                functional.intra.enabled
+                or functional.extra.enabled
+                or extra_plan is not None
+                and extra_plan.uses_waveforms
+            )
+        ):
+            sampling_times = _sampling_time_tape(
+                functional,
+                sampling_origin,
+                start,
+                stop - start,
+                dt,
+                clock_dt=clock_dt,
+            )
+            if functional.intra.enabled or functional.extra.enabled:
+                chunk_inputs = chunk_inputs._replace(sampling_time=sampling_times)
         extra_ve = _assemble_extra_chunk(
             functional,
             extra_plan,
@@ -920,11 +963,8 @@ def _execute_chunks(
             steps,
             dt,
             runtime_extra_slot=runtime_extra_slot,
-            clock_dt=(
-                step.prepared_values["integrator"]["dt"]
-                if isinstance(step, _StepExecution) and step.prepared_values is not None
-                else None
-            ),
+            times=sampling_times,
+            clock_dt=clock_dt,
         )
         if extra_ve is not None:
             chunk_inputs = chunk_inputs._replace(ve=extra_ve)
@@ -1007,6 +1047,20 @@ def _execute_checkpointed_chunks(
         None if full_draws is None else _runtime_draws_binding(full_draws)
     )
     auxiliary: Any = None
+    sampling_origin = state["clock"]["t"]
+    if functional.device.type == "mps" and (
+        functional.intra.enabled
+        or functional.extra.enabled
+        or extra_plan is not None
+        and extra_plan.uses_waveforms
+    ):
+        sampling_origin = sampling_origin.to(device="cpu")
+    accepted_bank_clock = (
+        _accepted_bank_clock(
+            functional, inputs.draws is not None or inputs.stimulation is not None
+        )
+        and inputs.sampling_time is None
+    )
     for start, stop in _execution_spans(steps, chunklength):
         chunk_steps = stop - start
         start_clock = _capture_clock(state)
@@ -1026,6 +1080,29 @@ def _execute_checkpointed_chunks(
         source_draws_binding = (
             None if source_draws is None else _runtime_draws_binding(source_draws)
         )
+        sampling_times = chunk_inputs.sampling_time
+        if (
+            sampling_times is None
+            and not accepted_bank_clock
+            and (
+                functional.intra.enabled
+                or functional.extra.enabled
+                or extra_plan is not None
+                and extra_plan.uses_waveforms
+            )
+        ):
+            sampling_times = _sampling_time_tape(
+                functional,
+                sampling_origin,
+                start,
+                chunk_steps,
+                dt,
+                clock_dt=(
+                    execution.prepared_values["integrator"]["dt"]
+                    if execution.prepared_values is not None
+                    else None
+                ),
+            )
         checkpoint_inputs = _materialize_checkpoint_tree(
             (
                 state,
@@ -1035,6 +1112,7 @@ def _execute_checkpointed_chunks(
                 chunk_inputs.noise,
                 chunk_inputs.stimulation,
                 chunk_inputs.draws,
+                sampling_times,
                 None if extra_tensors is None else extra_tensors.parameters,
                 None if extra_tensors is None else extra_tensors.constants,
             )
@@ -1048,6 +1126,7 @@ def _execute_checkpointed_chunks(
             noise,
             stimulation,
             draws,
+            sampling_times,
             extra_parameters,
             extra_constants,
             chunk_steps=chunk_steps,
@@ -1092,6 +1171,7 @@ def _execute_checkpointed_chunks(
                     total_steps,
                     dt,
                     runtime_extra_slot=runtime_extra_slot,
+                    times=sampling_times,
                     clock_dt=(
                         chunk_execution.prepared_values["integrator"]["dt"]
                         if chunk_execution.prepared_values is not None
@@ -1108,6 +1188,11 @@ def _execute_checkpointed_chunks(
                         noise=noise,
                         stimulation=stimulation,
                         draws=draws,
+                        sampling_time=(
+                            sampling_times
+                            if functional.intra.enabled or functional.extra.enabled
+                            else None
+                        ),
                     ),
                     chunk_steps,
                 )
@@ -1120,6 +1205,11 @@ def _execute_checkpointed_chunks(
                     noise=noise,
                     stimulation=stimulation,
                     draws=draws,
+                    sampling_time=(
+                        sampling_times
+                        if functional.intra.enabled or functional.extra.enabled
+                        else None
+                    ),
                 ),
                 chunk_steps,
                 callbacks,
