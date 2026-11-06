@@ -1,6 +1,6 @@
 """Run/resume 40 complete CPU/NEURON units with bounded process concurrency.
 
-GitLab keeps ten physical jobs, each owning four serial units by default.
+GitLab keeps forty physical jobs, each owning one complete logical unit.
 Without a job index, a local invocation owns all units. This orchestrator never
 changes pytest selection or splits a test module. Recovery replaces complete
 modules and delegates outcome/coverage reconciliation to recover_ci_shard.
@@ -27,7 +27,7 @@ except ImportError:
     from recover_ci_shard import _case, _duration, _read_artifact, _validate_outcome
 
 UNITS = 40
-JOBS = 10
+JOBS = UNITS
 MARKERS = "cpu or (neuron and not cuda)"
 THREADS = {
     "OMP_NUM_THREADS": "1",
@@ -45,6 +45,7 @@ ARTIFACTS = (
     "runner-context.json",
     "completion.json",
 )
+HEARTBEAT_SECONDS = 60
 
 
 def stamp():
@@ -65,6 +66,10 @@ def read(path):
 
 def write(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def progress(message):
+    print(f"[{stamp()}] {message}", file=sys.stderr, flush=True)
 
 
 def units_for_job(index):
@@ -142,7 +147,7 @@ def command(repo, output, index, *, total=UNITS, modules=None, collect=False):
     return result
 
 
-def execute(repo, output, cmd, context):
+def execute(repo, output, cmd, context, *, label="Pytest"):
     output.mkdir(parents=True)
     write(
         output / "runner-context.json",
@@ -159,39 +164,73 @@ def execute(repo, output, cmd, context):
     invocation["ci_job_url"] = os.environ.get("CI_JOB_URL")
     write(output / "invocation.json", invocation)
     started = time.monotonic()
-    with (output / "pytest.log").open("wb") as log:
-        status = subprocess.run(
+    log_path = output / "pytest.log"
+    progress(f"{label} started; log={log_path}")
+    with (
+        log_path.open("wb") as log,
+        subprocess.Popen(
             cmd, cwd=repo, env=environment(output), stdout=log, stderr=subprocess.STDOUT
-        ).returncode
+        ) as process,
+    ):
+        try:
+            while True:
+                try:
+                    status = process.wait(timeout=HEARTBEAT_SECONDS)
+                    break
+                except subprocess.TimeoutExpired:
+                    # This is a reporting interval, never a child execution limit.
+                    progress(
+                        f"{label} running after {time.monotonic() - started:.0f}s; "
+                        f"log={log_path}\n"
+                        + log_tail(log_path, max_bytes=3072, max_lines=6)
+                    )
+        except BaseException:
+            # Match subprocess.run cleanup on genuine interrupts/errors.
+            process.kill()
+            process.wait()
+            raise
+    elapsed = time.monotonic() - started
     write(
         output / "completion.json",
         {
             **invocation,
             "exitcode": status,
             "finished": stamp(),
-            "seconds": time.monotonic() - started,
+            "seconds": elapsed,
         },
     )
     seal(output)
+    progress(
+        f"{label} finished after {elapsed:.1f}s (pytest exit {status}); log={log_path}"
+    )
     return status
+
+
+def log_tail(log_path, *, max_bytes=16_384, max_lines=80, label="pytest"):
+    """Read bounded output, including a verbose test line without its newline."""
+    try:
+        with log_path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            offset = max(0, stream.tell() - max_bytes)
+            stream.seek(offset)
+            text = stream.read(max_bytes).decode("utf-8", errors="replace").encode()
+            # Replacement characters must not expand invalid bytes beyond the cap.
+            lines = text[-max_bytes:].decode("utf-8", errors="ignore").splitlines()
+    except OSError as error:
+        return f"Unable to read {label} log: {error}"
+    omitted = (
+        f"[earlier {label} output omitted]\n"
+        if offset or len(text) > max_bytes or len(lines) > max_lines
+        else ""
+    )
+    excerpt = "\n".join(lines[-max_lines:]) or f"[{label} log is empty]"
+    return f"{omitted}{excerpt}"
 
 
 def collection_failure(log_path, status):
     """Expose a bounded diagnostic tail while retaining the complete artifact."""
     message = f"Full-suite collection failed (pytest exit {status}); see {log_path}"
-    try:
-        with log_path.open("rb") as stream:
-            stream.seek(0, os.SEEK_END)
-            offset = max(0, stream.tell() - 16_384)
-            stream.seek(offset)
-            lines = stream.read(16_384).decode("utf-8", errors="replace").splitlines()
-    except OSError as error:
-        return f"{message}\nUnable to read collection log: {error}"
-    omitted = (
-        "[earlier collection output omitted]\n" if offset or len(lines) > 80 else ""
-    )
-    excerpt = "\n".join(lines[-80:]) or "[collection log is empty]"
-    return f"{message}\n{omitted}{excerpt}"
+    return f"{message}\n{log_tail(log_path, label='collection')}"
 
 
 def seal(directory):
@@ -441,6 +480,11 @@ def run_unit(repo, output_root, state, current, unit):
                     replacement,
                     command(repo, replacement, 1, total=1, modules=modules),
                     current,
+                    label=(
+                        f"Unit {unit} module retry "
+                        f"({sum(node.split('::', 1)[0] in modules for node in manifest['assigned_nodeids'])} "
+                        f"tests in {len(modules)} modules)"
+                    ),
                 )
                 if status:
                     return {
@@ -504,7 +548,16 @@ def run_unit(repo, output_root, state, current, unit):
                     }
             reason = "unsuccessful evidence has no safely identifiable failed module"
     staged = workspace / "fresh"
-    status = execute(repo, staged, command(repo, staged, unit), current)
+    status = execute(
+        repo,
+        staged,
+        command(repo, staged, unit),
+        current,
+        label=(
+            f"Unit {unit} fresh ({len(assigned(current, unit))} tests; "
+            f"profile estimate {current['estimated_loads'][unit - 1]:.0f}s; {reason})"
+        ),
+    )
     try:
         result = inspect_artifacts(staged, unit, current)
         if status or result["exitstatus"] != 0 or recovery_modules(repo, result):
@@ -564,10 +617,15 @@ def main():
             collection,
             command(repo, collection, 1, collect=True),
             {"action": "collect"},
+            label="Full-suite collection",
         )
         if status:
             raise ValueError(collection_failure(collection / "pytest.log", status))
         current = context(repo, read(collection / "manifest.json"))
+        progress(
+            f"Full-suite collection complete: {len(current['selected_nodeids'])} selected tests; "
+            f"owned units={units}; log={collection / 'pytest.log'}"
+        )
         records = []
         with ThreadPoolExecutor(max_workers=args.workers) as workers:
             pending = {
@@ -585,6 +643,17 @@ def main():
                     }
                 records.append(result)
                 print(json.dumps(result), flush=True)
+                if result["status"] == "failed":
+                    details = result.get("retry", result.get("output"))
+                    progress(
+                        f"Unit {result['unit']} failed: {result.get('reason', 'unknown reason')}"
+                        + (
+                            f"; log={Path(details) / 'pytest.log'}\n"
+                            + log_tail(Path(details) / "pytest.log")
+                            if details
+                            else ""
+                        )
+                    )
                 write(
                     state / "results.json",
                     {"units": units, "workers": args.workers, "results": records},

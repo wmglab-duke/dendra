@@ -7,7 +7,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import coverage
 
@@ -120,17 +120,33 @@ class ShardRunnerTests(unittest.TestCase):
         runner.seal(directory)
         return manifest
 
-    def test_ten_jobs_cover_all_forty_units_once(self):
-        owners = [runner.units_for_job(index) for index in range(1, 11)]
-        self.assertTrue(all(len(units) == 4 for units in owners))
+    def test_forty_jobs_own_one_complete_unit_each(self):
+        self.assertEqual(runner.JOBS, runner.UNITS)
+        self.assertEqual(runner.UNITS, 40)
+        owners = [runner.units_for_job(index) for index in range(1, 41)]
+        self.assertEqual(owners, [[unit] for unit in range(1, 41)])
         self.assertEqual(
             sorted(unit for units in owners for unit in units), list(range(1, 41))
         )
         self.assertEqual(runner.units_for_job(None), list(range(1, 41)))
-        self.assertEqual(runner.units_for_job(1), [1, 11, 21, 31])
-        for index in (0, 11, True, 1.5):
+        for index in (0, 41, True, 1.5):
             with self.subTest(index=index), self.assertRaises(ValueError):
                 runner.units_for_job(index)
+        for total in (10, 39, 41):
+            error = io.StringIO()
+            with (
+                self.subTest(total=total),
+                patch.object(sys, "argv", [str(SCRIPT), "--job-index=1"]),
+                patch.dict(runner.os.environ, {"CI_NODE_TOTAL": str(total)}),
+                patch.object(
+                    runner, "repository", side_effect=AssertionError("No collection")
+                ),
+                redirect_stderr(error),
+                self.assertRaises(SystemExit) as failure,
+            ):
+                runner.main()
+            self.assertEqual(failure.exception.code, 2)
+            self.assertIn("GitLab ownership requires exactly 40 jobs", error.getvalue())
 
     def test_cli_rejects_unignored_output_before_starting_collection(self):
         subprocess.run(["git", "init", "-q"], cwd=self.repo, check=True)
@@ -164,7 +180,7 @@ class ShardRunnerTests(unittest.TestCase):
             + "Interrupted: 1 error during collection\n"
         )
 
-        def execute(repo, output, command, context):
+        def execute(repo, output, command, context, *, label):
             self.assertIn("--collect-only", command)
             self.assertIn("--cov-branch", command)
             self.assertEqual(command[command.index("-W") + 1], "error")
@@ -176,7 +192,7 @@ class ShardRunnerTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", [str(SCRIPT), "--output-dir", str(self.output)]),
             patch.dict(
-                runner.os.environ, {"CI_NODE_INDEX": "1", "CI_NODE_TOTAL": "10"}
+                runner.os.environ, {"CI_NODE_INDEX": "1", "CI_NODE_TOTAL": "40"}
             ),
             patch.object(runner, "repository", return_value=self.repo),
             patch.object(runner, "validate_output"),
@@ -203,7 +219,7 @@ class ShardRunnerTests(unittest.TestCase):
         self.assertLess(len(message), 17_000)
 
     def test_successful_collection_does_not_echo_its_log(self):
-        def execute(repo, output, command, context):
+        def execute(repo, output, command, context, *, label):
             output.mkdir()
             (output / "pytest.log").write_text("Successful collection detail\n")
             runner.write(output / "manifest.json", {})
@@ -213,7 +229,7 @@ class ShardRunnerTests(unittest.TestCase):
         with (
             patch.object(sys, "argv", [str(SCRIPT), "--output-dir", str(self.output)]),
             patch.dict(
-                runner.os.environ, {"CI_NODE_INDEX": "1", "CI_NODE_TOTAL": "10"}
+                runner.os.environ, {"CI_NODE_INDEX": "1", "CI_NODE_TOTAL": "40"}
             ),
             patch.object(runner, "repository", return_value=self.repo),
             patch.object(runner, "validate_output"),
@@ -227,8 +243,149 @@ class ShardRunnerTests(unittest.TestCase):
             redirect_stdout(output),
         ):
             self.assertEqual(runner.main(), 0)
-        self.assertEqual(error.getvalue(), "")
+        self.assertIn("Full-suite collection complete", error.getvalue())
+        self.assertNotIn("Successful collection detail", error.getvalue())
         self.assertNotIn("Successful collection detail", output.getvalue())
+
+    def test_heartbeats_preserve_process_and_artifacts_without_limiting_runtime(self):
+        command = ["python", "-m", "pytest", "tests", "-v"]
+        original = list(command)
+        raw = (
+            b"completed test output\n" * 10_000
+            + b"tests/test_a.py::test_current[partial]"
+        )
+        for status in (0, 1):
+            with self.subTest(status=status):
+                output = self.state / f"execution-{status}"
+                process = MagicMock()
+                process.wait.side_effect = [
+                    subprocess.TimeoutExpired(command, 60),
+                    status,
+                ]
+                context = MagicMock()
+                context.__enter__.return_value = process
+
+                def launch(*args, **kwargs):
+                    kwargs["stdout"].write(raw)
+                    kwargs["stdout"].flush()
+                    return context
+
+                error = io.StringIO()
+                with (
+                    patch.object(
+                        runner.subprocess, "Popen", side_effect=launch
+                    ) as popen,
+                    patch.object(
+                        runner.subprocess, "check_output", return_value="head\n"
+                    ),
+                    patch.object(runner.time, "monotonic", side_effect=[100, 160, 161]),
+                    redirect_stderr(error),
+                ):
+                    self.assertEqual(
+                        runner.execute(
+                            self.repo, output, command, {}, label="Unit 1 fresh"
+                        ),
+                        status,
+                    )
+                self.assertEqual(command, original)
+                self.assertEqual(popen.call_args.args, (command,))
+                self.assertEqual(popen.call_args.kwargs["cwd"], self.repo)
+                self.assertEqual(
+                    popen.call_args.kwargs["env"], runner.environment(output)
+                )
+                self.assertEqual(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
+                self.assertEqual(
+                    process.wait.call_args_list, [call(timeout=60), call(timeout=60)]
+                )
+                process.kill.assert_not_called()
+                process.terminate.assert_not_called()
+                self.assertEqual((output / "pytest.log").read_bytes(), raw)
+                completion = runner.read(output / "completion.json")
+                self.assertEqual(completion["exitcode"], status)
+                self.assertEqual(completion["seconds"], 61)
+                self.assertEqual(completion["command"], command)
+                self.assertEqual(
+                    set(runner.read(output / "artifact-hashes.json")),
+                    {
+                        "runner-context.json",
+                        "invocation.json",
+                        "completion.json",
+                        "pytest.log",
+                    },
+                )
+                lines = error.getvalue().splitlines()
+                self.assertIn("Unit 1 fresh started", lines[0])
+                self.assertIn(f"pytest exit {status}", lines[-1])
+                heartbeat = "\n".join(lines[1:-1])
+                self.assertIn("running after 60s", heartbeat)
+                self.assertIn("tests/test_a.py::test_current[partial]", heartbeat)
+                self.assertLessEqual(len(heartbeat.splitlines()), 8)
+                self.assertLess(len(heartbeat.encode()), 4096)
+
+    def test_real_wait_errors_and_interrupts_cleanup_the_child(self):
+        for failure in (RuntimeError("wait failed"), KeyboardInterrupt()):
+            with self.subTest(failure=type(failure).__name__):
+                output = self.state / type(failure).__name__
+                process = MagicMock()
+                process.wait.side_effect = [failure, 0]
+                context = MagicMock()
+                context.__enter__.return_value = process
+                with (
+                    patch.object(runner.subprocess, "Popen", return_value=context),
+                    patch.object(
+                        runner.subprocess, "check_output", return_value="head\n"
+                    ),
+                    redirect_stderr(io.StringIO()),
+                    self.assertRaises(type(failure)) as raised,
+                ):
+                    runner.execute(self.repo, output, ["python"], {})
+                self.assertIs(raised.exception, failure)
+                process.kill.assert_called_once_with()
+                process.terminate.assert_not_called()
+                self.assertEqual(
+                    process.wait.call_args_list, [call(timeout=60), call()]
+                )
+                self.assertFalse((output / "completion.json").exists())
+
+    def test_unit_failures_expose_bounded_tail_only_on_stderr(self):
+        failed = self.output / "1"
+        failed.mkdir()
+        (failed / "pytest.log").write_text(
+            "old test output\n" * 10_000
+            + "Traceback (most recent call last):\nRuntimeError: unit failure\n"
+        )
+        result = {
+            "unit": 1,
+            "status": "failed",
+            "reason": "pytest/unit failed with exit 1",
+            "output": str(failed),
+        }
+
+        def execute(repo, output, command, context, *, label):
+            output.mkdir()
+            runner.write(output / "manifest.json", {})
+            return 0
+
+        error, output = io.StringIO(), io.StringIO()
+        with (
+            patch.object(sys, "argv", [str(SCRIPT), "--output-dir", str(self.output)]),
+            patch.object(runner, "repository", return_value=self.repo),
+            patch.object(runner, "validate_output"),
+            patch.object(runner, "execute", side_effect=execute),
+            patch.object(runner, "context", return_value=self.current),
+            patch.object(runner, "units_for_job", return_value=[1]),
+            patch.object(runner, "run_unit", return_value=result),
+            redirect_stderr(error),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(runner.main(), 1)
+        self.assertEqual(runner.json.loads(output.getvalue()), result)
+        self.assertIn("Unit 1 failed", error.getvalue())
+        self.assertIn(str(failed / "pytest.log"), error.getvalue())
+        self.assertIn("RuntimeError: unit failure", error.getvalue())
+        self.assertIn("earlier pytest output omitted", error.getvalue())
+        self.assertLessEqual(len(error.getvalue().splitlines()), 84)
+        self.assertLess(len(error.getvalue()), 17_000)
 
     def test_collection_diagnostics_handle_missing_empty_and_non_utf8_logs(self):
         log = self.state / "pytest.log"
@@ -245,6 +402,10 @@ class ShardRunnerTests(unittest.TestCase):
         bounded = runner.collection_failure(log, 2)
         self.assertLess(len(bounded), 17_000)
         self.assertIn("RuntimeError: final error", bounded)
+        log.write_bytes(b"\xff" * 100_000 + b"\ntests/test_a.py::test_current")
+        heartbeat = runner.log_tail(log, max_bytes=3072, max_lines=6)
+        self.assertLess(len(heartbeat.encode()), 3200)
+        self.assertTrue(heartbeat.endswith("tests/test_a.py::test_current"))
 
     def test_valid_unit_resumes_without_invoking_tests(self):
         self.artifact(self.output / "1")
@@ -315,7 +476,7 @@ class ShardRunnerTests(unittest.TestCase):
         self.artifact(directory)
         (directory / "junit.xml").unlink()
 
-        def execute(repo, output, command, context):
+        def execute(repo, output, command, context, *, label):
             self.assertIn("tests", command)
             self.assertIn("--ci-shard-total=40", command)
             self.artifact(output)
@@ -344,7 +505,7 @@ class ShardRunnerTests(unittest.TestCase):
         self.current["source_snapshot"]["config"]["selective_recovery_safe"] = False
         self.artifact(self.output / "1", failure=True)
 
-        def execute(repo, output, command, context):
+        def execute(repo, output, command, context, *, label):
             self.assertIn("--ci-shard-total=40", command)
             self.assertFalse(
                 any(arg.startswith("--ci-recovery-module=") for arg in command)
@@ -362,7 +523,7 @@ class ShardRunnerTests(unittest.TestCase):
         self.artifact(self.output / "1")
         (self.repo / self.module).write_text("# changed fixture, stable test IDs\n")
 
-        def execute(repo, output, command, context):
+        def execute(repo, output, command, context, *, label):
             self.assertIn("--ci-recovery-module=" + self.module, command)
             self.assertIn("tests", command)
             self.assertIn("--ci-shard-total=1", command)

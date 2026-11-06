@@ -43,7 +43,9 @@ def test_independent_runtime_streams_follow_native_request_order(monkeypatch, ro
         observed.setattr(RNGModule, "randn", normal)
         observed.setattr(native_pulse, "fn", MethodType(poisson, native_pulse))
         _step_native(native, native_extra)
-    if not owned_fn:
+    # Older pytest restores an inherited method as an instance shadow; newer
+    # pytest removes the temporary attribute itself during undo.
+    if not owned_fn and "fn" in vars(native_pulse):
         delattr(native_pulse, "fn")
 
     draw = _runtime_sampling.sample_random_parameter_draw

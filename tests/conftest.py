@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import os
+import platform
 import re
-from pathlib import PurePosixPath
+import sys
+from pathlib import Path, PurePosixPath
 
 import pytest
 
@@ -11,6 +14,8 @@ import pytest
 # initialization is deterministic. TorchInductor cache configuration is opt-in.
 import dendra  # noqa: F401
 from dendra._bootstrap import reset_torch_compiler
+
+import torch  # isort: skip
 
 _MPS_REASON = re.compile(r"\b(?:mps|metal)\b", re.IGNORECASE)
 
@@ -56,6 +61,47 @@ _UPSTREAM_COMPILER_WARNING_FILTERS = (
         ),
     )
 )
+
+
+def _cpu_lacks_sse41():
+    """Require readable x86 flag records before classifying an old CI CPU."""
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return False
+    flags = [
+        set(value.split())
+        for line in cpuinfo.splitlines()
+        for name, separator, value in [line.partition(":")]
+        if separator and name.strip() == "flags"
+    ]
+    return bool(flags) and all(
+        "sse2" in values and "sse4_1" not in values for values in flags
+    )
+
+
+def pytest_configure(config):
+    """Use native Torch kernels on CI hosts below oneDNN's x86 ISA floor."""
+    if (
+        os.environ.get("CI", "").casefold() not in {"true", "1"}
+        or sys.platform != "linux"
+        or platform.machine().casefold() not in {"x86_64", "amd64"}
+    ):
+        return
+    backend = torch.backends.mkldnn
+    if not backend.is_available() or not backend.enabled or not _cpu_lacks_sse41():
+        return
+    original = backend.enabled
+    config.add_cleanup(lambda: setattr(backend, "enabled", original))
+    backend.enabled = False
+    config._dendra_ci_cpu_backend = (
+        "CI CPU policy: native Torch kernels; MKLDNN disabled because "
+        "Linux x86 CPU flags lack SSE4.1."
+    )
+
+
+def pytest_report_header(config):
+    return getattr(config, "_dendra_ci_cpu_backend", None)
 
 
 @pytest.fixture(autouse=True)

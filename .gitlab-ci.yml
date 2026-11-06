@@ -149,18 +149,21 @@ test_base_install:
 test_shards:
   extends: .full_test_rules
   stage: test
-  parallel: 10
+  timeout: 3 hours
+  parallel: 40
   # Keep dependency downloads separate from branch/job-scoped unit evidence.
   cache:
     - key: "$CI_JOB_NAME_SLUG"
       paths:
         - .cache/pip
-    - key: "ci-units-v1-$CI_COMMIT_REF_SLUG-$CI_NODE_INDEX"
+    - key: "ci-units-v2-$CI_COMMIT_REF_SLUG-$CI_NODE_INDEX"
       paths:
         - ci-results/
       policy: pull-push
       when: always
   variables:
+    # Leave time to upload completed units and diagnostic logs on a script timeout.
+    RUNNER_SCRIPT_TIMEOUT: "2h45m"
     OMP_NUM_THREADS: "1"
     MKL_NUM_THREADS: "1"
     OPENBLAS_NUM_THREADS: "1"
@@ -168,7 +171,7 @@ test_shards:
     TORCHINDUCTOR_COMPILE_THREADS: "1"
   script:
     - python -m pip install pytest pytest-cov hypothesis neuron
-    # Forty complete module-preserving logical units, four per physical job.
+    # Forty complete module-preserving units, each with its own job budget.
     # Valid branch-cache units resume; eligible test-body changes recover with
     # complete module reruns and provenance-checked coverage replacement.
     - python scripts/run_ci_shards.py --job-index="$CI_NODE_INDEX" --workers=1 --output-dir=ci-results

@@ -85,10 +85,13 @@ def test_private_cpp_preference_preserves_other_codegen_choices(
     options = {"backend": "inductor"}
     if source == "options":
         options["options"] = {setting.replace("_", "-"): True}
-    else:
-        monkeypatch.setattr(config, setting, True)
-    _compile_scan(lambda: None, options, prefer_cpp_wrapper=True)
-    assert "cpp_wrapper" not in captured["options"]["backend"].config
+    previous = getattr(config, setting)
+    # These virtual attributes need Inductor's restoration protocol; generic
+    # setattr undo can delete the entry instead of restoring its value.
+    with config.patch({setting: True} if source == "ambient" else {}):
+        _compile_scan(lambda: None, options, prefer_cpp_wrapper=True)
+        assert "cpp_wrapper" not in captured["options"]["backend"].config
+    assert getattr(config, setting) is previous
 
 
 @pytest.mark.parametrize(

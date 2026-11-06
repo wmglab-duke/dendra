@@ -60,7 +60,9 @@ def test_request_order_matches_independently_observed_native_random_boundaries(
         observed.setattr(native_pulse, "fn", MethodType(poisson, native_pulse))
         observed.setattr(RNGModule, "randn", normal)
         _step_native(native, native_extra)
-    if not owned_fn:
+    # Older pytest restores an inherited method as an instance shadow; newer
+    # pytest removes the temporary attribute itself during undo.
+    if not owned_fn and "fn" in vars(native_pulse):
         delattr(native_pulse, "fn")
     requests = plan.runtime_requests()
     assert [

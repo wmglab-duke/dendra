@@ -202,12 +202,12 @@ python scripts/check_coverage_floors.py coverage.json
 
 ## Run the full lane as CI units
 
-GitLab keeps ten physical jobs and installs dependencies once per job. The
-required CPU/NEURON lane is divided into forty duration-balanced logical units,
-with complete test modules kept together. Each job runs four units serially;
-job 1 owns units 1, 11, 21 and 31. All forty units and the coverage aggregation
-must qualify before merging. The functional compiler compatibility matrix is
-an additional required check.
+The required CPU/NEURON lane is divided into forty duration-balanced units,
+with complete test modules kept together. GitLab runs each unit in a separate
+job, so job 1 owns unit 1. Each job installs its dependencies and has its own
+execution budget. All forty units and the coverage aggregation must qualify
+before merging. The functional compiler compatibility matrix is an additional
+required check.
 
 To run the same full lane locally with two concurrent unit processes:
 
@@ -218,8 +218,14 @@ python scripts/run_ci_shards.py --workers 2 --output-dir ci-results
 `--workers` controls process concurrency independently of the forty logical
 units. Keep it small enough for compiler memory use. Output and its sibling
 runner directory must be Gitignored or outside the checkout, so generated
-artifacts cannot change the source fingerprint. To run the four units
-owned by GitLab job 1, add `--job-index=1`; its default worker count is one.
+artifacts cannot change the source fingerprint. To run the unit owned by
+GitLab job 1, add `--job-index=1`; its default worker count is one.
+
+The runner reports collection and unit progress to stderr, including a bounded
+log tail every 60 seconds and a failure summary when a unit fails. Unit-result
+JSON stays on stdout. CI allows three hours per job and stops its script after
+two hours and 45 minutes, leaving time to upload completed evidence and logs.
+These deadlines fail the job; they do not skip tests or relax the coverage gates.
 
 Every unit records its full selected inventory, assignments, outcomes, source
 fingerprints and timings in `ci-results/<unit>/manifest.json`. Its command,
@@ -250,7 +256,16 @@ provenance remain visible. The same restrictions apply to local resume.
 
 Reuse is scoped to the same configured CPU/NEURON lane, image and device class.
 Fingerprints cover Python/packages, native sources and binaries, and runner
-options; they do not probe arbitrary environment variables or hardware.
+options; they do not record arbitrary environment variables or hardware features.
+Use fresh unit caches after changing a runner's CPU features or execution policy.
+
+On Linux x86 CI hosts that report CPU flags without SSE4.1, the test session
+uses PyTorch's native CPU backend instead of oneDNN, whose x86 implementation
+requires SSE4.1. The pytest header records this choice, and every test and
+assertion still runs. Capable CPUs retain their normal backend. Exposing the
+host CPU's supported features to the runner VM also enables its optimized
+kernels; timing results from a baseline virtual CPU are not representative of
+a modern CPU.
 
 After all forty units finish, validate their exact disjoint selected-ID
 partition and combine raw statement/branch coverage with:

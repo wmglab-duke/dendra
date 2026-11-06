@@ -30,7 +30,8 @@ class RunnerIntegrationTests(unittest.TestCase):
             )
             (root / "pyproject.toml").write_text(
                 '[tool.pytest.ini_options]\ntestpaths=["tests"]\n'
-                'markers=["cpu: portable tests"]\naddopts="--strict-markers"\n'
+                'markers=["cpu: portable tests", "neuron: simulator tests", '
+                '"cuda: accelerator tests"]\naddopts="--strict-markers"\n'
             )
             (root / ".coveragerc.cpu").write_text(
                 "[run]\nrelative_files=True\nbranch=True\nsource=dendra\n"
