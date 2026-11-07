@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from time import sleep
 from urllib.parse import quote, urlsplit, urlunsplit
 
 from packaging.version import Version
@@ -182,6 +183,12 @@ def release(repository: str, tag: str, commit: str, dist_dir: Path, changelog=No
                 command.extend(("--notes-file", str(path)))
             gh(*command)
         current = find_release(repository, tag)
+        # A created draft can take time to appear in the release listing.
+        for delay in (1, 2, 4, 8, 15, 30, 60):
+            if current is not None:
+                break
+            sleep(delay)
+            current = find_release(repository, tag)
         if current is None:
             raise ValueError("Created draft could not be found.")
     if current["prerelease"] != version.is_prerelease:

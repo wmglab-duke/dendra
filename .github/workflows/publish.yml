@@ -147,6 +147,29 @@ jobs:
         run: |
           cd "$RUNNER_TEMP"
           python -I "$GITHUB_WORKSPACE/scripts/distribution_smoke.py" --expect-solvers "$SOLVERS"
+      - name: Qualify Python 3.14 Linux Inductor scan and while execution
+        if: runner.os == 'Linux' && matrix.python == '3.14'
+        env:
+          TORCHINDUCTOR_COMPILE_THREADS: "1"
+        run: |
+          python -m pip install pytest
+          probe_dir=$(mktemp -d "$RUNNER_TEMP/dendra-inductor-XXXXXX")
+          cp -R tests pyproject.toml "$probe_dir"
+          cd "$probe_dir"
+          export TORCHINDUCTOR_CACHE_DIR="$probe_dir/inductor-cache"
+          python -m pytest -q -p no:cacheprovider \
+            --junitxml=python314-inductor.xml \
+            "tests/func/test_scnv.py::test_scnv_inductor_checkpointed_scan_and_inference_while[scan-2]" \
+            "tests/func/test_scnv.py::test_scnv_inductor_checkpointed_scan_and_inference_while[while-None]" \
+            tests/func/test_input_bindings.py::test_input_bindings_native_inductor_scan \
+            tests/func/test_network_connection_parameters.py::test_inductor_raw_connection_sources_keep_native_shared_gradient
+          python -I - <<'PY'
+          from xml.etree import ElementTree
+
+          cases = list(ElementTree.parse("python314-inductor.xml").iter("testcase"))
+          if len(cases) != 4 or any(case.find("skipped") is not None for case in cases):
+              raise SystemExit("All four Python 3.14 Inductor cases must run.")
+          PY
 
   test_functional_cpu_shards:
     # Retain the complete compiler selection, split only at module boundaries.

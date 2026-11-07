@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 HELPER = Path(__file__).resolve().parents[1] / "github_release.py"
 SPEC = importlib.util.spec_from_file_location("github_release_under_test", HELPER)
@@ -33,6 +33,7 @@ class GitHub:
         self.fail_upload = None
         self.retag_after_upload = False
         self.annotated = True
+        self.unlisted_release_reads = 0
 
     @property
     def mutations(self):
@@ -59,6 +60,9 @@ class GitHub:
             if "/assets?" in endpoint:
                 return json.dumps([self.assets]).encode()
             if endpoint.endswith("/releases?per_page=100"):
+                if self.current is not None and self.unlisted_release_reads:
+                    self.unlisted_release_reads -= 1
+                    return b"[[]]"
                 return json.dumps([[self.current] if self.current else []]).encode()
             raise AssertionError(f"Unexpected API endpoint: {endpoint}")
         assert args[0] == "release" and "--repo" in args
@@ -135,6 +139,7 @@ class GitHubReleaseTests(unittest.TestCase):
         self.patcher = patch.object(release, "gh", self.github)
         self.patcher.start()
         self.addCleanup(self.patcher.stop)
+        self.sleep = self.enterContext(patch.object(release, "sleep"))
 
     def run_release(self, *, changelog=True):
         release.release(
@@ -159,6 +164,26 @@ class GitHubReleaseTests(unittest.TestCase):
             [call[1] for call in self.github.mutations],
             ["create", "upload", "upload", "edit"],
         )
+        self.sleep.assert_not_called()
+
+    def test_created_draft_can_take_multiple_reads_to_appear(self):
+        self.github.unlisted_release_reads = 2
+        self.run_release()
+        self.assertEqual(self.sleep.call_args_list, [call(1), call(2)])
+        self.assertFalse(self.github.current["draft"])
+        self.assertEqual(
+            [command[1] for command in self.github.mutations],
+            ["create", "upload", "upload", "edit"],
+        )
+
+    def test_created_draft_that_stays_unlisted_fails_after_bounded_wait(self):
+        self.github.unlisted_release_reads = 8
+        with self.assertRaisesRegex(ValueError, "Created draft could not be found"):
+            self.run_release()
+        self.assertEqual(self.sleep.call_count, 7)
+        self.assertEqual(sum(wait.args[0] for wait in self.sleep.call_args_list), 120)
+        self.assertTrue(self.github.current["draft"])
+        self.assertEqual([command[1] for command in self.github.mutations], ["create"])
 
     def test_interrupted_upload_resumes_draft_without_replacing_existing_asset(self):
         self.github.fail_upload = self.sdist.name

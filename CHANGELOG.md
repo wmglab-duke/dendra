@@ -1,4 +1,4 @@
-## v0.28.1
+## v0.28.1 (2026-11-07)
 
 - Fix functional lowering, compiled connection parameter checks, and native
   runtime draw sampling on Python 3.13 and 3.14.
