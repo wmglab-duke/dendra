@@ -12,6 +12,7 @@ import torch
 EXAMPLE = (
     Path(__file__).resolve().parents[1]
     / "examples"
+    / "training"
     / "threshold_descriptor_gradients.py"
 )
 

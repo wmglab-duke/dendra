@@ -8,6 +8,7 @@ import torch
 
 _STATE_REFERENCES = {
     "state.integrator.v",
+    "state.integrator.vc",
     "state.clock.t",
     "state.control.duration_remainder",
 }
@@ -76,6 +77,7 @@ def _validate_reference(reference: str) -> None:
     raise ValueError(
         f"Unsupported initialization-transform reference {reference!r}. Expected "
         "'parameters.<named_parameters key>', 'state.integrator.v', "
+        "'state.integrator.vc' (for block integrators), "
         "'state.clock.t', 'state.control.duration_remainder', or "
         "'state.mechanisms.<mechanism>.<state>', "
         "'state.ions.<ion>.<field>', or "

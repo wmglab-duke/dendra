@@ -7,6 +7,12 @@ import pytest
 import torch
 
 import dendra as dn
+from dendra.models.extcell import gather_extcell
+from dendra.models.tree import (
+    gather_diffusion_edges,
+    gather_membrane,
+    gather_morphology,
+)
 
 
 def _precise_graph():
@@ -37,6 +43,31 @@ def _precise_graph():
         L=2.000000345678912,
     )
     return graph
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    "gather",
+    (gather_morphology, gather_diffusion_edges, gather_membrane, gather_extcell),
+)
+@pytest.mark.parametrize("ambient_device", ("cpu", "meta"))
+@pytest.mark.parametrize("ambient_dtype", (torch.float32, torch.float64))
+def test_tree_graph_gathering_stages_precise_cpu_metadata_independently_of_defaults(
+    gather, ambient_device, ambient_dtype
+):
+    graph = _precise_graph()
+    with dn.ctx(DEVICE="cpu", DTYPE=torch.float64):
+        expected = gather(graph)
+    with dn.ctx(DEVICE=ambient_device, DTYPE=ambient_dtype):
+        assert torch.empty(()).device.type == ambient_device
+        actual = gather(graph)
+    assert actual.keys() == expected.keys()
+    for name, value in actual.items():
+        assert value.device.type == "cpu", name
+        assert value.dtype == (
+            torch.float64 if value.is_floating_point() else torch.long
+        )
+        torch.testing.assert_close(value, expected[name], rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("dtype", [torch.float64, torch.float32])

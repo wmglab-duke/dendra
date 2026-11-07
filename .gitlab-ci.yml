@@ -2,16 +2,26 @@ image: python:3.12-slim
 
 stages:
   - test
+  - coverage
   - build
   - release
   - deploy
 
+workflow:
+  rules:
+    # An open feature MR already receives the full checks for this push.
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS && $CI_COMMIT_BRANCH != "main" && $CI_COMMIT_BRANCH != "develop"'
+      when: never
+    - when: always
+
 variables:
   PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
   DEBIAN_FRONTEND: noninteractive
+  TORCH_SPEC: "torch==2.15.0"
 
 cache:
-  key: "$CI_JOB_NAME"
+  # Parallel job names contain '/', which is not allowed in cache keys.
+  key: "$CI_JOB_NAME_SLUG"
   paths:
     - .cache/pip
 
@@ -29,7 +39,9 @@ before_script:
   - python -m pip install numpy
 
   # 1) Install PyTorch first
-  - python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
+  - python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
+  # Retain the selected CPU build through subsequent dependency resolution.
+  - python -c 'from importlib.metadata import version; print("torch==" + version("torch"))' >> "$PIP_CONSTRAINT"
 
   # 2) Include optional native solvers for the full test and documentation lanes.
   # Require the published wheel so CI exercises the distributed artifact.
@@ -65,12 +77,14 @@ before_script:
 
 # Keep prose-only branch pipelines focused on the executable documentation build.
 # Runtime, packaging, test, CI, and internal model-revision changes still run
-# both test lanes. Set RUN_FULL_TESTS=1 as a CI/CD variable to override the
-# changed-path filter for a branch pipeline.
+# every test lane. Merge requests and integration/release branches always run
+# the full gates. Set RUN_FULL_TESTS=1 to override the feature-push path filter.
 .full_test_rules:
   rules:
-    - if: '$RUN_FULL_TESTS == "1" && $CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
+    - if: '$RUN_FULL_TESTS == "1"'
     - if: '$CI_COMMIT_TAG'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" || $CI_PIPELINE_SOURCE == "external_pull_request_event"'
+    - if: '$CI_PIPELINE_SOURCE == "push" && ($CI_COMMIT_BRANCH == "main" || $CI_COMMIT_BRANCH == "develop")'
     - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH'
       changes:
         paths:
@@ -93,8 +107,9 @@ test_base_install:
   # Override the full test setup: this lane must never install native solvers.
   before_script:
     - python -m pip install --upgrade pip
-    - python -m pip install "torch==2.12.0" --index-url https://download.pytorch.org/whl/cpu
+    - python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
     - printf "numpy<2\ndendra-solvers==0\n" > "$CI_PROJECT_DIR/base-constraints.txt"
+    - python -c 'from importlib.metadata import version; print("torch==" + version("torch"))' >> "$CI_PROJECT_DIR/base-constraints.txt"
     - python -m pip install --constraint "$CI_PROJECT_DIR/base-constraints.txt" .
   script:
     # Isolated mode imports the installed distribution, not the source checkout.
@@ -131,13 +146,58 @@ test_base_install:
       print("Base installation and CPU cable fallback succeeded without native solvers.")
       PY
 
-test:
+test_shards:
   extends: .full_test_rules
   stage: test
+  timeout: 3 hours
+  parallel: 40
+  # Keep dependency downloads separate from branch/job-scoped unit evidence.
+  cache:
+    - key: "$CI_JOB_NAME_SLUG"
+      paths:
+        - .cache/pip
+    - key: "ci-units-v2-$CI_COMMIT_REF_SLUG-$CI_NODE_INDEX"
+      paths:
+        - ci-results/
+      policy: pull-push
+      when: always
+  variables:
+    # Leave time to upload completed units and diagnostic logs on a script timeout.
+    RUNNER_SCRIPT_TIMEOUT: "2h45m"
+    OMP_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1"
+    OPENBLAS_NUM_THREADS: "1"
+    MAX_JOBS: "1"
+    TORCHINDUCTOR_COMPILE_THREADS: "1"
   script:
     - python -m pip install pytest pytest-cov hypothesis neuron
-    - python -m pytest tests -W error -m "cpu or (neuron and not cuda)" --cov=dendra --cov-branch --cov-config=.coveragerc.cpu --cov-report=term-missing:skip-covered --cov-report=json:coverage.json --cov-report=xml --cov-report=html --cov-fail-under=84
-    - python scripts/check_coverage_floors.py coverage.json
+    # Forty complete module-preserving units, each with its own job budget.
+    # Valid branch-cache units resume; eligible test-body changes recover with
+    # complete module reruns and provenance-checked coverage replacement.
+    - python scripts/run_ci_shards.py --job-index="$CI_NODE_INDEX" --workers=1 --output-dir=ci-results
+  artifacts:
+    when: always
+    name: "cpu-neuron-$CI_NODE_INDEX"
+    paths:
+      - ci-results/
+      - ci-results-runner/
+    reports:
+      junit: "ci-results/*/junit.xml"
+    expire_in: 1 week
+
+test_coverage:
+  extends: .full_test_rules
+  stage: coverage
+  needs:
+    # A need on a parallel job waits for every instance and downloads every
+    # artifact; per-index paths above prevent one shard overwriting another.
+    - job: test_shards
+      artifacts: true
+  before_script:
+    - python -m pip install --upgrade pip
+    - python -m pip install coverage
+  script:
+    - python scripts/combine_ci_coverage.py --shards 40 --input-dir ci-results --fail-under=84
   coverage: '/TOTAL.*\s+(\d+%)$/'
   artifacts:
     when: always
@@ -150,8 +210,82 @@ test:
         path: coverage.xml
     expire_in: 1 week
 
+test_functional_compatibility_shards:
+  extends: .full_test_rules
+  stage: test
+  timeout: 90 minutes
+  parallel:
+    matrix:
+      - TORCH_SPEC: "torch==2.14.0"
+        TORCH_LABEL: minimum
+        COMPAT_SHARD: ["1", "2", "3", "4"]
+      - TORCH_SPEC: "torch==2.15.0"
+        TORCH_LABEL: current
+        COMPAT_SHARD: ["1", "2", "3", "4"]
+      - TORCH_SPEC: "torch>=2.15,<3"
+        TORCH_LABEL: rolling
+        COMPAT_SHARD: ["1", "2", "3", "4"]
+  variables:
+    OMP_NUM_THREADS: "1"
+    MKL_NUM_THREADS: "1"
+    OPENBLAS_NUM_THREADS: "1"
+    TORCHINDUCTOR_COMPILE_THREADS: "1"
+  script:
+    - python -m pip install pytest hypothesis
+    # Do not let a missing optional dependency silently skip DHS gradients.
+    - |
+      python - <<'PYCODE'
+      import torch
+      import dendra_solvers._ext
+      from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE
+      assert DENDRA_SOLVERS_AVAILABLE, "Native DHS coverage must not be skipped"
+      print("Functional compiler lane:", torch.__version__)
+      PYCODE
+    - >-
+      python -m pytest -q -p scripts.ci_shard
+      --ci-shard-index="$COMPAT_SHARD" --ci-shard-total=4
+      --ci-shard-output="ci-results/functional-compatibility/$TORCH_LABEL/$COMPAT_SHARD"
+      --ci-shard-durations=scripts/ci_durations.json
+      --junitxml="ci-results/functional-compatibility/$TORCH_LABEL/$COMPAT_SHARD/junit.xml"
+      @scripts/functional_compatibility_tests.txt
+  artifacts:
+    when: always
+    name: "functional-$TORCH_LABEL-$COMPAT_SHARD"
+    paths:
+      - ci-results/functional-compatibility/
+    reports:
+      junit: "ci-results/functional-compatibility/*/*/junit.xml"
+    expire_in: 1 week
+
+test_functional_compatibility:
+  extends: .full_test_rules
+  stage: coverage
+  needs:
+    - job: test_functional_compatibility_shards
+      artifacts: true
+  parallel:
+    matrix:
+      - TORCH_SPEC: "torch==2.14.0"
+        TORCH_LABEL: minimum
+      - TORCH_SPEC: "torch==2.15.0"
+        TORCH_LABEL: current
+      - TORCH_SPEC: "torch>=2.15,<3"
+        TORCH_LABEL: rolling
+  before_script:
+    - apt-get update && apt-get install -y --no-install-recommends git
+    - rm -rf /var/lib/apt/lists/*
+    - python -m pip install coverage packaging
+  script:
+    - >-
+      python scripts/combine_ci_coverage.py --partition-only --shards=4
+      --input-dir="ci-results/functional-compatibility/$TORCH_LABEL"
+      --torch-spec="$TORCH_SPEC"
+
 build_docs:
   stage: build
+  # Explicit rules keep this job in MR pipelines as well as branch pipelines.
+  rules:
+    - when: on_success
   script:
     # Validate Dendra's documentation strictly and execute every notebook from
     # a fresh Sphinx environment. Remote intersphinx availability must not make
@@ -169,10 +303,10 @@ release_bump:
   image: python:3.12-slim
   needs:
     - job: test_base_install
-      optional: true
       artifacts: false
-    - job: test
-      optional: true
+    - job: test_coverage
+      artifacts: false
+    - job: test_functional_compatibility
       artifacts: false
     - job: build_docs
       artifacts: false
@@ -196,7 +330,8 @@ release_bump:
     # Preview (won't fail job if there's nothing to bump)
     - cz -nr NO_INCREMENT bump --dry-run --major-version-zero
 
-    # Perform bump (breaking changes won't jump to 1.0.0)
+    # Bump version files and create the tag; curated changelog generation is
+    # disabled in pyproject.toml. Breaking changes won't jump to 1.0.0.
     - cz -nr NO_INCREMENT bump --yes --major-version-zero
 
     # Push bump commit and tags back to main

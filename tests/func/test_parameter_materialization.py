@@ -17,6 +17,14 @@ from dendra.models.core import Myelinated
 from dendra.models.mod import hh, pas
 from dendra.models.parametric import PositiveParam
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.01
 
 

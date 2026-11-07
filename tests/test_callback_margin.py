@@ -189,7 +189,7 @@ def test_rejects_recorder_that_cannot_reconstruct_hard_callback_window():
     callback = Active(node_check=[0])
     recorder = Recorder(["v"], max_only=True)
     run_callback(callback, trace, recorder)
-    with pytest.raises(ValueError, match="reduced or smoothed"):
+    with pytest.raises(ValueError, match="reduced"):
         callback_signed_margin(callback, recorder)
 
     recorder = Recorder(["v"], node_indices=[1])

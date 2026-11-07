@@ -12,14 +12,14 @@ model from that snapshot. If the compiled graph is one unbranched material
 path, :meth:`dendra.Cable.from_morphology` uses the faster tridiagonal cable
 backend without approximating the canonical geometry.
 
-NEURON import remains fully supported. :meth:`dendra.Morphology.from_swc` and
-:meth:`dendra.Morphology.from_asc` now make the editable native declaration the
-canonical representation after loading. The older
-:meth:`dendra.Tree.from_NEURON`, :meth:`dendra.Tree.from_swc`, and
-:meth:`dendra.Tree.from_asc` constructors remain available for established
-workflows that intentionally want NEURON's immediate d-lambda discretization.
-Native and imported morphologies ultimately use the same scalar
-compartment-resistor graph contract in Dendra.
+Use :meth:`dendra.Morphology.from_swc` and
+:meth:`dendra.Morphology.from_asc` to load an editable native declaration before
+compiling it or constructing a model. For direct model construction,
+:meth:`dendra.Tree.from_swc` and :meth:`dendra.Tree.from_asc` load the same native
+declarations, apply native d-lambda discretization, and construct a Tree.
+:meth:`dendra.Tree.from_NEURON` instead captures an existing NEURON model with
+its authored ``nseg`` values. All of these paths produce a scalar
+compartment-resistor graph for simulation in Dendra.
 
 Declare sections
 ----------------
@@ -167,8 +167,8 @@ every current Section:
    refined_tree = dn.Tree.from_morphology(policy_morphology)
 
 ``d_lambda`` is a positive dimensionless target for compartment length as a
-fraction of ``lambda_f(freq_hz=...)``. Dendra applies the same odd-count
-rounding rule as its NEURON-backed importer, so every selected ``nseg`` is odd.
+fraction of ``lambda_f(freq_hz=...)``. Dendra applies NEURON's classic odd-count
+rounding rule, so every selected ``nseg`` is odd.
 The returned dictionary maps exact Section names to those counts in declaration
 order. The operation is a one-time authoring edit, not a live policy: a later
 geometry, ``rhoa``, or ``cm`` update does not silently rediscretize the
@@ -336,18 +336,73 @@ ASC import preserves the selected NEURON-normalized cable topology,
 centerlines, diameters, logical attachments, and explicit Dendra electrical
 policy. As with native SWC loading, ``nseg`` is a uniform initial declaration;
 the later ``apply_d_lambda`` call is an explicit, independently repeatable
-authoring step. This differs from the older :meth:`dendra.Tree.from_swc` and
-:meth:`dendra.Tree.from_asc` constructors, which intentionally apply their
-NEURON-backed d-lambda policy during immediate model import. Native ASC loading
-is not a lossless document parser: source formatting, comments,
-colors, markers, properties, spines, trace IDs, original soma contours, and
-components not selected by ``root`` are not retained. The returned
-``Morphology`` contains no live NEURON objects and is the editable Dendra source
-for subsequent inspection, updates, compilation, and model construction.
+authoring step. Native ASC loading is not a lossless document parser: source
+formatting, comments, colors, markers, properties, spines, trace IDs, original
+soma contours, and components not selected by ``root`` are not retained. The
+returned ``Morphology`` contains no live NEURON objects and is the editable
+Dendra source for subsequent inspection, updates, compilation, and model
+construction.
 When NEURON repairs an outlying main branch by connecting it logically to the
 nearest soma, Dendra preserves that established Import3d behavior but emits one
 ``RuntimeWarning`` containing NEURON's repair diagnostics. The normalization is
 therefore explicit rather than silent.
+
+Construct a Tree directly from a file
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When no edits are needed before discretization, use the Tree convenience
+constructors:
+
+.. code-block:: python
+
+   tree = dn.Tree.from_swc(
+       "cell.swc",
+       rhoa=35.4,
+       cm=1.0,
+       d_lambda=0.1,
+       freq=100.0,  # Raw Hz, not Dendra's kHz waveform coordinate.
+       N=128,
+   )
+
+   # Select a component explicitly when an ASC file has multiple roots.
+   asc_tree = dn.Tree.from_asc(
+       "reconstruction.asc", root="soma[0]", d_lambda=0.1, freq=100.0
+   )
+
+``Tree.from_asc`` is an alias of :meth:`~dendra.Tree.from_neurolucida`. Each
+constructor loads a native Morphology, calls ``apply_d_lambda``, and constructs
+the model with ``Tree.from_morphology``. Their electrical defaults are
+``rhoa=35.4`` Ω·cm and ``cm=1.0`` µF/cm²; the standalone Morphology loaders use
+``rhoa=100.0`` Ω·cm and ``cm=1.0`` µF/cm². Supply these explicitly when comparing
+the two workflows. The Tree's ``freq`` argument and the Morphology's
+``freq_hz`` argument both accept raw hertz.
+
+For an ASC file with several disconnected roots, ``Tree.from_asc`` and
+``Tree.from_neurolucida`` require an exact ``root`` name, just like
+``Morphology.from_asc``. Omitting it lists the available roots in an error;
+no component is discarded implicitly.
+
+``Tree.from_swc`` follows the native SWC parser's section names and strict
+validation described above. It also supplies the shared ``dend`` and ``apic``
+labels for SWC types 3 and 4, alongside the native semantic and provenance
+labels. It does not use NEURON's SWC repair heuristics.
+
+Capture an existing NEURON model
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Use :meth:`~dendra.Tree.from_NEURON` when the source is an existing NEURON
+Section tree. Set the NEURON model's geometry, electrical properties, and
+``nseg`` values before passing its root Section. Dendra captures that grid
+without changing ``nseg`` or applying a discretization policy.
+
+The low-level ``dendra.models.io.read_swc``, ``read_neurolucida``, and
+``read_asc`` helpers serve a different workflow: they return a geometry graph
+and an ``id2seg`` map retaining live NEURON segments. They accept
+``file_path`` plus keyword-only ``data_func``, ``rhoa``, and ``cm`` arguments,
+and retain the imported NEURON grid without d-lambda selection. Use these
+helpers with ``Tree.from_graph`` when a NEURON-specific ``data_func`` callback
+must attach custom segment metadata. Use a native Morphology when editing or
+selecting compartment counts is the goal.
 
 Update section declarations
 ---------------------------
@@ -671,13 +726,14 @@ authored endpoints:
    # Attach child x=0 to parent x=1.
    apic.connect(soma.at(1.0), child_end=0)
 
-   # Interior parent locations are supported.
-   basal.connect(soma.at(0.5), child_end=0)
+   # The child endpoint can instead be the receiver; parent interiors work.
+   basal.at(0).connect(soma.at(0.5))
 
    # Attaching authored child x=1 traverses toward decreasing authored x.
-   axon.connect(soma.at(0.0), child_end=1)
+   axon.at(1).connect(soma.at(0.0))
 
-The equivalent explicit form is useful when both endpoints should be visible:
+The equivalent Morphology-level form is useful when both endpoints should be
+passed to a builder explicitly:
 
 .. code-block:: python
 
@@ -820,8 +876,8 @@ An authored zero-length diameter discontinuity appears as the corresponding
 annular shoulder rather than being smoothed or assigned artificial length.
 Likewise, connected stylized Sections retain their canonical local z-axis and
 may overlap. This is a tapered-cable envelope, not a histological reconstruction
-or a boolean surface union at branch junctions; native Morphology does not yet
-define a distinct spherical-soma primitive.
+or a boolean surface union at branch junctions. A distinct spherical-soma
+primitive is currently unsupported.
 
 For a diagnostic orthographic view, :meth:`~dendra.Morphology.plot` draws the
 exact authored centerlines and optional controls. ``view`` is the axis viewed
@@ -1219,7 +1275,7 @@ Dendra checks these geometry and solver-workspace invariants at public
 execution boundaries. The default policy is appropriate for normal
 simulations. Advanced validation modes, trusted-loop performance tuning,
 aliasing and callback caveats, and owner reinitialization rules are documented
-in :doc:`../advanced/A5_runtime_contracts`.
+in :doc:`../advanced/diagnostics`.
 
 The canonical compartment graph
 --------------------------------
@@ -1298,11 +1354,10 @@ The native morphology API currently supports:
   :class:`dendra.Cable` populations for material-only unbranched paths, whose
   ``N`` members share that morphology.
 
-It does not yet define finite-extracellular/double-cable circuit layers for
+Finite-extracellular/double-cable circuit layers for
 :class:`dendra.ExtCellTree` or :class:`dendra.ExtCellAxon`, a packed block-DHS
-representation, or per-population-member graph variation. Those extensions can
-build on the canonical contract without changing the section connection rules
-described here.
+representation, and per-population-member graph variation are currently
+unsupported by the native morphology API.
 
 See also
 --------

@@ -10,6 +10,14 @@ import torch
 import dendra as dn
 from dendra.models.mechanisms import Mechanism, State
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.0125
 MECHANISM_NAME = "_DeclaredInitializationMechanism"
 DECLARED_KEY = f"mechanisms.{MECHANISM_NAME}.declared_value"
@@ -800,25 +808,14 @@ def test_canonical_unmyelinated_subclass_initializes_purely_and_differentiates()
 
 def test_unmyelinated_subclass_with_authored_lifecycle_remains_fail_closed():
     model = _unmyelinated_subclass_model(_AuthoredLifecycleUnmyelinated)
-    functional, tensors = dn.func.make_functional(model, dt=DT)
 
+    # Subclass admission rejects a replaced lifecycle before creating a plan,
+    # even when the authored hook delegates to the canonical implementation.
     with pytest.raises(
         dn.func.FunctionalizationError,
-        match=r"Population replaces canonical fresh-initialization hooks.*pre_initialize",
+        match=r"replaces canonical Unmyelinated execution hooks.*pre_initialize",
     ):
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
-
-    prepared = functional.prepare(tensors.parameters, tensors.constants)
-    next_state, _auxiliary = functional.step(
-        tensors.parameters,
-        prepared,
-        tensors.state,
-    )
-    assert set(next_state) == set(tensors.state)
+        dn.func.make_functional(model, dt=DT)
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)

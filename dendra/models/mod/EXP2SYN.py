@@ -6,6 +6,20 @@ from ..mechanisms import Synapse as Syn
 from ..mechanisms.ops import exp, log
 
 
+@torch.compiler.allow_in_graph
+def _validation_predicate_values(value):
+    """Validate every physical lane without differentiating a bool predicate.
+
+    Tensor assertions have no vmap rule. The predicate is already boolean,
+    so exposing its physical transform axes preserves the validity check
+    without changing the differentiable time-constant calculations.
+    """
+    functorch = torch._C._functorch
+    while functorch.is_functorch_wrapped_tensor(value):
+        value = functorch.get_unwrapped(value)
+    return value
+
+
 class A(S):
     S.STATE("A")
     S.ASSIGNED("tau1_effective")
@@ -82,9 +96,10 @@ class exp2syn(PP, Syn):
     to ``[1e-9, 0.9999]`` during initialization. Equal, nearly equal, or
     reversed time constants therefore approach a normalized alpha-synapse
     response instead of producing a division by zero. Both time constants must
-    be positive and finite; invalid values raise :class:`ValueError`. For low
-    precision dtypes, the bounds are tightened to the nearest representable
-    values strictly between zero and one.
+    be positive and finite; invalid values raise :class:`ValueError` in eager
+    execution or a tensor assertion :class:`RuntimeError` in compiled execution.
+    For low precision dtypes, the bounds are tightened to the nearest
+    representable values strictly between zero and one.
     """
 
     PP.STATE_BUNDLE(A, B)
@@ -99,8 +114,12 @@ class exp2syn(PP, Syn):
         tau1 = state_a.tau1
         tau2 = self.DE["B"].tau2
         valid = torch.isfinite(tau1) & torch.isfinite(tau2) & (tau1 > 0) & (tau2 > 0)
-        if not bool(torch.all(valid).item()):
-            raise ValueError("exp2syn tau1 and tau2 must be positive and finite.")
+        valid = _validation_predicate_values(valid)
+        message = "exp2syn tau1 and tau2 must be positive and finite."
+        if torch.compiler.is_compiling():
+            torch._assert_async(torch.all(valid), message)
+        elif not bool(torch.all(valid).item()):
+            raise ValueError(message)
 
         ratio = tau1 / tau2
         zero = torch.zeros_like(ratio)
@@ -132,7 +151,6 @@ class exp2syn(PP, Syn):
         conductance = self.B - self.A
         return conductance * (v - self.e), conductance
 
-    def net_receive(self, weights, netcon):
-        weights = weights * self.factor
-        self.A = self.A + weights
-        self.B = self.B + weights
+    def net_receive_values(self, weights, dt, values):
+        weights = weights * values["factor"]
+        return {"states": {"A": values["A"] + weights, "B": values["B"] + weights}}

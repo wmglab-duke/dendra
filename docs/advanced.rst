@@ -1,20 +1,50 @@
 .. _advanced:
 
-Advanced
-========
+Guides
+======
+
+Start with a workflow, then use the API reference for detailed signatures and
+contracts. Define an ordinary Population or Network once and choose how to
+execute it.
+
+The `examples directory <https://github.com/wmglab-duke/dendra/tree/main/examples>`_
+groups runnable scripts by task, with a guide in each folder. Start with
+``examples/getting_started`` for small Population and Network workflows.
+
+Simulation, training and observations
+-------------------------------------
 
 .. toctree::
    :maxdepth: 1
 
-   advanced/A0_mechanisms_and_ions_materials.ipynb
-   advanced/A1_model_parameterization.ipynb
-   advanced/A2_advanced_networks.ipynb
-   advanced/A3_synapse_banks_and_slots.ipynb
-   advanced/A4_multi_device_and_batching.ipynb
-   advanced/A5_runtime_contracts.rst
-   advanced/A6_mechanism_support_layouts.rst
-   advanced/A7_model_initialization.rst
-   advanced/A8_functional_populations.rst
-   advanced/A9_macroscopic_descriptor_training.rst
-   advanced/A10_hard_transition_scans.rst
-   advanced/A11_event_margin_training.rst
+   advanced/functional_execution
+   advanced/inputs_and_randomness
+   advanced/recording_and_callbacks
+   advanced/training_and_parameters
+   advanced/initialization_and_checkpoints
+   advanced/custom_models
+
+Building models
+---------------
+
+.. toctree::
+   :maxdepth: 1
+
+   advanced/mechanisms_and_materials
+   synapse_authoring
+   advanced/model_parameters
+   advanced/connected_networks
+   advanced/synapse_banks
+   advanced/batching_and_devices
+   advanced/model_initialization
+
+Specialized training and diagnostics
+------------------------------------
+
+.. toctree::
+   :maxdepth: 1
+
+   advanced/descriptor_training
+   advanced/threshold_scans
+   advanced/event_based_training
+   advanced/diagnostics

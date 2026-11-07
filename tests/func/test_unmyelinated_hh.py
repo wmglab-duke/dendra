@@ -723,7 +723,7 @@ def test_structured_step_capture_is_lazy_and_signature_specific(monkeypatch):
     assert functional._structured_step_graphs == {}
     assert functional.prewarm_structured_rollout(ve=True, intra=False)
     assert len(make_fx_calls) == 1
-    assert set(functional._structured_step_graphs) == {(True, False)}
+    assert set(functional._structured_step_graphs) == {(True, False, "auto")}
 
     # Reusing one signature is free; requesting another captures only that one.
     assert functional.prewarm_structured_rollout(ve=True, intra=False)
@@ -731,8 +731,8 @@ def test_structured_step_capture_is_lazy_and_signature_specific(monkeypatch):
     assert functional.prewarm_structured_rollout(ve=False, intra=True)
     assert len(make_fx_calls) == 2
     assert set(functional._structured_step_graphs) == {
-        (True, False),
-        (False, True),
+        (True, False, "auto"),
+        (False, True, "auto"),
     }
 
 
@@ -753,11 +753,11 @@ def test_structured_capture_failure_is_cached_per_signature(monkeypatch):
     assert not functional.prewarm_structured_rollout(ve=False, intra=False)
     assert not functional.prewarm_structured_rollout(ve=False, intra=False)
     assert make_fx_calls == 1
-    assert (False, False) in functional._structured_capture_errors
+    assert (False, False, "auto") in functional._structured_capture_errors
 
     assert functional.prewarm_structured_rollout(ve=True, intra=True)
     assert make_fx_calls == 2
-    assert set(functional._structured_step_graphs) == {(True, True)}
+    assert set(functional._structured_step_graphs) == {(True, True, "auto")}
 
 
 def test_no_grad_fullgraph_without_prewarm_uses_correct_unrolled_fallback():
@@ -798,7 +798,7 @@ def test_no_grad_compiled_rollout_uses_structured_loop_for_optional_drives(
     ve, intra = _drives(model, 5)
     selected_ve = ve if drive_kind in {"ve", "both"} else None
     selected_intra = intra if drive_kind in {"intra", "both"} else None
-    signature = (selected_ve is not None, selected_intra is not None)
+    signature = (selected_ve is not None, selected_intra is not None, "auto")
     assert not functional._structured_step_graphs
     assert functional.prewarm_structured_rollout(
         ve=signature[0],
@@ -1076,7 +1076,7 @@ def test_no_grad_direct_forward_ad_retains_differentiable_unrolled_rollout():
     model = _model(method="pcr")
     functional, tensors = dn.func.make_functional(model, dt=DT)
     parameter_name = "integrator.mech.mechanisms.hh.gnabar_param"
-    graphs = []
+    compiler_calls = []
 
     def final_voltage(gnabar):
         parameters = dict(tensors.parameters)
@@ -1090,12 +1090,14 @@ def test_no_grad_direct_forward_ad_retains_differentiable_unrolled_rollout():
         return state["integrator"]["v"]
 
     def backend(graph_module, _example_inputs):
-        graphs.append(graph_module)
-        return graph_module.forward
+        compiler_calls.append(graph_module)
+        raise AssertionError("direct forward AD must not enter the compiler")
 
     primal = tensors.parameters[parameter_name].detach()
     tangent = torch.full_like(primal, 0.125)
-    compiled = torch.compile(final_voltage, backend=backend, fullgraph=True)
+    # External torch.compile rejects pre-existing dual inputs. The owned chunk
+    # preserves them by selecting its differentiable eager recurrence instead.
+    compiled = functional.compile_rollout_chunk(5, backend=backend)
     with (
         torch.no_grad(),
         torch.autograd.forward_ad.dual_level(),
@@ -1103,8 +1105,15 @@ def test_no_grad_direct_forward_ad_retains_differentiable_unrolled_rollout():
     ):
         gnabar = torch.autograd.forward_ad.make_dual(primal, tangent)
         expected = torch.autograd.forward_ad.unpack_dual(final_voltage(gnabar))
-        actual = torch.autograd.forward_ad.unpack_dual(compiled(gnabar))
+        parameters = dict(tensors.parameters)
+        parameters[parameter_name] = gnabar
+        prepared = functional.prepare(parameters, tensors.constants)
+        state, _aux = compiled(parameters, prepared, tensors.state)
+        actual = torch.autograd.forward_ad.unpack_dual(state["integrator"]["v"])
 
+    assert expected.tangent is not None
+    assert torch.isfinite(expected.tangent).all()
+    assert torch.count_nonzero(expected.tangent)
     torch.testing.assert_close(actual.primal, expected.primal, rtol=0.0, atol=0.0)
     torch.testing.assert_close(
         actual.tangent,
@@ -1112,8 +1121,8 @@ def test_no_grad_direct_forward_ad_retains_differentiable_unrolled_rollout():
         rtol=2.0e-9,
         atol=2.0e-10,
     )
-    assert graphs
-    assert all(not _while_loop_nodes(graph) for graph in graphs)
+    assert not compiler_calls
+    assert compiled.execution_report().strategy == "eager_forward_ad_fallback"
 
 
 def test_no_grad_structured_rollout_supports_native_thomas_solver():

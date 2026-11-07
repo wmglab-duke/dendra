@@ -212,10 +212,13 @@ and would make the point-process value one million times too small. To express
 50 nS in the required µS coordinate using the conversion scalars, use
 ``50 * nS / uS``.
 
-Connection weights are otherwise target-defined. A custom synapse must document
-the units of the input changed by its ``net_receive`` or ``continuous_receive``
-method. For the built-in density-style ``graded_syn``, a dimensionless release
-gate uses a connection weight and ``g_pre`` in S/cm².
+Connection weights are otherwise target-defined. A custom event synapse must
+document the units of the state changed by its pure ``net_receive_values``
+hook; the standard ``net_receive`` adapter applies those updates. A continuous
+target documents the units of the input filled by ``continuous_receive``.
+For the built-in density-style ``graded_syn``, a dimensionless release gate
+uses a connection weight and ``g_pre`` in S/cm². See :doc:`synapse_authoring`
+for complete implementations of both contracts.
 
 Materials and ions
 ------------------
@@ -300,21 +303,26 @@ API-specific exceptions
 
 Parameter-specific documentation overrides the general table. In particular,
 waveform frequencies use Dendra's kHz coordinate, but the ``freq`` argument of
-``Tree.from_swc`` / ``Tree.from_asc`` and related D-lambda morphology-import
-helpers is explicitly in Hz. APIs whose names end in ``_hz`` likewise expect
-raw Hz. Electric-field data are in V/m even though integrated extracellular
-potentials are in mV. The native ``Morphology.from_swc`` and
+``Tree.from_swc``, ``Tree.from_asc``, and ``Tree.from_neurolucida`` is
+explicitly in Hz. These constructors select compartment counts through
+native ``Morphology.apply_d_lambda``; their electrical defaults are
+``rhoa=35.4`` Ω·cm and ``cm=1.0`` µF/cm². APIs whose names end in ``_hz``
+likewise expect raw Hz. Electric-field data are in V/m even though integrated
+extracellular potentials are in mV. The native ``Morphology.from_swc`` and
 ``Morphology.from_asc`` loaders do not apply d-lambda: their ``nseg`` argument
 is an explicit initial positive integer, and SWC/ASC geometry samples are not
-numerical compartments. Call
+numerical compartments. These standalone loaders default to ``rhoa=100.0``
+Ω·cm and ``cm=1.0`` µF/cm². Call
 :meth:`~dendra.models.morphology.Morphology.apply_d_lambda` with, for example,
 ``d_lambda=0.1`` and ``freq_hz=100.0`` after loading or editing when native
-d-lambda selection is desired.
+d-lambda selection is desired. ``Tree.from_NEURON`` and the low-level
+``dendra.models.io`` graph readers retain their source NEURON grids and do not
+select compartment counts.
 
 See also
 --------
 
 * :doc:`mechanisms`
-* :doc:`advanced/A0_mechanisms_and_ions_materials`
+* :doc:`advanced/mechanisms_and_materials`
 * :doc:`api/dendra.models.mechanisms`
 * :ref:`native-morphologies`

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from numbers import Number
 from typing import Any, Mapping
 
 import torch
@@ -185,16 +187,28 @@ def _unsupported_local_declaration(name: str):
 
 
 class MaterialProcess(Mechanism):
-    """Base class for full-field processes over shared Material objects.
+    """Full-field operator over shared Material objects.
 
-    A MaterialProcess is inserted like a mechanism but scheduled in the material
-    phase.  It binds full population-wide Material fields instead of local views.
+    Insert a process like a Mechanism and select its execution phase with
+    :meth:`PHASE`. Pure implementations expose :attr:`material_fields`, prepare
+    operator data with :meth:`prepare_materials`, and return replacement fields
+    from :meth:`material_updates`. The native :meth:`advance_materials` adapter
+    publishes those replacements; functional execution uses the same pure hooks.
+
+    Notes
+    -----
+    The voltage-local Mechanism lifecycle does not apply: State bundles, CARRY,
+    ``initial_values``, ``advance``, and Mechanism workspace declarations are
+    unsupported. Use :meth:`configure_process` for persistent configuration and
+    :meth:`set_dt` for native timestep setup. Parameter declarations and explicit
+    RAND/NOISE inputs remain available.
     """
 
     _material_process_phase = "post_local"
     _material_process_method = "none"
     _material_process_method_kwargs: dict[str, Any] = {}
     _material_process_set_dt_lifecycle = True
+    _functional_material_family = None
 
     _phase_declarations = []
     _method_declarations = []
@@ -348,8 +362,137 @@ class MaterialProcess(Mechanism):
         """Framework adapter binding the Material registry and population geometry."""
         self._material_resolver = material_resolver
         self._population_shape = None if population is None else tuple(population.shape)
+        self._configure_material_support(population)
         self.configure_process(population)
         return self
+
+    def _configure_material_support(self, population):
+        """Resolve process placement and material availability outside time loops.
+
+        A packed process retains its component's authored operand frame, while
+        its pure updates read and replace full parent fields. Registered indices
+        make that change of frame explicit and differentiable on CPU and CUDA.
+        """
+        object.__setattr__(self, "_mp_population", population)
+        if (
+            population is not None
+            and hasattr(population, "populations")
+            and not population.populations
+            and "_mp_process_mask" in self._buffers
+        ):
+            # Private functional owners intentionally discard child runtime
+            # trees. Their validated static placement remains registered.
+            return
+        self._mp_material_support_names = {}
+        self._mp_component_shape = None
+        if population is None:
+            return
+
+        def register(name, value):
+            if name in self._buffers:
+                self._buffers[name] = value
+            else:
+                self.register_buffer(name, value, persistent=False)
+
+        grid = torch.arange(
+            population.shape[-2] * population.shape[-1], device=self.diam.device
+        ).reshape(population.shape[-2:])
+        runtime_key = (
+            self.key.to(device=grid.device) if torch.is_tensor(self.key) else self.key
+        )
+        local = (
+            grid
+            if self.key is None
+            else self.support_map.gather(grid, runtime_key)
+            if self.support_map is not None
+            else self.get(grid)
+        )
+        register("_mp_process_index", local.reshape(-1))
+        mask = torch.zeros_like(grid, dtype=torch.bool).reshape(-1)
+        mask = mask.index_fill(0, local.reshape(-1), True).reshape(grid.shape)
+        register("_mp_process_mask", mask)
+        component_name = getattr(type(self), "_material_process_component", None)
+        if component_name is not None:
+            component = population.populations[component_name]
+            self._mp_component_shape = tuple(component.core_shape())
+            offset = 0
+            for name, child in population.populations.items():
+                if name == component_name:
+                    break
+                offset += child.core_shape()[0] * child.core_shape()[1]
+            register(
+                "_mp_component_index",
+                torch.arange(
+                    offset,
+                    offset + component.core_shape()[0] * component.core_shape()[1],
+                    device=grid.device,
+                ),
+            )
+        for index, (key, available) in enumerate(
+            getattr(population, "_material_field_support", {}).items()
+        ):
+            name = f"_mp_field_support_{index}"
+            register(name, available.to(device=grid.device, dtype=torch.bool))
+            self._mp_material_support_names[key] = name
+
+    def _expand_material_operand(self, value, like, *, local=False):
+        """Lift a component/local node operand into the full material frame."""
+        if value.ndim == 0:
+            return value
+        component_shape = getattr(self, "_mp_component_shape", None)
+        batch_shape = tuple(like.shape[:-2])
+        if local:
+            local_shape = tuple(self.support_spec.runtime_local_shape)
+            values = torch.broadcast_to(value, batch_shape + local_shape).reshape(
+                batch_shape + (-1,)
+            )
+            result = like.new_zeros(batch_shape + (like.shape[-2] * like.shape[-1],))
+            return result.index_copy(
+                -1, self._buffers["_mp_process_index"], values
+            ).reshape(like.shape)
+        if component_shape is not None:
+            try:
+                local = torch.broadcast_to(value, batch_shape + component_shape)
+            except RuntimeError:
+                local = None
+            if local is not None:
+                result = like.new_zeros(
+                    like.shape[:-2] + (like.shape[-2] * like.shape[-1],)
+                )
+                return result.index_copy(
+                    -1,
+                    self._buffers["_mp_component_index"],
+                    local.reshape(batch_shape + (-1,)),
+                ).reshape(like.shape)
+        try:
+            if torch.broadcast_shapes(value.shape, like.shape) == like.shape:
+                return value
+        except RuntimeError:
+            pass
+        local_shape = tuple(self.support_spec.runtime_local_shape)
+        local = torch.broadcast_to(value, batch_shape + local_shape).reshape(
+            batch_shape + (-1,)
+        )
+        result = like.new_zeros(like.shape[:-2] + (like.shape[-2] * like.shape[-1],))
+        return result.index_copy(-1, self._buffers["_mp_process_index"], local).reshape(
+            like.shape
+        )
+
+    def _material_support_mask(self, key, like):
+        name = getattr(self, "_mp_material_support_names", {}).get(key)
+        available = None if name is None else self._buffers[name]
+        if self.key is None:
+            return available
+        placed = self._buffers["_mp_process_mask"]
+        return placed if available is None else placed & available
+
+    def _mask_material_updates(self, fields, updates):
+        return {
+            key: value
+            if (mask := self._material_support_mask(key, fields[key])) is None
+            else torch.where(mask, value, fields[key])
+            for key, value in updates.items()
+        }
 
     def configure_process(self, population=None):
         """Configure this process after Material/Population binding.
@@ -408,6 +551,12 @@ class MaterialProcess(Mechanism):
         Mechanism._configure_timestep(self, dt)
         return None
 
+    def _install_monomorphic_advance(self):
+        # Material processes have no voltage-local States or advance stage.
+        # In particular, preparing a configuration-only packed child must not
+        # generate unused class-level voltage-update methods during lowering.
+        return None
+
     def _reset_initialization_timestep(self):
         """Discard family-specific timestep state before fresh initialization.
 
@@ -446,7 +595,36 @@ class MaterialProcess(Mechanism):
         """
         if isinstance(value, str):
             if hasattr(self, value):
-                return getattr(self, value).to(device=like.device, dtype=like.dtype)
+                local = self.key is not None and any(
+                    value in getattr(self, declaration, {})
+                    for declaration in (
+                        "_range",
+                        "_range_p",
+                        "_range_n",
+                        "_batch",
+                        "_batch_p",
+                        "_batch_n",
+                    )
+                )
+                if self.key is not None:
+                    stochastic = self.random_parameters.get(
+                        value, self.runtime_noises.get(value)
+                    )
+                    local = local or (
+                        stochastic is not None
+                        and stochastic.scope in {"range", "batch"}
+                    )
+                operand = getattr(self, value)
+                if value in self.runtime_noises:
+                    # Native sampling refreshes these buffers in place. An
+                    # accepted step owns its detached realization, including
+                    # values saved for another operand's backward pass.
+                    operand = operand.detach().clone()
+                return self._expand_material_operand(
+                    operand.to(device=like.device, dtype=like.dtype),
+                    like,
+                    local=local,
+                )
             try:
                 return self._buffers[value].to(device=like.device, dtype=like.dtype)
             except KeyError as exc:
@@ -456,12 +634,72 @@ class MaterialProcess(Mechanism):
                     "or pass a scalar/tensor value."
                 ) from exc
         if torch.is_tensor(value):
-            return value.to(device=like.device, dtype=like.dtype)
+            return self._expand_material_operand(
+                value.to(device=like.device, dtype=like.dtype), like
+            )
+        # Construct literals independently of the field's hidden vmap axes.
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
 
-    def advance_materials(self, dt):
+    def advance_materials(self, dt, *, prepared=None):
+        """Prepare a pure operator and atomically publish its replacements.
+
+        Pure process families inherit this adapter; legacy families may retain
+        their own imperative implementation. ``prepared`` lets an execution
+        adapter supply explicit operator tensors prepared outside a time loop.
+        """
+        fields = {
+            key: self._get_material(key[0])._buffers[key[1]]
+            for key in self.material_fields
+        }
+        if prepared is None:
+            prepared = self.prepare_materials(fields, dt)
+        updates = self.material_updates(fields, prepared)
+        transaction = _MaterialFieldTransaction()
+        for (name, field), value in updates.items():
+            transaction.write(self._get_material(name), field, value)
+        transaction.commit()
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        """Canonical full-field inputs to a pure material-process operator.
+
+        This optional protocol is separate from ordinary Mechanism workspace
+        declarations. Legacy processes may continue implementing only
+        :meth:`configure_process`, :meth:`set_dt`, and :meth:`advance_materials`.
+        """
         raise NotImplementedError(
-            f"{type(self).__name__}.advance_materials(dt) must be implemented."
+            f"{type(self).__name__} does not declare pure material field inputs; "
+            "implement the pure material protocol or override advance_materials(dt)."
+        )
+
+    def prepare_materials(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        dt,
+    ):
+        """Return tensor-only operator data without changing fields or self.
+
+        ``fields`` is keyed by canonical ``(material_name, field_name)`` pairs.
+        Implementations resolve current parameters and geometry into an explicit
+        tensor PyTree; they must not retain this preparation on the process.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement pure material preparation."
+        )
+
+    def material_updates(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        prepared,
+    ) -> dict[tuple[str, str], torch.Tensor]:
+        """Return full-field replacements without mutating inputs or self.
+
+        Returned keys use the same canonical identifiers as ``fields``. The
+        adapter owns publication of this transaction, including later shared
+        field guards and derived updates such as Nernst reversals.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement pure material updates."
         )
 
 
@@ -481,6 +719,7 @@ class ClearanceProcess(MaterialProcess):
 
     _clearance_specs: tuple[ClearanceSpec, ...] = tuple()
     _clearance_declarations = []
+    _functional_material_family = "clearance"
 
     def __init_subclass__(cls, **kwargs):
         super().__init_subclass__(**kwargs)
@@ -558,12 +797,6 @@ class ClearanceProcess(MaterialProcess):
         )
 
     def configure_process(self, population=None):
-        if self.key is not None:
-            raise NotImplementedError(
-                "ClearanceProcess MVP must be inserted globally. Region-restricted "
-                "clearance will require explicit masks or restricted process operators."
-            )
-
         kwargs = _copy_method_kwargs(type(self)._material_process_method_kwargs)
         method = str(type(self)._material_process_method or "exact").lower()
         if method in {"none", ""}:
@@ -597,7 +830,101 @@ class ClearanceProcess(MaterialProcess):
                 "ClearanceProcess.CLEAR(...)."
             )
         self._validate_clearance_specs()
+        self._configure_clearance_material_plan()
         return None
+
+    def _configure_clearance_material_plan(self):
+        """Bind authored operands without retaining derived operator graphs."""
+        entries = []
+        for index, spec in enumerate(type(self)._clearance_specs):
+            operands = []
+            for role, value in (("rate", spec.rate), ("target", spec.target)):
+                if isinstance(value, str):
+                    operands.append(("named", value))
+                elif isinstance(value, Number):
+                    operands.append(("scalar", value))
+                else:
+                    # Preserve the authored tensor and its autograd ownership;
+                    # dtype/device conversion belongs to each pure preparation,
+                    # not a persistent, potentially already-consumed AD graph.
+                    literal = (
+                        value if torch.is_tensor(value) else torch.as_tensor(value)
+                    )
+                    name = f"_clearance_literal_{index}_{role}"
+                    if name in self._buffers:
+                        self._buffers[name] = literal
+                    else:
+                        self.register_buffer(name, literal, persistent=False)
+                    operands.append(("buffer", name))
+            key = (_canonical_material_name(spec.material), spec.field)
+            entries.append((key, operands[0], operands[1]))
+        self._clearance_material_plan = tuple(entries)
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        return tuple(dict.fromkeys(entry[0] for entry in self._clearance_material_plan))
+
+    def _clearance_operand(self, reference, like, *, what):
+        kind, value = reference
+        if kind == "buffer":
+            return self._expand_material_operand(
+                self._buffers[value].to(device=like.device, dtype=like.dtype), like
+            )
+        return self._resolve_quantity(value, like, what=what)
+
+    @staticmethod
+    def _validate_clearance_operand(value, like, *, what):
+        if torch.broadcast_shapes(value.shape, like.shape) != like.shape:
+            raise ValueError(
+                f"Clearance {what} shape {tuple(value.shape)} must broadcast to "
+                f"the full material field shape {tuple(like.shape)}."
+            )
+
+    def prepare_materials(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        dt,
+    ) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], ...]:
+        prepared = []
+        for key, rate_reference, target_reference in self._clearance_material_plan:
+            c = fields[key]
+            rate = self._clearance_operand(rate_reference, c, what="clearance rate")
+            target = self._clearance_operand(
+                target_reference, c, what="clearance target"
+            )
+            dt_t = torch.as_tensor(dt, device=c.device, dtype=c.dtype)
+            self._validate_clearance_operand(rate, c, what="rate")
+            self._validate_clearance_operand(target, c, what="target")
+            self._validate_clearance_operand(dt_t, c, what="timestep")
+            if not self._clearance_allow_negative_rate:
+                rate = torch.clamp_min(rate, 0.0)
+            prepared.append((dt_t, rate, target))
+        return tuple(prepared)
+
+    def material_updates(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        prepared,
+    ) -> dict[tuple[str, str], torch.Tensor]:
+        if len(prepared) != len(self._clearance_material_plan):
+            raise ValueError(
+                "Clearance preparation does not match its declared field plan."
+            )
+        updates = {}
+        for (key, _rate, _target), (dt_t, rate, target) in zip(
+            self._clearance_material_plan, prepared
+        ):
+            # Later declarations of the same canonical field consume earlier
+            # replacements, exactly as in the imperative field transaction.
+            c = updates.get(key, fields[key])
+            if self._clearance_method == "explicit":
+                c_new = c + dt_t * (-rate * (c - target))
+            elif self._clearance_method == "implicit":
+                c_new = (c + dt_t * rate * target) / (1.0 + dt_t * rate)
+            else:
+                c_new = target + (c - target) * torch.exp(-rate * dt_t)
+            updates[key] = c_new
+        return self._mask_material_updates(fields, updates)
 
     def _effective_clearance_domain(self, material, spec: ClearanceSpec) -> str | None:
         domain = spec.domain
@@ -622,33 +949,6 @@ class ClearanceProcess(MaterialProcess):
             # applied to intracellular, extracellular, membrane, or custom fields.
             self._effective_clearance_domain(material, spec)
 
-    def advance_materials(self, dt):
-        dt_t = None
-        transaction = _MaterialFieldTransaction()
-        for spec in type(self)._clearance_specs:
-            material = self._get_material(spec.material)
-            c = transaction.read(material, spec.field)
-            rate = self._resolve_quantity(spec.rate, c, what="clearance rate")
-            target = self._resolve_quantity(spec.target, c, what="clearance target")
-
-            if dt_t is None:
-                dt_t = torch.as_tensor(dt, device=c.device, dtype=c.dtype)
-            else:
-                dt_t = dt_t.to(device=c.device, dtype=c.dtype)
-
-            if not self._clearance_allow_negative_rate:
-                rate = torch.clamp_min(rate, 0.0)
-
-            if self._clearance_method == "explicit":
-                c_new = c + dt_t * (-rate * (c - target))
-            elif self._clearance_method == "implicit":
-                c_new = (c + dt_t * rate * target) / (1.0 + dt_t * rate)
-            else:  # exact exponential relaxation
-                c_new = target + (c - target) * torch.exp(-rate * dt_t)
-
-            transaction.write(material, spec.field, c_new)
-        transaction.commit()
-
 
 class ClampProcess(MaterialProcess):
     """Pointwise hard or bound clamp of full Material fields.
@@ -665,6 +965,7 @@ class ClampProcess(MaterialProcess):
     """
 
     _material_process_phase = "post_transport"
+    _functional_material_family = "clamp"
     _clamp_specs: tuple[ClampSpec, ...] = tuple()
     _clamp_declarations = []
 
@@ -803,12 +1104,6 @@ class ClampProcess(MaterialProcess):
         )
 
     def configure_process(self, population=None):
-        if self.key is not None:
-            raise NotImplementedError(
-                "ClampProcess MVP must be inserted globally. Region-restricted "
-                "clamps should be expressed with the `where=` mask/index argument."
-            )
-
         kwargs = _copy_method_kwargs(type(self)._material_process_method_kwargs)
         method = str(type(self)._material_process_method or "set").lower()
         if method in {"none", ""}:
@@ -847,7 +1142,127 @@ class ClampProcess(MaterialProcess):
         )
         self._clamp_mask_names: dict[str, str | None] = {}
         self._validate_and_configure_clamp_specs(population)
+        self._configure_clamp_material_plan()
         return None
+
+    def _configure_clamp_material_plan(self):
+        """Bind authored operands and masks without retaining update graphs."""
+        entries = []
+        for index, (operator_key, spec) in enumerate(
+            zip(self._clamp_operator_keys, type(self)._clamp_specs)
+        ):
+            mode = self._effective_clamp_mode(spec)
+            if mode == "range":
+                # Preserve the existing failure at execution, including malformed
+                # bounds that cannot otherwise be represented as a tensor.
+                values = (
+                    tuple(zip(("lower", "upper"), spec.value))
+                    if isinstance(spec.value, (tuple, list)) and len(spec.value) == 2
+                    else ()
+                )
+            else:
+                values = (("value", spec.value),)
+            operands = []
+            for role, value in values:
+                if isinstance(value, str):
+                    operands.append(("named", value))
+                elif isinstance(value, Number):
+                    operands.append(("scalar", value))
+                else:
+                    literal = (
+                        value if torch.is_tensor(value) else torch.as_tensor(value)
+                    )
+                    name = f"_clamp_literal_{index}_{role}"
+                    if name in self._buffers:
+                        self._buffers[name] = literal
+                    else:
+                        self.register_buffer(name, literal, persistent=False)
+                    operands.append(("buffer", name))
+            key = (_canonical_material_name(spec.material), spec.field)
+            entries.append(
+                (key, mode, tuple(operands), self._clamp_mask_names[operator_key])
+            )
+        self._clamp_material_plan = tuple(entries)
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        return tuple(dict.fromkeys(entry[0] for entry in self._clamp_material_plan))
+
+    def _clamp_operand(self, reference, like, *, what):
+        kind, value = reference
+        if kind == "buffer":
+            return self._expand_material_operand(
+                self._buffers[value].to(device=like.device, dtype=like.dtype), like
+            )
+        return self._resolve_quantity(value, like, what=what)
+
+    @staticmethod
+    def _validate_clamp_operand(value, like, *, what):
+        if torch.broadcast_shapes(value.shape, like.shape) != like.shape:
+            raise ValueError(
+                f"Clamp {what} shape {tuple(value.shape)} must broadcast to "
+                f"the full material field shape {tuple(like.shape)}."
+            )
+
+    def prepare_materials(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        dt,
+    ):
+        del dt  # clamps are algebraic process updates
+        prepared = []
+        for key, mode, references, mask_name in self._clamp_material_plan:
+            c = fields[key]
+            if mode == "range" and len(references) != 2:
+                raise ValueError(
+                    "ClampProcess mode='range' requires value=(lower, upper)."
+                )
+            values = tuple(
+                self._clamp_operand(reference, c, what="clamp value")
+                for reference in references
+            )
+            for value in values:
+                self._validate_clamp_operand(value, c, what="value")
+            if mask_name is None:
+                prepared.append((values,))
+            else:
+                mask = self._buffers[mask_name].to(device=c.device, dtype=torch.bool)
+                self._validate_clamp_operand(mask, c, what="mask")
+                prepared.append((values, mask))
+        return tuple(prepared)
+
+    def material_updates(
+        self,
+        fields: Mapping[tuple[str, str], torch.Tensor],
+        prepared,
+    ) -> dict[tuple[str, str], torch.Tensor]:
+        if len(prepared) != len(self._clamp_material_plan):
+            raise ValueError(
+                "Clamp preparation does not match its declared field plan."
+            )
+        updates = {}
+        for (key, mode, _references, mask_name), operands in zip(
+            self._clamp_material_plan, prepared
+        ):
+            values = operands[0]
+            c = updates.get(key, fields[key])
+            if mode == "range":
+                lower, upper = values
+                c_clamped = torch.maximum(torch.minimum(c, upper), lower)
+            else:
+                (value,) = values
+                if mode == "min":
+                    c_clamped = torch.maximum(c, value)
+                elif mode == "max":
+                    c_clamped = torch.minimum(c, value)
+                else:
+                    c_clamped = value + torch.zeros_like(c)
+            updates[key] = (
+                c_clamped
+                if mask_name is None
+                else torch.where(operands[1], c_clamped, c)
+            )
+        return self._mask_material_updates(fields, updates)
 
     def _effective_clamp_domain(self, material, spec: ClampSpec) -> str | None:
         domain = spec.domain
@@ -896,7 +1311,24 @@ class ClampProcess(MaterialProcess):
             self._effective_clamp_mode(spec)
 
             c = material._buffers[spec.field]
-            mask = self._build_where_mask(spec.where, c, population=population)
+            mask_name = f"_clamp_mask_{key}"
+            if (
+                hasattr(population, "populations")
+                and not population.populations
+                and mask_name in self._buffers
+            ):
+                mask = self._buffers[mask_name]
+            elif (
+                hasattr(population, "populations")
+                and not population.populations
+                and (
+                    spec.where is None
+                    or (isinstance(spec.where, str) and spec.where == "all")
+                )
+            ):
+                mask = None
+            else:
+                mask = self._build_where_mask(spec.where, c, population=population)
             if mask is None:
                 self._clamp_mask_names[key] = None
             else:
@@ -909,6 +1341,30 @@ class ClampProcess(MaterialProcess):
                 self._clamp_mask_names[key] = mask_name
 
     def _build_where_mask(self, where, like: torch.Tensor, *, population=None):
+        if isinstance(where, str) and any(
+            where in getattr(self, declaration, {})
+            for declaration in (
+                "_range",
+                "_range_p",
+                "_range_n",
+                "_batch",
+                "_batch_p",
+                "_batch_n",
+            )
+        ):
+            return self._resolve_quantity(
+                where, torch.zeros_like(like, dtype=torch.bool)
+            )
+        component_name = getattr(type(self), "_material_process_component", None)
+        if component_name is not None and hasattr(population, "populations"):
+            component = population.populations[component_name]
+            local = like.new_zeros(component.core_shape())
+            mask = self._build_where_mask(where, local, population=component)
+            if mask is None:
+                return None
+            return self._expand_material_operand(
+                mask, torch.zeros_like(like, dtype=torch.bool)
+            )
         if where is None:
             return None
         if isinstance(where, str):
@@ -958,6 +1414,15 @@ class ClampProcess(MaterialProcess):
         return mask
 
     def _terminal_mask(self, like: torch.Tensor, population=None):
+        if hasattr(population, "populations"):
+            return torch.cat(
+                [
+                    self._terminal_mask(
+                        like.new_zeros(child.core_shape()), child
+                    ).reshape(-1)
+                    for child in population.populations.values()
+                ]
+            ).reshape(like.shape[-2:])
         mask = torch.zeros_like(like, dtype=torch.bool)
         graph = getattr(population, "graph", None) if population is not None else None
         if graph is not None:
@@ -981,6 +1446,15 @@ class ClampProcess(MaterialProcess):
         return mask
 
     def _root_mask(self, like: torch.Tensor, population=None):
+        if hasattr(population, "populations"):
+            return torch.cat(
+                [
+                    self._root_mask(like.new_zeros(child.core_shape()), child).reshape(
+                        -1
+                    )
+                    for child in population.populations.values()
+                ]
+            ).reshape(like.shape[-2:])
         mask = torch.zeros_like(like, dtype=torch.bool)
         graph = getattr(population, "graph", None) if population is not None else None
         if graph is not None:
@@ -995,48 +1469,6 @@ class ClampProcess(MaterialProcess):
         if like.shape[-1] > 0:
             mask[..., 0] = True
         return mask
-
-    def _broadcast_mask(self, mask, c: torch.Tensor):
-        if mask is None:
-            return None
-        mask = mask.to(device=c.device, dtype=torch.bool)
-        while mask.ndim < c.ndim:
-            mask = mask.unsqueeze(0)
-        return mask.expand_as(c)
-
-    def _apply_clamp_mode(self, c: torch.Tensor, spec: ClampSpec, mode: str):
-        if mode == "range":
-            if not isinstance(spec.value, (tuple, list)) or len(spec.value) != 2:
-                raise ValueError(
-                    "ClampProcess mode='range' requires value=(lower, upper)."
-                )
-            lower = self._resolve_quantity(spec.value[0], c, what="clamp lower bound")
-            upper = self._resolve_quantity(spec.value[1], c, what="clamp upper bound")
-            return torch.maximum(torch.minimum(c, upper), lower)
-
-        value = self._resolve_quantity(spec.value, c, what="clamp value")
-        if mode == "min":
-            return torch.maximum(c, value)
-        if mode == "max":
-            return torch.minimum(c, value)
-        return value + torch.zeros_like(c)
-
-    def advance_materials(self, dt):
-        del dt  # clamps are algebraic process updates
-        transaction = _MaterialFieldTransaction()
-        for key, spec in zip(self._clamp_operator_keys, type(self)._clamp_specs):
-            material = self._get_material(spec.material)
-            c = transaction.read(material, spec.field)
-            mode = self._effective_clamp_mode(spec)
-            c_clamped = self._apply_clamp_mode(c, spec, mode)
-            mask_name = self._clamp_mask_names.get(key, None)
-            if mask_name is None:
-                c_new = c_clamped
-            else:
-                mask = self._broadcast_mask(self._buffers[mask_name], c)
-                c_new = torch.where(mask, c_clamped, c)
-            transaction.write(material, spec.field, c_new)
-        transaction.commit()
 
 
 class ExchangeProcess(MaterialProcess):
@@ -1059,6 +1491,7 @@ class ExchangeProcess(MaterialProcess):
     floating-point roundoff on compartments with positive volumes.
     """
 
+    _functional_material_family = "exchange"
     _exchange_specs: tuple[ExchangeSpec, ...] = tuple()
     _exchange_declarations = []
 
@@ -1154,12 +1587,6 @@ class ExchangeProcess(MaterialProcess):
         ExchangeProcess.EXCHANGE(*args, **kwargs)
 
     def configure_process(self, population=None):
-        if self.key is not None:
-            raise NotImplementedError(
-                "ExchangeProcess MVP must be inserted globally. Region-restricted "
-                "exchange should be expressed with masks or region-aware process operators."
-            )
-
         kwargs = _copy_method_kwargs(type(self)._material_process_method_kwargs)
         method = str(type(self)._material_process_method or "exact").lower()
         if method in {"none", ""}:
@@ -1196,6 +1623,7 @@ class ExchangeProcess(MaterialProcess):
                 "ExchangeProcess.EXCHANGE(...)."
             )
         self._validate_exchange_specs()
+        self._configure_exchange_material_plan()
         return None
 
     def _set_exchange_geometry_buffer(self, name: str, value: torch.Tensor) -> None:
@@ -1206,33 +1634,261 @@ class ExchangeProcess(MaterialProcess):
 
     def _configure_exchange_geometry(self, population=None):
         if population is None:
+            if not hasattr(self, "_exchange_geometry_sources"):
+                self._exchange_geometry_sources = ()
+                self._exchange_analytic_area = False
             return None
 
+        sources = []
         for name in ("volume", "volume_um3", "volume_i", "volume_o"):
             if hasattr(population, name):
                 value = getattr(population, name)
                 if torch.is_tensor(value):
-                    self._set_exchange_geometry_buffer(
-                        f"_mp_{name}", value.detach().clone()
-                    )
+                    self._set_exchange_geometry_buffer(f"_mp_{name}", value)
+                    sources.append((f"_mp_{name}", name))
 
         if hasattr(population, "dx"):
             value = getattr(population, "dx")
             if torch.is_tensor(value):
-                self._set_exchange_geometry_buffer("_mp_dx", value.detach().clone())
+                self._set_exchange_geometry_buffer("_mp_dx", value)
+                sources.append(("_mp_dx", "dx"))
 
+        component_area = getattr(population, "_component_area", None)
+        canonical_graph = getattr(population, "compartment_graph", None)
+        graph = getattr(population, "graph", None)
+        # A packed population's area is its exact component area, not the
+        # cylindrical area of the concatenated parent diameter/length arrays.
+        self._exchange_analytic_area = (
+            not torch.is_tensor(component_area)
+            and canonical_graph is None
+            and graph is None
+            and hasattr(population, "diam")
+            and any(name == "_mp_dx" for name, _source in sources)
+        )
         try:
             area = population.area
-            if torch.is_tensor(area):
-                # Population.area is in cm^2; convert to µm^2 for surface-like
-                # material masses.  This is available for future membrane-domain
-                # processes, but ExchangeProcess does not require it.
-                self._set_exchange_geometry_buffer(
-                    "_mp_area_um2", (area.detach().clone() * 1e8)
+            if torch.is_tensor(area) and not self._exchange_analytic_area:
+                # Retain raw geometry inputs, never a detached snapshot or a
+                # converted AD graph that a previous backward might consume.
+                self._set_exchange_geometry_buffer("_mp_area_cm2", area)
+                area_source = (
+                    "component_area"
+                    if torch.is_tensor(component_area)
+                    else "canonical_area_cm2"
+                    if canonical_graph is not None or graph is not None
+                    else "area"
                 )
+                # Area labels identify physical adapters, not necessarily a
+                # same-named Population buffer. Functional preparation supplies
+                # canonical or packed component area explicitly.
+                sources.append(("_mp_area_cm2", area_source))
         except Exception:
             pass
+        previous = getattr(self, "_exchange_geometry_sources", ())
+        current_names = {name for name, _source in sources}
+        for name, _source in previous:
+            if name not in current_names:
+                self._buffers.pop(name, None)
+        self._exchange_geometry_sources = tuple(sources)
         return None
+
+    @staticmethod
+    def _exchange_volume_is_geometry(value):
+        return value is None or (
+            isinstance(value, str)
+            and value.lower()
+            in {
+                "domain",
+                "field",
+                "auto",
+                "i",
+                "inside",
+                "intra",
+                "cytosol",
+                "cytosolic",
+                "intracellular",
+                "o",
+                "outside",
+                "extra",
+                "extracellular",
+                "membrane",
+                "surface",
+                "volume",
+                "volume_i",
+                "volume_um3",
+                "intracellular_volume",
+                "volume_o",
+                "extracellular_volume",
+                "area",
+                "surface_area",
+                "membrane_area",
+            }
+        )
+
+    def _configure_exchange_material_plan(self):
+        entries = []
+        for index, spec in enumerate(type(self)._exchange_specs):
+            uses_conductance = spec.conductance is not None
+            kinetics = spec.conductance if uses_conductance else spec.rate
+            operands = []
+            for role, value in (
+                ("conductance" if uses_conductance else "rate", kinetics),
+                ("volume_a", spec.volume_a),
+                ("volume_b", spec.volume_b),
+            ):
+                if role.startswith("volume_") and self._exchange_volume_is_geometry(
+                    value
+                ):
+                    operands.append(("geometry", value))
+                elif isinstance(value, str):
+                    operands.append(("named", value))
+                elif isinstance(value, Number):
+                    operands.append(("scalar", value))
+                else:
+                    literal = (
+                        value if torch.is_tensor(value) else torch.as_tensor(value)
+                    )
+                    name = f"_exchange_literal_{index}_{role}"
+                    if name in self._buffers:
+                        self._buffers[name] = literal
+                    else:
+                        self.register_buffer(name, literal, persistent=False)
+                    operands.append(("buffer", name))
+            ma = self._get_material(spec.material_a)
+            mb = self._get_material(spec.material_b)
+            key_a = (_canonical_material_name(spec.material_a), spec.field_a)
+            key_b = (_canonical_material_name(spec.material_b), spec.field_b)
+            entries.append(
+                (
+                    key_a,
+                    key_b,
+                    operands[0],
+                    uses_conductance,
+                    operands[1],
+                    operands[2],
+                    self._effective_exchange_domain(ma, spec.field_a, spec.domain_a),
+                    self._effective_exchange_domain(mb, spec.field_b, spec.domain_b),
+                )
+            )
+        self._exchange_material_plan = tuple(entries)
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        return tuple(
+            dict.fromkeys(
+                key for entry in self._exchange_material_plan for key in entry[:2]
+            )
+        )
+
+    def _exchange_operand(self, reference, like, *, what, volume=False, domain=None):
+        kind, value = reference
+        if kind == "buffer":
+            return self._expand_material_operand(
+                self._buffers[value].to(device=like.device, dtype=like.dtype), like
+            )
+        if volume:
+            return self._resolve_exchange_volume(value, like, domain=domain, what=what)
+        return self._resolve_quantity(value, like, what=what)
+
+    @staticmethod
+    def _validate_exchange_operand(value, like, *, what):
+        if torch.broadcast_shapes(value.shape, like.shape) != like.shape:
+            raise ValueError(
+                f"Exchange {what} shape {tuple(value.shape)} must broadcast to "
+                f"the full material field shape {tuple(like.shape)}."
+            )
+
+    def prepare_materials(self, fields: Mapping[tuple[str, str], torch.Tensor], dt):
+        prepared = []
+        for (
+            key_a,
+            key_b,
+            kinetic,
+            uses_conductance,
+            volume_a,
+            volume_b,
+            domain_a,
+            domain_b,
+        ) in self._exchange_material_plan:
+            a, b = fields[key_a], fields[key_b]
+            if a.shape != b.shape:
+                raise ValueError(
+                    "Exchange fields must have identical full material field shapes."
+                )
+            Va = self._exchange_operand(
+                volume_a, a, volume=True, domain=domain_a, what="exchange volume_a"
+            )
+            Vb = self._exchange_operand(
+                volume_b, a, volume=True, domain=domain_b, what="exchange volume_b"
+            )
+            coefficient = self._exchange_operand(
+                kinetic,
+                a,
+                what="exchange conductance" if uses_conductance else "exchange rate",
+            )
+            dt_t = torch.as_tensor(dt, device=a.device, dtype=a.dtype)
+            for value, what in (
+                (Va, "volume_a"),
+                (Vb, "volume_b"),
+                (coefficient, "coefficient"),
+                (dt_t, "timestep"),
+            ):
+                self._validate_exchange_operand(value, a, what=what)
+            eps_t = torch.as_tensor(self._exchange_eps, device=a.device, dtype=a.dtype)
+            active = (Va > eps_t) & (Vb > eps_t)
+            for key, field in ((key_a, a), (key_b, b)):
+                mask = self._material_support_mask(key, field)
+                if mask is not None:
+                    active = active & mask
+            # Inactive pairs are identities, so use finite dummy weights there.
+            # Tiny clamp-only weights can overflow reciprocal derivatives in
+            # float32 even behind a later, inactive torch.where branch.
+            Va_safe = torch.where(
+                active, torch.clamp_min(Va, eps_t), torch.ones_like(Va)
+            )
+            Vb_safe = torch.where(
+                active, torch.clamp_min(Vb, eps_t), torch.ones_like(Vb)
+            )
+            if not self._exchange_allow_negative_rate:
+                coefficient = torch.clamp_min(coefficient, 0.0)
+            g = coefficient if uses_conductance else coefficient * Va_safe
+            if not self._exchange_allow_negative_rate:
+                g = torch.clamp_min(g, 0.0)
+            prepared.append((dt_t, Va_safe, Vb_safe, active, g))
+        return tuple(prepared)
+
+    def material_updates(
+        self, fields: Mapping[tuple[str, str], torch.Tensor], prepared
+    ):
+        if len(prepared) != len(self._exchange_material_plan):
+            raise ValueError(
+                "Exchange preparation does not match its declared field plan."
+            )
+        updates = {}
+        for entry, (dt_t, Va_safe, Vb_safe, active, g) in zip(
+            self._exchange_material_plan, prepared
+        ):
+            key_a, key_b = entry[:2]
+            a = updates.get(key_a, fields[key_a])
+            b = updates.get(key_b, fields[key_b]).to(device=a.device, dtype=a.dtype)
+            diff = a - b
+            if self._exchange_method == "explicit":
+                flux = g * diff
+                a_new = a - dt_t * flux / Va_safe
+                b_new = b + dt_t * flux / Vb_safe
+            else:
+                lam = g * (1.0 / Va_safe + 1.0 / Vb_safe)
+                if self._exchange_method == "implicit":
+                    diff_new = diff / (1.0 + dt_t * lam)
+                else:
+                    diff_new = diff * torch.exp(-dt_t * lam)
+                total = Va_safe * a + Vb_safe * b
+                denom = Va_safe + Vb_safe
+                a_new = (total + Vb_safe * diff_new) / denom
+                b_new = (total - Va_safe * diff_new) / denom
+            updates[key_a] = torch.where(active, a_new, a)
+            updates[key_b] = torch.where(active, b_new, b)
+        return self._mask_material_updates(fields, updates)
 
     def _validate_exchange_specs(self):
         for spec in type(self)._exchange_specs:
@@ -1248,7 +1904,7 @@ class ExchangeProcess(MaterialProcess):
                     f"Material {spec.material_b!r} has no field {spec.field_b!r}. "
                     f"Available fields: {mb.fields}."
                 )
-            if spec.material_a == spec.material_b and spec.field_a == spec.field_b:
+            if ma is mb and spec.field_a == spec.field_b:
                 raise ValueError("ExchangeProcess cannot exchange a field with itself.")
             self._effective_exchange_domain(ma, spec.field_a, spec.domain_a)
             self._effective_exchange_domain(mb, spec.field_b, spec.domain_b)
@@ -1286,8 +1942,12 @@ class ExchangeProcess(MaterialProcess):
                 return _buf("_mp_volume_o")
 
         if domain == "membrane":
-            if "_mp_area_um2" in self._buffers:
-                return _buf("_mp_area_um2")
+            if self._exchange_analytic_area and "_mp_dx" in self._buffers:
+                return (
+                    torch.pi * self.diam.to(device=device, dtype=dtype) * _buf("_mp_dx")
+                )
+            if "_mp_area_cm2" in self._buffers:
+                return _buf("_mp_area_cm2") * 1e8
 
         if self._exchange_require_volumes:
             raise NotImplementedError(
@@ -1305,32 +1965,6 @@ class ExchangeProcess(MaterialProcess):
 
         if isinstance(value, str):
             lower = value.lower()
-            domain_words = {
-                "domain",
-                "field",
-                "auto",
-                "i",
-                "inside",
-                "intra",
-                "cytosol",
-                "cytosolic",
-                "intracellular",
-                "o",
-                "outside",
-                "extra",
-                "extracellular",
-                "membrane",
-                "surface",
-                "volume",
-                "volume_i",
-                "volume_um3",
-                "intracellular_volume",
-                "volume_o",
-                "extracellular_volume",
-                "area",
-                "surface_area",
-                "membrane_area",
-            }
             if lower in {"domain", "field", "auto"}:
                 return self._geometry_volume_for_domain(domain, like, what=what)
             if lower in {"volume", "volume_um3"}:
@@ -1352,7 +1986,7 @@ class ExchangeProcess(MaterialProcess):
                 )
             if lower in {"area", "surface_area", "membrane_area"}:
                 return self._geometry_volume_for_domain("membrane", like, what=what)
-            if lower in domain_words:
+            if self._exchange_volume_is_geometry(value):
                 return self._geometry_volume_for_domain(value, like, what=what)
             # Otherwise interpret the string as a RANGE/GLOBAL parameter/buffer name.
             return self._resolve_quantity(value, like, what=what)
@@ -1360,75 +1994,6 @@ class ExchangeProcess(MaterialProcess):
         if torch.is_tensor(value):
             return value.to(device=like.device, dtype=like.dtype)
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
-
-    def _exchange_conductance(
-        self, spec: ExchangeSpec, a: torch.Tensor, Va: torch.Tensor
-    ):
-        if spec.conductance is not None:
-            g = self._resolve_quantity(spec.conductance, a, what="exchange conductance")
-        else:
-            rate = self._resolve_quantity(spec.rate, a, what="exchange rate")
-            if not self._exchange_allow_negative_rate:
-                rate = torch.clamp_min(rate, 0.0)
-            g = rate * Va
-        if not self._exchange_allow_negative_rate:
-            g = torch.clamp_min(g, 0.0)
-        return g
-
-    def advance_materials(self, dt):
-        dt_t = None
-        transaction = _MaterialFieldTransaction()
-        for spec in type(self)._exchange_specs:
-            ma = self._get_material(spec.material_a)
-            mb = self._get_material(spec.material_b)
-            a = transaction.read(ma, spec.field_a)
-            b = transaction.read(mb, spec.field_b)
-
-            if dt_t is None:
-                dt_t = torch.as_tensor(dt, device=a.device, dtype=a.dtype)
-            else:
-                dt_t = dt_t.to(device=a.device, dtype=a.dtype)
-
-            domain_a = self._effective_exchange_domain(ma, spec.field_a, spec.domain_a)
-            domain_b = self._effective_exchange_domain(mb, spec.field_b, spec.domain_b)
-
-            Va = self._resolve_exchange_volume(
-                spec.volume_a, a, domain=domain_a, what="exchange volume_a"
-            )
-            Vb = self._resolve_exchange_volume(
-                spec.volume_b, b, domain=domain_b, what="exchange volume_b"
-            ).to(device=a.device, dtype=a.dtype)
-            b = b.to(device=a.device, dtype=a.dtype)
-
-            eps_t = torch.as_tensor(self._exchange_eps, device=a.device, dtype=a.dtype)
-            Va_safe = torch.clamp_min(Va, eps_t)
-            Vb_safe = torch.clamp_min(Vb, eps_t)
-            active = (Va > eps_t) & (Vb > eps_t)
-
-            g = self._exchange_conductance(spec, a, Va_safe)
-            diff = a - b
-
-            if self._exchange_method == "explicit":
-                flux = g * diff
-                a_new = a - dt_t * flux / Va_safe
-                b_new = b + dt_t * flux / Vb_safe
-            else:
-                lam = g * (1.0 / Va_safe + 1.0 / Vb_safe)
-                if self._exchange_method == "implicit":
-                    diff_new = diff / (1.0 + dt_t * lam)
-                else:  # exact
-                    diff_new = diff * torch.exp(-dt_t * lam)
-                total = Va_safe * a + Vb_safe * b
-                denom = Va_safe + Vb_safe
-                a_new = (total + Vb_safe * diff_new) / denom
-                b_new = (total - Va_safe * diff_new) / denom
-
-            a_new = torch.where(active, a_new, a)
-            b_new = torch.where(active, b_new, b)
-
-            transaction.write(ma, spec.field_a, a_new)
-            transaction.write(mb, spec.field_b, b_new)
-        transaction.commit()
 
 
 class DiffusionProcess(MaterialProcess):
@@ -1447,6 +2012,12 @@ class DiffusionProcess(MaterialProcess):
     independent matrix blocks, and excluded field values remain exactly
     unchanged.  Repeated insertions of the same process class form one union
     support, so separately inserted regions communicate if they touch.
+
+    Concatenation retains each component's transport geometry and process
+    placement. A packed MultiPopulation uses a disconnected parent-index
+    forest: different cells never acquire chemical interfaces merely because
+    their storage is adjacent. Fields absent from a component are excluded
+    from that field's induced transport forest and remain unchanged.
 
     :meth:`RELAX` (alias :meth:`BATH`) optionally fuses linear reservoir
     coupling into the implicit diffusion solve.  With storage matrix ``M``,
@@ -1487,6 +2058,7 @@ class DiffusionProcess(MaterialProcess):
     """
 
     _material_process_phase = "transport"
+    _functional_material_family = "diffusion"
     _diffusion_specs: tuple[DiffusionSpec, ...] = tuple()
     _diffusion_declarations = []
     _diffusion_relaxation_specs: tuple[DiffusionRelaxationSpec, ...] = tuple()
@@ -1731,6 +2303,7 @@ class DiffusionProcess(MaterialProcess):
             _safe_key(i, spec.material, spec.field)
             for i, spec in enumerate(type(self)._diffusion_specs)
         )
+        self._diffusion_geometry_sources = ()
 
         self._configure_region(population)
         self._validate_overlapping_diffusivity_overrides()
@@ -1750,6 +2323,9 @@ class DiffusionProcess(MaterialProcess):
         if (
             self._diffusion_geometry_kind == "tree"
             and self._diffusion_interface_scheme != "arithmetic"
+            and not torch.is_tensor(
+                getattr(population, "_material_analytic_geometry", None)
+            )
         ):
             raise NotImplementedError(
                 "interface_scheme='series' is available only for analytic 1-D "
@@ -1758,12 +2334,14 @@ class DiffusionProcess(MaterialProcess):
             )
         if self._diffusion_geometry_kind == "tree":
             self._configure_tree_geometry(population)
+            self._configure_component_edges()
         else:
             self._configure_1d_geometry(population)
 
         self._spatial_operators = self._new_spatial_operators()
 
         self._validate_diffusion_specs()
+        self._configure_diffusion_material_plan()
         self._spatial_configured = False
         return None
 
@@ -1787,6 +2365,10 @@ class DiffusionProcess(MaterialProcess):
             )
 
         self._diffusion_geometry_name = next(iter(named), None)
+        if self._diffusion_geometry_name is not None:
+            self._diffusion_geometry_name = getattr(
+                type(self), "_material_process_geometry_names", {}
+            ).get(self._diffusion_geometry_name, self._diffusion_geometry_name)
         self._diffusion_geometry_domain = None
         if self._diffusion_geometry_name is not None:
             try:
@@ -1806,6 +2388,10 @@ class DiffusionProcess(MaterialProcess):
         self._diffusion_population_quantities = {}
 
         def register_population_quantity(source_name, destination_name, role):
+            original_name = source_name
+            source_name = getattr(
+                type(self), "_material_process_quantity_names", {}
+            ).get(source_name, source_name)
             registered = source_name in getattr(
                 population, "_buffers", {}
             ) or source_name in getattr(population, "_parameters", {})
@@ -1820,7 +2406,7 @@ class DiffusionProcess(MaterialProcess):
             value = getattr(population, source_name)
             if not torch.is_tensor(value):
                 raise TypeError(f"Population {role} {source_name!r} must be a tensor.")
-            self._diffusion_population_quantities[source_name] = destination_name
+            self._diffusion_population_quantities[original_name] = destination_name
             return True
 
         for spec in type(self)._diffusion_specs:
@@ -1880,31 +2466,42 @@ class DiffusionProcess(MaterialProcess):
                     raise TypeError(
                         f"Material geometry component {source_name!r} must be a tensor."
                     )
-                return value.clone()
+                return value
 
             volume = component("volume")
             if "edge_factor" in config:
-                self._set_geometry_buffer(
-                    "_mp_transport_edge_factor", component("edge_factor")
+                self._set_diffusion_geometry_source(
+                    "_mp_transport_edge_factor",
+                    config["edge_factor"],
+                    component("edge_factor"),
                 )
             else:
                 # Retain the primitive quantities until the spatial backend has
                 # applied its regional edge mask. This lets excluded/crossing
                 # Tree edges carry harmless sentinels and avoids inventing a
                 # dummy root-edge distance.
-                self._set_geometry_buffer(
-                    "_mp_transport_edge_area", component("edge_area")
+                self._set_diffusion_geometry_source(
+                    "_mp_transport_edge_area",
+                    config["edge_area"],
+                    component("edge_area"),
                 )
-                self._set_geometry_buffer(
-                    "_mp_transport_edge_distance", component("edge_distance")
+                self._set_diffusion_geometry_source(
+                    "_mp_transport_edge_distance",
+                    config["edge_distance"],
+                    component("edge_distance"),
                 )
-            self._set_geometry_buffer("_mp_transport_volume", volume)
+            self._set_diffusion_geometry_source(
+                "_mp_transport_volume", config["volume"], volume
+            )
 
         for source_name, destination_name in getattr(
             self, "_diffusion_population_quantities", {}
         ).items():
+            source_name = getattr(
+                type(self), "_material_process_quantity_names", {}
+            ).get(source_name, source_name)
             value = getattr(population, source_name)
-            self._set_geometry_buffer(destination_name, value.clone())
+            self._set_diffusion_geometry_source(destination_name, source_name, value)
 
     def _validate_overlapping_diffusivity_overrides(self) -> None:
         """Reject contradictory RANGE D assignments on overlapping regions.
@@ -2080,6 +2677,7 @@ class DiffusionProcess(MaterialProcess):
     def _reset_initialization_timestep(self):
         """Release configured diffusion operators and their autograd graphs."""
 
+        self.__dict__.pop("_material_restored_workspace_dt", None)
         self._spatial_operators = self._new_spatial_operators()
         self._spatial_configured = False
         return None
@@ -2089,20 +2687,25 @@ class DiffusionProcess(MaterialProcess):
 
         Specialized Axon populations expose ``graph=None`` and use analytic 1D
         finite-volume geometry. Tree and native Cable populations expose a
-        graph and use the Tree spatial backend. Unnamed Tree diffusion requires
+        graph and use the Tree spatial backend. Packed populations register a
+        parent-index forest and use the same solver without inventing edges
+        between independent cells. Unnamed Tree diffusion requires
         canonical material-geometry buffers so pt3d-aware volumes and edge
         diffusion geometry are used rather than stylized ``diam*L``
         approximations; named geometry supplies those chemical coefficients
         explicitly while retaining only the graph topology.
         """
         graph = getattr(population, "graph", None)
+        has_parent_topology = torch.is_tensor(
+            getattr(population, "diff_parent_index", None)
+        )
         if self._diffusion_geometry_name is not None:
             # A named geometry replaces chemical storage/edge coefficients, not
             # adjacency. Graph-backed populations therefore retain the Tree
             # solver and morphology topology without requiring native chemical
             # volumes or diff_geom metadata.
-            return "tree" if graph is not None else "1d"
-        if graph is None:
+            return "tree" if graph is not None or has_parent_topology else "1d"
+        if graph is None and not has_parent_topology:
             return "1d"
 
         has_volume = any(
@@ -2132,7 +2735,8 @@ class DiffusionProcess(MaterialProcess):
         except Exception:
             has_edge_geom_graph = False
 
-        if not has_edge_geom_graph:
+        has_edge_geometry = torch.is_tensor(getattr(population, "diff_geom_um", None))
+        if not has_edge_geom_graph and not (has_parent_topology and has_edge_geometry):
             raise RuntimeError(
                 "DiffusionProcess detected a graph morphology, but graph edges "
                 "do not expose diff_geom_um or R_ohm. Use a supported native or "
@@ -2146,20 +2750,26 @@ class DiffusionProcess(MaterialProcess):
         else:
             self.register_buffer(name, value)
 
+    def _set_diffusion_geometry_source(self, name, source_name, value):
+        """Register raw numerical geometry separately from fixed topology."""
+        self._set_geometry_buffer(name, value)
+        sources = dict(self._diffusion_geometry_sources)
+        sources[name] = source_name
+        self._diffusion_geometry_sources = tuple(sources.items())
+
     def _configure_1d_geometry(self, population) -> None:
-        # dx is geometry, not a dynamic material field.  Keep a local registered
-        # copy so device/dtype movement follows the process module.  The heavy
+        # dx is geometry, not a dynamic material field. Keep its raw registered
+        # input, without a detached snapshot or persistent converted AD graph. The heavy
         # finite-volume coefficients are built later in set_dt(...), mirroring
         # the voltage-integrator initialize(...) split.
-        dx = population.dx.detach().clone()
-        self._set_geometry_buffer("_mp_dx", dx)
+        self._set_diffusion_geometry_source("_mp_dx", "dx", population.dx)
         return None
 
     def _configure_tree_geometry(self, population) -> None:
         # Store the Python graph object without registering the Population itself
         # as a submodule, which would create a module cycle.  The graph is static
         # topology/metadata used during set_dt(...) precomputation only.
-        object.__setattr__(self, "_mp_graph", getattr(population, "graph"))
+        object.__setattr__(self, "_mp_graph", getattr(population, "graph", None))
 
         for name in (
             "volume",
@@ -2170,11 +2780,25 @@ class DiffusionProcess(MaterialProcess):
             "diff_parent_index",
             "diff_edge_parent",
             "diff_edge_child",
+            "_material_analytic_geometry",
         ):
             if hasattr(population, name):
                 value = getattr(population, name)
                 if torch.is_tensor(value):
-                    self._set_geometry_buffer(f"_mp_{name}", value.detach().clone())
+                    if name in {
+                        "diff_parent_index",
+                        "diff_edge_parent",
+                        "diff_edge_child",
+                        "_material_analytic_geometry",
+                    }:
+                        self._set_geometry_buffer(f"_mp_{name}", value.detach().clone())
+                    else:
+                        self._set_diffusion_geometry_source(f"_mp_{name}", name, value)
+        if torch.is_tensor(getattr(population, "_material_analytic_geometry", None)):
+            self._set_diffusion_geometry_source(
+                "_mp_analytic_diam", "diam", population.diam
+            )
+            self._set_diffusion_geometry_source("_mp_analytic_dx", "dx", population.dx)
         return None
 
     @property
@@ -2267,7 +2891,12 @@ class DiffusionProcess(MaterialProcess):
     def _resolve_quantity(self, value, like: torch.Tensor):
         if isinstance(value, str):
             if hasattr(self, value):
-                return getattr(self, value)
+                resolved = getattr(self, value)
+                return (
+                    resolved.detach().clone()
+                    if value in self.runtime_noises
+                    else resolved
+                )
             population_buffer = getattr(
                 self, "_diffusion_population_quantities", {}
             ).get(value)
@@ -2282,6 +2911,8 @@ class DiffusionProcess(MaterialProcess):
                 ) from exc
         if torch.is_tensor(value):
             return value.to(device=like.device, dtype=like.dtype)
+        if isinstance(value, Number):
+            return like.new_full((), value)
         return torch.as_tensor(value, device=like.device, dtype=like.dtype)
 
     def _resolve_spatial_quantity(self, value, like: torch.Tensor):
@@ -2300,6 +2931,14 @@ class DiffusionProcess(MaterialProcess):
         range_names = set()
         for declaration in ("range", "range_p", "range_n"):
             range_names.update(getattr(self, declaration, {}).keys())
+        range_names.update(
+            name
+            for name, spec in (
+                *self.random_parameters.items(),
+                *self.runtime_noises.items(),
+            )
+            if spec.scope in {"range", "batch"}
+        )
         if value not in range_names:
             return resolved
 
@@ -2316,6 +2955,353 @@ class DiffusionProcess(MaterialProcess):
             ) from exc
         return self.put(local, torch.zeros_like(like), like)
 
+    def _diffusion_operand_reference(self, value, *, name):
+        if isinstance(value, str):
+            population_buffer = self._diffusion_population_quantities.get(value)
+            if population_buffer is not None:
+                return ("buffer", population_buffer)
+            return ("named", value)
+        if isinstance(value, Number):
+            return ("scalar", value)
+        literal = value if torch.is_tensor(value) else torch.as_tensor(value)
+        buffer_name = f"_diffusion_literal_{name}"
+        if buffer_name in self._buffers:
+            self._buffers[buffer_name] = literal
+        else:
+            self.register_buffer(buffer_name, literal, persistent=False)
+        return ("buffer", buffer_name)
+
+    def _configure_diffusion_material_plan(self):
+        self._diffusion_fraction_refs = tuple(
+            self._diffusion_operand_reference(value, name=name)
+            for name, value in (
+                ("volume_fraction", self._diffusion_volume_fraction),
+                ("area_fraction", self._diffusion_area_fraction),
+            )
+        )
+        entries = []
+        for index, (operator_key, spec) in enumerate(
+            zip(self._diffusion_operator_keys, type(self)._diffusion_specs)
+        ):
+            key = (_canonical_material_name(spec.material), spec.field)
+            D_reference = self._diffusion_operand_reference(spec.D, name=f"{index}_D")
+            relaxations = []
+            for relaxation_index, relaxation in enumerate(self._relaxations_for(spec)):
+                prefix = f"{index}_relax_{relaxation_index}"
+                rate = self._diffusion_operand_reference(
+                    relaxation.rate, name=f"{prefix}_rate"
+                )
+                target = self._diffusion_operand_reference(
+                    relaxation.target, name=f"{prefix}_target"
+                )
+                where = (
+                    None
+                    if relaxation.where is None
+                    or (
+                        isinstance(relaxation.where, str)
+                        and relaxation.where.lower() == "all"
+                    )
+                    else self._diffusion_operand_reference(
+                        relaxation.where, name=f"{prefix}_where"
+                    )
+                )
+                relaxations.append((rate, target, where))
+            material = self._get_material(spec.material)
+            domain = self._effective_domain(material, spec) or "intracellular"
+            entries.append(
+                (
+                    operator_key,
+                    key,
+                    D_reference,
+                    domain,
+                    spec.D_location,
+                    tuple(relaxations),
+                )
+            )
+        self._diffusion_material_plan = tuple(entries)
+
+    @property
+    def material_fields(self) -> tuple[tuple[str, str], ...]:
+        return tuple(dict.fromkeys(entry[1] for entry in self._diffusion_material_plan))
+
+    def _diffusion_operand(self, reference, like, *, spatial=True, boolean=False):
+        kind, value = reference
+        dtype = torch.bool if boolean else like.dtype
+        operand_like = torch.zeros_like(like, dtype=dtype) if boolean else like
+        if kind == "buffer":
+            resolved = self._buffers[value].to(device=like.device, dtype=dtype)
+            if spatial:
+                return self._expand_material_operand(resolved, operand_like)
+            return resolved
+        if kind == "named":
+            resolved = (
+                self._resolve_spatial_quantity(value, like)
+                if spatial
+                else self._resolve_quantity(value, like)
+            )
+            resolved = resolved.to(device=like.device, dtype=dtype)
+            return (
+                self._expand_material_operand(resolved, operand_like)
+                if spatial
+                else resolved
+            )
+        return like.new_full((), value, dtype=dtype)
+
+    def _diffusion_edge_operand(self, value, like):
+        """Lift component-local edge values into the packed forest edge order."""
+        edge_child = self._buffers.get("_mp_diff_edge_child")
+        component_index = self._buffers.get("_mp_component_index")
+        if edge_child is None or component_index is None or value.ndim == 0:
+            return value
+        count = int(edge_child.numel())
+        batch_shape = tuple(like.shape[:-2])
+        full_shape = (*batch_shape, 1, count)
+        if value.shape[-1] == count:
+            try:
+                if torch.broadcast_shapes(value.shape, full_shape) == full_shape:
+                    return value
+            except RuntimeError:
+                pass
+        # The registered forest uses ascending storage-child order, hence each
+        # original child's compact edges occupy the same order after packing.
+        local_count = int(self._diffusion_component_edge_count)
+        component_shape = self._mp_component_shape
+        neuron_count = math.prod(component_shape[:-1])
+        local_shape = (
+            *batch_shape,
+            *component_shape[:-1],
+            local_count // neuron_count,
+        )
+        try:
+            local = torch.broadcast_to(value, local_shape).reshape(
+                *batch_shape, local_count
+            )
+        except RuntimeError:
+            # Also accept an already compact, component-local edge vector.
+            local = torch.broadcast_to(value, (*batch_shape, local_count))
+        index = self._buffers["_mp_component_edge_index"]
+        lifted = local.new_zeros((*batch_shape, count)).scatter(
+            -1, index.expand(*batch_shape, -1), local
+        )
+        return lifted.reshape(full_shape)
+
+    def _configure_component_edges(self):
+        """Snapshot the scoped component's compact edge map once at binding."""
+        edge_child = self._buffers.get("_mp_diff_edge_child")
+        component_index = self._buffers.get("_mp_component_index")
+        if edge_child is None or component_index is None:
+            return
+        mask = torch.zeros(
+            self._diffusion_core_shape[-1], device=edge_child.device, dtype=torch.bool
+        )
+        mask[component_index.reshape(-1).to(mask.device)] = True
+        edge_parent = self._buffers["_mp_diff_edge_parent"]
+        selected = mask[edge_child] & mask[edge_parent]
+        index = torch.nonzero(selected, as_tuple=False).flatten()
+        self._set_geometry_buffer("_mp_component_edge_index", index)
+        self._diffusion_component_edge_count = int(index.numel())
+
+    def _packed_analytic_geometry_inputs(self, c, D, domain, *, node_mask, validate):
+        """Retain analytic 1-D coefficients within a heterogeneous forest."""
+        analytic = self._buffers["_mp__material_analytic_geometry"].to(c.device)
+        parent = self._buffers["_mp_diff_edge_parent"].to(c.device)
+        child = self._buffers["_mp_diff_edge_child"].to(c.device)
+        analytic_edge = analytic.index_select(-1, parent) & analytic.index_select(
+            -1, child
+        )
+        volume_fraction = self._expand_material_operand(
+            self._diffusion_operand(self._diffusion_fraction_refs[0], c, spatial=False),
+            c,
+        )
+        volume = self.material_volume(domain).to(device=c.device, dtype=c.dtype)
+        volume = volume * torch.where(analytic, volume_fraction, 1.0)
+        factor = (
+            self._buffers["_mp_diff_geom_um"]
+            .to(device=c.device, dtype=c.dtype)
+            .index_select(-1, child)
+        )
+        area_fraction = self._diffusion_edge_operand(
+            self._diffusion_operand(self._diffusion_fraction_refs[1], c, spatial=False),
+            c,
+        )
+        factor = factor * torch.where(analytic_edge, area_fraction, 1.0)
+        if self._diffusion_interface_scheme == "arithmetic":
+            return D, {"volume": volume, "edge_factor": factor}
+
+        # Series interfaces are an analytic cable option. Native Tree edges
+        # retain their established arithmetic D averaging and exact geometry.
+        D_full = torch.broadcast_to(D, c.shape)
+        if validate:
+            selected = analytic if node_mask is None else analytic & node_mask
+            selected = torch.broadcast_to(selected, c.shape)
+            selected_D = D_full[selected]
+            if bool(torch.any(~torch.isfinite(selected_D)).item()) or bool(
+                torch.any(selected_D < 0).item()
+            ):
+                raise ValueError(
+                    "series-interface diffusion requires finite non-negative diffusivity."
+                )
+        D_parent = D_full.index_select(-1, parent)
+        D_child = D_full.index_select(-1, child)
+        diam = self._buffers["_mp_analytic_diam"].to(device=c.device, dtype=c.dtype)
+        dx = self._buffers["_mp_analytic_dx"].to(device=c.device, dtype=c.dtype)
+        capacity = D_full * SpatialOperator1D.cylinder_cross_section_um2(diam)
+        tiny = torch.finfo(c.dtype).tiny
+        resistance = torch.where(
+            capacity > 0,
+            0.5 * dx / capacity.clamp_min(tiny),
+            torch.full_like(capacity, torch.inf),
+        )
+        resistance = resistance.index_select(-1, parent) + resistance.index_select(
+            -1, child
+        )
+        valid = torch.isfinite(resistance) & (resistance > 0)
+        conductance = (
+            torch.where(
+                valid,
+                resistance.clamp_min(tiny).reciprocal(),
+                torch.zeros_like(resistance),
+            )
+            * area_fraction
+        )
+        native_conductance = 0.5 * (D_parent + D_child) * factor
+        conductance = torch.where(analytic_edge, conductance, native_conductance)
+        return conductance, {
+            "volume": volume,
+            "edge_factor": torch.ones_like(conductance),
+            "D_location": "edge",
+        }
+
+    def _diffusion_relaxation_inputs(self, references, c):
+        rate_reference, target_reference, where_reference = references
+        return (
+            self._diffusion_operand(rate_reference, c),
+            self._diffusion_operand(target_reference, c),
+            None
+            if where_reference is None
+            else self._diffusion_operand(where_reference, c, boolean=True),
+        )
+
+    def _diffusion_operator_inputs(self, entry, c, dt, *, prepared=False):
+        """Resolve registered numerical inputs for both configuration paths."""
+        _operator_key, key, D_reference, domain, D_location, _relaxations = entry
+        D = self._diffusion_operand(D_reference, c, spatial=D_location != "edge")
+        node_mask = self._material_support_mask(key, c)
+        if D_location == "edge" and self._diffusion_geometry_kind == "tree":
+            D = self._diffusion_edge_operand(D, c)
+        kwargs = {
+            "node_mask": node_mask,
+            "solver": self._diffusion_solver,
+            "D_location": D_location,
+        }
+        if self._diffusion_geometry_name is not None:
+            kwargs["volume"] = self._buffers["_mp_transport_volume"].to(
+                device=c.device, dtype=c.dtype
+            )
+            if "_mp_transport_edge_factor" in self._buffers:
+                kwargs["edge_factor"] = self._buffers["_mp_transport_edge_factor"].to(
+                    device=c.device, dtype=c.dtype
+                )
+            else:
+                kwargs["edge_area"] = self._buffers["_mp_transport_edge_area"].to(
+                    device=c.device, dtype=c.dtype
+                )
+                kwargs["edge_distance"] = self._buffers[
+                    "_mp_transport_edge_distance"
+                ].to(device=c.device, dtype=c.dtype)
+        if self._diffusion_geometry_kind == "tree":
+            kwargs["domain"] = domain
+            if not prepared:
+                if "_mp_diff_parent_index" in self._buffers:
+                    kwargs["parent_index"] = self._buffers["_mp_diff_parent_index"]
+                if (
+                    "_mp_diff_edge_parent" in self._buffers
+                    and "_mp_diff_edge_child" in self._buffers
+                ):
+                    kwargs["material_edge_index"] = torch.stack(
+                        (
+                            self._buffers["_mp_diff_edge_parent"],
+                            self._buffers["_mp_diff_edge_child"],
+                        ),
+                        dim=0,
+                    )
+            if self._diffusion_geometry_name is None:
+                if "_mp_diff_geom_um" in self._buffers:
+                    kwargs["native_edge_factor"] = self._buffers["_mp_diff_geom_um"].to(
+                        device=c.device, dtype=c.dtype
+                    )
+                elif prepared:
+                    raise RuntimeError(
+                        "Pure native Tree diffusion requires registered diff_geom_um geometry."
+                    )
+                if "_mp__material_analytic_geometry" in self._buffers:
+                    D, analytic_kwargs = self._packed_analytic_geometry_inputs(
+                        c, D, domain, node_mask=node_mask, validate=not prepared
+                    )
+                    kwargs.pop("native_edge_factor", None)
+                    kwargs.update(analytic_kwargs)
+            return (c, dt, D, self), kwargs
+
+        if self._diffusion_geometry_name is not None:
+            diam = torch.ones_like(c)
+        elif self._diffusion_is_regional:
+            local_like = self.get(c)
+            local_diam = torch.broadcast_to(
+                self.diam.to(device=c.device, dtype=c.dtype), local_like.shape
+            )
+            diam = self.put(local_diam, torch.zeros_like(c), c)
+        else:
+            diam = self.diam.to(device=c.device, dtype=c.dtype)
+        dx = self._buffers["_mp_dx"].to(device=c.device, dtype=c.dtype)
+        kwargs["volume_fraction"] = self._diffusion_operand(
+            self._diffusion_fraction_refs[0], c, spatial=False
+        )
+        kwargs["area_fraction"] = self._diffusion_operand(
+            self._diffusion_fraction_refs[1], c, spatial=False
+        )
+        return (c, dt, D, diam, dx), kwargs
+
+    def prepare_materials(self, fields: Mapping[tuple[str, str], torch.Tensor], dt):
+        """Build explicit operator tensors on already validated static plans."""
+        if not self._spatial_configured:
+            raise RuntimeError(
+                "Pure diffusion preparation requires configured spatial plans; call set_dt(dt) first."
+            )
+        prepared = []
+        for entry in self._diffusion_material_plan:
+            operator_key, key, _D, _domain, _location, relaxations = entry
+            c = fields[key]
+            operator = self._spatial_operators[operator_key]
+            args, kwargs = self._diffusion_operator_inputs(entry, c, dt, prepared=True)
+            workspace = operator.prepare_diffusion(*args, **kwargs)
+            for references in relaxations:
+                rate, target, where = self._diffusion_relaxation_inputs(references, c)
+                workspace = operator.prepare_relaxation(
+                    workspace, rate, target, where=where
+                )
+            prepared.append(workspace)
+        return tuple(prepared)
+
+    def material_updates(
+        self, fields: Mapping[tuple[str, str], torch.Tensor], prepared
+    ):
+        if len(prepared) != len(self._diffusion_material_plan):
+            raise ValueError(
+                "Diffusion preparation does not match its declared field plan."
+            )
+        updates = {}
+        for entry, workspace in zip(self._diffusion_material_plan, prepared):
+            operator_key, key = entry[:2]
+            c = updates.get(key, fields[key])
+            operator = self._spatial_operators[operator_key]
+            if self._diffusion_method == "explicit":
+                updates[key] = operator.diffuse_explicit_prepared(c, workspace)
+            else:
+                updates[key] = operator.diffuse_implicit_prepared(
+                    c, workspace, solve=operator._solve
+                )
+        return self._mask_material_updates(fields, updates)
+
     def _relaxations_for(self, diffusion_spec: DiffusionSpec):
         material = _canonical_material_name(diffusion_spec.material)
         return tuple(
@@ -2325,20 +3311,6 @@ class DiffusionProcess(MaterialProcess):
             and spec.field == diffusion_spec.field
         )
 
-    def _resolve_relaxation_where(self, value, like: torch.Tensor):
-        if value is None or (isinstance(value, str) and value.lower() == "all"):
-            return None
-        return self._resolve_spatial_quantity(value, like).to(
-            device=like.device, dtype=torch.bool
-        )
-
-    def _configure_relaxations(self, operator, diffusion_spec, c):
-        for relaxation in self._relaxations_for(diffusion_spec):
-            rate = self._resolve_spatial_quantity(relaxation.rate, c)
-            target = self._resolve_spatial_quantity(relaxation.target, c)
-            where = self._resolve_relaxation_where(relaxation.where, c)
-            operator.configure_relaxation(rate, target, where=where)
-
     def set_dt(self, dt):
         """Update dt and precompute diffusion operators for the current run."""
         # Validate and stage the mechanism dt without mutating the registered
@@ -2347,7 +3319,12 @@ class DiffusionProcess(MaterialProcess):
         dt_new.fill_(dt)
         dt_new = dt_new.detach()
         if hasattr(self, "_material_resolver"):
-            self.configure_spatial_operators(dt)
+            from ._material_stochasticity import (
+                consume_stochastic_material_workspace_restore,
+            )
+
+            if not consume_stochastic_material_workspace_restore(self, dt):
+                self.configure_spatial_operators(dt)
         self.dt = dt_new
         return None
 
@@ -2362,184 +3339,49 @@ class DiffusionProcess(MaterialProcess):
         return self._configure_1d_spatial_operators(dt)
 
     def _configure_1d_spatial_operators(self, dt):
-        dx = self._buffers["_mp_dx"].to(device=self.diam.device, dtype=self.diam.dtype)
-        node_mask = (
-            self._buffers["_mp_node_mask"] if self._diffusion_is_regional else None
-        )
-        resolved = []
-        for key, spec in zip(
-            self._diffusion_operator_keys, type(self)._diffusion_specs
-        ):
-            material = self._get_material(spec.material)
-            c = material._buffers[spec.field]
-            if spec.D_location == "edge":
-                D = self._resolve_quantity(spec.D, c)
-            else:
-                D = self._resolve_spatial_quantity(spec.D, c)
-            resolved.append((key, spec, c, D))
-
-        staged_operators = self._new_spatial_operators()
-        for key, spec, c, D in resolved:
-            if self._diffusion_geometry_name is not None:
-                # Explicit chemical geometry supplies all storage and edge
-                # factors; electrical/cylindrical diam and dx are unused.
-                diam = torch.ones_like(c)
-            elif self._diffusion_is_regional:
-                # ``self.diam`` is the differentiable local view compiled for
-                # the union support. Scatter it into full material-field space;
-                # values outside the support never participate because crossing
-                # edges and excluded volumes are masked. This avoids a detached
-                # geometry snapshot and preserves morphology gradients.
-                local_like = self.get(c)
-                local_diam = torch.broadcast_to(
-                    self.diam.to(device=c.device, dtype=c.dtype), local_like.shape
-                )
-                diam = self.put(local_diam, torch.zeros_like(c), c)
-            else:
-                # Preserve the original global path, where ``self.diam`` aliases
-                # the population geometry and carries any live autograd graph.
-                diam = self.diam.to(device=c.device, dtype=c.dtype)
-            dx_c = dx.to(device=c.device, dtype=c.dtype)
-            volume = None
-            edge_factor = None
-            edge_area = None
-            edge_distance = None
-            if self._diffusion_geometry_name is not None:
-                volume = self._buffers["_mp_transport_volume"].to(
-                    device=c.device, dtype=c.dtype
-                )
-                if "_mp_transport_edge_factor" in self._buffers:
-                    edge_factor = self._buffers["_mp_transport_edge_factor"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-                else:
-                    edge_area = self._buffers["_mp_transport_edge_area"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-                    edge_distance = self._buffers["_mp_transport_edge_distance"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-            staged_operators[key].configure_diffusion(
-                c,
-                dt,
-                D,
-                diam,
-                dx_c,
-                volume_fraction=self._diffusion_volume_fraction,
-                area_fraction=self._diffusion_area_fraction,
-                node_mask=node_mask,
-                solver=self._diffusion_solver,
-                volume=volume,
-                edge_factor=edge_factor,
-                edge_area=edge_area,
-                edge_distance=edge_distance,
-                D_location=spec.D_location,
-            )
-            self._configure_relaxations(staged_operators[key], spec, c)
-        self._spatial_operators = staged_operators
-        self._spatial_configured = True
-        return None
+        return self._configure_material_operators(dt)
 
     def _configure_tree_spatial_operators(self, dt):
-        node_mask = (
-            self._buffers["_mp_node_mask"] if self._diffusion_is_regional else None
-        )
-        resolved = []
-        for key, spec in zip(
-            self._diffusion_operator_keys, type(self)._diffusion_specs
-        ):
-            material = self._get_material(spec.material)
-            c = material._buffers[spec.field]
-            if spec.D_location == "edge":
-                D = self._resolve_quantity(spec.D, c)
-            else:
-                D = self._resolve_spatial_quantity(spec.D, c)
-            domain = self._effective_domain(material, spec) or "intracellular"
-            resolved.append((key, spec, c, D, domain))
+        return self._configure_material_operators(dt)
 
-        staged_operators = self._new_spatial_operators()
-        for key, spec, c, D, domain in resolved:
-            volume = None
-            edge_factor = None
-            edge_area = None
-            edge_distance = None
-            if self._diffusion_geometry_name is not None:
-                volume = self._buffers["_mp_transport_volume"].to(
-                    device=c.device, dtype=c.dtype
-                )
-                if "_mp_transport_edge_factor" in self._buffers:
-                    edge_factor = self._buffers["_mp_transport_edge_factor"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-                else:
-                    edge_area = self._buffers["_mp_transport_edge_area"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-                    edge_distance = self._buffers["_mp_transport_edge_distance"].to(
-                        device=c.device, dtype=c.dtype
-                    )
-            parent_index = None
-            material_edge_index = None
-            if "_mp_diff_parent_index" in self._buffers:
-                parent_index = self._buffers["_mp_diff_parent_index"]
-            if (
-                "_mp_diff_edge_parent" in self._buffers
-                and "_mp_diff_edge_child" in self._buffers
-            ):
-                material_edge_index = torch.stack(
-                    (
-                        self._buffers["_mp_diff_edge_parent"],
-                        self._buffers["_mp_diff_edge_child"],
-                    ),
-                    dim=0,
-                )
-            native_edge_factor = None
-            if (
-                self._diffusion_geometry_name is None
-                and "_mp_diff_geom_um" in self._buffers
-            ):
-                native_edge_factor = self._buffers["_mp_diff_geom_um"].to(
-                    device=c.device, dtype=c.dtype
-                )
-            staged_operators[key].configure_diffusion(
-                c,
-                dt,
-                D,
-                self,
-                domain=domain,
-                node_mask=node_mask,
-                solver=self._diffusion_solver,
-                volume=volume,
-                edge_factor=edge_factor,
-                edge_area=edge_area,
-                edge_distance=edge_distance,
-                D_location=spec.D_location,
-                parent_index=parent_index,
-                material_edge_index=material_edge_index,
-                native_edge_factor=native_edge_factor,
+    def _configure_material_operators(self, dt):
+        """Validate and stage all operators before replacing the cached plan."""
+        resolved = []
+        for entry in self._diffusion_material_plan:
+            _operator_key, key = entry[:2]
+            c = self._get_material(key[0])._buffers[key[1]]
+            args, kwargs = self._diffusion_operator_inputs(entry, c, dt)
+            relaxations = tuple(
+                self._diffusion_relaxation_inputs(references, c)
+                for references in entry[5]
             )
-            self._configure_relaxations(staged_operators[key], spec, c)
+            resolved.append((entry[0], args, kwargs, relaxations))
+        staged_operators = self._new_spatial_operators()
+        for key, args, kwargs, relaxations in resolved:
+            operator = staged_operators[key]
+            operator.configure_diffusion(*args, **kwargs)
+            for rate, target, where in relaxations:
+                operator.configure_relaxation(rate, target, where=where)
+            if (
+                self._diffusion_geometry_kind == "tree"
+                and self._diffusion_method == "explicit"
+            ):
+                operator.validate_explicit()
         self._spatial_operators = staged_operators
         self._spatial_configured = True
+        from ._material_stochasticity import capture_stochastic_material_noise
+
+        capture_stochastic_material_noise(self)
         return None
 
-    def advance_materials(self, dt):
-        if not getattr(self, "_spatial_configured", False):
-            # This should normally be done by MechanismHandler.set_dt(...), which
-            # is called from Integrator._initialize(...).  The fallback keeps
-            # manual/eager calls usable while still moving the work out of the
-            # steady-state hot path after the first call.
-            self.configure_spatial_operators(dt)
-        transaction = _MaterialFieldTransaction()
-        for key, spec in zip(
-            self._diffusion_operator_keys, type(self)._diffusion_specs
-        ):
-            material = self._get_material(spec.material)
-            c = transaction.read(material, spec.field)
-            op = self._spatial_operators[key]
-            if self._diffusion_method == "explicit":
-                c_new = op.diffuse_explicit_configured(c)
-            else:
-                c_new = op.diffuse_implicit_configured(c)
-            transaction.write(material, spec.field, c_new)
-        transaction.commit()
+    def advance_materials(self, dt, *, prepared=None):
+        if prepared is None:
+            if not self._spatial_configured:
+                # Preserve manual eager calls while keeping all preparation out
+                # of the steady-state imperative timestep loop.
+                self.configure_spatial_operators(dt)
+            prepared = tuple(
+                self._spatial_operators[entry[0]]._buffers
+                for entry in self._diffusion_material_plan
+            )
+        return MaterialProcess.advance_materials(self, dt, prepared=prepared)

@@ -10,18 +10,28 @@ from __future__ import annotations
 
 import warnings
 from collections import deque
+from collections.abc import Mapping
 from functools import partial
+from math import prod
+from numbers import Number
 from typing import Literal
 
 import numpy as np
 import torch
+
+from dendra.models.integrators._native import _cpu_topology, _mps_solver_available
 
 try:  # Registers torch.ops.dendra_solvers when available.
     import dendra_solvers  # noqa: F401
 
     DENDRA_SOLVERS_AVAILABLE = True
 except ImportError:  # pragma: no cover - depends on local installation
+    dendra_solvers = None
     DENDRA_SOLVERS_AVAILABLE = False
+
+_FUNCTIONAL_SCALAR_SPD = getattr(dendra_solvers, "solve_tri_spd", None)
+if not getattr(_FUNCTIONAL_SCALAR_SPD, "_DENDRA_FUNC_COMPATIBLE", False):
+    _FUNCTIONAL_SCALAR_SPD = None
 
 try:
     from dendra.models.integrators.tridiag import (
@@ -47,6 +57,8 @@ except Exception:  # pragma: no cover - triton may be unavailable
 def _as_tensor_like(value, like: torch.Tensor) -> torch.Tensor:
     if torch.is_tensor(value):
         return value.to(device=like.device, dtype=like.dtype)
+    if isinstance(value, Number):
+        return like.new_full((), value)
     return torch.as_tensor(value, device=like.device, dtype=like.dtype)
 
 
@@ -61,7 +73,12 @@ def _broadcast_to(value, target: torch.Tensor) -> torch.Tensor:
 
 def _broadcast_mask_to(value, target: torch.Tensor) -> torch.Tensor:
     """Broadcast a structural boolean mask without adopting target dtype."""
-    value = torch.as_tensor(value, device=target.device, dtype=torch.bool)
+    if isinstance(value, bool):
+        value = target.new_full((), value, dtype=torch.bool)
+    elif torch.is_tensor(value):
+        value = value.to(device=target.device, dtype=torch.bool)
+    else:
+        value = torch.as_tensor(value, device=target.device, dtype=torch.bool)
     if value.ndim == 0:
         return value.expand(target.shape)
     while value.ndim < target.ndim:
@@ -115,7 +132,9 @@ def _flatten_last(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     shape = tuple(x.shape)
     if x.ndim < 1:
         raise ValueError("spatial operators require at least one spatial dimension")
-    return x.reshape(-1, shape[-1]), shape
+    # Explicit leading-size arithmetic also works under a zero-lane vmap;
+    # reshape(-1, K) otherwise asks PyTorch to infer a dimension from 0 / 0.
+    return x.reshape(prod(shape[:-1]), shape[-1]), shape
 
 
 def _dense_tridiagonal_solve(a, b, c, rhs):
@@ -125,17 +144,13 @@ def _dense_tridiagonal_solve(a, b, c, rhs):
     """
     rhs2, shape = _flatten_last(rhs)
     K = rhs2.shape[-1]
-    a2 = a.reshape(-1, max(K - 1, 0))
-    b2 = b.reshape(-1, K)
-    c2 = c.reshape(-1, max(K - 1, 0))
     B = rhs2.shape[0]
-    A = rhs2.new_zeros((B, K, K))
-    idx = torch.arange(K, device=rhs2.device)
-    A[:, idx, idx] = b2
+    a2 = a.reshape(B, max(K - 1, 0))
+    b2 = b.reshape(B, K)
+    c2 = c.reshape(B, max(K - 1, 0))
+    A = torch.diag_embed(b2)
     if K > 1:
-        eidx = torch.arange(K - 1, device=rhs2.device)
-        A[:, eidx + 1, eidx] = a2
-        A[:, eidx, eidx + 1] = c2
+        A = A + torch.diag_embed(a2, offset=-1) + torch.diag_embed(c2, offset=1)
     out = torch.linalg.solve(A, rhs2.unsqueeze(-1)).squeeze(-1)
     return out.reshape(shape)
 
@@ -250,7 +265,7 @@ def select_tridiagonal_solver(solver: str | None, device: torch.device | str):
                 "Using material diffusion on CPU without dendra-solvers installed; "
                 "falling back to the PyTorch PCR/Thomas solver. Install the native "
                 "package with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
             return pcr_solve_t, "pcr_cpu"
         return None, "dense"
@@ -279,9 +294,10 @@ def solve_tridiagonal_1d(
 
     rhs2, shape = _flatten_last(rhs)
     K = rhs2.shape[-1]
-    a2 = a.reshape(-1, K - 1).contiguous()
-    b2 = b.reshape(-1, K).contiguous()
-    c2 = c.reshape(-1, K - 1).contiguous()
+    B = rhs2.shape[0]
+    a2 = a.reshape(B, K - 1).contiguous()
+    b2 = b.reshape(B, K).contiguous()
+    c2 = c.reshape(B, K - 1).contiguous()
     d2 = rhs2.contiguous()
 
     mode = _normalize_solver_name(solver)
@@ -386,6 +402,7 @@ class SpatialOperator1D(torch.nn.Module):
         volume_fraction=1.0,
         area_fraction=1.0,
         interface_scheme: str | None = None,
+        _validate_values: bool = True,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return ``(volume, g_edge)`` for finite-volume diffusion."""
         volume, edge_area = self.finite_volume_geometry(
@@ -410,7 +427,7 @@ class SpatialOperator1D(torch.nn.Module):
             tiny = torch.finfo(edge_len.dtype).tiny
             g_edge = D_edge * edge_area / edge_len.clamp_min(tiny)
         elif scheme == "series":
-            if bool(torch.any(D_full < 0).item()):
+            if _validate_values and bool(torch.any(D_full < 0).item()):
                 raise ValueError(
                     "series-interface diffusion requires non-negative diffusivity."
                 )
@@ -456,6 +473,8 @@ class SpatialOperator1D(torch.nn.Module):
         edge_area=None,
         edge_distance=None,
         D_location: str = "node",
+        _validate_values: bool = True,
+        _select_solver: bool = True,
     ) -> "SpatialOperator1D":
         """Precompute geometry, solver choice, and timestep-scaled bands.
 
@@ -509,22 +528,23 @@ class SpatialOperator1D(torch.nn.Module):
             else:
                 edge_area = _broadcast_edge_to(edge_area, c_ref)
                 edge_distance = _broadcast_edge_to(edge_distance, c_ref)
-                selected_area = edge_area[edge_active]
-                selected_distance = edge_distance[edge_active]
-                if bool(torch.any(~torch.isfinite(selected_area)).item()) or bool(
-                    torch.any(selected_area < 0).item()
-                ):
-                    raise ValueError(
-                        "Active finite-volume interfaces require finite "
-                        "non-negative edge_area."
-                    )
-                if bool(torch.any(~torch.isfinite(selected_distance)).item()) or bool(
-                    torch.any(selected_distance <= 0).item()
-                ):
-                    raise ValueError(
-                        "Active finite-volume interfaces require finite positive "
-                        "edge_distance."
-                    )
+                if _validate_values:
+                    selected_area = edge_area[edge_active]
+                    selected_distance = edge_distance[edge_active]
+                    if bool(torch.any(~torch.isfinite(selected_area)).item()) or bool(
+                        torch.any(selected_area < 0).item()
+                    ):
+                        raise ValueError(
+                            "Active finite-volume interfaces require finite "
+                            "non-negative edge_area."
+                        )
+                    if bool(
+                        torch.any(~torch.isfinite(selected_distance)).item()
+                    ) or bool(torch.any(selected_distance <= 0).item()):
+                        raise ValueError(
+                            "Active finite-volume interfaces require finite positive "
+                            "edge_distance."
+                        )
                 safe_area = torch.where(
                     edge_active, edge_area, torch.zeros_like(edge_area)
                 )
@@ -532,47 +552,50 @@ class SpatialOperator1D(torch.nn.Module):
                     edge_active, edge_distance, torch.ones_like(edge_distance)
                 )
                 edge_factor = safe_area / safe_distance
-            active_volume = volume[active]
-            if bool(torch.any(~torch.isfinite(active_volume)).item()) or bool(
-                torch.any(active_volume <= 0).item()
-            ):
-                raise ValueError(
-                    "Active finite-volume compartments require finite positive volume."
-                )
-            active_edge_factor = edge_factor[edge_active]
-            if bool(torch.any(~torch.isfinite(active_edge_factor)).item()) or bool(
-                torch.any(active_edge_factor < 0).item()
-            ):
-                raise ValueError(
-                    "Active finite-volume interfaces require finite non-negative "
-                    "edge_factor."
-                )
+            if _validate_values:
+                active_volume = volume[active]
+                if bool(torch.any(~torch.isfinite(active_volume)).item()) or bool(
+                    torch.any(active_volume <= 0).item()
+                ):
+                    raise ValueError(
+                        "Active finite-volume compartments require finite positive volume."
+                    )
+                active_edge_factor = edge_factor[edge_active]
+                if bool(torch.any(~torch.isfinite(active_edge_factor)).item()) or bool(
+                    torch.any(active_edge_factor < 0).item()
+                ):
+                    raise ValueError(
+                        "Active finite-volume interfaces require finite non-negative "
+                        "edge_factor."
+                    )
 
             if D_location == "edge":
                 D_edge = _broadcast_edge_to(D_um2_per_ms, c_ref)
             else:
                 D_full = _broadcast_to(D_um2_per_ms, c_ref)
                 D_full = torch.where(active, D_full, torch.zeros_like(D_full))
-                participates = torch.zeros_like(active)
-                participates[..., :-1] |= edge_active
-                participates[..., 1:] |= edge_active
-                active_node_D = D_full[participates]
-                if bool(torch.any(~torch.isfinite(active_node_D)).item()) or bool(
-                    torch.any(active_node_D < 0).item()
+                if _validate_values:
+                    participates = torch.zeros_like(active)
+                    participates[..., :-1] |= edge_active
+                    participates[..., 1:] |= edge_active
+                    active_node_D = D_full[participates]
+                    if bool(torch.any(~torch.isfinite(active_node_D)).item()) or bool(
+                        torch.any(active_node_D < 0).item()
+                    ):
+                        raise ValueError(
+                            "Nodes incident to active finite-volume interfaces "
+                            "require finite non-negative diffusivity."
+                        )
+                D_edge = 0.5 * (D_full[..., :-1] + D_full[..., 1:])
+            if _validate_values:
+                active_D = D_edge[edge_active]
+                if bool(torch.any(~torch.isfinite(active_D)).item()) or bool(
+                    torch.any(active_D < 0).item()
                 ):
                     raise ValueError(
-                        "Nodes incident to active finite-volume interfaces "
-                        "require finite non-negative diffusivity."
+                        "Active finite-volume interfaces require finite non-negative "
+                        "diffusivity."
                     )
-                D_edge = 0.5 * (D_full[..., :-1] + D_full[..., 1:])
-            active_D = D_edge[edge_active]
-            if bool(torch.any(~torch.isfinite(active_D)).item()) or bool(
-                torch.any(active_D < 0).item()
-            ):
-                raise ValueError(
-                    "Active finite-volume interfaces require finite non-negative "
-                    "diffusivity."
-                )
             # Mask before multiplication so NaN/sentinel values on excluded
             # interfaces cannot contaminate the induced transport subgraph.
             safe_D = torch.where(edge_active, D_edge, torch.zeros_like(D_edge))
@@ -596,6 +619,7 @@ class SpatialOperator1D(torch.nn.Module):
                 volume_fraction=volume_fraction,
                 area_fraction=area_fraction,
                 interface_scheme=interface_scheme,
+                _validate_values=_validate_values,
             )
 
         vol2, base_shape = _flatten_last(volume)
@@ -650,9 +674,12 @@ class SpatialOperator1D(torch.nn.Module):
 
         solve_volume = torch.where(active2, vol2, torch.ones_like(vol2))
         if dt_t.ndim == 0:
-            lower = -dt_t * g2
+            # A rank-two scalar view avoids PyTorch's empty-vmap scalar
+            # dispatch special case without materializing a broadcast plane.
+            dt_math = dt_t.reshape(1, 1)
+            lower = -dt_math * g2
             upper = lower
-            main = solve_volume + dt_t * (left_g + right_g)
+            main = solve_volume + dt_math * (left_g + right_g)
         else:
             # A node-wise timestep scales each finite-volume balance row.  The
             # two entries for one physical edge are consequently not symmetric:
@@ -679,11 +706,12 @@ class SpatialOperator1D(torch.nn.Module):
         self._set_buffer("upper", upper.contiguous())
         self._set_buffer("main", main.contiguous())
 
-        solve_fn, solver_name = select_tridiagonal_solver(
-            solver or self.solver, c_ref.device
-        )
-        self._solve = solve_fn
-        self.solver_name = solver_name
+        if _select_solver:
+            solve_fn, solver_name = select_tridiagonal_solver(
+                solver or self.solver, c_ref.device
+            )
+            self._solve = solve_fn
+            self.solver_name = solver_name
         self.configured = True
         return self
 
@@ -694,22 +722,34 @@ class SpatialOperator1D(torch.nn.Module):
         couple to the same transported field without an additional split step.
         """
         self._require_configured()
-        like = self._buffers["volume"].reshape(self.base_shape)
-        active = self._buffers["node_mask"].reshape(self.base_shape)
+        updates = self._prepare_relaxation(
+            self._buffers, rate, target, where=where, validate_values=True
+        )
+        self._set_buffer("main", updates["main"])
+        self._set_buffer("relax_rhs", updates["relax_rhs"])
+        self._has_relaxation = True
+        return self
+
+    def _prepare_relaxation(self, workspace, rate, target, *, where, validate_values):
+        like = workspace["volume"].reshape(self.base_shape)
+        active = workspace["node_mask"].reshape(self.base_shape)
         if where is not None:
             active = active & _broadcast_mask_to(where, like)
 
         rate_full = _broadcast_to(rate, like)
-        selected_rate = rate_full[active]
-        if bool(torch.any(~torch.isfinite(selected_rate)).item()) or bool(
-            torch.any(selected_rate < 0).item()
-        ):
-            raise ValueError("Relaxation rates must be finite and non-negative.")
+        if validate_values:
+            selected_rate = rate_full[active]
+            if bool(torch.any(~torch.isfinite(selected_rate)).item()) or bool(
+                torch.any(selected_rate < 0).item()
+            ):
+                raise ValueError("Relaxation rates must be finite and non-negative.")
         rate_full = torch.where(active, rate_full, torch.zeros_like(rate_full))
 
         target_full = _broadcast_to(target, like)
         coupled = active & (rate_full != 0)
-        if bool(torch.any(~torch.isfinite(target_full[coupled])).item()):
+        if validate_values and bool(
+            torch.any(~torch.isfinite(target_full[coupled])).item()
+        ):
             raise ValueError("Relaxation targets must be finite where rate is nonzero.")
         target_full = torch.where(coupled, target_full, torch.zeros_like(target_full))
 
@@ -718,17 +758,101 @@ class SpatialOperator1D(torch.nn.Module):
         active2 = active.reshape(self.B, self.K)
         safe_volume = torch.where(
             active2,
-            self._buffers["volume"],
-            torch.zeros_like(self._buffers["volume"]),
+            workspace["volume"],
+            torch.zeros_like(workspace["volume"]),
         )
         mass_rate = safe_volume * rate2
-        dt_t = self._buffers["dt"]
-        reaction_main = dt_t * mass_rate
+        dt_t = workspace["dt"]
+        dt_math = dt_t.reshape(1, 1) if dt_t.ndim == 0 else dt_t
+        reaction_main = dt_math * mass_rate
         reaction_rhs = reaction_main * target2
-        self._set_buffer("main", self._buffers["main"] + reaction_main)
-        self._set_buffer("relax_rhs", self._buffers["relax_rhs"] + reaction_rhs)
-        self._has_relaxation = True
-        return self
+        return dict(
+            workspace,
+            main=workspace["main"] + reaction_main,
+            relax_rhs=workspace["relax_rhs"] + reaction_rhs,
+        )
+
+    def _prepared_buffer_names(self) -> tuple[str, ...]:
+        """Inventory the shared numerical export without cloning its tensors."""
+        self._require_configured()
+        return tuple(self._buffers)
+
+    def prepared_buffers(self) -> dict[str, torch.Tensor]:
+        """Export an independent, differentiable numerical workspace."""
+        return {
+            name: self._buffers[name].clone() for name in self._prepared_buffer_names()
+        }
+
+    def prepare_diffusion(self, c_like, dt, D_um2_per_ms, diam_um, dx_um, **kwargs):
+        """Build explicit tensor workspace without changing this operator.
+
+        Structural checks remain active. Numerical inputs must satisfy the
+        same physical-domain contract checked by :meth:`configure_diffusion`;
+        no tensor-value reads or solver selection occur in this transformable
+        builder. Configure and validate the owning plan before lowering it.
+        """
+        self._require_configured()
+        if (
+            kwargs.get("solver") is not None
+            and _normalize_solver_name(kwargs["solver"]) != self.solver
+        ):
+            raise ValueError("Prepared diffusion cannot change its configured solver.")
+        staged = type(self)(
+            solver=self.solver,
+            boundary=self.boundary,
+            interface_scheme=self.interface_scheme,
+        )
+        staged.configure_diffusion(
+            c_like,
+            dt,
+            D_um2_per_ms,
+            diam_um,
+            dx_um,
+            **kwargs,
+            _validate_values=False,
+            _select_solver=False,
+        )
+        if staged.base_shape != self.base_shape:
+            raise ValueError(
+                "Prepared diffusion must retain its configured field shape."
+            )
+        return staged.prepared_buffers()
+
+    def prepare_relaxation(self, workspace, rate, target=0.0, *, where=None):
+        """Return updated implicit coefficients for a validated reservoir."""
+        self._require_configured()
+        return self._prepare_relaxation(
+            workspace, rate, target, where=where, validate_values=False
+        )
+
+    def _functional_solver(self):
+        """Bind AD-compatible facades over the selected, unchanged solver."""
+        self._require_configured()
+        solver = self._solve
+        if solver is None:
+            return None
+        if solver is _FUNCTIONAL_SCALAR_SPD:
+            return solver
+        if solver is thomas_solve_cuda_t:
+            from dendra.models.integrators._cuda_functional import thomas_solve
+
+            return thomas_solve
+        if solver is pcr_solve_cuda_t:
+            from dendra.models.integrators._cuda_functional import pcr_solve
+
+            return pcr_solve
+        name = getattr(solver, "__name__", None)
+        if getattr(solver, "__module__", None) == "torch._ops.dendra_solvers":
+            facade = getattr(dendra_solvers, name, None)
+            if name in {"thomas_solve_t", "pcr_solve_t"} and callable(facade):
+                return facade
+        if solver in {pcr_solve_t, pcr_solve_parallel_t}:
+            return solver
+        raise RuntimeError(
+            f"Material diffusion solver {self.solver_name!r} is not "
+            "transform-compatible; use a dendra-solvers build with pure SPD "
+            "facades, or select the native Thomas, PCR, or dense solver."
+        )
 
     def _require_configured(self) -> None:
         if not self.configured:
@@ -740,43 +864,57 @@ class SpatialOperator1D(torch.nn.Module):
     def diffuse_implicit_configured(self, c: torch.Tensor) -> torch.Tensor:
         """Backward-Euler sealed-boundary update using precomputed bands."""
         self._require_configured()
-        if self.K <= 1 and not self._has_relaxation:
+        return self.diffuse_implicit_prepared(c, self._buffers, solve=self._solve)
+
+    def diffuse_implicit_prepared(
+        self, c: torch.Tensor, workspace: Mapping[str, torch.Tensor], *, solve
+    ) -> torch.Tensor:
+        """Advance from explicit coefficients using the configured solver plan."""
+        # Only the bound workspace shares the template's reservoir declaration.
+        # A caller may add relaxation to an independent prepared workspace.
+        if self.K <= 1 and workspace is self._buffers and not self._has_relaxation:
             return c
         c2 = c.reshape(self.B, self.K).contiguous()
-        rhs = self._buffers["solve_volume"] * c2 + self._buffers["relax_rhs"]
+        rhs = workspace["solve_volume"] * c2 + workspace["relax_rhs"]
         if self.K <= 1:
-            out = rhs / self._buffers["main"]
-        elif self._solve is None:
+            out = rhs / workspace["main"]
+        elif solve is None:
             out = _dense_tridiagonal_solve(
-                self._buffers["lower"],
-                self._buffers["main"],
-                self._buffers["upper"],
+                workspace["lower"],
+                workspace["main"],
+                workspace["upper"],
                 rhs,
             ).reshape(self.B, self.K)
         else:
-            out = self._solve(
-                self._buffers["lower"],
-                self._buffers["main"],
-                self._buffers["upper"],
+            out = solve(
+                workspace["lower"],
+                workspace["main"],
+                workspace["upper"],
                 rhs,
             )
         out = out.reshape(self.base_shape)
-        active = self._buffers["node_mask"].reshape(self.base_shape)
+        active = workspace["node_mask"].reshape(self.base_shape)
         return torch.where(active, out, c)
 
     def diffuse_explicit_configured(self, c: torch.Tensor) -> torch.Tensor:
         """Explicit sealed-boundary finite-volume update using precomputed geometry."""
         self._require_configured()
+        return self.diffuse_explicit_prepared(c, self._buffers)
+
+    def diffuse_explicit_prepared(
+        self, c: torch.Tensor, workspace: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Advance explicit diffusion without reading bound numerical buffers."""
         if self.K <= 1:
             return c
         c2 = c.reshape(self.B, self.K)
-        edge_flux = self._buffers["g_edge"] * (c2[:, 1:] - c2[:, :-1])
-        net = torch.zeros_like(c2)
-        net[:, :-1] = net[:, :-1] + edge_flux
-        net[:, 1:] = net[:, 1:] - edge_flux
-        dt_t = self._buffers["dt"]
-        out = (c2 + dt_t * net * self._buffers["inv_volume"]).reshape(self.base_shape)
-        active = self._buffers["node_mask"].reshape(self.base_shape)
+        edge_flux = workspace["g_edge"] * (c2[:, 1:] - c2[:, :-1])
+        padding = torch.zeros_like(edge_flux[:, :1])
+        net = torch.cat((edge_flux, padding), -1) - torch.cat((padding, edge_flux), -1)
+        dt_t = workspace["dt"]
+        dt_math = dt_t.reshape(1, 1) if dt_t.ndim == 0 else dt_t
+        out = (c2 + dt_math * net * workspace["inv_volume"]).reshape(self.base_shape)
+        active = workspace["node_mask"].reshape(self.base_shape)
         return torch.where(active, out, c)
 
     # ------------------------------------------------------------------
@@ -849,7 +987,7 @@ THREADS_PER_WARP = 32
 def _build_tree_morphology(
     parent_idx: list[int],
 ) -> tuple[torch.Tensor, list[list[int]], torch.Tensor]:
-    """Build DHS/Hines morphology metadata from a parent-index vector.
+    """Build DHS/Hines forest metadata from a parent-index vector.
 
     This mirrors :func:`dendra.models.integrators.tree.build_morphology` but is
     kept local to avoid importing the full voltage-integrator module from the
@@ -857,25 +995,23 @@ def _build_tree_morphology(
     """
     K = len(parent_idx)
     children: list[list[int]] = [[] for _ in range(K)]
-    root = None
+    roots: list[int] = []
     for i, p in enumerate(parent_idx):
         p = int(p)
         if p == -1:
-            if root is not None:
-                raise ValueError("tree morphology has more than one root")
-            root = i
+            roots.append(i)
         else:
             if p < 0 or p >= K:
                 raise ValueError(f"invalid parent index {p} for node {i}")
             children[p].append(i)
 
-    if root is None:
-        raise ValueError("tree morphology must have one root with parent=-1")
+    if not roots:
+        raise ValueError("tree morphology must have at least one root with parent=-1")
 
     depth = torch.zeros(K, dtype=torch.int32)
     visited = torch.zeros(K, dtype=torch.bool)
-    visited[root] = True
-    q = deque([root])
+    visited[roots] = True
+    q = deque(roots)
     while q:
         u = q.popleft()
         for child in children[u]:
@@ -887,7 +1023,7 @@ def _build_tree_morphology(
 
     if not bool(torch.all(visited)):
         raise ValueError(
-            "tree morphology must be connected; unreachable nodes may form a cycle"
+            "tree morphology must be connected to a root; unreachable nodes may form a cycle"
         )
 
     return torch.as_tensor(parent_idx, dtype=torch.int32), children, depth
@@ -1048,7 +1184,7 @@ def parent_index_to_tree_topology(parent_index):
     """Build solver and compact-edge maps from storage-order parents.
 
     ``parent_index[j]`` is the parent of model-storage compartment ``j`` or
-    ``-1`` at the root. This registered tensor is the authoritative compiled
+    ``-1`` at each root. This registered tensor is the authoritative compiled
     topology for named Tree geometry; mutable interoperability graph views are
     deliberately not consulted.
     """
@@ -1115,7 +1251,7 @@ def _select_dhs_solver(solver: str | None, device: torch.device | str, *, thread
     mode = str(solver or "auto").lower()
     aliases = {"dhs": "auto", "hines": "auto", "tree": "auto", "custom": "auto"}
     mode = aliases.get(mode, _normalize_solver_name(mode))
-    dev_type = torch.device(device).type if not isinstance(device, str) else device
+    dev_type = torch.device(device).type
 
     if mode in {"dense", "debug", "torch", "linalg"}:
         return None, "dense"
@@ -1142,14 +1278,24 @@ def _select_dhs_solver(solver: str | None, device: torch.device | str, *, thread
                 "Tree material diffusion solver='thomas' on CPU requires the "
                 "dendra-solvers package. Install it with `python -m pip install "
                 "--upgrade --only-binary=dendra-solvers "
-                '"dendra-solvers>=0.3.1"`.'
+                '"dendra-solvers>=0.5.1"`.'
             )
         warnings.warn(
             "Using tree material diffusion on CPU without dendra-solvers installed; "
             "falling back to dense torch.linalg.solve. Install the native package "
             "with `python -m pip install --upgrade "
-            '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+            '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
         )
+        return None, "dense"
+
+    if dev_type == "mps":
+        if DENDRA_SOLVERS_AVAILABLE and _mps_solver_available(dendra_solvers):
+            return torch.ops.dendra_solvers.dhs_solve, "dhs_mps"
+        if mode == "thomas":
+            raise ImportError(
+                "Tree material diffusion on MPS requires an MPS-enabled "
+                "dendra-solvers installation and an available Apple GPU."
+            )
         return None, "dense"
 
     return None, "dense"
@@ -1169,19 +1315,25 @@ def _dense_tree_solve(
     ``-g``.
     """
     B, K = rhs.shape
-    A = rhs.new_zeros((B, K, K))
-    idx = torch.arange(K, device=rhs.device)
-    A[:, idx, idx] = d_mem
-    for child in range(K):
-        p = int(parent_idx[child].item())
-        if p < 0:
-            continue
-        g = a_geom[:, child]
-        A[:, child, child] = A[:, child, child] + g
-        A[:, p, p] = A[:, p, p] + g
-        A[:, child, p] = A[:, child, p] - g
-        A[:, p, child] = A[:, p, child] - g
+    # Assemble from explicit endpoint maps rather than exporting one parent
+    # index per Python iteration. This is also usable under vmap/FX/compile.
+    child = torch.arange(K, device=rhs.device)
+    parent = parent_idx.clamp_min(0)
+    edge = torch.where(parent_idx.unsqueeze(0) >= 0, a_geom, 0.0)
+    parent_diagonal = torch.zeros_like(d_mem).scatter_add(
+        -1, parent.unsqueeze(0).expand(B, -1), edge
+    )
+    A = torch.diag_embed(d_mem + edge + parent_diagonal).reshape(B, K * K)
+    forward_index = (child * K + parent).unsqueeze(0).expand(B, -1)
+    reverse_index = (parent * K + child).unsqueeze(0).expand(B, -1)
+    A = A.scatter_add(-1, forward_index, -edge)
+    A = A.scatter_add(-1, reverse_index, -edge).reshape(B, K, K)
     return torch.linalg.solve(A, rhs.unsqueeze(-1)).squeeze(-1)
+
+
+def _functional_dhs_plan_solve(main, edge, rhs, _parent, _order, _layers, *, plan):
+    """Use one independently owned native topology snapshot in functional AD."""
+    return dendra_solvers.dhs_solve_plan(main, edge, rhs, plan)
 
 
 class SpatialOperatorTree(torch.nn.Module):
@@ -1197,6 +1349,16 @@ class SpatialOperatorTree(torch.nn.Module):
     algebraic flux-balance junctions.  Explicit diffusion rejects zero-volume
     nodes because they would require division by zero.
     """
+
+    _FUNCTIONAL_TOPOLOGY_BUFFERS = frozenset(
+        {
+            "solver_order",
+            "inv_solver_order",
+            "parent_idx",
+            "order",
+            "layer_ptr",
+        }
+    )
 
     def __init__(
         self, *, solver: str = "auto", boundary: str = "sealed", threads: int = 16
@@ -1272,6 +1434,9 @@ class SpatialOperatorTree(torch.nn.Module):
         parent_index=None,
         material_edge_index=None,
         native_edge_factor=None,
+        _validate_values: bool = True,
+        _select_solver: bool = True,
+        _topology_plan=None,
     ) -> "SpatialOperatorTree":
         """Precompute DHS topology, mass term, diffusion couplings, and solver.
 
@@ -1319,7 +1484,21 @@ class SpatialOperatorTree(torch.nn.Module):
                 "Edge-located Tree diffusivity requires explicit geometry."
             )
 
-        if parent_index is not None:
+        if _topology_plan is not None:
+            (
+                parents,
+                nodes,
+                edge_parents,
+                edge_children,
+                elimination_order,
+                elimination_layers,
+            ) = _topology_plan
+            parent_idx_t = torch.tensor(parents, dtype=torch.int32)
+            node_order = nodes
+            edge_parent_t = torch.tensor(edge_parents, dtype=torch.long)
+            edge_child_t = torch.tensor(edge_children, dtype=torch.long)
+            diff_geom_t = None
+        elif parent_index is not None:
             parent_idx_t, solver_order_t, edge_parent_t, edge_child_t = (
                 parent_index_to_tree_topology(parent_index)
             )
@@ -1348,12 +1527,12 @@ class SpatialOperatorTree(torch.nn.Module):
                         "topology, `model.graph`, or `model.assemble_graphs()`."
                     ) from err
             graph_arg = graph if isinstance(graph, (list, tuple)) else [graph]
-        if explicit_geometry and parent_index is None:
+        if _topology_plan is None and explicit_geometry and parent_index is None:
             parent_idx_t, node_order, edge_parent_t, edge_child_t = (
                 graph_to_tree_topology(graph_arg)
             )
             diff_geom_t = None
-        elif not explicit_geometry and parent_index is None:
+        elif _topology_plan is None and not explicit_geometry and parent_index is None:
             parent_idx_t, diff_geom_t, node_order = graph_to_parent_and_diffusion(
                 graph_arg, dtype=c_like.dtype
             )
@@ -1363,8 +1542,22 @@ class SpatialOperatorTree(torch.nn.Module):
                 f"tree graph has {len(node_order)} compartments, but field has final dimension {K}."
             )
 
-        parent_idx, _, depth = _build_tree_morphology(parent_idx_t.tolist())
-        order, layer_ptr = _build_dhs_layers(depth, self.threads)
+        if _topology_plan is None:
+            parent_idx, _, depth = _build_tree_morphology(parent_idx_t.tolist())
+            order, layer_ptr = _build_dhs_layers(depth, self.threads)
+            self._topology_plan = (
+                tuple(parent_idx.tolist()),
+                tuple(node_order),
+                tuple(edge_parent_t.tolist()),
+                tuple(edge_child_t.tolist()),
+                tuple(order.tolist()),
+                tuple(layer_ptr.tolist()),
+            )
+        else:
+            parent_idx = parent_idx_t
+            order = torch.tensor(elimination_order, dtype=torch.int32)
+            layer_ptr = torch.tensor(elimination_layers, dtype=torch.int32)
+            self._topology_plan = _topology_plan
 
         device = c_like.device
         dtype = c_like.dtype
@@ -1405,13 +1598,14 @@ class SpatialOperatorTree(torch.nn.Module):
             active_s & parent_active_s & has_parent.unsqueeze(0)
         ).contiguous()
 
-        active_volume = volume_s[active_s]
-        if bool(torch.any(~torch.isfinite(active_volume)).item()) or bool(
-            torch.any(active_volume < 0).item()
-        ):
-            raise ValueError(
-                "Active Tree finite-volume nodes require finite non-negative volume."
-            )
+        if _validate_values:
+            active_volume = volume_s[active_s]
+            if bool(torch.any(~torch.isfinite(active_volume)).item()) or bool(
+                torch.any(active_volume < 0).item()
+            ):
+                raise ValueError(
+                    "Active Tree finite-volume nodes require finite non-negative volume."
+                )
 
         if D_location == "edge":
             E = int(edge_child_t.numel())
@@ -1438,19 +1632,20 @@ class SpatialOperatorTree(torch.nn.Module):
             # Mark both endpoints of every conductive edge. This is a static,
             # configure-time topology walk; keeping it boolean avoids making
             # validation depend on scatter-reduction dtype/backend support.
-            participates_s = edge_active_s.clone()
-            for child in range(K):
-                parent = int(parent_idx_dev[child].item())
-                if parent >= 0:
-                    participates_s[:, parent] |= edge_active_s[:, child]
-            active_node_D = D_s[participates_s]
-            if bool(torch.any(~torch.isfinite(active_node_D)).item()) or bool(
-                torch.any(active_node_D < 0).item()
-            ):
-                raise ValueError(
-                    "Nodes incident to active Tree finite-volume interfaces "
-                    "require finite non-negative diffusivity."
-                )
+            if _validate_values:
+                participates_s = edge_active_s.clone()
+                for child in range(K):
+                    parent = int(parent_idx_dev[child].item())
+                    if parent >= 0:
+                        participates_s[:, parent] |= edge_active_s[:, child]
+                active_node_D = D_s[participates_s]
+                if bool(torch.any(~torch.isfinite(active_node_D)).item()) or bool(
+                    torch.any(active_node_D < 0).item()
+                ):
+                    raise ValueError(
+                        "Nodes incident to active Tree finite-volume interfaces "
+                        "require finite non-negative diffusivity."
+                    )
             D_parent_s = D_s.index_select(-1, parent_safe)
             D_edge_s = torch.where(
                 has_parent.unsqueeze(0),
@@ -1476,22 +1671,23 @@ class SpatialOperatorTree(torch.nn.Module):
                 compact_active = active2.index_select(
                     -1, edge_parent
                 ) & active2.index_select(-1, edge_child)
-                selected_area = area_compact[compact_active]
-                selected_distance = distance_compact[compact_active]
-                if bool(torch.any(~torch.isfinite(selected_area)).item()) or bool(
-                    torch.any(selected_area < 0).item()
-                ):
-                    raise ValueError(
-                        "Active Tree finite-volume interfaces require finite "
-                        "non-negative edge_area."
-                    )
-                if bool(torch.any(~torch.isfinite(selected_distance)).item()) or bool(
-                    torch.any(selected_distance <= 0).item()
-                ):
-                    raise ValueError(
-                        "Active Tree finite-volume interfaces require finite "
-                        "positive edge_distance."
-                    )
+                if _validate_values:
+                    selected_area = area_compact[compact_active]
+                    selected_distance = distance_compact[compact_active]
+                    if bool(torch.any(~torch.isfinite(selected_area)).item()) or bool(
+                        torch.any(selected_area < 0).item()
+                    ):
+                        raise ValueError(
+                            "Active Tree finite-volume interfaces require finite "
+                            "non-negative edge_area."
+                        )
+                    if bool(
+                        torch.any(~torch.isfinite(selected_distance)).item()
+                    ) or bool(torch.any(selected_distance <= 0).item()):
+                        raise ValueError(
+                            "Active Tree finite-volume interfaces require finite "
+                            "positive edge_distance."
+                        )
                 safe_area = torch.where(
                     compact_active, area_compact, torch.zeros_like(area_compact)
                 )
@@ -1532,22 +1728,23 @@ class SpatialOperatorTree(torch.nn.Module):
                         f"but material field has {B} solve rows."
                     )
 
-        active_D = D_edge_s[edge_active_s]
-        if bool(torch.any(~torch.isfinite(active_D)).item()) or bool(
-            torch.any(active_D < 0).item()
-        ):
-            raise ValueError(
-                "Active Tree finite-volume interfaces require finite "
-                "non-negative diffusivity."
-            )
-        active_factor = diff_geom_s[edge_active_s]
-        if bool(torch.any(~torch.isfinite(active_factor)).item()) or bool(
-            torch.any(active_factor < 0).item()
-        ):
-            raise ValueError(
-                "Active Tree finite-volume interfaces require finite "
-                "non-negative edge_factor."
-            )
+        if _validate_values:
+            active_D = D_edge_s[edge_active_s]
+            if bool(torch.any(~torch.isfinite(active_D)).item()) or bool(
+                torch.any(active_D < 0).item()
+            ):
+                raise ValueError(
+                    "Active Tree finite-volume interfaces require finite "
+                    "non-negative diffusivity."
+                )
+            active_factor = diff_geom_s[edge_active_s]
+            if bool(torch.any(~torch.isfinite(active_factor)).item()) or bool(
+                torch.any(active_factor < 0).item()
+            ):
+                raise ValueError(
+                    "Active Tree finite-volume interfaces require finite "
+                    "non-negative edge_factor."
+                )
         safe_D = torch.where(edge_active_s, D_edge_s, torch.zeros_like(D_edge_s))
         safe_factor = torch.where(
             edge_active_s, diff_geom_s, torch.zeros_like(diff_geom_s)
@@ -1559,33 +1756,33 @@ class SpatialOperatorTree(torch.nn.Module):
         # made entirely of zero-volume nodes, however, has neither storage nor
         # an anchoring mass term and leaves a singular pure-Laplacian block.
         # Validate that every active component reaches positive material mass.
-        reachable_mass = active_s & (volume_s > 0)
-        conductive_edge_s = edge_active_s & (g_diff_s != 0)
-        # Solver order is topological (each parent precedes its children). One
-        # reverse sweep propagates mass anchors up to component roots, and one
-        # forward sweep propagates them back down: O(K), including large trees.
-        for child in range(K - 1, -1, -1):
-            p = int(parent_idx[child].item())
-            if p >= 0:
-                reachable_mass[:, p] |= (
-                    conductive_edge_s[:, child] & reachable_mass[:, child]
+        if _validate_values:
+            reachable_mass = active_s & (volume_s > 0)
+            conductive_edge_s = edge_active_s & (g_diff_s != 0)
+            # Topological order permits two linear sweeps. This physical-domain
+            # preflight runs before functional lowering, never in a scan body.
+            for child in range(K - 1, -1, -1):
+                p = int(parent_idx[child].item())
+                if p >= 0:
+                    reachable_mass[:, p] |= (
+                        conductive_edge_s[:, child] & reachable_mass[:, child]
+                    )
+            for child in range(K):
+                p = int(parent_idx[child].item())
+                if p >= 0:
+                    reachable_mass[:, child] |= (
+                        conductive_edge_s[:, child] & reachable_mass[:, p]
+                    )
+            unanchored = active_s & ~reachable_mass
+            if bool(torch.any(unanchored).item()):
+                first_row, first_slot = torch.nonzero(unanchored, as_tuple=False)[
+                    0
+                ].tolist()
+                raise ValueError(
+                    "Each active Tree diffusion component must contain positive "
+                    "material volume; found a zero-volume component at solve row "
+                    f"{first_row}, compartment slot {first_slot}."
                 )
-        for child in range(K):
-            p = int(parent_idx[child].item())
-            if p >= 0:
-                reachable_mass[:, child] |= (
-                    conductive_edge_s[:, child] & reachable_mass[:, p]
-                )
-        unanchored = active_s & ~reachable_mass
-        if bool(torch.any(unanchored).item()):
-            first_row, first_slot = torch.nonzero(unanchored, as_tuple=False)[
-                0
-            ].tolist()
-            raise ValueError(
-                "Each active Tree diffusion component must contain positive "
-                "material volume; found a zero-volume component at solve row "
-                f"{first_row}, compartment slot {first_slot}."
-            )
 
         dt_t = _as_tensor_like(dt, c_like)
         if dt_t.ndim != 0:
@@ -1597,7 +1794,7 @@ class SpatialOperatorTree(torch.nn.Module):
         tiny = torch.finfo(dtype).tiny
         safe_volume_s = torch.where(active_s, volume_s, torch.ones_like(volume_s))
         if dt_t.ndim == 0:
-            dmem = safe_volume_s / dt_t.clamp_min(tiny)
+            dmem = safe_volume_s / dt_t.clamp_min(tiny).reshape(1, 1)
         else:
             safe_dt_t = torch.where(active_s, dt_t, torch.ones_like(dt_t))
             dmem = safe_volume_s / safe_dt_t.clamp_min(tiny)
@@ -1609,12 +1806,13 @@ class SpatialOperatorTree(torch.nn.Module):
 
         self._set_buffer("volume", volume2.contiguous())
         self._set_buffer("volume_solver", volume_s.contiguous())
-        safe_volume2 = torch.where(active2, volume2, torch.ones_like(volume2))
+        positive_volume = active2 & (volume2 > 0)
+        safe_volume2 = torch.where(positive_volume, volume2, torch.ones_like(volume2))
         self._set_buffer(
             "inv_volume",
             torch.where(
-                active2,
-                1.0 / safe_volume2.clamp_min(tiny),
+                positive_volume,
+                1.0 / safe_volume2,
                 torch.zeros_like(volume2),
             ).contiguous(),
         )
@@ -1625,39 +1823,57 @@ class SpatialOperatorTree(torch.nn.Module):
         self._set_buffer("relax_rhs", dmem.new_zeros((B, K)))
         self._has_relaxation = False
         self._set_buffer("a_geom", g_diff_s.contiguous())
+        if not explicit_geometry:
+            self._set_buffer(
+                "native_edge_factor",
+                diff_geom_s.index_select(-1, inv_solver_order).contiguous(),
+            )
         self._set_buffer("solver_order", solver_order)
         self._set_buffer("inv_solver_order", inv_solver_order)
         self._set_buffer("parent_idx", parent_idx_dev)
         self._set_buffer("order", order.to(dtype=torch.long, device=device))
         self._set_buffer("layer_ptr", layer_ptr.to(dtype=torch.long, device=device))
 
-        solve_fn, solver_name = _select_dhs_solver(
-            solver or self.solver, device, threads=self.threads
-        )
-        self._solve = solve_fn
-        self.solver_name = solver_name
+        if _select_solver:
+            solve_fn, solver_name = _select_dhs_solver(
+                solver or self.solver, device, threads=self.threads
+            )
+            self._solve = solve_fn
+            self.solver_name = solver_name
         self.configured = True
         return self
 
     def configure_relaxation(self, rate, target=0.0, *, where=None):
         """Add a linear reservoir term to the configured tree system."""
         self._require_configured()
-        like = self._buffers["volume"].reshape(self.base_shape)
-        active = self._buffers["node_mask"].reshape(self.base_shape)
+        updates = self._prepare_relaxation(
+            self._buffers, rate, target, where=where, validate_values=True
+        )
+        self._set_buffer("dmem", updates["dmem"])
+        self._set_buffer("relax_rhs", updates["relax_rhs"])
+        self._has_relaxation = True
+        return self
+
+    def _prepare_relaxation(self, workspace, rate, target, *, where, validate_values):
+        like = workspace["volume"].reshape(self.base_shape)
+        active = workspace["node_mask"].reshape(self.base_shape)
         if where is not None:
             active = active & _broadcast_mask_to(where, like)
 
         rate_full = _broadcast_to(rate, like)
-        selected_rate = rate_full[active]
-        if bool(torch.any(~torch.isfinite(selected_rate)).item()) or bool(
-            torch.any(selected_rate < 0).item()
-        ):
-            raise ValueError("Relaxation rates must be finite and non-negative.")
+        if validate_values:
+            selected_rate = rate_full[active]
+            if bool(torch.any(~torch.isfinite(selected_rate)).item()) or bool(
+                torch.any(selected_rate < 0).item()
+            ):
+                raise ValueError("Relaxation rates must be finite and non-negative.")
         rate_full = torch.where(active, rate_full, torch.zeros_like(rate_full))
 
         target_full = _broadcast_to(target, like)
         coupled = active & (rate_full != 0)
-        if bool(torch.any(~torch.isfinite(target_full[coupled])).item()):
+        if validate_values and bool(
+            torch.any(~torch.isfinite(target_full[coupled])).item()
+        ):
             raise ValueError("Relaxation targets must be finite where rate is nonzero.")
         target_full = torch.where(coupled, target_full, torch.zeros_like(target_full))
 
@@ -1667,14 +1883,134 @@ class SpatialOperatorTree(torch.nn.Module):
         active_s = active.reshape(self.B, self.K).index_select(-1, order)
         safe_volume_s = torch.where(
             active_s,
-            self._buffers["volume_solver"],
-            torch.zeros_like(self._buffers["volume_solver"]),
+            workspace["volume_solver"],
+            torch.zeros_like(workspace["volume_solver"]),
         )
         mass_rate = safe_volume_s * rate_s
-        self._set_buffer("dmem", self._buffers["dmem"] + mass_rate)
-        self._set_buffer("relax_rhs", self._buffers["relax_rhs"] + mass_rate * target_s)
-        self._has_relaxation = True
-        return self
+        return dict(
+            workspace,
+            dmem=workspace["dmem"] + mass_rate,
+            relax_rhs=workspace["relax_rhs"] + mass_rate * target_s,
+        )
+
+    def _prepared_buffer_names(self) -> tuple[str, ...]:
+        """Inventory numerical coefficients independently of fixed topology."""
+        self._require_configured()
+        return tuple(
+            name
+            for name in self._buffers
+            if name not in self._FUNCTIONAL_TOPOLOGY_BUFFERS
+            and name != "native_edge_factor"
+        )
+
+    def prepared_buffers(self) -> dict[str, torch.Tensor]:
+        """Export numerical coefficients, excluding fixed topology metadata."""
+        return {
+            name: self._buffers[name].clone() for name in self._prepared_buffer_names()
+        }
+
+    def prepare_diffusion(self, c_like, dt, D_um2_per_ms, model, **kwargs):
+        """Build coefficients on this operator's immutable, validated topology.
+
+        This shares the imperative coefficient builder, excluding its eager
+        value preflights and topology export. The caller must retain the
+        configured physical-domain contract while changing numerical inputs.
+        No caller, bound buffer, or solver plan is mutated.
+        """
+        self._require_configured()
+        if (
+            kwargs.get("parent_index") is not None
+            or kwargs.get("material_edge_index") is not None
+        ):
+            raise ValueError(
+                "Prepared Tree diffusion reuses its configured topology; "
+                "do not supply parent_index or material_edge_index."
+            )
+        if (
+            kwargs.get("solver") is not None
+            and _normalize_solver_name(kwargs["solver"]) != self.solver
+        ):
+            raise ValueError("Prepared diffusion cannot change its configured solver.")
+        staged = type(self)(
+            solver=self.solver, boundary=self.boundary, threads=self.threads
+        )
+        if (
+            not any(
+                kwargs.get(name) is not None
+                for name in ("volume", "edge_factor", "edge_area", "edge_distance")
+            )
+            and kwargs.get("native_edge_factor") is None
+        ):
+            kwargs["native_edge_factor"] = self._buffers["native_edge_factor"]
+        staged.configure_diffusion(
+            c_like,
+            dt,
+            D_um2_per_ms,
+            model,
+            **kwargs,
+            _validate_values=False,
+            _select_solver=False,
+            _topology_plan=self._topology_plan,
+        )
+        if staged.base_shape != self.base_shape:
+            raise ValueError(
+                "Prepared diffusion must retain its configured field shape."
+            )
+        return staged.prepared_buffers()
+
+    def prepare_relaxation(self, workspace, rate, target=0.0, *, where=None):
+        """Return updated coefficients for a validated implicit reservoir."""
+        self._require_configured()
+        return self._prepare_relaxation(
+            workspace, rate, target, where=where, validate_values=False
+        )
+
+    def _functional_solver(self):
+        """Bind transform-compatible execution without changing the algorithm."""
+        self._require_configured()
+        solver = self._solve
+        if solver is None:
+            return None
+        if (
+            isinstance(solver, partial)
+            and solver.func is dhs_solve_cuda
+            and not solver.args
+            and solver.keywords == {"threads": self.threads}
+        ):
+            from dendra.models.integrators._cuda_functional import dhs_solve
+
+            return partial(dhs_solve, threads=self.threads)
+        if DENDRA_SOLVERS_AVAILABLE and solver is torch.ops.dendra_solvers.dhs_solve:
+            if callable(getattr(dendra_solvers, "DHSPlan", None)):
+                plan = dendra_solvers.DHSPlan(
+                    *_cpu_topology(
+                        tuple(
+                            self._buffers[name]
+                            for name in ("parent_idx", "order", "layer_ptr")
+                        )
+                    )
+                )
+                return partial(_functional_dhs_plan_solve, plan=plan)
+            facade = getattr(dendra_solvers, "dhs_solve", None)
+            if callable(facade):
+                return facade
+        raise RuntimeError(
+            f"Tree material diffusion solver {self.solver_name!r} is not yet "
+            "transform-compatible; use the native DHS or dense solver."
+        )
+
+    def validate_explicit(self) -> None:
+        """Reject unsupported zero-volume explicit dynamics before lowering."""
+        self._require_configured()
+        if self.K > 1 and bool(
+            torch.any(
+                (self._buffers["volume_solver"] <= 0)
+                & self._buffers["node_mask_solver"]
+            ).item()
+        ):
+            raise RuntimeError(
+                "Explicit tree diffusion is undefined for zero-volume nodes/branchpoints; use implicit diffusion."
+            )
 
     def _require_configured(self) -> None:
         if not self.configured:
@@ -1686,25 +2022,33 @@ class SpatialOperatorTree(torch.nn.Module):
     def diffuse_implicit_configured(self, c: torch.Tensor) -> torch.Tensor:
         """Backward-Euler sealed-boundary diffusion update on a tree."""
         self._require_configured()
-        if self.K <= 1 and not self._has_relaxation:
+        return self.diffuse_implicit_prepared(c, self._buffers, solve=self._solve)
+
+    def diffuse_implicit_prepared(
+        self, c: torch.Tensor, workspace: Mapping[str, torch.Tensor], *, solve
+    ) -> torch.Tensor:
+        """Advance with explicit numerical coefficients and a static solve plan."""
+        # Independent workspaces can contain a reservoir absent from the
+        # configured template, including when this forest has just one node.
+        if self.K <= 1 and workspace is self._buffers and not self._has_relaxation:
             return c
         c2 = c.reshape(self.B, self.K).contiguous()
         c_s = c2.index_select(-1, self._buffers["solver_order"])
-        rhs_s = self._buffers["storage"] * c_s + self._buffers["relax_rhs"]
+        rhs_s = workspace["storage"] * c_s + workspace["relax_rhs"]
 
         if self.K <= 1:
-            out_s = rhs_s / self._buffers["dmem"]
-        elif self._solve is None:
+            out_s = rhs_s / workspace["dmem"]
+        elif solve is None:
             out_s = _dense_tree_solve(
-                self._buffers["dmem"],
-                self._buffers["a_geom"],
+                workspace["dmem"],
+                workspace["a_geom"],
                 rhs_s,
                 self._buffers["parent_idx"],
             )
         else:
-            out_s = self._solve(
-                self._buffers["dmem"],
-                self._buffers["a_geom"],
+            out_s = solve(
+                workspace["dmem"],
+                workspace["a_geom"],
                 rhs_s,
                 self._buffers["parent_idx"],
                 self._buffers["order"],
@@ -1713,7 +2057,7 @@ class SpatialOperatorTree(torch.nn.Module):
 
         out = out_s.index_select(-1, self._buffers["inv_solver_order"])
         out = out.reshape(self.base_shape)
-        active = self._buffers["node_mask"].reshape(self.base_shape)
+        active = workspace["node_mask"].reshape(self.base_shape)
         return torch.where(active, out, c)
 
     def diffuse_explicit_configured(self, c: torch.Tensor) -> torch.Tensor:
@@ -1724,34 +2068,34 @@ class SpatialOperatorTree(torch.nn.Module):
         morphologies.
         """
         self._require_configured()
+        self.validate_explicit()
+        return self.diffuse_explicit_prepared(c, self._buffers)
+
+    def diffuse_explicit_prepared(
+        self, c: torch.Tensor, workspace: Mapping[str, torch.Tensor]
+    ) -> torch.Tensor:
+        """Tensor-only explicit flux update on a prevalidated tree plan."""
         if self.K <= 1:
             return c
         c2 = c.reshape(self.B, self.K).contiguous()
         c_s = c2.index_select(-1, self._buffers["solver_order"])
-        volume_s = self._buffers["volume_solver"]
-        active_s = self._buffers["node_mask_solver"]
-        if torch.any((volume_s <= 0) & active_s):
-            raise RuntimeError(
-                "Explicit tree diffusion is undefined for zero-volume nodes/branchpoints; use implicit diffusion."
-            )
-
-        net = torch.zeros_like(c_s)
+        volume_s = workspace["volume_solver"]
+        active_s = workspace["node_mask_solver"]
         parent_idx = self._buffers["parent_idx"]
-        g = self._buffers["a_geom"]
-        for child in range(self.K):
-            p = int(parent_idx[child].item())
-            if p < 0:
-                continue
-            flux = g[:, child] * (c_s[:, p] - c_s[:, child])
-            net[:, child] = net[:, child] + flux
-            net[:, p] = net[:, p] - flux
+        parent_safe = parent_idx.clamp_min(0)
+        flux = workspace["a_geom"] * (c_s.index_select(-1, parent_safe) - c_s)
+        flux = torch.where(parent_idx.unsqueeze(0) >= 0, flux, 0.0)
+        net = flux - torch.zeros_like(c_s).scatter_add(
+            -1, parent_safe.unsqueeze(0).expand(self.B, -1), flux
+        )
 
-        dt_t = self._buffers["dt"]
+        dt_t = workspace["dt"]
+        dt_math = dt_t.reshape(1, 1) if dt_t.ndim == 0 else dt_t
         safe_volume_s = torch.where(active_s, volume_s, torch.ones_like(volume_s))
-        c_next_s = c_s + dt_t * net / safe_volume_s
+        c_next_s = c_s + dt_math * net / safe_volume_s
         c_next = c_next_s.index_select(-1, self._buffers["inv_solver_order"])
         c_next = c_next.reshape(self.base_shape)
-        active = self._buffers["node_mask"].reshape(self.base_shape)
+        active = workspace["node_mask"].reshape(self.base_shape)
         return torch.where(active, c_next, c)
 
     # Backward-compatible convenience wrappers.

@@ -56,5 +56,5 @@ class expsyn(PP, Syn):
     def i(self, v):
         return self.g * (v - self.e)
 
-    def net_receive(self, weights, netcon):
-        self.g = self.g + weights
+    def net_receive_values(self, weights, dt, values):
+        return {"states": {"g": values["g"] + weights}}

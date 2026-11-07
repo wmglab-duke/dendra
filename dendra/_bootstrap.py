@@ -5,6 +5,7 @@ from __future__ import annotations
 import atexit
 import getpass
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -12,6 +13,7 @@ import uuid
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
+from types import FunctionType, MethodType
 
 _DISABLED_INDUCTOR_CACHE_POLICIES = {
     "0",
@@ -29,39 +31,81 @@ _PROCESS_INDUCTOR_CACHE_POLICIES = {
 }
 _SHARED_INDUCTOR_CACHE_POLICIES = {"shared", "global"}
 
+_TORCH_COMPILER_WARNING_SPECS = (
+    (
+        r".*torch\.jit\.script_method.*deprecated.*",
+        DeprecationWarning,
+        r"torch\.jit\._script",
+    ),
+    (
+        r".*torch\.jit\.script_method.*deprecated.*",
+        FutureWarning,
+        r"torch\.jit\._script",
+    ),
+    (
+        r".*torch\.jit\.script.*deprecated.*",
+        DeprecationWarning,
+        r"torch\.jit\._script",
+    ),
+    (
+        r".*torch\.jit\.script.*deprecated.*",
+        FutureWarning,
+        r"torch\.jit\._script",
+    ),
+    (
+        r".*The \.grad attribute of a Tensor that is not a leaf Tensor "
+        r"is being accessed.*",
+        UserWarning,
+        "",
+    ),
+    (
+        r".*torch\.autograd\.function\.Function.*should not be "
+        r"instantiated\..*Methods on autograd functions.*",
+        DeprecationWarning,
+        "",
+    ),
+)
+# filterwarnings prepends each entry; preserve both its order and regex flags.
+_TORCH_COMPILER_WARNING_FILTERS = tuple(
+    (
+        "ignore",
+        re.compile(message, re.I),
+        category,
+        re.compile(module) if module else None,
+        0,
+    )
+    for message, category, module in reversed(_TORCH_COMPILER_WARNING_SPECS)
+)
+# The direct filter-list update below is confined to the classic CPython
+# warnings implementation. New/context-aware runtimes keep the public path.
+_USE_PRECOMPILED_WARNING_FILTERS = (
+    sys.implementation.name == "cpython"
+    and (3, 11) <= sys.version_info[:2] < (3, 14)
+    and not getattr(sys.flags, "context_aware_warnings", False)
+    and callable(getattr(warnings, "_filters_mutated", None))
+)
+
 
 @contextmanager
 def torch_compiler_warning_context():
     """Filter only known PyTorch compiler deprecations in strict-warning runs."""
     with warnings.catch_warnings():
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*torch\.jit\.script_method.*deprecated.*",
-            category=DeprecationWarning,
-            module=r"torch\.jit\._script",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=r".*torch\.jit\.script.*deprecated.*",
-            category=DeprecationWarning,
-            module=r"torch\.jit\._script",
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=(
-                r".*The \.grad attribute of a Tensor that is not a leaf Tensor "
-                r"is being accessed.*"
-            ),
-            category=UserWarning,
-        )
-        warnings.filterwarnings(
-            "ignore",
-            message=(
-                r".*torch\.autograd\.function\.Function.*should not be "
-                r"instantiated\..*Methods on autograd functions.*"
-            ),
-            category=DeprecationWarning,
-        )
+        if _USE_PRECOMPILED_WARNING_FILTERS:
+            filters = warnings.filters
+            # Match filterwarnings' removal of the first equal entry, including
+            # unusual inherited duplicate filters, without rebuilding regexes.
+            for entry in _TORCH_COMPILER_WARNING_FILTERS:
+                try:
+                    filters.remove(entry)
+                except ValueError:
+                    pass
+            filters[:0] = _TORCH_COMPILER_WARNING_FILTERS
+            warnings._filters_mutated()
+        else:
+            for message, category, module in _TORCH_COMPILER_WARNING_SPECS:
+                warnings.filterwarnings(
+                    "ignore", message=message, category=category, module=module
+                )
         yield
 
 
@@ -83,6 +127,51 @@ def reset_torch_compiler(*, prefer_public: bool = True) -> None:
             torch.compiler.reset()
         elif hasattr(torch, "_dynamo") and hasattr(torch._dynamo, "reset"):
             torch._dynamo.reset()
+
+
+def isolate_compilation_callable(function):
+    """Give an owned Python compilation root its own specialization budget.
+
+    Dynamo caches specializations by code object. Independent models and
+    execution plans must not exhaust one shared method or closure's budget.
+    Preserve live globals, closure cells, defaults, and bound-owner reads;
+    only the owned root code object changes. Ordinary tensor guards remain.
+    """
+    owner = function.__self__ if isinstance(function, MethodType) else None
+    source = function.__func__ if isinstance(function, MethodType) else function
+    if not isinstance(source, FunctionType):
+        return function
+    isolated = FunctionType(
+        source.__code__.replace(),
+        source.__globals__,
+        source.__name__,
+        source.__defaults__,
+        source.__closure__,
+    )
+    isolated.__kwdefaults__ = source.__kwdefaults__
+    isolated.__annotations__ = source.__annotations__
+    isolated.__dict__.update(source.__dict__)
+    isolated.__qualname__ = source.__qualname__
+    isolated.__module__ = source.__module__
+    isolated.__doc__ = source.__doc__
+    if hasattr(source, "__type_params__"):
+        isolated.__type_params__ = source.__type_params__
+    return MethodType(isolated, owner) if owner is not None else isolated
+
+
+def compile_owned(function, **compile_options):
+    """Compile a Dendra-owned root with qualified compiler compatibility.
+
+    Callable isolation and option validation remain with their existing owners.
+    Compatibility is selected lazily and leaves disabled compilation untouched.
+    """
+    import torch
+
+    if not compile_options.get("disable", False):
+        from ._tensorify_compat import install_tensorify_compatibility
+
+        install_tensorify_compatibility()
+    return torch.compile(function, **compile_options)
 
 
 def _truthy(x: str | None) -> bool:

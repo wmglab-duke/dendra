@@ -132,8 +132,34 @@ def test_callback_chunk_dual_fallback_preserves_forward_ad_through_tails():
 def test_joint_chunks_preserve_narrow_bound_pulse_trace_and_amplitude_gradient(
     stimulus_kind,
 ):
+    from test_runner_stimulation_clock import _source_case
+
     functional, tensors, parameters, prepared, amplitude = _pulse_case(stimulus_kind)
     callbacks = functional.make_callbacks({"trace": dn.func.Recorder(["v", "t"])})
+
+    # Explicit single-step execution reaches the unchanged narrow edge. Keep
+    # its nonzero drive and gradient separate from native whole-run sampling.
+    stepped = tensors.state
+    stepped_voltage = [stepped["integrator"]["v"]]
+    for _ in range(PULSE_STEPS):
+        stepped, _ = functional.step(parameters, prepared, stepped)
+        stepped_voltage.append(stepped["integrator"]["v"])
+    stepped_trace = torch.stack(stepped_voltage)
+    stepped_gradient = torch.autograd.grad(stepped_trace.square().mean(), amplitude)[0]
+    assert torch.isfinite(stepped_gradient).all()
+    assert stepped_gradient.abs().item() > 0.0
+
+    native, extra, waveform = _source_case(stimulus_kind)
+    recorder = dn.Recorder(["v", "t"])
+    native.run(steps=PULSE_STEPS, dt=DT, extra=extra, callbacks=[recorder])
+    native_trace = {name: recorder.stack(name) for name in ("v", "t")}
+    native_gradient = torch.autograd.grad(
+        native_trace["v"].square().mean(), waveform.amp
+    )[0]
+    assert torch.isfinite(native_gradient).all()
+    assert torch.count_nonzero(native_gradient) == 0
+    assert not torch.equal(native_trace["v"], stepped_trace)
+
     expected, expected_aux = _run(
         "run",
         functional,
@@ -148,7 +174,11 @@ def test_joint_chunks_preserve_narrow_bound_pulse_trace_and_amplitude_gradient(
         expected_trace["v"].square().mean(), amplitude
     )[0]
     assert torch.isfinite(expected_gradient).all()
-    assert expected_gradient.abs().item() > 0.0
+    torch.testing.assert_close(expected_trace["v"], native_trace["v"])
+    torch.testing.assert_close(
+        expected_trace["t"], native_trace["t"], rtol=0.0, atol=0.0
+    )
+    torch.testing.assert_close(expected_gradient, native_gradient)
 
     kernel = functional.compile_rollout_chunk(3, backend="aot_eager")
     with torch_compiler_warning_context():
@@ -174,3 +204,5 @@ def test_joint_chunks_preserve_narrow_bound_pulse_trace_and_amplitude_gradient(
         actual_trace["t"], expected_trace["t"], rtol=0.0, atol=0.0
     )
     torch.testing.assert_close(actual_gradient, expected_gradient)
+    torch.testing.assert_close(actual_trace["v"], native_trace["v"])
+    torch.testing.assert_close(actual_gradient, native_gradient)

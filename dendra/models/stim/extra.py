@@ -37,14 +37,16 @@ class Extra(torch.nn.Module):
         field_waveform_tuples: list[tuple[torch.Tensor, Waveform]],
         precomputed=None,
     ):
-        """
-        Initialize extracellular stimulation handler.
+        """Initialize extracellular stimulation handler.
 
         Parameters
         ----------
         field_waveform_tuples : list of (torch.Tensor, Waveform)
             Each tuple contains a spatial field (shape (n_cell, n_comp)) and a
             temporal waveform (Waveform instance).
+        precomputed : torch.Tensor, optional
+            Spatial-first, time-last extracellular voltage in mV. When supplied,
+            ``field_waveform_tuples`` is ignored.
         """
         super(Extra, self).__init__()
         self.is_precomputed = precomputed is not None
@@ -111,13 +113,12 @@ class Extra(torch.nn.Module):
 
     @classmethod
     def from_precomputed(cls, precomputed_extracellular: torch.Tensor):
-        """
-        Create an Extra instance from precomputed extracellular data.
+        """Create an Extra instance from precomputed extracellular data.
 
         Parameters
         ----------
         precomputed_extracellular : torch.Tensor
-            Precomputed extracellular data with shape (n_field, n_cell, n_timepoints).
+            Extracellular voltage in mV with shape ``(*model.v.shape, n_timepoints)``.
 
         Returns
         -------

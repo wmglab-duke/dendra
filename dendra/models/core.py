@@ -1,5 +1,6 @@
 """Core data structures and utilities for Dendra population models."""
 
+import ast
 import copy
 import hashlib
 import itertools
@@ -9,9 +10,11 @@ import random
 import re
 import sys
 import textwrap
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
 from fractions import Fraction
+from types import BuiltinMethodType, CodeType, FunctionType, MethodType
 from typing import (
     Any,
     Callable,
@@ -32,6 +35,7 @@ import torch
 from tqdm.auto import tqdm
 
 from dendra._bootstrap import (
+    compile_owned,
     reset_torch_compiler,
     torch_compiler_warning_context,
 )
@@ -55,17 +59,49 @@ from dendra.helpers import (
     op_mc,
     op_sc,
 )
+from dendra.models._checkpoint import _checkpoint_recompute_contexts
+from dendra.models._execution_horizons import (
+    execution_step_budget,
+    native_horizon_request,
+)
+from dendra.models._runtime_inputs import (
+    native_input_sources,
+    normalize_input_frame,
+    normalize_input_tape,
+)
 from dendra.models.backend import Backend as A
-from dendra.models.callbacks import Callback, CallbackList
+from dendra.models.callbacks import (
+    Callback,
+    CallbackList,
+    Recorder,
+    _append_tensor,
+    _append_tensor_indexed,
+    _append_tensor_max,
+    _bind_callback_dt,
+    _recorder_should_save,
+)
 from dendra.models.graph import get_area_from_graph
 from dendra.models.initialization import (
     _InitializationTransformAction,
     _InitializationTransformHook,
 )
 from dendra.models.integrators import bwd_euler_sc, bwd_euler_ub
+from dendra.models.integrators.core import (
+    Integrator,
+    _DeferredIntra,
+    _NoiseFreeStep,
+    _population_runtime_modes_plain,
+)
 from dendra.models.mechanisms._handler import MechanismHandler
+from dendra.models.mechanisms._inputs import InputBinding
 from dendra.models.mechanisms._ions import Ion, concentrations, equilibria, valid_ions
-from dendra.models.mechanisms._material_process import MaterialProcess
+from dendra.models.mechanisms._material_process import (
+    ClampProcess,
+    ClearanceProcess,
+    DiffusionProcess,
+    ExchangeProcess,
+    MaterialProcess,
+)
 from dendra.models.mechanisms._materials import (
     Material,
     MaterialFieldSpec,
@@ -75,6 +111,7 @@ from dendra.models.mechanisms._materials import (
 )
 from dendra.models.mechanisms._mechanism import (
     ContinuousSynapse,
+    Mechanism,
     PointProcess,
     Synapse,
     VoltageProcess,
@@ -83,15 +120,87 @@ from dendra.models.mechanisms._support import SupportKind, SupportSpec
 from dendra.models.mechanisms.validate import validate
 from dendra.models.modular import matches_any_pattern
 from dendra.models.parametric import Parameterized as P
-from dendra.models.parametric import _ReplicaRangeValue, create_param_expander
-from dendra.models.rng import _validate_rng_checkpoint_payload
+from dendra.models.parametric import (
+    _ReplicaRangeValue,
+    create_param_expander,
+    staticproperty,
+    to_param,
+)
+from dendra.models.rng import (
+    _restore_rng_lifecycle,
+    _snapshot_rng_lifecycle,
+    _validate_rng_checkpoint_payload,
+)
+from dendra.models.stim._assembly import (
+    _aligned_current_indices,
+    _indexed_current_tapes,
+    _IndexedCurrentSamples,
+)
 from dendra.models.stim.intra import Intra
 from dendra.models.stim.waveform import Waveform
+from dendra.models.stim.waveform._poisson import (
+    apply_prepared_poisson_state,
+    borrow_pending_poisson_rng,
+    poisson_state_dict_for_checkpoint,
+    prepare_poisson_state_from_checkpoint,
+    reconcile_extra_poisson_rng,
+    restore_poisson_rng_lifecycle,
+    snapshot_poisson_rng_lifecycle,
+)
 from dendra.units import mm
 
 from .slice import IndexSpec, Slice, Sliceable, parse_key
 
 TensorLike = Union[torch.Tensor, "np.ndarray"]  # torch or numpy are supported
+
+
+def _canonical_material_process_fields(mechanism):
+    """Return the shared-field manifest authored by built-in process families."""
+    fields = {}
+    for family, attribute in (
+        (ClearanceProcess, "_clearance_specs"),
+        (ClampProcess, "_clamp_specs"),
+        (DiffusionProcess, "_diffusion_specs"),
+    ):
+        if issubclass(mechanism, family):
+            for spec in getattr(mechanism, attribute):
+                fields.setdefault(_canonical_material_name(spec.material), []).append(
+                    spec.field
+                )
+    if issubclass(mechanism, ExchangeProcess):
+        for spec in mechanism._exchange_specs:
+            fields.setdefault(_canonical_material_name(spec.material_a), []).append(
+                spec.field_a
+            )
+            fields.setdefault(_canonical_material_name(spec.material_b), []).append(
+                spec.field_b
+            )
+    return fields
+
+
+# Capture canonical sampler implementations before user-side monkeypatches.
+# Comparing against a later class attribute would accept a replaced class hook.
+_STANDARD_RUNTIME_NOISE_SAMPLERS = (
+    MechanismHandler.sample_runtime_noises_,
+    Mechanism.sample_runtime_noises_,
+    P.sample_runtime_noises_,
+)
+_STANDARD_INTRA_CALL = Intra.__call__
+_STANDARD_NOISE_FREE_DISPATCH = Integrator._supports_fused_intra_step
+_STANDARD_MODULE_GETATTR = torch.nn.Module.__getattr__
+_STANDARD_MODULE_SETATTR = torch.nn.Module.__setattr__
+_STANDARD_CALLBACK_PRE_STEP = Callback.pre_step_hook
+_STANDARD_CALLBACK_POST_STEP = Callback.post_step_hook
+_STANDARD_CALLBACK_LIST_PRE_STEP = CallbackList.pre_step_hook
+_STANDARD_CALLBACK_LIST_POST_STEP = CallbackList.post_step_hook
+_STANDARD_RECORDER_POST_STEP = Recorder.post_step_hook
+_STANDARD_RECORDER_SHOULD_SAVE = _recorder_should_save
+_STANDARD_RECORDER_APPEND_HELPERS = {
+    "_append_tensor": _append_tensor,
+    "_append_tensor_indexed": _append_tensor_indexed,
+    "_append_tensor_max": _append_tensor_max,
+}
+_RUNTIME_UNSAFE_ATTRIBUTE = object()
 
 ExtraSpec = Union[
     Tuple[TensorLike, Union["Waveform", TensorLike]],
@@ -538,6 +647,486 @@ def make_intra(intra, stims, indices):
     return intra(stims, indices)
 
 
+_STANDARD_TENSOR_UNBIND = torch.Tensor.unbind
+
+
+def _can_index_intra_tapes(model, intra):
+    return (
+        model.jit
+        and type(model.backend) is str
+        and model.backend == "inductor"
+        and not torch.is_grad_enabled()
+        and type(intra) is Intra
+        and _runtime_plain_intra_metadata(intra)
+        and intra.device.type == "mps"
+        and _runtime_method_is(intra, "__call__", _STANDARD_INTRA_CALL)
+        and _population_runtime_modes_plain()
+    )
+
+
+def _unbind_intra_tapes(tapes, intra, n_steps, *, indexed=False):
+    """Retain the public slice preparation and optionally capture its tapes."""
+    if (
+        not indexed
+        or type(tapes) not in (list, tuple)
+        or not _population_runtime_modes_plain()
+    ):
+        return [tape.unbind(-1) for tape in tapes], None
+    stims = []
+    canonical = torch.Tensor.unbind is _STANDARD_TENSOR_UNBIND
+    for tape in tapes:
+        unbind = tape.unbind
+        stims.append(unbind(-1))
+        canonical = canonical and (
+            type(unbind) is BuiltinMethodType
+            and unbind.__self__ is tape
+            and unbind.__name__ == "unbind"
+        )
+    captured = None
+    if canonical and _population_runtime_modes_plain():
+        captured = _indexed_current_tapes(
+            tapes, n_steps, device=intra.device, dtype=intra.dtype
+        )
+    return stims, captured
+
+
+def _prepare_intra_run(model, intra, n, dt, *, indexed=False):
+    times = _time_grid_from_step_count(model.t, n, dt, device=model.device()).to(
+        model.dtype()
+    )
+    tapes, indices = intra.init(times)
+    stims, captured = _unbind_intra_tapes(tapes, intra, n, indexed=indexed)
+    return stims, indices, captured
+
+
+def _intra_fusion_callbacks_safe(callbacks):
+    """Only move a pure scatter across genuinely empty pre-step hooks.
+
+    Recheck each step unless the complete callback tree is proven stable: a
+    post-step callback can replace a later pre-step hook. In particular, never
+    bypass a custom CallbackList forwarding method.
+    """
+    if (
+        getattr(callbacks.pre_step_hook, "__func__", None)
+        is not _STANDARD_CALLBACK_LIST_PRE_STEP
+    ):
+        return False
+    for callback in callbacks.callbacks:
+        hook = getattr(callback.pre_step_hook, "__func__", None)
+        if hook is _STANDARD_CALLBACK_PRE_STEP:
+            continue
+        if hook is _STANDARD_CALLBACK_LIST_PRE_STEP and _intra_fusion_callbacks_safe(
+            callback
+        ):
+            continue
+        return False
+    return True
+
+
+def _runtime_plain_module_namespace(module):
+    """Inspect Module storage without invoking an authored attribute accessor."""
+    cls = type(module)
+    if (
+        cls.__getattribute__ is not object.__getattribute__
+        or getattr(cls, "__getattr__", None) is not _STANDARD_MODULE_GETATTR
+        or cls.__setattr__ is not _STANDARD_MODULE_SETATTR
+    ):
+        return None
+    namespace = object.__getattribute__(module, "__dict__")
+    if type(namespace) is not dict or any(
+        type(namespace.get(name)) is not dict
+        for name in ("_modules", "_parameters", "_buffers")
+    ):
+        return None
+    return namespace
+
+
+def _runtime_plain_attribute(module, name):
+    """Resolve only plain instance/registered storage, never class descriptors."""
+    namespace = _runtime_plain_module_namespace(module)
+    if namespace is None or any(name in base.__dict__ for base in type(module).__mro__):
+        return _RUNTIME_UNSAFE_ATTRIBUTE
+    if name in namespace:
+        return namespace[name]
+    for registry in ("_parameters", "_buffers", "_modules"):
+        if name in namespace[registry]:
+            return namespace[registry][name]
+    return _RUNTIME_UNSAFE_ATTRIBUTE
+
+
+def _runtime_method_is(module, name, canonical):
+    """Compare the actual method slot, without evaluating a property getter."""
+    namespace = _runtime_plain_module_namespace(module)
+    if namespace is None:
+        return False
+    if name in namespace:
+        method = namespace[name]
+        return (
+            type(method) is MethodType
+            and method.__func__ is canonical
+            and method.__self__ is module
+        )
+    for base in type(module).__mro__:
+        if name in base.__dict__:
+            return base.__dict__[name] is canonical
+    return False
+
+
+def _intra_fusion_recorder_buffers_safe(callback, model, generated):
+    """Prove a generated Recorder only reads ordinary registered tensors.
+
+    Resolve chains such as ``model.integrator.mech.hh.m`` through plain Module
+    registries, not ``getattr``: lazy references, descriptors, tensor subclasses,
+    and user-authored recorder operations retain the dynamic fallback. The
+    generated source, code, and append-helper bindings must agree; a filename or
+    the mutable ``Recorder.states`` metadata is not an authorization token.
+    """
+    if model is None or type(generated) is not FunctionType:
+        return False
+    source = getattr(generated, "__source__", None)
+    if type(source) is not str:
+        return False
+    digest = hashlib.sha1(source.encode("utf-8")).hexdigest()[:12]
+    if generated.__code__.co_filename != f"<dendra.callbacks.recorder_func:{digest}>":
+        return False
+    generated_globals = generated.__globals__
+    if type(generated_globals) is not dict or (
+        generated_globals.get("_recorder_should_save")
+        is not _STANDARD_RECORDER_SHOULD_SAVE
+    ):
+        return False
+    try:
+        tree = ast.parse(source)
+        function = tree.body[0]
+        statements = function.body[-1].body
+        if len(statements) % 2:
+            return False
+        expected = [
+            "def recorder(self, model):",
+            "  if self.save_every is not None:",
+            "    save = _recorder_should_save(self.i, self.save_every)",
+            "  else:",
+            "    save = True",
+            "  if save:",
+        ]
+        for assignment, expression in zip(statements[::2], statements[1::2]):
+            if not isinstance(assignment, ast.Assign):
+                return False
+            names = []
+            value = assignment.value
+            while isinstance(value, ast.Attribute):
+                names.append(value.attr)
+                value = value.value
+            if not (isinstance(value, ast.Name) and value.id == "model" and names):
+                return False
+            names.reverse()
+            module = model
+            for name in names[:-1]:
+                namespace = _runtime_plain_module_namespace(module)
+                if (
+                    namespace is None
+                    or name in namespace
+                    or any(name in base.__dict__ for base in type(module).__mro__)
+                    or name not in namespace["_modules"]
+                ):
+                    return False
+                module = namespace["_modules"][name]
+            namespace = _runtime_plain_module_namespace(module)
+            name = names[-1]
+            if (
+                namespace is None
+                or name in namespace
+                or any(name in base.__dict__ for base in type(module).__mro__)
+            ):
+                return False
+            value = namespace["_parameters"].get(name, namespace["_buffers"].get(name))
+            if type(value) not in (torch.Tensor, torch.nn.Parameter):
+                return False
+
+            call = expression.value
+            helper_name = call.func.id
+            helper = _STANDARD_RECORDER_APPEND_HELPERS.get(helper_name)
+            if helper is None or generated_globals.get(helper_name) is not helper:
+                return False
+            key = call.args[1].slice.value
+            if type(key) is not str:
+                return False
+            suffix = {
+                "_append_tensor": "",
+                "_append_tensor_indexed": ", self.node_indices",
+                "_append_tensor_max": ", self.partition",
+            }[helper_name]
+            expected.append(f"    states = model.{'.'.join(names)}")
+            expected.append(f"    {helper_name}(states, self.rec[{key!r}]{suffix})")
+        # Match the entire body, not only its tensor selections: an authored
+        # extra statement must not gain trust by copying generated metadata.
+        expected_tree = ast.parse("\n".join(expected))
+        if ast.dump(tree) != ast.dump(expected_tree):
+            return False
+        compiled = compile(
+            source, generated.__code__.co_filename, "exec", dont_inherit=True
+        )
+        codes = [value for value in compiled.co_consts if type(value) is CodeType]
+        if codes != [generated.__code__]:
+            return False
+    except (AttributeError, IndexError, KeyError, SyntaxError, TypeError):
+        return False
+    # Generated append/index/reduction operations must not dispatch to custom
+    # list containers or tensor subclasses with user-defined side effects.
+    rec = _runtime_plain_attribute(callback, "rec")
+    return (
+        type(rec) is dict
+        and all(
+            type(key) is str and type(values) is list for key, values in rec.items()
+        )
+        and type(_runtime_plain_attribute(callback, "i")) is int
+        and type(_runtime_plain_attribute(callback, "save_every")) in (int, type(None))
+        and type(_runtime_plain_attribute(callback, "node_indices"))
+        in (torch.Tensor, type(None))
+        and type(_runtime_plain_attribute(callback, "partition"))
+        in (torch.Tensor, type(None))
+    )
+
+
+def _intra_fusion_callbacks_stable(callbacks, model=None):
+    """Whether post-step hooks are known not to replace the runtime machinery.
+
+    A custom hook is supported, but requires refreshing structural eligibility
+    before every step. The ordinary in-memory Recorder avoids that repeated
+    module walk only for plain registered tensor reads; custom getters,
+    overridden recorder hooks, and custom callback containers do not.
+    """
+    # A subclass can customize attribute lookup or its child container without
+    # overriding either hook. Such objects retain the per-step check, including
+    # subclasses that happen to expose the built-in no-op hooks right now.
+    if (
+        type(callbacks) is not CallbackList
+        or type(_runtime_plain_attribute(callbacks, "callbacks"))
+        is not torch.nn.ModuleList
+        or not _runtime_method_is(
+            callbacks, "pre_step_hook", _STANDARD_CALLBACK_LIST_PRE_STEP
+        )
+        or not _runtime_method_is(
+            callbacks, "post_step_hook", _STANDARD_CALLBACK_LIST_POST_STEP
+        )
+    ):
+        return False
+    children = _runtime_plain_attribute(callbacks, "callbacks")
+    child_namespace = _runtime_plain_module_namespace(children)
+    if child_namespace is None:
+        return False
+    for callback in child_namespace["_modules"].values():
+        if type(callback) not in (Callback, CallbackList, Recorder):
+            return False
+        if type(callback) is CallbackList:
+            if _intra_fusion_callbacks_stable(callback, model):
+                continue
+            return False
+        if not _runtime_method_is(
+            callback, "pre_step_hook", _STANDARD_CALLBACK_PRE_STEP
+        ):
+            return False
+        if _runtime_method_is(callback, "post_step_hook", _STANDARD_CALLBACK_POST_STEP):
+            continue
+        bound = _runtime_plain_attribute(callback, "_post_step_hook")
+        generated = (
+            bound.__func__
+            if type(bound) is MethodType and bound.__self__ is callback
+            else None
+        )
+        filename = getattr(generated, "__generated_filename__", "")
+        if (
+            type(callback) is Recorder
+            and _runtime_method_is(
+                callback, "post_step_hook", _STANDARD_RECORDER_POST_STEP
+            )
+            and _runtime_plain_attribute(callback, "cache_with_hdf5") is False
+            and type(filename) is str
+            and filename.startswith("<dendra.callbacks.recorder_func:")
+            and getattr(getattr(generated, "__code__", None), "co_filename", None)
+            == filename
+            and _intra_fusion_recorder_buffers_safe(callback, model, generated)
+        ):
+            continue
+        return False
+    return True
+
+
+def _runtime_execution_stable(handler, model=None):
+    """Conservatively admit framework-owned execution for a single segment.
+
+    Stable callbacks alone cannot prove that an authored mechanism or integrator
+    helper will not replace a sampler or callback during its transition. Unknown authored
+    classes and executable overrides keep ordinary sampling and per-step
+    fusion checks. This is rebuilt for each run/chunk, never cached on a model.
+    """
+    if type(handler) is not MechanismHandler:
+        return False
+    if model is not None:
+        model_namespace = _runtime_plain_module_namespace(model)
+        if model_namespace is None or any(
+            value is not None and type(value) not in (torch.Tensor, torch.nn.Parameter)
+            for registry in ("_buffers", "_parameters")
+            for value in model_namespace[registry].values()
+        ):
+            return False
+    module_hooks = torch.nn.modules.module
+    for name in ("_global_forward_hooks", "_global_forward_pre_hooks"):
+        hooks = vars(module_hooks).get(name)
+        if type(hooks) not in (dict, OrderedDict) or len(hooks):
+            return False
+    source_root = os.path.dirname(os.path.dirname(__file__)) + os.sep
+
+    def framework_callable(value):
+        if isinstance(value, staticproperty):
+            return framework_callable(value.func)
+        if isinstance(value, (staticmethod, classmethod)):
+            value = value.__func__
+        if isinstance(value, property):
+            return all(
+                framework_callable(fn) for fn in (value.fget, value.fset, value.fdel)
+            )
+        value = getattr(value, "__func__", value)
+        code = getattr(value, "__code__", None)
+        if code is None:
+            return not callable(value) or getattr(value, "__module__", "").startswith(
+                "torch."
+            )
+        filename = code.co_filename
+        return (
+            filename.startswith(source_root)
+            or filename.startswith("<dendra.")
+            or getattr(value, "__module__", "").startswith("torch.")
+        )
+
+    seen_classes = set()
+    seen_modules = set()
+    execution_root = (
+        handler if model is None else _runtime_plain_attribute(model, "integrator")
+    )
+    pending = [execution_root]
+    if model is not None:
+        # Population getters can run while step arguments are evaluated, even
+        # when Recorder does not select the attribute. Reject authored proxies
+        # and inspect parametrization modules rather than invoking their reads.
+        for cls in type(model).__mro__:
+            if cls is object:
+                continue
+            if not cls.__module__.startswith(("dendra.", "torch.")) or any(
+                not framework_callable(value) for value in vars(cls).values()
+            ):
+                return False
+            seen_classes.add(cls)
+        parametrizations = model_namespace["_modules"].get("parametrizations")
+        if parametrizations is not None:
+            pending.append(parametrizations)
+    while pending:
+        module = pending.pop()
+        if id(module) in seen_modules:
+            continue
+        seen_modules.add(id(module))
+        namespace = _runtime_plain_module_namespace(module)
+        if namespace is None:
+            return False
+        for name in ("_forward_hooks", "_forward_pre_hooks"):
+            hooks = namespace.get(name)
+            if type(hooks) not in (dict, OrderedDict) or len(hooks):
+                return False
+        # A tensor subclass can execute authored dispatch even when its buffer
+        # is not selected by Recorder (for example a GLOBAL channel parameter).
+        for registry in ("_buffers", "_parameters"):
+            if any(
+                value is not None
+                and type(value) not in (torch.Tensor, torch.nn.Parameter)
+                for value in namespace[registry].values()
+            ):
+                return False
+        for cls in type(module).__mro__:
+            if cls in seen_classes or cls is object:
+                continue
+            seen_classes.add(cls)
+            if not cls.__module__.startswith(("dendra.", "torch.")):
+                return False
+            if any(not framework_callable(value) for value in vars(cls).values()):
+                return False
+        if any(not framework_callable(value) for value in namespace.values()):
+            return False
+        pending.extend(
+            value for value in namespace["_modules"].values() if value is not None
+        )
+    return True
+
+
+def _runtime_plain_step_inputs(value):
+    """Prove per-step indexing cannot invoke an authored container/dispatch."""
+    if value is None or type(value) in (torch.Tensor, torch.nn.Parameter):
+        return True
+    if type(value) in (list, tuple):
+        return all(_runtime_plain_step_inputs(item) for item in value)
+    return False
+
+
+def _runtime_plain_intra_metadata(intra):
+    """Canonical scatter metadata must not hide authored Python iteration."""
+
+    def plain(value):
+        if type(value) in (int, torch.dtype, torch.device):
+            return True
+        if type(value) in (list, tuple, torch.Size):
+            return all(plain(item) for item in value)
+        return False
+
+    return all(
+        plain(_runtime_plain_attribute(intra, name))
+        for name in ("shape", "batch_shape", "selected_batch_shapes", "dtype", "device")
+    )
+
+
+class _RuntimeStepEligibility(NamedTuple):
+    fuse_intra: bool
+    stable_callbacks: bool
+    skip_empty_noise: bool
+
+
+def _runtime_step_eligibility(
+    model, callbacks, intra, *, with_intra, progressbar, step_inputs, post_step
+):
+    """Build a segment-local absence proof; never persist it on the model.
+
+    Rebuild after run setup and after every longrun waveform/chunk hook. Only
+    framework execution, canonical hooks, ordinary tensor inputs, and proven
+    pure Recorder reads may reuse eligibility. Unknown authored execution keeps
+    the existing per-step checks and sampling, so no invalidation API is needed.
+    """
+    fuse_intra = with_intra and model._can_fuse_intra_step(intra)
+    stable = (
+        model.jit
+        and model.device().type in ("cpu", "mps")
+        and _population_runtime_modes_plain()
+        and not progressbar
+        and pre_step_hook is _STANDARD_PRE_STEP_HOOK
+        and post_step_hook is _STANDARD_POST_STEP_HOOK
+        and post_step is _STANDARD_POST_STEP_HOOK
+        and _runtime_method_is(
+            model, "_can_fuse_intra_step", _STANDARD_CAN_FUSE_INTRA_STEP
+        )
+        and _runtime_method_is(
+            model, "_can_skip_runtime_noise_sampling", _STANDARD_CAN_SKIP_RUNTIME_NOISE
+        )
+        and _runtime_plain_step_inputs(step_inputs)
+        and (not with_intra or _runtime_plain_intra_metadata(intra))
+        and _intra_fusion_callbacks_stable(callbacks, model)
+        and _runtime_execution_stable(model.integrator.mech, model)
+    )
+    skip_empty_noise = (
+        not with_intra
+        and stable
+        and model.device().type == "cpu"
+        and model._can_skip_runtime_noise_sampling()
+    )
+    return _RuntimeStepEligibility(fuse_intra, stable, skip_empty_noise)
+
+
 def _clone_nested_state(value, *, detach_tensors=False, memo=None):
     """Clone tensors and mutable containers in a nested runtime-state payload.
 
@@ -672,6 +1261,18 @@ def _duration_step_count(duration: float, dt: float) -> int:
     return _duration_step_budget(duration, dt, 0.0)[0]
 
 
+def _time_tensor_to(value: torch.Tensor, *, device, dtype) -> torch.Tensor:
+    """Transfer times without requesting unsupported binary64 work on MPS."""
+    device = torch.device(device)
+    if value.device.type == "cpu" and device.type == "mps":
+        # Casting on CPU also makes backward transfer the supported dtype
+        # before widening the cotangent on CPU.
+        return value.to(dtype=dtype).to(device=device)
+    if value.device.type == "mps" and device.type == "cpu":
+        return value.to(device=device).to(dtype=dtype)
+    return value.to(device=device, dtype=dtype)
+
+
 def _time_grid_from_step_count(
     start: torch.Tensor,
     n_steps: int,
@@ -683,7 +1284,7 @@ def _time_grid_from_step_count(
 
     MPS does not support binary64 tensors. Preserve the established binary64
     timestamp calculation there by staging it on CPU, then cast once to the
-    caller's supported dtype while transferring the finished grid.
+    caller's supported dtype on CPU before transferring the finished grid.
     """
     device = torch.device(device)
     if device.type == "mps":
@@ -694,28 +1295,43 @@ def _time_grid_from_step_count(
         # both are requested in one `.to(...)`, which still asks MPS to perform
         # unsupported binary64 work. Move first, then widen on CPU.
         grid = start.to(device="cpu").to(dtype=torch.double) + offsets * dt
-        return grid.to(device=device, dtype=start.dtype)
+        return _time_tensor_to(grid, device=device, dtype=start.dtype)
 
     offsets = torch.arange(n_steps, device=device, dtype=torch.double)
     return start.to(device=device, dtype=torch.double) + offsets * dt
 
 
 class Population(P, Sliceable):
-    """
-    Base class for a population of multicompartment neurons.
+    """Population of neurons with a shared compartment layout.
 
     Parameters
     ----------
     N : int, default 1
         Number of population rows (cells).
     C : int, default 1
-        Number of compartments per row.
-    preserve_mechanism_population_axis : bool or None, default None
-        Experimentally store eligible shared-column distributed mechanisms as
-        ``(N, K)`` instead of one packed ``(N * K,)`` slot axis. Ineligible
-        supports retain their legacy representation. ``None`` resolves the
-        construction-time Dendra context/environment policy, then this model
-        family's default.
+        Compartments per row.
+    integrator : integrator class, optional
+        Numerical integrator. Defaults to ``bwd_euler_sc``.
+    v_init : scalar or Tensor, default -65.0
+        Initial membrane voltage in mV, broadcastable to the voltage shape.
+    preserve_mechanism_population_axis : bool or None, optional
+        Preserve separate population and support axes for eligible distributed
+        mechanisms. ``None`` uses the construction context, then the model
+        family's default. This layout policy is fixed at construction.
+    device : str or torch.device, optional
+        Tensor device. Uses the Dendra context, defaulting to CPU.
+    dtype : torch.dtype or str, optional
+        Floating-point dtype. Uses the Dendra context, defaulting to float32.
+    **kwargs
+        Declared model parameters, including ``cm`` in µF/cm², ``rhoa`` in Ω·cm,
+        and ``celsius`` in °C.
+
+    Notes
+    -----
+    Insert mechanisms and configure geometry before calling :meth:`initialize`.
+    Use :meth:`run` for a single host chunk or :meth:`longrun` for bounded
+    stimulation preparation. Functional execution uses the same model definition
+    through :func:`dendra.compile` or :func:`dendra.func.make_functional`.
     """
 
     # ---------- repr knobs (safe defaults) ----------
@@ -797,6 +1413,7 @@ class Population(P, Sliceable):
 
         self.is_built = False
         self._flag_rebuild = False
+        self._input_bindings = ()
         self.key = None
 
         if integrator is None:
@@ -921,8 +1538,6 @@ class Population(P, Sliceable):
         self.post_initialize_hooks: List[Callable] = []
         self._initialization_transforms = torch.nn.ModuleDict()
 
-        reset_torch_compiler(prefer_public=False)
-
         # Keep the state-mutating Population/Integrator wrapper eager.  JIT
         # settings are propagated to the integrator, which compiles only its
         # tensor-valued numerical kernels.  This avoids Dynamo tracing
@@ -948,6 +1563,7 @@ class Population(P, Sliceable):
 
         self.initialized: bool = False
         self._integrator_reinit_pending: bool = False
+        self._detached_materializations_pending: bool = False
         self.eval()
 
     def force_integrator_reinit(self):
@@ -1025,15 +1641,83 @@ class Population(P, Sliceable):
                 if effective_compile_options is not None:
                     kwargs["options"] = dict(effective_compile_options)
                 with torch_compiler_warning_context():
-                    self.make_intra = torch.compile(make_intra, **kwargs)
+                    self.make_intra = compile_owned(make_intra, **kwargs)
             else:
                 self.make_intra = make_intra
             self._make_intra_config = make_intra_config
         return self
 
     def _call_make_intra(self, intra, stims, indices):
+        if (
+            type(intra) is Intra
+            and type(stims) in (list, tuple)
+            and len(stims) > 1
+            and _runtime_method_is(intra, "__call__", _STANDARD_INTRA_CALL)
+            and getattr(self.make_intra, "_torchdynamo_orig_callable", self.make_intra)
+            is make_intra
+        ):
+            indices = intra._prepare_assembly(
+                stims, indices, backend=self.backend if self.jit else None
+            )
         with torch_compiler_warning_context():
             return self.make_intra(intra, stims, indices)
+
+    def _can_fuse_intra_step(self, intra):
+        """Eligibility for CPU/MPS stimulus/transition fusion in run/longrun.
+
+        Custom injection/stepping hooks, runtime NOISE, and unsupported devices
+        retain the original scatter -> pre-step -> noise -> transition order.
+        All tensor guards remain enabled, and the ordinary integrator cache owns
+        the fused kernel, so reset, serialization, and device changes keep their
+        existing invalidation behavior.
+        """
+        if (
+            not self.jit
+            or self.device().type not in ("cpu", "mps")
+            or type(intra) is not Intra
+            or not _runtime_plain_intra_metadata(intra)
+            or not _runtime_method_is(intra, "__call__", _STANDARD_INTRA_CALL)
+            or self._step is not step
+            or pre_step_hook is not _STANDARD_PRE_STEP_HOOK
+            or getattr(self._call_make_intra, "__func__", None)
+            is not _STANDARD_CALL_MAKE_INTRA
+            or getattr(self.make_intra, "_torchdynamo_orig_callable", self.make_intra)
+            is not make_intra
+        ):
+            return False
+        return self._can_skip_runtime_noise_sampling()
+
+    def _can_skip_runtime_noise_sampling(self):
+        """Prove the current canonical dispatch has no runtime NOISE to sample."""
+        if (
+            not self.jit
+            or self.device().type not in ("cpu", "mps")
+            or self._step is not step
+        ):
+            return False
+        supports = getattr(self.integrator, "_supports_fused_intra_step", None)
+        if (
+            getattr(supports, "__func__", None) is not _STANDARD_NOISE_FREE_DISPATCH
+            or not supports()
+        ):
+            return False
+        handler = self.integrator.mech
+        if (
+            getattr(getattr(handler, "sample_runtime_noises_", None), "__func__", None)
+            is not _STANDARD_RUNTIME_NOISE_SAMPLERS[0]
+        ):
+            return False
+        for module in handler.modules():
+            if getattr(module, "runtime_noises", None):
+                return False
+            sampler = getattr(module, "sample_runtime_noises_", None)
+            if (
+                sampler is not None
+                and getattr(sampler, "__func__", None)
+                not in _STANDARD_RUNTIME_NOISE_SAMPLERS
+            ):
+                return False
+        return True
 
     def clear_jit_cache(self):
         """Drop lazily compiled functions attached to this population.
@@ -1183,6 +1867,7 @@ class Population(P, Sliceable):
         state.setdefault("_mech_data_ic", {})
         state.setdefault("_mech_data_base_kwargs", {})
         state.setdefault("_material_geometries", {})
+        state.setdefault("_input_bindings", ())
         state.setdefault("_integrator_reinit_pending", False)
 
         # Duration carry was originally a registered model-device buffer. Move
@@ -1463,6 +2148,14 @@ class Population(P, Sliceable):
         integrator = getattr(self, "integrator", None)
         if integrator is not None:
             integrator.initialized = False
+        handler = getattr(self, "mech", None)
+        for process in getattr(handler, "material_processes", {}).values():
+            if hasattr(process, "_spatial_configured"):
+                # A regular state-dict load restores parameter/noise inputs;
+                # its next timestep configuration owns the spatial workspace.
+                # Runtime checkpoint restoration follows a separate path and
+                # retains the held operator and its stochastic provenance.
+                process._spatial_configured = False
 
         if not has_remainder:
             if strict:
@@ -1531,6 +2224,7 @@ class Population(P, Sliceable):
             Keyword arguments forwarded to ``dendra.models.mechanisms._ions.equilibria``.
         """
         self._equilibria.update(kwargs)
+        self._update_built_ion_initials(kwargs, reversal=True)
 
     def concentrations(self, **kwargs):
         """
@@ -1542,6 +2236,46 @@ class Population(P, Sliceable):
             Keyword arguments forwarded to ``dendra.models.mechanisms._ions.concentrations``.
         """
         self._concentrations.update(kwargs)
+        self._update_built_ion_initials(kwargs, reversal=False)
+
+    def _update_built_ion_initials(self, updates, *, reversal):
+        """Replace Ion sources without rebuilding unrelated learned mechanisms."""
+        if not self.is_built or self._flag_rebuild:
+            return
+        for name, ion in self.mech.ions.items():
+            fields = (
+                ((f"e{name}", "e_init"),)
+                if reversal
+                else ((f"{name}i0", "i_init"), (f"{name}o0", "o_init"))
+            )
+            for field, attribute in fields:
+                if field not in updates:
+                    continue
+                value = updates[field]
+                if torch.is_tensor(value) or isinstance(value, torch.nn.Module):
+                    source = to_param(value)
+                else:
+                    previous = getattr(ion, attribute)
+                    requires_grad = (
+                        previous.requires_grad
+                        if torch.is_tensor(previous)
+                        else any(
+                            parameter.requires_grad
+                            for parameter in previous.parameters()
+                        )
+                    )
+                    source = to_param(
+                        value,
+                        device=self.device(),
+                        dtype=self.dtype(),
+                        requires_grad=requires_grad,
+                    )
+                # A source may change from a Parameter to a pure Module (or
+                # vice versa). Remove the old registration before assigning
+                # the replacement, preserving the new leaf/module identity.
+                for registry in (ion._parameters, ion._buffers, ion._modules):
+                    registry.pop(attribute, None)
+                setattr(ion, attribute, source)
 
     def material(
         self,
@@ -2141,6 +2875,19 @@ class Population(P, Sliceable):
         writes,
         inputs,
     ):
+        if "state.integrator.vc" in (*reads, *writes):
+            integrator = (
+                self.integrator
+                if self.integrator is not None
+                else self._integrator_class
+            )
+            if "vc" not in tuple(getattr(integrator, "v_vars", ())):
+                raise ValueError(
+                    "Initialization transforms may reference state.integrator.vc "
+                    "only when the selected integrator declares 'vc' in v_vars. "
+                    "Build custom integrator factories before registering this "
+                    "reference if their voltage contract is not visible yet."
+                )
         shared_state_references = tuple(
             reference
             for reference in (*reads, *writes)
@@ -2204,6 +2951,13 @@ class Population(P, Sliceable):
 
         if reference == "state.integrator.v":
             target = self.v
+        elif reference == "state.integrator.vc":
+            if "vc" not in tuple(getattr(self.integrator, "v_vars", ())):
+                raise KeyError(
+                    "Initialization transform references state.integrator.vc, "
+                    "but the active integrator does not declare 'vc' in v_vars."
+                )
+            target = self._buffers.get("vc")
         elif reference == "state.clock.t":
             target = self.t
         elif reference == "state.control.duration_remainder":
@@ -2399,22 +3153,64 @@ class Population(P, Sliceable):
         }
 
     @classmethod
-    def _rematerialize_parameter_owner(cls, owner):
+    def _rematerialize_parameter_owner(cls, owner, *, replay_random=False):
         derive = getattr(owner, "_derive_parameter_buffers", None)
         install = getattr(owner, "_install_parameter_buffers", None)
         if not callable(derive) or not callable(install):
             return
         preserved = cls._preserved_stochastic_parameter_buffers(owner)
         values = derive()
+        if replay_random:
+            from dendra.models.networks._population_cache import (
+                _restore_parameter,
+                restore_population_cache_values,
+            )
+            from dendra.models.random_parameters import (
+                clone_random_parameter_tree,
+                evaluate_random_parameter,
+            )
+
+            for name, spec in getattr(owner, "random_parameters", {}).items():
+                if name not in preserved or not spec.reparameterized:
+                    continue
+                current = {
+                    parameter: (
+                        values[spec.full_parameter_name(parameter)]
+                        if spec.full_parameter_name(parameter) in values
+                        else getattr(owner, spec.full_parameter_name(parameter))
+                    )
+                    for parameter in spec.params
+                }
+                if not any(value.requires_grad for value in current.values()):
+                    continue
+                draws = getattr(owner, "_random_parameter_draws", {})
+                parameters = getattr(owner, "_random_parameter_parameters", {})
+                if name not in draws or name not in parameters:
+                    raise RuntimeError(
+                        f"Cannot reconnect detached RAND parameter {name!r}: "
+                        "retained sampling provenance is required for trainable "
+                        "reparameterized values. Use a distribution with a pure "
+                        "draw_sampler/transform contract."
+                    )
+                anchored = restore_population_cache_values(
+                    current, parameters[name], parameter_names=current
+                )
+                draw = clone_random_parameter_tree(draws[name], detach=True)
+                evaluated = evaluate_random_parameter(spec, anchored, draw).to(
+                    preserved[name]
+                )
+                preserved[name] = _restore_parameter(evaluated, preserved[name])
         for name, value in preserved.items():
-            if name in values:
+            if name in values or replay_random:
                 values[name] = value
         install(values)
         make_contiguous = getattr(owner, "make_contiguous", None)
         if callable(make_contiguous):
             make_contiguous()
 
-    def _deterministically_rematerialize_initialization_parameters(self):
+    def _deterministically_rematerialize_initialization_parameters(
+        self, *, preserve_state=False
+    ):
         # Parameter wrappers may cache resolved raw leaves in eval mode. A raw
         # output is a new generation even though initialization itself remains
         # an imperative no-grad transaction.
@@ -2423,7 +3219,7 @@ class Population(P, Sliceable):
             if callable(clear_cache):
                 clear_cache()
 
-        self._rematerialize_parameter_owner(self)
+        self._rematerialize_parameter_owner(self, replay_random=preserve_state)
         self._refresh_parameter_views_for_initialization()
 
         handler = getattr(self, "mech", None)
@@ -2435,7 +3231,9 @@ class Population(P, Sliceable):
         make_maps = getattr(handler, "make_maps", None)
         if callable(make_maps):
             make_maps()
-        set_buffers = getattr(handler, "set_buffers", None)
+        set_buffers = getattr(
+            handler, "_bind_state_geometry" if preserve_state else "set_buffers", None
+        )
         if callable(set_buffers):
             set_buffers(self.diam)
 
@@ -2443,9 +3241,9 @@ class Population(P, Sliceable):
         processes = tuple(getattr(handler, "material_processes", {}).values())
         owners = (*mechanisms, *processes)
         for owner in owners:
-            self._rematerialize_parameter_owner(owner)
+            self._rematerialize_parameter_owner(owner, replay_random=preserve_state)
             for state in getattr(owner, "DE", {}).values():
-                self._rematerialize_parameter_owner(state)
+                self._rematerialize_parameter_owner(state, replay_random=preserve_state)
 
         from dendra.models.mechanisms._state import _materialize_derived_buffers
 
@@ -2454,14 +3252,34 @@ class Population(P, Sliceable):
             for state in getattr(owner, "DE", {}).values():
                 _materialize_derived_buffers(state)
 
+    def _refresh_detached_materializations(self):
+        """Reconnect parameter workspaces at a continued training boundary."""
+        if not (
+            getattr(self, "_detached_materializations_pending", False)
+            and self.training
+            and torch.is_grad_enabled()
+            and not torch.is_inference_mode_enabled()
+        ):
+            return False
+        # Leave failed refreshes pending and the solver invalid until a complete
+        # retry succeeds. Neither this path nor its owner materializers samples
+        # randomness or initializes recurrent state.
+        self.integrator.initialized = False
+        self._integrator_reinit_pending = True
+        self._deterministically_rematerialize_initialization_parameters(
+            preserve_state=True
+        )
+        self._detached_materializations_pending = False
+        return True
+
     def _invalidate_integrator_after_initialization_transform(self):
         integrator = getattr(self, "integrator", None)
         if integrator is None:
             return
         integrator.initialized = False
-        compiled = getattr(integrator, "_compiled_kernels", None)
-        if hasattr(compiled, "clear"):
-            compiled.clear()
+        # Rebuild numeric workspaces from the transformed parameters/state.
+        # Compiled callables read those live operands; their guards still
+        # specialize genuine schema changes without discarding valid graphs.
 
     def _execute_initialization_transform(self, action_name, *, phase):
         try:
@@ -2680,12 +3498,25 @@ class Population(P, Sliceable):
             Pair ``(stims, indices)`` where ``stims`` is a list of sequences
             of stimuli and ``indices`` encodes electrode mapping metadata.
         """
-        t_ = _time_grid_from_step_count(self.t, n, dt, device=self.device()).to(
-            self.dtype()
-        )
-        stims, indices = intra.init(t_)
-        stims = [s.unbind(-1) for s in stims]
+        stims, indices, _ = _prepare_intra_run(self, intra, n, dt)
         return stims, indices
+
+    def _normalize_runtime_inputs(self, inputs, *, steps=None, step=False):
+        """Normalize canonical drives without coercing their source tensors."""
+        options = dict(
+            shape=tuple(self.v.shape), device=self.device(), dtype=self.dtype()
+        )
+        if step:
+            return (
+                normalize_input_frame(inputs.ve, name="ve", **options),
+                normalize_input_frame(inputs.intra, name="intra", **options),
+                1,
+            )
+        ve, steps = normalize_input_tape(inputs.ve, name="ve", steps=steps, **options)
+        intra, steps = normalize_input_tape(
+            inputs.intra, name="intra", steps=steps, **options
+        )
+        return ve, intra, steps
 
     # extracellular helpers
     def _broadcast_step_value(
@@ -3055,14 +3886,16 @@ class Population(P, Sliceable):
                 # [n_contacts, np, n_t_chunk]
                 t_per_contact: List[torch.Tensor] = []
                 for wf in cfg.waveforms:
-                    t_i = wf(t_chunk).to(self.dtype())
+                    with borrow_pending_poisson_rng(self, wf):
+                        t_i = wf(t_chunk).to(self.dtype())
                     t_i = self._expand_eval_time(t_i, n_steps=t_chunk.numel())
                     t_per_contact.append(t_i.unsqueeze(0))  # [1, np, n_t_chunk]
 
                 t_extra = torch.cat(t_per_contact, dim=0)
             else:
                 wf = cfg.waveforms[0]
-                t_extra = wf(t_chunk).to(self.dtype())
+                with borrow_pending_poisson_rng(self, wf):
+                    t_extra = wf(t_chunk).to(self.dtype())
                 t_extra = self._expand_eval_time(t_extra, n_steps=t_chunk.numel())
         else:
             # Non-functional: use pre-split chunks
@@ -3101,14 +3934,35 @@ class Population(P, Sliceable):
         """Start a fresh duration budget for a new simulation episode."""
         self._duration_remainder = torch.zeros((), device="cpu", dtype=torch.float64)
 
+    def _prepare_replayed_stimulation(
+        self, replay, intra, dt, extra_cfg, *, ve=None, current=None
+    ):
+        """Evaluate one accepted-step bank recipe using ordinary native assembly."""
+        with replay.bank_scope(finish=False):
+            if extra_cfg is not None and extra_cfg.functional:
+                time = self.t.reshape(1).to(device=self.device(), dtype=self.dtype())
+                values = self._compute_extra_chunk(extra_cfg, 0, time)
+                ve = None if values is None else values[0]
+            if intra is not None:
+                stims, indices = self.prep_intra(intra, 1, dt)
+                current = self._call_make_intra(
+                    intra, [stim[0] for stim in stims], indices
+                )
+        return ve, current
+
     def step(
         self,
         dt: Optional[float] = None,
         *,
+        inputs=None,
+        draws=None,
         ve: Optional[TensorLike] = None,
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         loop_hooks: bool = False,
+        callback_state=None,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         """Advance this population by exactly one timestep.
 
@@ -3123,25 +3977,62 @@ class Population(P, Sliceable):
             tried first. If it fails, low-rank data may broadcast right-aligned
             within the explicit batch shape and be shared spatially. A leading
             singleton time dimension ``[1, ...]`` is also accepted.
+        inputs : dendra.func.Inputs, optional
+            One strict Tensor frame of extracellular voltage and/or intracellular
+            current. An explicit ``ve`` frame conflicts with ``ve=`` or ``extra=``;
+            an explicit ``intra`` frame conflicts with solver-level Slice injections.
+            Omitted fields retain the existing stimulation sources.
+        draws : dendra.func.RuntimeDraws, optional
+            One explicit NOISE/SDE draw frame with authoritative RNG suffixes.
+            Solver-owned intracellular and call-local extracellular Poisson
+            waveform banks, and mechanism-owned waveform injections, consume
+            invocation-indexed draws in native execution order. Omission retains
+            automatic sampling; supplied base draws and schedules remain detached.
         extra : extracellular specification, optional
             Higher-level extracellular stimulation specification with the same
             shape and broadcasting semantics as :meth:`run`. It is evaluated
             at the model's current time and converted to this step's ``ve``.
-        callbacks : sequence of Callback, optional
-            Callbacks to execute around this single step. By default ``step``
-            calls ``pre_step_hook`` and ``post_step_hook`` only.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this Population or a compatible
+            initialized Population. Requested ``dt`` must honor prepared Recorder
+            cadence and threshold timing. Pure observations read this receiver's
+            state with fixed prepared selections. They run after clock advancement
+            and before native post-step hooks. Native hooks retain their
+            loop/chunk/step timing.
         loop_hooks : bool, optional
             If ``True``, also call ``pre_loop_hook`` before the step and
             ``post_loop_hook`` after the step. Leave this ``False`` when
             manually stepping inside an outer user-controlled loop.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
-        Population
-            ``self``, for chaining.
+        Population or dendra.func.FunctionalCallbackResults
+            Returns ``self`` for chaining when pure observations are omitted.
+            With pure observations, returns their named results and explicit
+            callback carry. Model state remains on the Population. Retained
+            observations preserve gradients and own their sampled tensor values.
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before stepping.")
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
+        )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -3150,6 +4041,22 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
+        if observer is not None:
+            observer.validate_dt(dt_f)
+
+        replay = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import bind_population_runtime_draws
+
+            replay = bind_population_runtime_draws(self, draws, extra=extra, dt=dt_f)
+
+        input_ve = input_intra = None
+        if inputs is not None:
+            packet = native_input_sources(inputs, ve=ve, extra=extra)
+            with nullcontext() if self.training else torch.no_grad():
+                input_ve, input_intra, _ = self._normalize_runtime_inputs(
+                    packet, step=True
+                )
 
         if ve is not None and extra is not None:
             raise ValueError("Provide either 've' or 'extra', not both.")
@@ -3160,6 +4067,10 @@ class Population(P, Sliceable):
             self.intra = self.build_intra()
         intra = self.intra
         with_intra = intra is not None
+        if input_intra is not None and with_intra:
+            raise ValueError(
+                "explicit intra cannot be combined with registered intracellular stimulation"
+            )
 
         device = self.device()
         dtype = self.dtype()
@@ -3169,10 +4080,11 @@ class Population(P, Sliceable):
             callbacks = CallbackList(callbacks)
         if callbacks:
             for c in callbacks:
-                c.dt = dt_f
+                _bind_callback_dt(c, dt_f)
 
         ctx = nullcontext() if self.training else torch.no_grad()
-        with ctx:
+        with _native_callback_storage(observer) as observer, ctx:
+            self._refresh_detached_materializations()
             self.integrator._initialize(
                 self,
                 dt_tensor,
@@ -3182,34 +4094,50 @@ class Population(P, Sliceable):
 
             if loop_hooks:
                 pre_loop_hook(callbacks, self)
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
             pre_step_hook(callbacks, self)
 
-            if ve is not None:
-                ve_c = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
-                if ve_c.dim() == self.v.dim() + 1 and int(ve_c.shape[0]) == 1:
-                    ve_c = ve_c[0]
-                ve_c = self._broadcast_step_value(ve_c, name="ve").contiguous()
-            elif extra is not None:
-                t_step = self.t.reshape(1).to(device=device, dtype=dtype)
-                extra_cfg = self._prepare_extra(extra, t_step, n_chunks=1)
-                ve_list = self._compute_extra_chunk(extra_cfg, 0, t_step)
-                ve_c = None if ve_list is None else ve_list[0]
-            else:
-                ve_c = None
+            with nullcontext() if replay is None else replay.bank_scope(finish=False):
+                if input_ve is not None:
+                    ve_c = input_ve
+                elif ve is not None:
+                    ve_c = torch.as_tensor(ve, device=device, dtype=dtype).contiguous()
+                    if ve_c.dim() == self.v.dim() + 1 and int(ve_c.shape[0]) == 1:
+                        ve_c = ve_c[0]
+                    ve_c = self._broadcast_step_value(ve_c, name="ve").contiguous()
+                elif extra is not None:
+                    t_step = self.t.reshape(1).to(device=device, dtype=dtype)
+                    extra_cfg = self._prepare_extra(extra, t_step, n_chunks=1)
+                    reconcile_extra_poisson_rng(self, extra)
+                    ve_list = self._compute_extra_chunk(extra_cfg, 0, t_step)
+                    ve_c = None if ve_list is None else ve_list[0]
+                else:
+                    ve_c = None
 
-            if with_intra:
-                stims, indices = self.prep_intra(intra, 1, dt_f)
-                s = [st[0] for st in stims]
-                intra_c = self._call_make_intra(intra, s, indices)
-            else:
-                intra_c = None
+                if with_intra:
+                    stims, indices = self.prep_intra(intra, 1, dt_f)
+                    s = [st[0] for st in stims]
+                    intra_c = self._call_make_intra(intra, s, indices)
+                else:
+                    intra_c = input_intra
 
-            self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+            with nullcontext() if replay is None else replay.scope():
+                self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+            if replay is not None:
+                replay.publish()
             self.t = self.t + dt_tensor
 
+            if observer is not None:
+                observed_state, emitted = observer.update(observed_state)
+                observer.collect(
+                    observed_state, observed_parts, observer.stack([emitted]), steps=1
+                )
             post_step_hook(callbacks, self)
             if loop_hooks:
                 post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
         return self
 
@@ -3221,9 +4149,16 @@ class Population(P, Sliceable):
         dt: Optional[float] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar: bool = False,
+        *,
+        steps=None,
+        duration=None,
+        inputs=None,
+        draws=None,
+        callback_state=None,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
-        """
-        Run the axon model simulation.
+        """Run the Population simulation.
 
         Parameters
         ----------
@@ -3235,6 +4170,20 @@ class Population(P, Sliceable):
             ``[n_timesteps, *batch, 1, 1]`` for explicit per-batch, spatially
             shared input. The number of time steps is inferred from
             ``ve.shape[0]``.
+        inputs : dendra.func.Inputs, optional
+            Strict time-first Tensor tapes. With an explicit horizon, tapes must
+            match its accepted complete steps; otherwise their common leading
+            length determines the horizon. The legacy ``ve=``/``tstop`` combination
+            retains the voltage tape's authoritative length. Explicit voltage cannot duplicate ``ve=`` or ``extra=``;
+            explicit current cannot replace registered solver-level Slice injections.
+        draws : dendra.func.RuntimeDraws, optional
+            Explicit time-leading draw and RNG tapes matching the accepted steps.
+            Mechanism-owned waveform injections consume their accepted-step
+            invocation recipes in native numerical order.
+            Populations with randomized Poisson bank waveforms replay their banks
+            per accepted step. Other waveforms retain full-run preparation.
+            Changing replay chunking does not change the experiment. Omission retains automatic
+            sampling. Base draws remain detached; model/input gradients are kept.
         extra : tuple or sequence of tuples, optional
             Extracellular input specification(s), with the same semantics as
             :meth:`longrun`.
@@ -3276,16 +4225,48 @@ class Population(P, Sliceable):
             :meth:`longrun`, or :meth:`longrun_checkpointed` call. If ``ve`` is
             provided, its leading length is authoritative, ``tstop`` is ignored,
             and the retained duration is left unchanged.
+        steps : int, optional
+            Exact non-negative step count. Mutually exclusive with ``duration``
+            and ``tstop``. Leaves retained fractional duration unchanged. Supplied
+            voltage and input tapes must match this count.
+        duration : float, optional
+            Non-negative elapsed milliseconds, using the same fractional carry
+            as ``tstop``. Mutually exclusive with ``steps`` and ``tstop``. Unlike
+            the legacy ``ve``/``tstop`` combination, a supplied voltage tape must
+            match the accepted complete steps.
         dt : float, optional
             Time step size in milliseconds. If ``None``, the default value
             ``A.dt`` from the backend is used.
-        callbacks : sequence of Callback, optional
-            Callback objects to execute during simulation (pre-loop, per-step,
-            post-loop, etc.). If not already a :class:`CallbackList`, it is
-            wrapped into one.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this Population or a compatible
+            initialized Population. Requested ``dt`` must honor prepared Recorder
+            cadence and threshold timing. Pure observations read this receiver's
+            state with fixed prepared selections. They run after clock advancement
+            and before native post-step hooks. Native hooks retain their
+            loop/chunk/step timing.
         progressbar : bool or tqdm, optional
             If ``True``, displays a progress bar during simulation. Can also be
             a :class:`tqdm.tqdm` instance for custom progress tracking.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
+
+        Returns
+        -------
+        None or dendra.func.FunctionalCallbackResults
+            With pure observations, returns their named results and explicit
+            callback carry. Otherwise returns ``None``. Model state remains
+            on the Population. Retained observations preserve gradients and
+            are isolated from subsequent native state mutation.
 
         Notes
         -----
@@ -3296,9 +4277,23 @@ class Population(P, Sliceable):
           but the entire simulation is treated as a single chunk.
         * The simulation updates the model's internal state (e.g. ``v``,
           ``v_prev`` for DF methods) and advances the model's time ``self.t``.
+        * Evaluation mode disables reverse-mode recording with ``no_grad``;
+          it does not implicitly enable ``torch.inference_mode``. Entering
+          inference mode around a run can create versionless tensors during
+          lazy solver preparation, which may disable version-checked native
+          topology plans. Prepare the solver outside inference mode when
+          comparing execution-only inference performance, and recreate normal
+          state before subsequently running gradients.
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
+        )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -3307,19 +4302,32 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
+        if observer is not None:
+            observer.validate_dt(dt_f)
+        packet = (
+            native_input_sources(inputs, ve=ve, extra=extra)
+            if inputs is not None
+            else None
+        )
         if ve is not None and extra is not None:
             raise ValueError("Provide either 've' or 'extra', not both.")
-        tstop_f = None
-        duration_steps = None
+        horizon_steps = None
         duration_remainder = None
-        if ve is None:
-            if tstop is None:
-                raise ValueError("tstop must be provided when 've' is not given.")
-            tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-            duration_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        canonical_horizon = steps is not None or duration is not None
+        if canonical_horizon or (ve is None and tstop is not None):
+            requested_steps, requested_duration = native_horizon_request(
+                tstop, steps=steps, duration=duration
+            )
+            horizon_steps, duration_remainder = execution_step_budget(
+                requested_steps, requested_duration, dt_f, self._duration_budget
+            )
+        elif ve is None and (
+            packet is None or (packet.ve is None and packet.intra is None)
+        ):
+            raise ValueError("tstop must be provided when 've' is not given.")
 
         # auto-build intra if missing
-        if self.intra is None:
+        if self.intra is None and draws is None:
             intra = self.build_intra()
             self.intra = intra
         else:
@@ -3332,6 +4340,49 @@ class Population(P, Sliceable):
 
         if ve is not None:
             ve = self._normalize_precomputed_ve(ve).contiguous()
+            if canonical_horizon and int(ve.shape[0]) != horizon_steps:
+                raise ValueError(
+                    f"ve has {int(ve.shape[0])} steps, but the execution expects {horizon_steps}"
+                )
+
+        input_intra = None
+        if packet is not None:
+            with nullcontext() if self.training else torch.no_grad():
+                input_ve, input_intra, input_steps = self._normalize_runtime_inputs(
+                    packet,
+                    steps=int(ve.shape[0]) if ve is not None else horizon_steps,
+                )
+            if input_intra is not None and with_intra:
+                raise ValueError(
+                    "explicit intra cannot be combined with registered intracellular stimulation"
+                )
+            if input_ve is not None:
+                ve = input_ve
+            horizon_steps = input_steps
+
+        replay_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import (
+                bind_population_runtime_draw_tape,
+            )
+
+            replay_tape = bind_population_runtime_draw_tape(
+                self,
+                draws,
+                steps=int(ve.shape[0]) if ve is not None else horizon_steps,
+                extra=extra,
+                dt=dt_f,
+            )
+            if self.intra is None:
+                self.intra = self.build_intra()
+            intra = self.intra
+            with_intra = intra is not None
+            if input_intra is not None and with_intra:
+                raise ValueError(
+                    "explicit intra cannot be combined with registered intracellular stimulation"
+                )
+
+        replay_banks = replay_tape is not None and replay_tape.plan.has_bank_poisson
 
         # dt as scalar and tensor
         dt_tensor = torch.tensor(dt_f, device=device, dtype=dtype)
@@ -3343,7 +4394,7 @@ class Population(P, Sliceable):
 
         psh = post_step_hook
 
-        with ctx:
+        with _native_callback_storage(observer) as observer, ctx:
             # --------------------------------------------------------------
             # Determine number of steps and global time grid
             # --------------------------------------------------------------
@@ -3356,17 +4407,32 @@ class Population(P, Sliceable):
                     self.t, n, dt_f, device=device
                 ).to(dtype)
             else:
-                n = duration_steps
+                n = horizon_steps
                 t_global = _time_grid_from_step_count(
                     self.t, n, dt_f, device=device
                 ).to(dtype)
 
+            if n:
+                self._refresh_detached_materializations()
+
             # --------------------------------------------------------------
             # Prepare intra
             # --------------------------------------------------------------
-            if with_intra:
-                # Preserve existing intra preparation semantics
-                stims, indices = self.prep_intra(intra, n, dt_f)
+            indexed_tapes = None
+            stims = indices = None
+            if replay_tape is None:
+                reconcile_extra_poisson_rng(self, extra)
+            if with_intra and not replay_banks and (replay_tape is None or n > 0):
+                if (
+                    n > 0
+                    and _can_index_intra_tapes(self, intra)
+                    and _runtime_method_is(self, "prep_intra", _STANDARD_PREP_INTRA)
+                ):
+                    stims, indices, indexed_tapes = _prepare_intra_run(
+                        self, intra, n, dt_f, indexed=True
+                    )
+                else:
+                    stims, indices = self.prep_intra(intra, n, dt_f)
 
             # --------------------------------------------------------------
             # Callbacks and integrator
@@ -3376,7 +4442,7 @@ class Population(P, Sliceable):
 
             if callbacks:
                 for c in callbacks:
-                    c.dt = dt_f
+                    _bind_callback_dt(c, dt_f)
 
             pre_loop_hook(callbacks, self)
             self.integrator._initialize(
@@ -3385,6 +4451,8 @@ class Population(P, Sliceable):
                 force=self.force_integrator_reinit(),
                 compile_scope="population",
             )
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
 
             # Progress bar setup
             if progressbar:
@@ -3397,6 +4465,7 @@ class Population(P, Sliceable):
             # --------------------------------------------------------------
             # Prepare extracellular input via 'extra' if needed
             # --------------------------------------------------------------
+            extra_cfg = None
             if ve is None and extra is not None:
                 # One "chunk" for the whole run
                 extra_cfg = self._prepare_extra(extra, t_global, n_chunks=1)
@@ -3405,7 +4474,12 @@ class Population(P, Sliceable):
                     extra_cfg.einsum = extra_cfg.einsum
 
                 # Single chunk index 0, over full time grid
-                ve_list = self._compute_extra_chunk(extra_cfg, 0, t_global)
+                ve_list = (
+                    self._compute_extra_chunk(extra_cfg, 0, t_global)
+                    if (not replay_banks or not extra_cfg.functional)
+                    and (replay_tape is None or n > 0 or not extra_cfg.functional)
+                    else None
+                )
             else:
                 ve_list = None
 
@@ -3415,54 +4489,146 @@ class Population(P, Sliceable):
             # --------------------------------------------------------------
             # Main time-stepping loop
             # --------------------------------------------------------------
-            for i in range(n):
-                # Extracellular voltage for this step
-                if ve is not None:
-                    ve_c = ve[i]
-                elif ve_list is not None:
-                    ve_c = ve_list[i]
-                else:
-                    ve_c = None
+            fuse_intra, stable_intra_callbacks, skip_empty_noise = (
+                _runtime_step_eligibility(
+                    self,
+                    callbacks,
+                    intra,
+                    with_intra=with_intra,
+                    progressbar=progressbar,
+                    step_inputs=(
+                        ve,
+                        ve_list,
+                        stims if with_intra else None,
+                        indices if with_intra else None,
+                    )
+                    + ((input_intra,) if input_intra is not None else ()),
+                    post_step=psh,
+                )
+            )
+            indexed_steps = (
+                _aligned_current_indices(n, device=intra.device)
+                if indexed_tapes is not None
+                and fuse_intra
+                and not torch.is_grad_enabled()
+                and _population_runtime_modes_plain()
+                else None
+            )
+            with (
+                self.integrator._population_step_scope(
+                    stable=stable_intra_callbacks and self.device().type == "cpu"
+                )
+                if isinstance(self.integrator, Integrator)
+                else nullcontext()
+            ):
+                for i in range(n):
+                    # Extracellular voltage for this step
+                    if ve is not None:
+                        ve_c = ve[i]
+                    elif ve_list is not None:
+                        ve_c = ve_list[i]
+                    else:
+                        ve_c = None
 
-                # Intracellular stimulation for this step
-                if with_intra:
-                    s = [st[local_ind] for st in stims]
-                    intra_c = self._call_make_intra(intra, s, indices)
-                else:
-                    intra_c = None
-
-                # Integrator step
-                pre_step_hook(callbacks, self)
-                self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
-                self.t = self.t + dt_tensor
-
-                psh(callbacks, self)
-                local_ind += 1
-
-                # Progress bar update
-                if progressbar:
-                    progressbar.update(1)
-                    if local_ind % 100 == 0:
-                        progressbar.set_description(
-                            f"{tstart + local_ind * dt_f:.1f} ms"
+                    # Explicit recipes use the accepted clock and ordinary
+                    # native bank/assembly operations before the numerical step.
+                    replay = None if replay_tape is None else replay_tape.frame(i)
+                    if replay is not None and replay_banks:
+                        ve_c, intra_c = self._prepare_replayed_stimulation(
+                            replay,
+                            intra,
+                            dt_f,
+                            extra_cfg,
+                            ve=ve_c,
+                            current=None if input_intra is None else input_intra[i],
                         )
+                    elif with_intra:
+                        s = [st[local_ind] for st in stims]
+                        if fuse_intra and (
+                            stable_intra_callbacks
+                            or (
+                                _intra_fusion_callbacks_safe(callbacks)
+                                and _runtime_plain_step_inputs((s, indices))
+                                and self._can_fuse_intra_step(intra)
+                            )
+                        ):
+                            intra_c = _DeferredIntra(
+                                intra,
+                                (
+                                    _IndexedCurrentSamples(
+                                        indexed_tapes, indexed_steps[local_ind]
+                                    )
+                                    if indexed_steps is not None
+                                    and not torch.is_grad_enabled()
+                                    and (
+                                        stable_intra_callbacks
+                                        or _population_runtime_modes_plain()
+                                    )
+                                    else s
+                                ),
+                                intra._prepare_assembly(
+                                    s, indices, backend=self.backend
+                                ),
+                            )
+                        else:
+                            intra_c = self._call_make_intra(intra, s, indices)
+                    else:
+                        intra_c = None if input_intra is None else input_intra[i]
+
+                    # Integrator step
+                    pre_step_hook(callbacks, self)
+                    if skip_empty_noise:
+                        intra_c = _NoiseFreeStep(intra_c)
+                    with nullcontext() if replay is None else replay.scope():
+                        self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                    if replay is not None:
+                        replay.publish()
+                    self.t = self.t + dt_tensor
+
+                    if observer is not None:
+                        observed_state, emitted = observer.update(observed_state)
+                        observer.collect(
+                            observed_state,
+                            observed_parts,
+                            observer.stack([emitted]),
+                            steps=1,
+                        )
+                    psh(callbacks, self)
+                    local_ind += 1
+
+                    # Progress bar update
+                    if progressbar:
+                        progressbar.update(1)
+                        if local_ind % 100 == 0:
+                            progressbar.set_description(
+                                f"{tstart + local_ind * dt_f:.1f} ms"
+                            )
 
             if progressbar:
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
     def longrun(
         self,
-        tstop: float,
-        chunklength: int,
+        tstop: float = None,
+        chunklength: int = None,
         dt: float = None,
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar=False,
+        *,
+        steps=None,
+        duration=None,
+        inputs=None,
+        draws=None,
+        callback_state=None,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
-        r"""
-        Run a long simulation by dividing it into multiple smaller chunks.
+        """Run a long simulation by dividing it into multiple smaller chunks.
 
         This method splits the overall simulation into chunks of a given length,
         allowing for more efficient memory management during long simulations.
@@ -3476,11 +4642,22 @@ class Population(P, Sliceable):
             model time ``self.t``. Only complete fixed timesteps are executed;
             fractional physical duration is retained and shared with subsequent
             duration-based Population execution calls.
+        steps : int, optional
+            Exact non-negative step count, leaving fractional duration carry
+            unchanged. Mutually exclusive with ``duration`` and ``tstop``.
+        duration : float, optional
+            Non-negative elapsed milliseconds, accumulating the same physical
+            duration carry as ``tstop``. Supply exactly one horizon argument.
         chunklength : int
             The number of time steps to process in each chunk.
         dt : float, optional
             The simulation time step in milliseconds. If ``None``, the default value
             from the backend will be used.
+        inputs : dendra.func.Inputs, optional
+            Strict time-first voltage/current tapes matching the accepted steps
+            for the selected horizon. Tapes are indexed at actual chunk boundaries. Omitted
+            current retains Slice injections; explicit current conflicts with
+            those injections. Explicit voltage conflicts with ``extra``.
         extra : tuple or sequence of tuples, optional
             Extracellular input specification(s).
 
@@ -3511,18 +4688,47 @@ class Population(P, Sliceable):
 
             Mixing :class:`Waveform` and tensor time specifications across
             contacts is not supported and will raise a :class:`ValueError`.
-        callbacks : list of Callback, optional
-            A list of callback objects to be executed during simulation, allowing for
-            customized processing at various stages (e.g., pre-loop, post-step,
-            post-loop).
+        draws : dendra.func.RuntimeDraws, optional
+            Time-leading explicit draws and RNG boundaries matching accepted steps.
+            Mechanism-owned waveform injections consume their accepted-step
+            invocation recipes in native numerical order.
+            Poisson bank recipes replay per step independently of chunklength;
+            other waveforms retain per-chunk preparation. Omitted draws retain
+            automatic sampling. Supplied base draws are detached while
+            model, waveform and input gradients are preserved.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this Population or a compatible
+            initialized Population. Requested ``dt`` must honor prepared Recorder
+            cadence and threshold timing. Pure observations read this receiver's
+            state with fixed prepared selections. They run after clock advancement
+            and before native post-step hooks. Native hooks retain their
+            loop/chunk/step timing.
         progressbar : bool or tqdm, optional
             If ``True`` (or if a :class:`tqdm.tqdm` instance is provided), displays
             a progress bar to track simulation progress across chunks. Default is ``False``.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
+
+        Returns
+        -------
+        None or dendra.func.FunctionalCallbackResults
+            Pure observations return their named results and carry when
+            supplied. Existing calls without them return ``None``. Cadence
+            and gradients are preserved across chunks and continued calls.
 
         Notes
         -----
-        * Multi-contact handling is inferred from the number of ``extra`` entries;
-          the ``multicontact`` flag is no longer required.
+        * Multi-contact handling follows the number of ``extra`` entries.
         * When ``extra`` is provided, the method uses it to assemble the
           extracellular voltage ``ve`` via :func:`op_sc` (single contact) or
           :func:`op_mc` (multi-contact).
@@ -3532,6 +4738,13 @@ class Population(P, Sliceable):
 
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
+        )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -3542,8 +4755,24 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        if observer is not None:
+            observer.validate_dt(dt_f)
+        requested_steps, requested_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
+        n_steps, duration_remainder = execution_step_budget(
+            requested_steps, requested_duration, dt_f, self._duration_budget
+        )
+        replay_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import (
+                bind_population_runtime_draw_tape,
+            )
+
+            replay_tape = bind_population_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra, dt=dt_f
+            )
+
         self._refresh_compile_config_from_ctx()
 
         # Match step()/run(): injections registered after initialization
@@ -3553,12 +4782,29 @@ class Population(P, Sliceable):
         intra = self.intra
         with_intra = intra is not None
 
+        input_ve = input_intra = None
+        if inputs is not None:
+            packet = native_input_sources(inputs, extra=extra)
+            with torch.set_grad_enabled(self.training):
+                input_ve, input_intra, _ = self._normalize_runtime_inputs(
+                    packet, steps=n_steps
+                )
+            if input_intra is not None and with_intra:
+                raise ValueError(
+                    "explicit intra cannot be combined with registered intracellular stimulation"
+                )
+
+        replay_banks = replay_tape is not None and replay_tape.plan.has_bank_poisson
+
         # dt scalars
         dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
 
         psh = post_step_hook
 
-        with torch.nn.utils.parametrize.cached():
+        with (
+            _native_callback_storage(observer) as observer,
+            torch.nn.utils.parametrize.cached(),
+        ):
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
                 # Global time grid and chunking
@@ -3568,9 +4814,14 @@ class Population(P, Sliceable):
                 ).to(self.dtype())
 
                 if t.numel() == 0:
-                    self._set_duration_remainder(duration_remainder)
+                    if duration_remainder is not None:
+                        self._set_duration_remainder(duration_remainder)
+                    if observer is not None:
+                        observed_state, observed_parts = observer.start()
+                        return observer.finish(observed_state, observed_parts)
                     return
 
+                self._refresh_detached_materializations()
                 n_chunks = math.ceil(len(t) / chunklength)
                 t_chunks = torch.tensor_split(t, n_chunks)
 
@@ -3589,7 +4840,7 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 if callbacks:
                     for c in callbacks:
-                        c.dt = dt_f
+                        _bind_callback_dt(c, dt_f)
 
                 callbacks = CallbackList(callbacks)
 
@@ -3603,40 +4854,175 @@ class Population(P, Sliceable):
                     compile_scope="population",
                 )
 
-                self._set_duration_remainder(duration_remainder)
+                if duration_remainder is not None:
+                    self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
+                if observer is not None:
+                    observed_state, observed_parts = observer.start()
 
                 # --------------------------------------------------------------
                 # Main chunk loop
                 # --------------------------------------------------------------
+                input_start = 0
                 for i, t_chunk in enumerate(t_chunks):
-                    if with_intra:
-                        stims, indices = intra.init(t_chunk)
+                    draw_start = input_start
+                    input_stop = input_start + len(t_chunk)
+                    input_intra_chunk = (
+                        None
+                        if input_intra is None
+                        else input_intra[input_start:input_stop]
+                    )
+                    if observer is not None:
+                        observed_emissions = []
+                    indexed_tapes = None
+                    stims = indices = None
+                    if replay_tape is None:
+                        reconcile_extra_poisson_rng(self, extra)
+                    else:
+                        replay_tape.validate_fresh()
+                    if with_intra and not replay_banks:
+                        tapes, indices = intra.init(t_chunk)
                         # Waveform output always carries time on its last axis;
                         # leading axes are population batch/sweep axes.
-                        stims = [s.unbind(-1) for s in stims]
+                        stims, indexed_tapes = _unbind_intra_tapes(
+                            tapes,
+                            intra,
+                            len(t_chunk),
+                            indexed=_can_index_intra_tapes(self, intra),
+                        )
 
-                    if with_extra:
+                    if with_extra and (not replay_banks or not extra_cfg.functional):
                         ve_list = self._compute_extra_chunk(extra_cfg, i, t_chunk)
                     else:
-                        ve_list = None
+                        ve_list = (
+                            None
+                            if input_ve is None
+                            else input_ve[input_start:input_stop]
+                        )
+                    input_start = input_stop
 
                     pre_chunk_hook(callbacks, self, t_chunk)
 
-                    for j in range(len(t_chunk)):
-                        ve_c = ve_list[j] if ve_list is not None else None
+                    # Chunk hooks and waveform evaluation may replace runtime
+                    # machinery. Establish fresh eligibility after both, never
+                    # carry a prior chunk's absence proof into this one.
+                    fuse_intra, stable_intra_callbacks, skip_empty_noise = (
+                        _runtime_step_eligibility(
+                            self,
+                            callbacks,
+                            intra,
+                            with_intra=with_intra,
+                            progressbar=progressbar,
+                            step_inputs=(
+                                ve_list,
+                                stims if with_intra else None,
+                                indices if with_intra else None,
+                            )
+                            + (
+                                (input_intra_chunk,)
+                                if input_intra_chunk is not None
+                                else ()
+                            ),
+                            post_step=psh,
+                        )
+                    )
+                    indexed_steps = (
+                        _aligned_current_indices(len(t_chunk), device=intra.device)
+                        if indexed_tapes is not None
+                        and fuse_intra
+                        and not torch.is_grad_enabled()
+                        and _population_runtime_modes_plain()
+                        else None
+                    )
+                    with (
+                        self.integrator._population_step_scope(
+                            stable=stable_intra_callbacks
+                            and self.device().type == "cpu"
+                        )
+                        if isinstance(self.integrator, Integrator)
+                        else nullcontext()
+                    ):
+                        for j in range(len(t_chunk)):
+                            ve_c = ve_list[j] if ve_list is not None else None
 
-                        if with_intra:
-                            s = [st[j] for st in stims]
-                            intra_c = self._call_make_intra(intra, s, indices)
-                        else:
-                            intra_c = None
+                            replay = (
+                                None
+                                if replay_tape is None
+                                else replay_tape.frame(draw_start + j)
+                            )
+                            if replay is not None and replay_banks:
+                                ve_c, intra_c = self._prepare_replayed_stimulation(
+                                    replay,
+                                    intra,
+                                    dt_f,
+                                    extra_cfg,
+                                    ve=ve_c,
+                                    current=None
+                                    if input_intra_chunk is None
+                                    else input_intra_chunk[j],
+                                )
+                            elif with_intra:
+                                s = [st[j] for st in stims]
+                                if fuse_intra and (
+                                    stable_intra_callbacks
+                                    or (
+                                        _intra_fusion_callbacks_safe(callbacks)
+                                        and _runtime_plain_step_inputs((s, indices))
+                                        and self._can_fuse_intra_step(intra)
+                                    )
+                                ):
+                                    intra_c = _DeferredIntra(
+                                        intra,
+                                        (
+                                            _IndexedCurrentSamples(
+                                                indexed_tapes, indexed_steps[j]
+                                            )
+                                            if indexed_steps is not None
+                                            and not torch.is_grad_enabled()
+                                            and (
+                                                stable_intra_callbacks
+                                                or _population_runtime_modes_plain()
+                                            )
+                                            else s
+                                        ),
+                                        intra._prepare_assembly(
+                                            s, indices, backend=self.backend
+                                        ),
+                                    )
+                                else:
+                                    intra_c = self._call_make_intra(intra, s, indices)
+                            else:
+                                intra_c = (
+                                    None
+                                    if input_intra_chunk is None
+                                    else input_intra_chunk[j]
+                                )
 
-                        pre_step_hook(callbacks, self)
-                        self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
-                        self.t = self.t + dt_tensor
-                        psh(callbacks, self)
+                            pre_step_hook(callbacks, self)
+                            if skip_empty_noise:
+                                intra_c = _NoiseFreeStep(intra_c)
+                            with nullcontext() if replay is None else replay.scope():
+                                self._step(
+                                    self.integrator, self, dt_tensor, ve_c, intra_c
+                                )
+                            if replay is not None:
+                                replay.publish()
+                            self.t = self.t + dt_tensor
+                            if observer is not None:
+                                observed_state, emitted = observer.update(
+                                    observed_state
+                                )
+                                if emitted is not None:
+                                    observed_emissions.append(emitted)
+                            psh(callbacks, self)
 
+                    if observer is not None:
+                        observer.collect(
+                            observed_state,
+                            observed_parts,
+                            observer.stack(observed_emissions),
+                            steps=len(t_chunk),
+                        )
                     post_chunk_hook(callbacks, self, t_chunk)
 
                     if progressbar:
@@ -3647,22 +5033,37 @@ class Population(P, Sliceable):
 
                 if progressbar:
                     progressbar.close()
+                if observer is not None:
+                    return observer.finish(observed_state, observed_parts)
 
     def steady_state(self, dt=0.2, tstop=200.0, with_ve=True, with_intra=True):
-        """
-        Run the model until it reaches a steady state and cache the result.
+        """Relax the model for a fixed duration and cache its resulting state.
 
         Parameters
         ----------
-        dt : float, optional
-            Time step size in milliseconds. Default is 0.2 ms.
-        t : float, optional
-            Time in milliseconds to run the simulation. Default is 200 ms.
+        dt : float, default 0.2
+            Positive integration timestep in milliseconds.
+        tstop : float, default 200.0
+            Relaxation duration in milliseconds. Executes ``int(tstop / dt)`` steps.
+        with_ve : bool, default True
+            Supply an explicit zero extracellular-voltage tensor to the solver.
+            If False, pass no explicit extracellular drive.
+        with_intra : bool, default True
+            Supply an explicit zero intracellular-current tensor to the solver.
+            If False, pass no explicit intracellular drive.
+
+        Returns
+        -------
+        Population
+            This population, with its clock reset to zero and its state cached for
+            subsequent :meth:`initialize` calls.
 
         Notes
         -----
-        This method clears any previous steady state cache before creating a new one.
-        The steady state can be restored later by calling model.initialize().
+        This is fixed-duration relaxation under ``torch.no_grad()``, not a
+        convergence test. It clears an earlier steady-state cache and initializes
+        before integrating. The explicit drives above do not evaluate solver-level
+        Slice injections. Mechanism-owned dynamics and injections still run.
         """
 
         dt_f = _validate_time_scalar(dt, name="dt", positive=True)
@@ -3770,24 +5171,26 @@ class Population(P, Sliceable):
         self.populate()
 
     def _has_random_parameters_resampled_on_initialize(self):
-        """Return True if this population or any mechanism redraws on initialize."""
+        """Return True if this population or any inserted owner redraws."""
 
         if any(spec.resample_on_initialize for spec in self.random_parameters.values()):
             return True
         mech_handler = getattr(self, "mech", None)
         if mech_handler is None:
             return False
-        for mech in getattr(mech_handler, "mechanisms", {}).values():
-            if any(
-                spec.resample_on_initialize for spec in mech.random_parameters.values()
-            ):
-                return True
-            for state_module in getattr(mech, "DE", {}).values():
+        for collection_name in ("mechanisms", "material_processes"):
+            for mech in getattr(mech_handler, collection_name, {}).values():
                 if any(
                     spec.resample_on_initialize
-                    for spec in state_module.random_parameters.values()
+                    for spec in mech.random_parameters.values()
                 ):
                     return True
+                for state_module in getattr(mech, "DE", {}).values():
+                    if any(
+                        spec.resample_on_initialize
+                        for spec in state_module.random_parameters.values()
+                    ):
+                        return True
         return False
 
     def resample_random_parameters(self, *names, force: bool = True):
@@ -3828,12 +5231,19 @@ class Population(P, Sliceable):
     def _restore_steady_state(self):
         if "_steady_state" in self._caches:
             self.restore("_steady_state")
-            # ``restore`` marks ordinary named-cache restores usable. A
-            # steady-state initialization still replays permissive legacy post
-            # hooks, so keep this transition fail-closed until every hook
-            # succeeds. Structured transforms are fresh-initialization work:
-            # every declared write is already present in the restored snapshot.
+            # ``restore`` marks ordinary named-cache restores usable. Keep
+            # steady-state initialization fail-closed until detachment and
+            # every permissive legacy post hook have completed successfully.
             self.initialized = False
+            # Cached materializations belong to the detached warm-up boundary.
+            # A no-grad state-dict copy can otherwise retain the destination's
+            # old graph after its saved tensors have been overwritten.
+            self.detach()
+            # Cached effective values are intentional initialization inputs,
+            # rather than an explicit request for a fresh training segment.
+            self._detached_materializations_pending = False
+            # Structured transforms are fresh-initialization work:
+            # every declared write is already present in the restored snapshot.
             self._restoring_steady_state = True
             try:
                 self.post_initialize()
@@ -3851,21 +5261,44 @@ class Population(P, Sliceable):
         """Refresh subclass-owned derived parameter views before state setup."""
         return None
 
-    def initialize(self, force_rebuild=False, populate_parameter_buffers=True):
-        """
-        Build, populate, and initialize mechanisms for simulation.
+    def initialize(
+        self, force_rebuild=False, populate_parameter_buffers=True, *, draws=None
+    ):
+        """Build, populate, and initialize mechanisms for simulation.
 
         Parameters
         ----------
         force_rebuild : bool, optional
             If True, force rebuilding of mechanisms even if a built graph
             already exists.
+        populate_parameter_buffers : bool, default True
+            Materialize parameter buffers before fresh initialization. Cached
+            restoration follows its own parameter and RNG policy.
+        draws : dendra.func.InitializationDraws, optional
+            Replay explicit initialization draws on a compatible initialized
+            population. Capture a packet with
+            ``dn.func.sample_initialization_draws(population)``. Explicit replay
+            does not support forced rebuilding.
 
         Returns
         -------
         Population
             The initialized population instance.
         """
+        if draws is not None:
+            from dendra.func._native_initialization_draws import initialize_native
+
+            return initialize_native(
+                self,
+                draws=draws,
+                options={
+                    "force_rebuild": force_rebuild,
+                    "populate_parameter_buffers": populate_parameter_buffers,
+                },
+            )
+        boundary = vars(self).get("_native_initialization_boundary")
+        if boundary is not None:
+            boundary.begin()
         # Initialization is a state transition, not a best-effort refresh.  If
         # any build/population/hook phase fails, callers must repair and retry
         # instead of stepping a partially reset model advertised as initialized.
@@ -3890,6 +5323,9 @@ class Population(P, Sliceable):
         # not reset voltage, repopulate parameters, advance RNG streams, or run
         # pre-initialization hooks/Mechanism INITIAL blocks before restoring it.
         if self._restore_steady_state():
+            boundary = vars(self).get("_native_initialization_boundary")
+            if boundary is not None:
+                boundary.finish(cached=True)
             return self
 
         # Fresh initialization starts with a zero population clock and a
@@ -3927,14 +5363,19 @@ class Population(P, Sliceable):
         # were unchanged. Rebuild timestep-dependent solver workspaces before
         # the next step in every case.
         self.integrator.initialized = False
+        if populate_parameter_buffers:
+            self._detached_materializations_pending = False
+        boundary = vars(self).get("_native_initialization_boundary")
+        if boundary is not None:
+            boundary.finish(cached=False)
         return self
 
-    def initialize_(self):
+    def initialize_(self, *args, **kwargs):
         """
         "In-place" alias of :meth:`initialize`. Same as :meth:`initialize`, but
         does not return self.
         """
-        self.initialize()
+        self.initialize(*args, **kwargs)
 
     def load(self, state_dict):
         """
@@ -4197,7 +5638,7 @@ class Population(P, Sliceable):
                 inj for inj, ok in zip(self.injections, accepted) if not ok
             ]
             if solver_injections:
-                return Intra(self, solver_injections)
+                return Intra(self, solver_injections).train(self.training)
         return None
 
     def _invalidate_mechanism_structure(self):
@@ -4355,11 +5796,11 @@ class Population(P, Sliceable):
             if alias is None:
                 if mechanism in self._mech_everywhere:
                     raise ValueError(
-                        f"Mechanism {mechanism} is already inserted everywhere."
+                        f"Mechanism {mechanism.__name__} is already inserted everywhere."
                     )
                 if self._mech_data.get(mechanism):
                     raise ValueError(
-                        f"Mechanism {mechanism} already has region-restricted "
+                        f"Mechanism {mechanism.__name__} already has region-restricted "
                         "insertions and cannot also be inserted everywhere."
                     )
                 self._mech_everywhere[mechanism] = (mechanism.__name__, ic, kwargs)
@@ -4372,14 +5813,16 @@ class Population(P, Sliceable):
             )
 
         if mechanism in self._mech_everywhere:
-            raise ValueError(f"Mechanism {mechanism} is already inserted everywhere.")
+            raise ValueError(
+                f"Mechanism {mechanism.__name__} is already inserted everywhere."
+            )
         existing_ic = self._mech_data_ic.get(mechanism)
         if ic is not None:
             if existing_ic is not None and not _configuration_values_equal(
                 existing_ic, ic
             ):
                 raise ValueError(
-                    f"Mechanism {mechanism} already has different class-wide "
+                    f"Mechanism {mechanism.__name__} already has different class-wide "
                     "initial conditions for another insertion region."
                 )
 
@@ -4395,7 +5838,7 @@ class Population(P, Sliceable):
                 planned_base_kwargs[name], value
             ):
                 raise ValueError(
-                    f"Mechanism {mechanism} already has a different class-wide "
+                    f"Mechanism {mechanism.__name__} already has a different class-wide "
                     f"GLOBAL value for {name!r}."
                 )
             planned_base_kwargs[name] = value
@@ -5149,6 +6592,13 @@ class Population(P, Sliceable):
                 self._material_source, getattr(mech, "_source_material", {})
             )
         else:
+            # Canonical process declarations are their shared-field manifest;
+            # they deliberately do not use voltage-local USEMATERIAL. Register
+            # that manifest before constructing material/ion containers, so a
+            # process can be the sole user of an ion or registered material.
+            process_fields = _canonical_material_process_fields(mech)
+            register_material_fields(self._material_process_read, process_fields)
+            register_material_fields(self._material_process_write, process_fields)
             register_material_fields(
                 self._material_process_read, getattr(mech, "_read_material", {})
             )
@@ -5287,6 +6737,23 @@ class Population(P, Sliceable):
         """
         self.build()
         return super().to(*args, **kwargs)
+
+    def bind_input(self, target, source):
+        """Route a declared State INPUT from another mechanism in this Population.
+
+        ``target`` has form ``mechanism.DE.State.input``. ``source`` names a
+        declared state, carry, saved current, or parameter tensor as
+        ``mechanism.field`` or ``mechanism.DE.State.field``. Bindings read the
+        source when the consumer advances, preserving mechanism execution
+        order. Initialization uses the INPUT declaration's scalar default.
+        """
+        binding = InputBinding(target, source)
+        bindings = tuple(item for item in self._input_bindings if item.target != target)
+        bindings += (binding,)
+        if self.is_built and not self._flag_rebuild:
+            self.mech.configure_input_bindings(bindings)
+        self._input_bindings = bindings
+        return self
 
     def build(self, force_rebuild=False):
         """
@@ -5502,6 +6969,7 @@ class Population(P, Sliceable):
                 source_material=self._material_source,
                 currents=self._m_curr,
                 population=self,
+                input_bindings=self._input_bindings,
             )
 
             for m in mech.mechanisms.values():
@@ -5541,7 +7009,19 @@ class Population(P, Sliceable):
 
     def detach(self):
         """
-        Detach parameters and buffers from the autograd graph.
+        Truncate simulation history while retaining state values and raw sources.
+
+        The next positive-step, gradient-enabled training call rebuilds effective
+        parameter, derived and solver graphs from the current raw sources.
+        Retained RAND draws are replayed without resampling; NOISE stays detached.
+        Evaluation, no-grad, inference-mode and zero-step calls defer that refresh.
+        Clocks and recurrent state are not reset. Raw parameter objects and
+        externally computed nonleaf source graphs remain caller-owned.
+
+        Reconnecting trainable reparameterized RAND values requires retained
+        explicit draws from a pure distribution draw_sampler/transform contract.
+        Callback history is separate; detach its returned carry through the
+        owning callback collection when continuing observations.
 
         Returns
         -------
@@ -5557,6 +7037,7 @@ class Population(P, Sliceable):
             and self._unversioned_integrator_workspace_values_match(workspace_signature)
         )
         self.integrator.detach(self)
+        self._detached_materializations_pending = True
         if workspace_was_valid:
             # Detach is value preserving but rebinds tensors, so rebase only a
             # workspace that was coherent before the operation. Never bless a
@@ -5986,7 +7467,15 @@ class Population(P, Sliceable):
                 "rng_state": _clone_nested_state(rng.rng_state(), detach_tensors=True),
             }
 
-        return {"buffers": buffers, "rng_states": rng_states}
+        result = {"buffers": buffers, "rng_states": rng_states}
+        poisson = poisson_state_dict_for_checkpoint(self)
+        if poisson["modules"]:
+            result["poisson"] = poisson
+        if self.random_parameters:
+            result["random_parameter_state"] = (
+                self._random_parameter_state_for_checkpoint()
+            )
+        return result
 
     def _prepare_stochastic_state_from_checkpoint(self, state_dict):
         """Validate and normalize Population stochastic checkpoint state."""
@@ -6045,24 +7534,31 @@ class Population(P, Sliceable):
                     f"Invalid Population stochastic RNG payload {name!r}: {error}"
                 ) from error
 
-        return prepared_buffers, prepared_rng_states
+        provenance = self._prepare_random_parameter_state(
+            state_dict.get("random_parameter_state")
+        )
+        poisson = prepare_poisson_state_from_checkpoint(self, state_dict.get("poisson"))
+        return prepared_buffers, prepared_rng_states, provenance, poisson
 
     def _apply_prepared_stochastic_state(self, prepared_state):
         """Apply state returned by
         :meth:`_prepare_stochastic_state_from_checkpoint`.
         """
 
-        buffers, rng_states = prepared_state
+        buffers, rng_states, provenance, poisson = prepared_state
         for name, restored in buffers.items():
             setattr(self, name, restored)
         for name, (base_seed, rng_state) in rng_states.items():
             rng = getattr(self, name)
-            if base_seed is None:
-                # Early checkpoint payloads stored only the raw device-state
-                # mapping. Preserve the target's constructor seed for reset_rng().
-                rng.set_rng_state(rng_state)
-            else:
-                rng.set_extra_state({"base_seed": base_seed, "rng_state": rng_state})
+            rng.restore_rng_checkpoint(
+                rng_state
+                if base_seed is None
+                else {"base_seed": base_seed, "rng_state": rng_state},
+                policy="checkpoint",
+                allow_legacy=True,
+            )
+        self._apply_random_parameter_state(provenance)
+        apply_prepared_poisson_state(poisson)
 
     def _restore_stochastic_state_from_checkpoint(self, state_dict):
         """Restore a Population stochastic checkpoint payload."""
@@ -6200,11 +7696,15 @@ class Population(P, Sliceable):
             State dictionary containing model parameters and buffers.
         """
         previous = self.state_dict_for_checkpoint()
+        rng_lifecycle = _snapshot_rng_lifecycle(self)
+        poisson_lifecycle = snapshot_poisson_rng_lifecycle(self)
         try:
             self._restore_dict_from_checkpoint_unchecked(state_dict)
         except Exception:
             try:
+                _restore_rng_lifecycle(rng_lifecycle)
                 self._restore_dict_from_checkpoint_unchecked(previous)
+                restore_poisson_rng_lifecycle(poisson_lifecycle)
             except Exception as rollback_error:
                 raise RuntimeError(
                     "Population checkpoint restore failed and rollback could not "
@@ -6215,16 +7715,21 @@ class Population(P, Sliceable):
 
     def longrun_checkpointed(
         self,
-        tstop: float,
-        chunklength: int,
+        tstop: float = None,
+        chunklength: int = None,
         dt: float = None,
         extra: Optional[ExtraSpec] = None,
         callbacks: Optional[Sequence[Callback]] = None,
         progressbar=False,
         *,
+        steps=None,
+        duration=None,
+        inputs=None,
+        draws=None,
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
+        callback_state=None,
         functional_callbacks=None,
         functional_callback_state=None,
     ):
@@ -6243,17 +7748,40 @@ class Population(P, Sliceable):
             Simulation duration in milliseconds to advance from the current
             model time ``self.t``. This uses the same cumulative complete-step
             budget and retained physical-duration semantics as :meth:`longrun`.
+        steps : int, optional
+            Exact non-negative step count, preserving fractional-duration carry.
+            Mutually exclusive with ``duration`` and ``tstop``.
+        duration : float, optional
+            Non-negative elapsed milliseconds, using the same physical-duration
+            budget as ``tstop``. Supply exactly one horizon argument.
         chunklength : int
             Number of time steps per checkpointed chunk.
         dt : float, optional
             Time step size in milliseconds. If None, uses the global default
             ``A.dt``.
+        inputs : dendra.func.Inputs, optional
+            Strict time-first voltage/current tapes matching accepted steps.
+            Checkpoint recomputation reuses each chunk's original input slices,
+            preserving gradients to their caller-owned sources. Omitted fields
+            retain registered stimulation; duplicate drive sources are rejected.
+        draws : dendra.func.RuntimeDraws, optional
+            Time-leading explicit draws and RNG boundaries matching accepted steps.
+            Checkpoint recomputation reuses the original step recipes without
+            sampling again. Keep tape tensors unchanged until backward completes.
+            Checkpointed training requires mutation counters; clone inference
+            tensors outside ``torch.inference_mode()`` before passing them here.
+            Omission retains automatic sampling and its bank preparation cadence.
         extra : ExtraSpec, optional
             Extracellular configuration with the same ``(ve_s, time)`` shape
             and trailing-first broadcasting contract as :meth:`longrun`.
-        callbacks : Sequence[Callback] or CallbackList, optional
-            Sequence of callback hooks to run at various points during the simulation.
-            See :class:`Callback` for details.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this Population or a compatible
+            initialized Population. Requested ``dt`` must honor prepared Recorder
+            cadence and threshold timing. Pure observations read this receiver's
+            state with fixed prepared selections. They run after clock advancement
+            and before native post-step hooks. Native hooks retain their
+            loop/chunk/step timing.
         progressbar : bool, optional
             If True, display a progress bar during the run. Default is False.
         safe_checkpoint : bool, optional
@@ -6270,13 +7798,17 @@ class Population(P, Sliceable):
             If True, return a tuple (loss, final_state) where final_state is a
             checkpoint state dictionary suitable for restore_dict_from_checkpoint.
             Default is False.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
         functional_callbacks : dendra.func.FunctionalCallbacks, optional
-            Native pure callback plan made from a FunctionalPopulation bound to
-            this exact source model. It runs beside, and does not replace, the
-            imperative hooks in ``callbacks``.
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
         functional_callback_state : dendra.func.FunctionalCallbackState, optional
-            Explicit carry returned by a previous native callback execution.
-            Requires ``functional_callbacks`` and resumes without reinitializing.
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
@@ -6284,7 +7816,7 @@ class Population(P, Sliceable):
             If return_final_state is False (default): returns the total loss contribution
             from callbacks, or None if no hook returned a non-None value.
             If return_final_state is True: returns (loss_or_none, final_state_dict).
-            When ``functional_callbacks`` is supplied, its result is appended:
+            With a prepared pure collection, its result is appended:
             ``(loss_or_none, callback_results)`` or
             ``(loss_or_none, final_state_dict, callback_results)``.
 
@@ -6320,24 +7852,13 @@ class Population(P, Sliceable):
         """
         if not self.initialized:
             raise ValueError("Model must be initialized before running.")
-        if functional_callbacks is None:
-            if functional_callback_state is not None:
-                raise ValueError(
-                    "functional_callback_state requires functional_callbacks"
-                )
-            functional_callback_binding = None
-        else:
-            from dendra.func._callbacks import (
-                FunctionalCallbackResults,
-                FunctionalCallbacks,
-            )
-
-            if not isinstance(functional_callbacks, FunctionalCallbacks):
-                raise TypeError(
-                    "functional_callbacks must be a FunctionalCallbacks plan "
-                    "created by functional.make_callbacks(...)"
-                )
-            functional_callback_binding = functional_callbacks._bind_imperative(self)
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
+        )
         self._validate_runtime_contracts(
             workspace_rebuild_pending=self._runtime_workspace_rebuild_pending()
         )
@@ -6348,10 +7869,24 @@ class Population(P, Sliceable):
         dt_f = _validate_time_scalar(
             A.dt if dt is None else dt, name="dt", positive=True
         )
-        if functional_callback_binding is not None:
-            functional_callbacks._validate_runtime_dt(dt_f)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        if observer is not None:
+            observer.validate_dt(dt_f)
+        requested_steps, requested_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
+        n_steps, duration_remainder = execution_step_budget(
+            requested_steps, requested_duration, dt_f, self._duration_budget
+        )
+        replay_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import (
+                bind_population_runtime_draw_tape,
+            )
+
+            replay_tape = bind_population_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra, dt=dt_f, checkpointed=True
+            )
+
         self._refresh_compile_config_from_ctx()
 
         # Match step()/run(): injections registered after initialization
@@ -6360,6 +7895,20 @@ class Population(P, Sliceable):
             self.intra = self.build_intra()
         intra = self.intra
         with_intra = intra is not None
+
+        input_ve = input_intra = None
+        if inputs is not None:
+            packet = native_input_sources(inputs, extra=extra)
+            with torch.set_grad_enabled(self.training):
+                input_ve, input_intra, _ = self._normalize_runtime_inputs(
+                    packet, steps=n_steps
+                )
+            if input_intra is not None and with_intra:
+                raise ValueError(
+                    "explicit intra cannot be combined with registered intracellular stimulation"
+                )
+
+        replay_banks = replay_tape is not None and replay_tape.plan.has_bank_poisson
 
         # dt scalars
         dt_tensor = torch.tensor(dt_f, device=self.device(), dtype=self.dtype())
@@ -6370,7 +7919,7 @@ class Population(P, Sliceable):
 
         if callbacks:
             for c in callbacks:
-                c.dt = dt_f
+                _bind_callback_dt(c, dt_f)
 
         def _as_loss_tensor(x):
             if x is None:
@@ -6397,77 +7946,17 @@ class Population(P, Sliceable):
             """
             return _clone_nested_state(sd)
 
-        def _copy_state_containers(sd: Dict[str, Any]) -> Dict[str, Any]:
-            """
-            Copy only nested containers (not tensors) so checkpoint replay can
-            restore the captured live bindings after mutating the module.
-            """
-
-            def _copy(value):
-                if isinstance(value, Mapping):
-                    return {key: _copy(item) for key, item in value.items()}
-                if isinstance(value, list):
-                    return [_copy(item) for item in value]
-                if isinstance(value, tuple):
-                    return tuple(_copy(item) for item in value)
-                return value
-
-            return _copy(sd)
-
-        class _PreserveModelStateDuringRecompute:
-            """Reusable context for first- and higher-order checkpoint replay."""
-
-            def __init__(context_self):
-                context_self._previous = []
-
-            def __enter__(context_self):
-                context_self._previous.append(
-                    _copy_state_containers(self.state_dict_for_checkpoint())
-                )
-                return None
-
-            def __exit__(context_self, exc_type, exc_value, traceback):
-                previous = context_self._previous.pop()
-                self.restore_dict_from_checkpoint(previous)
-                return False
-
         def _checkpoint_contexts():
-            return nullcontext(), _PreserveModelStateDuringRecompute()
-
-        def _prepare_functional_callback_state():
-            """Establish explicit native carry and the optional initial sample."""
-
-            if functional_callback_binding is None:
-                return None, []
-            if functional_callback_state is None:
-                native_state, initial_emission = functional_callbacks._initialize(
-                    functional_callback_binding.state()
-                )
-                initial_part = functional_callbacks._stack([initial_emission])
-                parts = (
-                    [initial_part]
-                    if functional_callbacks._has_emissions(initial_part)
-                    else []
-                )
-                return native_state, parts
-            return functional_callbacks._validate_state(functional_callback_state), []
-
-        def _finalize_functional_callback_results(native_state, parts):
-            """Finalize one imperative execution segment without hiding carry."""
-
-            stacked = functional_callbacks._concatenate(parts)
-            native_state = functional_callbacks._capture_emission_schemas(
-                native_state,
-                stacked,
-            )
-            outputs = functional_callbacks._finalize(native_state, stacked)
-            native_state = functional_callbacks._materialize_state(native_state)
-            return FunctionalCallbackResults(
-                state=native_state,
-                outputs=outputs,
+            return (
+                _checkpoint_recompute_contexts(self)
+                if replay_tape is None
+                else replay_tape.checkpoint_contexts()
             )
 
-        with torch.nn.utils.parametrize.cached():
+        with (
+            _native_callback_storage(observer) as observer,
+            torch.nn.utils.parametrize.cached(),
+        ):
             with torch.set_grad_enabled(self.training):
                 # --------------------------------------------------------------
                 # Global time grid and chunking
@@ -6477,13 +7966,14 @@ class Population(P, Sliceable):
                 ).to(self.dtype())
 
                 if t.numel() == 0:
-                    self._set_duration_remainder(duration_remainder)
-                    if functional_callback_binding is None:
+                    if duration_remainder is not None:
+                        self._set_duration_remainder(duration_remainder)
+                    if observer is None:
                         if return_final_state:
                             return None, self.state_dict_for_checkpoint()
                         return None
-                    native_state, callback_parts = _prepare_functional_callback_state()
-                    functional_results = _finalize_functional_callback_results(
+                    native_state, callback_parts = observer.start()
+                    functional_results = observer.finish(
                         native_state,
                         callback_parts,
                     )
@@ -6495,6 +7985,7 @@ class Population(P, Sliceable):
                         )
                     return None, functional_results
 
+                self._refresh_detached_materializations()
                 n_chunks = math.ceil(len(t) / chunklength)
                 t_chunks = torch.tensor_split(t, n_chunks)
 
@@ -6515,7 +8006,8 @@ class Population(P, Sliceable):
                     compile_scope="population",
                 )
 
-                native_state, callback_parts = _prepare_functional_callback_state()
+                if observer is not None:
+                    native_state, callback_parts = observer.start()
 
                 if progressbar:
                     progressbar = tqdm(total=n_chunks, desc=f"{self.t.item():.1f} ms")
@@ -6523,7 +8015,8 @@ class Population(P, Sliceable):
                 # Commit before the first checkpoint boundary is captured so
                 # forward replay and backward restoration observe one coherent
                 # duration budget.
-                self._set_duration_remainder(duration_remainder)
+                if duration_remainder is not None:
+                    self._set_duration_remainder(duration_remainder)
                 # Capture boundary state after initialization
                 state = self.state_dict_for_checkpoint()
 
@@ -6542,13 +8035,36 @@ class Population(P, Sliceable):
                 # --------------------------------------------------------------
                 # Main chunk loop (checkpointed)
                 # --------------------------------------------------------------
+                input_start = 0
                 for i, t_chunk in enumerate(t_chunks):
+                    draw_start = input_start
                     chunk_idx = int(i)
                     t_chunk_local = t_chunk
+                    input_stop = input_start + len(t_chunk)
+                    input_ve_chunk = (
+                        None if input_ve is None else input_ve[input_start:input_stop]
+                    )
+                    input_intra_chunk = (
+                        None
+                        if input_intra is None
+                        else input_intra[input_start:input_stop]
+                    )
+                    input_start = input_stop
+                    checkpoint_inputs = (
+                        () if inputs is None else (input_ve_chunk, input_intra_chunk)
+                    )
 
                     def _run_chunk(
-                        state_in, t_chunk_local=t_chunk_local, chunk_idx=chunk_idx
+                        state_in,
+                        input_ve_chunk=None,
+                        input_intra_chunk=None,
+                        *,
+                        t_chunk_local=t_chunk_local,
+                        chunk_idx=chunk_idx,
+                        draw_start=draw_start,
                     ):
+                        if replay_tape is not None:
+                            replay_tape.validate_fresh()
                         # IMPORTANT: torch.utils.checkpoint forbids in-place mutation of
                         # checkpoint *inputs*. If out-of-place stepping is guaranteed,
                         # we can safely reuse the boundary tensors. Otherwise, clone.
@@ -6561,7 +8077,9 @@ class Population(P, Sliceable):
                         # Restore model state at chunk boundary
                         self.restore_dict_from_checkpoint(state_local)
 
-                        if with_intra:
+                        if replay_tape is None:
+                            reconcile_extra_poisson_rng(self, extra)
+                        if with_intra and not replay_banks:
                             stims, indices = intra.init(t_chunk_local)
                             # Waveform output always carries time on its last
                             # axis; leading axes are population batch/sweep axes.
@@ -6569,12 +8087,14 @@ class Population(P, Sliceable):
                         else:
                             stims, indices = None, None
 
-                        if with_extra:
+                        if with_extra and (
+                            not replay_banks or not extra_cfg.functional
+                        ):
                             ve_list = self._compute_extra_chunk(
                                 extra_cfg, chunk_idx, t_chunk_local
                             )
                         else:
-                            ve_list = None
+                            ve_list = input_ve_chunk
 
                         pre_chunk_hook(callbacks, self, t_chunk_local)
 
@@ -6584,13 +8104,38 @@ class Population(P, Sliceable):
                         for j in range(len(t_chunk_local)):
                             ve_c = ve_list[j] if ve_list is not None else None
 
-                            if with_intra:
+                            replay = (
+                                None
+                                if replay_tape is None
+                                else replay_tape.frame(draw_start + j)
+                            )
+                            if replay is not None and replay_banks:
+                                ve_c, intra_c = self._prepare_replayed_stimulation(
+                                    replay,
+                                    intra,
+                                    dt_f,
+                                    extra_cfg,
+                                    ve=ve_c,
+                                    current=None
+                                    if input_intra_chunk is None
+                                    else input_intra_chunk[j],
+                                )
+                            elif with_intra:
                                 s = [st[j] for st in stims]
                                 intra_c = self._call_make_intra(intra, s, indices)
                             else:
-                                intra_c = None
+                                intra_c = (
+                                    None
+                                    if input_intra_chunk is None
+                                    else input_intra_chunk[j]
+                                )
 
-                            self._step(self.integrator, self, dt_tensor, ve_c, intra_c)
+                            with nullcontext() if replay is None else replay.scope():
+                                self._step(
+                                    self.integrator, self, dt_tensor, ve_c, intra_c
+                                )
+                            if replay is not None:
+                                replay.publish()
                             self.t = self.t + dt_tensor
 
                             # Replay-safe post-step callbacks (may contribute loss)
@@ -6630,10 +8175,11 @@ class Population(P, Sliceable):
 
                         return state_out, chunk_loss, saw_loss_flag
 
-                    if functional_callback_binding is None:
+                    if observer is None:
                         state, chunk_loss, saw_loss_flag = _checkpoint(
                             _run_chunk,
                             state,
+                            *checkpoint_inputs,
                             **checkpoint_options,
                         )
                     else:
@@ -6641,9 +8187,15 @@ class Population(P, Sliceable):
                         def _run_chunk_functional(
                             state_in,
                             native_state_in,
+                            input_ve_chunk=None,
+                            input_intra_chunk=None,
+                            *,
                             t_chunk_local=t_chunk_local,
                             chunk_idx=chunk_idx,
+                            draw_start=draw_start,
                         ):
+                            if replay_tape is not None:
+                                replay_tape.validate_fresh()
                             # Functional callback carry is an explicit checkpoint
                             # input/output. The model boundary follows the same
                             # mutation-safety policy as the ordinary path.
@@ -6654,20 +8206,24 @@ class Population(P, Sliceable):
                             )
                             self.restore_dict_from_checkpoint(state_local)
 
-                            if with_intra:
+                            if replay_tape is None:
+                                reconcile_extra_poisson_rng(self, extra)
+                            if with_intra and not replay_banks:
                                 stims, indices = intra.init(t_chunk_local)
                                 stims = [s.unbind(-1) for s in stims]
                             else:
                                 stims, indices = None, None
 
-                            if with_extra:
+                            if with_extra and (
+                                not replay_banks or not extra_cfg.functional
+                            ):
                                 ve_list = self._compute_extra_chunk(
                                     extra_cfg,
                                     chunk_idx,
                                     t_chunk_local,
                                 )
                             else:
-                                ve_list = None
+                                ve_list = input_ve_chunk
 
                             pre_chunk_hook(callbacks, self, t_chunk_local)
 
@@ -6679,7 +8235,23 @@ class Population(P, Sliceable):
                             for j in range(len(t_chunk_local)):
                                 ve_c = ve_list[j] if ve_list is not None else None
 
-                                if with_intra:
+                                replay = (
+                                    None
+                                    if replay_tape is None
+                                    else replay_tape.frame(draw_start + j)
+                                )
+                                if replay is not None and replay_banks:
+                                    ve_c, intra_c = self._prepare_replayed_stimulation(
+                                        replay,
+                                        intra,
+                                        dt_f,
+                                        extra_cfg,
+                                        ve=ve_c,
+                                        current=None
+                                        if input_intra_chunk is None
+                                        else input_intra_chunk[j],
+                                    )
+                                elif with_intra:
                                     s = [st[j] for st in stims]
                                     intra_c = self._call_make_intra(
                                         intra,
@@ -6687,24 +8259,24 @@ class Population(P, Sliceable):
                                         indices,
                                     )
                                 else:
-                                    intra_c = None
+                                    intra_c = (
+                                        None
+                                        if input_intra_chunk is None
+                                        else input_intra_chunk[j]
+                                    )
 
-                                self._step(
-                                    self.integrator,
-                                    self,
-                                    dt_tensor,
-                                    ve_c,
-                                    intra_c,
-                                )
+                                with (
+                                    nullcontext() if replay is None else replay.scope()
+                                ):
+                                    self._step(
+                                        self.integrator, self, dt_tensor, ve_c, intra_c
+                                    )
+                                if replay is not None:
+                                    replay.publish()
                                 self.t = self.t + dt_tensor
 
-                                model_state = functional_callback_binding.state()
-                                native_state_local, emitted = (
-                                    functional_callbacks._update(
-                                        native_state_local,
-                                        model_state,
-                                        {"v": model_state["integrator"]["v"]},
-                                    )
+                                native_state_local, emitted = observer.update(
+                                    native_state_local
                                 )
                                 if emitted is not None:
                                     emissions.append(emitted)
@@ -6732,7 +8304,7 @@ class Population(P, Sliceable):
                                     saw_loss_local = saw_loss_local or saw
 
                             state_out = self.state_dict_for_checkpoint()
-                            emitted_part = functional_callbacks._stack(emissions)
+                            emitted_part = observer.stack(emissions)
 
                             if chunk_loss is None:
                                 chunk_loss = torch.zeros(
@@ -6765,10 +8337,16 @@ class Population(P, Sliceable):
                             _run_chunk_functional,
                             state,
                             native_state,
+                            *checkpoint_inputs,
                             **checkpoint_options,
                         )
-                        if functional_callbacks._has_emissions(emitted_part):
-                            callback_parts.append(emitted_part)
+                        observer.collect(
+                            native_state,
+                            callback_parts,
+                            emitted_part,
+                            steps=len(t_chunk),
+                        )
+                        del emitted_part
 
                     total_loss, _ = _add_loss(total_loss, chunk_loss)
                     saw_any_loss = saw_any_loss or bool(int(saw_loss_flag.item()))
@@ -6790,15 +8368,15 @@ class Population(P, Sliceable):
                     progressbar.close()
 
                 functional_results = None
-                if functional_callback_binding is not None:
-                    functional_results = _finalize_functional_callback_results(
+                if observer is not None:
+                    functional_results = observer.finish(
                         native_state,
                         callback_parts,
                     )
 
         if not saw_any_loss:
             total_loss = None
-            if functional_callback_binding is None:
+            if observer is None:
                 if return_final_state:
                     return None, self.state_dict_for_checkpoint()
                 return None
@@ -6807,7 +8385,7 @@ class Population(P, Sliceable):
         if return_final_state:
             final_state = self.state_dict_for_checkpoint()
 
-        if functional_callback_binding is not None:
+        if observer is not None:
             if return_final_state:
                 return total_loss, final_state, functional_results
             return total_loss, functional_results
@@ -7933,7 +9511,7 @@ class Cable(Population):
 
     _supports_native_cable_factory = True
 
-    _CANONICAL_RUNTIME_CONTRACT_TENSORS = (
+    _CANONICAL_GEOMETRY_TENSORS = (
         "diam",
         "dx",
         "rhoa",
@@ -7947,6 +9525,10 @@ class Cable(Population):
         "diff_parent_index",
         "_canonical_morphology_fingerprint",
         "_canonical_geometry_reference",
+    )
+
+    _CANONICAL_RUNTIME_CONTRACT_TENSORS = (
+        *_CANONICAL_GEOMETRY_TENSORS,
         "rhoa_scale",
     )
 
@@ -7966,6 +9548,37 @@ class Cable(Population):
         "area_scale",
         "rhoa_scale",
     )
+
+    def _install_parameter_buffers(self, values):
+        if (
+            not isinstance(values, dict)
+            or getattr(self, "_compartment_graph", None) is None
+        ):
+            return super()._install_parameter_buffers(values)
+        frozen = set()
+        for name, value in values.items():
+            if name not in Cable._CANONICAL_GEOMETRY_TENSORS:
+                continue
+            target = getattr(self, name)
+            if (
+                torch.is_tensor(value)
+                and value.shape == target.shape
+                and value.device == target.device
+                and value.dtype == target.dtype
+                and torch.equal(value, target)
+            ):
+                frozen.add(name)
+        if not frozen:
+            return super()._install_parameter_buffers(values)
+        # These fields describe the immutable morphology, rather than a new
+        # trainable workspace generation. Keeping their bindings also retains
+        # prepared callback and solver topology guards across continuation.
+        # Differing values retain the ordinary installer and canonical geometry
+        # validation, including bounded rhoa's cross-dtype reconstruction tolerance.
+        super()._install_parameter_buffers(
+            {name: value for name, value in values.items() if name not in frozen}
+        )
+        return values
 
     def __init__(self, N, C, graph=None, integrator=None, **kwargs):
         if graph is not None:
@@ -9081,20 +10694,46 @@ def _load_population_cache_transactionally(population, state_dict):
     if not isinstance(state_dict, Mapping):
         raise TypeError("Cached population state must be a mapping.")
 
-    live_state = population.state_dict()
-    prepared = dict(state_dict)
-    integrator = getattr(population, "integrator", None)
-    if integrator is not None:
-        prefix = "integrator."
-        # Inject current direct workspace buffers. Nested mechanism state
-        # (``integrator.mech.*``), including unexpected keys, remains part of
-        # the strict snapshot validation.
-        for name in integrator._buffers:
-            key = f"{prefix}{name}"
-            if key in live_state:
-                prepared[key] = live_state[key]
+    # Batched geometry can expose broadcast views, including mechanism areas.
+    # Own their storage before strict copying, preserving every registered
+    # identity alias and restoring the original objects if validation fails.
+    rebound, owned = [], {}
+    try:
+        for module in population.modules():
+            for field, value in module._buffers.items():
+                if (
+                    torch.is_tensor(value)
+                    and value.layout is torch.strided
+                    and any(
+                        size > 1 and stride == 0
+                        for size, stride in zip(value.shape, value.stride())
+                    )
+                ):
+                    if id(value) not in owned:
+                        owned[id(value)] = value.detach().clone(
+                            memory_format=torch.contiguous_format
+                        )
+                    rebound.append((module, field, value))
+                    module._buffers[field] = owned[id(value)]
 
-    result = _load_state_dict_transactionally(population, prepared, strict=True)
+        live_state = population.state_dict()
+        prepared = dict(state_dict)
+        integrator = getattr(population, "integrator", None)
+        if integrator is not None:
+            prefix = "integrator."
+            # Inject current direct workspace buffers. Nested mechanism state
+            # (``integrator.mech.*``), including unexpected keys, remains part of
+            # the strict snapshot validation.
+            for name in integrator._buffers:
+                key = f"{prefix}{name}"
+                if key in live_state:
+                    prepared[key] = live_state[key]
+
+        result = _load_state_dict_transactionally(population, prepared, strict=True)
+    except Exception:
+        for module, field, value in rebound:
+            module._buffers[field] = value
+        raise
     if integrator is not None:
         integrator.initialized = False
     return result
@@ -9114,6 +10753,51 @@ def _load_compatible_state_dict_transactionally(module, state_dict):
         )
     live_state = module.state_dict()
     matched, _ = _match_state_dict(live_state, state_dict)
+    for path, owner in module.named_modules(remove_duplicate=False):
+        if not isinstance(owner, P) or not owner.random_parameters:
+            continue
+        prefix = f"{path}." if path else ""
+        key = f"{prefix}_random_parameter_state"
+        if key not in matched:
+            continue
+        selected = {
+            name for name in owner.random_parameters if f"{prefix}{name}" in matched
+        }
+        if not selected:
+            # This metadata describes samples excluded by compatible loading.
+            # The owner's load hook retains provenance for its live samples.
+            matched.pop(key)
+            continue
+        incoming = matched[key]
+        labels = ("initialized", "draws", "parameters")
+        if not isinstance(incoming, dict) or not all(
+            isinstance(incoming.get(label), dict) for label in labels
+        ):
+            # Let the regular load hook report malformed matching metadata.
+            continue
+        # Ignore metadata belonging to actual source declarations omitted by
+        # compatibility filtering; unexplained metadata names remain invalid.
+        unknown = set().union(*(incoming[label] for label in labels)) - set(
+            owner.random_parameters
+        )
+        if any(f"{prefix}{name}" not in state_dict for name in unknown):
+            continue
+        retained = live_state[key]
+        compatible = dict(incoming)
+        for label in labels:
+            compatible[label] = {
+                **{
+                    name: value
+                    for name, value in retained[label].items()
+                    if name not in selected
+                },
+                **{
+                    name: incoming[label][name]
+                    for name in selected
+                    if name in incoming[label]
+                },
+            }
+        matched[key] = compatible
     _load_state_dict_transactionally(module, matched, strict=False)
 
 
@@ -9427,6 +11111,52 @@ class Myelinated(Axon):
 
 
 # callback helpers
+def _native_callback_arguments(
+    model, callbacks, callback_state, functional_callbacks, functional_callback_state
+):
+    """Resolve shared observation names without consuming native hook lists."""
+    if callbacks is not None:
+        # A prepared collection cannot exist before its defining class is
+        # loaded. Use that class identity without importing functional code
+        # or inspecting authored callback objects on the native-only path.
+        module = sys.modules.get("dendra.func._callbacks")
+        collection_type = (
+            None if module is None else vars(module).get("FunctionalCallbacks")
+        )
+        if collection_type is not None and issubclass(type(callbacks), collection_type):
+            if functional_callbacks is not None:
+                raise ValueError(
+                    "Provide either callbacks or functional_callbacks, not both."
+                )
+            functional_callbacks = callbacks
+            callbacks = None
+    if callback_state is not None:
+        if functional_callback_state is not None:
+            raise ValueError(
+                "Provide either callback_state or functional_callback_state, not both."
+            )
+        if functional_callbacks is None:
+            raise ValueError("callback_state requires a FunctionalCallbacks collection")
+        functional_callback_state = callback_state
+    return callbacks, _native_functional_callback_session(
+        model, functional_callbacks, functional_callback_state
+    )
+
+
+def _native_callback_storage(observer):
+    """Own optional host recording without importing on the ordinary path."""
+    return nullcontext() if observer is None else observer.recording()
+
+
+def _native_functional_callback_session(model, callbacks, callback_state):
+    """Bind optional pure observations without importing on the ordinary path."""
+    if callbacks is None and callback_state is None:
+        return None
+    from dendra.func._native_callbacks import _bind_native_callbacks
+
+    return _bind_native_callbacks(model, callbacks, callback_state)
+
+
 def pre_loop_hook(c, m):
     """
     Invoke the registered pre-loop hook on a callback list.
@@ -10318,3 +12048,13 @@ def passive_end_nodes_(
         root.register_parametrization("diam", diameter_override)
     elif diam is not None:
         ends.diam = diam
+
+
+# Capture once after definitions, rather than comparing with mutable class or
+# module attributes at eligibility time (which would authorize monkeypatches).
+_STANDARD_CALL_MAKE_INTRA = Population._call_make_intra
+_STANDARD_PREP_INTRA = Population.prep_intra
+_STANDARD_CAN_FUSE_INTRA_STEP = Population._can_fuse_intra_step
+_STANDARD_CAN_SKIP_RUNTIME_NOISE = Population._can_skip_runtime_noise_sampling
+_STANDARD_PRE_STEP_HOOK = pre_step_hook
+_STANDARD_POST_STEP_HOOK = post_step_hook

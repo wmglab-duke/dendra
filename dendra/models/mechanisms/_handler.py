@@ -1,13 +1,41 @@
 import copy
+import inspect
+import math
 from collections.abc import Mapping
 
 import torch
 import torch._dynamo as dynamo
 
+from dendra.helpers import MEMBRANE_ASSEMBLY
+
 from ..rng import _validate_rng_checkpoint_payload
+from ._inputs import InputBinding, _input_path
 from ._material_process import DiffusionProcess, MaterialProcess
+from ._material_stochasticity import (
+    retain_stochastic_material_workspace_once,
+    stage_stochastic_material_workspace,
+    stochastic_material_workspace_slots,
+)
 from ._materials import _canonical_material_name
 from ._mechanism import Mechanism, PointProcess, VoltageProcess
+from ._noise_workspaces import (
+    noise_workspace_slots,
+    reset_noise_workspace_timestep,
+    retain_noise_workspace_once,
+)
+from ._state import _is_unresolved_deferred_buffer
+from ._state_inventory import (
+    _capture_tensor_values,
+    _DelayedStateBoundary,
+    _MutableTensorPlan,
+    _StochasticStateBoundary,
+    checkpoint_module_blocks,
+)
+from ._state_slots import (
+    local_binding_groups,
+    material_local_buffer_names,
+    shared_field_slots,
+)
 from ._support import SupportKind
 from ._support_registry import SupportRegistry
 
@@ -68,17 +96,37 @@ _SUPPORT_ENTRY_PLAN_ATTRS = (
     "_map_exp_grouped",
     "_map_exp_ion_reads_grouped",
     "_map_exp_total_grouped",
+    "_membrane_map_grouped",
 )
 
 
-def _runtime_state_buffer_names(state):
-    """Return State buffers that are true mutable runtime carry."""
-    return tuple(getattr(state, "_carry", ()))
+def _prepare_mutable_tensor(candidate, live):
+    return candidate.to(device=live.device, dtype=live.dtype).clone()
 
 
-def _runtime_mechanism_carry_names(module):
-    """Return declared persistent Mechanism carry names."""
-    return tuple(getattr(module, "_carry", ()))
+def _ordinary_state_tensor(value):
+    return (
+        type(value) in (torch.Tensor, torch.nn.Parameter)
+        and value.layout == torch.strided
+        and value.device.type != "meta"
+        and not value.is_quantized
+    )
+
+
+def _capture_binding_tensor(value):
+    # Preserve uncommon tensor clone dispatch before any state validation.
+    return value if _ordinary_state_tensor(value) else value.clone()
+
+
+def _prepare_binding_token(candidate, live):
+    if (
+        _ordinary_state_tensor(candidate)
+        and _ordinary_state_tensor(live)
+        and candidate.device == live.device
+        and candidate.dtype == live.dtype
+    ):
+        return object()
+    return _prepare_mutable_tensor(candidate, live)
 
 
 def _support_spec(module):
@@ -176,6 +224,15 @@ def _capture_stochastic_state(states, prefix, module):
     for parameter_name in sorted(getattr(module, "random_parameters", {})):
         key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter.{parameter_name}"
         states[key] = getattr(module, parameter_name)
+    for suffix, owner, buffer_name in stochastic_material_workspace_slots(module):
+        key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}material_workspace.{suffix}"
+        states[key] = owner._buffers[buffer_name]
+    for suffix, owner, buffer_name in noise_workspace_slots(module):
+        key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}noise_workspace.{suffix}"
+        states[key] = owner._buffers[buffer_name]
+    if getattr(module, "random_parameters", {}):
+        key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter_state"
+        states[key] = module._random_parameter_state_for_checkpoint()
 
 
 def _integer_metadata(value, *, label, minimum=0):
@@ -477,6 +534,7 @@ class MechanismHandler(torch.nn.Module):
         source_material=None,
         currents=None,
         population=None,
+        input_bindings=(),
     ):
         super().__init__()
         self.mechanisms = torch.nn.ModuleDict()
@@ -550,6 +608,7 @@ class MechanismHandler(torch.nn.Module):
             process._bind_materials(self._get_material, population=population)
 
         self._validate_diffusion_process_overlaps()
+        self.configure_input_bindings(input_bindings)
 
         self._material_process_order = self._ordered_material_process_names()
 
@@ -562,6 +621,8 @@ class MechanismHandler(torch.nn.Module):
         self._current_assigned_plan = ()
         self._map_grouped = ()
         self._map_exp_grouped = ()
+        self._membrane_map_grouped = ()
+        self._membrane_map_supported = False
         self._ion_support_entries = ()
         self._ion_support_representatives = ()
         self._ion_support_ids = ()
@@ -664,6 +725,7 @@ class MechanismHandler(torch.nn.Module):
     def __setstate__(self, state):
         """Restore synchronization wrappers bound to the restored handler."""
 
+        state.setdefault("_input_bindings", ())
         for method_name in self._SYNC_METHODS:
             state.pop(method_name, None)
         super().__setstate__(state)
@@ -735,6 +797,214 @@ class MechanismHandler(torch.nn.Module):
             self.make_maps()
         return result
 
+    def configure_input_bindings(self, bindings):
+        """Validate immutable paths and compile consumer-local source indices.
+
+        Plans retain names and shapes only. Execution resolves the handler's
+        current registered modules, so deepcopy and functional tensor rebinding
+        cannot leave references to the original Population.
+        """
+        bindings = tuple(bindings)
+        plans = []
+        indices = []
+        targets = set()
+        for binding in bindings:
+            if not isinstance(binding, InputBinding):
+                raise TypeError("Input bindings must be InputBinding declarations.")
+            if binding.target in targets:
+                raise ValueError(f"Duplicate input binding target {binding.target!r}.")
+            targets.add(binding.target)
+            target_name, _, state_name, input_name = _input_path(
+                binding.target, target=True
+            )
+            source_parts = _input_path(binding.source)
+            source_name, field = source_parts[0], source_parts[-1]
+            source_state_name = source_parts[2] if len(source_parts) == 4 else None
+            if target_name not in self.mechanisms or source_name not in self.mechanisms:
+                raise ValueError(
+                    "Input binding sources and targets must name mechanisms in "
+                    f"the same Population: {binding.target!r} <- {binding.source!r}."
+                )
+            target = self.mechanisms[target_name]
+            source = self.mechanisms[source_name]
+            if (
+                state_name not in target.DE
+                or input_name not in target.DE[state_name]._inputs
+            ):
+                raise ValueError(
+                    f"Input binding target {binding.target!r} is not a declared State.INPUT."
+                )
+            if source_state_name is not None:
+                if source_state_name not in source.DE:
+                    raise ValueError(f"Unknown input source State {binding.source!r}.")
+                owner = source.DE[source_state_name]
+                if field in owner._state:
+                    # State variables are registered on their parent Mechanism.
+                    source_state_name = None
+                    owner = source
+            else:
+                owner = source
+            parameters = set(owner.all_parameter_names())
+            allowed = set(owner._carry) | parameters
+            if owner is source:
+                allowed.update(source._all_states)
+                allowed.update(source._saved_current_buffer_names)
+            if field not in allowed:
+                raise ValueError(
+                    f"Input binding source {binding.source!r} must name declared "
+                    "state, carry, saved-current, or parameter tensor storage."
+                )
+            if field in owner._carry_specs and owner._carry_specs[field][1] != "local":
+                raise ValueError(
+                    f"Input source {binding.source!r} requires local carry storage; "
+                    "structural and deferred carry have no physical support mapping."
+                )
+            if inspect.getattr_static(type(owner), field, None) is not None:
+                raise ValueError(
+                    f"Input source {binding.source!r} cannot use authored properties or callbacks."
+                )
+            if field in owner._buffers:
+                value = owner._buffers[field]
+            elif field in owner._parameters:
+                value = owner._parameters[field]
+            else:
+                raise ValueError(
+                    f"Input source {binding.source!r} must be registered Tensor storage."
+                )
+            if not torch.is_tensor(value):
+                raise TypeError(
+                    f"Input binding source {binding.source!r} is not a Tensor."
+                )
+            source_spec = source.support_map.spec
+            target_spec = target.support_map.spec
+            if source_spec.source_core_shape != target_spec.source_core_shape:
+                raise ValueError(
+                    "Input bindings require one common Population support domain."
+                )
+            missing_packed_keys = any(
+                not mechanism.support_map.spec.has_compact_identity
+                and (
+                    not getattr(mechanism, "_support_key_values_valid", True)
+                    or mechanism.key.device.type == "meta"
+                )
+                for mechanism in (source, target)
+            )
+            if missing_packed_keys:
+                if bindings == getattr(self, "_input_bindings", ()) and hasattr(
+                    self, "_input_binding_plan"
+                ):
+                    # Meta conversion and to_empty deliberately discard key
+                    # values. Preserve the established immutable routing plan
+                    # and relocated buffers until state loading restores the
+                    # selectors and reruns make_maps with real values.
+                    return
+                raise ValueError(
+                    "Cannot configure input bindings while packed support keys "
+                    "are unavailable; restore their state before rebinding."
+                )
+            source_slots = source_spec.materialized_flat_indices(
+                source.key, device="cpu"
+            )
+            target_slots = target_spec.materialized_flat_indices(
+                target.key, device="cpu"
+            )
+            if len(set(source_slots.tolist())) != source_slots.numel():
+                raise ValueError(
+                    f"Input source {source_name!r} has ambiguous duplicate support."
+                )
+            scalar = field in parameters and value.numel() == 1
+            positions = {
+                slot: position for position, slot in enumerate(source_slots.tolist())
+            }
+            if not scalar and any(
+                slot not in positions for slot in target_slots.tolist()
+            ):
+                raise ValueError(
+                    f"Input source {source_name!r} does not cover target support {target_name!r}."
+                )
+            index_name = f"_input_binding_index_{len(plans)}"
+            index = torch.tensor(
+                [] if scalar else [positions[slot] for slot in target_slots.tolist()],
+                dtype=torch.long,
+                device=self.celsius.device,
+            )
+            source_shape = (
+                tuple(source_spec.local_core_shape)
+                if source_spec.kind in (SupportKind.DENSE, SupportKind.RECTANGULAR)
+                or source_spec.preserves_population_axis
+                else (source_spec.slot_count,)
+            )
+            target_shape = (
+                tuple(target_spec.local_core_shape)
+                if target_spec.kind in (SupportKind.DENSE, SupportKind.RECTANGULAR)
+                or target_spec.preserves_population_axis
+                else (target_spec.slot_count,)
+            )
+            plans.append(
+                (
+                    target_name,
+                    state_name,
+                    input_name,
+                    source_name,
+                    source_state_name,
+                    field,
+                    index_name,
+                    source_shape,
+                    target_shape,
+                    scalar,
+                )
+            )
+            indices.append((index_name, index))
+        # Commit only after every binding validates, keeping failed rebinding
+        # transactional for an already initialized Population.
+        for name in tuple(self._buffers):
+            if name.startswith("_input_binding_index_"):
+                delattr(self, name)
+        for name, index in indices:
+            self.register_buffer(name, index, persistent=False)
+        self._input_bindings = bindings
+        self._input_binding_plan = tuple(plans)
+
+    def _resolve_state_inputs(self, mechanism_name):
+        """Gather current source values immediately before one consumer visit."""
+        result = {}
+        for (
+            target_name,
+            state_name,
+            input_name,
+            source_name,
+            source_state_name,
+            field,
+            index_name,
+            source_shape,
+            target_shape,
+            scalar,
+        ) in self._input_binding_plan:
+            if target_name != mechanism_name:
+                continue
+            source = self.mechanisms[source_name]
+            owner = (
+                source if source_state_name is None else source.DE[source_state_name]
+            )
+            value = (
+                owner._buffers[field]
+                if field in owner._buffers
+                else owner._parameters[field]
+            )
+            if scalar:
+                value = value.reshape(())
+            else:
+                local_rank = len(source_shape)
+                # Effective RANGE parameters may have broadcast singleton axes;
+                # expand them to source storage before physical-slot projection.
+                source_batch_shape = tuple(value.shape[:-local_rank])
+                value = torch.broadcast_to(value, source_batch_shape + source_shape)
+                value = value.reshape(source_batch_shape + (math.prod(source_shape),))
+                value = value.index_select(-1, self._buffers[index_name])
+                value = value.reshape(source_batch_shape + target_shape)
+            result.setdefault(state_name, {})[input_name] = value
+        return result
+
     def make_maps(self):
         """
         Create the mapping of current indices to mechanisms and their functions.
@@ -744,6 +1014,7 @@ class MechanismHandler(torch.nn.Module):
         # invalidate packed key values.  Re-intern from the authored sequence
         # at every existing map-rebuild boundary.
         self._support_registry.rebuild(self.mechanisms.values())
+        self.configure_input_bindings(self._input_bindings)
 
         self._map = []
         self._map_exp = []
@@ -819,6 +1090,55 @@ class MechanismHandler(torch.nn.Module):
         )
         self._make_voltage_support_plans()
         self._make_grouped_current_plans()
+        self._make_membrane_plans()
+
+    def _make_membrane_plans(self):
+        """Group per-current affine evaluators using ordinary support plans.
+
+        Affinity is established when the mechanism is constructed, either by
+        its AFFINE declaration or symbolic analysis. There is no additional
+        mechanism-wide hook or user-maintained field/implementation inventory.
+        """
+        self._membrane_current_signature = tuple(
+            (
+                category,
+                tuple((name, tuple(currents)) for name, currents in mapping.items()),
+            )
+            for category, mapping in self.currents.items()
+        )
+        self._membrane_owners = tuple(self.mechanisms.items())
+        self._membrane_owner_currents = tuple(
+            tuple(
+                (category, tuple(names)) for category, names in mech._currents.items()
+            )
+            for _, mech in self._membrane_owners
+        )
+        groups = []
+        supported = bool(self._map_grouped)
+        for category, support_index, support_entry, entries in self._map_grouped:
+            if not support_entry.is_injective():
+                supported = False
+            direct_entries = []
+            for mech, pair_name, scaler, _factorable in entries:
+                current = pair_name.removesuffix("_with_g")
+                coefficient = mech._affine_evaluators.get(current)
+                if coefficient is None:
+                    supported = False
+                    continue
+                direct_entries.append(
+                    (
+                        mech,
+                        coefficient,
+                        scaler,
+                        current,
+                        mech._affine_coefficient_fields.get(current),
+                    )
+                )
+            groups.append(
+                (category, support_index, support_entry, tuple(direct_entries))
+            )
+        self._membrane_map_grouped = tuple(groups)
+        self._membrane_map_supported = supported
 
     @staticmethod
     def _partition_current_supports(mechanisms):
@@ -1365,10 +1685,14 @@ class MechanismHandler(torch.nn.Module):
         for ion in self.ions.values():
             values = ion._derive_initial_field_values(celsius)
             ion._install_field_values(values)
+            if not ion.training:
+                ion.detach()
         for material in self.materials.values():
             values = material._derive_initial_field_values()
             values.update(material._derive_advanced_field_updates(values, celsius))
             material._install_field_values(values)
+            if not material.training:
+                material.detach()
 
     def _advance_shared_fields(self, celsius, *, dispatch_hooks):
         """Apply guards and derived-field updates to the committed frame."""
@@ -1501,6 +1825,7 @@ class MechanismHandler(torch.nn.Module):
             if torch.is_tensor(dt):
                 module._buffers["dt"] = torch.zeros_like(dt).detach()
             for owner in (module, *module.DE.values()):
+                reset_noise_workspace_timestep(owner)
                 for name in owner._timestep_buffers:
                     value = owner._buffers.get(name)
                     if torch.is_tensor(value):
@@ -1899,8 +2224,30 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._pre_state_support_entries,
         )
-        for mech, support_index in self._pre_state_advance_plan:
-            mech._advance_states(local_voltages[support_index], dt)
+        self._execute_state_advance_plan(
+            "pre", self._pre_state_advance_plan, local_voltages, dt
+        )
+
+    def _execute_state_advance_plan(self, phase, plan, local_voltages, dt):
+        """Execute the phase's original calls or its prepared solver groups."""
+        grouped = getattr(self, "_solver_grouping_plans", None)
+        if grouped is not None:
+            from ._solver_grouping import _solver_grouping_runtime_plain, _SolverGroup
+
+            if not _solver_grouping_runtime_plain():
+                grouped = None
+
+        actions = plan if grouped is None else grouped[phase]
+        for action in actions:
+            if grouped is not None and isinstance(action, _SolverGroup):
+                action.advance(local_voltages, dt)
+            else:
+                mech, support_index = action
+                inputs = self._resolve_state_inputs(mech.name)
+                if inputs:
+                    mech._advance_states(local_voltages[support_index], dt, inputs)
+                else:
+                    mech._advance_states(local_voltages[support_index], dt)
 
     def advance_post_current(self, v, dt, temp, current_frame):
         """Publish the accepted current, advance its readers, and commit state.
@@ -1921,9 +2268,9 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._post_state_support_entries,
         )
-        for mech, support_index in self._post_state_advance_plan:
-            local_v = local_voltages[support_index]
-            mech._advance_states(local_v, dt)
+        self._execute_state_advance_plan(
+            "post", self._post_state_advance_plan, local_voltages, dt
+        )
 
         self._finish_advance(v, dt, temp)
 
@@ -1940,8 +2287,9 @@ class MechanismHandler(torch.nn.Module):
             v,
             self._state_support_entries,
         )
-        for mech, support_index in self._state_advance_plan:
-            mech._advance_states(local_voltages[support_index], dt)
+        self._execute_state_advance_plan(
+            "all", self._state_advance_plan, local_voltages, dt
+        )
 
         self._finish_advance(v, dt, temp)
 
@@ -1989,7 +2337,211 @@ class MechanismHandler(torch.nn.Module):
         )
         return itot, gtot
 
-    def _evaluate_current_frame(self, v, *, scratch=None):
+    def _can_evaluate_direct_membrane_frame(self):
+        """Whether every current can supply observer-free direct coefficients."""
+        if (
+            not self._membrane_map_supported
+            or self.ions
+            or self.materials
+            or self.voltage_processes
+            or self.material_processes
+            or self.read_ion
+            or self.write_ion_c
+            or self.read_material
+            or self.write_material
+            or self.source_material
+            or self._ion_current_reads
+        ):
+            return False
+        # Respect custom public-current and call-local evaluator behavior.
+        if (
+            type(self).i is not _MEMBRANE_LEGACY_I
+            or type(self)._evaluate_current_frame is not _MEMBRANE_LEGACY_FRAME
+            or "i" in self.__dict__
+            or "_evaluate_current_frame" in self.__dict__
+        ):
+            return False
+        signature = tuple(
+            (
+                category,
+                tuple((name, tuple(currents)) for name, currents in mapping.items()),
+            )
+            for category, mapping in self.currents.items()
+        )
+        if signature != self._membrane_current_signature or len(self.mechanisms) != len(
+            self._membrane_owners
+        ):
+            return False
+        for (name, mech), declared in zip(
+            self._membrane_owners, self._membrane_owner_currents
+        ):
+            if (
+                name not in self.mechanisms
+                or self.mechanisms[name] is not mech
+                or mech._save
+                or mech._write_ion
+                or mech._read_ion
+                or mech._read_material
+                or mech._write_material
+                or mech._source_material
+                or not mech._support_key_values_valid
+                or tuple(
+                    (category, tuple(names))
+                    for category, names in mech._currents.items()
+                )
+                != declared
+            ):
+                return False
+        return True
+
+    def _direct_membrane_dtype_compatible(self, v):
+        if (
+            v.dtype not in (torch.float32, torch.float64)
+            or self.area.dtype != v.dtype
+            or self.area.device != v.device
+        ):
+            return False
+        for (
+            _category,
+            _support_index,
+            _support_entry,
+            entries,
+        ) in self._membrane_map_grouped:
+            for mech, _name, _scale, _current, fields in entries:
+                for field in fields or ():
+                    value = getattr(mech, field)
+                    if torch.is_tensor(value):
+                        if value.dtype != v.dtype or value.device != v.device:
+                            return False
+                    elif type(value) not in (int, float):
+                        return False
+        return True
+
+    def _evaluate_direct_membrane_coefficients(self, v, local_voltages):
+        """Reduce declared coefficients using ordinary category/support order."""
+        buf_g = [None for _ in self.currents]
+        buf_j = [None for _ in self.currents]
+        zero = v.new_zeros(()).expand(v.shape)
+        for (
+            category,
+            support_index,
+            support_entry,
+            entries,
+        ) in self._membrane_map_grouped:
+            local_g = local_j = None
+            voltage = local_voltages[support_index]
+            for mech, name, scale, current, _fields in entries:
+                conductance, source = getattr(mech, name)(voltage)
+                if MEMBRANE_ASSEMBLY.value == "validate":
+                    mech._validate_affine_current(current, voltage, conductance, source)
+                # Authored hooks need no field inventory. If their result uses
+                # mixed precision, preserve legacy cast-before-assembly order.
+                if any(
+                    torch.is_tensor(value)
+                    and (value.dtype != v.dtype or value.device != v.device)
+                    for value in (conductance, source)
+                ):
+                    return None, None
+                conductance, source = scale(conductance, source)
+                # The generator/hook expands its inputs before arithmetic;
+                # this final expansion also covers scalar-only constants.
+                conductance = torch.broadcast_to(
+                    _current_value_for_buffer(conductance, v), voltage.shape
+                )
+                source = torch.broadcast_to(
+                    _current_value_for_buffer(source, v), voltage.shape
+                )
+                local_g = conductance if local_g is None else local_g + conductance
+                local_j = source if local_j is None else local_j + source
+            if (
+                support_entry.spec is not None
+                and support_entry.spec.kind is SupportKind.DENSE
+            ):
+                buf_g[category] = (
+                    local_g if buf_g[category] is None else buf_g[category] + local_g
+                )
+                buf_j[category] = (
+                    local_j if buf_j[category] is None else buf_j[category] + local_j
+                )
+            else:
+                buf_g[category] = support_entry.scatter_add(
+                    zero if buf_g[category] is None else buf_g[category], local_g
+                )
+                buf_j[category] = support_entry.scatter_add(
+                    zero if buf_j[category] is None else buf_j[category], local_j
+                )
+        buf_g = [torch.zeros_like(v) if value is None else value for value in buf_g]
+        buf_j = [torch.zeros_like(v) if value is None else value for value in buf_j]
+        return torch.stack(buf_g).sum(dim=0), torch.stack(buf_j).sum(dim=0)
+
+    def _evaluate_membrane_frame(
+        self,
+        v,
+        *,
+        call_local=False,
+        require_current=False,
+        _structure_prevalidated=False,
+    ):
+        """Return ``(G,J,I_optional,ion_I,ion_G)`` with ``J=G*v-I``.
+
+        The legacy fallback preserves both the imperative scratch-rebinding
+        policy and functional call-local frames. Actual-current observers and
+        integrators requesting membrane current retain this path.
+        """
+        local_voltages = None
+        if (
+            MEMBRANE_ASSEMBLY.value != "off"
+            and not require_current
+            and (_structure_prevalidated or self._can_evaluate_direct_membrane_frame())
+        ):
+            local_voltages = self._gather_assigned_current_fields(v)
+            if self._direct_membrane_dtype_compatible(v):
+                conductance, source = self._evaluate_direct_membrane_coefficients(
+                    v, local_voltages
+                )
+                if conductance is not None:
+                    return conductance, source, None, (), ()
+        if call_local:
+            if local_voltages is None:
+                current, conductance, ion_current, ion_conductance = (
+                    self._evaluate_current_frame(v)
+                )
+            else:
+                current, conductance, ion_current, ion_conductance = (
+                    self._evaluate_current_frame(v, _local_voltages=local_voltages)
+                )
+        elif local_voltages is not None:
+            # An ASSIGNED result can reveal mixed dtype only after its single
+            # scheduled evaluation. Preserve imperative scratch rebindings and
+            # reuse that phase instead of executing ASSIGNED a second time.
+            self._buf_i = [torch.zeros_like(value) for value in self._buf_i]
+            self._buf_g = [torch.zeros_like(value) for value in self._buf_g]
+            current, conductance, ion_current, ion_conductance = (
+                self._evaluate_current_frame(
+                    v,
+                    scratch=(self._buf_i, self._buf_g),
+                    _local_voltages=local_voltages,
+                )
+            )
+        else:
+            current, conductance = self.i(v)
+            ion_current = self.capture_ion_current_frame()
+            ion_conductance = self.capture_ion_conductance_frame()
+        return (
+            conductance,
+            conductance * v - current,
+            current,
+            ion_current,
+            ion_conductance,
+        )
+
+    def _gather_assigned_current_fields(self, v):
+        local_voltages = self._gather_support_fields(v, self._current_support_entries)
+        for mech, support_index in self._current_assigned_plan:
+            mech._evaluate_assigned(local_voltages[support_index])
+        return local_voltages
+
+    def _evaluate_current_frame(self, v, *, scratch=None, _local_voltages=None):
         """Evaluate affine currents and return totals plus aligned Ion frames.
 
         ``scratch=None`` is the call-local, transform-safe execution policy.
@@ -2002,12 +2554,11 @@ class MechanismHandler(torch.nn.Module):
         functional caller must isolate registered mechanism state (for example
         with :func:`torch.func.functional_call`) or lower them explicitly.
         """
-        local_voltages = self._gather_support_fields(
-            v,
-            self._current_support_entries,
+        local_voltages = (
+            self._gather_assigned_current_fields(v)
+            if _local_voltages is None
+            else _local_voltages
         )
-        for mech, support_index in self._current_assigned_plan:
-            mech._evaluate_assigned(local_voltages[support_index])
 
         if not self.currents:
             z = torch.zeros_like(v)
@@ -2125,44 +2676,107 @@ class MechanismHandler(torch.nn.Module):
         )
 
     def iexp(self, v):
-        local_voltages = self._gather_support_fields(
-            v,
-            self._current_support_entries,
+        current, _frame = self._evaluate_explicit_current_frame(
+            v, scratch=self._buf_i if self.currents else None
         )
-        for mech, support_index in self._current_assigned_plan:
-            mech._evaluate_assigned(local_voltages[support_index])
+        return current
+
+    def _evaluate_explicit_current_frame(self, v, *, scratch=None):
+        """Evaluate explicit authored currents and aligned ionic-current frames.
+
+        ``scratch=None`` uses out-of-place support reductions for functional
+        transforms. Passing the native current-buffer list preserves the
+        imperative accumulation policy. Both paths evaluate ASSIGNED products,
+        current hooks, support groups, and current categories in the same order;
+        conductance hooks are not evaluated. Registered mechanism state must be
+        isolated by the functional caller around this method.
+        """
+        local_voltages = self._gather_assigned_current_fields(v)
 
         if not self.currents:
-            return torch.zeros_like(v)
+            current_frame = tuple(
+                torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+                for ion in self._ion_current_frame_ions
+            )
+            return torch.zeros_like(v), current_frame
 
-        for i, buf in enumerate(self._buf_i):
-            self._buf_i[i] = torch.zeros_like(buf)
+        call_local = scratch is None
+        if call_local:
+            buf_i = [None for _ in self._buf_i]
+            zero_field = v.new_zeros(()).expand(v.shape)
+        else:
+            if len(scratch) != len(self._buf_i):
+                raise ValueError(
+                    "explicit current scratch must have one buffer per current category"
+                )
+            buf_i = scratch
+            for index, value in enumerate(buf_i):
+                buf_i[index] = torch.zeros_like(value)
 
         for c_idx, support_index, support_entry, entries in self._map_exp_grouped:
             local_i = None
             local_voltage = local_voltages[support_index]
             for mech, fn, scale_f in entries:
                 i = scale_f(getattr(mech, fn)(local_voltage))
-                i = _current_value_for_buffer(i, self._buf_i[c_idx])
+                i = _current_value_for_buffer(i, v if call_local else buf_i[c_idx])
+                if call_local:
+                    i = torch.broadcast_to(i, local_voltage.shape)
                 local_i = i if local_i is None else local_i + i
-            support_entry.scatter_add_(self._buf_i[c_idx], local_i)
+            if call_local:
+                if support_entry.spec.kind is SupportKind.DENSE:
+                    buf_i[c_idx] = (
+                        local_i if buf_i[c_idx] is None else buf_i[c_idx] + local_i
+                    )
+                else:
+                    destination = zero_field if buf_i[c_idx] is None else buf_i[c_idx]
+                    buf_i[c_idx] = support_entry.scatter_add(destination, local_i)
+            else:
+                support_entry.scatter_add_(buf_i[c_idx], local_i)
 
-        # sum up currents and conductances
-        tot_i = torch.stack(self._buf_i).sum(dim=0)
+        if call_local:
+            buf_i = [torch.zeros_like(v) if value is None else value for value in buf_i]
 
-        return tot_i
+        current_frame = tuple(
+            buf_i[current_index]
+            if current_index >= 0
+            else torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+            for ion, current_index in zip(
+                self._ion_current_frame_ions,
+                self._ion_current_frame_indices,
+            )
+        )
+        return torch.stack(buf_i).sum(dim=0), current_frame
 
     def idf(self, v, v_prev):
-        local_voltages = self._gather_support_fields(
-            v,
-            self._current_support_entries,
+        current, conductance, _current_frame, _conductance_frame = (
+            self._evaluate_dufort_current_frame(
+                v,
+                v_prev,
+                scratch=(self._buf_i, self._buf_g) if self.currents else None,
+            )
         )
-        for mech, support_index in self._current_assigned_plan:
-            mech._evaluate_assigned(local_voltages[support_index])
+        return current, conductance
+
+    def _evaluate_dufort_current_frame(self, v, v_prev, *, scratch=None):
+        """Return Dufort currents, conductances, and aligned ionic frames.
+
+        Affine currents are evaluated at half the stored previous voltage;
+        other currents are evaluated explicitly at the current voltage with
+        zero conductance. ASSIGNED products retain the current-voltage phase.
+        ``scratch=None`` uses out-of-place reductions for functional transforms;
+        the native :meth:`idf` supplies its current and conductance buffers.
+        Registered ASSIGNED and SAVE_CURRENT rebindings must be isolated by a
+        functional caller, as for the other call-local current evaluators.
+        """
+        local_voltages = self._gather_assigned_current_fields(v)
 
         if not self.currents:
             z = torch.zeros_like(v)
-            return z, z
+            empty_frame = tuple(
+                torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+                for ion in self._ion_current_frame_ions
+            )
+            return z, z, empty_frame, empty_frame
 
         v_half = 0.5 * v_prev
         local_half_voltages = self._gather_support_fields(
@@ -2170,11 +2784,27 @@ class MechanismHandler(torch.nn.Module):
             self._current_support_entries,
         )
 
-        # reset buffers
-        for i, buf in enumerate(self._buf_i):
-            self._buf_i[i] = torch.zeros_like(buf)
-        for i, buf in enumerate(self._buf_g):
-            self._buf_g[i] = torch.zeros_like(buf)
+        call_local = scratch is None
+        if call_local:
+            buf_i = [None for _ in self._buf_i]
+            buf_g = [None for _ in self._buf_g]
+            zero_field = v.new_zeros(()).expand(v.shape)
+        else:
+            try:
+                buf_i, buf_g = scratch
+            except (TypeError, ValueError) as error:
+                raise TypeError(
+                    "Dufort current scratch must be a (current_buffers, "
+                    "conductance_buffers) pair"
+                ) from error
+            if len(buf_i) != len(self._buf_i) or len(buf_g) != len(self._buf_g):
+                raise ValueError(
+                    "Dufort current scratch does not match the handler current layout"
+                )
+            for index, value in enumerate(buf_i):
+                buf_i[index] = torch.zeros_like(value)
+            for index, value in enumerate(buf_g):
+                buf_g[index] = torch.zeros_like(value)
 
         for c_idx, support_index, support_entry, entries in self._map_grouped:
             local_i = None
@@ -2191,18 +2821,59 @@ class MechanismHandler(torch.nn.Module):
                         setattr(mech, f"{current_fn}_", raw_i)
                     i = scale_f(raw_i)
                     g = torch.zeros_like(i) if torch.is_tensor(i) else 0.0
-                i = _current_value_for_buffer(i, self._buf_i[c_idx])
-                g = _current_value_for_buffer(g, self._buf_g[c_idx])
+                i = _current_value_for_buffer(i, v if call_local else buf_i[c_idx])
+                g = _current_value_for_buffer(g, v if call_local else buf_g[c_idx])
+                if call_local:
+                    local_shape = local_voltages[support_index].shape
+                    i = torch.broadcast_to(i, local_shape)
+                    g = torch.broadcast_to(g, local_shape)
                 local_i = i if local_i is None else local_i + i
                 local_g = g if local_g is None else local_g + g
-            support_entry.scatter_add_(self._buf_i[c_idx], local_i)
-            support_entry.scatter_add_(self._buf_g[c_idx], local_g)
+            if call_local:
+                if support_entry.spec.kind is SupportKind.DENSE:
+                    buf_i[c_idx] = (
+                        local_i if buf_i[c_idx] is None else buf_i[c_idx] + local_i
+                    )
+                    buf_g[c_idx] = (
+                        local_g if buf_g[c_idx] is None else buf_g[c_idx] + local_g
+                    )
+                else:
+                    destination_i = zero_field if buf_i[c_idx] is None else buf_i[c_idx]
+                    destination_g = zero_field if buf_g[c_idx] is None else buf_g[c_idx]
+                    buf_i[c_idx] = support_entry.scatter_add(destination_i, local_i)
+                    buf_g[c_idx] = support_entry.scatter_add(destination_g, local_g)
+            else:
+                support_entry.scatter_add_(buf_i[c_idx], local_i)
+                support_entry.scatter_add_(buf_g[c_idx], local_g)
 
-        # sum up currents and conductances
-        tot_i = torch.stack(self._buf_i).sum(dim=0)
-        tot_g = torch.stack(self._buf_g).sum(dim=0)
+        if call_local:
+            buf_i = [torch.zeros_like(v) if value is None else value for value in buf_i]
+            buf_g = [torch.zeros_like(v) if value is None else value for value in buf_g]
 
-        return tot_i, tot_g
+        current_frame = tuple(
+            buf_i[current_index]
+            if current_index >= 0
+            else torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+            for ion, current_index in zip(
+                self._ion_current_frame_ions,
+                self._ion_current_frame_indices,
+            )
+        )
+        conductance_frame = tuple(
+            buf_g[current_index]
+            if current_index >= 0
+            else torch.zeros_like(self.ions[ion]._buffers[f"i{ion}"])
+            for ion, current_index in zip(
+                self._ion_current_frame_ions,
+                self._ion_current_frame_indices,
+            )
+        )
+        return (
+            torch.stack(buf_i).sum(dim=0),
+            torch.stack(buf_g).sum(dim=0),
+            current_frame,
+            conductance_frame,
+        )
 
     def itot(self, v):
         if not self.currents:
@@ -2308,28 +2979,10 @@ class MechanismHandler(torch.nn.Module):
 
     def _material_local_buffer_names(self):
         """Return mechanism-local material buffers that cross step boundaries."""
-        names = {}
-        for material_map in (self.read_material, self.write_material):
-            for mechanism_map in material_map.values():
-                for mech_name, fields in mechanism_map.items():
-                    names.setdefault(mech_name, set()).update(fields)
-        for mechanism_map in self.source_material.values():
-            for mech_name, field_map in mechanism_map.items():
-                names.setdefault(mech_name, set()).update(field_map.values())
-        return {
-            mech_name: tuple(sorted(buffer_names))
-            for mech_name, buffer_names in names.items()
-        }
+        return material_local_buffer_names(self)
 
-    def mutable_state_dict(self):
-        """
-        Return a dictionary of all mutable / rebound states in the MechanismHandler.
-
-        Structural support is configuration rather than mutable state. It is
-        nevertheless recorded so restore can reject a same-shaped checkpoint
-        whose local slots refer to different physical compartments. Checkpoints
-        created before support identity was added remain loadable.
-        """
+    def _mutable_state_values(self):
+        """Read checkpoint values before choosing snapshot storage ownership."""
         states = {
             _SUPPORT_IDENTITY_STATE_KEY: {
                 "version": _SUPPORT_IDENTITY_VERSION,
@@ -2343,106 +2996,85 @@ class MechanismHandler(torch.nn.Module):
                 },
             }
         }
+
+        def capture_module(module, prefix):
+            for block in checkpoint_module_blocks(module, prefix):
+                if isinstance(block, _StochasticStateBoundary):
+                    _capture_stochastic_state(states, block.prefix, block.owner)
+                elif isinstance(block, _DelayedStateBoundary):
+                    # Histories are registered dynamically, independently of
+                    # ordinary declared carry. Their metadata remains native.
+                    for name in sorted(module._delayed_state_specs):
+                        spec = module._delayed_state_specs[name]
+                        for spec_key in ("buffer", "pointer", "steps_buffer"):
+                            buffer_name = spec.get(spec_key)
+                            if (
+                                buffer_name is not None
+                                and buffer_name in module._buffers
+                            ):
+                                states[f"{prefix}.{buffer_name}"] = module._buffers[
+                                    buffer_name
+                                ]
+                    if module._delayed_state_specs:
+                        states[f"{prefix}{_DELAY_SPEC_STATE_SUFFIX}"] = copy.deepcopy(
+                            module._delayed_state_specs
+                        )
+                else:
+                    for slot in block.slots:
+                        states[f"{prefix}.{slot.checkpoint_suffix}"] = (
+                            getattr(slot.owner, slot.name)
+                            if block.role == "state"
+                            else slot.owner._buffers[slot.name]
+                        )
+
         for mech_name, mech in self.mechanisms.items():
-            _capture_stochastic_state(states, mech_name, mech)
-            for state_key, state in mech.DE.items():
-                for state_name in sorted(state._state):
-                    states[f"{mech_name}.{state_name}"] = getattr(mech, state_name)
-                for buffer_name in sorted(_runtime_state_buffer_names(state)):
-                    states[f"{mech_name}.DE.{state_key}.{buffer_name}"] = (
-                        state._buffers[buffer_name]
-                    )
-                _capture_stochastic_state(states, f"{mech_name}.DE.{state_key}", state)
-            for buffer_name in _runtime_mechanism_carry_names(mech):
-                states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
-            for saved_name in sorted(mech._save):
-                buffer_name = f"{saved_name}_"
-                states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
-            # Delayed-state queues and ring pointers are registered dynamically,
-            # so they are not necessarily present in Mechanism._assigned.
-            for name in sorted(mech._delayed_state_specs):
-                spec = mech._delayed_state_specs[name]
-                for spec_key in ("buffer", "pointer", "steps_buffer"):
-                    buffer_name = spec.get(spec_key)
-                    if buffer_name is not None and buffer_name in mech._buffers:
-                        states[f"{mech_name}.{buffer_name}"] = mech._buffers[
-                            buffer_name
-                        ]
-            if mech._delayed_state_specs:
-                states[f"{mech_name}{_DELAY_SPEC_STATE_SUFFIX}"] = copy.deepcopy(
-                    mech._delayed_state_specs
-                )
+            capture_module(mech, mech_name)
         for process_name, process in self.material_processes.items():
-            _capture_stochastic_state(states, process_name, process)
-            for state_key, state in process.DE.items():
-                for state_name in sorted(state._state):
-                    states[f"{process_name}.{state_name}"] = getattr(
-                        process, state_name
-                    )
-                for buffer_name in sorted(_runtime_state_buffer_names(state)):
-                    states[f"{process_name}.DE.{state_key}.{buffer_name}"] = (
-                        state._buffers[buffer_name]
-                    )
-                _capture_stochastic_state(
-                    states, f"{process_name}.DE.{state_key}", state
-                )
-            for buffer_name in _runtime_mechanism_carry_names(process):
-                states[f"{process_name}.{buffer_name}"] = process._buffers[buffer_name]
-            for saved_name in sorted(process._save):
-                buffer_name = f"{saved_name}_"
-                states[f"{process_name}.{buffer_name}"] = process._buffers[buffer_name]
-            for name in sorted(process._delayed_state_specs):
-                spec = process._delayed_state_specs[name]
-                for spec_key in ("buffer", "pointer", "steps_buffer"):
-                    buffer_name = spec.get(spec_key)
-                    if buffer_name is not None and buffer_name in process._buffers:
-                        states[f"{process_name}.{buffer_name}"] = process._buffers[
-                            buffer_name
-                        ]
-            if process._delayed_state_specs:
-                states[f"{process_name}{_DELAY_SPEC_STATE_SUFFIX}"] = copy.deepcopy(
-                    process._delayed_state_specs
-                )
-        for ion, ion_read in self.read_ion.items():
-            for k, conc_list in ion_read.items():
-                mech = self.mechanisms[k]
-                for conc in conc_list:
-                    states[f"{k}.{conc}"] = mech._buffers[conc]
-        for ion, ion_write in self.write_ion_c.items():
-            for k, conc_list in ion_write.items():
-                mech = self.mechanisms[k]
-                for conc in conc_list:
-                    states[f"{k}.{conc}"] = mech._buffers[conc]
+            capture_module(process, process_name)
+        for mapping_name in ("read_ion", "write_ion_c"):
+            groups = local_binding_groups(
+                mapping for _ion, mapping in getattr(self, mapping_name).items()
+            )
+            for mech_name, concentrations in groups:
+                mech = self.mechanisms[mech_name]
+                for concentration in concentrations:
+                    states[f"{mech_name}.{concentration}"] = mech._buffers[
+                        concentration
+                    ]
         for mech_name, buffer_names in self._material_local_buffer_names().items():
             mech = self.mechanisms[mech_name]
             for buffer_name in buffer_names:
                 states[f"{mech_name}.{buffer_name}"] = mech._buffers[buffer_name]
         for ion_name, ion in self.ions.items():
-            for buffer_name in getattr(
-                ion, "fields", tuple(dict(ion.named_buffers()).keys())
+            for slot in shared_field_slots(
+                ion,
+                f"{ion_name}_ion",
+                getattr(ion, "fields", tuple(dict(ion.named_buffers()).keys())),
             ):
-                states[f"{ion_name}_ion.{buffer_name}"] = ion._buffers[buffer_name]
+                states[slot.checkpoint_suffix] = slot.owner._buffers[slot.name]
         for material_name, material in self.materials.items():
-            for buffer_name in getattr(
-                material, "fields", tuple(dict(material.named_buffers()).keys())
+            for slot in shared_field_slots(
+                material,
+                f"{material_name}_material",
+                getattr(
+                    material, "fields", tuple(dict(material.named_buffers()).keys())
+                ),
             ):
-                states[f"{material_name}_material.{buffer_name}"] = material._buffers[
-                    buffer_name
-                ]
+                states[slot.checkpoint_suffix] = slot.owner._buffers[slot.name]
+        return states
+
+    def mutable_state_dict(self):
+        """Return a snapshot of the Handler's mutable and rebound state.
+
+        Structural support identifies the physical compartments addressed by
+        local slots. Checkpoints predating support identity retain their legacy
+        shape-based restoration behavior.
+        """
+        states = self._mutable_state_values()
         # Capture an actual boundary snapshot: later in-place simulation updates
         # must not mutate the saved tensors. Preserve graph connectivity and
         # aliases by cloning once per distinct tensor object.
-        memo = {}
-        snapshot = {}
-        for name, value in states.items():
-            if not torch.is_tensor(value):
-                snapshot[name] = value
-                continue
-            value_id = id(value)
-            if value_id not in memo:
-                memo[value_id] = value.clone()
-            snapshot[name] = memo[value_id]
-        return snapshot
+        return _capture_tensor_values(states, lambda value: value.clone())
 
     def restore_mutable_state_dict(self, state_dict):
         """Restore a mutable-state snapshot as a two-phase transaction.
@@ -2456,6 +3088,10 @@ class MechanismHandler(torch.nn.Module):
         assignments = plan["assignments"]
         rng_assignments = plan["rng_assignments"]
         delay_assignments = plan["delay_assignments"]
+        random_parameter_assignments = plan["random_parameter_assignments"]
+        material_assignments = plan["material_assignments"]
+        noise_workspace_assignments = plan["noise_workspace_assignments"]
+        noise_workspace_resolutions = plan["noise_workspace_resolutions"]
 
         missing = object()
         original_tensors = [
@@ -2463,9 +3099,48 @@ class MechanismHandler(torch.nn.Module):
             for owner, name, _ in assignments
         ]
         original_delays = [
-            (module, module._delayed_state_specs) for module, _ in delay_assignments
+            (
+                module,
+                module._delayed_state_specs,
+                dict(module._carry_resolved_shapes),
+            )
+            for module, _ in delay_assignments
+        ]
+        original_random_parameters = [
+            (
+                module,
+                {
+                    name: getattr(module, name)
+                    for name in (
+                        "_random_parameter_initialized",
+                        "_random_parameter_draws",
+                        "_random_parameter_parameters",
+                        "_random_parameter_generation",
+                    )
+                },
+            )
+            for module, _ in random_parameter_assignments
         ]
         original_rngs = {}
+        original_materials = [
+            (
+                owner,
+                owner._spatial_operators,
+                owner._spatial_configured,
+                dict(owner._buffers),
+                set(owner._non_persistent_buffers_set),
+                getattr(owner, "_material_restored_workspace_dt", missing),
+            )
+            for owner, _staged in material_assignments
+        ]
+        original_noise_workspaces = [
+            (module, getattr(module, "_noise_workspace_restored_dt", missing))
+            for module in noise_workspace_assignments
+        ]
+        original_workspace_resolutions = [
+            (module, dict(module._derived_resolved_shapes))
+            for module, _name, _shape in noise_workspace_resolutions
+        ]
         for rng, _, _ in rng_assignments:
             if id(rng) in original_rngs:
                 continue
@@ -2479,22 +3154,74 @@ class MechanismHandler(torch.nn.Module):
 
         try:
             for rng, base_seed, rng_state in rng_assignments:
-                if base_seed is not None:
-                    rng.reseed(base_seed)
-                rng.set_rng_state(rng_state)
+                rng.restore_rng_checkpoint(
+                    rng_state
+                    if base_seed is None
+                    else {"base_seed": base_seed, "rng_state": rng_state},
+                    policy="checkpoint",
+                    allow_legacy=True,
+                )
             for owner, name, value in assignments:
                 setattr(owner, name, value)
             for module, specs in delay_assignments:
                 module._delayed_state_specs = specs
+                module._sync_delay_history_shapes()
+            for module, provenance in random_parameter_assignments:
+                module._apply_random_parameter_state(provenance)
+            for module, staged in material_assignments:
+                module._spatial_operators = staged._spatial_operators
+                module._spatial_configured = True
+                for name in module.runtime_noises:
+                    name = f"_material_held_noise_{name}"
+                    if name in module._buffers:
+                        module._buffers[name] = staged._buffers[name]
+                    else:
+                        module.register_buffer(
+                            name, staged._buffers[name], persistent=False
+                        )
+                retain_stochastic_material_workspace_once(module)
+            for module in noise_workspace_assignments:
+                module.__dict__.pop("_noise_workspace_restored_dt", None)
+                retain_noise_workspace_once(module)
+            for module, name, shape in noise_workspace_resolutions:
+                module._derived_resolved_shapes[name] = shape
         except Exception:
+            for module, resolutions in original_workspace_resolutions:
+                module._derived_resolved_shapes = resolutions
+            for module, restored_dt in original_noise_workspaces:
+                if restored_dt is missing:
+                    module.__dict__.pop("_noise_workspace_restored_dt", None)
+                else:
+                    module._noise_workspace_restored_dt = restored_dt
+            for (
+                module,
+                operators,
+                configured,
+                buffers,
+                nonpersistent,
+                restored_dt,
+            ) in original_materials:
+                module._spatial_operators = operators
+                module._spatial_configured = configured
+                module._buffers = buffers
+                module._non_persistent_buffers_set = nonpersistent
+                if restored_dt is missing:
+                    module.__dict__.pop("_material_restored_workspace_dt", None)
+                else:
+                    module._material_restored_workspace_dt = restored_dt
             for owner, name, original in reversed(original_tensors):
                 if original is missing:
                     if hasattr(owner, name):
                         delattr(owner, name)
                 else:
                     setattr(owner, name, original)
-            for module, specs in original_delays:
+            for module, specs, resolved_shapes in original_delays:
                 module._delayed_state_specs = specs
+                module._carry_resolved_shapes.clear()
+                module._carry_resolved_shapes.update(resolved_shapes)
+            for module, attributes in original_random_parameters:
+                for name, value in attributes.items():
+                    setattr(module, name, value)
             for (
                 rng,
                 base_seed,
@@ -2511,73 +3238,32 @@ class MechanismHandler(torch.nn.Module):
 
     def _preflight_mutable_state_dict(self, state_dict):
         """Build a fully validated, non-mutating mutable-state restore plan."""
+        return self._mutable_state_plan(state_dict, _prepare_mutable_tensor)
+
+    def _mutable_state_plan(self, state_dict, prepare_tensor):
+        """Validate every inventory phase with caller-owned tensor preparation."""
 
         if not isinstance(state_dict, Mapping):
             raise TypeError("MechanismHandler mutable state must be a mapping.")
 
         self._validate_support_identity_payload(state_dict)
 
-        assignment_map = {}
-        assignment_keys = {}
-        tensor_memo = {}
+        tensor_plan = _MutableTensorPlan(state_dict, prepare_tensor)
+        assignment_map = tensor_plan.assignment_map
+        assignment_keys = tensor_plan.assignment_keys
+        add_tensor = tensor_plan.add
         rng_assignments = []
         delay_assignments = []
-        missing = object()
-
-        def add_tensor(
-            owner,
-            name,
-            key,
-            *,
-            expected_shape=None,
-            optional=False,
-            reference=None,
-        ):
-            if key not in state_dict:
-                if optional:
-                    return
-                raise KeyError(f"MechanismHandler mutable state is missing {key!r}.")
-            candidate = state_dict[key]
-            if not torch.is_tensor(candidate):
-                raise TypeError(
-                    f"MechanismHandler mutable state {key!r} must be a tensor."
-                )
-
-            live = getattr(owner, name, missing) if reference is None else reference
-            if live is missing or not torch.is_tensor(live):
-                raise TypeError(
-                    f"Live mutable field {key!r} must be a tensor before restore."
-                )
-            shape = (
-                tuple(live.shape) if expected_shape is None else tuple(expected_shape)
-            )
-            if tuple(candidate.shape) != shape:
-                raise ValueError(
-                    f"MechanismHandler mutable state {key!r} has shape "
-                    f"{tuple(candidate.shape)}, expected {shape}."
-                )
-            if candidate.layout != live.layout:
-                raise ValueError(
-                    f"MechanismHandler mutable state {key!r} has layout "
-                    f"{candidate.layout}, expected {live.layout}."
-                )
-
-            memo_key = (id(candidate), live.device, live.dtype, live.layout)
-            if memo_key not in tensor_memo:
-                tensor_memo[memo_key] = candidate.to(
-                    device=live.device, dtype=live.dtype
-                ).clone()
-            prepared = tensor_memo[memo_key]
-            target = (id(owner), name)
-            existing = assignment_map.get(target)
-            if existing is not None and existing[2] is not prepared:
-                raise ValueError(
-                    f"Mutable field {name!r} received conflicting snapshot entries."
-                )
-            assignment_map[target] = (owner, name, prepared)
-            assignment_keys.setdefault(target, key)
+        random_parameter_assignments = []
+        material_assignments = []
+        noise_workspace_assignments = []
+        noise_workspace_resolutions = []
 
         def add_stochastic(module, prefix, legacy_prefixes):
+            if getattr(module, "random_parameters", {}):
+                key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}random_parameter_state"
+                provenance = module._prepare_random_parameter_state(state_dict.get(key))
+                random_parameter_assignments.append((module, provenance))
             for rng_name in _stochastic_rng_names(module):
                 canonical_key = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}rng.{rng_name}"
                 payload_key = canonical_key if canonical_key in state_dict else None
@@ -2608,6 +3294,104 @@ class MechanismHandler(torch.nn.Module):
                     f"random_parameter.{parameter_name}"
                 )
                 add_tensor(module, parameter_name, key)
+            noise_workspace_prefix = (
+                f"{prefix}{_STOCHASTIC_STATE_SEGMENT}noise_workspace."
+            )
+            noise_workspace = {
+                f"{noise_workspace_prefix}{suffix}": (owner, buffer_name)
+                for suffix, owner, buffer_name in noise_workspace_slots(module)
+            }
+            present_noise_workspace = {
+                key
+                for key in state_dict
+                if isinstance(key, str) and key.startswith(noise_workspace_prefix)
+            }
+            if present_noise_workspace:
+                missing_workspace = set(noise_workspace) - present_noise_workspace
+                unexpected_workspace = present_noise_workspace - set(noise_workspace)
+                if missing_workspace:
+                    raise KeyError(
+                        "MechanismHandler NOISE workspace state is missing "
+                        f"entries: {sorted(missing_workspace)}."
+                    )
+                if unexpected_workspace:
+                    raise ValueError(
+                        "MechanismHandler NOISE workspace state has unexpected "
+                        f"entries: {sorted(unexpected_workspace)}."
+                    )
+                for key, (owner, buffer_name) in noise_workspace.items():
+                    candidate = state_dict[key]
+                    if key.endswith(".active") and (
+                        not torch.is_tensor(candidate)
+                        or candidate.ndim != 0
+                        or candidate.dtype != torch.bool
+                    ):
+                        raise ValueError(
+                            "NOISE workspace active flags must be scalar bool tensors."
+                        )
+                    if key.endswith("timestep.dt") and (
+                        not torch.is_tensor(candidate)
+                        or candidate.ndim != 0
+                        or not math.isfinite(float(candidate.item()))
+                        or float(candidate.item()) < 0
+                    ):
+                        raise ValueError(
+                            "NOISE workspace timestep must be a finite nonnegative scalar tensor."
+                        )
+                    if (
+                        ".derived.buffer." in key
+                        and _is_unresolved_deferred_buffer(owner, buffer_name)
+                        and torch.is_tensor(candidate)
+                    ):
+                        reference = owner._buffers[buffer_name].new_empty(
+                            candidate.shape
+                        )
+                        add_tensor(owner, buffer_name, key, reference=reference)
+                        noise_workspace_resolutions.append(
+                            (owner, buffer_name, tuple(candidate.shape))
+                        )
+                    else:
+                        add_tensor(owner, buffer_name, key)
+                noise_workspace_assignments.append(module)
+            if not isinstance(module, DiffusionProcess) or not module.runtime_noises:
+                return
+            staged = stage_stochastic_material_workspace(
+                module,
+                state_dict,
+                prefix=f"{prefix}{_STOCHASTIC_STATE_SEGMENT}",
+            )
+            workspace_owner = module if staged is None else staged
+            if staged is not None:
+                material_assignments.append((module, staged))
+            workspace_prefix = f"{prefix}{_STOCHASTIC_STATE_SEGMENT}material_workspace."
+            workspace = {
+                f"{workspace_prefix}{suffix}": (owner, buffer_name)
+                for suffix, owner, buffer_name in stochastic_material_workspace_slots(
+                    workspace_owner
+                )
+            }
+            present = {
+                key
+                for key in state_dict
+                if isinstance(key, str) and key.startswith(workspace_prefix)
+            }
+            if present:
+                missing_workspace = set(workspace) - present
+                unexpected_workspace = present - set(workspace)
+                if missing_workspace:
+                    raise KeyError(
+                        "MechanismHandler material workspace state is missing "
+                        f"entries: {sorted(missing_workspace)}."
+                    )
+                if unexpected_workspace:
+                    raise ValueError(
+                        "MechanismHandler material workspace state has unexpected "
+                        f"entries: {sorted(unexpected_workspace)}."
+                    )
+            for key, (owner, buffer_name) in workspace.items():
+                # Only an entirely absent namespace has the legacy behavior of
+                # retaining the target's configured operator and provenance.
+                add_tensor(owner, buffer_name, key, optional=not present)
 
         def require_integer_tensor(key, expected_shape):
             if key not in state_dict:
@@ -2708,61 +3492,74 @@ class MechanismHandler(torch.nn.Module):
                     )
 
         def add_module(module, prefix):
-            add_stochastic(module, prefix, (prefix,))
-            for state_key, state in module.DE.items():
-                state_names = tuple(sorted(state._state))
-                for state_name in state_names:
-                    add_tensor(module, state_name, f"{prefix}.{state_name}")
-                for buffer_name in sorted(_runtime_state_buffer_names(state)):
-                    add_tensor(
-                        state,
-                        buffer_name,
-                        f"{prefix}.DE.{state_key}.{buffer_name}",
-                        optional=True,
-                    )
-                add_stochastic(
-                    state,
-                    f"{prefix}.DE.{state_key}",
-                    tuple(f"{prefix}.{name}" for name in state_names),
-                )
-            for buffer_name in _runtime_mechanism_carry_names(module):
-                add_tensor(module, buffer_name, f"{prefix}.{buffer_name}")
-            for saved_name in sorted(module._save):
-                buffer_name = f"{saved_name}_"
-                add_tensor(module, buffer_name, f"{prefix}.{buffer_name}")
-            add_delayed_state(module, prefix)
+            for block in checkpoint_module_blocks(module, prefix):
+                if isinstance(block, _StochasticStateBoundary):
+                    add_stochastic(block.owner, block.prefix, block.legacy_prefixes)
+                elif isinstance(block, _DelayedStateBoundary):
+                    add_delayed_state(block.owner, block.prefix)
+                else:
+                    for slot in block.slots:
+                        # Saved history metadata owns queue capacity even when
+                        # the storage is also declared ordinary CARRY.
+                        if (
+                            block.role == "carry"
+                            and slot.name in module._delay_history_buffer_names
+                        ):
+                            continue
+                        add_tensor(
+                            slot.owner,
+                            slot.name,
+                            f"{prefix}.{slot.checkpoint_suffix}",
+                            optional=block.role == "state_carry",
+                        )
 
         for mech_name, mech in self.mechanisms.items():
             add_module(mech, mech_name)
         for process_name, process in self.material_processes.items():
             add_module(process, process_name)
 
-        for ion_read in self.read_ion.values():
-            for mech_name, concentrations in ion_read.items():
-                mech = self.mechanisms[mech_name]
-                for concentration in concentrations:
-                    key = f"{mech_name}.{concentration}"
-                    add_tensor(mech, concentration, key)
-                    for state in mech.DE.values():
-                        add_tensor(state, concentration, key)
-        for ion_write in self.write_ion_c.values():
-            for mech_name, concentrations in ion_write.items():
-                mech = self.mechanisms[mech_name]
-                for concentration in concentrations:
-                    key = f"{mech_name}.{concentration}"
-                    add_tensor(mech, concentration, key)
-                    for state in mech.DE.values():
-                        state_value = getattr(state, concentration, missing)
-                        add_tensor(
-                            state,
-                            concentration,
-                            key,
-                            reference=(
-                                mech._buffers[concentration]
-                                if state_value is missing
-                                else state_value
-                            ),
-                        )
+        self._add_mutable_local_tensors(add_tensor)
+
+        return {
+            "assignments": list(assignment_map.values()),
+            "assignment_keys": assignment_keys,
+            "rng_assignments": rng_assignments,
+            "delay_assignments": delay_assignments,
+            "random_parameter_assignments": random_parameter_assignments,
+            "material_assignments": material_assignments,
+            "noise_workspace_assignments": noise_workspace_assignments,
+            "noise_workspace_resolutions": noise_workspace_resolutions,
+        }
+
+    def _add_mutable_local_tensors(self, add_tensor):
+        """Project shared/local checkpoint aliases onto live targets."""
+        missing = object()
+        for mech_name, concentrations in local_binding_groups(self.read_ion.values()):
+            mech = self.mechanisms[mech_name]
+            for concentration in concentrations:
+                key = f"{mech_name}.{concentration}"
+                add_tensor(mech, concentration, key)
+                for state in mech.DE.values():
+                    add_tensor(state, concentration, key)
+        for mech_name, concentrations in local_binding_groups(
+            self.write_ion_c.values()
+        ):
+            mech = self.mechanisms[mech_name]
+            for concentration in concentrations:
+                key = f"{mech_name}.{concentration}"
+                add_tensor(mech, concentration, key)
+                for state in mech.DE.values():
+                    state_value = getattr(state, concentration, missing)
+                    add_tensor(
+                        state,
+                        concentration,
+                        key,
+                        reference=(
+                            mech._buffers[concentration]
+                            if state_value is missing
+                            else state_value
+                        ),
+                    )
         for mech_name, buffer_names in self._material_local_buffer_names().items():
             mech = self.mechanisms[mech_name]
             for buffer_name in buffer_names:
@@ -2771,36 +3568,32 @@ class MechanismHandler(torch.nn.Module):
                 for state in mech.DE.values():
                     add_tensor(state, buffer_name, key)
         for ion_name, ion in self.ions.items():
-            for buffer_name in getattr(
-                ion, "fields", tuple(dict(ion.named_buffers()).keys())
+            for slot in shared_field_slots(
+                ion,
+                f"{ion_name}_ion",
+                getattr(ion, "fields", tuple(dict(ion.named_buffers()).keys())),
             ):
-                add_tensor(ion, buffer_name, f"{ion_name}_ion.{buffer_name}")
+                add_tensor(slot.owner, slot.name, slot.checkpoint_suffix)
         for material_name, material in self.materials.items():
-            for buffer_name in getattr(
-                material, "fields", tuple(dict(material.named_buffers()).keys())
+            for slot in shared_field_slots(
+                material,
+                f"{material_name}_material",
+                getattr(
+                    material, "fields", tuple(dict(material.named_buffers()).keys())
+                ),
             ):
-                add_tensor(
-                    material,
-                    buffer_name,
-                    f"{material_name}_material.{buffer_name}",
-                )
-
-        return {
-            "assignments": list(assignment_map.values()),
-            "assignment_keys": assignment_keys,
-            "rng_assignments": rng_assignments,
-            "delay_assignments": delay_assignments,
-        }
+                add_tensor(slot.owner, slot.name, slot.checkpoint_suffix)
 
     def _mutable_state_bindings(self):
-        """Return checkpoint-key bindings from the canonical state inventory.
+        """Project validated aliases without bulk checkpoint tensor copies.
 
-        This private manifest is shared by checkpoint restoration and the
-        experimental functional Population lowering.  Building it through the
-        normal snapshot preflight keeps one authority for aliases, shapes, and
-        dynamically registered boundary state.
+        RNG/provenance, history and workspace admission use the same phase
+        plan as restoration. Only restoration publishes the prepared state.
         """
-        plan = self._preflight_mutable_state_dict(self.mutable_state_dict())
+        values = _capture_tensor_values(
+            self._mutable_state_values(), _capture_binding_tensor
+        )
+        plan = self._mutable_state_plan(values, _prepare_binding_token)
         keys = plan["assignment_keys"]
         return tuple(
             (keys[(id(owner), name)], owner, name)
@@ -2944,3 +3737,11 @@ class MechanismHandler(torch.nn.Module):
                         f"Mechanism support identity mismatch for {label}; the "
                         "checkpoint flat key addresses different physical slots."
                     )
+
+
+# Stable function identities, not mutable class lookups, make late handler or
+# mechanism overrides disable the derived-coefficient fast path.
+_MEMBRANE_LEGACY_I = MechanismHandler.i
+_MEMBRANE_LEGACY_FRAME = MechanismHandler._evaluate_current_frame
+_MEMBRANE_COEFFICIENT_FRAME = MechanismHandler._evaluate_membrane_frame
+_MEMBRANE_DIRECT_ELIGIBILITY = MechanismHandler._can_evaluate_direct_membrane_frame

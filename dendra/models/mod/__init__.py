@@ -20,7 +20,11 @@ from .SPIKEDETECT import spikedetect
 
 
 class MechanismContainer:
-    """Simple attribute / dict-style container."""
+    """Mechanism definitions returned by :func:`load_mechanisms`.
+
+    Access definitions as ``container.name`` or ``container["name"]``. Use
+    :meth:`available` to list the stored names.
+    """
 
     def __init__(self, **kwargs):
         for k, v in kwargs.items():
@@ -30,39 +34,30 @@ class MechanismContainer:
         return getattr(self, key)
 
     def available(self):
+        """Return the loaded definition names in insertion order."""
         return list(self.__dict__.keys())
 
 
 def load_mechanisms(*paths):
-    """
-    Load mechanism modules from the specified file paths.
-    This function dynamically imports Python files from the given directories,
-    extracting modules that are expected to contain mechanism implementations.
-    Each mechanism is assumed to have a class with the same name as the file.
+    """Load mechanism definitions from Python files in the supplied directories.
 
     Parameters
     ----------
-    *paths : str
-        Variable number of directory paths where mechanism files are located.
+    *paths : str or path-like
+        Directories to scan for ``*.py`` files, excluding ``__init__.py``.
 
     Returns
     -------
     MechanismContainer
-        A container object that holds all successfully loaded mechanisms.
-        The mechanisms are accessible as attributes of the container,
-        with attribute names corresponding to the module names.
+        Definitions accessible by attribute or string key. Each file must export
+        a mechanism whose name is the lower-case file stem; ``MyChannel.py``
+        must therefore export ``mychannel``. Later directories replace earlier
+        definitions with the same lower-case name.
 
     Notes
     -----
-    - Files must have a .py extension and not be named "__init__.py"
-    - Each file should define a class with the same name as the file itself
-    - The function assumes the module structure follows the convention where
-      the class name matches the file name
-
-    Examples
-    --------
-    >>> mechanisms = load_mechanisms('/path/to/mechanisms', '/another/path')
-    >>> my_mechanism = mechanisms.mechanism_name
+    Loading executes the Python modules. Import or definition errors propagate
+    to the caller. Only load trusted mechanism code.
     """
 
     mechanisms = {}

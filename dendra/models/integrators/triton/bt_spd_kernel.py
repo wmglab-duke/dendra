@@ -7,6 +7,27 @@ BLOCK_FIBRES = 32  # fibres per warp, as before
 
 
 @triton.jit
+def _symmetric_midpoint(a, b):
+    # Sum first in the ordinary range to preserve subnormal coefficients.
+    # Finite large entries must be halved before summing to avoid overflow.
+    if a.dtype == tl.float64:
+        half_max = 8.988465674311579e307
+        twice_tiny = 4.450147717014403e-308
+    else:
+        half_max = 1.7014117331926443e38
+        twice_tiny = 2.350988701644575e-38
+    bounded = (tl.abs(a) <= half_max) & (tl.abs(b) <= half_max)
+    half_a = 0.5 * a
+    half_b = 0.5 * b
+    extreme = tl.where(
+        tl.abs(a) < twice_tiny,
+        a + half_b,
+        tl.where(tl.abs(b) < twice_tiny, half_a + b, half_a + half_b),
+    )
+    return tl.where(bounded, 0.5 * (a + b), extreme)
+
+
+@triton.jit
 def _chol3x3_raw(
     a0,
     a1,
@@ -64,9 +85,9 @@ def _try_chol_with_bump3x3(
     eps_rel,
     eps_abs,
 ):
-    a01 = 0.5 * (a1 + a3)
-    a02 = 0.5 * (a2 + a6)
-    a12 = 0.5 * (a5 + a7)
+    a01 = _symmetric_midpoint(a1, a3)
+    a02 = _symmetric_midpoint(a2, a6)
+    a12 = _symmetric_midpoint(a5, a7)
 
     a1 = a01
     a3 = a01
@@ -463,6 +484,7 @@ def thomas_bt3_spd_solve_with_chol_kernel(
 import torch  # noqa: E402
 from torch.library import triton_op, wrap_triton  # noqa: E402
 
+from .._symmetry import _symmetric_part  # noqa: E402
 from ._contracts import (  # noqa: E402
     flatten_vmap_solver_batch,
     restore_vmap_solver_batch,
@@ -682,7 +704,7 @@ class _SolveBTSPDCudaConsumeUnchecked(torch.autograd.Function):
 
         grad_rhs = g
         GX = g.unsqueeze(-1) * x.unsqueeze(-2)
-        grad_main = -0.5 * (GX + GX.transpose(-1, -2))
+        grad_main = -_symmetric_part(GX)
         grad_upper = -(g[:, :-1, :] * x[:, 1:, :])
         grad_lower = -(g[:, 1:, :] * x[:, :-1, :])
 

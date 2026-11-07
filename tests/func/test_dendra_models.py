@@ -319,6 +319,66 @@ def test_real_unmyelinated_subclass_fresh_initialization_parity_and_grad(case):
     assert torch.count_nonzero(gradient) > 0
 
 
+@pytest.mark.cpu
+@pytest.mark.skipif(
+    not DENDRA_SOLVERS_AVAILABLE,
+    reason="MRG fresh initialization requires the native CPU block solver",
+)
+@pytest.mark.parametrize(
+    ("model_name", "diameter"),
+    (("bigMRG", 8.0), ("smolMRG", 2.0), ("exactMRG", 5.7)),
+)
+def test_real_mrg_fresh_initialization_parity_and_gate_voltage_gradient(
+    model_name, diameter
+):
+    previous = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        source = _mrg(model_name, diameter)
+        functional, tensors = dn.func.make_functional(source, dt=DT)
+        voltage = torch.linspace(
+            -84.0,
+            -70.0,
+            source.v.numel(),
+            dtype=source.dtype(),
+            device=source.device(),
+        ).reshape(source.shape)
+        initialized = functional.initialize(
+            tensors.parameters,
+            tensors.constants,
+            tensors.initialization._replace(v_init=voltage),
+        )
+        reference = _mrg(model_name, diameter)
+        reference.set_v_init(voltage)
+        reference.initialize()
+        expected = functional.extract(reference)
+        _assert_every_leaf_close(initialized.state, expected.state, rtol=0.0, atol=0.0)
+        torch.testing.assert_close(
+            initialized.state["integrator"]["vc"][..., 0], voltage
+        )
+        assert torch.count_nonzero(initialized.state["integrator"]["vc"][..., 1:]) == 0
+
+        def gate_loss(initial_voltage):
+            state = functional.initialize(
+                tensors.parameters,
+                tensors.constants,
+                tensors.initialization._replace(v_init=initial_voltage),
+            ).state
+            return sum(
+                value.square().mean()
+                for mechanism_state in state["mechanisms"].values()
+                for value in mechanism_state.values()
+            )
+
+        # Gate-only loss excludes the direct returned-voltage identity, so
+        # this checks genuine dependence through fresh physiological gating.
+        gradient = torch.func.grad(gate_loss)(voltage)
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient) > 0
+    finally:
+        torch.set_num_threads(previous)
+
+
 @pytest.mark.parametrize(
     "case",
     BALANCED_INITIALIZATION_MODEL_CASES,
@@ -501,6 +561,7 @@ def test_cfiber_balance_initialization_vmap_including_empty_lanes(
         assert value.shape[0] == 0
 
 
+@pytest.mark.slow
 def test_thio_balance_initialization_compile_of_jacrev_matches_eager():
     case = BALANCED_INITIALIZATION_MODEL_CASES[2]
     source = _model(case, method="pcr")
@@ -1089,6 +1150,7 @@ def _bigmrg_bptt_case(functional, tensors, ve, intra, *, compiled):
     not DENDRA_SOLVERS_AVAILABLE,
     reason="bigMRG compiled CPU BPTT requires dendra-solvers",
 )
+@pytest.mark.slow
 def test_bigmrg_compiled_chunks_match_eager_bptt():
     model = _big_mrg()
     functional, tensors = dn.func.make_functional(model, dt=DT)
@@ -1554,6 +1616,7 @@ def test_schild_explicit_batch_matches_imperative_fused_vmap_and_gradient():
     assert gradient.abs() > 0.0
 
 
+@pytest.mark.slow
 def test_schild_no_grad_compiled_rollout_uses_structured_loop_for_full_state():
     case = _ModelCase(
         "Schild1997",
@@ -1564,7 +1627,7 @@ def test_schild_no_grad_compiled_rollout_uses_structured_loop_for_full_state():
     functional, tensors = dn.func.make_functional(model, dt=TIGERHOLM_DT)
     assert not functional._structured_step_graphs
     assert functional.prewarm_structured_rollout(ve=True, intra=True)
-    assert set(functional._structured_step_graphs) == {(True, True)}
+    assert set(functional._structured_step_graphs) == {(True, True, "auto")}
     assert functional._structured_capture_error is None
     ve, intra = _drives(model, 5)
     graphs = []
@@ -1591,6 +1654,7 @@ def test_schild_no_grad_compiled_rollout_uses_structured_loop_for_full_state():
     assert len(_while_loop_nodes(graphs[0])) == 1
 
 
+@pytest.mark.slow
 def test_schild_compiled_chunks_match_eager_bptt_through_derived_workspaces():
     case = _ModelCase(
         "Schild1997",

@@ -209,6 +209,40 @@ def _ads_trace(q: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.stack(compartments, dim=-1)[:, None, :], pulses
 
 
+@pytest.mark.parametrize("descriptor", ["ap_width", "ads"])
+@pytest.mark.filterwarnings(
+    r"ignore:`torch\.jit\.script` is deprecated.*:DeprecationWarning"
+)
+def test_hard_forward_timing_jvp_matches_selected_reverse_derivative(descriptor):
+    def readout(q):
+        if descriptor == "ap_width":
+            out = branch_conditioned_action_potential_width(
+                _ap_trace(q), DT, baseline_margin_mV=10.0
+            )
+            return out["width_ms"].sum() + out["full_width_ms"].sum()
+        voltage, pulses = _ads_trace(q)
+        out = branch_conditioned_activity_dependent_slowing(
+            voltage,
+            pulses,
+            DT,
+            lengths_um=100.0,
+            response_window_ms=(0.1, 1.4),
+            V_th=-20.0,
+            dv_th=None,
+            baseline_n_pulses=2,
+            tail_n_pulses=2,
+        )
+        return out["final_ads_percent"].sum() + out["velocity_change_percent"].sum()
+
+    q = torch.zeros((), dtype=DTYPE, requires_grad=True)
+    value = readout(q)
+    (reverse,) = torch.autograd.grad(value, q)
+    primal, forward = torch.func.jvp(readout, (q.detach(),), (torch.ones_like(q),))
+    torch.testing.assert_close(primal, value.detach(), rtol=0, atol=0)
+    assert reverse.abs() > 1e-4
+    torch.testing.assert_close(forward, reverse, rtol=1e-10, atol=1e-10)
+
+
 @pytest.mark.parametrize("mode", ["half_height", "half_peak_to_peak"])
 @pytest.mark.parametrize("baseline_mean_mode", ["sampled", "continuous_time"])
 def test_ap_width_exact_forward_and_voltage_chain_rule(mode, baseline_mean_mode):

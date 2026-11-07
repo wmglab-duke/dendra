@@ -74,7 +74,7 @@ class fire_r_d(VoltageProcess):
             "reset_gate": torch.zeros_like(v),
         }
 
-    def update_v(self, v):
+    def voltage_values(self, v, dt, values):
         threshold = self._tensor_like(self.threshold, v)
         rest = self._tensor_like(self.rest, v)
         refractory = self._tensor_like(self.refractory, v)
@@ -82,9 +82,9 @@ class fire_r_d(VoltageProcess):
         ste = self._tensor_like(self.ste_scale, v)
 
         # ----- Original hard refractory bookkeeping -----
-        still_ref = self.is_refractory
+        still_ref = values["is_refractory"]
         time_refractory = torch.where(
-            still_ref, self.time_refractory - self.dt, self.time_refractory
+            still_ref, values["time_refractory"] - dt, values["time_refractory"]
         )
 
         recovered = still_ref & (time_refractory <= 0)
@@ -93,14 +93,12 @@ class fire_r_d(VoltageProcess):
         can_spike = ~is_refractory_before_spike
         hard_new_spike_bool = can_spike & (v > threshold)
 
-        self.is_refractory = torch.where(
+        is_refractory = torch.where(
             hard_new_spike_bool, True, is_refractory_before_spike
         )
-        self.time_refractory = torch.where(
-            hard_new_spike_bool, refractory, time_refractory
-        )
+        time_refractory = torch.where(hard_new_spike_bool, refractory, time_refractory)
 
-        hard_v = torch.where(self.is_refractory, rest, v)
+        hard_v = torch.where(is_refractory, rest, v)
 
         # ----- Smooth surrogate path for gradients -----
         availability = can_spike.to(dtype=v.dtype)
@@ -110,15 +108,18 @@ class fire_r_d(VoltageProcess):
         # New spikes are possible only outside the hard refractory period.
         soft_spike = voltage_gate * availability
         hard_new_spike = hard_new_spike_bool.to(dtype=v.dtype)
-        self.spike_gate = hard_new_spike + ste * (soft_spike - soft_spike.detach())
+        spike_gate = hard_new_spike + ste * (soft_spike - soft_spike.detach())
 
         # Reset is hard-on during an existing refractory period, otherwise it is
         # driven by the threshold surrogate for a newly triggered spike.
         soft_reset_gate = 1.0 - (1.0 - refractory_before) * (1.0 - soft_spike)
-        hard_reset = self.is_refractory.to(dtype=v.dtype)
-        self.reset_gate = hard_reset + ste * (
-            soft_reset_gate - soft_reset_gate.detach()
-        )
+        hard_reset = is_refractory.to(dtype=v.dtype)
+        reset_gate = hard_reset + ste * (soft_reset_gate - soft_reset_gate.detach())
 
         smooth_v = v + soft_reset_gate * (rest - v)
-        return hard_v.detach() + ste * (smooth_v - smooth_v.detach())
+        return hard_v.detach() + ste * (smooth_v - smooth_v.detach()), {
+            "is_refractory": is_refractory,
+            "time_refractory": time_refractory,
+            "spike_gate": spike_gate,
+            "reset_gate": reset_gate,
+        }

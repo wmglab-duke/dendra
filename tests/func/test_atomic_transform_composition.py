@@ -157,6 +157,7 @@ def test_compile_jacrev_of_atomic_rollout_tracks_every_explicit_source(method):
     )
 
 
+@pytest.mark.slow
 def test_compile_jacfwd_of_atomic_rollout_tracks_geometry_through_preparation():
     _model_value, functional, tensors, ve = _case()
     final_voltage = _atomic_final_voltage(functional, tensors)
@@ -207,6 +208,7 @@ def test_compile_vmap_of_atomic_rollout_matches_eager_torch_func_lanes():
     torch.testing.assert_close(actual, expected, rtol=2.0e-10, atol=2.0e-11)
 
 
+@pytest.mark.slow
 def test_compile_hessian_of_atomic_rollout_matches_eager_torch_func():
     _model_value, functional, tensors, ve = _case()
     final_voltage = _atomic_final_voltage(functional, tensors)
@@ -261,9 +263,12 @@ def test_audit_clone_clock_reference_is_isolated_and_mutation_fails_closed(
         capture_accepted_clock,
     )
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match=r"read-only transition inputs.*positional:t",
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(
+            dn.func.FunctionalizationError,
+            match=r"read-only transition inputs.*positional:t",
+        ),
     ):
         dn.func.make_functional(model, dt=DT)
 

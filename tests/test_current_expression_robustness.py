@@ -207,7 +207,7 @@ def test_symbolic_affine_expression_forms_match_independent_oracles(
 
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)
-def test_shipped_hh_multi_current_conductances_match_autograd(dtype):
+def test_shipped_hh_total_current_conductance_matches_autograd(dtype):
     mechanism = _mechanism(hh, dtype)
     voltage = _voltage(dtype)
     with torch.no_grad():
@@ -215,20 +215,22 @@ def test_shipped_hh_multi_current_conductances_match_autograd(dtype):
         mechanism.h.fill_(0.625)
         mechanism.n.fill_(0.375)
 
-    expected = {
-        "il": mechanism.gl,
-        "ina": mechanism.gnabar * mechanism.m**3 * mechanism.h,
-        "ik": mechanism.gkbar * mechanism.n**4,
-    }
-    for current_name, analytic_conductance in expected.items():
-        current, conductance = getattr(mechanism, f"{current_name}_with_g")(voltage)
-        _assert_close(current, getattr(mechanism, current_name)(voltage))
-        _assert_close(conductance, analytic_conductance.expand_as(voltage))
-        _assert_close(
-            conductance,
-            _autograd_conductance(mechanism, current_name, voltage),
-        )
-        _assert_symbolic_path(mechanism, current_name)
+    expected = (
+        mechanism.gl
+        + mechanism.gnabar * mechanism.m**3 * mechanism.h
+        + mechanism.gkbar * mechanism.n**4
+    )
+    current, conductance = mechanism.i_with_g(voltage)
+    _assert_close(current, mechanism.i(voltage))
+    _assert_close(conductance, expected)
+    _assert_close(conductance, _autograd_conductance(mechanism, "i", voltage))
+    assert mechanism._currents == {"nonspecific": ["i"]}
+    assert mechanism._current_conductance_mode == {"i": "affine"}
+    assert mechanism._current_conductance_fallback_reason == {"i": None}
+    assert mechanism._current_factorable == {"i": True}
+    for name in ("ina", "ik", "il"):
+        assert not hasattr(mechanism, name)
+        assert not hasattr(mechanism, f"{name}_with_g")
 
 
 @pytest.mark.parametrize("dtype", FLOAT_DTYPES)

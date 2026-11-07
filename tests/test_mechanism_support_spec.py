@@ -188,6 +188,46 @@ def test_support_classifier_and_materialization_are_exact(case):
     assert tuple(_materialized(spec, runtime_key).tolist()) == case.expected_flat
 
 
+@pytest.mark.parametrize(
+    "default_device",
+    [
+        "cpu",
+        "meta",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="CUDA is unavailable"
+                ),
+            ],
+        ),
+    ],
+)
+def test_shared_column_key_validation_is_independent_of_default_device(default_device):
+    shared = next(case for case in CASES if case.name == "shared_columns")
+    spec = _spec(shared)
+    key = shared.key.to(device="cuda" if default_device == "cuda" else "cpu")
+    changed = key.roll(1)
+
+    # The meta default reproduces the ambient-device failure without hardware.
+    # A materialized runtime key must still be checked exactly on the host.
+    with torch.device(default_device):
+        spec.validate_runtime_key(key)
+        with pytest.raises(ValueError, match="key no longer matches"):
+            spec.validate_runtime_key(changed)
+
+
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+def test_explicit_materialization_device_overrides_default_device(case):
+    spec = _spec(case)
+    with torch.device("meta"):
+        actual = spec.materialized_flat_indices(runtime_key=case.key, device="cpu")
+
+    assert actual.device.type == "cpu"
+    assert tuple(actual.tolist()) == case.expected_flat
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 def test_structural_support_matches_legacy_batched_gather_and_scatter_add(case):
     """The classifier must be a semantic no-op during the metadata rollout."""

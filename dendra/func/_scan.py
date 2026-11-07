@@ -7,26 +7,46 @@ This module is imported only when a caller requests scan execution.
 
 from __future__ import annotations
 
+from functools import wraps
+
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
+from ..helpers import MEMBRANE_ASSEMBLY
+from ._callback_carry import _CallbackCarryPartition
+from ._callback_recurrence import _transition_sample_values
 from ._callbacks import _update_callback_values
-from ._scan_autograd import guard_scan_outputs
+from ._draws import _has_runtime_stimulation
+from ._hop_inputs import (
+    _input_usage,
+    _isolate_dense_lifted_inputs,
+    _LiftedViewIsolation,
+    _own_runtime_draw_packets,
+    _parameter_input_isolation,
+)
+from ._inputs import _RuntimeInputs
 from ._scan_compat import install_scan_compatibility
-from ._types import StepInput
+from ._scan_inductor import _compile_scan
+from ._scan_tree import _capture_tensor_step, _CompiledTensorTreeScan, _tensor_samples
+from ._tensor_contracts import _clone_contiguous_tree as _clone
 
-
-def _clone(tree):
-    return pytree.tree_map_only(
-        torch.Tensor,
-        lambda value: value.clone(memory_format=torch.contiguous_format),
-        tree,
-    )
+# Bound the inference graph independently of the horizon, while amortizing the
+# scan loop boundary over several accepted timesteps. Keep training's audited
+# one-step partition/save policy. This is private so experiments can compare
+# the small supported widths without adding an execution-policy public API.
+_FORWARD_SCAN_BLOCK = 4
 
 
 def _detach(tree):
     return pytree.tree_map_only(torch.Tensor, lambda value: value.detach(), tree)
+
+
+def _stack_steps(steps):
+    return pytree.tree_map(
+        lambda *values: None if values[0] is None else torch.stack(values, dim=0),
+        *steps,
+    )
 
 
 class _CompiledScanPopulationChunk:
@@ -45,30 +65,195 @@ class _CompiledScanPopulationChunk:
         self._functional = functional
         self._steps = steps
         self._options = compile_options
-        self._stepwise = stepwise_stimulation or plans is not None
+        self._stepwise = stepwise_stimulation
         self._plans = plans
         # Only static graphs/callables belong here, never example operands.
         self._kernels = {}
+        self._training = None
+        self._assemblies = {}
 
-    def _capture(self, parameters, prepared, state, ve, intra, carries):
+    def _training_values(
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries,
+        noise,
+        stimulation,
+        draws=None,
+        sampling_times=None,
+    ):
+        functional = self._functional
+        plans = self._plans
+        # Population parameters are named operands. Stable key order keeps
+        # the shared engine's PyTree schema independent of caller dict order.
+        parameters = {name: parameters[name] for name in sorted(parameters)}
+        stepwise = self._stepwise or _has_runtime_stimulation(stimulation, draws)
+        if not stepwise and (functional.intra.enabled or functional.extra.enabled):
+            signature = (
+                ve is not None,
+                intra is not None,
+                sampling_times is not None,
+                MEMBRANE_ASSEMBLY.value,
+            )
+            if signature not in self._assemblies:
+                steps = self._steps
+
+                def assemble(parameters, prepared, state, ve, intra, sampling_times):
+                    return functional._assemble_bound_inputs(
+                        parameters,
+                        state,
+                        ve,
+                        intra,
+                        steps,
+                        prepared["integrator"]["dt"],
+                        sampling_times=sampling_times,
+                    )
+
+                with torch.inference_mode(False), torch.no_grad():
+                    examples = _detach(
+                        (
+                            parameters,
+                            prepared,
+                            functional._clone_state_tree(state),
+                            ve,
+                            intra,
+                            sampling_times,
+                        )
+                    )
+                    self._assemblies[signature] = make_fx(assemble, pre_dispatch=True)(
+                        *examples
+                    )
+            ve, intra = self._assemblies[signature](
+                parameters, prepared, state, ve, intra, sampling_times
+            )
+
+        if self._training is None:
+            stepwise_stimulation = self._stepwise
+
+            def body(parameters, prepared, state, carries, sample):
+                next_state, auxiliary = _transition_sample_values(
+                    functional,
+                    parameters,
+                    prepared,
+                    state,
+                    _RuntimeInputs(
+                        sample["ve"],
+                        sample["intra"],
+                        sample["noise"],
+                        sample["stimulation"],
+                        sample["draws"],
+                        sample["sampling_time"],
+                    ),
+                    stepwise_stimulation=stepwise_stimulation,
+                )
+                emitted = None
+                if plans is not None:
+                    carries, emitted = _update_callback_values(
+                        plans, carries, next_state, auxiliary
+                    )
+                return (next_state, carries), emitted or {}
+
+            self._training = _CompiledTensorTreeScan(
+                body,
+                steps=self._steps,
+                compile_options=self._options,
+                device=functional.device,
+                plans=plans,
+                static_state_paths=(("control", "duration_remainder"),),
+                clone_state=functional._clone_state_tree,
+                capture_examples=_detach,
+            )
+        final, updated, emitted = self._training(
+            parameters,
+            prepared,
+            state,
+            carries,
+            {
+                "ve": ve,
+                "intra": intra,
+                "noise": noise,
+                "stimulation": stimulation,
+                "draws": draws,
+                "sampling_time": sampling_times,
+            },
+        )
+        auxiliary = {"v": final["integrator"]["v"]}
+        if plans is None:
+            return final, auxiliary
+        return (
+            final,
+            auxiliary,
+            updated,
+            {plan.name: emitted.get(plan.name) for plan in plans},
+        )
+
+    def _capture(
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries,
+        noise,
+        stimulation=None,
+        draws=None,
+        sampling_times=None,
+        *,
+        block=1,
+    ):
+        """Capture the specialized inference scan and its blocked emissions."""
         from torch._higher_order_ops.scan import scan
 
         functional = self._functional
         plans = self._plans
         steps = self._steps
-        stepwise = self._stepwise
-        state = functional._clone_state_tree(state)
-        parameters, prepared, state, ve, intra, carries = _detach(
-            (parameters, prepared, state, ve, intra, carries)
+        stepwise = self._stepwise or _has_runtime_stimulation(stimulation, draws)
+        phase_emissions = (
+            block > 1 and plans is not None and functional.device.type == "cpu"
         )
+        # Detaching capture examples erases the source's Parameter class.
+        # Retain it only until the cold operand policy has been selected.
+        raw_parameters, raw_prepared = parameters, prepared
+        state = functional._clone_state_tree(state)
+        (
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            carries,
+            noise,
+            stimulation,
+            draws,
+            sampling_times,
+        ) = _detach(
+            (
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                carries,
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
+            )
+        )
+        callback_carry = _CallbackCarryPartition.from_plans(plans)
+        carries, invariant_carries = callback_carry.split(carries)
 
-        # Atomic rollout samples a bound waveform on start + arange * dt;
-        # host runners sample it at each accepted, repeatedly added clock.
-        # Preserve both established contracts instead of changing pulse edges.
+        # Host schedules provide their invocation-local sampling tape. Atomic
+        # rollout retains its own grid; single-step replay can omit the tape
+        # to evaluate at the accepted solver clock.
         assembly = None
         if not stepwise and (functional.intra.enabled or functional.extra.enabled):
 
-            def assemble(parameters, prepared, state, ve, intra):
+            def assemble(parameters, prepared, state, ve, intra, sampling_times):
                 return functional._assemble_bound_inputs(
                     parameters,
                     state,
@@ -76,72 +261,269 @@ class _CompiledScanPopulationChunk:
                     intra,
                     steps,
                     prepared["integrator"]["dt"],
+                    sampling_times=sampling_times,
                 )
 
-            assembly = make_fx(assemble)(parameters, prepared, state, ve, intra)
-            ve, intra = assembly(parameters, prepared, state, ve, intra)
+            assembly = make_fx(assemble, pre_dispatch=False)(
+                parameters, prepared, state, ve, intra, sampling_times
+            )
+            ve, intra = assembly(parameters, prepared, state, ve, intra, sampling_times)
 
         sample = {}
         if ve is not None:
             sample["ve"] = ve[0]
         if intra is not None:
             sample["intra"] = intra[0]
-        if not sample:
+        if noise is not None:
+            sample["noise"] = pytree.tree_map_only(
+                torch.Tensor, lambda value: value[0], noise
+            )
+        if stimulation is not None:
+            sample["stimulation"] = pytree.tree_map_only(
+                torch.Tensor, lambda value: value[0], stimulation
+            )
+        if draws is not None:
+            sample["draws"] = pytree.tree_map_only(
+                torch.Tensor, lambda value: value[0], draws
+            )
+        if sampling_times is not None:
+            sample["sampling_time"] = sampling_times[0]
+        if not any(torch.is_tensor(value) for value in pytree.tree_leaves(sample)):
             # Scan requires a leading iteration axis even without input drives.
             sample["index"] = torch.zeros(
                 (), dtype=torch.int64, device=functional.device
             )
 
-        def authored(parameters, prepared, state, carries, sample):
-            if stepwise:
-                next_state, auxiliary = functional._step_values(
-                    parameters,
-                    prepared,
-                    state,
-                    StepInput(sample.get("ve"), sample.get("intra")),
-                )
-            else:
-                next_state, auxiliary = functional._transition_rollout_values(
-                    parameters,
-                    prepared,
-                    state,
-                    None if "ve" not in sample else sample["ve"].unsqueeze(0),
-                    None if "intra" not in sample else sample["intra"].unsqueeze(0),
-                    1,
-                )
+        def authored(parameters, prepared, state, carries, invariant_carries, sample):
+            next_state, auxiliary = _transition_sample_values(
+                functional,
+                parameters,
+                prepared,
+                state,
+                _RuntimeInputs(
+                    sample.get("ve"),
+                    sample.get("intra"),
+                    sample.get("noise"),
+                    sample.get("stimulation"),
+                    sample.get("draws"),
+                    sample.get("sampling_time"),
+                ),
+                stepwise_stimulation=stepwise,
+            )
             emitted = None
             if plans is not None:
-                carries, emitted = _update_callback_values(
-                    plans, carries, next_state, auxiliary
+                updated, emitted = _update_callback_values(
+                    plans,
+                    callback_carry.merge(carries, invariant_carries),
+                    next_state,
+                    auxiliary,
                 )
-            # Unchanged clocks, reducers and Recorder views must not alias the
-            # incoming carry or another output of the scan body.
-            return _clone((next_state, carries)), _clone(emitted or {})
+                carries, _ = callback_carry.split(updated)
+            if block == 1:
+                # Keep the established single-step body/partition boundaries.
+                # Unchanged clocks, reducers and Recorder views must not alias
+                # the incoming carry or another output of the scan body.
+                return _clone((next_state, carries)), _clone(emitted or {})
+            # Intermediate inference steps are ordinary pure transitions;
+            # scan's non-aliasing contract applies at the block boundary.
+            return (next_state, carries), emitted or {}
 
-        graph = make_fx(authored)(parameters, prepared, state, carries, sample)
+        # Inference does not differentiate this captured graph. Training's
+        # authored AD boundaries belong to the shared tensor-tree engine.
+        graph = _capture_tensor_step(
+            authored,
+            (parameters, prepared, state, carries, invariant_carries, sample),
+            grad_enabled=False,
+            tracer=make_fx,
+        )
+        parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
+            graph, (parameters, prepared, state, carries, invariant_carries, sample)
+        )
+        sample_use = pytree.tree_map(lambda _value: True, sample_use)
+        isolate_views = _LiftedViewIsolation.from_usage(
+            (
+                parameter_use,
+                prepared_use,
+                invariant_use,
+                sample_use.get("ve", False),
+                sample_use.get("intra", False),
+                sample_use.get("noise", False),
+                sample_use.get("stimulation", False),
+                sample_use.get("draws", False),
+                sample_use.get("sampling_time", False),
+            )
+        )
+        if isinstance(graph, torch.fx.GraphModule):
+            isolate_views = _parameter_input_isolation(
+                isolate_views,
+                (
+                    raw_parameters,
+                    raw_prepared,
+                    invariant_carries,
+                    ve,
+                    intra,
+                    noise,
+                    stimulation,
+                    draws,
+                    sampling_times,
+                ),
+            )
 
-        def execute(parameters, prepared, state, ve, intra, carries):
-            if assembly is not None:
-                ve, intra = assembly(parameters, prepared, state, ve, intra)
+        def execute(
+            parameters,
+            prepared,
+            state,
+            ve,
+            intra,
+            carries,
+            noise,
+            stimulation=None,
+            draws=None,
+            sampling_times=None,
+        ):
+            carries, invariant_carries = callback_carry.split(carries)
+            (
+                parameters,
+                prepared,
+                invariant_carries,
+                ve,
+                intra,
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
+            ) = _isolate_dense_lifted_inputs(
+                (
+                    parameters,
+                    prepared,
+                    invariant_carries,
+                    ve,
+                    intra,
+                    noise,
+                    stimulation,
+                    draws,
+                    sampling_times,
+                )
+            )
             samples = {}
             if ve is not None:
                 samples["ve"] = ve
             if intra is not None:
                 samples["intra"] = intra
-            if not samples:
+            if noise is not None:
+                samples["noise"] = noise
+            if stimulation is not None:
+                samples["stimulation"] = stimulation
+            if draws is not None:
+                samples["draws"] = draws
+            if sampling_times is not None:
+                samples["sampling_time"] = sampling_times
+            if not any(torch.is_tensor(value) for value in pytree.tree_leaves(samples)):
                 samples["index"] = torch.arange(
                     steps, dtype=torch.int64, device=functional.device
                 )
 
-            def combine(carry, sample):
-                state, carries = carry
-                return graph(parameters, prepared, state, carries, sample)
-
-            (final, updated), emitted = scan(
-                combine,
-                (functional._clone_state_tree(state), _clone(carries)),
-                samples,
+            flat_samples, sample_layout = _tensor_samples(
+                samples, steps, functional.device
             )
+
+            def unpack_sample(values):
+                spec, positions = sample_layout
+                return pytree.tree_unflatten(
+                    [None if index is None else values[index] for index in positions],
+                    spec,
+                )
+
+            if block == 1:
+
+                def combine(carry, sample):
+                    sample = unpack_sample(sample)
+                    state, carries = carry
+                    return graph(
+                        parameters, prepared, state, carries, invariant_carries, sample
+                    )
+
+                (final, updated), emitted = scan(
+                    combine,
+                    (state, carries),
+                    flat_samples,
+                )
+            else:
+                full_steps = (steps // block) * block
+                carry = (state, carries)
+
+                def combine(carry, samples):
+                    emissions = []
+                    for offset in range(block):
+                        sample = unpack_sample(
+                            pytree.tree_map_only(
+                                torch.Tensor, lambda value: value[offset], samples
+                            )
+                        )
+                        carry, emission = graph(
+                            parameters, prepared, *carry, invariant_carries, sample
+                        )
+                        emissions.append(emission)
+                    # Each stack owns its storage, including when callbacks
+                    # emit state views or the same Tensor in several leaves.
+                    # Carry clones also separate unchanged reducers/clocks.
+                    if phase_emissions:
+                        # The extra singleton step axis separates recording
+                        # output metadata from identical final-carry values.
+                        # Copy each accepted frame, not a four-frame block.
+                        phases = tuple(
+                            pytree.tree_map_only(
+                                torch.Tensor,
+                                lambda value: value.unsqueeze(0).clone(
+                                    memory_format=torch.contiguous_format
+                                ),
+                                emission,
+                            )
+                            for emission in emissions
+                        )
+                        return _clone(carry), phases
+                    return _clone(carry), _stack_steps(emissions)
+
+                blocked_samples = pytree.tree_map_only(
+                    torch.Tensor,
+                    lambda value: value[:full_steps].reshape(
+                        full_steps // block, block, *value.shape[1:]
+                    ),
+                    flat_samples,
+                )
+                carry, emitted = scan(combine, carry, blocked_samples)
+                if not phase_emissions:
+                    emitted = pytree.tree_map_only(
+                        torch.Tensor, lambda value: value.flatten(0, 1), emitted
+                    )
+
+                # At most block-1 authored steps. Short horizons reduce the
+                # effective block width before capture, retaining a real scan.
+                tail = []
+                for index in range(full_steps, steps):
+                    sample = unpack_sample(
+                        pytree.tree_map_only(
+                            torch.Tensor, lambda value: value[index], flat_samples
+                        )
+                    )
+                    carry, emission = graph(
+                        parameters, prepared, *carry, invariant_carries, sample
+                    )
+                    tail.append(emission)
+                if tail:
+                    tail = _stack_steps(tail)
+                    if not phase_emissions:
+                        emitted = pytree.tree_map(
+                            lambda prefix, suffix: None
+                            if prefix is None
+                            else torch.cat((prefix, suffix), dim=0),
+                            emitted,
+                            tail,
+                        )
+                    carry = _clone(carry)
+                elif phase_emissions:
+                    tail = None
+                final, updated = carry
             # Scan's AD wrapper marks every floating output differentiable.
             # Timesteps never change host scheduling carry, which must remain
             # gradient-free for duration validation and exact resumed runs.
@@ -149,6 +531,8 @@ class _CompiledScanPopulationChunk:
                 "duration_remainder"
             ].clone()
             auxiliary = {"v": final["integrator"]["v"]}
+            if phase_emissions:
+                return final, updated, emitted, tail
             if plans is None:
                 return final, auxiliary
             return (
@@ -158,28 +542,184 @@ class _CompiledScanPopulationChunk:
                 {plan.name: emitted.get(plan.name) for plan in plans},
             )
 
-        return torch.compile(execute, **self._options)
+        compiled = _compile_scan(
+            execute,
+            self._options,
+            prefer_cpp_wrapper=functional.device.type == "cpu",
+        )
 
-    def __call__(self, parameters, prepared, state, ve, intra, carries=None):
-        signature = (ve is not None, intra is not None)
-        if signature not in self._kernels:
-            # Capture a differentiable tensor program using disposable detached
-            # examples, even when first called under inference_mode/no_grad.
-            with torch.inference_mode(False), torch.no_grad():
-                self._kernels[signature] = self._capture(
-                    parameters,
-                    prepared,
-                    state,
-                    ve,
-                    intra,
-                    {} if carries is None else carries,
-                )
-        result = self._kernels[signature](
+        @wraps(compiled)
+        def materialize(
             parameters,
             prepared,
             state,
             ve,
             intra,
-            {} if carries is None else carries,
-        )
-        return guard_scan_outputs(result)
+            carries,
+            noise,
+            stimulation=None,
+            draws=None,
+            sampling_times=None,
+        ):
+            if assembly is not None:
+                ve, intra = assembly(
+                    parameters, prepared, state, ve, intra, sampling_times
+                )
+            recurrent, invariant = callback_carry.split(carries)
+            (
+                parameters,
+                prepared,
+                invariant,
+                ve,
+                intra,
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
+            ) = isolate_views(
+                (
+                    parameters,
+                    prepared,
+                    invariant,
+                    ve,
+                    intra,
+                    noise,
+                    stimulation,
+                    draws,
+                    sampling_times,
+                )
+            )
+            # The recurrence already owns these leaves. Establish ownership
+            # before Dynamo sees their public aliases, offsets or inference
+            # flags, rather than specializing on metadata discarded by clone.
+            with torch.inference_mode(False), torch.no_grad():
+                state = functional._clone_state_tree(state)
+                recurrent = _clone(recurrent)
+            result = compiled(
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                callback_carry.merge(recurrent, invariant),
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
+            )
+            if not phase_emissions and not callback_carry.invariant_names:
+                return result
+            if phase_emissions:
+                final, updated, phases, tail = result
+                if callback_carry.invariant_names:
+                    updated = _clone(
+                        callback_carry.restore_invariants(updated, carries)
+                    )
+                # Each phase history is (blocks, 1, *sample_shape). Interleave
+                # once outside the hot compiled loop, in accepted-clock order.
+                emitted = pytree.tree_map(
+                    lambda *values: None
+                    if values[0] is None
+                    else torch.cat(values, dim=1).flatten(0, 1),
+                    *phases,
+                )
+                if tail is not None:
+                    emitted = pytree.tree_map(
+                        lambda prefix, suffix: None
+                        if prefix is None
+                        else torch.cat((prefix, suffix), dim=0),
+                        emitted,
+                        tail,
+                    )
+                return (
+                    final,
+                    {"v": final["integrator"]["v"]},
+                    updated,
+                    {plan.name: emitted.get(plan.name) for plan in plans},
+                )
+            final, auxiliary, updated, emitted = result
+            updated = _clone(callback_carry.restore_invariants(updated, carries))
+            return final, auxiliary, updated, emitted
+
+        return materialize
+
+    def __call__(
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries=None,
+        noise=None,
+        stimulation=None,
+        draws=None,
+        sampling_times=None,
+    ):
+        carries = {} if carries is None else carries
+        if torch.is_grad_enabled():
+            result = self._training_values(
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                carries,
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
+            )
+        else:
+            draws = _own_runtime_draw_packets(draws)
+            # Preserve the measured CPU inference block/phase-recording path.
+            block = _FORWARD_SCAN_BLOCK if self._functional.device.type == "cpu" else 1
+            if type(block) is not int or block not in (1, 2, 4):
+                raise ValueError("the private forward scan block must be 1, 2, or 4")
+            block = min(block, self._steps)
+            signature = (
+                ve is not None,
+                intra is not None,
+                noise is not None,
+                stimulation is not None,
+                draws is not None,
+                sampling_times is not None,
+                _has_runtime_stimulation(stimulation, draws),
+                MEMBRANE_ASSEMBLY.value,
+                block,
+            )
+            if signature not in self._kernels:
+                with torch.inference_mode(False), torch.no_grad():
+                    self._kernels[signature] = self._capture(
+                        parameters,
+                        prepared,
+                        state,
+                        ve,
+                        intra,
+                        carries,
+                        noise,
+                        stimulation,
+                        draws,
+                        sampling_times,
+                        block=block,
+                    )
+            result = self._kernels[signature](
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                carries,
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
+            )
+        # Scan's AD wrapper marks floating carry outputs differentiable even
+        # when their authored update is detached. Runtime NOISE retains its
+        # native stop-gradient boundary when exposed as public carry. Poisson
+        # event times and generator frames retain the same detached contract.
+        for name in ("runtime_noise", "stimulation"):
+            if name in result[0]:
+                result[0][name] = _detach(result[0][name])
+        return result

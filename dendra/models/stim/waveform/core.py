@@ -8,76 +8,45 @@ import torch
 from dendra.models.parametric import SimpleParameterized
 
 from ._gates import _rect_gate
+from ._poisson import (
+    POISSON_EVENT_SLOTS,
+    POISSON_INVOCATION_POSITION,
+    POISSON_INVOCATION_STACK,
+    evaluate_poisson_schedule,
+    poisson_interval_from_uniform,
+    poisson_invocation_schedule,
+    poisson_schedule_from_draws,
+    restore_pending_poisson_rng,
+    sample_poisson_draws,
+)
 
 
 class Waveform(SimpleParameterized):
-    """
-    Base class for creating waveform generators.
+    """A parameterized temporal waveform evaluated at times in milliseconds.
 
-    This abstract class provides the foundation for implementing various types of
-    waveforms (like sine waves, rectangular pulses, etc.) that can be used for
-    neural stimulation. It inherits from torch.nn.Module.
+    Declare subclass parameters with ``Waveform.PARAMETER`` and implement
+    :meth:`fn`. Call the instance, for example ``waveform(t)``, so registered
+    PyTorch hooks are honored. Waveform outputs use time as the final axis;
+    parameters can add leading batch or stimulus dimensions through broadcasting.
 
     Parameters
     ----------
-    **kwargs : dict
-        Parameter values to initialize the waveform. These are passed to
-        the Parameterized class's instantiate_parameters method. These parameters
-        should be defined in subclasses using the PARAMETER class method. These parameters
-        can be scalars or tensors, allowing for flexible waveform definitions. They will
-        be automatically broadcasted to match the shape of the input time tensor `t`
-        when the waveform is evaluated. All parameters are accessible as attributes of the waveform instance.
+    **kwargs
+        Values for parameters declared by the concrete waveform class.
 
     Notes
     -----
-    When subclassing Waveform, you need to:
-        1. Define parameters using the PARAMETER class method
-        2. Implement the fn(t) method to define the waveform's behavior
+    Waveforms support addition, subtraction, multiplication, and division with
+    other waveforms or numerical constants. :meth:`repeat` and :meth:`poisson`
+    create repeated event trains without changing the original waveform.
+    Amplitude units follow the target: intracellular current in mA, or the
+    amplitude that makes an extracellular field-waveform product mV.
 
-    Custom subclasses used by :mod:`dendra.func` must additionally declare
-    ``FUNCTIONAL_PURE = True`` on each concrete class.  This is a promise that
-    evaluating the waveform is deterministic and does not mutate registered
-    tensors, Python instance state, or random-number-generator state. Functional
-    lowering audits the declaration and fails closed when it cannot establish a
-    safe contract. The default is ``False`` so purity is never inherited by
-    accident when a subclass changes behavior.
-
-    Examples
-    --------
-    Creating a custom triangular wave:
-
-    >>> import torch
-    >>> from dendra.models.stim.waveform.core import Waveform
-    >>>
-    >>> class triangle(Waveform):
-    ...     '''Triangular waveform generator'''
-    ...     FUNCTIONAL_PURE = True
-    ...     Waveform.PARAMETER(amp=1.0, freq=1.0, delay=0.0)
-    ...
-    ...     def fn(self, t):
-    ...         t_adjusted = t - self.delay
-    ...         period = 1.0 / self.freq
-    ...         phase = torch.fmod(t_adjusted, period) / period
-    ...         tri = 2 * torch.abs(2 * phase - 1) - 1
-    ...         return self.amp * torch.where(t >= self.delay, tri, 0.0)
-    >>>
-    >>> # Using the custom waveform
-    >>> waveform = triangle(amp=2.0, freq=5.0)
-    >>> t = torch.linspace(0, 1, 100)
-    >>> values = waveform(t)
-
-    Waveform arithmetic:
-
-    You can perform arithmetic operations with waveforms. For example, you can add two waveforms together or add a constant to a waveform:
-
-    >>> w1 = triangle(amp=1.0, freq=2.0)
-    >>> w2 = triangle(amp=0.5, freq=2.0)
-    >>> w_sum = w1 + w2
-    >>> w_const = w1 + 3.0
-
-    This will create new waveform instances representing the sum of the two waveforms and the waveform with a constant added, respectively.
-    Arithmetic operations supported include addition (+), subtraction (-), multiplication (*), and division (/).
-
+    Custom deterministic waveforms used in functional execution must not mutate
+    module state or consume implicit randomness. This contract is trusted by
+    default. ``dn.ctx(CHECK_PURITY=True)`` enables diagnostics and requires an
+    explicit ``FUNCTIONAL_PURE = True`` declaration on each authored concrete
+    class. Poisson wrappers use Dendra's explicit sampling protocol.
     """
 
     FUNCTIONAL_PURE = False
@@ -117,7 +86,22 @@ class Waveform(SimpleParameterized):
         raise NotImplementedError
 
     def forward(self, t):
-        return self.fn(torch.as_tensor(t))
+        # An ambient default-device context must not relocate a supplied grid.
+        """Evaluate :meth:`fn` on a Tensor time grid in milliseconds.
+
+        Parameters
+        ----------
+        t : Tensor or array-like
+            Evaluation times. A Tensor keeps its device; broadcasting within ``fn``
+            determines the result's leading dimensions.
+
+        Returns
+        -------
+        torch.Tensor
+            Waveform samples with time on the final axis.
+        """
+        device = t.device if torch.is_tensor(t) else None
+        return self.fn(torch.as_tensor(t, device=device))
 
     def repeat(
         self, freq: float, delay: float = 0.0, off: float = torch.inf, *, tau=0.01
@@ -194,6 +178,20 @@ class Waveform(SimpleParameterized):
         )
 
     def assemble(self, start, end, dt):
+        """Evaluate this waveform on the endpoint-exclusive grid ``[start, end)``.
+
+        Parameters
+        ----------
+        start, end : float
+            Time bounds in milliseconds.
+        dt : float
+            Time spacing in milliseconds.
+
+        Returns
+        -------
+        torch.Tensor
+            Samples on a grid using the waveform's parameter or buffer device/dtype.
+        """
         ref = next(self.parameters(), None)
         if ref is None:
             ref = next(self.buffers(), torch.empty(()))
@@ -513,6 +511,13 @@ class Product(Waveform):
         return super().__truediv__(other)
 
 
+def _poisson_randomization_policy(waveform):
+    """Return the authored policy across native and pure execution adapters."""
+    return isinstance(waveform, _randomized_poisson) or getattr(
+        waveform, "_functional_poisson_recipe", False
+    )
+
+
 class _poisson(Waveform):
     """
     Wrap a single-waveform generator so that it is emitted at
@@ -550,7 +555,9 @@ class _poisson(Waveform):
     def randomize_every_call(self) -> bool:
         """Whether evaluation regenerates the schedule before every call."""
 
-        return isinstance(self, _randomized_poisson)
+        # Pure execution selects a fresh explicit schedule on each call while
+        # keeping generator dispatch outside the numerical waveform recipe.
+        return _poisson_randomization_policy(self)
 
     @randomize_every_call.setter
     def randomize_every_call(self, enabled: bool) -> None:
@@ -623,26 +630,37 @@ class _poisson(Waveform):
         if self.noise == 0.0:
             # perfectly regular
             return self.interval
-        # exponential sample (mean = interval)
-        u = torch.rand((), generator=gen, device=gen.device)  # uniform (0,1)
-        exp_sample = -u.log() * self.interval  # Exp(λ=1/interval)
-        return (1.0 - self.noise) * self.interval + self.noise * exp_sample.item()
+        u = torch.rand((), generator=gen, device=gen.device)
+        return poisson_interval_from_uniform(
+            u, interval=self.interval, noise=self.noise
+        ).item()
 
     def _make_schedule(self, gen: torch.Generator) -> torch.Tensor:
         """Generate all spike onset times once, store as buffer."""
-        times = []
-        t = self.start
-        k = 0
-        while t < self.off and (self.n is None or k < self.n):
-            times.append(t)
-            t += self._next_dt(gen)
-            k += 1
-        if not times:  # handle edge‑case: no spikes at all
-            times.append(torch.inf)
+        initialization = vars(self).get("_native_initialization_draws")
+        if initialization is not None:
+            return initialization.poisson_schedule(self, gen)
+        restore_pending_poisson_rng(self)
+        draws, count = sample_poisson_draws(
+            interval=self.interval,
+            n=self.n,
+            start=self.start,
+            noise=self.noise,
+            off=self.off,
+            generator=gen,
+        )
         ref = next(self.waveform.parameters(), None)
         if ref is None:
             ref = next(self.waveform.buffers(), torch.empty(()))
-        return torch.tensor(times, device=ref.device, dtype=ref.dtype)
+        return poisson_schedule_from_draws(
+            draws[:count],
+            interval=self.interval,
+            start=self.start,
+            noise=self.noise,
+            off=self.off,
+            device=ref.device,
+            dtype=ref.dtype,
+        )
 
     def regenerate_schedule_(self) -> None:
         schedule = self._make_schedule(self.generator)
@@ -675,11 +693,16 @@ class _poisson(Waveform):
         # Evaluate each onset independently so the spike axis can never alias a
         # population, compartment, oscillator-component, or other leading axis
         # of the wrapped waveform merely because their lengths happen to match.
-        responses = [
-            self.waveform.fn(t - onset.unsqueeze(-1))
-            for onset in self._spike_times.unbind(dim=0)
-        ]
-        return torch.stack(responses, dim=0).sum(dim=0)
+        schedule = self._spike_times
+        invocations = getattr(self, POISSON_INVOCATION_STACK, None)
+        if invocations is not None and invocations.shape[0]:
+            position = getattr(self, POISSON_INVOCATION_POSITION)
+            schedule, following = poisson_invocation_schedule(invocations, position)
+            position.copy_(following)
+        event_slots = getattr(self, POISSON_EVENT_SLOTS, None)
+        if event_slots is not None:
+            schedule = schedule[:event_slots]
+        return evaluate_poisson_schedule(self.waveform.fn, t, schedule)
 
     def __repr__(self):
         return f"Poisson({self.waveform}, interval={self.interval}, noise={self.noise})"
@@ -704,5 +727,9 @@ class _randomized_poisson(_poisson):
         self.randomize_every_call = True
 
     def fn(self, t: torch.Tensor) -> torch.Tensor:
-        self.regenerate_schedule_()
+        replay = getattr(self, "_native_poisson_replay", None)
+        if replay is None:
+            self.regenerate_schedule_()
+        else:
+            replay.consume(self)
         return super().fn(t)

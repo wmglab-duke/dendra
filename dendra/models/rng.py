@@ -13,6 +13,49 @@ _UINT64_MASK = (1 << 64) - 1
 _MIN_MANUAL_SEED = -(1 << 63)
 
 
+def should_restore_rng(*, policy: str, ignore_rng_on_load: bool = False) -> bool:
+    """Choose whether a saved RNG frame owns a restoration boundary.
+
+    Model and cache loads respect ``ignore_rng_on_load``. Runtime checkpoint
+    continuation restores the saved stream regardless of that preference.
+    This predicate also applies to explicit functional RNG tensor frames.
+    """
+    if policy not in {"cache", "checkpoint"}:
+        raise ValueError("RNG restoration policy must be 'cache' or 'checkpoint'.")
+    return policy == "checkpoint" or not ignore_rng_on_load
+
+
+def _snapshot_rng_lifecycle(module):
+    """Retain physical sampler handles for an enclosing checkpoint transaction.
+
+    Module traversal deduplicates shared streams. The existing serialized
+    checkpoint owns seed and generator bytes; these records retain only the
+    bindings that a successful inner restore can replace or evict.
+    """
+    return tuple(
+        (
+            rng,
+            rng._cpu_gen,
+            dict(rng._device_gens),
+            "rng" in vars(rng),
+            vars(rng).get("rng"),
+        )
+        for rng in module.modules()
+        if isinstance(rng, RNGMixin)
+    )
+
+
+def _restore_rng_lifecycle(snapshot):
+    """Rebind original handles before replaying the preceding checkpoint."""
+    for rng, cpu_generator, device_generators, has_active, active in snapshot:
+        rng._cpu_gen = cpu_generator
+        rng._device_gens = dict(device_generators)
+        if has_active:
+            rng.rng = active
+        else:
+            vars(rng).pop("rng", None)
+
+
 def _device_seed(base_seed: int, device: torch.device) -> int:
     """Derive a stable uint64 seed for a non-CPU device generator."""
     device_type = zlib.crc32(device.type.encode("utf-8"))
@@ -168,12 +211,13 @@ class RNGMixin(nn.Module):
         self._ignore_rng_on_load = False
 
     def ignore_rng_on_load(self, ignore: bool = True) -> None:
-        """Toggle restoration of RNG state when loading a checkpoint.
+        """Toggle RNG restoration for model and initialization-cache loads.
 
         Parameters
         ----------
         ignore : bool, optional
             If ``True``, RNG state is ignored during :meth:`load_state_dict`.
+            Explicit runtime checkpoint restoration retains its saved stream.
         """
         self._ignore_rng_on_load = ignore
 
@@ -243,7 +287,19 @@ class RNGMixin(nn.Module):
             if generator is not None:
                 generator.set_state(device_state)
 
+        self._device_gens = {
+            device: generator
+            for device, generator in self._device_gens.items()
+            if str(device) in state
+        }
         self._device_gens.update(prepared_generators)
+        active = getattr(self, "rng", None)
+        if (
+            active is not None
+            and active is not self._cpu_gen
+            and all(active is not generator for generator in self._device_gens.values())
+        ):
+            self.rng = None
         # ``state`` is a complete snapshot. Do not retain deferred states from
         # an older snapshot that are absent from this one.
         self._pending_device_states = pending_states
@@ -259,12 +315,16 @@ class RNGMixin(nn.Module):
         validated = _validate_rng_state(state)
         previous_state = self.rng_state()
         previous_generators = self._device_gens.copy()
+        missing = object()
+        previous_active = getattr(self, "rng", missing)
         try:
             self._apply_validated_rng_state(validated)
         except Exception:
             self._device_gens = previous_generators
             try:
                 self._apply_validated_rng_state(previous_state)
+                if previous_active is not missing:
+                    self.rng = previous_active
             except Exception as rollback_error:
                 raise RuntimeError(
                     "RNG-state restoration failed and rollback could not recover "
@@ -291,25 +351,45 @@ class RNGMixin(nn.Module):
         extra_state : Mapping
             Serialized dictionary containing RNG state and base seed.
         """
-        if self._ignore_rng_on_load:
+        self.restore_rng_checkpoint(extra_state, policy="cache")
+
+    def restore_rng_checkpoint(
+        self, payload, *, policy: str = "checkpoint", allow_legacy: bool = False
+    ) -> None:
+        """Restore seed and generator suffix under an explicit load policy.
+
+        ``cache`` honors :meth:`ignore_rng_on_load` before inspecting the
+        payload. ``checkpoint`` restores exact continuation independently of
+        that flag. With ``allow_legacy=True``, a raw device-state mapping keeps
+        the current base seed. Failed restores recover the preceding frame.
+        """
+        if not should_restore_rng(
+            policy=policy,
+            ignore_rng_on_load=getattr(self, "_ignore_rng_on_load", False),
+        ):
             return
         base_seed, rng_state = _validate_rng_checkpoint_payload(
-            extra_state, allow_legacy=False
+            payload, allow_legacy=allow_legacy
         )
         previous_seed = self._base_seed
         previous_state = self.rng_state()
         previous_generators = self._device_gens.copy()
+        missing = object()
+        previous_active = getattr(self, "rng", missing)
         try:
-            self.reseed(base_seed)
+            if base_seed is not None:
+                self.reseed(base_seed)
             self._apply_validated_rng_state(rng_state)
         except Exception:
             self._device_gens = previous_generators
+            self._base_seed = previous_seed
             try:
-                self.reseed(previous_seed)
                 self._apply_validated_rng_state(previous_state)
+                if previous_active is not missing:
+                    self.rng = previous_active
             except Exception as rollback_error:
                 raise RuntimeError(
-                    "RNG extra-state restoration failed and rollback could not "
+                    "RNG checkpoint restoration failed and rollback could not "
                     "recover the previous generator state."
                 ) from rollback_error
             raise
@@ -357,6 +437,34 @@ class RNGModule(RNGMixin):
         self.shape_p = shape_p
         self.shape_f = shape_f
         self.rng = None
+
+    @classmethod
+    def from_checkpoint(cls, payload, *, shape_p=(), shape_f=()):
+        """Construct an isolated host sampler from explicit generator metadata.
+
+        Sampling the returned module changes neither the source checkpoint nor
+        any live model RNG. Device generators retain their saved byte states;
+        missing devices derive their stream from the saved base seed.
+        """
+        base_seed, state = _validate_rng_checkpoint_payload(payload, allow_legacy=False)
+        module = cls(base_seed, shape_p=shape_p, shape_f=shape_f)
+        module._apply_validated_rng_state(state)
+        return module
+
+    def reseed_for_generation(self, generation):
+        """Reset once at the first initialization request sharing this RNG.
+
+        A missing generation denotes manual sampling and does not reset the
+        stream. Other declarations sharing this RNG continue in Native order.
+        """
+        if generation is None:
+            return False
+        previous = getattr(self, "_random_parameter_reseed_generation", None)
+        if previous is generation or previous == generation:
+            return False
+        self.reset()
+        self._random_parameter_reseed_generation = generation
+        return True
 
     def init(self, device: torch.device | str | None = None):
         """Initialize the RNG for a specific device."""

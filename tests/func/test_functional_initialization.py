@@ -12,6 +12,14 @@ from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.mechanisms import Mechanism
 from dendra.models.mod import hh, pas
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.01
 AM1 = "integrator.mech.mechanisms.hh.DE.mhn.am1_param"
 GNABAR = "integrator.mech.mechanisms.hh.gnabar_param"
@@ -27,7 +35,7 @@ pytestmark = [
 
 
 class _RandomCurrent(Mechanism):
-    """Unsupported random initializer used to exercise the admission boundary."""
+    """Declared random initializer with explicit functional base draws."""
 
     Mechanism.GLOBALRAND(
         "sample",
@@ -124,7 +132,23 @@ def _assert_tensor_snapshot(tensor, snapshot):
     assert id(tensor) == identity
     assert tensor.untyped_storage().data_ptr() == storage
     assert tensor._version == version
-    torch.testing.assert_close(tensor, value, rtol=0.0, atol=0.0)
+    assert tensor.shape == value.shape
+    assert tensor.dtype == value.dtype
+    assert tensor.device == value.device
+    # Purity means unchanged bits, including any unprepared workspace bytes.
+    # Numeric equality would reject unchanged NaNs in torch.empty scratch and
+    # would miss changes to NaN payloads or the sign of zero.
+    torch.testing.assert_close(
+        tensor.detach()
+        .reshape(-1)
+        .clone(memory_format=torch.contiguous_format)
+        .view(torch.uint8),
+        value.reshape(-1)
+        .clone(memory_format=torch.contiguous_format)
+        .view(torch.uint8),
+        rtol=0.0,
+        atol=0.0,
+    )
 
 
 def _module_snapshot(module):
@@ -522,20 +546,17 @@ def test_initialize_rechecks_source_initialization_semantics_after_lowering(muta
         )
 
 
-def test_initialize_fails_closed_for_a_cached_steady_state():
+def test_initialize_restores_a_population_owned_steady_state():
     model = _model("sc")
     model.cache("_steady_state")
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match=r"steady.state|steady state",
-    ):
-        functional, tensors = dn.func.make_functional(model, dt=DT)
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    initialized = functional.initialize(
+        tensors.parameters, tensors.constants, tensors.initialization
+    )
+    model.initialize()
+    _assert_tree_close(initialized.state, functional.extract(model).state)
+    assert initialized.constants["cache.active"].item()
 
 
 def test_initialize_rechecks_a_derived_buffer_builder_after_lowering():
@@ -555,19 +576,25 @@ def test_initialize_rechecks_a_derived_buffer_builder_after_lowering():
         )
 
 
-def test_initialize_fails_closed_for_random_parameters():
+def test_initialize_consumes_explicit_random_draws_without_changing_the_source():
     model = _model("sc", mechanism=_RandomCurrent)
-
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match=r"random parameters|_random_parameters",
-    ):
-        functional, tensors = dn.func.make_functional(model, dt=DT)
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
+    native = _model("sc", mechanism=_RandomCurrent)
+    source_snapshot = _module_snapshot(model)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    draw = functional.sample_initialization_draw(tensors.parameters, tensors.state)
+    initialized = functional.initialize(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization._replace(random_draw=draw),
+        state=tensors.state,
+    )
+    native.initialize()
+    _assert_tree_close(initialized.state, functional.extract(native).state)
+    key = "random.values.integrator.mech.mechanisms._RandomCurrent.sample"
+    torch.testing.assert_close(
+        initialized.constants[key], native.mech._RandomCurrent.sample
+    )
+    _assert_module_snapshot(model, source_snapshot)
 
 
 def test_initializer_supports_stateless_mechanisms_without_special_cases():

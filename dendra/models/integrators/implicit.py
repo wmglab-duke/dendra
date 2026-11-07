@@ -13,6 +13,9 @@ except ImportError:
     dendra_solvers = None
     DENDRA_SOLVERS_AVAILABLE = False
 
+from ._cuda_functional import pcr_solve as _functional_pcr_solve
+from ._cuda_functional import thomas_solve as _functional_thomas_solve
+from ._native import _mps_solver_available
 from .cable import (
     _layered_edge_conductance,
     unbranched_edge_conductance,
@@ -27,13 +30,55 @@ from .core import (
     _model_solve_shape,
     ensure_model_buffer,
 )
-from .tridiag import pcr_solve_t
+from .tridiag import pcr_solve_parallel_t, pcr_solve_t
 from .tridiag.block import block_pcr_solve_t
 from .triton import (
     pcr_solve_cuda_t,
     solve_bt_spd_cuda_consume_unchecked,
     thomas_solve_cuda_bt,
     thomas_solve_cuda_t,
+)
+
+# Older solver packages expose identically named reverse-only SPD wrappers.
+# Admit only the framework-owned pure facades that declare the transform
+# contract, and retain their identities when validating a configured solver.
+_FUNCTIONAL_SCALAR_SPD = getattr(dendra_solvers, "solve_tri_spd", None)
+if not getattr(_FUNCTIONAL_SCALAR_SPD, "_DENDRA_FUNC_COMPATIBLE", False):
+    _FUNCTIONAL_SCALAR_SPD = None
+_FUNCTIONAL_BLOCK_SPD = getattr(dendra_solvers, "solve_bt_spd", None)
+if not getattr(_FUNCTIONAL_BLOCK_SPD, "_DENDRA_FUNC_COMPATIBLE", False):
+    _FUNCTIONAL_BLOCK_SPD = None
+_NATIVE_BLOCK_SPD_CONSUME = getattr(
+    dendra_solvers, "solve_bt_spd_consume_unchecked", None
+)
+
+# Only exact, framework-owned Thomas/PCR solves are authorized to receive a
+# voltage-increment RHS. A custom callable keeps its historical absolute-RHS
+# contract, even when it shares a standard solver's name or wrapped metadata.
+# Capture identities once, so a later monkeypatch cannot authorize itself.
+_BWD_EULER_INCREMENT_SOLVERS = tuple(
+    solve
+    for solve in (
+        pcr_solve_t,
+        pcr_solve_parallel_t,
+        pcr_solve_cuda_t,
+        thomas_solve_cuda_t,
+        _functional_pcr_solve,
+        _functional_thomas_solve,
+        (
+            getattr(torch.ops.dendra_solvers, "thomas_solve_t", None)
+            if DENDRA_SOLVERS_AVAILABLE
+            else None
+        ),
+        (
+            getattr(torch.ops.dendra_solvers, "pcr_solve_t", None)
+            if DENDRA_SOLVERS_AVAILABLE
+            else None
+        ),
+        getattr(dendra_solvers, "thomas_solve_t", None),
+        getattr(dendra_solvers, "pcr_solve_t", None),
+    )
+    if callable(solve)
 )
 
 
@@ -121,14 +166,22 @@ class _bwd_euler_sc(Integrator):
         intra=None,
         *,
         solver=None,
+        membrane_source=None,
     ):
         """Return the shared closed-form single-compartment voltage update."""
         del dt, ve, solver
 
         denom = self.cmdt + gtot
-        v_new = v - itot / denom
+        if itot is None:
+            residual = membrane_source - gtot * v
+        else:
+            residual = -itot
         if intra is not None:
-            v_new = v_new + (intra / self.area) / denom
+            residual = residual + intra / self.area
+        # Cancel the capacitive old-voltage term analytically. Combining the
+        # physical currents first also avoids two separately rounded voltage
+        # updates when membrane and applied currents nearly balance.
+        v_new = v + residual / denom
 
         i_membrane = None
         if self.imem:
@@ -136,6 +189,8 @@ class _bwd_euler_sc(Integrator):
             i_ion = itot + gtot * (v_new - v)
             i_membrane = (i_cap + i_ion) * self.area
         return v_new, i_membrane
+
+    _DIRECT_MEMBRANE_VOLTAGE_UPDATE = _voltage_update
 
 
 class _bwd_euler_sc_skip(Integrator):
@@ -158,6 +213,14 @@ class _bwd_euler_sc_skip(Integrator):
     """
 
     v_vars = []
+    # Imperative integration leaves voltage ownership to mechanisms. The
+    # functional transition still carries the externally imposed model voltage
+    # explicitly so recording, continuation and capacitive current retain it.
+    _FUNCTIONAL_STATE_NAMES = ("v",)
+    _PREPARED_WORKSPACE_SCHEMA = _bwd_euler_sc._PREPARED_WORKSPACE_SCHEMA
+    _FUNCTIONAL_OPERATOR_KIND = "scalar_point_skip"
+    _FUNCTIONAL_CRITICAL_METHODS = ()
+    _prepare_workspace = staticmethod(_bwd_euler_sc._prepare_workspace)
 
     def __init__(self, model, mech, imem=None):
         super().__init__(model, mech, imem)
@@ -165,8 +228,12 @@ class _bwd_euler_sc_skip(Integrator):
         self.register_buffer("area", torch.tensor(0.0))
 
     def initialize(self, model, dt):
-        self.cmdt = (1e-6 * model.cm * model.cm_scale) / (1e-3 * dt)
-        self.area = model.area * model.area_scale
+        workspace = self._derive_prepared_workspace(
+            dt,
+            cm=model.cm * model.cm_scale,
+            area=model.area * model.area_scale,
+        )
+        self._install_prepared_workspace(workspace)
 
     def step(self, model, dt, ve=None, intra=None):
         v_new, i_membrane = self._call_kernel(
@@ -176,8 +243,18 @@ class _bwd_euler_sc_skip(Integrator):
         if self.imem:
             model.i_membrane = i_membrane
 
-    def _step(self, v, dt, temp, ve=None, intra=None):
-        del ve
+    def _step(
+        self,
+        v,
+        dt,
+        temp,
+        ve=None,
+        intra=None,
+        *,
+        solver=None,
+        call_local_currents=False,
+    ):
+        del ve, intra, solver
         # apply voltage processes
         # Keep the pre-process voltage independent from the returned tensor.
         # VoltageProcess implementations are documented as out-of-place, but
@@ -188,8 +265,13 @@ class _bwd_euler_sc_skip(Integrator):
         self._advance_pre_current(v_new, dt, temp)
         # No voltage solve/linearization follows, so ``itot`` is the exact
         # mechanism current evaluated at the externally imposed voltage.
-        itot, _ = self.mech.i(v_new)
-        ion_current_frame = self._capture_ion_current_frame()
+        if call_local_currents:
+            _, _, itot, ion_current_frame, _ = self._membrane_frame(
+                v_new, call_local=True, require_current=True
+            )
+        else:
+            itot, _ = self.mech.i(v_new)
+            ion_current_frame = self._capture_ion_current_frame()
 
         i_membrane = None
         if self.imem:
@@ -231,16 +313,12 @@ class _bwd_euler_ub(Integrator):
 
     Builds a tridiagonal system from the cable diffusion operator and ionic
     linearization, then solves it each step with a selectable solver backend.
-    Supports optional gradient-clipped Thomas kernels on CUDA.
 
     Parameters
     ----------
     method : {"thomas", "inv", "spd", "pcr"}, optional
         Solver backend: Thomas (default; ``"inv"`` maps to ``"thomas"``),
         SPD tridiagonal (CPU only), or PCR (CPU/CUDA fallback).
-    clip_scale_backward : float, optional
-        Enable gradient clipping in the CUDA Thomas kernel by this scale factor
-        (only applicable when ``method="thomas"``). Default None disables.
     imem : bool or None, optional
         If truthy, accumulate membrane currents each step. Default None.
     """
@@ -262,25 +340,11 @@ class _bwd_euler_ub(Integrator):
     _FUNCTIONAL_OPERATOR_KIND = "scalar_path"
     _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver",)
 
-    def __init__(
-        self, model, mech, method: str = "inv", clip_scale_backward=None, **kw
-    ):
+    def __init__(self, model, mech, method: str = "inv", **kw):
         super().__init__(model, mech, **kw)
         if method == "inv":
             method = "thomas"
         self.method = method.lower()
-
-        # GC-variant (gradient clipping inside Thomas kernel) only makes sense for method="thomas"
-        self.use_gc_variant = False
-        if clip_scale_backward is not None:
-            if self.method != "thomas":
-                warnings.warn(
-                    f"clip_scale_backward is only supported for method='thomas'; "
-                    f"ignoring for method='{self.method}'."
-                )
-            else:
-                self.register_buffer("clip_scale", torch.tensor(clip_scale_backward))
-                self.use_gc_variant = True
 
         B, K = _model_solve_shape(model)
         self.B = B
@@ -304,12 +368,24 @@ class _bwd_euler_ub(Integrator):
         if self.method == "pcr":
             if dev == "cuda":
                 self._solve = pcr_solve_cuda_t
+            elif dev == "mps":
+                self._solve = (
+                    torch.ops.dendra_solvers.pcr_solve_t
+                    if DENDRA_SOLVERS_AVAILABLE
+                    and _mps_solver_available(dendra_solvers)
+                    else pcr_solve_parallel_t
+                )
             else:
                 self._solve = pcr_solve_t
             return
 
         # -------- SPD option (CPU only) --------
         if self.method == "spd":
+            if dev == "mps":
+                raise NotImplementedError(
+                    "method='spd' is currently unsupported on MPS; "
+                    "select method='thomas' or method='pcr'."
+                )
             if dev == "cuda":
                 warnings.warn(
                     "method='spd' is not implemented on CUDA; falling back to method='thomas' (CUDA)."
@@ -345,24 +421,37 @@ class _bwd_euler_ub(Integrator):
         if dev == "cuda":
             # CUDA: always use CUDA Thomas implementation
             self._solve = thomas_solve_cuda_t
+        elif dev == "mps":
+            self._solve = (
+                torch.ops.dendra_solvers.thomas_solve_t
+                if DENDRA_SOLVERS_AVAILABLE and _mps_solver_available(dendra_solvers)
+                else pcr_solve_parallel_t
+            )
         elif dev == "cpu":
             if DENDRA_SOLVERS_AVAILABLE:
-                if self.use_gc_variant:
-                    self._solve = torch.ops.dendra_solvers.thomas_solve_t_gc
-                else:
-                    self._solve = torch.ops.dendra_solvers.thomas_solve_t
+                self._solve = torch.ops.dendra_solvers.thomas_solve_t
             else:
                 warnings.warn(
                     "Using `bwd_euler_ub` on CPU without dendra-solvers installed. "
                     "Falling back to PCR solver. Install the native package with "
                     "`python -m pip install --upgrade "
-                    '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                    '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                 )
                 self._solve = pcr_solve_t
 
     def _functional_solver(self):
         """Return the transform-compatible facade for the selected UB solver."""
         solver = self._solve
+        if solver is not None and solver is _FUNCTIONAL_SCALAR_SPD:
+            return solver
+        if solver is not None and solver is thomas_solve_cuda_t:
+            from ._cuda_functional import thomas_solve
+
+            return thomas_solve
+        if solver is not None and solver is pcr_solve_cuda_t:
+            from ._cuda_functional import pcr_solve
+
+            return pcr_solve
         solver_name = getattr(solver, "__name__", None)
         solver_module = getattr(solver, "__module__", None)
 
@@ -378,17 +467,18 @@ class _bwd_euler_ub(Integrator):
                 "The selected native CPU solver requires a dendra-solvers build "
                 "that exports torch.func-compatible tridiagonal facades. Upgrade "
                 "it with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
 
-        if solver_name == "pcr_solve_t" and solver_module == (
+        if solver_name in {"pcr_solve_t", "pcr_solve_parallel_t"} and solver_module == (
             "dendra.models.integrators.tridiag.pcr"
         ):
             return solver
 
         raise RuntimeError(
-            "The selected bwd_euler_ub solver is not yet transform-compatible. "
-            "Use method='thomas' with current dendra-solvers or method='pcr'."
+            "The selected bwd_euler_ub solver is not transform-compatible. "
+            "Use a dendra-solvers build with pure SPD facades for method='spd', "
+            "or select method='thomas' or method='pcr'."
         )
 
     @staticmethod
@@ -439,6 +529,9 @@ class _bwd_euler_ub(Integrator):
         # Select solver first (depends on device and method)
         self._select_solver(model.device())
 
+        if not torch.is_tensor(dt):
+            dt = torch.as_tensor(dt, device=model.v.device, dtype=model.v.dtype)
+
         B, K = _model_solve_shape(model)
         self.B, self.K = B, K
         cm = _as_solve_matrix(model.cm, model) * _as_solve_matrix(model.cm_scale, model)
@@ -483,21 +576,44 @@ class _bwd_euler_ub(Integrator):
         intra=None,
         *,
         solver=None,
+        membrane_source=None,
     ):
         """Return the shared unbranched implicit voltage update."""
+        # Match preparation's model-dtype rounding before converting to seconds.
+        # Python scalar arithmetic can otherwise perturb the diagonal relative
+        # to the prepared off-diagonals, especially in float32 cable solves.
+        if not torch.is_tensor(dt):
+            dt = torch.as_tensor(dt, device=v.device, dtype=v.dtype)
         # Retain a logical singleton axis until dt is combined with spatial
         # tensors. Scalar-only binary batching otherwise selects lane zero for
         # an empty outer vmap.
-        if torch.is_tensor(dt):
-            dt_s = dt.reshape(1) * 1.0e-3
-        else:
-            dt_s = dt * 1.0e-3
+        dt_s = dt.reshape(1) * 1.0e-3
 
         v_flat = _flatten_to_solve(v, self.K, self.base_shape)
-        itot = _flatten_to_solve(itot, self.K, self.base_shape)
         gtot = _flatten_to_solve(gtot, self.K, self.base_shape)
+        solve = self._solve if solver is None else solver
+        # The SPD facade can regularize pivots, so it is excluded from the
+        # exact-solve list.
+        # Unsupported/custom solvers retain the absolute-voltage RHS contract.
+        increment = any(solve is standard for standard in _BWD_EULER_INCREMENT_SOLVERS)
+        if itot is None:
+            source = _flatten_to_solve(membrane_source, self.K, self.base_shape)
+            f_n = (source - gtot * v_flat if increment else source) * self.scale
+        else:
+            itot = _flatten_to_solve(itot, self.K, self.base_shape)
+            f_n = (-itot if increment else gtot * v_flat - itot) * self.scale
 
-        f_n = (gtot * v_flat - itot) * self.scale
+        if increment and self.K > 1:
+            delta_v = v_flat[..., 1:] - v_flat[..., :-1]
+            left = self.g_edge_Cinv * delta_v
+            right = self.g_edge_Cinv_right * delta_v
+            # Retain the distinct row-capacitance normalization at both ends
+            # of each physical edge. This matrix is generally nonsymmetric.
+            axial = torch.cat(
+                (left[..., :1], left[..., 1:] - right[..., :-1], -right[..., -1:]),
+                dim=-1,
+            )
+            f_n = f_n + axial
 
         if ve is not None:
             ve_flat = _flatten_to_solve(ve, self.K, self.base_shape)
@@ -522,23 +638,16 @@ class _bwd_euler_ub(Integrator):
                 _flatten_to_solve(intra, self.K, self.base_shape) * self.cm_inv
             )
 
-        rhs = v_flat + dt_s * f_n
+        rhs = dt_s * f_n if increment else v_flat + dt_s * f_n
         main = 1.0 - dt_s * (self.diag_base - gtot * self.scale)
 
         if self.K == 1:
             v_np1 = rhs / main
         else:
-            solve = self._solve if solver is None else solver
-            if self.use_gc_variant:
-                v_np1 = solve(
-                    self.lower,
-                    main,
-                    self.upper,
-                    rhs,
-                    self.clip_scale,
-                )
-            else:
-                v_np1 = solve(self.lower, main, self.upper, rhs)
+            v_np1 = solve(self.lower, main, self.upper, rhs)
+
+        if increment:
+            v_np1 = v_flat + v_np1
 
         i_membrane = None
         if self.imem:
@@ -553,6 +662,8 @@ class _bwd_euler_ub(Integrator):
             ).reshape(self.base_shape)
 
         return v_np1.reshape(self.base_shape), i_membrane
+
+    _DIRECT_MEMBRANE_VOLTAGE_UPDATE = _voltage_update
 
 
 class _bwd_euler_bt(Integrator):
@@ -605,7 +716,7 @@ class _bwd_euler_bt(Integrator):
                 "Native CPU block solvers are unavailable. CUDA will use Triton "
                 "and MPS will use pure-PyTorch block PCR; install dendra-solvers "
                 "for CPU support with `python -m pip install --upgrade "
-                '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
             )
         super().__init__(model, mech, imem)
 
@@ -653,18 +764,39 @@ class _bwd_euler_bt(Integrator):
     def _functional_solver(self):
         """Return a transform-compatible block solver facade.
 
-        Current dendra-solvers releases expose the native block-Thomas kernel
-        through a ``torch.func``-aware Python facade. Older installations retain
-        correctness through the portable pure-Torch PCR implementation.
+        Native consuming SPD execution and this nonmutating facade share the
+        same factorization and cached-Cholesky adjoint kernels.
         """
-        native = (
-            None
-            if dendra_solvers is None
-            else getattr(dendra_solvers, "solve_bt", None)
+        if (
+            self._solve is not None
+            and self._solve is solve_bt_spd_cuda_consume_unchecked
+        ):
+            from ._cuda_functional import block_spd_solve
+
+            return block_spd_solve
+        if (
+            self._solve is not None
+            and self._solve is _NATIVE_BLOCK_SPD_CONSUME
+            and _FUNCTIONAL_BLOCK_SPD is not None
+        ):
+            return _FUNCTIONAL_BLOCK_SPD
+        if self._solve is not None and self._solve is thomas_solve_cuda_bt:
+            from ._cuda_functional import block_thomas_solve
+
+            return block_thomas_solve
+        if self._solve is block_pcr_solve_t:
+            return block_pcr_solve_t
+        if (
+            DENDRA_SOLVERS_AVAILABLE
+            and self._solve is torch.ops.dendra_solvers.solve_bt
+        ):
+            native = getattr(dendra_solvers, "solve_bt", None)
+            return native if callable(native) else block_pcr_solve_t
+        raise RuntimeError(
+            "The selected block solver is not transform-compatible. "
+            "Use a dendra-solvers build with pure SPD facades for method='spd', "
+            "or the standard CPU or CUDA method='thomas' implementation."
         )
-        if callable(native):
-            return native
-        return block_pcr_solve_t
 
     @staticmethod
     def _prepare_workspace(
@@ -773,11 +905,15 @@ class _bwd_euler_bt(Integrator):
     def _select_solver(self, device):
         dev = torch.device(device).type
 
-        # Apple MPS cannot load either the CPU extension or CUDA/Triton kernels.
-        # Use a vectorized, differentiable pure-Torch solver for both public
-        # methods. The method still controls CPU/CUDA dispatch exactly as before.
         if dev == "mps":
-            self._solve = block_pcr_solve_t
+            if self.method == "spd":
+                self._solve = block_pcr_solve_t
+                return
+            self._solve = (
+                torch.ops.dendra_solvers.solve_bt
+                if DENDRA_SOLVERS_AVAILABLE and _mps_solver_available(dendra_solvers)
+                else block_pcr_solve_t
+            )
             return
 
         if self.method == "spd":
@@ -791,7 +927,7 @@ class _bwd_euler_bt(Integrator):
                         "_bwd_euler_bt(method='spd') requires the dendra-solvers "
                         "package for CPU execution. Use CUDA or run "
                         "`python -m pip install --upgrade "
-                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                     )
                 try:
                     from dendra_solvers import solve_bt_spd_consume_unchecked
@@ -800,7 +936,7 @@ class _bwd_euler_bt(Integrator):
                         "_bwd_euler_bt(method='spd') requires the dendra-solvers "
                         "package for CPU execution. Use CUDA or run "
                         "`python -m pip install --upgrade "
-                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                     ) from err
                 else:
                     # _step constructs fresh B_work/D_work buffers, so use the
@@ -817,7 +953,7 @@ class _bwd_euler_bt(Integrator):
                         "_bwd_euler_bt(method='thomas') requires the dendra-solvers "
                         "package for CPU execution. Use CUDA or run "
                         "`python -m pip install --upgrade "
-                        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.'
+                        '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.'
                     )
 
     def initialize(self, model, dt):
@@ -895,40 +1031,41 @@ class _bwd_euler_bt(Integrator):
         solver=None,
         call_local_currents=False,
     ) -> Tuple[Tensor, Tensor]:
-        xg = self.xg[..., -1]
-
         # apply voltage processes
         v_state = self.mech.update_v(v)
 
         # advance gating
         self._advance_pre_current(v_state, dt, temp)
 
-        if call_local_currents:
-            evaluate = getattr(self.mech, "_evaluate_current_frame", None)
-            if evaluate is None:
-                raise RuntimeError(
-                    "call-local current evaluation requires a MechanismHandler "
-                    "with _evaluate_current_frame()"
-                )
-            (
-                itot,
-                gtot,
-                ion_current_frame,
-                ion_conductance_frame,
-            ) = evaluate(v_state)
-        else:
-            itot, gtot = self.mech.i(v_state)
-            ion_current_frame = self._capture_ion_current_frame()
-            ion_conductance_frame = self._capture_ion_conductance_frame()
+        (
+            gtot,
+            membrane_source,
+            itot,
+            ion_current_frame,
+            ion_conductance_frame,
+        ) = self._membrane_frame(v_state, call_local=call_local_currents)
 
         # linearized ionic conductances & reversal
         public_voltage_shape = self.base_shape[:-1]
         v_flat = _flatten_to_solve(v_state, self.K, public_voltage_shape)
-        gtot = _flatten_to_solve(gtot, self.K, public_voltage_shape) * self.area
+        gtot = _flatten_to_solve(gtot, self.K, public_voltage_shape)
+        v_prev_membrane = vc[..., 0] - vc[..., 1]
 
-        itot = _flatten_to_solve(itot, self.K, public_voltage_shape) * self.area
-
-        d = gtot * v_flat - itot
+        if itot is None:
+            # Capacitance uses vc, not the separately carried membrane v.
+            # Passive direct coefficients can be independent of v entirely.
+            # Retain the legacy cancellation's zero AD edge to that input so
+            # differentiating both state fields still returns zero, not unused.
+            d = (
+                _flatten_to_solve(membrane_source, self.K, public_voltage_shape)
+                + 0.0 * v_flat
+                - gtot * v_prev_membrane
+            ) * self.area
+        else:
+            itot = _flatten_to_solve(itot, self.K, public_voltage_shape)
+            d = (gtot * (v_flat - v_prev_membrane) - itot) * self.area
+            itot = itot * self.area
+        gtot = gtot * self.area
 
         if intra is not None:
             d = d + _flatten_to_solve(intra, self.K, self.base_shape[:-1])
@@ -952,13 +1089,23 @@ class _bwd_euler_bt(Integrator):
             if ve is not None
             else None
         )
-        D_work = assemble_rhs(vc, self.c_rad, d, xg, ve_flat)
+        # Solve for a voltage increment. Forming rhs - A @ vc numerically
+        # would cancel large capacitance terms; their exact cancellation leaves
+        # only the physical membrane, shell, bath and axial current residuals.
+        D_work = _block_voltage_residual(vc, d, self.xg, ve_flat)
+        axial_flux = -self.lower * (vc[..., 1:, :] - vc[..., :-1, :])
+        sealed_end = torch.zeros_like(vc[..., :1, :])
+        D_work = (
+            D_work
+            + torch.cat((axial_flux, sealed_end), dim=-2)
+            - torch.cat((sealed_end, axial_flux), dim=-2)
+        )
 
         # solve block-tridiagonal system
         solve = self._solve if solver is None else solver
-        vc_new = solve(self.lower, B_work, self.upper, D_work).reshape(
+        vc_new = (vc + solve(self.lower, B_work, self.upper, D_work)).reshape(
             self.base_shape
-        )  # (model.shape)
+        )
         v_new = vc_new[..., 0] - vc_new[..., 1]  # v = vi - ve0
 
         i_membrane = None
@@ -987,6 +1134,17 @@ class _bwd_euler_bt(Integrator):
         self._advance_post_current(v_state, dt, temp, accepted_frame)
 
         return vc_new, v_new, i_membrane
+
+
+def _block_voltage_residual(v_prev, membrane_residual, xg, e_ext):
+    """Assemble physical currents for a three-component voltage increment."""
+    zero = torch.zeros_like(membrane_residual)
+    shell_flux = xg[..., 0] * (v_prev[..., 1] - v_prev[..., 2])
+    bath_voltage = zero if e_ext is None else e_ext
+    bath_flux = xg[..., 1] * (bath_voltage - v_prev[..., 2])
+    membrane = torch.stack((membrane_residual, -membrane_residual, zero), dim=-1)
+    radial = torch.stack((zero, -shell_flux, shell_flux + bath_flux), dim=-1)
+    return membrane + radial
 
 
 def assemble_rhs(v_prev, c_rad, d, xg, e_ext):

@@ -95,7 +95,7 @@ def test_missing_cpu_spd_extension_falls_back_through_cpu_policy(monkeypatch):
         "Using material diffusion on CPU without dendra-solvers installed; "
         "falling back to the PyTorch PCR/Thomas solver. Install the native "
         "package with `python -m pip install --upgrade "
-        '--only-binary=dendra-solvers "dendra-solvers>=0.3.1"`.',
+        '--only-binary=dendra-solvers "dendra-solvers>=0.5.1"`.',
     ]
 
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import inspect
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -19,9 +20,10 @@ import numpy as np
 import torch
 from torch.func import functional_call
 
-from dendra.helpers import op_mc, op_sc
-from dendra.models.core import Population
+from dendra.helpers import current_check_purity, op_mc, op_sc
+from dendra.models.core import Population, _time_tensor_to
 from dendra.models.parametric import SimpleParameterized, cacheable
+from dendra.models.stim._assembly import _assemble_currents, _current_groups
 from dendra.models.stim.intra import (
     _canonicalize_index_for_index_put,
     _retained_leading_batch_shape,
@@ -29,6 +31,8 @@ from dendra.models.stim.intra import (
 from dendra.models.stim.waveform import Waveform
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
+from ._module_traversal import _raw_module_namespace, _registered_modules
+from ._rng_diagnostics import _numpy_rng_state_equal
 from ._types import FunctionalizationError
 
 
@@ -153,6 +157,41 @@ _MODULE_INTERNAL_STATE = {
     "_modules",
 }
 _SIMPLE_PARAMETERIZED_CONSTRUCTOR_MIRRORS = {"params", "params_p", "params_n"}
+_WAVEFORM_MODULE_DISPATCH = {
+    name: inspect.getattr_static(torch.nn.Module, name)
+    for name in ("__call__", "_call_impl", "_wrapped_call_impl", "__getattr__")
+}
+_WAVEFORM_MODULE_DISPATCH["__getattribute__"] = object.__getattribute__
+
+
+def _validate_waveform_dispatch(module: torch.nn.Module, label: str) -> None:
+    """Keep evaluated recipes on the forward/registered-attribute contract."""
+    for name, standard in _WAVEFORM_MODULE_DISPATCH.items():
+        if inspect.getattr_static(
+            type(module), name
+        ) is not standard or name in object.__getattribute__(module, "__dict__"):
+            raise FunctionalizationError(
+                f"Waveform {label!r} requires canonical module call/attribute "
+                "dispatch; express custom behavior in forward or fn and use "
+                "registered parameters, buffers, and child modules."
+            )
+    if getattr(module, "_compiled_call_impl", None) is not None:
+        raise FunctionalizationError(
+            f"Waveform {label!r} cannot retain compiled custom call dispatch."
+        )
+
+
+def _waveform_registered_modules(waveform: Waveform):
+    """Visit raw registered children, qualifying dispatch before reading state."""
+
+    def qualified():
+        for path, module in _registered_modules(
+            waveform, namespace=_raw_module_namespace
+        ):
+            _validate_waveform_dispatch(module, path or "waveform")
+            yield path, module
+
+    return qualified()
 
 
 def _is_internal_module_state(module: torch.nn.Module, name: str) -> bool:
@@ -253,14 +292,55 @@ def _strict_state_signature(value: Any, *, label: str) -> Any:
     )
 
 
+def _trusted_state_signature(value: Any) -> Any:
+    """Retain recipe structure without inspecting hidden numerical state."""
+    if value is None or isinstance(value, (bool, int, float, complex, str)):
+        return value
+    if isinstance(value, (torch.dtype, torch.device)):
+        return (type(value).__name__, str(value))
+    if isinstance(value, slice):
+        return ("slice", value.start, value.stop, value.step)
+    if isinstance(value, torch.Generator):
+        return ("torch.Generator", str(value.device))
+    if isinstance(value, np.generic):
+        return (type(value).__name__, str(value.dtype), value.item())
+    if isinstance(value, np.ndarray):
+        return ("ndarray", tuple(value.shape), str(value.dtype))
+    if isinstance(value, (tuple, list)):
+        return (
+            type(value).__name__,
+            tuple(_trusted_state_signature(item) for item in value),
+        )
+    if isinstance(value, dict):
+        return (
+            "dict",
+            tuple(
+                (_trusted_state_signature(key), _trusted_state_signature(item))
+                for key, item in value.items()
+            ),
+        )
+    return ("opaque", type(value), id(value))
+
+
 def _module_python_state_signature(
-    module: torch.nn.Module, label: str
+    module: torch.nn.Module, label: str, *, check_purity: bool = True
 ) -> tuple[Any, ...]:
     state = []
     for name, value in sorted(vars(module).items()):
         if _is_internal_module_state(module, name):
             continue
+        if name == "_functional_poisson_rng":
+            continue
+        from dendra.models.stim.waveform.core import _randomized_poisson
+
+        if type(module) is _randomized_poisson and name == "generator":
+            state.append((name, ("poisson-generator", str(value.device))))
+            continue
         if name == "_cache" and isinstance(module, cacheable):
+            continue
+        if not check_purity:
+            if not isinstance(value, torch.nn.Module):
+                state.append((name, _trusted_state_signature(value)))
             continue
         if name == "_cache":
             raise FunctionalizationError(
@@ -277,21 +357,25 @@ def _module_python_state_signature(
     return tuple(state)
 
 
-def _validate_waveform_contract(waveform: Waveform, label: str) -> None:
+def _validate_waveform_contract(
+    waveform: Waveform, label: str, *, check_purity: bool | None = None
+) -> None:
     """Validate hooks, determinism capability, and callable instance state.
 
-    Every behavior-defining Waveform class, including Dendra's built-ins, must
-    opt in explicitly with ``FUNCTIONAL_PURE = True`` on that exact concrete
-    class.
+    Optional diagnostics require ``FUNCTIONAL_PURE = True`` on each concrete
+    Waveform class. Canonical dispatch and registered hooks remain structural
+    execution contracts in either mode.
     """
 
+    if check_purity is None:
+        check_purity = current_check_purity()
     hook_attributes = (
         "_forward_pre_hooks",
         "_forward_hooks",
         "_backward_pre_hooks",
         "_backward_hooks",
     )
-    for module_name, module in waveform.named_modules():
+    for module_name, module in _waveform_registered_modules(waveform):
         module_label = label if not module_name else f"{label}.{module_name}"
         for attribute in hook_attributes:
             if getattr(module, attribute, None):
@@ -307,12 +391,15 @@ def _validate_waveform_contract(waveform: Waveform, label: str) -> None:
                     "gradient hooks; functional stimulation currently fails "
                     "closed on hooks."
                 )
-        if bool(getattr(module, "randomize_every_call", False)):
-            raise FunctionalizationError(
-                f"Waveform {module_label!r} randomizes its Poisson schedule on "
-                "every call. Functional stimulation requires deterministic "
-                "waveforms; use a fixed schedule or make RNG state explicit."
-            )
+        if not check_purity:
+            continue
+        from dendra.models.stim.waveform.core import _randomized_poisson
+
+        shared_poisson = type(module) is _randomized_poisson
+        if shared_poisson:
+            from ._poisson_stimulation import randomized_nodes
+
+            randomized_nodes(module)
         for name, value in vars(module).items():
             if _is_internal_module_state(module, name):
                 continue
@@ -325,7 +412,13 @@ def _validate_waveform_contract(waveform: Waveform, label: str) -> None:
                 )
         _module_python_state_signature(module, module_label)
         if isinstance(module, Waveform):
-            if type(module).__dict__.get(_FUNCTIONAL_PURITY_CAPABILITY) is not True:
+            from ._torch_parametrizations import canonical_type
+
+            if (
+                canonical_type(module).__dict__.get(_FUNCTIONAL_PURITY_CAPABILITY)
+                is not True
+                and not shared_poisson
+            ):
                 raise FunctionalizationError(
                     f"Waveform {module_label!r} has no functional purity "
                     "contract. Declare FUNCTIONAL_PURE = True on the concrete "
@@ -410,14 +503,6 @@ def _module_tree_state_signature(
             ),
         )
         for path, module in waveform.named_modules()
-    )
-
-
-def _numpy_rng_state_equal(left, right) -> bool:
-    return (
-        left[0] == right[0]
-        and np.array_equal(left[1], right[1])
-        and left[2:] == right[2:]
     )
 
 
@@ -542,11 +627,15 @@ class _FunctionalWaveformBank:
         namespace: str,
         device: torch.device,
         dtype: torch.dtype,
+        check_purity: bool | None = None,
     ):
         self._namespace = namespace.rstrip(".")
         self._device = device
         self._dtype = dtype
         self._sources = tuple(waveforms)
+        self._check_purity = (
+            current_check_purity() if check_purity is None else check_purity
+        )
 
         clones = []
         for index, waveform in enumerate(self._sources):
@@ -555,7 +644,14 @@ class _FunctionalWaveformBank:
                     f"waveform {index} has type {type(waveform).__name__}; "
                     "expected Waveform"
                 )
-            _validate_waveform_contract(waveform, f"waveforms.{index}")
+            _validate_waveform_contract(
+                waveform, f"waveforms.{index}", check_purity=self._check_purity
+            )
+            from ._torch_parametrizations import failures, install_output_schemas
+
+            parametrization_failures = failures(waveform, diagnostic=self._check_purity)
+            if parametrization_failures:
+                raise FunctionalizationError("; ".join(parametrization_failures))
             try:
                 clone = copy.deepcopy(waveform)
             except Exception as exc:  # pragma: no cover - custom Waveform detail
@@ -565,6 +661,22 @@ class _FunctionalWaveformBank:
             # This mutates only the private execution copy.  In particular, a
             # CPU-authored Waveform is never moved out from under its caller.
             clone.to(device=device, dtype=dtype)
+            from ._poisson_stimulation import configure_execution, randomized_nodes
+
+            poisson_nodes = randomized_nodes(waveform)
+            for path, source in poisson_nodes:
+                from ._poisson_stimulation import normalize_schedule
+
+                target = clone.get_submodule(path) if path else clone
+                target._spike_times = normalize_schedule(source, target._spike_times)
+            if poisson_nodes:
+                configure_execution(clone)
+            else:
+                from ._poisson_execution import isolate_waveform_aliases
+
+                # Every explicit alias path must have its own registration
+                # owner so functional_call restores caller operands exactly.
+                isolate_waveform_aliases(clone)
             # Preserve every authored Waveform/module train/eval flag. Only
             # cache-bearing parameter modules use training mode internally so
             # explicit functional leaves remain authoritative and evaluation
@@ -573,24 +685,26 @@ class _FunctionalWaveformBank:
                 if isinstance(module, cacheable) and not isinstance(module, Waveform):
                     module.clear_cache()
                     module.training = True
-            _audit_waveform_purity(
-                clone,
-                label=f"waveforms.{index}",
-                device=device,
-                dtype=dtype,
-            )
+            install_output_schemas(clone)
+            if self._check_purity:
+                _audit_waveform_purity(
+                    clone,
+                    label=f"waveforms.{index}",
+                    device=device,
+                    dtype=dtype,
+                )
             clones.append(clone)
 
         self._bank = _WaveformBank(clones)
-        template_parameters = dict(self._bank.named_parameters())
-        template_constants = dict(self._bank.named_buffers())
+        template_parameters = dict(self._bank.named_parameters(remove_duplicate=False))
+        template_constants = dict(self._bank.named_buffers(remove_duplicate=False))
         parameter_leaves: list[_BankLeaf] = []
         constant_leaves: list[_BankLeaf] = []
         canonical_parameters: dict[int, str] = {}
         canonical_constants: dict[int, str] = {}
 
         for index, source in enumerate(self._sources):
-            for source_name, value in source.named_parameters():
+            for source_name, value in source.named_parameters(remove_duplicate=False):
                 internal_name = f"waveforms.{index}.{source_name}"
                 if internal_name not in template_parameters:
                     raise FunctionalizationError(
@@ -609,15 +723,23 @@ class _FunctionalWaveformBank:
                         _schema(template_parameters[internal_name]),
                     )
                 )
-            for source_name, value in source.named_buffers():
+            for source_name, value in source.named_buffers(remove_duplicate=False):
                 internal_name = f"waveforms.{index}.{source_name}"
                 if internal_name not in template_constants:
                     raise FunctionalizationError(
                         f"Waveform buffer layout for contact {index} is not "
                         "stable under deepcopy."
                     )
-                public_name = canonical_constants.setdefault(
-                    id(value), self._public_name(index, source_name)
+                parent, _separator, field = source_name.rpartition(".")
+                owner = source.get_submodule(parent) if parent else source
+                from dendra.models.stim.waveform.core import _randomized_poisson
+
+                public_name = (
+                    self._public_name(index, source_name)
+                    if field == "_spike_times" and type(owner) is _randomized_poisson
+                    else canonical_constants.setdefault(
+                        id(value), self._public_name(index, source_name)
+                    )
                 )
                 constant_leaves.append(
                     _BankLeaf(
@@ -650,13 +772,42 @@ class _FunctionalWaveformBank:
     def constant_schema(self) -> dict[str, TensorSchema]:
         return {leaf.public_name: leaf.schema for leaf in self._constant_leaves}
 
+    def _tensor_sources(self) -> dict[str, torch.Tensor]:
+        """Map explicit names to authored Tensors before placement or cloning.
+
+        This cold correspondence records identity, rather than shared storage.
+        Aggregate snapshots use it to preserve aliases across stimulus plans.
+        """
+        sources = {}
+        for leaves, accessor in (
+            (self._parameter_leaves, "named_parameters"),
+            (self._constant_leaves, "named_buffers"),
+        ):
+            for leaf in leaves:
+                waveform = self._sources[leaf.waveform_index]
+                source = dict(getattr(waveform, accessor)(remove_duplicate=False))[
+                    leaf.source_name
+                ]
+                if (
+                    leaf.public_name in sources
+                    and sources[leaf.public_name] is not source
+                ):
+                    raise FunctionalizationError(
+                        "Waveform source aliases changed after lowering; "
+                        "lower the Population or Network again."
+                    )
+                sources[leaf.public_name] = source
+        return sources
+
     def extract(self) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         parameters: dict[str, torch.Tensor] = {}
         constants: dict[str, torch.Tensor] = {}
         for leaf in self._parameter_leaves:
-            source = dict(self._sources[leaf.waveform_index].named_parameters())[
-                leaf.source_name
-            ]
+            source = dict(
+                self._sources[leaf.waveform_index].named_parameters(
+                    remove_duplicate=False
+                )
+            )[leaf.source_name]
             # Device/dtype conversion is differentiable and does not mutate the
             # authored source Parameter.  Matching leaves remain the originals.
             parameters[leaf.public_name] = source.to(
@@ -664,9 +815,18 @@ class _FunctionalWaveformBank:
                 dtype=leaf.schema.dtype,
             )
         for leaf in self._constant_leaves:
-            source = dict(self._sources[leaf.waveform_index].named_buffers())[
-                leaf.source_name
-            ]
+            source = dict(
+                self._sources[leaf.waveform_index].named_buffers(remove_duplicate=False)
+            )[leaf.source_name]
+            parent, _separator, field = leaf.source_name.rpartition(".")
+            from dendra.models.stim.waveform.core import _randomized_poisson
+
+            owner = self._sources[leaf.waveform_index]
+            owner = owner.get_submodule(parent) if parent else owner
+            if field == "_spike_times" and type(owner) is _randomized_poisson:
+                from ._poisson_stimulation import normalize_schedule
+
+                source = normalize_schedule(owner, source)
             constants[leaf.public_name] = (
                 source.detach()
                 .to(
@@ -688,6 +848,23 @@ class _FunctionalWaveformBank:
             mapping[leaf.internal_name] = parameters[leaf.public_name]
         for leaf in self._constant_leaves:
             mapping[leaf.internal_name] = constants[leaf.public_name]
+            if leaf.internal_name.endswith("._spike_times"):
+                from dendra.models.stim.waveform._poisson import (
+                    POISSON_INVOCATION_POSITION,
+                    POISSON_INVOCATION_STACK,
+                )
+
+                path = leaf.internal_name.rsplit(".", 1)[0]
+                owner = self._bank.get_submodule(path)
+                if getattr(owner, "_functional_poisson_recipe", False):
+                    stack = constants.get(
+                        leaf.public_name + ".__invocations",
+                        getattr(owner, POISSON_INVOCATION_STACK),
+                    )
+                    mapping[f"{path}.{POISSON_INVOCATION_STACK}"] = stack
+                    mapping[f"{path}.{POISSON_INVOCATION_POSITION}"] = torch.zeros(
+                        (1,), dtype=torch.int64, device=stack.device
+                    )
         return functional_call(
             self._bank,
             mapping,
@@ -702,6 +879,16 @@ class _FunctionalStimulus:
 
     _parameter_schema: dict[str, TensorSchema]
     _constant_schema: dict[str, TensorSchema]
+
+    def _validate_deterministic_assembly(self):
+        from ._poisson_stimulation import randomized_nodes
+
+        if any(randomized_nodes(waveform) for waveform in self._waveforms._sources):
+            raise FunctionalizationError(
+                "Randomized Poisson stimulation requires explicit draws and RNG "
+                "carry; bind it through make_functional(..., extra=...) or "
+                "dn.compile and use the Population stimulation input."
+            )
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -744,6 +931,10 @@ class _FunctionalStimulus:
         """Authored Waveform identities used to detect cross-plan aliases."""
 
         return self._waveforms.source_identities
+
+    def _tensor_sources(self) -> dict[str, torch.Tensor]:
+        """Return original Tensor correspondence for cold aggregate extraction."""
+        return self._waveforms._tensor_sources()
 
     def _validate_mapping(
         self,
@@ -841,7 +1032,7 @@ class _FunctionalStimulus:
 
     def _times(self, times: Any) -> torch.Tensor:
         if torch.is_tensor(times):
-            result = times.to(device=self.device, dtype=self.dtype)
+            result = _time_tensor_to(times, device=self.device, dtype=self.dtype)
         else:
             result = torch.as_tensor(times, device=self.device, dtype=self.dtype)
         if result.ndim == 0:
@@ -960,13 +1151,29 @@ def _tensor_content_signature(value: torch.Tensor) -> tuple[Any, ...]:
     return (_shape(value), value.dtype, hashlib.sha256(payload).hexdigest())
 
 
-def _waveform_layout_signature(waveform: Waveform) -> tuple[Any, ...]:
+def _waveform_layout_signature(
+    waveform: Waveform, *, check_purity: bool | None = None
+) -> tuple[Any, ...]:
+    if check_purity is None:
+        check_purity = current_check_purity()
     modules = []
     for path, module in waveform.named_modules():
+        from dendra.models.stim.waveform.core import _randomized_poisson
+
+        def buffer_shape(name, value):
+            if (
+                name == "_spike_times"
+                and type(module) is _randomized_poisson
+                and module.n is not None
+            ):
+                return (max(module.n, 1),) + (1,) * module._spike_time_trailing_dims
+            return _shape(value)
+
         module_label = "waveform" if not path else f"waveform.{path}"
         static = _module_python_state_signature(
             module,
             module_label,
+            check_purity=check_purity,
         )
         modules.append(
             (
@@ -978,7 +1185,7 @@ def _waveform_layout_signature(waveform: Waveform) -> tuple[Any, ...]:
                     for name, value in module.named_parameters(recurse=False)
                 ),
                 tuple(
-                    (name, _shape(value), value.dtype)
+                    (name, buffer_shape(name, value), value.dtype)
                     for name, value in module.named_buffers(recurse=False)
                 ),
                 static,
@@ -995,7 +1202,9 @@ def _solver_injection_specs(population: Population):
     return [spec for spec, claimed in zip(injections, accepted) if not claimed]
 
 
-def _injection_signature(population: Population) -> tuple[Any, ...]:
+def _injection_signature(
+    population: Population, *, check_purity: bool = True
+) -> tuple[Any, ...]:
     accepted = list(getattr(population, "mechanism_injection_accepted", ()))
     injections = list(getattr(population, "injections", ()))
     if len(accepted) < len(injections):
@@ -1003,7 +1212,7 @@ def _injection_signature(population: Population) -> tuple[Any, ...]:
     return tuple(
         (
             id(waveform),
-            _waveform_layout_signature(waveform),
+            _waveform_layout_signature(waveform, check_purity=check_purity),
             tuple(int(size) for size in registered_shape),
             _index_signature(index),
             bool(claimed),
@@ -1021,14 +1230,19 @@ class FunctionalIntra(_FunctionalStimulus):
     solver-owned injection is registered.
     """
 
-    def __init__(self, population: Population):
+    def __init__(self, population: Population, *, _check_purity: bool | None = None):
         shape, batch_shape, device, dtype = _population_contract(population)
         self._shape = shape
         self._batch_shape = batch_shape
         self._device = device
         self._dtype = dtype
         self._population = population
-        self._source_signature = _injection_signature(population)
+        self._check_purity = (
+            current_check_purity() if _check_purity is None else _check_purity
+        )
+        self._source_signature = _injection_signature(
+            population, check_purity=self._check_purity
+        )
         self._token = object()
 
         specs = _solver_injection_specs(population)
@@ -1060,12 +1274,14 @@ class FunctionalIntra(_FunctionalStimulus):
                 _retained_leading_batch_shape(canonical, batch_shape)
             )
         self._indices = tuple(indices)
+        self._current_groups = _current_groups(self._indices, shape)
         self._selected_batch_shapes = tuple(selected_batch_shapes)
         self._waveforms = _FunctionalWaveformBank(
             waveforms,
             namespace="stimulation.intra",
             device=device,
             dtype=dtype,
+            check_purity=self._check_purity,
         )
         self._parameter_schema = self._waveforms.parameter_schema
         self._constant_schema = self._waveforms.constant_schema
@@ -1080,7 +1296,10 @@ class FunctionalIntra(_FunctionalStimulus):
                 for canonical in self._indices
             ),
             self._selected_batch_shapes,
-            tuple(_waveform_layout_signature(waveform) for waveform in waveforms),
+            tuple(
+                _waveform_layout_signature(waveform, check_purity=self._check_purity)
+                for waveform in waveforms
+            ),
             tuple(self._parameter_schema.items()),
             tuple(self._constant_schema.items()),
         )
@@ -1103,15 +1322,32 @@ class FunctionalIntra(_FunctionalStimulus):
         )
 
     def _validate_source(self) -> None:
-        if _injection_signature(self._population) != self._source_signature:
+        if (
+            _injection_signature(self._population, check_purity=self._check_purity)
+            != self._source_signature
+        ):
             raise FunctionalizationError(
                 "Population injection structure changed after FunctionalIntra "
                 "was created; lower the Population again."
             )
 
+    def _tensor_sources(
+        self, population: Population | None = None
+    ) -> dict[str, torch.Tensor]:
+        if population is not None and population is not self._population:
+            candidate = FunctionalIntra(population, _check_purity=self._check_purity)
+            if not self.is_compatible(candidate):
+                raise FunctionalizationError(
+                    "Population injection topology or Waveform structure does "
+                    "not match this FunctionalIntra plan."
+                )
+            return candidate._tensor_sources()
+        self._validate_source()
+        return super()._tensor_sources()
+
     def extract(self, population: Population | None = None) -> StimulusTensors:
         if population is not None and population is not self._population:
-            candidate = FunctionalIntra(population)
+            candidate = FunctionalIntra(population, _check_purity=self._check_purity)
             if not self.is_compatible(candidate):
                 raise FunctionalizationError(
                     "Population injection topology or Waveform structure does "
@@ -1139,6 +1375,7 @@ class FunctionalIntra(_FunctionalStimulus):
     ) -> torch.Tensor | None:
         """Assemble a contiguous ``[time, *population.shape]`` current."""
 
+        self._validate_deterministic_assembly()
         self._validate_source()
         self._validate_inputs(parameters, constants)
         if not self.enabled:
@@ -1162,54 +1399,43 @@ class FunctionalIntra(_FunctionalStimulus):
             return None
         n_steps = int(times.shape[0])
         evaluated = self._waveforms.evaluate(parameters, constants, times)
-        result = torch.zeros(
-            (n_steps, *self.shape), device=self.device, dtype=self.dtype
-        )
 
-        for waveform_index, (value, indices, selected_batch_shape) in enumerate(
-            zip(
-                evaluated,
-                self._indices,
-                self._selected_batch_shapes,
-                strict=True,
-            )
-        ):
-            value = value.to(device=self.device, dtype=self.dtype)
-            value = _normalize_time_last_output(
-                value,
-                n_steps=n_steps,
-                name=f"intracellular waveform {waveform_index}",
-            )
-            samples = value.movedim(-1, 0)
-            selection_shape = tuple(
-                int(size)
-                for size in torch.broadcast_shapes(
-                    *(tuple(item.shape) for item in indices)
+        def samples():
+            for waveform_index, (value, indices, selected_batch_shape) in enumerate(
+                zip(
+                    evaluated,
+                    self._indices,
+                    self._selected_batch_shapes,
+                    strict=True,
                 )
-            )
-            samples = _expand_time_first_to_selection(
-                samples,
-                selection_shape,
-                selected_batch_shape,
-                name=f"intracellular waveform {waveform_index}",
-            )
+            ):
+                value = value.to(device=self.device, dtype=self.dtype)
+                value = _normalize_time_last_output(
+                    value,
+                    n_steps=n_steps,
+                    name=f"intracellular waveform {waveform_index}",
+                )
+                selection_shape = tuple(
+                    int(size)
+                    for size in torch.broadcast_shapes(
+                        *(tuple(item.shape) for item in indices)
+                    )
+                )
+                yield _expand_time_first_to_selection(
+                    value.movedim(-1, 0),
+                    selection_shape,
+                    selected_batch_shape,
+                    name=f"intracellular waveform {waveform_index}",
+                )
 
-            time_shape = (n_steps, *(1,) * len(selection_shape))
-            time_index = (
-                torch.arange(n_steps, device=self.device, dtype=torch.long)
-                .reshape(time_shape)
-                .expand(n_steps, *selection_shape)
-            )
-            assembled_indices = [time_index]
-            assembled_indices.extend(
-                index.unsqueeze(0).expand(n_steps, *selection_shape)
-                for index in indices
-            )
-            # Out-of-place index_put is essential here: its transform rule is
-            # vmap-safe, and accumulate=True preserves duplicate/overlap sums.
-            result = result.index_put(
-                tuple(assembled_indices), samples, accumulate=True
-            )
+        result = _assemble_currents(
+            self.shape,
+            self.dtype,
+            self.device,
+            samples(),
+            self._current_groups,
+            n_steps=n_steps,
+        )
         return result.contiguous()
 
 
@@ -1324,6 +1550,7 @@ class FunctionalExtra(_FunctionalStimulus):
         self._dtype = dtype
         self._token = object()
         self._namespace = namespace.rstrip(".")
+        self._check_purity = current_check_purity()
         pairs = _parse_extra(extra)
         self._pairs = tuple(pairs)
         self._enabled = extra is not None
@@ -1345,6 +1572,7 @@ class FunctionalExtra(_FunctionalStimulus):
             namespace=self._namespace,
             device=device,
             dtype=dtype,
+            check_purity=self._check_purity,
         )
 
         parameter_schema = self._waveforms.parameter_schema
@@ -1393,6 +1621,17 @@ class FunctionalExtra(_FunctionalStimulus):
     def uses_waveforms(self) -> bool:
         return self._uses_waveforms
 
+    def _tensor_sources(self) -> dict[str, torch.Tensor]:
+        sources = super()._tensor_sources()
+        # Python-valued fields have no authored Tensor identity. Omitting them
+        # leaves each materialized contact independent in aggregate snapshots.
+        sources.update(
+            (name, source)
+            for name, source in self._contact_sources.items()
+            if torch.is_tensor(source)
+        )
+        return sources
+
     def extract(self) -> StimulusTensors:
         parameters, constants = self._waveforms.extract()
         for name, source in self._contact_sources.items():
@@ -1419,6 +1658,7 @@ class FunctionalExtra(_FunctionalStimulus):
         total_steps: int | None = None,
     ) -> torch.Tensor | None:
         """Assemble contiguous extracellular voltage ``[time, *shape]``."""
+        self._validate_deterministic_assembly()
 
         self._validate_inputs(parameters, constants)
         if not self.enabled:

@@ -7,7 +7,10 @@ import pytest
 import torch
 
 import dendra as dn
-from dendra._bootstrap import torch_compiler_warning_context
+from dendra._bootstrap import (
+    isolate_compilation_callable,
+    torch_compiler_warning_context,
+)
 from dendra.func._lowered import _LoweredPopulationChunk
 from dendra.models.mod import hh
 
@@ -125,7 +128,7 @@ def _make_bound_step(name, functional, parameters, prepared, state, inputs):
             )
 
         return torch.compile(
-            tensor_step,
+            isolate_compilation_callable(tensor_step),
             backend="aot_eager",
             fullgraph=True,
             dynamic=False,

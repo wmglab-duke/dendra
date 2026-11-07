@@ -15,6 +15,7 @@ from dendra.models.graph import (
     share_topology_labeled,
 )
 from dendra.models.integrators.tree import _dhs_multi
+from dendra.models.integrators.tree_bt import _dhs_bt_multi
 from dendra.models.mod import pas
 from dendra.models.multi import (
     MultiPopulation,
@@ -520,17 +521,25 @@ def test_multi_validation_rejects_empty_batched_and_heterogeneous_inputs():
     assert callable(_assess_type_and_make_integrator({"tree": tree}))
 
 
-def test_multi_solver_selection_rejects_block_state_tree_and_axon_models():
+def test_multi_solver_selection_accepts_block_state_tree_and_axon_models():
     ext_tree = dn.ExtCellTree.from_graph(_morphology_graph(), dtype=DTYPE)
     ext_axon = dn.ExtCellAxon(n_comp=3, dtype=DTYPE)
 
     for name, population in (("tree", ext_tree), ("axon", ext_axon)):
-        with pytest.raises(TypeError, match="require a block multi-solver"):
-            _assess_type_and_make_integrator({name: population})
+        factory = _assess_type_and_make_integrator({name: population})
+        assert issubclass(factory, _dhs_bt_multi)
+        model = MultiPopulation(**{name: population})
+        assert model.n_layers == 2
+        assert model.vc.shape == (*model.shape, 3)
         with pytest.raises(TypeError, match="require a block multi-solver"):
             MultiPopulation(
                 integrator=lambda *args, **kwargs: None, **{name: population}
             )
+
+    factory = _assess_type_and_make_integrator({"tree": ext_tree, "axon": ext_axon})
+    assert issubclass(factory, _dhs_bt_multi)
+    with pytest.raises(TypeError, match="cannot be mixed"):
+        _assess_type_and_make_integrator({"tree": ext_tree, "scalar": _population()})
 
 
 def test_multi_solver_selection_detects_custom_vc_state_capability():

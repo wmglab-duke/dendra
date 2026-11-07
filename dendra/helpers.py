@@ -6,7 +6,6 @@ import importlib
 import json
 import logging
 import os
-import re
 import time
 import warnings
 from collections.abc import Mapping
@@ -50,6 +49,13 @@ class ctx(contextlib.ContextDecorator):
       dictionary forwarded to supported compiled kernels.
     - ``DEBUG`` (int/bool): increase logging verbosity for mechanism/state
       compilation (symbolic transforms, conductance differentiation).
+    - ``CHECK_PURITY`` (bool/int): opt into diagnostic purity checking when
+      lowering or compiling functional models. The default is ``False``:
+      Dendra trusts authored hooks to obey their pure API contracts. ``True``
+      inspects dependencies and probes disposable execution copies for hidden
+      mutation and implicit randomness. Tensor schemas and binding contracts
+      required for execution remain checked in both modes. Plans retain the
+      policy selected when they are lowered.
     - ``DEVICE`` (str/torch.device/None): default device for newly constructed
       Dendra modules and eligible PyTorch factory calls without an explicit
       ``device``.
@@ -58,6 +64,11 @@ class ctx(contextlib.ContextDecorator):
       installed PyTorch release, PyTorch factories that infer a floating dtype.
     - ``IMEM`` (int/bool): whether integrators compute/store ``i_membrane``
       in populations (required for LFP calculations).
+    - ``MEMBRANE_ASSEMBLY`` (str): ``"auto"`` (default) uses affine membrane
+      coefficients when all currents support that contract; ``"off"`` forces
+      ordinary current/conductance assembly; ``"validate"`` additionally
+      checks affine coefficients against fixed-state voltage probes. Validation
+      is diagnostic and deliberately adds work, not a proof of global affinity.
     - ``PRESERVE_MECHANISM_POPULATION_AXIS`` (bool/int/None): construction-time
       policy for population-axis-preserving mechanism storage. ``True``/``1``
       enables it, ``False``/``0`` disables it, and ``None`` or ``"default"``
@@ -138,8 +149,12 @@ class ctx(contextlib.ContextDecorator):
                 v = normalize_runtime_contract_validation(v)
             elif key == "NATIVE_EXTENSION_POLICY":
                 v = normalize_native_extension_policy(v)
+            elif key == "MEMBRANE_ASSEMBLY":
+                v = normalize_membrane_assembly(v)
             elif key == "PRESERVE_MECHANISM_POPULATION_AXIS":
                 v = normalize_preserve_mechanism_population_axis(v)
+            elif key == "CHECK_PURITY":
+                v = normalize_check_purity(v)
             elif key == "DEVICE":
                 torch_defaults[key] = _normalize_device_value(
                     v, default=torch.device("cpu")
@@ -474,6 +489,22 @@ def current_native_extension_policy() -> str:
     return normalize_native_extension_policy(NATIVE_EXTENSION_POLICY.value)
 
 
+def normalize_membrane_assembly(value) -> str:
+    """Validate the affine-current assembly/debug policy."""
+    if isinstance(value, str):
+        policy = value.strip().lower()
+        if policy in ("auto", "off", "validate"):
+            return policy
+    raise ValueError(
+        f"MEMBRANE_ASSEMBLY must be 'auto', 'off', or 'validate'; got {value!r}."
+    )
+
+
+def current_membrane_assembly() -> str:
+    """Return the active membrane assembly policy."""
+    return normalize_membrane_assembly(MEMBRANE_ASSEMBLY.value)
+
+
 def normalize_preserve_mechanism_population_axis(value) -> bool | None:
     """Normalize the construction-time mechanism population-axis policy.
 
@@ -507,6 +538,26 @@ def current_preserve_mechanism_population_axis() -> bool | None:
     )
 
 
+def normalize_check_purity(value) -> bool:
+    """Normalize the opt-in functional purity diagnostic policy."""
+    if type(value) is bool:
+        return value
+    if type(value) is int and value in (0, 1):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "default", "false", "0"}:
+            return False
+        if normalized in {"true", "1"}:
+            return True
+    raise ValueError(f"CHECK_PURITY must be True, False, 1, or 0; got {value!r}.")
+
+
+def current_check_purity() -> bool:
+    """Return whether new functional plans enable optional purity diagnostics."""
+    return normalize_check_purity(CHECK_PURITY.value)
+
+
 # Backward-compatible context-key aliases. The exported variable
 # ``JIT_IN_NETWORK`` below points at ``JIT_NETWORK_SOLVES`` as well, but ctx()
 # needs a key-level alias so ``with dendra.ctx(JIT_IN_NETWORK=0): ...`` keeps
@@ -517,10 +568,14 @@ CONTEXT_ALIASES = {
 
 
 DEBUG = ContextVar("DEBUG", 0)
+CHECK_PURITY = ContextVar("CHECK_PURITY", "0")
+CHECK_PURITY.value = normalize_check_purity(CHECK_PURITY.value)
 DEVICE = ContextVar("DEVICE", "")
 DTYPE = ContextVar("DTYPE", "")
 TF32 = ContextVar("TF32", 0)
 IMEM = ContextVar("IMEM", 0)
+MEMBRANE_ASSEMBLY = ContextVar("MEMBRANE_ASSEMBLY", "auto")
+MEMBRANE_ASSEMBLY.value = normalize_membrane_assembly(MEMBRANE_ASSEMBLY.value)
 CUDA = ContextVar("CUDA", int(torch.cuda.is_available()))
 PADE = ContextVar("PADE", -1)
 REQUIRE_GRAD = ContextVar("REQUIRE_GRAD", 0)
@@ -708,39 +763,28 @@ def detach_vars(obj, vars: list[str]):
 
 def allow_tf32(allow: bool = True) -> None:
     """
-    Toggle TF32 usage for matmul (cuBLAS) and cuDNN (conv/RNN).
-    - PyTorch >= 2.9: use the new fp32_precision API.
-    - 2.7.0 <= PyTorch < 2.9.0: use the legacy allow_tf32 flags.
+    Toggle TF32 for matmul and cuDNN convolution/RNN with fine-grained controls.
 
-    On non-CUDA builds this is a no-op.
+    Without a CUDA backend this is a no-op. Unavailable backend controls retain
+    their existing best-effort behavior and do not block the other controls.
     """
-    # Parse X.Y.Z from versions like "2.9.0+cu121"
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", torch.__version__)
-    ver = tuple(map(int, m.groups())) if m else (0, 0, 0)
-    use_new = ver >= (2, 9, 0)
-
     if not hasattr(torch.backends, "cuda"):  # CPU/MPS build
         return
 
-    if use_new:
-        mode = "tf32" if allow else "ieee"
-        # New fine-grained switches (don’t mix with old ones)
-        try:
-            torch.backends.cuda.matmul.fp32_precision = mode
-        except Exception:
-            pass
-        try:
-            torch.backends.cudnn.conv.fp32_precision = mode
-        except Exception:
-            pass
-        try:
-            torch.backends.cudnn.rnn.fp32_precision = mode
-        except Exception:
-            pass
-    else:
-        # Legacy flags for 2.7–2.8
-        torch.backends.cuda.matmul.allow_tf32 = bool(allow)
-        torch.backends.cudnn.allow_tf32 = bool(allow)
+    mode = "tf32" if allow else "ieee"
+    # Do not mix the fine-grained precision controls with legacy flags.
+    try:
+        torch.backends.cuda.matmul.fp32_precision = mode
+    except Exception:
+        pass
+    try:
+        torch.backends.cudnn.conv.fp32_precision = mode
+    except Exception:
+        pass
+    try:
+        torch.backends.cudnn.rnn.fp32_precision = mode
+    except Exception:
+        pass
 
 
 def ve_from_s_t(space, time, n, device, multicontact=False):

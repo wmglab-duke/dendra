@@ -19,10 +19,12 @@ The complete documentation is published at
 with the [installation guide](https://wmglab-duke.github.io/dendra/installation.html),
 then see the tutorials and the
 [unit conventions](https://wmglab-duke.github.io/dendra/units.html).
+The [examples](examples/README.md) provide runnable scripts grouped by task,
+from simulation and recording to training and custom model components.
 
 ## Installation
 
-Dendra requires Python 3.11 or newer and PyTorch 2.12 or newer. On Windows,
+Dendra requires Python 3.11 or newer and PyTorch 2.14 or newer. On Windows,
 install inside WSL2 because the required NEURON dependency does not publish
 native Windows wheels on PyPI.
 
@@ -97,10 +99,12 @@ stimulation." *Nature Communications.* 2024.
 
 ## License
 
-Dendra is distributed under Duke University's custom license for non-commercial
-research and academic testing. Commercial use, including industrially
-sponsored research, requires a separate agreement with Duke's Office for
+Dendra's original code is distributed under Duke University's custom license
+for non-commercial research and academic testing. Commercial use, including
+industrially sponsored research, requires a separate agreement with Duke's Office for
 Translation and Commercialization. The
-[license](https://github.com/wmglab-duke/dendra/blob/main/LICENSE.md) governs
-all use; downloading, cloning, or forking the software constitutes acceptance
-of those terms.
+[license](https://github.com/wmglab-duke/dendra/blob/main/LICENSE.md) sets out
+those terms; downloading, cloning, or forking the software constitutes acceptance
+of the agreement. Identified third-party portions retain their upstream terms;
+see the
+[third-party notices](https://github.com/wmglab-duke/dendra/blob/main/THIRD_PARTY_NOTICES.md).

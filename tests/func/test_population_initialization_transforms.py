@@ -11,6 +11,14 @@ import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.mod import hh
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.01
 Celsius = "celsius_param"
 
@@ -248,6 +256,81 @@ def test_transform_input_supports_higher_order_autograd_vmap_and_compile():
     with torch_compiler_warning_context():
         actual_compiled = compiled(offset)
     torch.testing.assert_close(actual_compiled, jacobian, rtol=0.0, atol=0.0)
+
+
+def test_explicit_scalar_transform_input_keeps_its_authored_rank():
+    class ScalarShift(torch.nn.Module):
+        def forward(self, voltage, shift):
+            if shift.ndim != 0:
+                raise ValueError("the registered transform input must remain scalar")
+            return (voltage + shift,)
+
+    reference = "state.integrator.v"
+    model = _model(
+        post=(
+            (
+                ("scalar_shift", ScalarShift()),
+                {
+                    "reads": (reference,),
+                    "writes": (reference,),
+                    "inputs": {"shift": torch.tensor(0.25, dtype=torch.float64)},
+                },
+            ),
+        )
+    )
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+
+    def voltage(shift):
+        inputs = tensors.initialization._replace(
+            transforms={"post.scalar_shift.shift": shift}
+        )
+        return functional.initialize(
+            tensors.parameters, tensors.constants, inputs
+        ).state["integrator"]["v"]
+
+    shift = model.v.new_tensor(0.5)
+    torch.testing.assert_close(voltage(shift), tensors.initialization.v_init + shift)
+    lanes = model.v.new_tensor([-0.5, 0.5])
+    torch.testing.assert_close(
+        torch.vmap(voltage)(lanes),
+        torch.stack([voltage(value) for value in lanes]),
+    )
+    compiled = torch.compile(voltage, backend="eager", fullgraph=True, dynamic=False)
+    with torch_compiler_warning_context():
+        torch.testing.assert_close(compiled(shift), voltage(shift))
+
+
+def test_compiled_transform_inputs_keep_empty_and_nonempty_vmap_lanes():
+    reference = "state.integrator.v"
+    model = _model(
+        post=(
+            (
+                ("shift", _Add()),
+                {
+                    "reads": (reference,),
+                    "writes": (reference,),
+                    "inputs": {"increment": torch.tensor(0.25, dtype=torch.float64)},
+                },
+            ),
+        )
+    )
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+
+    def voltage(increment):
+        inputs = tensors.initialization._replace(
+            transforms={"post.shift.increment": increment}
+        )
+        return functional.initialize(
+            tensors.parameters, tensors.constants, inputs
+        ).state["integrator"]["v"]
+
+    compiled = torch.compile(
+        torch.vmap(voltage), backend="eager", fullgraph=True, dynamic=False
+    )
+    lanes = model.v.new_tensor([-0.5, 0.5])
+    with torch_compiler_warning_context():
+        for values in (lanes[:0], lanes, lanes[:0]):
+            torch.testing.assert_close(compiled(values), torch.vmap(voltage)(values))
 
 
 def test_mixed_rank_multiwrite_transform_preserves_each_output_schema():

@@ -1,5 +1,11 @@
 import torch
 
+from ._assembly import (
+    _assemble_currents,
+    _current_groups,
+    _IndexedCurrentSamples,
+    _PreparedCurrentIndices,
+)
 from .waveform import Waveform
 
 
@@ -148,13 +154,16 @@ def _expand_stimulus_to_selection(stim, selection_shape, batch_shape=()):
 
 class Intra(torch.nn.Module):
     def __init__(self, model, stims):
-        """
-        Initialize intracellular stimulation handler.
+        """Build an intracellular-current handler from registered waveform injections.
 
         Parameters
         ----------
-        model : Axon
-            The axon model to which this stimulation will be applied.
+        model : Population
+            Receiver whose voltage shape, device, and dtype define the current layout.
+        stims : sequence of tuple
+            Registered ``(waveform, label, indices)`` triples supplying current in mA.
+            Overlapping injections add. Most users configure these through
+            :meth:`dendra.models.slice.Slice.inject`.
         """
         super(Intra, self).__init__()
         self.shape = model.v.shape
@@ -198,6 +207,91 @@ class Intra(torch.nn.Module):
         inds = self.indices
         return wavs, inds
 
+    def _prepare_assembly(self, stims, inds, *, backend=None):
+        """Capture versioned plain coordinates before entering a compiled call.
+
+        Custom samples/indices retain the original scatter, including its
+        dispatch and exception ordering. Inference tensors have no mutation
+        counter and therefore cannot support a persistent disjointness proof.
+        """
+        # CPU Inductor already fuses the ordered scatters into one kernel.
+        # Keeping its live coordinates avoids an unnecessary eager cache guard.
+        if type(backend) is str and backend == "inductor" and self.device.type == "cpu":
+            return inds
+        if (
+            type(stims) not in (list, tuple)
+            or type(inds) not in (list, tuple)
+            or min(len(stims), len(inds), len(self.selected_batch_shapes)) < 2
+        ):
+            return inds
+        count = min(len(stims), len(inds), len(self.selected_batch_shapes))
+        cached = self.__dict__.get("_current_assembly_cache")
+        if (
+            cached is not None
+            and cached[0] == tuple(self.shape)
+            and count == len(cached[2].indices)
+        ):
+            for position in range(count):
+                index = inds[position]
+                previous = cached[2].indices[position]
+                # Cached exact tuples cannot replace their members. Tensor
+                # mutations still pass through every version check below.
+                if index is previous:
+                    continue
+                if (
+                    type(index) is not tuple
+                    or len(index) != len(previous)
+                    or any(
+                        item is not old
+                        for item, old in zip(index, previous, strict=True)
+                    )
+                ):
+                    break
+            else:
+                if all(tensor._version == version for tensor, version in cached[1]):
+                    return cached[2]
+        indices = tuple(inds[:count])
+        if any(
+            type(index) is not tuple
+            or len(index) != len(self.shape)
+            or any(
+                type(item) is not torch.Tensor
+                or item.dtype != torch.long
+                or item.device != self.device
+                or item.layout != torch.strided
+                for item in index
+            )
+            for index in indices
+        ):
+            return inds
+        # Views share their root's mutation counter. Storage aliases created
+        # independently may have distinct counters, so never deduplicate by
+        # storage address. Retain every coordinate's identity check above.
+        watchers = {}
+        for index in indices:
+            for item in index:
+                base = item._base
+                root = (
+                    base if type(base) in (torch.Tensor, torch.nn.Parameter) else item
+                )
+                watchers[id(root)] = root
+        try:
+            selection_shapes = tuple(
+                tuple(torch.broadcast_shapes(*(item.shape for item in index)))
+                for index in indices
+            )
+            versions = tuple((item, item._version) for item in watchers.values())
+        except RuntimeError:
+            # Invalid later coordinates must not mask an earlier sample error.
+            return inds
+        prepared = _PreparedCurrentIndices(
+            indices,
+            _current_groups(indices, tuple(self.shape)),
+            selection_shapes,
+        )
+        self._current_assembly_cache = (tuple(self.shape), versions, prepared)
+        return prepared
+
     def __call__(self, stims, inds):
         """
         Compute total intracellular current at the given time index.
@@ -222,6 +316,39 @@ class Intra(torch.nn.Module):
             axes (``[B]`` to ``[B, 1, 1]``).  Use explicit singleton axes when
             equal-sized batch and spatial axes would otherwise be ambiguous.
         """
+        if isinstance(stims, _IndexedCurrentSamples):
+            stims = [
+                tape.index_select(-1, stims.index).squeeze(-1) for tape in stims.tapes
+            ]
+        if not torch.compiler.is_compiling() and type(self) is Intra:
+            inds = self._prepare_assembly(stims, inds)
+        if isinstance(inds, _PreparedCurrentIndices):
+            prepared = inds
+            # Compiled callers specialize these ordinary tensor contracts in
+            # their guards, avoiding eager metadata dispatch on every timestep.
+            if all(
+                type(sample) in (torch.Tensor, torch.nn.Parameter)
+                and sample.dtype == self.dtype
+                and sample.device == self.device
+                and sample.layout == torch.strided
+                for sample in stims
+            ):
+
+                def samples():
+                    for stim, selection_shape, selected_batch_shape in zip(
+                        stims, prepared.selection_shapes, self.selected_batch_shapes
+                    ):
+                        yield _expand_stimulus_to_selection(
+                            stim,
+                            selection_shape,
+                            selected_batch_shape,
+                        )
+
+                return _assemble_currents(
+                    self.shape, self.dtype, self.device, samples(), prepared.groups
+                )
+            inds = prepared.indices
+
         intra = torch.zeros(self.shape, device=self.device, dtype=self.dtype)
         for stim, idx, selected_batch_shape in zip(
             stims, inds, self.selected_batch_shapes

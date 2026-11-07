@@ -1,9 +1,9 @@
 """Hard-forward, branch-conditioned derivatives for spike timing descriptors.
 
 These estimators make exactly the same discrete event choices as the hard
-AP-width and ADS descriptors. Within a selected branch, Torch tracks the
-linearly interpolated crossing times and downstream arithmetic. Signature
-changes need interpretation: a crossing's interpolation pair can advance by
+AP-width, conduction-velocity, and ADS descriptors. Within a selected branch,
+Torch tracks the linearly interpolated crossing times and downstream arithmetic.
+Signature changes need interpretation: a crossing's interpolation pair can advance by
 one sample while following the *same* physical event continuously. Changing
 the selected spike, validity or window-boundary state, or the historical
 sampled baseline window can instead introduce a genuine derivative
@@ -16,7 +16,7 @@ same-branch derivative check; it does not by itself prove the descriptor or
 its derivative is discontinuous.
 
 The hard value is attached to the selected-branch derivative by
-``hard + selected - selected.detach()``. This keeps the published reference
+``hard.detach() + selected - selected.detach()``. This keeps the published reference
 value on the forward pass, while exposing its ordinary piecewise derivative.
 This is deliberately not a smooth proxy for absent spikes or event changes.
 """
@@ -30,6 +30,7 @@ from typing import Any, Literal
 import torch
 
 from .descriptors import (
+    LengthLike,
     _as_F_vector,
     _coerce_lengths_um,
     _coerce_pulse_times_ms,
@@ -38,6 +39,7 @@ from .descriptors import (
     _resolve_ads_stabilizers,
     hard_action_potential_width,
     hard_activity_dependent_slowing,
+    hard_conduction_velocity,
 )
 
 
@@ -69,7 +71,282 @@ def compare_branch_signatures(
 
 def _attach(hard: torch.Tensor, selected: torch.Tensor) -> torch.Tensor:
     """Use the hard forward value and selected branch's Torch derivative."""
-    return hard + (selected - selected.detach())
+    # no_grad suppresses reverse-mode tracking but not forward-mode tangents.
+    return hard.detach() + (selected - selected.detach())
+
+
+def _selected_first_crossings(
+    voltage: torch.Tensor,
+    times: torch.Tensor,
+    valid_samples: torch.Tensor,
+    dt: torch.Tensor,
+    *,
+    V_th: float,
+    dv_th: float | None,
+    interpolate: bool,
+    window_start: torch.Tensor | None = None,
+    window_end: torch.Tensor | None = None,
+    interpolation_eps: float = 1e-12,
+    times_are_indices: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Select first crossings in (..., K, C) windows and rebuild their roots.
+
+    ``times`` and ``valid_samples`` have shape (..., K). Index-mode times
+    preserve the arithmetic of ``hard_spike_arrival_times``; millisecond
+    times preserve the pulse-window arithmetic used by the hard ADS metric.
+    Absent roots use finite placeholders so they cannot poison a valid lane's
+    backward pass. Their published values are supplied by the hard descriptor.
+    """
+    if voltage.shape[-2] < 2:
+        zero = (
+            torch.where(
+                torch.isfinite(voltage), voltage, torch.zeros_like(voltage)
+            ).sum(dim=-2)
+            * 0
+        )
+        has = torch.zeros_like(zero, dtype=torch.bool)
+        return zero, has, torch.full_like(zero, -1, dtype=torch.long)
+
+    v0, v1 = voltage[..., :-1, :], voltage[..., 1:, :]
+    t0 = times[..., :-1, None].expand_as(v0)
+    valid_pair = valid_samples[..., :-1] & valid_samples[..., 1:]
+
+    def crossing_time(origin: torch.Tensor, fraction: torch.Tensor) -> torch.Tensor:
+        if times_are_indices:
+            return (origin + fraction) * dt
+        return origin + fraction * dt
+
+    with torch.no_grad():
+        crossings = (v0 < V_th) & (v1 >= V_th) & valid_pair[..., None]
+        if dv_th is not None:
+            crossings &= (v1 - v0) / dt >= dv_th
+        difference = v1 - v0
+        safe_difference = torch.where(
+            difference != 0, difference, torch.ones_like(difference)
+        )
+        fraction = (
+            ((V_th - v0) / (safe_difference + interpolation_eps)).clamp(0, 1)
+            if interpolate
+            else torch.ones_like(v0)
+        )
+        candidate_time = crossing_time(t0, fraction)
+        if window_start is not None:
+            crossings &= candidate_time >= window_start[..., None, None]
+        if window_end is not None:
+            crossings &= candidate_time <= window_end[..., None, None]
+        has = crossings.any(dim=-2)
+        first_index = crossings.long().argmax(dim=-2)
+
+    gather_index = first_index[..., None, :]
+    v0_sel = v0.gather(-2, gather_index).squeeze(-2)
+    v1_sel = v1.gather(-2, gather_index).squeeze(-2)
+    origin = t0.gather(-2, gather_index).squeeze(-2)
+    safe_v0 = torch.where(has, v0_sel, torch.full_like(v0_sel, V_th - 1.0))
+    safe_v1 = torch.where(has, v1_sel, torch.full_like(v1_sel, V_th + 1.0))
+    if interpolate:
+        fraction = ((V_th - safe_v0) / (safe_v1 - safe_v0 + interpolation_eps)).clamp(
+            0, 1
+        )
+    else:
+        # Keep a graph-connected zero voltage derivative for sampled times.
+        fraction = torch.ones_like(safe_v0) + 0 * safe_v0
+    cross_safe = crossing_time(origin, fraction)
+    pair = (
+        origin.detach().long()
+        if times_are_indices
+        else (origin.detach() / dt.detach()).round().long()
+    )
+    pair = torch.where(has, pair, torch.full_like(pair, -1))
+    return cross_safe, has, pair
+
+
+def _selected_velocity_fit(
+    crossing_times: torch.Tensor,
+    positions_um: torch.Tensor,
+    site_used: torch.Tensor,
+    *,
+    eps_time_ms2: float,
+    regularize: bool,
+    velocity_valid: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fit position on selected arrival times without invalid-lane divisions.
+
+    Standalone hard CV uses epsilon as a validity cutoff only. Hard ADS also
+    adds it to the variance denominator; ``regularize`` retains this distinction.
+    """
+    w = site_used.to(dtype=crossing_times.dtype)
+    count = w.sum(-1)
+    normalizer = count.clamp(min=1)
+    cross_zero = torch.where(
+        site_used, crossing_times, torch.zeros_like(crossing_times)
+    )
+    positions_zero = torch.where(
+        site_used, positions_um, torch.zeros_like(positions_um)
+    )
+    t_bar = (w * cross_zero).sum(-1, keepdim=True) / normalizer[..., None]
+    x_bar = (w * positions_zero).sum(-1, keepdim=True) / normalizer[..., None]
+    centered_time = torch.where(
+        site_used, crossing_times - t_bar, torch.zeros_like(crossing_times)
+    )
+    centered_position = torch.where(
+        site_used, positions_um - x_bar, torch.zeros_like(positions_um)
+    )
+    variance = (w * centered_time.square()).sum(-1) / normalizer
+    covariance = (w * centered_time * centered_position).sum(-1) / normalizer
+    if velocity_valid is None:
+        velocity_valid = (count >= 2) & (variance.detach() > eps_time_ms2)
+    denominator = variance + eps_time_ms2 if regularize else variance
+    denominator = torch.where(velocity_valid, denominator, torch.ones_like(denominator))
+    velocity_um_per_ms = torch.where(
+        velocity_valid, covariance / denominator, torch.zeros_like(covariance)
+    )
+    return velocity_um_per_ms, variance, velocity_valid
+
+
+def branch_conditioned_conduction_velocity(
+    V: torch.Tensor,
+    lengths_um: LengthLike,
+    dt_ms: float | torch.Tensor,
+    node_mask: torch.Tensor | None = None,
+    *,
+    V_th: float = 0.0,
+    dv_th: float | None = None,
+    time_window: tuple[int, int] | None = None,
+    time_window_ms: tuple[float, float] | None = None,
+    interpolate: bool = True,
+    eps: float = 1e-12,
+) -> dict[str, Any]:
+    """Return hard conduction velocity with selected-crossing derivatives.
+
+    The arguments and measurement fields match ``hard_conduction_velocity``.
+    ``V`` has shape (T, F, C), and ``lengths_um`` is scalar, (C,), or (F, C).
+    Compartment midpoint positions are regressed on the first upward crossing
+    times at the selected sites. A (C,) or (F, C) ``node_mask`` selects sites
+    by nonzero entries, rather than supplying continuous regression weights.
+    ``time_window`` selects sample indices; ``time_window_ms`` includes roots
+    on both boundaries. Pass only one window type.
+
+    Discrete crossing pairs, spike presence, and site inclusion are selected
+    without tracking gradients. The chosen roots are then linearly interpolated
+    using graph-connected voltage endpoints, and the same spatial regression
+    supplies the local derivative. The forward values are exactly the matching
+    hard values, including NaN for invalid measurements. ``eps`` is a minimum
+    time variance in ms squared, not an offset in the regression denominator.
+
+    In addition to all hard measurement fields, returns ``velocity_valid``
+    with shape (F,), ``branch_signature`` with (F, C) integer fields, and
+    ``branch_matches_hard`` with shape (F, C). The signature records crossing
+    pairs (or -1 for absence), crossing presence, site inclusion, velocity
+    validity, and velocity sign. The match diagnostic compares the selected
+    roots and unanchored fit against the hard measurement.
+
+    The derivative describes an existing propagated spike. It does not provide
+    a direction for creating missing spikes or differentiating event identity
+    switches. Recompute after every parameter update; a pair moving to an
+    adjacent sample can still represent the same continuous physical event.
+    With ``interpolate=False``, voltage timing derivatives are zero. Speed
+    follows ``abs(v)`` and has its ordinary derivative at nonzero velocity.
+
+    Example::
+
+        out = branch_conditioned_conduction_velocity(
+            V, lengths_um, dt_ms, node_mask=node_mask,
+            time_window_ms=(1.0, 8.0),
+        )
+        loss = (out["v_m_per_s"][out["velocity_valid"]] - target).square().mean()
+        loss.backward()
+    """
+    hard = hard_conduction_velocity(
+        V,
+        lengths_um,
+        dt_ms,
+        node_mask,
+        V_th=V_th,
+        dv_th=dv_th,
+        time_window=time_window,
+        time_window_ms=time_window_ms,
+        interpolate=interpolate,
+        eps=eps,
+    )
+    T, F, C = V.shape
+    dt = torch.as_tensor(dt_ms, device=V.device, dtype=V.dtype)
+    if time_window_ms is not None:
+        dt_float = float(dt.detach().item())
+        start = max(0, math.floor(float(time_window_ms[0]) / dt_float) - 1)
+        end = min(T, math.floor(float(time_window_ms[1]) / dt_float) + 2)
+    elif time_window is not None:
+        start, end = max(0, int(time_window[0])), min(T, int(time_window[1]))
+    else:
+        start, end = 0, T
+    # An out-of-recording or reversed sample window has no selected roots.
+    end = max(start, end)
+    voltage = V[start:end].permute(1, 0, 2)
+    indices = torch.arange(
+        start, start + voltage.shape[1], device=V.device, dtype=V.dtype
+    )
+    indices = indices[None, :].expand(F, -1)
+    window_start = window_end = None
+    if time_window_ms is not None:
+        window_start = torch.as_tensor(
+            time_window_ms[0], device=V.device, dtype=V.dtype
+        )
+        window_end = torch.as_tensor(time_window_ms[1], device=V.device, dtype=V.dtype)
+    cross_safe, has, pair = _selected_first_crossings(
+        voltage,
+        indices,
+        torch.ones_like(indices, dtype=torch.bool),
+        dt,
+        V_th=V_th,
+        dv_th=dv_th,
+        interpolate=interpolate,
+        window_start=window_start,
+        window_end=window_end,
+        interpolation_eps=0.0,
+        times_are_indices=True,
+    )
+    L = _coerce_lengths_um(lengths_um, Fibs=F, C=C, device=V.device, dtype=V.dtype)
+    positions = torch.cumsum(L, dim=-1) - 0.5 * L
+    velocity_valid = (hard["ess"] >= 2) & (hard["var_t_ms2"] > eps)
+    velocity_um, variance, _ = _selected_velocity_fit(
+        cross_safe,
+        positions,
+        hard["weights"],
+        eps_time_ms2=eps,
+        regularize=False,
+        velocity_valid=velocity_valid,
+    )
+    velocity = 1e-3 * velocity_um
+    out: dict[str, Any] = dict(hard)
+    for key, selected in (
+        ("t_cross_ms", cross_safe),
+        ("var_t_ms2", variance),
+        ("v_um_per_ms", velocity_um),
+        ("v_m_per_s", velocity),
+        ("speed_m_per_s", velocity.abs()),
+    ):
+        out[key] = _attach(hard[key], selected)
+    out["velocity_valid"] = velocity_valid
+    out["branch_signature"] = {
+        "crossing_pair": pair,
+        "crossing_present": has.long(),
+        "site_used": hard["weights"].long(),
+        "velocity_valid": velocity_valid[:, None].expand(F, C).long(),
+        "velocity_sign": torch.sign(hard["v_m_per_s"].nan_to_num())[:, None]
+        .expand(F, C)
+        .long(),
+    }
+    tolerance = max(1e-10, 32 * torch.finfo(V.dtype).eps)
+    roots_match = (has == hard["has_crossing"]) & (
+        ~has
+        | torch.isclose(
+            cross_safe.detach(), hard["t_cross_ms"], rtol=tolerance, atol=tolerance
+        )
+    )
+    fit_matches = ~velocity_valid | torch.isclose(
+        velocity.detach(), hard["v_m_per_s"], rtol=tolerance, atol=tolerance
+    )
+    out["branch_matches_hard"] = roots_match & fit_matches[:, None]
+    return out
 
 
 def _crossing_time(
@@ -551,35 +828,17 @@ def branch_conditioned_activity_dependent_slowing(
     V_win, t_win, valid = _gather_time_windows_FNKC(
         V, dt, win_start, win_end, margin_ms=margin, sample_offset=0.0
     )
-    v0, v1 = V_win[:, :, :-1, :], V_win[:, :, 1:, :]
-    t0 = t_win[:, :, :-1]
-    valid_pair = valid[:, :, :-1] & valid[:, :, 1:]
-    with torch.no_grad():
-        crossings = (v0 < V_th) & (v1 >= V_th) & valid_pair[:, :, :, None]
-        if dv_th is not None:
-            crossings &= (v1 - v0) / dt >= dv_th
-        if interpolate:
-            candidate_frac = ((V_th - v0) / (v1 - v0 + 1e-12)).clamp(0, 1)
-            candidate_time = t0[:, :, :, None] + candidate_frac * dt
-        else:
-            candidate_time = t0[:, :, :, None] + dt
-        crossings &= (candidate_time >= win_start[:, :, None, None]) & (
-            candidate_time <= win_end[:, :, None, None]
-        )
-        has_comp = crossings.any(dim=2)
-        first_idx = crossings.to(torch.int64).argmax(dim=2)
-
-    gather_idx = first_idx[:, :, None, :]
-    v0_sel = v0.gather(2, gather_idx).squeeze(2)
-    v1_sel = v1.gather(2, gather_idx).squeeze(2)
-    t0_sel = t0[:, :, :, None].expand_as(v0).gather(2, gather_idx).squeeze(2)
-    safe_v0 = torch.where(has_comp, v0_sel, torch.full_like(v0_sel, V_th - 1.0))
-    safe_v1 = torch.where(has_comp, v1_sel, torch.full_like(v1_sel, V_th + 1.0))
-    if interpolate:
-        frac = ((V_th - safe_v0) / (safe_v1 - safe_v0 + 1e-12)).clamp(0, 1)
-        cross_safe = t0_sel + frac * dt
-    else:
-        cross_safe = t0_sel + dt
+    cross_safe, has_comp, time_pair = _selected_first_crossings(
+        V_win,
+        t_win,
+        valid,
+        dt,
+        V_th=V_th,
+        dv_th=dv_th,
+        interpolate=interpolate,
+        window_start=win_start,
+        window_end=win_end,
+    )
     valid_selected = has_comp & hard["weights"][:, None, :]
     earliest = torch.where(
         valid_selected, cross_safe, torch.full_like(cross_safe, float("inf"))
@@ -647,22 +906,14 @@ def branch_conditioned_activity_dependent_slowing(
     if lengths_um is not None:
         L = _coerce_lengths_um(lengths_um, Fibs=F, C=C, device=V.device, dtype=V.dtype)
         x = (torch.cumsum(L, dim=-1) - 0.5 * L)[:, None, :]
-        w = valid_selected.to(dtype=V.dtype)
-        W = w.sum(-1)
-        cross_zero = torch.where(
-            valid_selected, cross_safe, torch.zeros_like(cross_safe)
+        velocity_um, _, vel_valid = _selected_velocity_fit(
+            cross_safe,
+            x,
+            valid_selected,
+            eps_time_ms2=eps_time_ms2,
+            regularize=True,
         )
-        t_bar = (w * cross_zero).sum(-1, keepdim=True) / W[:, :, None].clamp(min=1)
-        x_bar = (w * x).sum(-1, keepdim=True) / W[:, :, None].clamp(min=1)
-        dtc = torch.where(
-            valid_selected, cross_safe - t_bar, torch.zeros_like(cross_safe)
-        )
-        dxc = x - x_bar
-        var_t = (w * dtc * dtc).sum(-1) / W.clamp(min=1)
-        cov = (w * dtc * dxc).sum(-1) / W.clamp(min=1)
-        vel_safe = 1e-3 * cov / (var_t + eps_time_ms2)
-        vel_valid = (W >= 2) & (var_t > eps_time_ms2)
-        vel_safe = torch.where(vel_valid, vel_safe, torch.zeros_like(vel_safe))
+        vel_safe = 1e-3 * velocity_um
         out["v_m_per_s"] = _attach(hard["v_m_per_s"], vel_safe)
         out["speed_m_per_s"] = _attach(hard["speed_m_per_s"], vel_safe.abs())
         ref_velocity = _as_F_vector(
@@ -710,8 +961,6 @@ def branch_conditioned_activity_dependent_slowing(
 
     # Return a common (F,N,C) signature shape so the generic comparator can
     # detect event switches without broadcasting or opaque string encodings.
-    time_pair = (t0_sel.detach() / dt.detach()).round().long()
-    time_pair = torch.where(has_comp, time_pair, torch.full_like(time_pair, -1))
     earliest_site = torch.where(
         has_any, earliest_site, torch.full_like(earliest_site, -1)
     )

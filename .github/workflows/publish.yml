@@ -48,9 +48,11 @@ jobs:
             exit 1
           fi
       - name: Install packaging tools
-        run: python -m pip install --upgrade build twine
+        run: python -m pip install --upgrade build packaging twine
       - name: Test publication safeguards
-        run: python -m unittest discover -s tests -p test_distribution_checks.py
+        run: |
+          python -m unittest discover -s tests -p test_distribution_checks.py
+          python -m unittest discover -s scripts/tests -p test_github_release.py
       - name: Build wheel from source distribution
         run: python -m build
       - name: Check metadata and archive contents
@@ -72,27 +74,32 @@ jobs:
         include:
           - os: ubuntu-24.04
             python: "3.11"
-            torch: "torch==2.12.0"
+            torch: "torch==2.14.0"
             distribution: wheel
             solvers: absent
           - os: ubuntu-24.04
             python: "3.13"
-            torch: "torch==2.12.0"
+            torch: "torch==2.14.0"
             distribution: wheel
             solvers: present
           - os: ubuntu-24.04
             python: "3.14"
-            torch: "torch>=2.12,<3"
+            torch: "torch>=2.14,<3"
             distribution: wheel
             solvers: absent
-          - os: macos-14
+          - os: macos-15
             python: "3.12"
-            torch: "torch==2.12.0"
+            torch: "torch==2.14.0"
             distribution: wheel
             solvers: absent
+          - os: macos-15
+            python: "3.12"
+            torch: "torch==2.15.0"
+            distribution: wheel
+            solvers: present
           - os: ubuntu-24.04
             python: "3.12"
-            torch: "torch==2.12.0"
+            torch: "torch==2.14.0"
             distribution: sdist
             solvers: absent
     runs-on: ${{ matrix.os }}
@@ -141,8 +148,94 @@ jobs:
           cd "$RUNNER_TEMP"
           python -I "$GITHUB_WORKSPACE/scripts/distribution_smoke.py" --expect-solvers "$SOLVERS"
 
+  test_functional_cpu_shards:
+    # Retain the complete compiler selection, split only at module boundaries.
+    strategy:
+      fail-fast: false
+      matrix:
+        torch:
+          - {spec: "torch==2.14.0", label: minimum}
+          - {spec: "torch==2.15.0", label: current}
+          - {spec: "torch>=2.15,<3", label: rolling}
+        shard: [1, 2, 3, 4]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install CPU compiler baseline or latest compatible release
+        env:
+          TORCH_SPEC: ${{ matrix.torch.spec }}
+        run: python -m pip install "$TORCH_SPEC" --index-url https://download.pytorch.org/whl/cpu
+      - name: Install source, test tools and required native solvers
+        run: python -m pip install --only-binary=dendra-solvers ".[dev,solvers]"
+      - name: Require native DHS before running all-eight-gradient checks
+        run: |
+          python - <<'PYCODE'
+          import torch
+          import dendra_solvers._ext
+          from dendra.models.integrators.tree import DENDRA_SOLVERS_AVAILABLE
+          assert DENDRA_SOLVERS_AVAILABLE, "Native DHS coverage must not be skipped"
+          print("Functional compiler lane:", torch.__version__)
+          PYCODE
+      - name: Check real scan and while-loop traces, gradients and ownership
+        env:
+          TORCHINDUCTOR_COMPILE_THREADS: "1"
+        run: >-
+          python -m pytest -q -p scripts.ci_shard
+          --ci-shard-index=${{ matrix.shard }} --ci-shard-total=4
+          --ci-shard-output=ci-results/functional-compatibility/${{ matrix.torch.label }}/${{ matrix.shard }}
+          --ci-shard-durations=scripts/ci_durations.json
+          --junitxml=ci-results/functional-compatibility/${{ matrix.torch.label }}/${{ matrix.shard }}/junit.xml
+          @scripts/functional_compatibility_tests.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: functional-compatibility-${{ matrix.torch.label }}-${{ matrix.shard }}
+          path: ci-results/functional-compatibility/${{ matrix.torch.label }}/
+          if-no-files-found: error
+          retention-days: 7
+
+  test_functional_cpu:
+    # This gate runs only after every shard succeeds. Validate each actual
+    # Torch environment separately rather than stitching twelve jobs together.
+    needs: test_functional_cpu_shards
+    strategy:
+      fail-fast: false
+      matrix:
+        torch:
+          - {spec: "torch==2.14.0", label: minimum}
+          - {spec: "torch==2.15.0", label: current}
+          - {spec: "torch>=2.15,<3", label: rolling}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: functional-compatibility-${{ matrix.torch.label }}-*
+          path: ci-results/functional-compatibility/${{ matrix.torch.label }}
+          merge-multiple: true
+      - name: Validate the complete compiler test partition
+        env:
+          TORCH_SPEC: ${{ matrix.torch.spec }}
+        run: |
+          python -m pip install coverage packaging
+          python scripts/combine_ci_coverage.py --partition-only --shards=4 \
+            --input-dir=ci-results/functional-compatibility/${{ matrix.torch.label }} \
+            --torch-spec="$TORCH_SPEC"
+
   check_dist:
-    needs: [build, test_install]
+    needs: [build, test_install, test_functional_cpu]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -196,3 +289,35 @@ jobs:
           name: checked-dists
           path: dist
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github_release:
+    needs: publish_pypi
+    if: needs.publish_pypi.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: checked-dists
+          path: dist
+      - name: Install release metadata tools
+        run: python -m pip install packaging
+      - name: Publish the tagged GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python scripts/github_release.py
+          --repository "$GITHUB_REPOSITORY"
+          --tag "$GITHUB_REF_NAME"
+          --commit "$(git rev-parse HEAD)"
+          --dist-dir dist
+          --changelog CHANGELOG.md

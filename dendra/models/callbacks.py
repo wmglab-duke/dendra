@@ -2,7 +2,7 @@ import gc
 import multiprocessing as mp
 from contextlib import nullcontext
 from numbers import Integral
-from queue import Queue
+from queue import Full, Queue
 from types import MethodType
 from typing import Dict, List, Tuple
 
@@ -13,6 +13,25 @@ from h5py import File
 from dendra.utils.dynamic_compilation import compile_generated_function
 
 from ..helpers import nojit
+from ._callback_scopes import (
+    _population_callback_target,
+    _validate_population_callback_name,
+)
+from ._lfp_callbacks import (
+    _materialize_lfp_fields,
+    _project_lfp,
+    _validate_lfp_fields,
+)
+from ._recorder_cadence import _recorder_should_save, _recorder_stride
+from ._threshold_callbacks import (
+    _COUNT_DTYPE,
+    _anomaly_flags,
+    _restore_count,
+    _validate_activity_target,
+)
+from ._threshold_callbacks import accumulate_count as _accumulate_count
+from ._threshold_callbacks import activity_from_counts as _activity_from_counts
+from ._threshold_callbacks import threshold_crossing as _threshold_crossing
 from .backend import Backend as A
 
 # Kept as a module-level compatibility hook, but initialized lazily by Recorder.
@@ -96,6 +115,90 @@ class Callback(torch.nn.Module):
         pass
 
 
+class PopulationCallback(Callback):
+    """Apply a callback to one top-level Population in a Network.
+
+    Parameters
+    ----------
+    population : str
+        Exact Population name in the Network's ``populations`` mapping. A
+        concatenated MultiPopulation is one owner; use its named physical
+        Slices with a Recorder's ``region`` argument to select components.
+    callback : Callback or dendra.func.FunctionalCallback
+        Observation configuration for the selected Population. Native Network
+        execution forwards hooks to a native :class:`Callback`. Functional
+        execution accepts supported native configurations and pure callbacks.
+
+    Notes
+    -----
+    Inspect native results through the supplied inner callback, also available
+    as ``callback``. Functional execution captures the configuration and returns
+    independently owned results without importing the inner callback's native
+    history. Scopes cannot be nested. Use the inner callback directly for a
+    standalone Population.
+
+    Examples
+    --------
+    >>> counts = APCount(node_check=[0, -1])
+    >>> scoped = PopulationCallback("left", counts)
+    >>> network.run(10.0, callbacks=[scoped])
+    >>> native_counts = counts.numpy()
+    """
+
+    def __init__(self, population, callback):
+        super().__init__()
+        from dendra.func._callbacks import FunctionalCallback
+        from dendra.func._callbacks import PopulationCallback as FunctionalScope
+
+        self.population = _validate_population_callback_name(population)
+        if not isinstance(callback, (Callback, FunctionalCallback)):
+            raise TypeError(
+                "PopulationCallback requires a native Callback or pure FunctionalCallback"
+            )
+        if isinstance(callback, (PopulationCallback, FunctionalScope)):
+            raise ValueError("PopulationCallback scopes cannot be nested")
+        self.callback = callback
+
+    def _native_target(self, network):
+        from .networks.net import Network
+
+        if not isinstance(self.callback, Callback):
+            raise TypeError(
+                "PopulationCallback requires a native Callback for native execution; "
+                "pure FunctionalCallback configurations require functional execution"
+            )
+        if not isinstance(network, Network):
+            raise TypeError(
+                "PopulationCallback must be used with a Network; "
+                "use the inner callback directly for a Population"
+            )
+        return _population_callback_target(network.populations, self.population)
+
+    def pre_loop_hook(self, model):
+        target = self._native_target(model)
+        return self.callback.pre_loop_hook(target)
+
+    def post_loop_hook(self, model):
+        target = self._native_target(model)
+        return self.callback.post_loop_hook(target)
+
+    def pre_step_hook(self, model):
+        target = self._native_target(model)
+        return self.callback.pre_step_hook(target)
+
+    def post_step_hook(self, model):
+        target = self._native_target(model)
+        return self.callback.post_step_hook(target)
+
+    def pre_chunk_hook(self, model, timepoints=None):
+        target = self._native_target(model)
+        return self.callback.pre_chunk_hook(target, timepoints)
+
+    def post_chunk_hook(self, model, timepoints=None):
+        target = self._native_target(model)
+        return self.callback.post_chunk_hook(target, timepoints)
+
+
 class CallbackList(torch.nn.Module):
     """
     Lightweight container that forwards hook calls to multiple callbacks.
@@ -158,7 +261,7 @@ class CallbackList(torch.nn.Module):
 template = """
 def recorder(self, model):
   if self.save_every is not None:
-    save = self.i % self.save_every == 0
+    save = _recorder_should_save(self.i, self.save_every)
   else:
     save = True
   if save:
@@ -256,7 +359,7 @@ def _is_state(s):
 
 
 def _parse_template(full_state, max_only=False, indexed=False):
-    mech, state = full_state.split(".")
+    mech, state = full_state.rsplit(".", 1)
     if max_only:
         impl = max_only_t
     elif indexed:
@@ -292,6 +395,7 @@ def _build_recorder_func(states, max_only, indexed):
         func_name="recorder",
         filename_prefix="dendra.callbacks.recorder_func",
         global_ns=globals(),
+        extra_ns={"_recorder_should_save": _recorder_should_save},
     )
 
 
@@ -354,9 +458,7 @@ def _atleast_3d(x: torch.Tensor) -> torch.Tensor:
 
 
 def _detect_anomalies(x: torch.Tensor, prev) -> torch.Tensor:
-    anomalous = (torch.isnan(x) | torch.isinf(x)).squeeze().any(-1)
-    anomalous = torch.logical_or(anomalous, prev)
-    return anomalous
+    return _anomaly_flags(prev, x)
 
 
 class AnomalyDetector(Callback):
@@ -374,7 +476,7 @@ class AnomalyDetector(Callback):
 
     def pre_loop_hook(self, model):
         """Allocate a boolean flag per axon on the model's device."""
-        self.rec = torch.zeros(model.n_ax, dtype=torch.bool, device=model.device())
+        self.rec = torch.zeros_like(model.v[..., 0], dtype=torch.bool)
 
     def post_step_hook(self, model):
         """Update the anomaly mask after each step using :func:`_detect_anomalies`."""
@@ -393,6 +495,28 @@ class AnomalyDetector(Callback):
         if self.rec is not None:
             return self.rec.detach().cpu().numpy()
         return None
+
+
+class _RecorderRegionView:
+    """Read physical Slice tensors while keeping the full model's scalar clock."""
+
+    def __init__(self, model, region):
+        self.model = model
+        self.index = region.flat_index
+        self.shape = tuple(region.shape)
+        self.physical_shape = tuple(model.shape)
+
+    def __getattr__(self, name):
+        value = getattr(self.model, name)
+        if name == "t":
+            return value
+        payload = tuple(value.shape[len(self.physical_shape) :])
+        if tuple(value.shape[: len(self.physical_shape)]) != self.physical_shape:
+            raise ValueError(
+                "Recorder region requires a full-coordinate physical tensor."
+            )
+        flattened = value.reshape(-1, *payload)
+        return flattened.index_select(0, self.index).reshape((*self.shape, *payload))
 
 
 class Recorder(Callback):
@@ -416,18 +540,24 @@ class Recorder(Callback):
         Indices of specific nodes to record. If None, all nodes are recorded.
         Default is None.
     dt : float, optional
-        Time step for recording. If provided, states are recorded every
-        dt/model.dt steps. Default is None (record every step).
-    sliding_window : int, optional
-        Size of sliding window for temporal averaging of recorded data.
-        Default is None (no averaging).
+        Recording interval, converted to the integer stride ``int(dt/model.dt)``
+        without rounding. Default is None (record every step). A fresh in-memory
+        recording retains the initial boundary, then post-step frames stride,
+        2 * stride, and so on.
     partition : sequence of int, optional
         With ``max_only=True``, contiguous segment lengths along the final
         compartment axis. One maximum per segment is appended as the final
         output axis.
+    region : Slice, optional
+        Physical Population coordinates to select for ``v``, ``vc``, and
+        ``i_membrane``. Scalar ``t`` is left unchanged. Cannot be combined
+        with node indices, maximum reduction, or partitions.
 
     Notes
     -----
+    Apply temporal filtering or averaging to the recorded tensors as a separate
+    postprocessing step.
+
     For large-scale simulations, use the set_hdf5 method to enable caching to an
     HDF5 file, which helps manage memory usage.
 
@@ -458,11 +588,15 @@ class Recorder(Callback):
         max_only=False,
         node_indices=None,
         dt=None,
-        sliding_window=None,
         partition=None,
+        *,
+        region=None,
     ):
         super().__init__()
+        states = (states,) if isinstance(states, str) else states
         self.states = states
+        self.region = region
+        self._region_reader = None
         self.rec: Dict[str, List[torch.Tensor]] = {s: [] for s in states}
         self.max_only: bool = max_only
         self.partition = None
@@ -474,15 +608,20 @@ class Recorder(Callback):
         if self.indexed:
             self.node_indices = torch.as_tensor(node_indices, dtype=torch.long)
 
-        self.sliding_window = sliding_window
         rfunc = _build_recorder_func(states, self.max_only, self.indexed)
         setattr(self, "_post_step_hook", MethodType(rfunc, self))
         setattr(self, "_pre_loop_hook", MethodType(rfunc, self))
+        self._recorder_generated_hooks = (
+            self._pre_loop_hook.__func__,
+            self._post_step_hook.__func__,
+        )
 
         self._dt = None
         self.save_dt = dt
         self.save_every = (
-            int(self.save_dt / self.dt) if self.save_dt is not None else None
+            _recorder_stride(self.save_dt, self.dt)
+            if self.save_dt is not None
+            else None
         )
 
         # HDF5 -- optional -- for large data
@@ -498,6 +637,8 @@ class Recorder(Callback):
         self.data_pinned = {}
         self.stream = None
         self._transfer_streams = {}
+        self._hdf5_session = None
+        self._native_hdf5_active = False
 
     def set_partition(self, partition=None):
         if partition is not None:
@@ -518,34 +659,30 @@ class Recorder(Callback):
     def dt(self, value):
         self._dt = value
         if self.save_dt is not None:
-            self.save_every = int(self.save_dt / self.dt)
+            self.save_every = _recorder_stride(self.save_dt, self.dt)
 
     def set_hdf5(self, hdf5: str, cache_every: int = 10000) -> "Recorder":
-        """
-        Enables caching of recorded data to an HDF5 file.
-
-        This method configures the recorder to periodically save recorded data to an HDF5 file
-        instead of keeping everything in memory. This is particularly useful for large-scale
-        simulations where memory usage would otherwise become prohibitive.
+        """Write recorded samples to HDF5 with bounded host buffering.
 
         Parameters
         ----------
         hdf5 : str
-            File path where the HDF5 data will be stored.
-        cache_every : int, optional
-            Number of simulation steps between cache operations. Controls how
-            frequently data is written to the HDF5 file. Default is 10000 steps.
+            Destination file path.
+        cache_every : int, default 10000
+            Positive number of solver iterations between flushes. A fresh recording
+            session also counts its initial boundary. Recorder ``dt`` selects which
+            samples are retained independently of this flush interval.
 
         Returns
         -------
         Recorder
-            Returns the recorder instance for method chaining.
+            This recorder for method chaining.
 
         Notes
         -----
-        This method starts a separate process for writing data to the HDF5 file to avoid
-        blocking the main simulation. The process will continue running until the recorder's
-        close() method is called.
+        Call :meth:`close` to finish writing before reading the file with
+        :class:`dendra.data.H5Reader`. HDF5 storage detaches samples from autograd;
+        use in-memory results when the recorded values must retain gradients.
         """
         if isinstance(cache_every, bool) or not isinstance(cache_every, Integral):
             raise TypeError("cache_every must be a positive integer.")
@@ -557,7 +694,7 @@ class Recorder(Callback):
         self.hdf5_path = hdf5
         mp.set_start_method("spawn", force=True)
         self.manager = mp.Manager()
-        self.queue = self.manager.Queue()
+        self.queue = self.manager.Queue(maxsize=2)
         self.writer_thread = mp.Process(
             target=_hdf5_write, args=(self.queue, self.hdf5_path)
         )
@@ -573,14 +710,50 @@ class Recorder(Callback):
         - Moves ``node_indices`` to the model device if indexed recording is used.
         - Executes the generated recorder function once to capture the initial
           state (so ``t=0`` is included).
-        - Advances the internal step counter if HDF5 caching is enabled so that
-          cache flushing cadence aligns with subsequent ``post_step_hook`` calls.
+        - Advances the internal step counter so subsequent samples use the
+          same cadence for in-memory and HDF5 recording.
         """
+        self._check_recording_session()
+        if self._native_hdf5_active:
+            raise RuntimeError("Recorder already has an active native HDF5 run.")
+        reader = self._bind_region_reader(model)
+        # A source Population must never become a registered child module of
+        # its own callback. Only the non-Module physical view is retained.
+        self._region_reader = None if reader is model else reader
         if self.indexed:
             self.node_indices = self.node_indices.to(model.device())
-        self._pre_loop_hook(model)
-        if self.cache_with_hdf5:
-            self.i += 1
+        self._pre_loop_hook(reader)
+        self.i += 1
+        self._native_hdf5_active = self.cache_with_hdf5
+
+    def _check_recording_session(self):
+        if self._hdf5_session is not None:
+            raise RuntimeError("Recorder already has an active HDF5 recording session.")
+
+    def _bind_region_reader(self, model):
+        if self.region is None:
+            return model
+        from .slice import Slice
+
+        if not isinstance(self.region, Slice):
+            raise ValueError("Recorder region must be a physical Population Slice.")
+        if object.__getattribute__(self.region, "root_model") is not model:
+            raise ValueError(
+                "Recorder region must belong to the exact source Population."
+            )
+        if object.__getattribute__(self.region, "module_path"):
+            raise ValueError(
+                "Recorder region must select physical Population coordinates."
+            )
+        if self.max_only or self.node_indices is not None or self.partition is not None:
+            raise ValueError(
+                "Recorder region cannot be combined with node_indices, max_only, or partition."
+            )
+        if any(state not in {"v", "vc", "i_membrane", "t"} for state in self.states):
+            raise ValueError(
+                "Recorder region only selects physical v, vc, or i_membrane state and clock t."
+            )
+        return _RecorderRegionView(model, self.region)
 
     def cache_hdf5(self):
         populated = [bool(self.rec[s]) for s in self.states]
@@ -595,9 +768,14 @@ class Recorder(Callback):
                 f"for state(s): {', '.join(missing)}."
             )
 
+        self._check_recording_session()
+        self._write_hdf5_frame({state: self.stack(state) for state in self.states})
+
+    def _write_hdf5_frame(self, values):
+        """Stage an owned detached frame for the shared native/functional writer."""
         streams_used = {}
         for s in self.states:
-            data = self.stack(s)
+            data = values[s].detach()
             cuda_source = data.device.type == "cuda"
             transfer_stream = None
             transfer_context = nullcontext()
@@ -627,14 +805,35 @@ class Recorder(Callback):
         for stream in streams_used.values():  # pragma: no cover - CUDA lane
             stream.synchronize()
 
-        self.queue.put("flush")
+        self._enqueue_hdf5("flush")
         for s in self.states:
             data = self.data_pinned[s]
             chunks = list(data.shape)
             if data.ndim > 1:
                 chunks[1] = 1
-            self.queue.put((s, self.run_number, self.save_count, data, tuple(chunks)))
+            self._enqueue_hdf5(
+                (s, self.run_number, self.save_count, data, tuple(chunks))
+            )
         self.save_count += 1
+
+    def _enqueue_hdf5(self, item):
+        writer = self.writer_thread
+        # Synchronous test/third-party queues do not expose process state.
+        if writer is None or not hasattr(writer, "exitcode"):
+            self.queue.put(item)
+            return
+        while True:
+            if writer.exitcode is not None:
+                raise RuntimeError(
+                    f"Recorder HDF5 writer stopped with exit code {writer.exitcode}."
+                )
+            try:
+                self.queue.put(item, timeout=0.1)
+                return
+            except Full:
+                # A bounded queue applies backpressure, while checking process
+                # state ensures a failed writer cannot leave the producer stuck.
+                continue
 
     def _transfer_stream_for(self, device):  # pragma: no cover - CUDA lane
         """Return a lazily-created transfer stream on ``device``."""
@@ -677,7 +876,8 @@ class Recorder(Callback):
         (optionally via a CUDA stream) to the writer process and the in-memory
         lists are cleared.
         """
-        self._post_step_hook(model)
+        self._check_recording_session()
+        self._post_step_hook(model if self.region is None else self._region_reader)
         self.i += 1
         if self.cache_with_hdf5:
             if self.i % self.cache_every == 0:
@@ -691,12 +891,16 @@ class Recorder(Callback):
         Flush any remaining buffered data to HDF5, then reset the per-run cache
         counters so the recorder can be reused for subsequent runs.
         """
-        if self.cache_with_hdf5:
-            self.cache_hdf5()
-            self.rec = {s: [] for s in self.states}
+        self._check_recording_session()
+        try:
+            if self.cache_with_hdf5:
+                self.cache_hdf5()
+                self.rec = {s: [] for s in self.states}
             self.i = 0
-        self.save_count = 0
-        self.run_number += 1
+            self.save_count = 0
+            self.run_number += 1
+        finally:
+            self._native_hdf5_active = False
 
     def reset(self):
         """
@@ -730,8 +934,10 @@ class Recorder(Callback):
         >>> # Get data only from second run
         >>> second_run_data = recorder.numpy()
         """
+        self._check_recording_session()
         self.rec = {s: [] for s in self.states}
         self.i = 0
+        self._native_hdf5_active = False
 
     def close(self) -> None:
         """
@@ -750,43 +956,50 @@ class Recorder(Callback):
         reset : Reset the recorder's state
         set_hdf5 : Enable HDF5 caching for recorded data
         """
+        self._check_recording_session()
         if self.cache_with_hdf5:
-            self.queue.put(None)
-            self.writer_thread.join()
-            if self.manager is not None:
-                self.manager.shutdown()
-            self.cache_with_hdf5 = False
+            try:
+                self._enqueue_hdf5(None)
+            finally:
+                try:
+                    self.writer_thread.join()
+                    code = getattr(self.writer_thread, "exitcode", None)
+                    if code not in (None, 0):
+                        raise RuntimeError(
+                            f"Recorder HDF5 writer stopped with exit code {code}."
+                        )
+                finally:
+                    if self.manager is not None:
+                        self.manager.shutdown()
+                    self.cache_with_hdf5 = False
+                    self._native_hdf5_active = False
 
     def stack(self, var: str = None) -> torch.Tensor:
-        """
-        Stack recorded tensors into a single tensor.
-
-        This method combines the recorded state tensors into a single tensor. If a specific
-        state name is provided, only that state's data is stacked. Otherwise, all recorded
-        states are stacked and concatenated.
+        """Stack retained in-memory samples.
 
         Parameters
         ----------
         var : str, optional
-            Name of the specific state to stack. If None, all states
-            are stacked on an axis immediately before the final recorded-node
-            or partition axis. Default is None.
+            Recorded field name, such as ``"v"`` or ``"mech.hh.m"``. When omitted,
+            stack all fields on an axis immediately before the final recorded-site
+            or partition axis; the fields must have compatible shapes.
 
         Returns
         -------
         torch.Tensor
-            A tensor containing the stacked recorded data. If max_only is True,
-            returns the maximum value along the time dimension. If sliding_window is set,
-            the data is temporally averaged using the specified window size.
+            With ``var`` supplied, samples retain their leading time axis, including
+            when ``max_only=True``. With ``var=None``, the legacy ``max_only=True``
+            form additionally takes the maximum over time; otherwise time is retained.
+
+        Notes
+        -----
+        ``max_only`` already reduces the selected spatial sites or partitions when
+        samples are recorded. :meth:`numpy` uses the same stacking convention and
+        then detaches and moves the result to CPU.
         """
         if var is not None:
-            vs = torch.stack(self.rec[var])
-            if self.sliding_window is not None:
-                vs = _sliding_window_average(vs, self.sliding_window)
-            return vs
+            return torch.stack(self.rec[var])
         vs = torch.stack([torch.stack(self.rec[s]) for s in self.rec], dim=-2)
-        if self.sliding_window is not None:
-            vs = _sliding_window_average(vs, self.sliding_window)
         if self.max_only:
             return torch.amax(vs, 0)
         return vs
@@ -930,9 +1143,10 @@ class LFP(Callback):
         stacks the list along a leading contact dimension. Pass ``[lead_field]``
         for one contact.
     rule : str, optional
-        Einstein summation rule for computing the dot product. Default is None,
-        which uses the rule ``"...,n...->n"`` and sums over all dimensions except
-        the field index.
+        Explicit Einstein summation rule for computing the dot product. The
+        default sums the physical cell and compartment axes, preserving batch
+        axes, and produces ``(*batch, contacts)`` per sample. An explicit rule
+        is passed to ``torch.einsum`` without changing its reductions.
 
     Notes
     -----
@@ -972,45 +1186,229 @@ class LFP(Callback):
 
     def __init__(self, v_unit: list[torch.Tensor], rule=None):
         super().__init__()
-        if not isinstance(v_unit, list):
-            raise TypeError(
-                "v_unit must be a non-empty list of lead-field tensors; "
-                "pass [lead_field] for one recording contact."
-            )
-        if not v_unit:
-            raise ValueError("v_unit must contain at least one lead-field tensor.")
-        if not all(isinstance(field, torch.Tensor) for field in v_unit):
-            raise TypeError("Every v_unit entry must be a torch.Tensor.")
-        field_shape = v_unit[0].shape
-        if any(field.shape != field_shape for field in v_unit[1:]):
-            raise ValueError("All v_unit lead-field tensors must have the same shape.")
+        fields = _validate_lfp_fields(v_unit)
         self._lfp = []
         self._t = []
-        self.register_buffer("v_unit", torch.stack(v_unit))
-        if rule is None:
-            rule = "...,n...->n"
-        self.rule = rule
+        self.register_buffer("v_unit", torch.stack(fields))
+        self._capture_lfp_fields(fields)
+        # Retain the public default spelling while distinguishing it from the
+        # same string supplied explicitly as a custom all-axis reduction.
+        self.rule = "...,n...->n" if rule is None else rule
+        object.__setattr__(self, "_configured_lfp_rule", rule)
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name == "v_unit" and not self.__dict__.get("_binding_lfp_fields", False):
+            self._retire_lfp_fields()
+        elif name == "rule":
+            object.__setattr__(self, "_configured_lfp_rule", value)
+
+    @staticmethod
+    def _lfp_tensor_version(value):
+        if type(value) in (torch.Tensor, torch.nn.Parameter):
+            try:
+                return value._version
+            except RuntimeError:
+                pass  # Inference tensors have no mutation version.
+        return None
+
+    def _capture_lfp_fields(self, fields, *, stacked_source=None):
+        current = self.v_unit
+        object.__setattr__(self, "_configured_lfp_fields", fields)
+        object.__setattr__(self, "_configured_lfp_stacked_source", stacked_source)
+        object.__setattr__(self, "_published_lfp_fields", current)
+        object.__setattr__(
+            self, "_published_lfp_fields_version", self._lfp_tensor_version(current)
+        )
+        object.__setattr__(
+            self, "_published_lfp_fields_snapshot", current.detach().clone()
+        )
+
+    def _retire_lfp_fields(self):
+        for name in (
+            "_configured_lfp_fields",
+            "_configured_lfp_stacked_source",
+            "_published_lfp_fields",
+            "_published_lfp_fields_version",
+            "_published_lfp_fields_snapshot",
+        ):
+            object.__setattr__(self, name, None)
+
+    def _lfp_fields_unchanged(self):
+        current = self.v_unit
+        if (
+            self.__dict__.get("_configured_lfp_fields") is not None
+            and self.__dict__.get("_published_lfp_fields") is current
+        ):
+            snapshot = self._published_lfp_fields_snapshot
+            if (
+                current.shape != snapshot.shape
+                or current.dtype != snapshot.dtype
+                or current.device != snapshot.device
+            ):
+                return False
+            version = self._published_lfp_fields_version
+            if version is not None:
+                return self._lfp_tensor_version(current) == version
+            if torch.is_complex(current):
+                current, snapshot = (
+                    torch.view_as_real(current),
+                    torch.view_as_real(snapshot),
+                )
+            if torch.is_floating_point(current):
+                return bool(
+                    torch.all(
+                        (current == snapshot)
+                        | (torch.isnan(current) & torch.isnan(snapshot))
+                    )
+                )
+            return torch.equal(current, snapshot)
+        return False
+
+    def _lfp_stacked_source(self):
+        if self._lfp_fields_unchanged():
+            return self.__dict__.get("_configured_lfp_stacked_source")
+        return self.v_unit
+
+    def _lfp_field_configuration(self):
+        source = self._lfp_stacked_source()
+        if source is None:
+            return self._configured_lfp_fields
+        if not torch.is_inference(source):
+            # Rebuild views from their authoritative owner for every fresh
+            # capture, retaining gradients after optimizer updates to a leaf
+            # Tensor that is itself a view of a non-trainable base.
+            with torch.inference_mode(False), torch.enable_grad():
+                return tuple(source[index] for index in range(source.shape[0]))
+        return tuple(source.unbind(0))
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        unchanged = self._lfp_fields_unchanged()
+        state["_lfp_serialized_sources_unchanged"] = unchanged
+        if not unchanged:
+            state["_configured_lfp_fields"] = None
+            state["_configured_lfp_stacked_source"] = None
+        return state
+
+    def __setstate__(self, state):
+        unchanged = state.pop("_lfp_serialized_sources_unchanged", False)
+        super().__setstate__(state)
+        if unchanged:
+            # Tensor copies may reset mutation versions. Rebase only when
+            # serialization recorded that no public-buffer edit had occurred.
+            object.__setattr__(self, "_published_lfp_fields", self.v_unit)
+            object.__setattr__(
+                self,
+                "_published_lfp_fields_version",
+                self._lfp_tensor_version(self.v_unit),
+            )
+        else:
+            self._retire_lfp_fields()
+
+    def _lfp_rule_configuration(self):
+        public = self.rule
+        if (
+            self.__dict__.get("_configured_lfp_rule", public) is None
+            and isinstance(public, str)
+            and str.__eq__(public, "...,n...->n")
+        ):
+            return None
+        return public
+
+    def _functional_lfp_configuration(self):
+        """Project field sources and reductions without native recording history."""
+        return {
+            "v_unit": list(self._lfp_field_configuration()),
+            "rule": self._lfp_rule_configuration(),
+        }
+
+    def _publish_lfp_fields(self, value, fields, *, stacked_source=None):
+        previous = self.__dict__.get("_binding_lfp_fields", False)
+        object.__setattr__(self, "_binding_lfp_fields", True)
+        try:
+            self.v_unit = value
+        finally:
+            object.__setattr__(self, "_binding_lfp_fields", previous)
+        self._capture_lfp_fields(fields, stacked_source=stacked_source)
+
+    def _apply(self, fn, recurse=True):
+        previous = self.v_unit
+        result = super()._apply(fn, recurse=recurse)
+        if self.v_unit is not previous:
+            self._retire_lfp_fields()
+        return result
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        errors = len(error_msgs)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if prefix + "v_unit" in state_dict and len(error_msgs) == errors:
+            # Loading the public buffer is authoritative even when its values
+            # happen to match an earlier publication of mutable raw sources.
+            self._retire_lfp_fields()
+
+    def _observe_lfp(self, current):
+        rule = self._lfp_rule_configuration()
+        fields = self.v_unit
+        if isinstance(fields, torch.nn.Parameter):
+            fields = fields.to(device=current.device, dtype=current.dtype)
+        padding = current.ndim - fields.ndim + 1 if rule is None else 0
+        return _project_lfp(current, fields, rule=rule, padding=padding)
 
     def pre_loop_hook(self, model):
         """
         Validate IMEM availability and record the baseline LFP.
 
-        Moves ``v_unit`` to the model device, raises if the model was not
-        compiled with membrane current output, and stores the t=0 dot product
-        between ``model.i_membrane`` and ``v_unit``.
+        Materializes lead fields at the membrane current's dtype and device,
+        raises if the model lacks membrane-current output, and records the
+        initial lead-field projection. Raw sources retain their aliases across
+        fresh native runs until the public ``v_unit`` buffer is overridden.
         """
         if not model.integrator.imem:
             raise RuntimeError(
                 "Model must be compiled with IMEM=1. Use with dn.ctx(IMEM=1): model = ..."
             )
-        self.v_unit = torch.as_tensor(self.v_unit, device=model.device())
-        self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
+        current = model.i_membrane
+        stacked_source = self._lfp_stacked_source()
+        fields = self._lfp_field_configuration()
+        if self._lfp_rule_configuration() is None:
+            shape = torch.broadcast_shapes(fields[0].shape, current.shape)
+            if tuple(shape) != tuple(current.shape):
+                raise ValueError(
+                    "LFP lead fields must broadcast to the Population shape "
+                    f"{tuple(current.shape)}; got {tuple(fields[0].shape)}"
+                )
+        if not isinstance(self.v_unit, torch.nn.Parameter):
+            materialized = _materialize_lfp_fields(
+                fields, device=current.device, dtype=current.dtype
+            )
+            self._publish_lfp_fields(
+                materialized, fields, stacked_source=stacked_source
+            )
+        self._lfp.append(self._observe_lfp(current))
         return super().pre_loop_hook(model)
 
     @nojit
     def post_step_hook(self, model):
-        """Append the LFP after each step via ``torch.einsum`` with ``v_unit``."""
-        self._lfp.append(torch.einsum(self.rule, model.i_membrane, self.v_unit))
+        """Append the shared lead-field projection after each accepted step."""
+        self._lfp.append(self._observe_lfp(model.i_membrane))
 
     @property
     def lfp(self):
@@ -1032,8 +1430,7 @@ class LFP(Callback):
 
 
 class ThresholdCallback(Callback):
-    """
-    Base class for callbacks that detect threshold crossings in membrane potential.
+    """Base class for callbacks that detect threshold crossings in membrane potential.
 
     This class provides common functionality for action potential detection by
     monitoring when membrane potential crosses a specified threshold at selected nodes.
@@ -1052,6 +1449,10 @@ class ThresholdCallback(Callback):
     t_start_check : float, optional
         Time in ms after which to start checking for threshold crossings.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to check for threshold crossings. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
@@ -1073,8 +1474,69 @@ class ThresholdCallback(Callback):
         Indices of nodes being monitored.
     i : int
         Time step counter.
-
     """
+
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if name == "node_check" and not self.__dict__.get("_binding_node_check", False):
+            # These are source references, not additional registered tensors.
+            object.__setattr__(self, "_configured_node_check", value)
+            object.__setattr__(self, "_normalized_node_check", None)
+
+    def _publish_node_check(self, value):
+        # Keep authored subclass setters authoritative during native binding.
+        previous = self.__dict__.get("_binding_node_check", False)
+        object.__setattr__(self, "_binding_node_check", True)
+        try:
+            self.node_check = value
+        finally:
+            object.__setattr__(self, "_binding_node_check", previous)
+
+    def _node_check_configuration(self):
+        current = self.node_check
+        published = self.__dict__.get("_normalized_node_check")
+        if published is None or published is not current:
+            return current
+        version = self._normalized_node_check_version
+        unchanged = (
+            version is not None and current._version == version
+        ) or torch.equal(current, self._normalized_node_check_snapshot)
+        return self._configured_node_check if unchanged else current
+
+    def _capture_normalized_node_check(self, source):
+        current = self.node_check
+        version = None
+        if type(current) in (torch.Tensor, torch.nn.Parameter):
+            try:
+                version = current._version
+            except RuntimeError:
+                pass  # Inference tensors have no mutation version.
+        # A content baseline also survives deepcopy/device publication that
+        # can recreate mutation versions without changing selector values.
+        snapshot = current.detach().clone()
+        object.__setattr__(self, "_configured_node_check", source)
+        object.__setattr__(self, "_normalized_node_check", current)
+        object.__setattr__(self, "_normalized_node_check_version", version)
+        object.__setattr__(self, "_normalized_node_check_snapshot", snapshot)
+
+    def _functional_threshold_configuration(self):
+        """Project authored settings independently of native execution history."""
+        return {
+            "threshold": self.threshold,
+            "t_start_check": self.t_start_check,
+            # Native omission means this existing finite sentinel, not the
+            # pure callback's unbounded end-window spelling.
+            "t_end_check": self.t_end_check,
+            "node_check": self._node_check_configuration(),
+            "dt": self.__dict__.get("_configured_dt", self._dt),
+        }
+
+    def _bind_runtime_dt(self, value):
+        configured = self.__dict__.get("_configured_dt", self._dt)
+        try:
+            self.dt = value
+        finally:
+            object.__setattr__(self, "_configured_dt", configured)
 
     def __init__(
         self,
@@ -1094,6 +1556,7 @@ class ThresholdCallback(Callback):
 
         self.i: int = 0
         self._dt: float = dt if dt is not None else A.dt
+        object.__setattr__(self, "_configured_dt", dt)
         self.ind_start = int(self.t_start_check / self._dt)
         self.ind_end = int(self.t_end_check / self._dt)
 
@@ -1104,9 +1567,12 @@ class ThresholdCallback(Callback):
         Negative indices use normal Python indexing semantics. Indices outside
         ``[-model.nc, model.nc - 1]`` are rejected rather than silently wrapped.
         """
-        self.node_check = torch.as_tensor(
-            self.node_check, dtype=torch.long, device=model.device()
-        ).reshape(-1)
+        configured = self._node_check_configuration()
+        self._publish_node_check(
+            torch.as_tensor(
+                self.node_check, dtype=torch.long, device=model.device()
+            ).reshape(-1)
+        )
 
         nc = int(model.nc)
         invalid = (self.node_check < -nc) | (self.node_check >= nc)
@@ -1116,9 +1582,10 @@ class ThresholdCallback(Callback):
                 "node_check entries must be valid compartment indices in "
                 f"[-{nc}, {nc - 1}]; got {invalid_values}."
             )
-        self.node_check = torch.where(
-            self.node_check < 0, self.node_check + nc, self.node_check
+        self._publish_node_check(
+            torch.where(self.node_check < 0, self.node_check + nc, self.node_check)
         )
+        self._capture_normalized_node_check(configured)
 
     @property
     def dt(self):
@@ -1127,6 +1594,7 @@ class ThresholdCallback(Callback):
 
     @dt.setter
     def dt(self, value):
+        object.__setattr__(self, "_configured_dt", value)
         self._dt = value
         self.ind_start = int(self.t_start_check / self._dt)
         self.ind_end = int(self.t_end_check / self._dt)
@@ -1174,9 +1642,19 @@ class ThresholdCallback(Callback):
         return self.record
 
 
+def _bind_callback_dt(callback, value):
+    """Bind native solver timing without replacing threshold configuration."""
+    if isinstance(callback, PopulationCallback):
+        if isinstance(callback.callback, Callback):
+            _bind_callback_dt(callback.callback, value)
+    elif isinstance(callback, ThresholdCallback):
+        callback._bind_runtime_dt(value)
+    else:
+        callback.dt = value
+
+
 class APCount(ThresholdCallback):
-    """
-    Callback for counting action potentials during axon model simulation.
+    """Callback for counting action potentials during axon model simulation.
 
     This class detects and counts the number of times membrane potential crosses above
     a specified voltage threshold at selected nodes. Each crossing is counted as an
@@ -1189,6 +1667,10 @@ class APCount(ThresholdCallback):
     t_start_check : float, optional
         Time in ms after which to start checking for APs.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to monitor for AP detection. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
@@ -1209,7 +1691,7 @@ class APCount(ThresholdCallback):
     Attributes
     ----------
     record : torch.Tensor
-        Tensor of shape ``(*batch, N, n_check_nodes)`` storing AP counts.
+        Int32 tensor of shape ``(*batch, N, n_check_nodes)`` storing AP counts.
     state_cache : torch.Tensor
         Boolean tensor tracking membrane potential state relative to threshold.
     """
@@ -1218,7 +1700,7 @@ class APCount(ThresholdCallback):
         """
         Allocate per-axon spike counters and state cache.
 
-        ``record`` is created as a ``(*batch, N, n_nodes_checked)`` float
+        ``record`` is created as a ``(*batch, N, n_nodes_checked)`` int32
         tensor and ``state_cache`` starts as ``True`` so the first upward
         crossing is counted. Negative indices in ``node_check`` have already
         been resolved by :meth:`ThresholdCallback.pre_loop_hook`.
@@ -1228,9 +1710,11 @@ class APCount(ThresholdCallback):
         if self.record is None:
             self.record = torch.zeros(
                 _threshold_record_shape(model, self.node_check),
-                dtype=torch.float,
+                dtype=_COUNT_DTYPE,
                 device=model.device(),
             )
+        else:
+            self.record = _restore_count(self.record, label="APCount record")
         if self.state_cache is None:
             self.state_cache = torch.ones(
                 _threshold_record_shape(model, self.node_check),
@@ -1257,24 +1741,24 @@ class APCount(ThresholdCallback):
 
     @property
     def n(self):
-        """
-        Return the number of axons being monitored.
+        """Return an owned int32 Tensor of per-node spike counts."""
+        return self.record.to(dtype=_COUNT_DTYPE, copy=True)
 
-        Returns
-        -------
-        int
-            Number of axons in the model.
-        """
-        return self.record.int()
+    def _functional_activity_configuration(self):
+        """Project activity settings independently of native query history."""
+        return {
+            **self._functional_threshold_configuration(),
+            "at_least": self.at_least,
+            "inv": self.inv,
+        }
 
 
 class ActiveAL(APCount):
-    """
-    Callback for detecting if axons fire at least a specified number of times.
+    """Detect activity in at least a specified number of checked slots.
 
-    This class extends APCount to detect if the membrane potential crosses a specified
-    voltage threshold at least N times during the simulation. It marks an axon as
-    "active" only if the threshold is crossed at least the specified number of times.
+    A checked slot qualifies after any upward voltage-threshold crossing.
+    Repeated crossings at one slot contribute only once to this criterion;
+    use :class:`ActiveALCount` to compare the total number of crossings instead.
 
     Parameters
     ----------
@@ -1283,14 +1767,19 @@ class ActiveAL(APCount):
     t_start_check : float, optional
         Time in ms after which to start checking for threshold crossings.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to monitor for spike detection. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
     dt : float, optional
         Time step in ms. If None, uses the default from backend. Default is None.
     at_least : int, optional
-        Minimum number of threshold crossings required to mark an axon as active.
-        Default is 1.
+        Minimum number of checked slots with at least one crossing required
+        to mark a logical population entry as active. Must be a positive
+        integer; Boolean values are not accepted. Default is 1.
     inv : bool, optional
         If True, inverts the active detection (marks axons as inactive if they
         meet the threshold). Default is False.
@@ -1299,14 +1788,15 @@ class ActiveAL(APCount):
     --------
     APCount : Callback for counting total spikes during simulation
     Active : Callback for detecting if axons fire at any point during simulation
+    ActiveALCount : Callback for a total crossing-count criterion
 
     Examples
     --------
-    >>> # Detect axons that fire at least 3 times
-    >>> detector = ActiveAL(threshold=20.0, at_least=3)
+    >>> # Require a crossing at each of three checked slots.
+    >>> detector = ActiveAL(threshold=20.0, node_check=[0, 1, -1], at_least=3)
     >>> model.run(ve, callbacks=[detector])
     >>> active_axons = detector.numpy()  # Get boolean array of active axons
-    >>> active_count = active_axons.sum()  # Count how many axons fired ≥3 times
+    >>> active_count = active_axons.sum()  # Count axons firing at three checked slots
 
     Attributes
     ----------
@@ -1315,7 +1805,7 @@ class ActiveAL(APCount):
     state_cache : torch.Tensor
         Boolean tensor tracking membrane potential state relative to threshold.
     at_least : int
-        Minimum number of threshold crossings required to mark an axon as active.
+        Positive integer number of checked slots with at least one crossing.
     """
 
     def __init__(
@@ -1329,7 +1819,7 @@ class ActiveAL(APCount):
         inv=False,
     ):
         super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
-        self.at_least = at_least
+        self.at_least = _validate_activity_target(at_least)
         self.inv = inv
 
     def is_active(self, partition=None):
@@ -1377,13 +1867,13 @@ class ActiveAL(APCount):
 
 
 class ActiveALCount(APCount):
-    """
-    Callback for determining whether an axon fired based on the total spike count.
+    """Callback for determining whether an axon fired based on the total spike count.
 
     This class extends APCount to determine if an axon is "active" based on whether
     the total number of threshold crossings across all monitored nodes meets or
-    exceeds a specified count. It marks an axon as active if the total spike count
-    is at least the specified threshold.
+    exceeds a specified count. Repeated crossings at one checked slot contribute
+    separately to this total, including the multiplicity of repeated
+    ``node_check`` entries.
 
     Parameters
     ----------
@@ -1392,6 +1882,10 @@ class ActiveALCount(APCount):
     t_start_check : float, optional
         Time in ms after which to start checking for threshold crossings.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to monitor for spike detection. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
@@ -1399,7 +1893,7 @@ class ActiveALCount(APCount):
         Time step in ms. If None, uses the default from backend. Default is None.
     at_least : int, optional
         Minimum total spike count across all monitored nodes required to mark an axon as active.
-        Default is 1.
+        Must be a positive integer; Boolean values are not accepted. Default is 1.
     inv : bool, optional
         If True, inverts the active detection (marks axons as inactive if they
         meet the count threshold). Default is False.
@@ -1416,7 +1910,7 @@ class ActiveALCount(APCount):
         inv=False,
     ):
         super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
-        self.at_least = at_least
+        self.at_least = _validate_activity_target(at_least)
         self.inv = inv
 
     def is_active(self, partition=None):
@@ -1449,8 +1943,7 @@ class ActiveALCount(APCount):
 
 
 class Active(ActiveAL):
-    """
-    Callback for detecting if axons fire at any point during simulation.
+    """Callback for detecting if axons fire at any point during simulation.
 
     This class detects if the membrane potential crosses above a specified
     voltage threshold at selected nodes at any point during the simulation.
@@ -1464,6 +1957,10 @@ class Active(ActiveAL):
     t_start_check : float, optional
         Time in ms after which to start checking for threshold crossings.
         Default is 0.0 (check from beginning).
+    t_end_check : float, optional
+        End of the detection window in milliseconds, excluded from checking.
+        ``None`` uses the native sentinel of 1e9 ms. Window boundaries are
+        converted to solver-step indices using ``dt``.
     node_check : list of int, optional
         Indices of nodes to monitor for spike detection. Default is [5, -5]
         (check at node 5 from beginning and node 5 from end).
@@ -1488,8 +1985,9 @@ class Active(ActiveAL):
     Attributes
     ----------
     record : torch.Tensor
-        Boolean tensor of shape ``(*batch, N)`` indicating which logical
-        population entries fired at least once.
+        Int32 per-slot spike counters of shape ``(*batch, N, K)``, inherited
+        from APCount. ``is_active()`` returns the Boolean activity mask shaped
+        ``(*batch, N)``.
     state_cache : torch.Tensor
         Boolean tensor of shape ``(*batch, N, K)`` tracking membrane potential
         state at the ``K`` checked compartments.
@@ -1696,6 +2194,14 @@ class Raster(ThresholdCallback):
         self.i += 1
 
     def stack(self):
+        if (
+            isinstance(self.record, list)
+            and not self.record
+            and self.state_cache is not None
+        ):
+            return self.state_cache.new_empty(
+                (0, *self.state_cache.shape), dtype=torch.bool
+            )
         return torch.stack(self.record)
 
     def numpy(self):
@@ -1794,154 +2300,54 @@ class Raster(ThresholdCallback):
 
 
 def _increment_count(vm, vm_new, record, threshold: float):  # pragma: no cover
-    m = vm_new >= threshold
-    mask = m & vm  # fused compare + and
-    record = record + mask.to(record.dtype)  # one fused kernel
-    next_mask = ~m  # can tag-on to same kernel
-    return next_mask, record
+    next_mask, spikes = _threshold_crossing(vm, vm_new, threshold)
+    return next_mask, _accumulate_count(record, spikes)
 
 
 def _increment_act(vm, vm_new, threshold: float):  # pragma: no cover
-    m = vm_new >= threshold
-    mask = m & vm  # fused compare + and
-    next_mask = ~m  # can tag-on to same kernel
-    return next_mask, mask
+    return _threshold_crossing(vm, vm_new, threshold)
 
 
 def _update_active(
     vm, vm_new, record, threshold: float
 ) -> Tuple[torch.Tensor, torch.Tensor]:  # pragma: no cover
-    ge = vm_new >= threshold
-    record = torch.logical_or(record, torch.any(torch.logical_and(ge, vm), dim=-1))
-    return ~ge, record
+    next_mask, spikes = _threshold_crossing(vm, vm_new, threshold)
+    record = torch.logical_or(record, torch.any(spikes, dim=-1))
+    return next_mask, record
+
+
+def _validate_activity_partition(record, at_least, partition):
+    if partition is None:
+        return None
+
+    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
+    if lengths.dim() != 1:
+        raise ValueError("partition must be a 1D sequence of integers.")
+
+    lengths_list = lengths.tolist()
+    if not lengths_list:
+        raise ValueError("partition must be non-empty.")
+    if sum(lengths_list) != record.shape[-1]:
+        raise ValueError(
+            "sum(partition) must equal record.shape[-1]; "
+            f"got {sum(lengths_list)} and {record.shape[-1]}."
+        )
+    if min(lengths_list) < at_least:
+        raise ValueError(
+            "all partition values must be at least `at_least`; "
+            f"minimum was {min(lengths_list)}."
+        )
+
+    return lengths_list
 
 
 def _is_active(record, at_least: int, partition=None) -> torch.Tensor:
-    if partition is None:
-        return torch.count_nonzero(record, dim=-1) >= at_least
-
-    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
-    if lengths.dim() != 1:
-        raise ValueError("partition must be a 1D sequence of integers.")
-
-    lengths_list = lengths.tolist()
-    if not lengths_list:
-        raise ValueError("partition must be non-empty.")
-    if sum(lengths_list) != record.shape[-1]:
-        raise ValueError(
-            "sum(partition) must equal record.shape[-1]; "
-            f"got {sum(lengths_list)} and {record.shape[-1]}."
-        )
-    if min(lengths_list) < at_least:
-        raise ValueError(
-            "all partition values must be at least `at_least`; "
-            f"minimum was {min(lengths_list)}."
-        )
-
-    segments = torch.split(record, lengths_list, dim=-1)
-    return torch.stack(
-        [torch.count_nonzero(seg, dim=-1) >= at_least for seg in segments], dim=-1
-    )
+    at_least = _validate_activity_target(at_least)
+    partition = _validate_activity_partition(record, at_least, partition)
+    return _activity_from_counts(record, at_least, partition)
 
 
 def _is_active_count(record, at_least: int, partition=None) -> torch.Tensor:
-    if partition is None:
-        return record.sum(dim=-1) >= at_least
-
-    lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
-    if lengths.dim() != 1:
-        raise ValueError("partition must be a 1D sequence of integers.")
-
-    lengths_list = lengths.tolist()
-    if not lengths_list:
-        raise ValueError("partition must be non-empty.")
-    if sum(lengths_list) != record.shape[-1]:
-        raise ValueError(
-            "sum(partition) must equal record.shape[-1]; "
-            f"got {sum(lengths_list)} and {record.shape[-1]}."
-        )
-    if min(lengths_list) < at_least:
-        raise ValueError(
-            "all partition values must be at least `at_least`; "
-            f"minimum was {min(lengths_list)}."
-        )
-
-    segments = torch.split(record, lengths_list, dim=-1)
-    return torch.stack([seg.sum(dim=-1) >= at_least for seg in segments], dim=-1)
-
-
-def _sliding_window_average(x, window_size: int):
-    """
-    Compute the sliding (moving) window average along axis 0 for a tensor,
-    with padding so that the output has the same shape as the input.
-
-    The function pads the input along axis 0 using edge replication and then
-    computes the average over every consecutive window. All remaining dimensions
-    are treated as independent feature channels and the output shape matches the input.
-
-    Parameters
-    ----------
-    x : torch.Tensor
-        A tensor with time or samples along axis 0.
-    window_size : int
-        The size of the sliding window (must be >= 1).
-
-    Returns
-    -------
-    out : torch.Tensor
-        The sliding window averages computed along axis 0 with the same shape as the input.
-
-    Raises
-    ------
-    ValueError
-        If window_size is less than 1.
-    TypeError
-        If x is not a PyTorch tensor.
-    """
-    if window_size < 1:
-        raise ValueError("window_size must be at least 1.")
-
-    # Compute padding sizes so that:
-    #    pad_left + pad_right = window_size - 1
-    if window_size % 2 == 1:
-        pad_left = pad_right = window_size // 2
-    else:
-        pad_left = window_size // 2
-        pad_right = window_size // 2 - 1
-
-    # ---------------------------
-    # PyTorch implementation
-    # ---------------------------
-    if not torch.is_tensor(x):
-        raise TypeError("x must be a PyTorch tensor.")
-    if x.ndim < 1 or x.shape[0] == 0:
-        raise ValueError("x must contain at least one sample along axis 0.")
-
-    # Recorder outputs are commonly 3-D, while other callers may use tensors
-    # of any rank. ``unfold`` appends the window dimension without copying the
-    # individual windows, and a regular reduction avoids backend-specific
-    # convolution primitives that may not be available on every supported CPU.
-    feature_shape = x.shape[1:]
-
-    # Manually pad along axis 0 (the N dimension) using replication.
-    # For pad_left, replicate the first slice; for pad_right, replicate the last slice.
-    left_pad = (
-        x[0:1].expand((pad_left, *feature_shape))
-        if pad_left > 0
-        else torch.empty((0, *feature_shape), device=x.device, dtype=x.dtype)
-    )
-    right_pad = (
-        x[-1:].expand((pad_right, *feature_shape))
-        if pad_right > 0
-        else torch.empty((0, *feature_shape), device=x.device, dtype=x.dtype)
-    )
-    # Concatenate along dimension 0.
-    x_padded = torch.cat([left_pad, x, right_pad], dim=0)
-
-    # Unfolding dimension 0 puts the window dimension last, so reducing it
-    # preserves both the original rank and the ordering of all feature axes.
-    return x_padded.unfold(0, window_size, 1).mean(dim=-1)
-
-
-# Public alias retained for tests and user code; Recorder uses the private name internally.
-sliding_window_average = _sliding_window_average
+    at_least = _validate_activity_target(at_least)
+    partition = _validate_activity_partition(record, at_least, partition)
+    return _activity_from_counts(record, at_least, partition, total=True)

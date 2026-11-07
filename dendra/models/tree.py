@@ -227,8 +227,8 @@ def gather_morphology(graph):
 
     Notes
     -----
-    In addition to Dendra's historical ``dx``, ``diam``, and coordinate buffers,
-    this now registers material-geometry buffers:
+    The CPU staging tensors include ``dx``, ``diam``, coordinate buffers, and
+    material-geometry buffers:
 
     ``volume`` / ``volume_um3``
         Total compartment volume in µm³.
@@ -260,24 +260,30 @@ def gather_morphology(graph):
     # those values until Tree.from_graph deliberately converts the gathered
     # buffers to the requested model dtype.  Constructing these tensors with
     # PyTorch's default float32 would irreversibly quantize a float64 Tree.
-    volume_t = torch.tensor(volume, dtype=torch.float64).unsqueeze(0)
+    # Stage on CPU independently of the ambient device: MPS cannot represent
+    # float64, and the model owns the final device/dtype conversion below.
+    volume_t = torch.tensor(volume, dtype=torch.float64, device="cpu").unsqueeze(0)
     return {
-        "dx": torch.tensor(L, dtype=torch.float64).unsqueeze(0),
-        "diam": torch.tensor(diam, dtype=torch.float64).unsqueeze(0),
-        "x": torch.tensor(x, dtype=torch.float64).unsqueeze(0),
-        "y": torch.tensor(y, dtype=torch.float64).unsqueeze(0),
-        "z": torch.tensor(z, dtype=torch.float64).unsqueeze(0),
+        "dx": torch.tensor(L, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "diam": torch.tensor(diam, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "x": torch.tensor(x, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "y": torch.tensor(y, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "z": torch.tensor(z, dtype=torch.float64, device="cpu").unsqueeze(0),
         "volume": volume_t,
         "volume_um3": volume_t.clone(),
-        "volume_i": torch.tensor(volume_i, dtype=torch.float64).unsqueeze(0),
-        "volume_o": torch.tensor(volume_o, dtype=torch.float64).unsqueeze(0),
+        "volume_i": torch.tensor(volume_i, dtype=torch.float64, device="cpu").unsqueeze(
+            0
+        ),
+        "volume_o": torch.tensor(volume_o, dtype=torch.float64, device="cpu").unsqueeze(
+            0
+        ),
     }
 
 
 def gather_diffusion_edges(graph):
     """Extract child-indexed diffusion-edge metadata from a tree graph.
 
-    Returns tensors suitable for registering on :class:`Tree`. The
+    Returns CPU staging tensors suitable for registering on :class:`Tree`. The
     ``diff_parent_index`` and ``diff_geom_um`` buffers have length ``n_comp`` and
     are child-indexed: root entries have parent ``-1`` and zero geometry.
     Compact edge-list buffers are also returned for scatter/gather backends.
@@ -308,12 +314,14 @@ def gather_diffusion_edges(graph):
         edge_diff_geom.append(geom)
 
     return {
-        "diff_parent_index": torch.tensor(parent_index, dtype=torch.long),
-        "diff_geom_um": torch.tensor(diff_geom, dtype=torch.float64).unsqueeze(0),
-        "diff_edge_parent": torch.tensor(edge_parent, dtype=torch.long),
-        "diff_edge_child": torch.tensor(edge_child, dtype=torch.long),
+        "diff_parent_index": torch.tensor(parent_index, dtype=torch.long, device="cpu"),
+        "diff_geom_um": torch.tensor(
+            diff_geom, dtype=torch.float64, device="cpu"
+        ).unsqueeze(0),
+        "diff_edge_parent": torch.tensor(edge_parent, dtype=torch.long, device="cpu"),
+        "diff_edge_child": torch.tensor(edge_child, dtype=torch.long, device="cpu"),
         "diff_edge_geom_um": torch.tensor(
-            edge_diff_geom, dtype=torch.float64
+            edge_diff_geom, dtype=torch.float64, device="cpu"
         ).unsqueeze(0),
     }
 
@@ -338,9 +346,9 @@ def gather_membrane(graph):
         cm.append(attrs.get("cm"))
         area.append(attrs.get("area"))
     return {
-        "rhoa": torch.tensor(rhoa, dtype=torch.float64).unsqueeze(0),
-        "cm": torch.tensor(cm, dtype=torch.float64).unsqueeze(0),
-        "area": torch.tensor(area, dtype=torch.float64).unsqueeze(0),
+        "rhoa": torch.tensor(rhoa, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "cm": torch.tensor(cm, dtype=torch.float64, device="cpu").unsqueeze(0),
+        "area": torch.tensor(area, dtype=torch.float64, device="cpu").unsqueeze(0),
     }
 
 
@@ -689,7 +697,18 @@ class Tree(Population):
         tree.slice("apic").label("apic")
         tree._compartment_graph = compartment_graph
         _register_canonical_internal_nodes(tree, compartment_graph)
-        _register_compartment_graph_labels(tree, compartment_graph)
+        # Canonical graph exports carry explicit anatomical labels; their
+        # native Section names need not match the legacy name-prefix search.
+        ordered = (
+            {
+                name: compartment_graph.nodes_with_label(name)
+                for name in ("soma", "axon", "dend", "apic")
+            }
+            if graph.graph.get("dendra_compartment_schema")
+            == compartment_graph.schema_version
+            else None
+        )
+        _register_compartment_graph_labels(tree, compartment_graph, ordered=ordered)
         return tree
 
     @classmethod
@@ -772,6 +791,9 @@ class Tree(Population):
     ):
         """Construct a tree population from a NEURON root section.
 
+        Geometry and the existing compartment grid are captured without
+        changing ``nseg``. Configure the NEURON Section tree before capture.
+
         Parameters
         ----------
         root_sec : neuron.h.Section, optional
@@ -807,7 +829,12 @@ class Tree(Population):
         principal_axis=None,
         **kwargs,
     ):
-        """Construct a tree population from an SWC file.
+        """Load SWC geometry, discretize a native Morphology, and construct a Tree.
+
+        SWC parsing uses :meth:`~dendra.Morphology.from_swc`, including its sample,
+        naming and validation conventions. Compartment counts are selected by
+        :meth:`~dendra.Morphology.apply_d_lambda`. The native pipeline requires no
+        NEURON objects.
 
         Parameters
         ----------
@@ -816,8 +843,8 @@ class Tree(Population):
         d_lambda : float, optional
             Dimensionless spatial-discretisation factor for tree reconstruction.
         freq : float, optional
-            Frequency in hertz used by NEURON's d-lambda morphology
-            discretisation. Pass a raw hertz value such as ``freq=100.0``.
+            Frequency in hertz used by native d-lambda discretization.
+            Pass a raw hertz value such as ``freq=100.0``.
             This morphology-only argument is intentionally an exception to
             Dendra's usual kHz (1/ms) frequency convention, so do not multiply
             it by :data:`dendra.units.Hz`.
@@ -826,20 +853,34 @@ class Tree(Population):
         integrator : callable, optional
             Integrator factory for the population.
         **kwargs
-            Additional keyword arguments forwarded to :meth:`from_graph`.
+            Membrane parameters forwarded to :meth:`from_morphology`.
+            ``rhoa`` and ``cm`` also determine spatial discretization; their
+            defaults here are ``35.4`` Ω·cm and ``1`` µF/cm².
 
         Returns
         -------
         Tree
             Configured tree population.
         """
-        from dendra.models.io import read_swc
-
-        graph, _ = read_swc(file_path, d_lambda=d_lambda, freq=freq, **kwargs)
-        cell = cls.from_graph(
-            graph, N, integrator, principal_axis=principal_axis, **kwargs
+        if "data_func" in kwargs:
+            raise TypeError(
+                "Tree.from_swc does not accept NEURON data_func callbacks; "
+                "use io.read_swc and Tree.from_graph for segment metadata."
+            )
+        morphology = Morphology.from_swc(
+            file_path,
+            rhoa=kwargs.get("rhoa", 35.4),
+            cm=kwargs.get("cm", 1.0),
+            type_labels={3: "dend", 4: "apic"},
         )
-        return cell
+        morphology.apply_d_lambda(d_lambda=d_lambda, freq_hz=freq)
+        return cls._from_file_morphology(
+            morphology,
+            N=N,
+            integrator=integrator,
+            principal_axis=principal_axis,
+            **kwargs,
+        )
 
     @classmethod
     def from_neurolucida(
@@ -850,19 +891,28 @@ class Tree(Population):
         N=1,
         integrator=None,
         principal_axis=None,
+        *,
+        root=None,
         **kwargs,
     ):
-        """Construct a tree population from a Neurolucida file.
+        """Load Neurolucida geometry and discretize it as a native Morphology.
+
+        NEURON's file reader supplies the normalized geometry through
+        :meth:`~dendra.Morphology.from_asc`. Compartment selection and graph compilation
+        operate on the resulting native snapshot, which holds no NEURON objects.
 
         Parameters
         ----------
         file_path : str
             Path to the Neurolucida morphology file.
+        root : str, optional
+            Exact imported root Section name, such as ``"soma[0]"``. Required
+            when the file contains several disconnected cable trees.
         d_lambda : float, optional
             Dimensionless spatial-discretisation factor for tree reconstruction.
         freq : float, optional
-            Frequency in hertz used by NEURON's d-lambda morphology
-            discretisation. Pass a raw hertz value such as ``freq=100.0``.
+            Frequency in hertz used by native d-lambda discretization.
+            Pass a raw hertz value such as ``freq=100.0``.
             This morphology-only argument is intentionally an exception to
             Dendra's usual kHz (1/ms) frequency convention, so do not multiply
             it by :data:`dendra.units.Hz`.
@@ -871,22 +921,45 @@ class Tree(Population):
         integrator : callable, optional
             Integrator factory for the population.
         **kwargs
-            Additional keyword arguments forwarded to :meth:`from_graph`.
+            Membrane parameters forwarded to :meth:`from_morphology`.
+            ``rhoa`` and ``cm`` also determine spatial discretization; their
+            defaults here are ``35.4`` Ω·cm and ``1`` µF/cm².
 
         Returns
         -------
         Tree
             Configured tree population.
         """
-        from dendra.models.io import read_neurolucida
-
-        graph, _ = read_neurolucida(file_path, d_lambda=d_lambda, freq=freq, **kwargs)
-        cell = cls.from_graph(
-            graph, N, integrator, principal_axis=principal_axis, **kwargs
+        if "data_func" in kwargs:
+            raise TypeError(
+                "Tree.from_neurolucida does not accept NEURON data_func callbacks; "
+                "use io.read_neurolucida and Tree.from_graph for segment metadata."
+            )
+        morphology = Morphology.from_asc(
+            file_path,
+            root=root,
+            rhoa=kwargs.get("rhoa", 35.4),
+            cm=kwargs.get("cm", 1.0),
         )
-        return cell
+        morphology.apply_d_lambda(d_lambda=d_lambda, freq_hz=freq)
+        return cls._from_file_morphology(
+            morphology,
+            N=N,
+            integrator=integrator,
+            principal_axis=principal_axis,
+            **kwargs,
+        )
 
     from_asc = from_neurolucida
+
+    @classmethod
+    def _from_file_morphology(cls, morphology, **kwargs):
+        # File constructors have always delegated to custom from_graph hooks.
+        # Keep those hooks in control of their output; the native factory's
+        # canonical-graph guard applies to explicitly native construction.
+        if cls.from_graph.__func__ is not Tree.from_graph.__func__:
+            return cls.from_graph(morphology.compile().to_networkx(), **kwargs)
+        return cls.from_morphology(morphology, **kwargs)
 
     def recentre(self, x=0.0, y=0.0, z=0.0, origin=None):
         """Recentre the morphology so the soma matches ``origin``.

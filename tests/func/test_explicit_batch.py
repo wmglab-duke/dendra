@@ -298,7 +298,8 @@ def test_singleton_prefixed_mutable_buffer_remains_complete_functional_carry():
     assert torch.count_nonzero(jacobian) > 0
 
 
-def test_batched_mutable_buffer_cannot_change_its_initialized_schema():
+@pytest.mark.parametrize("check_purity", [False, True])
+def test_batched_mutable_buffer_cannot_change_its_initialized_schema(check_purity):
     model = _buffer_model(
         batch_calls=(2,),
         mechanism=_ShapeDriftingBufferMechanism,
@@ -310,14 +311,25 @@ def test_batched_mutable_buffer_cannot_change_its_initialized_schema():
     original_t = model.t.detach().clone()
 
     assert gain.shape == model.shape
-    with pytest.raises(
-        ValueError,
-        match=r"advance\(\)\['gain'\] must match",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    with dn.ctx(CHECK_PURITY=check_purity):
+        if check_purity:
+            with pytest.raises(
+                ValueError,
+                match=r"advance\(\)\['gain'\] must match",
+            ):
+                dn.func.make_functional(model, dt=DT)
+        else:
+            functional, tensors = dn.func.make_functional(model, dt=DT)
+            prepared = functional.prepare(tensors.parameters, tensors.constants)
+            with pytest.raises(
+                ValueError,
+                match=r"advance\(\)\['gain'\] must match",
+            ):
+                functional.step(tensors.parameters, prepared, tensors.state)
 
-    # Admission validates canonical returned-output schemas on a disposable
-    # audit clone; failure must not advance or otherwise mutate the source.
+    # Diagnostics audit returned-output schemas on a disposable clone during
+    # admission; default execution validates them during the step. Neither
+    # failure may advance or otherwise mutate the source.
     assert model.mech._ShapeDriftingBufferMechanism.gain is gain
     assert gain._version == original_version
     assert gain.shape == model.shape

@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-EXAMPLE = Path(__file__).parents[2] / "examples" / "functional_gradient_descent.py"
+EXAMPLE = (
+    Path(__file__).parents[2]
+    / "examples"
+    / "training"
+    / "functional_gradient_descent.py"
+)
 
 
 def _parse(monkeypatch, *arguments):

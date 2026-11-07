@@ -278,13 +278,24 @@ def test_tree_morphology_layers_and_invalid_parent_vectors():
     assert layer_ptr.tolist() == [0, 1, 3, 4]
 
     for bad, message in [
-        ([-1, -1], "more than one root"),
         ([0], "one root"),
         ([-1, 3], "invalid parent"),
         ([-1, 2, 1], "connected"),
     ]:
         with pytest.raises(ValueError, match=message):
             spatial._build_tree_morphology(bad)
+
+    parent, children, depth = spatial._build_tree_morphology([-1, 0, -1, 2, 2])
+    assert parent.tolist() == [-1, 0, -1, 2, 2]
+    assert children == [[1], [], [3, 4], [], []]
+    assert depth.tolist() == [0, 1, 0, 1, 1]
+    parent, order, edge_parent, edge_child = spatial.parent_index_to_tree_topology(
+        [1, -1, 4, 4, -1]
+    )
+    assert parent.tolist() == [-1, -1, 0, 1, 1]
+    assert order.tolist() == [1, 4, 0, 2, 3]
+    assert edge_parent.tolist() == [1, 4, 4]
+    assert edge_child.tolist() == [0, 2, 3]
 
 
 @pytest.mark.parametrize("threads", [0, -1, 3, 64])

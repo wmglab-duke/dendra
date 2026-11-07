@@ -8,9 +8,9 @@ import dis
 import hashlib
 import inspect
 import math
-import random
 import types
 from collections.abc import Mapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from dataclasses import fields as dataclass_fields
 from dataclasses import is_dataclass
@@ -20,15 +20,22 @@ import numpy as np
 import torch
 from torch.func import functional_call
 from torch.fx.experimental.proxy_tensor import make_fx
+from torch.overrides import TorchFunctionMode
+from torch.utils._device import DeviceContext
 
+from dendra.helpers import MEMBRANE_ASSEMBLY, ctx, current_check_purity
+from dendra.models._runtime_inputs import normalize_input_tape
 from dendra.models.core import (
+    Axon,
     Cable,
     Myelinated,
     Population,
     SingleCompartment,
     Unmyelinated,
     _PassiveEndDiameter,
+    _time_grid_from_step_count,
 )
+from dendra.models.core import step as _standard_population_step
 from dendra.models.extcell import ExtCellAxon, ExtCellTree
 from dendra.models.initialization import _InitializationTransformHook
 from dendra.models.integrators.cable import (
@@ -38,20 +45,69 @@ from dendra.models.integrators.cable import (
     _layered_edge_conductance,
 )
 from dendra.models.integrators.core import _FunctionalIntegratorSpec
-from dendra.models.integrators.implicit import _bwd_euler_sc, _bwd_euler_ub
-from dendra.models.integrators.tree_bt import _tree_layered_edge_conductance
+from dendra.models.integrators.explicit import (
+    SymmetricConv1D,
+    _dufort_frankel,
+    _dufort_frankel_homogeneous,
+    _euler,
+    _eulerv1,
+    _rk2,
+    _rk4,
+)
+from dendra.models.integrators.implicit import (
+    _bwd_euler_bt,
+    _bwd_euler_sc,
+    _bwd_euler_sc_multi,
+    _bwd_euler_sc_skip,
+    _bwd_euler_ub,
+)
+from dendra.models.integrators.tree import _dhs, _dhs_multi
+from dendra.models.integrators.tree_bt import (
+    _dhs_bt,
+    _dhs_bt_multi,
+    _tree_layered_edge_conductance,
+)
+from dendra.models.mechanisms._continuous_receive import reset_continuous_values
 from dendra.models.mechanisms._handler import MechanismHandler
 from dendra.models.mechanisms._ions import Ion
+from dendra.models.mechanisms._material_process import (
+    ClampProcess,
+    ClearanceProcess,
+    DiffusionProcess,
+    ExchangeProcess,
+    MaterialProcess,
+)
 from dendra.models.mechanisms._materials import Material
-from dendra.models.mechanisms._mechanism import Mechanism, PointProcess
+from dendra.models.mechanisms._mechanism import (
+    ContinuousSynapse,
+    Mechanism,
+    PointProcess,
+    Synapse,
+    VoltageProcess,
+)
 from dendra.models.mechanisms._numerical import (
     validate_declared_numerical_current as _validate_declared_numerical_current,
 )
+from dendra.models.mechanisms._spatial import SpatialOperator1D, SpatialOperatorTree
 from dendra.models.mechanisms._state import State
+from dendra.models.mechanisms._state_inventory import (
+    _DelayedStateBoundary,
+    functional_module_blocks,
+)
+from dendra.models.mechanisms._state_slots import (
+    local_field_bindings,
+    local_source_bindings,
+    read_local_bindings,
+    shared_field_slots,
+)
 from dendra.models.mechanisms._support import SupportKind
-from dendra.models.mechanisms._support_registry import SupportEntry
+from dendra.models.mechanisms._support_registry import SupportEntry, SupportRegistry
 from dendra.models.mechanisms._symbolic import build_numerical_equation
-from dendra.models.multi import MultiPopulation
+from dendra.models.multi import (
+    MultiPopulation,
+    _PackedMaterialGeometry,
+    _PackedMaterialInitial,
+)
 from dendra.models.parametric import Functional as ParameterFunctional
 from dendra.models.parametric import (
     Parameterized,
@@ -59,15 +115,57 @@ from dendra.models.parametric import (
     cacheable,
     staticproperty,
 )
+from dendra.models.stim.waveform.core import Waveform
 from dendra.models.tree import Tree
 from dendra.utils.tensor_ops import _logical_tensor_bytes
 
-from ._stimuli import (
-    FunctionalExtra,
-    FunctionalIntra,
-    _is_internal_module_state,
-    _numpy_rng_state_equal,
+from ._binding import _BINDING_UNSET
+from ._draws import RuntimeDraws, _has_runtime_stimulation, _with_runtime_draws
+from ._inputs import Inputs, _population_inputs, _RuntimeInputs
+from ._retained_materializations import (
+    _cache_materialization,
+    _capture_retained_frame,
+    _clear_retained_frame,
+    _complete_snapshot_baselines,
+    _materialization_overrides,
+    _project_retained_frame,
+    _retained_workspace_builder,
 )
+from ._retained_materializations import (
+    _RetainedMaterialization as _RetainedMaterialization,
+)
+from ._retained_materializations import (
+    _RetainedMaterializationInventory,
+    _seed_snapshot_frame,
+)
+from ._retained_materializations import (
+    _SnapshotMaterialization as _SnapshotMaterialization,
+)
+from ._retained_materializations import (
+    _validate_retained_constants,
+    _validate_retained_prepared,
+)
+from ._rng_diagnostics import (
+    _global_rng_changes,
+    _global_rng_snapshot,
+    _restore_global_rng,
+    _rng_diagnostic_scope,
+)
+from ._state_projection import (
+    _clone_state_leaf,
+    _identity_state_leaf,
+    _state_projection,
+)
+from ._stimuli import FunctionalExtra, FunctionalIntra, _is_internal_module_state
+from ._tensor_contracts import (
+    _clone_tensor,
+    _has_inference_tensor_component,
+    _shape_tuple,
+    _tensor_binding,
+    _tensor_tree_binding,
+)
+from ._torch_parametrizations import canonical_type as _canonical_type
+from ._tree_paths import _get_path, _put_path
 from ._types import (
     FunctionalizationError,
     InitializationInput,
@@ -112,6 +210,7 @@ _CLASS_STATE_METADATA_NAMES = frozenset(
         "__doc__",
         "__module__",
         "__qualname__",
+        "__slotnames__",  # copyreg lazily memoizes inherited slots during deepcopy
         "__weakref__",
     }
 )
@@ -120,12 +219,15 @@ _RUNTIME_SCHEMA_CACHE_STATE = frozenset(
         "_assigned_schema_validated",
         "_advance_schema_validated",
         "_advance_return_names",
+        "_voltage_schema_validated",
     }
 )
 _FUNCTIONAL_INTEGRATOR_HOOKS = (
     "_functional_spec",
     "_functional_solver",
+    "_membrane_frame",
     "_voltage_update",
+    "_DIRECT_MEMBRANE_VOLTAGE_UPDATE",
     "_prepare_workspace",
     "_prepared_workspace_schema",
     "_derive_prepared_workspace",
@@ -135,15 +237,219 @@ _FUNCTIONAL_INTEGRATOR_HOOKS = (
     "initialize",
     "step",
 )
-_FUNCTIONAL_HANDLER_HOOKS = ("_evaluate_current_frame",)
+_FUNCTIONAL_HANDLER_HOOKS = (
+    "update_v",
+    "configure_input_bindings",
+    "_resolve_state_inputs",
+    "_evaluate_current_frame",
+    "_evaluate_membrane_frame",
+    "_can_evaluate_direct_membrane_frame",
+    "_direct_membrane_dtype_compatible",
+    "_evaluate_direct_membrane_coefficients",
+    "_gather_assigned_current_fields",
+)
+_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS = ("_evaluate_explicit_current_frame", "iexp")
+_FUNCTIONAL_DUFORT_HANDLER_HOOKS = ("_evaluate_dufort_current_frame", "idf")
 _STANDARD_FUNCTIONAL_HANDLER_HOOKS = {
     name: inspect.getattr_static(MechanismHandler, name)
-    for name in _FUNCTIONAL_HANDLER_HOOKS
+    for name in (
+        *_FUNCTIONAL_HANDLER_HOOKS,
+        *_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS,
+        *_FUNCTIONAL_DUFORT_HANDLER_HOOKS,
+    )
+}
+_MATERIAL_FUNCTIONAL_COMMON_HOOKS = (
+    "material_fields",
+    "prepare_materials",
+    "material_updates",
+    "advance_materials",
+    "configure_process",
+    "_resolve_quantity",
+    "_get_material",
+    "_bind_materials",
+    "_configure_material_support",
+    "_expand_material_operand",
+    "_material_support_mask",
+    "_mask_material_updates",
+    "set_dt",
+    "_reset_initialization_timestep",
+)
+_STANDARD_PACKED_MATERIAL_GEOMETRY_FORWARD = _PackedMaterialGeometry.forward
+
+
+def _is_pure_shared_initial_source(source):
+    # Module recipes receive a separate cold purity audit. Its failures disable
+    # fresh initialization while retaining an otherwise valid snapshot plan.
+    return isinstance(source, (torch.nn.Parameter, torch.nn.Module))
+
+
+@dataclass(frozen=True)
+class _MaterialProcessContract:
+    family: type
+    prefix: str
+    hooks: tuple[str, ...]
+    declarations: tuple[str, ...]
+    configuration: tuple[str, ...]
+    spatial: bool = False
+
+
+_MATERIAL_PROCESS_CONTRACTS = (
+    _MaterialProcessContract(
+        ClearanceProcess,
+        "clearance",
+        (
+            "_configure_clearance_material_plan",
+            "_clearance_operand",
+            "_validate_clearance_operand",
+            "_validate_clearance_specs",
+            "_effective_clearance_domain",
+        ),
+        ("_clearance_specs",),
+        (
+            "_clearance_material_plan",
+            "_clearance_method",
+            "_clearance_allow_negative_rate",
+            "_clearance_domain",
+        ),
+    ),
+    _MaterialProcessContract(
+        ClampProcess,
+        "clamp",
+        (
+            "_configure_clamp_material_plan",
+            "_clamp_operand",
+            "_validate_clamp_operand",
+            "_effective_clamp_domain",
+            "_effective_clamp_mode",
+            "_validate_and_configure_clamp_specs",
+            "_build_where_mask",
+            "_terminal_mask",
+            "_root_mask",
+        ),
+        ("_clamp_specs",),
+        (
+            "_clamp_material_plan",
+            "_clamp_method",
+            "_clamp_domain",
+            "_clamp_mask_names",
+            "_clamp_operator_keys",
+        ),
+    ),
+    _MaterialProcessContract(
+        ExchangeProcess,
+        "exchange",
+        (
+            "_configure_exchange_material_plan",
+            "_exchange_volume_is_geometry",
+            "_exchange_operand",
+            "_validate_exchange_operand",
+            "_configure_exchange_geometry",
+            "_set_exchange_geometry_buffer",
+            "_validate_exchange_specs",
+            "_effective_exchange_domain",
+            "_geometry_volume_for_domain",
+            "_resolve_exchange_volume",
+        ),
+        ("_exchange_specs",),
+        (
+            "_exchange_material_plan",
+            "_exchange_method",
+            "_exchange_domain",
+            "_exchange_eps",
+            "_exchange_require_volumes",
+            "_exchange_allow_negative_rate",
+            "_exchange_geometry_sources",
+            "_exchange_analytic_area",
+        ),
+    ),
+    _MaterialProcessContract(
+        DiffusionProcess,
+        "diffusion",
+        (
+            "_configure_component_edges",
+            "_diffusion_edge_operand",
+            "_packed_analytic_geometry_inputs",
+            "_configure_named_transport_geometry",
+            "_refresh_named_transport_quantities",
+            "_validate_overlapping_diffusivity_overrides",
+            "_configure_region",
+            "_new_spatial_operators",
+            "_select_geometry_kind",
+            "_set_geometry_buffer",
+            "_set_diffusion_geometry_source",
+            "_configure_1d_geometry",
+            "_configure_tree_geometry",
+            "graph",
+            "material_volume",
+            "_validate_diffusion_specs",
+            "_effective_domain",
+            "_resolve_spatial_quantity",
+            "_diffusion_operand_reference",
+            "_configure_diffusion_material_plan",
+            "_diffusion_operand",
+            "_diffusion_relaxation_inputs",
+            "_diffusion_operator_inputs",
+            "_relaxations_for",
+            "configure_spatial_operators",
+            "_configure_1d_spatial_operators",
+            "_configure_tree_spatial_operators",
+            "_configure_material_operators",
+        ),
+        ("_diffusion_specs", "_diffusion_relaxation_specs"),
+        (
+            "_diffusion_material_plan",
+            "_diffusion_fraction_refs",
+            "_diffusion_method",
+            "_diffusion_solver",
+            "_diffusion_boundary",
+            "_diffusion_volume_fraction",
+            "_diffusion_area_fraction",
+            "_diffusion_interface_scheme",
+            "_diffusion_domain",
+            "_diffusion_threads",
+            "_diffusion_geometry_sources",
+            "_diffusion_geometry_kind",
+            "_diffusion_geometry_name",
+            "_diffusion_geometry_domain",
+            "_diffusion_geometry_config",
+            "_diffusion_population_quantities",
+            "_diffusion_operator_keys",
+            "_diffusion_is_regional",
+            "_diffusion_core_shape",
+            "_diffusion_component_edge_count",
+            "_mp_node_mask",
+            "_mp_diff_parent_index",
+            "_mp_diff_edge_parent",
+            "_mp_diff_edge_child",
+        ),
+        spatial=True,
+    ),
+)
+_CUSTOM_MATERIAL_PROCESS_CONTRACT = _MaterialProcessContract(
+    MaterialProcess, "custom", (), (), ()
+)
+_STANDARD_MATERIAL_FUNCTIONAL_HOOKS = {
+    contract.family: {
+        name: inspect.getattr_static(contract.family, name)
+        for name in (*_MATERIAL_FUNCTIONAL_COMMON_HOOKS, *contract.hooks)
+    }
+    for contract in _MATERIAL_PROCESS_CONTRACTS
+}
+_STANDARD_MATERIAL_RESOLVER = inspect.getattr_static(MechanismHandler, "_get_material")
+_STANDARD_MATERIAL_SPATIAL_HOOKS = {
+    family: {
+        name: value
+        for name, value in vars(family).items()
+        if inspect.isfunction(value)
+        or isinstance(value, (staticmethod, classmethod, property))
+    }
+    for family in (SpatialOperator1D, SpatialOperatorTree)
 }
 _HANDLER_INITIALIZATION_HOOKS = (
     "initialize",
     "_sync_celsius",
     "make_maps",
+    "_make_membrane_plans",
     "init_rng",
     "populate",
     "_reset_initialization_timestep",
@@ -166,6 +472,7 @@ _HANDLER_INITIALIZATION_HOOKS = (
     "read_from_ions",
     "read_from_materials",
     "_evaluate_current_frame",
+    "_gather_assigned_current_fields",
 )
 _STANDARD_HANDLER_INITIALIZATION = {
     name: inspect.getattr_static(MechanismHandler, name)
@@ -188,32 +495,346 @@ _STANDARD_POPULATION_FRESH_INITIALIZATION = {
         name: inspect.getattr_static(population_type, name)
         for name in _POPULATION_FRESH_INITIALIZATION_HOOKS
     }
-    for population_type in (SingleCompartment, Unmyelinated)
+    for population_type in (
+        Population,
+        SingleCompartment,
+        Unmyelinated,
+        Myelinated,
+        Cable,
+        Tree,
+        ExtCellAxon,
+        ExtCellTree,
+        MultiPopulation,
+    )
+}
+_POPULATION_EXECUTION_HOOK_NAMES = (
+    *_POPULATION_FRESH_INITIALIZATION_HOOKS,
+    "_refresh_compile_config_from_ctx",
+    "__getattribute__",
+    "__getattr__",
+    "__setattr__",
+    "__delattr__",
+    "__deepcopy__",
+    "__getstate__",
+    "__setstate__",
+    "shape",
+    "graph",
+    "compartment_graph",
+    "area",
+    "edge_resistance_ohm",
+    "material_volume",
+    "material_edge_index",
+    "material_edges",
+    "preserve_mechanism_population_axis",
+    "device",
+    "dtype",
+    "core_shape",
+    "batched_shape",
+    "_calc_shape_p",
+    "n_batch_dimensions",
+    "n",
+    "is_batched",
+    "numel",
+    "numelc",
+    "expanded_v_init",
+    "step",
+    "init_v",
+    "prep_intra",
+    "_call_make_intra",
+    "_broadcast_step_value",
+    "_normalize_spatial",
+    "_normalize_precomputed_ve",
+    "_normalize_temporal_values",
+    "_prepare_extra",
+    "_compute_extra_chunk",
+    "_duration_budget",
+    "_set_duration_remainder",
+    "force_integrator_reinit",
+    "_complete_integrator_reinitialization",
+    "_runtime_workspace_rebuild_pending",
+    "_validate_runtime_contracts",
+    "_validate_static_runtime_contracts",
+    "_validate_integrator_workspace_contracts",
+    "_validate_integrator_rebuild_contracts",
+    "_integrator_workspace_contract_signature",
+    "_record_integrator_workspace_contracts",
+    "_record_unversioned_integrator_workspace_values",
+    "_unversioned_integrator_workspace_values_match",
+    "_validate_canonical_geometry",
+    "_validate_canonical_workspace",
+    "populate",
+    "_derive_parameter_buffers",
+    "_install_parameter_buffers",
+    "make_contiguous",
+    "_sample_random_parameters",
+    "sample_runtime_noises_",
+    "resample_random_parameters",
+    "resample_runtime_noise",
+    "init_rng",
+    "reset_rng",
+    "_random_parameter_shape",
+    "_runtime_noise_shape",
+    "_stochastic_shape",
+    "_has_random_parameters_resampled_on_initialize",
+    "_run_initialization_hooks",
+    "_initialization_transform_argument",
+    "_initialization_transform_numpy_rng_equal",
+    "_evaluate_initialization_transform",
+    "_execute_initialization_transform",
+    "_deterministically_rematerialize_initialization_parameters",
+    "clear_cache",
+    "_invalidate_integrator_after_initialization_transform",
+    "_resolve_initialization_transform_reference",
+    "_normalize_initialization_transform_output",
+    "_rematerialize_parameter_owner",
+    "_preserved_stochastic_parameter_buffers",
+    "_refresh_component_fields",
+    "_refresh_material_geometry",
+    "_refresh_named_material_geometry",
+    "_sync_core_buffers_to_population_device",
+    "restore",
+    "detach",
+    "state_dict",
+    "load_state_dict",
+    "state_dict_for_checkpoint",
+    "restore_dict_from_checkpoint",
+    "_restore_dict_from_checkpoint_unchecked",
+    "_stochastic_state_dict_for_checkpoint",
+    "_prepare_stochastic_state_from_checkpoint",
+    "_apply_prepared_stochastic_state",
+    "_restore_stochastic_state_from_checkpoint",
+    "_random_parameter_state_for_checkpoint",
+    "_prepare_random_parameter_state",
+    "_apply_random_parameter_state",
+    "_save_to_state_dict",
+    "_load_from_state_dict",
+    "_apply",
+)
+_STANDARD_POPULATION_EXECUTION_HOOKS = {
+    family: {
+        name: inspect.getattr_static(family, name, None)
+        for name in dict.fromkeys(_POPULATION_EXECUTION_HOOK_NAMES)
+        if hasattr(family, name) or name == "clear_cache"
+    }
+    for family in _STANDARD_POPULATION_FRESH_INITIALIZATION
+}
+_POPULATION_RESERVED_ATTRIBUTE_NAMES = (
+    "v",
+    "vc",
+    "t",
+    "i_membrane",
+    "v_prev",
+    "_df_history_valid",
+    "_df_history_dt",
+    "diam",
+    "diameters",
+    "dx",
+    "cm",
+    "rhoa",
+    "celsius",
+    "cm_scale",
+    "rhoa_scale",
+    "area_scale",
+    "shape_f",
+    "shape_p",
+    "np",
+    "nc",
+    "mech",
+    "integrator",
+    "intra",
+    "injections",
+    "mechanism_injections",
+    "mechanism_injection_accepted",
+    "training",
+    "initialized",
+    "is_built",
+    "_flag_rebuild",
+    "_duration_remainder",
+    "_step",
+    "populations",
+    "_compartment_graph",
+    "_graph",
+    "xraxial",
+    "xc",
+    "xg",
+    "n_layers",
+    "random_parameters",
+    "runtime_noises",
+    "in_graph_parametrizations",
+    "_buffers",
+    "_parameters",
+    "_modules",
+    "_caches",
+    "_initialization_transforms",
+    "pre_initialize_hooks",
+    "post_initialize_hooks",
+    "_restoring_steady_state",
+    "initializing_from_state_cache",
+    "_integrator_reinit_pending",
+)
+_STANDARD_OWNED_CACHE_METHODS = {
+    name: inspect.getattr_static(Population, name)
+    for name in (
+        "restore",
+        "_run_initialization_hooks",
+        "_has_random_parameters_resampled_on_initialize",
+    )
 }
 _INTEGRATOR_FRESH_INITIALIZATION_HOOKS = ("init_v",)
+_SCALAR_EXPLICIT_INTEGRATORS = (_euler, _eulerv1, _rk2, _rk4)
+_SCALAR_DUFORT_INTEGRATORS = (_dufort_frankel, _dufort_frankel_homogeneous)
+_PACKED_OPERATOR_PROFILES = {
+    "scalar_multi_point": ("multi_point", _bwd_euler_sc_multi),
+    "scalar_multi": ("multi_scalar", _dhs_multi),
+    "block_multi_tree": ("multi_block", _dhs_bt_multi),
+}
+_FIXED_OPERATOR_PROFILES = {
+    "native_cable": ("scalar_path", _bwd_euler_ub),
+    "scalar_tree": ("scalar_tree", _dhs),
+    "extcell_axon": ("block_path", _bwd_euler_bt),
+    "extcell_tree": ("block_tree", _dhs_bt),
+    **{
+        topology: (operator, implementation)
+        for operator, (topology, implementation) in _PACKED_OPERATOR_PROFILES.items()
+    },
+}
 _STANDARD_INTEGRATOR_FRESH_INITIALIZATION = {
     implementation: {
         name: inspect.getattr_static(implementation, name)
         for name in _INTEGRATOR_FRESH_INITIALIZATION_HOOKS
     }
-    for implementation in (_bwd_euler_sc, _bwd_euler_ub)
+    for implementation in (
+        *_SCALAR_EXPLICIT_INTEGRATORS,
+        *_SCALAR_DUFORT_INTEGRATORS,
+        _bwd_euler_sc,
+        _bwd_euler_sc_skip,
+        _bwd_euler_ub,
+        _dhs,
+        _bwd_euler_bt,
+        _dhs_bt,
+        _bwd_euler_sc_multi,
+        _dhs_multi,
+        _dhs_bt_multi,
+    )
 }
 
 
-def _functional_initialization_profile(population):
-    """Return the audited scalar initializer family for ``population``.
+_STANDARD_FUNCTIONAL_INTEGRATOR_STATE_NAMES = {
+    _bwd_euler_sc_skip: ("v",),
+    **{
+        implementation: ("v", "v_prev", "_df_history_valid", "_df_history_dt")
+        for implementation in _SCALAR_DUFORT_INTEGRATORS
+    },
+}
+_STANDARD_EXPLICIT_INTEGRATOR_HOOKS = {
+    implementation: {
+        name: inspect.getattr_static(implementation, name)
+        for name in dict.fromkeys(
+            (
+                *_FUNCTIONAL_INTEGRATOR_HOOKS,
+                *implementation._FUNCTIONAL_CRITICAL_METHODS,
+                "_FUNCTIONAL_OPERATOR_KIND",
+                "_PREPARED_WORKSPACE_SCHEMA",
+                "_FUNCTIONAL_CRITICAL_METHODS",
+                "_FUNCTIONAL_STATE_NAMES",
+            )
+        )
+        if hasattr(implementation, name)
+    }
+    for implementation in (*_SCALAR_EXPLICIT_INTEGRATORS, *_SCALAR_DUFORT_INTEGRATORS)
+}
 
-    SingleCompartment lowering remains exact-type because general subclasses are
-    not admitted by the transition contract. Unmyelinated subclasses may add
-    mechanisms and construction-time parameterization while retaining the same
-    scalar-path voltage and lifecycle semantics; their inherited hooks are
-    checked against the canonical base separately.
+
+def _functional_handler_hooks(population):
+    if (
+        getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None)
+        == "scalar_dufort_path"
+    ):
+        return (
+            *_FUNCTIONAL_HANDLER_HOOKS,
+            *_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS,
+            *_FUNCTIONAL_DUFORT_HANDLER_HOOKS,
+        )
+    if (
+        getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None)
+        == "scalar_explicit_path"
+    ):
+        return (*_FUNCTIONAL_HANDLER_HOOKS, *_FUNCTIONAL_EXPLICIT_HANDLER_HOOKS)
+    return _FUNCTIONAL_HANDLER_HOOKS
+
+
+def _scalar_path_integrator_profile(integrator):
+    """Select the admitted numerical family independently of path geometry."""
+    spec = _resolve_functional_integrator_spec(integrator, "scalar_dufort_path")
+    if spec is not None and spec.implementation in _SCALAR_DUFORT_INTEGRATORS:
+        return "scalar_dufort_path", spec.implementation
+    spec = _resolve_functional_integrator_spec(integrator, "scalar_explicit_path")
+    if spec is not None and spec.implementation in _SCALAR_EXPLICIT_INTEGRATORS:
+        return "scalar_explicit_path", spec.implementation
+    return "scalar_path", _bwd_euler_ub
+
+
+def _scalar_point_integrator_profile(integrator):
+    """Resolve point-container numerics without changing their native stencil.
+
+    Explicit point containers use the same final-axis spatial operator as
+    scalar cables. The implicit point integrators retain their independent
+    compartment equations and workspace layouts.
+    """
+    profile = _scalar_path_integrator_profile(integrator)
+    if profile[0] in {"scalar_explicit_path", "scalar_dufort_path"}:
+        return profile
+    if isinstance(integrator, _bwd_euler_sc_skip):
+        return "scalar_point_skip", _bwd_euler_sc_skip
+    return "scalar_point", _bwd_euler_sc
+
+
+def _functional_initialization_profile(population):
+    """Return the audited initializer family for ``population``.
+
+    Compatible subclasses inherit the native family's execution contracts;
+    their construction and parameter declarations remain part of the model.
+    The selected point integrator determines independent-compartment or spatial
+    explicit equations. Canonical scalar Trees use
+    the same voltage initialization and support-local mechanism transaction;
+    their already-lowered graph supplies immutable geometry and support maps.
+    Myelinated and extracellular families use that same declaration-driven
+    transaction with their own canonical geometry preparation and voltage
+    initializer. A packed model initializes its consolidated parent handler;
+    imperative initialization does not run component initialization hooks.
     """
 
-    if type(population) is SingleCompartment:
-        return SingleCompartment, "scalar_point", _bwd_euler_sc
+    if _is_multi(population):
+        operator_kind = getattr(
+            population.integrator,
+            "_FUNCTIONAL_OPERATOR_KIND",
+            None,
+        )
+        profile = _PACKED_OPERATOR_PROFILES.get(operator_kind)
+        if profile is not None:
+            return MultiPopulation, operator_kind, profile[1]
+        return None
+    if isinstance(population, ExtCellAxon):
+        return ExtCellAxon, *_FIXED_OPERATOR_PROFILES["extcell_axon"]
+    if _is_extcell_tree(population):
+        return ExtCellTree, *_FIXED_OPERATOR_PROFILES["extcell_tree"]
+    if _is_scalar_point(population):
+        return (
+            (
+                SingleCompartment
+                if isinstance(population, SingleCompartment)
+                else Population
+            ),
+            *_scalar_point_integrator_profile(population.integrator),
+        )
+    if isinstance(population, Myelinated):
+        return Myelinated, *_scalar_path_integrator_profile(population.integrator)
     if isinstance(population, Unmyelinated):
-        return Unmyelinated, "scalar_path", _bwd_euler_ub
+        return Unmyelinated, *_scalar_path_integrator_profile(population.integrator)
+    if _is_native_cable(population):
+        return Cable, *_FIXED_OPERATOR_PROFILES["native_cable"]
+    if _is_scalar_tree(population):
+        return Tree, *_FIXED_OPERATOR_PROFILES["scalar_tree"]
     return None
 
 
@@ -252,6 +873,224 @@ _STANDARD_MECHANISM_ASSIGNED_VALUES = inspect.getattr_static(
     "assigned_values",
 )
 _STANDARD_MECHANISM_ADVANCE = inspect.getattr_static(Mechanism, "advance")
+_STANDARD_VOLTAGE_FUNCTIONAL_ADAPTERS = {
+    name: inspect.getattr_static(VoltageProcess, name)
+    for name in ("update_v", "_derive_voltage_values")
+}
+_STANDARD_VOLTAGE_VALUES = inspect.getattr_static(VoltageProcess, "voltage_values")
+_RECEIVE_ADAPTER_NAMES = (
+    "net_receive",
+    "_net_receive_payload_shape",
+    "_net_receive_value_frame",
+    "_derive_net_receive_values",
+    "_validate_net_receive_updates",
+    "_apply_net_receive_updates",
+)
+_STANDARD_RECEIVE_ADAPTERS = {
+    name: inspect.getattr_static(Synapse, name) for name in _RECEIVE_ADAPTER_NAMES
+}
+_STANDARD_RECEIVE_VALUES = inspect.getattr_static(Synapse, "net_receive_values")
+_CONTINUOUS_RECEIVE_ADAPTER_NAMES = (
+    "reset_continuous_inputs",
+    "continuous_receive",
+    "_continuous_input_name",
+    "_continuous_receive_payload_shape",
+    "_continuous_receive_value_frame",
+    "_derive_continuous_receive_values",
+    "_validate_net_receive_updates",
+    "_apply_continuous_receive_updates",
+)
+_STANDARD_CONTINUOUS_RECEIVE_ADAPTERS = {
+    name: inspect.getattr_static(ContinuousSynapse, name)
+    for name in _CONTINUOUS_RECEIVE_ADAPTER_NAMES
+}
+
+
+class _RawClassHookIdentity:
+    """Compare one stored class hook without resolving its descriptor.
+
+    A class mappingproxy delegates comparison to its underlying dictionary.
+    This right-hand operand therefore receives that raw dict, allowing an
+    identity check after functional_call writes without invoking user equality
+    or descriptor getters. Dynamo's ordinary raw-entry guards remain visible.
+    """
+
+    def __init__(self, name, expected):
+        self.name = name
+        self.expected = expected
+
+    def __eq__(self, namespace):
+        return namespace.get(self.name) is self.expected
+
+
+def _subclass_contract_matches(owner, base, hooks):
+    """Compare inherited execution hooks without evaluating descriptors.
+
+    Raw MRO entries remain visible to Dynamo so a warmed graph cannot keep
+    executing a private copy after an instance or class hook is replaced.
+    Constructors and construction-only helpers are outside this contract.
+    """
+    for name, standard in hooks.items():
+        for cls in _canonical_type(owner).__mro__:
+            if name in cls.__dict__:
+                if not (cls.__dict__ == _RawClassHookIdentity(name, standard)):
+                    return False
+                break
+        else:
+            # An absent optional hook, such as clear_cache during parameter
+            # rematerialization, has the same native behavior as None. A
+            # subclass must not add callable work that pure lowering omits.
+            if standard is not None:
+                return False
+    if any(name in owner.__dict__ for name in hooks):
+        return False
+    for name, standard in hooks.items():
+        # nn.Module dictionary-membership checks alone do not guard an absent
+        # instance override in a warmed Dynamo graph. Reading canonical method
+        # bindings records the function identity that execution depends on.
+        # Parametrized modules supply generated serialization adapters; their
+        # own binding plan qualifies those wrappers separately.
+        if name in {"__deepcopy__", "__getstate__"}:
+            continue
+        if standard is None:
+            if getattr(owner, name, None) is not None:
+                return False
+            continue
+        expected = (
+            standard.__func__
+            if isinstance(standard, (classmethod, staticmethod))
+            else standard
+        )
+        if isinstance(expected, types.FunctionType):
+            method = getattr(owner, name)
+            if isinstance(standard, staticmethod):
+                if method is not expected:
+                    return False
+            elif (
+                not isinstance(method, types.MethodType)
+                or method.__func__ is not expected
+                or method.__self__
+                is not (type(owner) if isinstance(standard, classmethod) else owner)
+            ):
+                return False
+    return True
+
+
+def _subclass_contract_failures(owner, base, hooks):
+    """Reject numerical/lifecycle replacements without invoking authored hooks."""
+    namespace = object.__getattribute__(owner, "__dict__")
+    replaced = [
+        name
+        for name, standard in hooks.items()
+        if name in namespace
+        or inspect.getattr_static(_canonical_type(owner), name, None) is not standard
+    ]
+    if not replaced:
+        return []
+    return [
+        f"{type(owner).__qualname__} replaces canonical {base.__qualname__} "
+        f"execution hooks {replaced}; compatible subclasses may customize "
+        "construction and declarations while inheriting numerical, geometry, "
+        "initialization, and checkpoint behavior"
+    ]
+
+
+def _subclass_slot_contract(base, names):
+    """Capture canonical class bindings for attributes owned by runtime slots."""
+    slots = {}
+    for name in names:
+        for cls in base.__mro__:
+            if name in cls.__dict__:
+                slots[name] = (True, cls.__dict__[name])
+                break
+        else:
+            slots[name] = (False, None)
+    return slots
+
+
+def _subclass_slot_contract_matches(owner, base, slots):
+    """Keep authored class descriptors from masking native runtime attributes.
+
+    PyTorch's generated parametrization class is checked by its own binding
+    plan. Compare the original authored class against the native family here.
+    """
+    for name, (present, standard) in slots.items():
+        for cls in _canonical_type(owner).__mro__:
+            if name in cls.__dict__:
+                if not present or not (
+                    cls.__dict__ == _RawClassHookIdentity(name, standard)
+                ):
+                    return False
+                break
+        else:
+            if present:
+                return False
+    return True
+
+
+def _subclass_slot_contract_failures(owner, base, slots):
+    replaced = [
+        name
+        for name, binding in slots.items()
+        if not _subclass_slot_contract_matches(owner, base, {name: binding})
+    ]
+    if not replaced:
+        return []
+    return [
+        f"{type(owner).__qualname__} masks canonical {base.__qualname__} "
+        f"runtime attributes {replaced}; use registered parameter declarations "
+        "and inherited runtime attributes"
+    ]
+
+
+_STANDARD_POPULATION_SLOT_CONTRACTS = {
+    family: _subclass_slot_contract(family, _POPULATION_RESERVED_ATTRIBUTE_NAMES)
+    for family in _STANDARD_POPULATION_EXECUTION_HOOKS
+}
+
+
+def _population_family(population):
+    """Resolve the nearest native family while retaining the authored class."""
+    return next(
+        (
+            cls
+            for cls in _canonical_type(population).__mro__
+            if cls in _STANDARD_POPULATION_EXECUTION_HOOKS
+        ),
+        None,
+    )
+
+
+def _population_subclass_failures(population, _seen=None):
+    family = _population_family(population)
+    if family is None:
+        return []
+    failures = _subclass_contract_failures(
+        population, family, _STANDARD_POPULATION_EXECUTION_HOOKS[family]
+    )
+    failures.extend(
+        _subclass_slot_contract_failures(
+            population, family, _STANDARD_POPULATION_SLOT_CONTRACTS[family]
+        )
+    )
+    if object.__getattribute__(population, "__dict__").get("_step") is not (
+        _standard_population_step
+    ):
+        failures.append(
+            "Population replaces the canonical native timestep adapter _step"
+        )
+    if not failures and family is MultiPopulation:
+        seen = set() if _seen is None else _seen
+        if id(population) not in seen:
+            seen.add(id(population))
+            for name, component in population.populations.items():
+                failures.extend(
+                    f"component {name!r}: {failure}"
+                    for failure in _population_subclass_failures(component, seen)
+                )
+    return failures
+
+
 _STATE_IMPERATIVE_INITIALIZATION_HOOKS = (
     "populate_parameter_buffers",
     "init_rng",
@@ -269,6 +1108,7 @@ _STANDARD_STATE_DEFAULTS = inspect.getattr_static(State, "state_defaults")
 _STANDARD_STATE_INITIAL_VALUES = inspect.getattr_static(State, "initial_values")
 _STANDARD_STATE_ASSIGNED_VALUES = inspect.getattr_static(State, "assigned_values")
 _STANDARD_STATE_ADVANCE = inspect.getattr_static(State, "advance")
+_STANDARD_STATE_INPUT_FRAME = inspect.getattr_static(State, "_input_value_frame")
 _ION_INITIALIZATION_HOOKS = (
     "initialize",
     "advance",
@@ -302,10 +1142,6 @@ _STANDARD_ION_MATERIAL_BASE_INITIALIZATION = {
     name: inspect.getattr_static(Material, name)
     for name in _ION_MATERIAL_BASE_INITIALIZATION_HOOKS
 }
-
-
-def _clone_tensor(tensor: torch.Tensor) -> torch.Tensor:
-    return tensor.detach().clone(memory_format=torch.preserve_format)
 
 
 def _audit_tensor_digest(value: torch.Tensor) -> str:
@@ -364,16 +1200,187 @@ def _audit_tensor_numerical_value(value: torch.Tensor) -> tuple:
     )
 
 
+_BINDING_MRO = type.__dict__["__mro__"].__get__
+_BINDING_CLASS_DICT = type.__dict__["__dict__"].__get__
+_BINDING_MODULE_DICT = vars(torch.nn.Module)["__dict__"].__get__
+_BINDING_TENSOR_DICT = vars(torch.Tensor)["__dict__"].__get__
+_BINDING_MODE_DICT = vars(TorchFunctionMode)["__dict__"].__get__
+_BINDING_NAMED_MODULES = torch.nn.Module.named_modules
+_BINDING_NAMED_MODULES_CODE = _BINDING_NAMED_MODULES.__code__
+_BINDING_NAMED_MODULES_DEFAULTS = _BINDING_NAMED_MODULES.__defaults__
+_BINDING_DEVICE_HANDLER = DeviceContext.__torch_function__
+_BINDING_DEVICE_CODE = _BINDING_DEVICE_HANDLER.__code__
+_BINDING_DEVICE_DEFAULTS = _BINDING_DEVICE_HANDLER.__defaults__
+_BINDING_DEVICE_MRO = _BINDING_MRO(DeviceContext)
+_BINDING_DEVICE_CONSTRUCTORS = _BINDING_DEVICE_HANDLER.__globals__.get(
+    "_device_constructors"
+)
+_BINDING_MISSING = object()
+
+
+def _binding_capture_modes():
+    """Recognize no modes or Torch's unmodified default-device context."""
+    try:
+        if (
+            torch._C._len_torch_dispatch_stack()
+            or torch._ops._len_torch_dispatch_stack_pre_dispatch()
+            or torch._C._are_functorch_transforms_active()
+            or torch.autograd.forward_ad._current_level >= 0
+            or torch.compiler.is_compiling()
+            or torch.jit.is_tracing()
+        ):
+            return None
+        modes = torch.overrides._get_current_function_mode_stack()
+    except AttributeError:
+        return None
+    if not modes:
+        return ()
+    if len(modes) != 1 or type(modes[0]) is not DeviceContext:
+        return None
+    mode = modes[0]
+    namespace = _BINDING_MODE_DICT(mode)
+    if any(type(key) is not str for key in namespace) or set(namespace) - {
+        "device",
+        "prev_mode",
+        "old_device",
+    }:
+        return None
+    if type(namespace.get("device")) is not torch.device:
+        return None
+    if _BINDING_MRO(DeviceContext) is not _BINDING_DEVICE_MRO:
+        return None
+    for cls in _BINDING_DEVICE_MRO[:-1]:
+        members = _BINDING_CLASS_DICT(cls)
+        if any(type(key) is not str for key in members):
+            return None
+        if "__getattribute__" in members or "device" in members:
+            return None
+    if (
+        _BINDING_CLASS_DICT(DeviceContext).get("__torch_function__")
+        is not _BINDING_DEVICE_HANDLER
+        or _BINDING_DEVICE_HANDLER.__code__ is not _BINDING_DEVICE_CODE
+        or _BINDING_DEVICE_HANDLER.__defaults__ is not _BINDING_DEVICE_DEFAULTS
+        or _BINDING_DEVICE_CONSTRUCTORS is None
+        or _BINDING_DEVICE_HANDLER.__globals__.get("_device_constructors")
+        is not _BINDING_DEVICE_CONSTRUCTORS
+    ):
+        return None
+    return (id(mode), namespace["device"])
+
+
+def _binding_capture_plain_graph(module):
+    """Qualify inert registration reads without invoking authored traversal."""
+    if (
+        _BINDING_NAMED_MODULES.__code__ is not _BINDING_NAMED_MODULES_CODE
+        or _BINDING_NAMED_MODULES.__defaults__ is not _BINDING_NAMED_MODULES_DEFAULTS
+    ):
+        return False
+    is_wrapped = getattr(
+        getattr(torch._C, "_functorch", None), "is_functorch_wrapped_tensor", None
+    )
+    is_functional = getattr(torch, "_is_functional_tensor", None)
+    if is_wrapped is None or is_functional is None:
+        return False
+    policy = {
+        "__getattribute__": object.__getattribute__,
+        "__hash__": object.__hash__,
+        "__eq__": object.__eq__,
+        "named_modules": _BINDING_NAMED_MODULES,
+        "__dict__": vars(torch.nn.Module)["__dict__"],
+        "_parameters": _BINDING_MISSING,
+        "_buffers": _BINDING_MISSING,
+        "_modules": _BINDING_MISSING,
+    }
+    qualified_types, visited, active = set(), set(), set()
+    pending = [(module, False)]
+    while pending:
+        owner, leaving = pending.pop()
+        identity = id(owner)
+        if leaving:
+            active.remove(identity)
+            visited.add(identity)
+            continue
+        if identity in active:
+            return False
+        if identity in visited:
+            continue
+        cls = type(owner)
+        if id(cls) not in qualified_types:
+            mro = _BINDING_MRO(cls)
+            if not any(base is torch.nn.Module for base in mro):
+                return False
+            members = {}
+            for base in mro:
+                namespace = _BINDING_CLASS_DICT(base)
+                if any(type(key) is not str for key in namespace):
+                    return False
+                for name in policy:
+                    if name not in members and name in namespace:
+                        members[name] = namespace[name]
+            if any(
+                members.get(name, _BINDING_MISSING) is not expected
+                for name, expected in policy.items()
+            ):
+                return False
+            qualified_types.add(id(cls))
+        namespace = _BINDING_MODULE_DICT(owner)
+        if (
+            any(type(key) is not str for key in namespace)
+            or "named_modules" in namespace
+        ):
+            return False
+        for name in ("_parameters", "_buffers", "_modules"):
+            registry = namespace.get(name)
+            if type(registry) is not dict or any(
+                type(key) is not str for key in registry
+            ):
+                return False
+        for name in ("_parameters", "_buffers"):
+            for value in namespace[name].values():
+                if value is None:
+                    continue
+                if (
+                    type(value) is not torch.Tensor
+                    and type(value) is not torch.nn.Parameter
+                ):
+                    return False
+                if (
+                    _BINDING_TENSOR_DICT(value)
+                    or is_wrapped(value)
+                    or is_functional(value)
+                ):
+                    return False
+        active.add(identity)
+        pending.append((owner, True))
+        pending.extend(
+            (child, False)
+            for child in namespace["_modules"].values()
+            if child is not None
+        )
+    return True
+
+
 def _registered_tensor_bindings(module: torch.nn.Module) -> dict[tuple, tuple]:
     """Snapshot every registered parameter/buffer slot, including aliases."""
-    bindings = {}
+    mode = _binding_capture_modes()
+    reuse = mode is not None and _binding_capture_plain_graph(module)
+    bindings, memo = {}, {}
     for module_path, owner in module.named_modules(remove_duplicate=False):
         for collection_name in ("_parameters", "_buffers"):
             for name, value in getattr(owner, collection_name).items():
                 if value is None:
                     continue
                 key = (module_path, collection_name, name)
-                bindings[key] = _audit_tensor_binding(value)
+                if reuse and _binding_capture_modes() != mode:
+                    reuse = False
+                    memo.clear()
+                if reuse:
+                    identity = id(value)
+                    if identity not in memo:
+                        memo[identity] = (value, _audit_tensor_binding(value))
+                    bindings[key] = memo[identity][1]
+                else:
+                    bindings[key] = _audit_tensor_binding(value)
     return bindings
 
 
@@ -537,8 +1544,15 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
     """Return authored classes whose mutable class state deepcopy shares."""
     population = getattr(module, "population", module)
     transform_module_ids = set()
+    waveform_child_ids = {
+        id(child)
+        for waveform in module.modules()
+        if isinstance(waveform, Waveform)
+        for child in waveform.modules()
+        if not isinstance(child, (Mechanism, State, cacheable, Waveform))
+    }
     physical_populations = [population] if isinstance(population, Population) else []
-    if type(population) is MultiPopulation:
+    if _is_multi(population):
         physical_populations.extend(population.populations.values())
     component_adapter_type = globals().get("_ComponentPhysicalPreparation")
     if component_adapter_type is not None:
@@ -548,6 +1562,16 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
             if isinstance(child, component_adapter_type)
         )
     for physical_population in physical_populations:
+        from ._initialization_sources import (
+            _registered_modules,
+            initialization_source_roots,
+        )
+
+        transform_module_ids.update(
+            id(child)
+            for _path, source in initialization_source_roots(physical_population)
+            for _child_path, child in _registered_modules(source)
+        )
         initialization_transforms = getattr(
             physical_population,
             "_initialization_transforms",
@@ -564,6 +1588,11 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
             else (physical_population,)
         )
         for owner in owners:
+            if (
+                isinstance(owner, MaterialProcess)
+                and _material_process_contract(owner).family is MaterialProcess
+            ):
+                transform_module_ids.update(id(child) for child in owner.modules())
             for transforms in owner.in_graph_parametrizations.values():
                 for transform, _args in transforms:
                     transform_module_ids.update(
@@ -580,9 +1609,12 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
 
     classes = set()
     for owner in module.modules():
-        is_transform_module = id(owner) in transform_module_ids
+        is_transform_module = (
+            id(owner) in transform_module_ids or id(owner) in waveform_child_ids
+        )
         if not (
-            isinstance(owner, (Mechanism, State, cacheable)) or is_transform_module
+            isinstance(owner, (Mechanism, State, cacheable, Waveform))
+            or is_transform_module
         ):
             continue
         if is_transform_module:
@@ -597,7 +1629,7 @@ def _authored_workspace_classes(module: torch.nn.Module) -> tuple[type, ...]:
                 classes.add(cls)
         else:
             for cls in type(owner).__mro__:
-                if cls in {Mechanism, State, cacheable, torch.nn.Module}:
+                if cls in {Mechanism, State, cacheable, Waveform, torch.nn.Module}:
                     break
                 classes.add(cls)
     return tuple(sorted(classes, key=lambda cls: (cls.__module__, cls.__qualname__)))
@@ -657,8 +1689,18 @@ def _snapshot_tensor_class_restore(value: torch.Tensor) -> _TensorClassRestore:
     )
 
 
-def _safe_class_restore_copy(value, *, label: str, seen: set[int]):
+def _safe_class_restore_copy(
+    value, *, label: str, seen: set[int], tensor_restores=None
+):
     """Copy only class state whose snapshot cannot execute authored code."""
+    if torch.is_tensor(value) and tensor_restores is not None:
+        # Declarations can contain tensors (for example ClearanceSpec.rate).
+        # Keep their identities in the structural copy and independently save
+        # raw storage, so restoring a nested literal also restores registered
+        # instance-buffer aliases rather than replacing them with new tensors.
+        if id(value) not in tensor_restores:
+            tensor_restores[id(value)] = (value, _snapshot_tensor_class_restore(value))
+        return value
     if value is None or isinstance(
         value,
         (
@@ -728,6 +1770,7 @@ def _safe_class_restore_copy(value, *, label: str, seen: set[int]):
                         object.__getattribute__(value, field.name),
                         label=f"{label}.{field.name}",
                         seen=seen,
+                        tensor_restores=tensor_restores,
                     ),
                 )
             return restored
@@ -737,12 +1780,15 @@ def _safe_class_restore_copy(value, *, label: str, seen: set[int]):
                     item,
                     label=f"{label}[{index}]",
                     seen=seen,
+                    tensor_restores=tensor_restores,
                 )
                 for index, item in enumerate(value)
             )
         if type(value) is frozenset:
             return frozenset(
-                _safe_class_restore_copy(item, label=f"{label}[]", seen=seen)
+                _safe_class_restore_copy(
+                    item, label=f"{label}[]", seen=seen, tensor_restores=tensor_restores
+                )
                 for item in value
             )
         if type(value) is list:
@@ -751,25 +1797,39 @@ def _safe_class_restore_copy(value, *, label: str, seen: set[int]):
                     item,
                     label=f"{label}[{index}]",
                     seen=seen,
+                    tensor_restores=tensor_restores,
                 )
                 for index, item in enumerate(value)
             ]
         if type(value) is set:
             return {
-                _safe_class_restore_copy(item, label=f"{label}[]", seen=seen)
+                _safe_class_restore_copy(
+                    item, label=f"{label}[]", seen=seen, tensor_restores=tensor_restores
+                )
                 for item in value
             }
-        if type(value) is dict:
-            return {
-                _safe_class_restore_copy(key, label=f"{label}.key", seen=seen): (
+        if type(value) in (dict, types.MappingProxyType):
+            restored = {
+                _safe_class_restore_copy(
+                    key,
+                    label=f"{label}.key",
+                    seen=seen,
+                    tensor_restores=tensor_restores,
+                ): (
                     _safe_class_restore_copy(
                         item,
                         label=f"{label}[{key!r}]",
                         seen=seen,
+                        tensor_restores=tensor_restores,
                     )
                 )
                 for key, item in value.items()
             }
+            return (
+                types.MappingProxyType(restored)
+                if type(value) is types.MappingProxyType
+                else restored
+            )
     finally:
         seen.remove(identity)
     raise FunctionalizationError(
@@ -786,6 +1846,7 @@ def _class_state_snapshot(classes: tuple[type, ...]):
         for name, value in vars(cls).items():
             if name in _CLASS_STATE_METADATA_NAMES:
                 continue
+            tensor_restores = {}
             if torch.is_tensor(value):
                 restored = _snapshot_tensor_class_restore(value)
             elif isinstance(value, np.ndarray):
@@ -799,11 +1860,36 @@ def _class_state_snapshot(classes: tuple[type, ...]):
                     value,
                     label=f"{cls.__module__}.{cls.__qualname__}.{name}",
                     seen=set(),
+                    tensor_restores=tensor_restores,
                 )
             signature = _audit_python_value_signature(value, set())
-            attributes[name] = (signature, value, restored)
+            attributes[name] = (signature, value, restored, tensor_restores)
         snapshot[cls] = attributes
     return snapshot
+
+
+def _restore_tensor_class_value(original, restored):
+    """Restore storage/view metadata without losing authored tensor aliases."""
+    with torch.no_grad():
+        if restored.storage.nbytes() != restored.storage_nbytes:
+            restored.storage.resize_(restored.storage_nbytes)
+        if restored.storage_nbytes:
+            storage_view = torch.empty(
+                0, device=restored.device, dtype=torch.uint8
+            ).set_(restored.storage, 0, (restored.storage_nbytes,), (1,))
+            storage_view.copy_(restored.storage_value)
+        restored_view = torch.empty(
+            0,
+            device=restored.device,
+            dtype=restored.dtype,
+            layout=restored.layout,
+        ).set_(
+            restored.storage, restored.storage_offset, restored.size, restored.stride
+        )
+        # set_ alone cannot recover dtype/device changes through tensor.data.
+        original.data = restored_view
+    if original.requires_grad != restored.requires_grad:
+        original.requires_grad_(restored.requires_grad)
 
 
 def _restore_class_state(snapshot) -> set[str]:
@@ -817,7 +1903,12 @@ def _restore_class_state(snapshot) -> set[str]:
         for name in current_names - expected_names:
             changed.add(f"{cls.__module__}.{cls.__qualname__}.{name}")
             delattr(cls, name)
-        for name, (signature, original, restored) in attributes.items():
+        for name, (
+            signature,
+            original,
+            restored,
+            tensor_restores,
+        ) in attributes.items():
             current = vars(cls).get(name, None)
             current_signature = (
                 None
@@ -826,16 +1917,22 @@ def _restore_class_state(snapshot) -> set[str]:
             )
             if current_signature != signature:
                 changed.add(f"{cls.__module__}.{cls.__qualname__}.{name}")
+                for tensor, tensor_restore in tensor_restores.values():
+                    _restore_tensor_class_value(tensor, tensor_restore)
+                memo = {
+                    identity: tensor
+                    for identity, (tensor, _saved) in tensor_restores.items()
+                }
                 if isinstance(original, dict):
                     original.clear()
-                    original.update(copy.deepcopy(restored))
+                    original.update(copy.deepcopy(restored, memo))
                     restored_value = original
                 elif isinstance(original, list):
-                    original[:] = copy.deepcopy(restored)
+                    original[:] = copy.deepcopy(restored, memo)
                     restored_value = original
                 elif isinstance(original, set):
                     original.clear()
-                    original.update(copy.deepcopy(restored))
+                    original.update(copy.deepcopy(restored, memo))
                     restored_value = original
                 elif isinstance(original, np.ndarray):
                     if original.dtype != restored.dtype:
@@ -844,42 +1941,7 @@ def _restore_class_state(snapshot) -> set[str]:
                     np.copyto(original, restored.value)
                     restored_value = original
                 elif torch.is_tensor(original):
-                    with torch.no_grad():
-                        # Restore raw storage before the original view metadata.
-                        # This preserves aliases and handles overlapping or
-                        # expanded tensors, where logical ``copy_`` is invalid.
-                        if restored.storage.nbytes() != restored.storage_nbytes:
-                            restored.storage.resize_(restored.storage_nbytes)
-                        if restored.storage_nbytes:
-                            storage_view = torch.empty(
-                                0,
-                                device=restored.device,
-                                dtype=torch.uint8,
-                            ).set_(
-                                restored.storage,
-                                0,
-                                (restored.storage_nbytes,),
-                                (1,),
-                            )
-                            storage_view.copy_(restored.storage_value)
-                        restored_view = torch.empty(
-                            0,
-                            device=restored.device,
-                            dtype=restored.dtype,
-                            layout=restored.layout,
-                        ).set_(
-                            restored.storage,
-                            restored.storage_offset,
-                            restored.size,
-                            restored.stride,
-                        )
-                        # ``set_`` alone cannot restore dtype/device metadata
-                        # changed through ``tensor.data = ...``. Reattach the
-                        # exact typed view while preserving the original Python
-                        # identity and captured shared raw storage.
-                        original.data = restored_view
-                    if original.requires_grad != restored.requires_grad:
-                        original.requires_grad_(restored.requires_grad)
+                    _restore_tensor_class_value(original, restored)
                     restored_value = original
                 elif isinstance(original, torch.Generator):
                     original.set_state(restored.get_state())
@@ -890,46 +1952,29 @@ def _restore_class_state(snapshot) -> set[str]:
     return changed
 
 
-def _global_rng_snapshot(device: torch.device) -> dict[str, object]:
-    snapshot = {
-        "torch": torch.random.get_rng_state(),
-        "python": random.getstate(),
-        "numpy": np.random.get_state(),
-    }
-    if device.type == "cuda":  # pragma: no cover - future device slice
-        snapshot["cuda"] = torch.cuda.get_rng_state(device)
-    if device.type == "mps" and hasattr(torch.mps, "get_rng_state"):
-        snapshot["mps"] = torch.mps.get_rng_state()
-    return snapshot
-
-
-def _global_rng_changes(snapshot, device: torch.device) -> set[str]:
+@contextmanager
+def _class_state_diagnostic_scope(classes: tuple[type, ...]):
+    """Restore authored class state while exposing only mutation findings."""
+    snapshot = _class_state_snapshot(classes)
     changed = set()
-    if not torch.equal(torch.random.get_rng_state(), snapshot["torch"]):
-        changed.add("global PyTorch")
-    if random.getstate() != snapshot["python"]:
-        changed.add("global Python")
-    if not _numpy_rng_state_equal(np.random.get_state(), snapshot["numpy"]):
-        changed.add("global NumPy")
-    if "cuda" in snapshot and not torch.equal(
-        torch.cuda.get_rng_state(device), snapshot["cuda"]
-    ):
-        changed.add("CUDA")
-    if "mps" in snapshot and not torch.equal(
-        torch.mps.get_rng_state(), snapshot["mps"]
-    ):
-        changed.add("MPS")
-    return changed
+    try:
+        yield changed
+    finally:
+        changed.update(_restore_class_state(snapshot))
 
 
-def _restore_global_rng(snapshot, device: torch.device) -> None:
-    torch.random.set_rng_state(snapshot["torch"])
-    random.setstate(snapshot["python"])
-    np.random.set_state(snapshot["numpy"])
-    if "cuda" in snapshot:  # pragma: no cover - future device slice
-        torch.cuda.set_rng_state(snapshot["cuda"], device)
-    if "mps" in snapshot:
-        torch.mps.set_rng_state(snapshot["mps"])
+@contextmanager
+def _functional_probe_restore_scope(functional, classes, snapshot):
+    """Restore captured probe state, including RNG when class rollback fails."""
+    try:
+        yield
+    finally:
+        try:
+            if classes is not None:
+                _restore_class_state(classes)
+        finally:
+            if snapshot is not None:
+                _restore_global_rng(snapshot, functional.device)
 
 
 def _deepcopy_execution_module(module: torch.nn.Module) -> torch.nn.Module:
@@ -1054,11 +2099,21 @@ def _rebind_population_time_references(population: Population) -> None:
         mechanism.setreference("t", lambda population=population: population.t)
     for process in handler.material_processes.values():
         process.setreference("t", lambda population=population: population.t)
+        # Resolver methods are external Python references, not registered module
+        # children. Always bind the private copy's material registry explicitly.
+        process._material_resolver = handler._get_material
+        object.__setattr__(process, "_mp_population", population)
 
 
 def _clone_execution_population(population: Population) -> Population:
     """Copy a model without retaining live autograd scratch or buffer aliases."""
     cloned = _deepcopy_execution_module(population)
+    from ._mechanism_injections import configure_mechanism_injection_execution
+
+    configure_mechanism_injection_execution(cloned)
+    from ._initialization_sources import configure_initialization_source_execution
+
+    configure_initialization_source_execution(cloned)
     if cloned.integrator is not None:
         cloned.integrator.clear_jit_cache()
     # Imperative execution installs conditional Dynamo barriers around shared
@@ -1086,6 +2141,8 @@ def _strip_packed_component_runtime_aliases(population: MultiPopulation) -> None
     # component owners below.
     population.clear_labels()
     population._modules["populations"] = torch.nn.ModuleDict()
+    if not population.mech.material_processes:
+        population._modules.pop("_material_geometry", None)
     population.injections = []
     population.mechanism_injections = []
     population.mechanism_injection_accepted = []
@@ -1139,62 +2196,6 @@ def _parameter_alias_paths(module: torch.nn.Module) -> dict[str, tuple[str, ...]
     return {name: tuple(paths) for name, paths in aliases.items()}
 
 
-def _unpack_forward_ad(value: torch.Tensor):
-    """Expose a dual tangent even when the caller has inference mode enabled."""
-    if torch.is_inference_mode_enabled():
-        # Inference mode normally hides forward-AD tangents from unpack_dual().
-        # Freshness metadata must describe the tensor itself rather than the
-        # ambient execution mode, or a plan could silently lose its tangent
-        # binding when prepared/consumed under inference mode.
-        with torch.inference_mode(False):
-            return torch.autograd.forward_ad.unpack_dual(value)
-    return torch.autograd.forward_ad.unpack_dual(value)
-
-
-def _has_inference_tensor_component(value: torch.Tensor) -> bool:
-    tangent = _unpack_forward_ad(value).tangent
-    return torch.is_inference(value) or (
-        tangent is not None and torch.is_inference(tangent)
-    )
-
-
-def _tensor_leaf_binding(value: torch.Tensor) -> tuple:
-    """Bind one primal (or ordinary Tensor) and its optional dual tangent."""
-    unpacked = _unpack_forward_ad(value)
-    tangent = unpacked.tangent
-    if torch.is_inference(value) or (
-        tangent is not None and torch.is_inference(tangent)
-    ):
-        raise TypeError(
-            "tensor bindings require versioned primal and forward-AD tangent values"
-        )
-    tangent_binding = (
-        None
-        if tangent is None
-        else (id(tangent), tangent._version, tangent.requires_grad)
-    )
-    # ``value`` is the stable owner for a dual's primal storage. The primal
-    # view returned by unpack_dual() is recreated on demand, so its Python
-    # identity is deliberately not part of the freshness contract.
-    return (id(value), value._version, value.requires_grad, tangent_binding)
-
-
-def _tensor_binding(values: Mapping[str, torch.Tensor]) -> tuple:
-    """Bind a derived workspace to the exact tensor versions that created it."""
-    return tuple((name, *_tensor_leaf_binding(values[name])) for name in sorted(values))
-
-
-def _tensor_tree_binding(values) -> tuple:
-    """Bind every tensor leaf in a prepared workspace tree."""
-    leaves, tree_spec = torch.utils._pytree.tree_flatten(values)
-    if any(not torch.is_tensor(value) for value in leaves):
-        raise TypeError("prepared workspaces must contain only Tensor leaves")
-    return (
-        tree_spec,
-        tuple(_tensor_leaf_binding(value) for value in leaves),
-    )
-
-
 class _PreparedPopulation:
     """Opaque plan-bound tensor bundle returned by :meth:`prepare`."""
 
@@ -1227,10 +2228,6 @@ class _PreparedPopulation:
         self.values = values
 
 
-def _shape_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
-    return tuple(int(value) for value in tensor.shape)
-
-
 def _module_at(population: Population, path: str) -> torch.nn.Module:
     return population if not path else population.get_submodule(path)
 
@@ -1253,20 +2250,6 @@ def _set_buffer(
         owner._buffers[name] = value
     else:
         setattr(owner, name, value)
-
-
-def _put_path(tree: dict, path: tuple[str, ...], value) -> None:
-    cursor = tree
-    for part in path[:-1]:
-        cursor = cursor.setdefault(part, {})
-    cursor[path[-1]] = value
-
-
-def _get_path(tree: Mapping, path: tuple[str, ...]):
-    value = tree
-    for part in path:
-        value = value[part]
-    return value
 
 
 @dataclass(frozen=True)
@@ -1408,6 +2391,1049 @@ def _timestep_buffer_names(module) -> tuple[str, ...]:
     return tuple(sorted(getattr(module, "_timestep_buffers", ())))
 
 
+def _material_process_contract(process):
+    return next(
+        (
+            contract
+            for contract in _MATERIAL_PROCESS_CONTRACTS
+            if isinstance(process, contract.family)
+        ),
+        _CUSTOM_MATERIAL_PROCESS_CONTRACT
+        if isinstance(process, MaterialProcess)
+        else None,
+    )
+
+
+def _voltage_process_failures(process):
+    """Require the shared returned-output adapter, never an imperative reset."""
+
+    failures = []
+    changed = [
+        name
+        for name, standard in _STANDARD_VOLTAGE_FUNCTIONAL_ADAPTERS.items()
+        if name in process.__dict__
+        or inspect.getattr_static(type(process), name) is not standard
+    ]
+    if changed:
+        failures.append(
+            "replaces canonical pure voltage adapters "
+            f"{changed}; implement voltage_values(v, dt, values) instead"
+        )
+    if "voltage_values" in process.__dict__:
+        failures.append(
+            "replaces voltage_values on the instance; define the pure "
+            "returned-output hook on its VoltageProcess subclass"
+        )
+    elif (
+        inspect.getattr_static(type(process), "voltage_values")
+        is _STANDARD_VOLTAGE_VALUES
+    ):
+        failures.append("does not implement the pure voltage_values hook")
+    else:
+        try:
+            if current_check_purity():
+                _initialization_callable_dependency_signature(
+                    process.voltage_values,
+                    label=f"{process.name}.voltage_values",
+                    owner=process,
+                    strict=True,
+                )
+        except FunctionalizationError as exc:
+            failures.append(str(exc))
+    support_map = getattr(process, "support_map", None)
+    if support_map is not None and not support_map.is_injective(
+        getattr(process, "key", None)
+    ):
+        failures.append(
+            "uses non-injective voltage replacement support, which is not lowered yet"
+        )
+    return failures
+
+
+def _event_receiver_failures(process):
+    if not isinstance(process, Synapse):
+        return ["target is not a Synapse"]
+    failures = []
+    changed = [
+        name
+        for name, standard in _STANDARD_RECEIVE_ADAPTERS.items()
+        if name in process.__dict__
+        or inspect.getattr_static(type(process), name) is not standard
+    ]
+    if changed:
+        failures.append(
+            f"replaces canonical event adapters {changed}; implement "
+            "net_receive_values(weights, dt, values) instead"
+        )
+    if "net_receive_values" in process.__dict__:
+        failures.append("replaces net_receive_values on the instance")
+    elif (
+        inspect.getattr_static(type(process), "net_receive_values")
+        is _STANDARD_RECEIVE_VALUES
+    ):
+        failures.append("does not implement pure net_receive_values")
+    elif not inspect.isfunction(
+        inspect.getattr_static(type(process), "net_receive_values")
+    ):
+        failures.append(
+            "net_receive_values must be a pure method on its Synapse subclass"
+        )
+    else:
+        try:
+            if current_check_purity():
+                _initialization_callable_dependency_signature(
+                    process.net_receive_values,
+                    label=f"{process.name}.net_receive_values",
+                    owner=process,
+                    strict=True,
+                    forbidden_receiver_attributes=frozenset(process._assigned)
+                    | {"_buffers", "_runtime_value_frame"},
+                )
+        except FunctionalizationError as exc:
+            failures.append(str(exc))
+    return failures
+
+
+def _event_receiver_signature(process):
+    if not isinstance(process, Synapse):
+        return None
+    return (
+        _configuration_signature(getattr(process, "_continuous_inputs", ())),
+        _configuration_signature(getattr(process, "_continuous_input_old", {})),
+        tuple(
+            (name, _effective_hook_identity(process, name))
+            for name in (*_RECEIVE_ADAPTER_NAMES, "net_receive_values")
+        ),
+        (
+            _initialization_callable_contract_signature(
+                process.net_receive_values,
+                label=f"{process.name}.net_receive_values",
+                owner=process,
+                strict=False,
+                forbidden_receiver_attributes=frozenset(process._assigned)
+                | {"_buffers", "_runtime_value_frame"},
+            )
+            if "net_receive_values" not in process.__dict__
+            and inspect.isfunction(
+                inspect.getattr_static(type(process), "net_receive_values")
+            )
+            else ("unsupported-receive-hook",)
+        ),
+    )
+
+
+def _continuous_receiver_failures(process):
+    if not isinstance(process, ContinuousSynapse):
+        return ["target is not a ContinuousSynapse"]
+    failures = []
+    changed = [
+        name
+        for name, standard in _STANDARD_CONTINUOUS_RECEIVE_ADAPTERS.items()
+        if name in process.__dict__
+        or inspect.getattr_static(type(process), name) is not standard
+    ]
+    if changed:
+        failures.append(
+            f"replaces canonical continuous adapters {changed}; implement "
+            "continuous_receive_values instead"
+        )
+    hook = inspect.getattr_static(type(process), "continuous_receive_values")
+    if "continuous_receive_values" in process.__dict__ or not inspect.isfunction(hook):
+        failures.append("continuous_receive_values must be a pure subclass method")
+    else:
+        try:
+            if current_check_purity():
+                _initialization_callable_dependency_signature(
+                    process.continuous_receive_values,
+                    label=f"{process.name}.continuous_receive_values",
+                    owner=process,
+                    strict=True,
+                    forbidden_receiver_attributes=frozenset(process._assigned)
+                    | {
+                        "_buffers",
+                        "_runtime_value_frame",
+                        "_continuous_received_masks",
+                        "_continuous_reset_count",
+                    },
+                )
+        except FunctionalizationError as exc:
+            failures.append(str(exc))
+    return failures
+
+
+def _continuous_receiver_signature(process):
+    if not isinstance(process, ContinuousSynapse):
+        return None
+    return (
+        _configuration_signature(process._continuous_inputs),
+        _configuration_signature(process._continuous_input_old),
+        tuple(
+            (name, _effective_hook_identity(process, name))
+            for name in (
+                *_CONTINUOUS_RECEIVE_ADAPTER_NAMES,
+                "continuous_receive_values",
+            )
+        ),
+        _initialization_callable_contract_signature(
+            process.continuous_receive_values,
+            label=f"{process.name}.continuous_receive_values",
+            owner=process,
+            strict=False,
+            forbidden_receiver_attributes=frozenset(process._assigned)
+            | {
+                "_buffers",
+                "_runtime_value_frame",
+                "_continuous_received_masks",
+                "_continuous_reset_count",
+            },
+        )
+        if "continuous_receive_values" not in process.__dict__
+        and inspect.isfunction(
+            inspect.getattr_static(type(process), "continuous_receive_values")
+        )
+        else ("unsupported-continuous-receive-hook",),
+    )
+
+
+def _state_external_input_signature(state, mechanism):
+    """Describe implicit external State inputs without evaluating getters.
+
+    State runtime frames have no explicit lowering contract for these external
+    references. In contrast to the framework-owned Mechanism clock, a nested
+    State reference can otherwise silently retain another live model's tensors.
+    Registered tensors reside in the module's parameter/buffer dictionaries.
+    The handler also binds declared state/shared-field aliases directly on
+    nested States; those already belong to the explicit runtime frame. Any
+    other tensor stored on the instance would instead be frozen by cloning.
+    """
+    instance_values = vars(state)
+    explicit_names = set(state._state) | set(mechanism._runtime_shared_local_names())
+    effective = {}
+    for cls in type(state).__mro__:
+        for name, descriptor in vars(cls).items():
+            effective.setdefault(name, descriptor)
+    entries = [
+        (name, "setreference", id(descriptor), id(descriptor.func))
+        for name, descriptor in effective.items()
+        if isinstance(descriptor, staticproperty) and name not in instance_values
+    ]
+    entries.extend(
+        (
+            name,
+            "unregistered-tensor",
+            id(value),
+            _shape_tuple(value),
+            str(value.dtype),
+            str(value.device),
+            str(value.layout),
+        )
+        for name, value in instance_values.items()
+        if torch.is_tensor(value) and name not in explicit_names
+    )
+    return tuple(sorted(entries))
+
+
+def _state_input_signature(state):
+    """Keep ephemeral inputs in the contract, outside parameter/runtime trees."""
+
+    return (
+        tuple(getattr(state, "_inputs", ())),
+        _configuration_signature(getattr(state, "_input_defaults", {})),
+        _effective_hook_identity(state, "_input_value_frame"),
+    )
+
+
+def _input_binding_signature(population):
+    handler = population.mech
+    sources = []
+    for plan in getattr(handler, "_input_binding_plan", ()):
+        if not isinstance(plan, tuple) or len(plan) != 10:
+            sources.append(("invalid-plan", _configuration_signature(plan)))
+            continue
+        source_name, state_name, field = plan[3:6]
+        if (
+            not isinstance(source_name, str)
+            or not isinstance(field, str)
+            or (state_name is not None and not isinstance(state_name, str))
+            or source_name not in handler.mechanisms
+        ):
+            sources.append(("invalid-source", _configuration_signature(plan)))
+            continue
+        source = handler.mechanisms[source_name]
+        if state_name is not None and state_name not in source.DE:
+            sources.append(("invalid-source-state", state_name))
+            continue
+        owner = source if state_name is None else source.DE[state_name]
+        descriptor = inspect.getattr_static(type(owner), field, None)
+        value = owner._buffers.get(field, owner._parameters.get(field))
+        sources.append(
+            (
+                source_name,
+                state_name,
+                field,
+                id(descriptor),
+                (
+                    _shape_tuple(value),
+                    value.dtype,
+                    value.device,
+                    value.layout,
+                )
+                if torch.is_tensor(value)
+                else ("missing-source-storage",),
+            )
+        )
+    return (
+        _configuration_signature(getattr(population, "_input_bindings", ())),
+        _configuration_signature(getattr(handler, "_input_bindings", ())),
+        _configuration_signature(getattr(handler, "_input_binding_plan", ())),
+        tuple(sources),
+    )
+
+
+def _input_binding_declarations(owner):
+    """Expose immutable literal paths to Dynamo's ordinary source guards."""
+
+    return tuple(
+        (binding.target, binding.source)
+        for binding in getattr(owner, "_input_bindings", ())
+    )
+
+
+def _input_binding_indices(population):
+    handler = population.mech
+    return tuple(
+        (name, value)
+        for name, value in handler._buffers.items()
+        if name.startswith("_input_binding_index_")
+    )
+
+
+def _input_binding_index_signature(population):
+    """Input placement is immutable; live provider values remain explicit leaves."""
+
+    return tuple(
+        (
+            name,
+            _immutable_source_tensor_binding(value)
+            if torch.is_tensor(value)
+            else ("invalid-index", type(value).__qualname__, id(value)),
+        )
+        for name, value in _input_binding_indices(population)
+    )
+
+
+def _validate_input_binding_indices(population, reference):
+    actual = dict(_input_binding_indices(population))
+    expected = dict(_input_binding_indices(reference))
+    if actual.keys() != expected.keys() or any(
+        not torch.is_tensor(actual[name])
+        or actual[name].dtype != value.dtype
+        or actual[name].device != value.device
+        or _shape_tuple(actual[name]) != _shape_tuple(value)
+        or not torch.equal(actual[name], value)
+        for name, value in expected.items()
+    ):
+        raise FunctionalizationError(
+            "Population input-binding placement does not match this functional "
+            "execution plan; rebuild and lower it again."
+        )
+
+
+def _input_binding_failures(population):
+    """Validate retained plans against declarations before any lowering work."""
+
+    handler = population.mech
+    bindings = getattr(population, "_input_bindings", ())
+    if bindings != getattr(handler, "_input_bindings", ()):
+        return [
+            "Population input-binding declarations differ from the built handler; "
+            "rebuild the Population before functionalization"
+        ]
+    if not bindings:
+        if getattr(handler, "_input_binding_plan", ()) or _input_binding_indices(
+            population
+        ):
+            return ["Population has input-binding storage without declarations"]
+        return []
+    try:
+        # Configuration retains only names/shapes/indices and does not evaluate
+        # source providers. Rebuild it on a disposable owner to detect a stale
+        # or manually edited plan without touching the live Population.
+        candidate = _deepcopy_execution_module(handler)
+        candidate.configure_input_bindings(bindings)
+        if candidate._input_binding_plan != handler._input_binding_plan:
+            return [
+                "Population input-binding plan differs from its declarations; "
+                "rebuild before functionalization"
+            ]
+        expected = {
+            name: value
+            for name, value in candidate._buffers.items()
+            if name.startswith("_input_binding_index_")
+        }
+        actual = dict(_input_binding_indices(population))
+        if actual.keys() != expected.keys() or any(
+            not torch.is_tensor(actual[name])
+            or actual[name].dtype != value.dtype
+            or actual[name].device != value.device
+            or _shape_tuple(actual[name]) != _shape_tuple(value)
+            or not torch.equal(actual[name], value)
+            for name, value in expected.items()
+        ):
+            return [
+                "Population input-binding indices differ from their declarations; "
+                "rebuild before functionalization"
+            ]
+    except (AttributeError, TypeError, ValueError, RuntimeError) as exc:
+        return [f"Population input-binding plan is invalid: {exc}"]
+    return []
+
+
+def _voltage_process_signature(process):
+    """Fingerprint reset behavior and helper dependencies, not live tensors."""
+
+    if not isinstance(process, VoltageProcess):
+        return None
+    return (
+        tuple(
+            (name, _effective_hook_identity(process, name))
+            for name in (*_STANDARD_VOLTAGE_FUNCTIONAL_ADAPTERS, "voltage_values")
+        ),
+        _initialization_callable_contract_signature(
+            process.voltage_values,
+            label=f"{process.name}.voltage_values",
+            owner=process,
+            strict=False,
+        ),
+    )
+
+
+def _voltage_process_plan_signature(handler):
+    """Retain the actual ordered support-local reset phase in source guards."""
+
+    return tuple(
+        (
+            process.name,
+            entry.support_id,
+            None if entry.spec is None else entry.spec.ordered_signature,
+        )
+        for process, entry in handler._voltage_process_support_plan
+    )
+
+
+def _install_voltage_process_audits(population):
+    """Audit authored resets inside, rather than around, the commit adapter.
+
+    Installed only on the disposable lowering probe. A returned State or CARRY
+    update is legal, but a write to that same slot inside the authored pure hook
+    is not. Whole-transition probes cannot distinguish those two operations.
+    """
+
+    def checked_hook(process, hook):
+        def evaluate(v, dt, values):
+            registered = _registered_tensor_bindings(process)
+            python_state = _transition_python_state_snapshot(process)
+            arguments = (v, dt, values)
+            argument_state = _audit_python_value_signature(arguments, set())
+            try:
+                return hook(v, dt, values)
+            finally:
+                if (
+                    _registered_tensor_bindings(process) != registered
+                    or _transition_python_state_snapshot(process) != python_state
+                    or _audit_python_value_signature(arguments, set()) != argument_state
+                ):
+                    raise FunctionalizationError(
+                        f"VoltageProcess {process.name!r}.voltage_values() mutated "
+                        "its module or read-only voltage, timestep, or values "
+                        "inputs. Return voltage and declared State/CARRY replacements "
+                        "without modifying inputs or self."
+                    )
+
+        return evaluate
+
+    for process in population.mech.voltage_processes.values():
+        process._voltage_schema_validated = False
+        process.voltage_values = checked_hook(process, process.voltage_values)
+
+
+def _install_state_input_audits(population):
+    """Verify ephemeral INPUTs are read-only inside each authored State hook.
+
+    A gather can allocate a fresh Tensor, and a provider may advance later in
+    the same step. Whole-transition input checks cannot detect either a write
+    to that gathered copy or a write hidden by a later provider replacement.
+    """
+
+    def checked_hook(label, names, hook):
+        def evaluate(*arguments, **keywords):
+            values = arguments[-1]
+            before = {name: _audit_tensor_binding(values[name]) for name in names}
+            try:
+                return hook(*arguments, **keywords)
+            finally:
+                changed = [
+                    name
+                    for name, binding in before.items()
+                    if name not in values
+                    or not torch.is_tensor(values[name])
+                    or _audit_tensor_binding(values[name]) != binding
+                ]
+                if changed:
+                    raise FunctionalizationError(
+                        f"State {label} mutated read-only INPUT fields {changed}; "
+                        "return declared state or carry updates without modifying "
+                        "the input values frame."
+                    )
+
+        return evaluate
+
+    for mechanism in population.mech.mechanisms.values():
+        for state_name, state in mechanism.DE.items():
+            if not state._inputs:
+                continue
+            for hook_name in ("assigned_values", "advance"):
+                setattr(
+                    state,
+                    hook_name,
+                    checked_hook(
+                        f"{mechanism.name}.{state_name}.{hook_name}()",
+                        state._inputs,
+                        getattr(state, hook_name),
+                    ),
+                )
+
+
+def _install_receiver_audit(process, hook_name):
+    """Observe a pure receiver before its returned updates are committed."""
+    hook = getattr(process, hook_name)
+
+    def evaluate(*args, **kwargs):
+        registered = _registered_tensor_bindings(process)
+        python_state = _transition_python_state_snapshot(process)
+        arguments = (args, kwargs)
+        argument_state = _audit_python_value_signature(arguments, set())
+        try:
+            return hook(*args, **kwargs)
+        finally:
+            if (
+                _registered_tensor_bindings(process) != registered
+                or _transition_python_state_snapshot(process) != python_state
+                or _audit_python_value_signature(arguments, set()) != argument_state
+            ):
+                raise FunctionalizationError(
+                    f"Synapse {process.name!r}.{hook_name}() mutated its "
+                    "module or read-only payload, timestep, or values inputs. "
+                    "Return declared event updates without modifying inputs or self."
+                )
+
+    setattr(process, hook_name, evaluate)
+
+
+def _material_process_failures(process, population=None):
+    """Admit shared pure protocols while retaining canonical scheduler adapters."""
+    contract = _material_process_contract(process)
+    if contract is None:
+        return [
+            "MaterialProcesses outside the admitted canonical families have "
+            "workspaces or update contracts that are not lowered yet"
+        ]
+    family = contract.family.__name__
+    if contract.family is MaterialProcess:
+        from ._custom_material_processes import (
+            custom_material_constant_slots,
+            custom_material_process_failures,
+        )
+
+        failures = custom_material_process_failures(process, population)
+        if failures:
+            return list(failures)
+        if population is not None:
+            from ._initialization_sources import (
+                initialization_source_runtime_buffer_ids,
+            )
+
+            runtime_buffers = initialization_source_runtime_buffer_ids(population)
+            aliases = tuple(
+                name
+                for name, value in custom_material_constant_slots(process)
+                if id(value) in runtime_buffers
+            )
+            if aliases:
+                return [
+                    f"Custom MaterialProcess config buffers {aliases} alias "
+                    "runtime state, geometry, or reconstructed parameters; "
+                    "use registered raw Parameters or independent config buffers"
+                ]
+    changed = (
+        []
+        if contract.family is MaterialProcess
+        else [
+            name
+            for name, standard in _STANDARD_MATERIAL_FUNCTIONAL_HOOKS[
+                contract.family
+            ].items()
+            if name in process.__dict__
+            or inspect.getattr_static(type(process), name) is not standard
+        ]
+    )
+    if changed:
+        return [f"{family} replaces canonical pure process hooks {changed}"]
+    resolver = getattr(process, "_material_resolver", None)
+    if getattr(resolver, "__func__", None) is not _STANDARD_MATERIAL_RESOLVER or (
+        population is not None
+        and (
+            getattr(resolver, "__self__", None) is not population.mech
+            or "_get_material" in population.mech.__dict__
+            or inspect.getattr_static(type(population.mech), "_get_material")
+            is not _STANDARD_MATERIAL_RESOLVER
+        )
+    ):
+        return [f"{family} requires its owning MechanismHandler material resolver"]
+    if contract.spatial:
+        if (
+            population is not None
+            and getattr(process, "_mp_population", None) is not population
+        ):
+            return [f"{family} requires its owning Population geometry registry"]
+        if (
+            process._diffusion_geometry_kind == "tree"
+            and process._diffusion_geometry_name is None
+            and "_mp_diff_geom_um" not in process._buffers
+        ):
+            return [
+                "Tree diffusion requires a registered live diff_geom_um "
+                "geometry tensor, not graph-only numerical coefficients"
+            ]
+        if population is not None:
+            for name in ("diff_parent_index", "diff_edge_parent", "diff_edge_child"):
+                cached = process._buffers.get(f"_mp_{name}")
+                current = population._buffers.get(name)
+                if torch.is_tensor(cached) and (
+                    not torch.is_tensor(current) or not torch.equal(cached, current)
+                ):
+                    return [
+                        "Diffusion topology changed after binding; reinitialize "
+                        "the Population before functional lowering"
+                    ]
+        for operator in process._spatial_operators.values():
+            standards = _STANDARD_MATERIAL_SPATIAL_HOOKS.get(type(operator))
+            if standards is None or any(
+                name in operator.__dict__
+                or inspect.getattr_static(type(operator), name) is not standard
+                for name, standard in (standards or {}).items()
+            ):
+                return [f"{family} requires canonical spatial operator hooks"]
+    if population is not None:
+        for _buffer_name, source_name in _material_process_geometry_sources(process):
+            if source_name not in {
+                "dx",
+                "area",
+                "canonical_area_cm2",
+                "component_area",
+            } and source_name not in (
+                population._buffers.keys() | population._parameters.keys()
+            ):
+                return [
+                    f"{family} geometry {source_name!r} must be a directly "
+                    "registered population buffer or Parameter"
+                ]
+    if contract.family is not MaterialProcess and not getattr(
+        process, f"_{contract.prefix}_material_plan", ()
+    ):
+        return [f"{family} is missing its configured material field plan"]
+    return []
+
+
+def _material_process_signature(process, handler):
+    contract = _material_process_contract(process)
+    if contract is None:
+        return None
+    if contract.family is MaterialProcess:
+        from ._custom_material_processes import custom_material_process_signature
+
+        return (
+            custom_material_process_signature(process),
+            tuple(
+                (
+                    name,
+                    _material_configuration_signature(
+                        getattr(type(process), name, None)
+                    ),
+                )
+                for name in (
+                    "_material_process_phase",
+                    "_material_process_method",
+                    "_material_process_method_kwargs",
+                    "_material_process_component",
+                )
+            ),
+            getattr(process, "_mp_component_shape", None),
+            tuple(sorted(getattr(process, "_mp_material_support_names", {}).items())),
+            (
+                getattr(process._material_resolver, "__self__", None) is handler,
+                id(
+                    getattr(
+                        process._material_resolver,
+                        "__func__",
+                        process._material_resolver,
+                    )
+                ),
+                _effective_hook_identity(handler, "_get_material"),
+            ),
+        )
+    return (
+        contract.family,
+        tuple(
+            (name, _material_configuration_signature(getattr(type(process), name, ())))
+            for name in contract.declarations
+        ),
+        (
+            tuple(
+                (
+                    name,
+                    type(operator),
+                    tuple(
+                        (
+                            option,
+                            _configuration_signature(getattr(operator, option, None)),
+                        )
+                        for option in (
+                            "solver",
+                            "boundary",
+                            "interface_scheme",
+                            "threads",
+                        )
+                    ),
+                    tuple(
+                        (hook, _effective_hook_identity(operator, hook))
+                        for hook in _STANDARD_MATERIAL_SPATIAL_HOOKS.get(
+                            type(operator), {}
+                        )
+                    ),
+                )
+                for name, operator in process._spatial_operators.items()
+            )
+            if contract.spatial
+            else ()
+        ),
+        (
+            tuple(
+                (
+                    name,
+                    _material_configuration_signature(
+                        getattr(
+                            getattr(process, "_mp_population", None), "_buffers", {}
+                        ).get(name)
+                    ),
+                )
+                for name in ("diff_parent_index", "diff_edge_parent", "diff_edge_child")
+            )
+            if contract.spatial
+            else ()
+        ),
+        tuple(
+            (name, _material_configuration_signature(getattr(process, name, None)))
+            for name in contract.configuration
+        ),
+        _configuration_signature(
+            getattr(type(process), "_material_process_method_kwargs", {})
+        ),
+        getattr(type(process), "_material_process_method", None),
+        getattr(type(process), "_material_process_phase", None),
+        getattr(type(process), "_material_process_component", None),
+        getattr(process, "_mp_component_shape", None),
+        tuple(sorted(getattr(process, "_mp_material_support_names", {}).items())),
+        (
+            getattr(process._material_resolver, "__self__", None) is handler,
+            id(
+                getattr(
+                    process._material_resolver, "__func__", process._material_resolver
+                )
+            ),
+            _effective_hook_identity(handler, "_get_material"),
+            (
+                getattr(getattr(process, "_mp_population", None), "mech", None)
+                is handler
+                if contract.spatial
+                else None
+            ),
+        ),
+        tuple(
+            (name, _effective_hook_identity(process, name))
+            for name in _STANDARD_MATERIAL_FUNCTIONAL_HOOKS[contract.family]
+        ),
+    )
+
+
+def _material_configuration_signature(value):
+    """Fingerprint declarations, including complete tensor literal contents."""
+    if torch.is_tensor(value):
+        # These are resident source declarations/topology, not differentiable
+        # invocation inputs. An ambient grad/vmap transform would otherwise
+        # wrap the temporary byte-copy tensors created by the hash and make
+        # their NumPy storage unreadable. Isolate only this metadata read;
+        # numerical preparation and all explicit inputs stay transformed.
+        if torch._C._functorch.is_functorch_wrapped_tensor(value):
+            raise FunctionalizationError(
+                "Material process configuration/topology must be lowered "
+                "outside torch.func transforms; pass numerical coefficients "
+                "as the resulting plan's explicit tensor inputs"
+            )
+        with torch._C._DisableFuncTorch():
+            digest = _audit_tensor_digest(value)
+        return (
+            "tensor",
+            tuple(value.shape),
+            value.dtype,
+            str(value.device),
+            digest,
+        )
+    if is_dataclass(value) and not isinstance(value, type):
+        return (
+            type(value),
+            tuple(
+                (
+                    field.name,
+                    _material_configuration_signature(getattr(value, field.name)),
+                )
+                for field in dataclass_fields(value)
+            ),
+        )
+    if isinstance(value, Mapping):
+        return tuple(
+            sorted(
+                (str(key), _material_configuration_signature(item))
+                for key, item in value.items()
+            )
+        )
+    if isinstance(value, (tuple, list)):
+        return (
+            type(value),
+            tuple(_material_configuration_signature(item) for item in value),
+        )
+    return _configuration_signature(value)
+
+
+def _material_fields(population, process):
+    return {
+        key: population.mech._get_material(key[0])._buffers[key[1]]
+        for key in process.material_fields
+    }
+
+
+def _material_process_operand_references(process):
+    """Registered numerical/mask dependencies, independent of module aliases."""
+    for name in (
+        "_mp_process_index",
+        "_mp_process_mask",
+        "_mp_component_index",
+        "_mp_component_edge_index",
+        "_mp__material_analytic_geometry",
+        *getattr(process, "_mp_material_support_names", {}).values(),
+    ):
+        if name in process._buffers:
+            yield "buffer", name
+    if isinstance(process, ClearanceProcess):
+        for _key, *references in process._clearance_material_plan:
+            yield from references
+    elif isinstance(process, ClampProcess):
+        for _key, _mode, references, mask_name in process._clamp_material_plan:
+            yield from references
+            if mask_name is not None:
+                yield "buffer", mask_name
+    elif isinstance(process, ExchangeProcess):
+        for (
+            _a,
+            _b,
+            kinetic,
+            _conductance,
+            volume_a,
+            volume_b,
+            *_domains,
+        ) in process._exchange_material_plan:
+            yield kinetic
+            yield volume_a
+            yield volume_b
+    elif isinstance(process, DiffusionProcess):
+        yield from process._diffusion_fraction_refs
+        for (
+            _operator,
+            _key,
+            diffusion,
+            _domain,
+            _location,
+            relaxations,
+        ) in process._diffusion_material_plan:
+            yield diffusion
+            for rate, target, where in relaxations:
+                yield rate
+                yield target
+                if where is not None:
+                    yield where
+
+
+def _material_process_geometry_sources(process):
+    """Numerical population dependencies declared by a canonical process."""
+    contract = _material_process_contract(process)
+    if contract is None:
+        return ()
+    return getattr(process, f"_{contract.prefix}_geometry_sources", ())
+
+
+def _prepared_material_advance(self, dt):
+    """Private adapter: returned replacements publish only to explicit carry."""
+    if self.runtime_noises:
+        # Pointwise/custom processes consume this step's NOISE. Diffusion uses
+        # the realization held at its native timestep-configuration boundary.
+        # Reusing pure preparation retains derivatives of other coefficients
+        # and geometry without changing that stochastic timing.
+        fields = {
+            key: self._get_material(key[0])._buffers[key[1]]
+            for key in self.material_fields
+        }
+        current_noise = {}
+        for suffix, slot in getattr(self, "_functional_material_workspace_slots", ()):
+            if suffix.startswith("noise."):
+                name = suffix.removeprefix("noise.")
+                current_noise[name] = self._buffers[name]
+                self._buffers[name] = self._buffers[slot]
+        try:
+            prepared = self.prepare_materials(fields, dt)
+        finally:
+            self._buffers.update(current_noise)
+        leaves, tree_spec = torch.utils._pytree.tree_flatten(prepared)
+        if tree_spec != self._functional_material_tree_spec or any(
+            not torch.is_tensor(value)
+            or (_shape_tuple(value), value.dtype, value.device) != schema
+            for value, schema in zip(
+                leaves, self._functional_material_prepared_schema, strict=True
+            )
+        ):
+            raise FunctionalizationError(
+                "Material preparation changed its tensor schema"
+            )
+        if isinstance(self, DiffusionProcess):
+            for slot, value in zip(
+                self._functional_material_slots, leaves, strict=True
+            ):
+                self._buffers[slot] = value
+    else:
+        values = tuple(self._buffers[name] for name in self._functional_material_slots)
+        prepared = torch.utils._pytree.tree_unflatten(
+            values, self._functional_material_tree_spec
+        )
+    MaterialProcess.advance_materials(self, dt, prepared=prepared)
+
+
+def _preserve_material_spatial_plan(self, population=None):
+    """Rebind a private clone without discarding its static solver topology."""
+    operators = self._spatial_operators
+    configured = self._spatial_configured
+    DiffusionProcess.configure_process(self, population)
+    self._spatial_operators = operators
+    self._spatial_configured = configured
+
+
+def _retain_material_spatial_plan_at_initialization(self):
+    # The handler resets the process clock. Numeric timestep/geometry data
+    # comes exclusively from explicit preparation, not these solver templates.
+    return None
+
+
+def _install_material_preparation(population, dt, *, custom_plans=None):
+    """Give the private transition fixed tensor slots for pure process outputs."""
+    from ._material_stochasticity import (
+        bind_stochastic_diffusion_workspaces,
+        stochastic_diffusion_workspace_bindings,
+    )
+
+    stochastic_bindings = stochastic_diffusion_workspace_bindings(population)
+    retained_workspaces = {
+        prepared: _clone_tensor(_buffer_at(population, *native.rsplit(".", 1)))
+        for prepared, native in stochastic_bindings.items()
+    }
+    for process_name, process in population.mech.material_processes.items():
+        contract = _material_process_contract(process)
+        if contract.family is MaterialProcess:
+            custom_plans[process_name].configure_execution(process)
+        if contract.spatial:
+            for operator in process._spatial_operators.values():
+                if process._diffusion_method == "explicit":
+                    if isinstance(operator, SpatialOperatorTree):
+                        operator.validate_explicit()
+                    operator._solve = None
+                else:
+                    try:
+                        operator._solve = operator._functional_solver()
+                    except RuntimeError as exc:
+                        raise FunctionalizationError(str(exc)) from exc
+            process.configure_process = types.MethodType(
+                _preserve_material_spatial_plan, process
+            )
+            process._reset_initialization_timestep = types.MethodType(
+                _retain_material_spatial_plan_at_initialization, process
+            )
+        for buffer_name, source_name in _material_process_geometry_sources(process):
+            if source_name in {"area", "canonical_area_cm2", "component_area"}:
+                # Freeze one logical frame for compact canonical geometry and
+                # explicitly batched packed components alike. This affects
+                # only the private lowering clone, not imperative storage.
+                process._buffers[buffer_name] = torch.broadcast_to(
+                    process._buffers[buffer_name], population.shape
+                )
+        fields = _material_fields(population, process)
+        values = process.prepare_materials(fields, dt)
+        leaves, tree_spec = torch.utils._pytree.tree_flatten(values)
+        if (
+            (not leaves and contract.family is not MaterialProcess)
+            or values is None
+            or not all(torch.is_tensor(value) for value in leaves)
+        ):
+            raise FunctionalizationError(
+                "Material preparation must be a tensor-only PyTree"
+            )
+        slots = tuple(
+            f"_functional_material_prepared_{index}" for index in range(len(leaves))
+        )
+        for name, value in zip(slots, leaves, strict=True):
+            process.register_buffer(name, _clone_tensor(value), persistent=False)
+        process._functional_material_slots = slots
+        process._functional_material_tree_spec = tree_spec
+        process._functional_material_prepared_schema = tuple(
+            (_shape_tuple(value), value.dtype, value.device) for value in leaves
+        )
+        # Canonical pointwise families use full-field arithmetic, so singleton
+        # axes avoid the empty-vmap scalar/spatial broadcast limitation. Custom
+        # workspace leaves retain their authored ranks: reducing one dimension
+        # of a vector must not become a reduction of a padded matrix instead.
+        visible_rank = (
+            0
+            if contract.family is MaterialProcess
+            else 2
+            if contract.spatial
+            else max(value.ndim for value in fields.values())
+        )
+        process._functional_material_visible_ranks = {
+            name: visible_rank for name in slots
+        }
+        process.advance_materials = types.MethodType(
+            _prepared_material_advance, process
+        )
+        if contract.spatial:
+            # Keep only immutable topology in private solver templates. This
+            # also prevents an accidental hidden read of configure-time floats
+            # and avoids cloning a second, unused numerical workspace.
+            for operator in process._spatial_operators.values():
+                topology = getattr(operator, "_FUNCTIONAL_TOPOLOGY_BUFFERS", ())
+                for name in tuple(operator._buffers):
+                    if name not in topology:
+                        del operator._buffers[name]
+    bind_stochastic_diffusion_workspaces(population, stochastic_bindings)
+    for path, value in retained_workspaces.items():
+        _set_buffer(population, *path.rsplit(".", 1), value)
+
+
 def _timestep_buffer_shape_specs(module) -> tuple[tuple[str, object], ...]:
     """Return the authored canonical-shape contract for each timestep buffer."""
 
@@ -1442,75 +3468,80 @@ def _derived_handler_keys(handler) -> set[str]:
 def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
     """Map checkpoint inventory keys to the public functional state tree."""
     keys = {}
+    from dendra.models.mechanisms._noise_workspaces import noise_workspace_slots
+
+    for collection_name in ("mechanisms", "material_processes"):
+        for mechanism_name, mechanism in getattr(handler, collection_name).items():
+            owners = (
+                ("", mechanism),
+                *((f"DE.{name}.", owner) for name, owner in mechanism.DE.items()),
+            )
+            for relative, owner in owners:
+                path = f"integrator.mech.{collection_name}.{mechanism_name}"
+                if relative:
+                    path += f".{relative.rstrip('.')}"
+                for suffix, _slot_owner, _name in noise_workspace_slots(owner):
+                    keys[
+                        f"{mechanism_name}.{relative}"
+                        f"__dendra_stochastic_state__.noise_workspace.{suffix}"
+                    ] = ("noise_workspaces", path, suffix)
+    from ._mechanism_delays import mechanism_delay_state_slots
+
+    def add_declared_keys(name, module, state_group, buffer_group, state_buffer_group):
+        for block in functional_module_blocks(module, name):
+            if isinstance(block, _DelayedStateBoundary):
+                for buffer_name, _value in mechanism_delay_state_slots(module):
+                    keys.setdefault(
+                        f"{name}.{buffer_name}",
+                        (buffer_group, name, buffer_name),
+                    )
+                continue
+            for slot in block.slots:
+                if block.role == "state":
+                    path = (state_group, name, slot.name)
+                elif block.role == "state_carry":
+                    path = (state_buffer_group, name, block.state_key, slot.name)
+                else:
+                    path = (buffer_group, name, slot.name)
+                keys[f"{name}.{slot.checkpoint_suffix}"] = path
+
     for mechanism_name, mechanism in handler.mechanisms.items():
-        for state in mechanism.DE.values():
-            for state_name in sorted(state._state):
-                keys[f"{mechanism_name}.{state_name}"] = (
-                    "mechanisms",
-                    mechanism_name,
-                    state_name,
-                )
-        for buffer_name in sorted(mechanism._carry):
-            keys[f"{mechanism_name}.{buffer_name}"] = (
-                "mechanism_buffers",
-                mechanism_name,
-                buffer_name,
-            )
-        for saved_name in sorted(mechanism._save):
-            buffer_name = f"{saved_name}_"
-            keys[f"{mechanism_name}.{buffer_name}"] = (
-                "mechanism_buffers",
-                mechanism_name,
-                buffer_name,
-            )
-        for state_name, state in mechanism.DE.items():
-            for buffer_name in sorted(state._carry):
-                keys[f"{mechanism_name}.DE.{state_name}.{buffer_name}"] = (
-                    "state_buffers",
-                    mechanism_name,
-                    state_name,
-                    buffer_name,
-                )
+        add_declared_keys(
+            mechanism_name,
+            mechanism,
+            "mechanisms",
+            "mechanism_buffers",
+            "state_buffers",
+        )
 
     for process_name, process in handler.material_processes.items():
-        for state in process.DE.values():
-            for state_name in sorted(state._state):
-                keys[f"{process_name}.{state_name}"] = (
-                    "material_processes",
-                    process_name,
-                    state_name,
-                )
-        for buffer_name in sorted(process._carry):
-            keys[f"{process_name}.{buffer_name}"] = (
-                "material_process_buffers",
-                process_name,
-                buffer_name,
-            )
-        for saved_name in sorted(process._save):
-            buffer_name = f"{saved_name}_"
-            keys[f"{process_name}.{buffer_name}"] = (
-                "material_process_buffers",
-                process_name,
-                buffer_name,
-            )
-        for state_name, state in process.DE.items():
-            for buffer_name in sorted(state._carry):
-                keys[f"{process_name}.DE.{state_name}.{buffer_name}"] = (
-                    "material_process_state_buffers",
-                    process_name,
-                    state_name,
-                    buffer_name,
-                )
+        from dendra.models.mechanisms._material_stochasticity import (
+            stochastic_material_workspace_slots,
+        )
+
+        for suffix, _owner, _name in stochastic_material_workspace_slots(process):
+            keys[
+                f"{process_name}.__dendra_stochastic_state__.material_workspace.{suffix}"
+            ] = ("material_preparation", process_name, suffix)
+        add_declared_keys(
+            process_name,
+            process,
+            "material_processes",
+            "material_process_buffers",
+            "material_process_state_buffers",
+        )
 
     for ion_name, ion in handler.ions.items():
-        for field in ion.fields:
-            keys[f"{ion_name}_ion.{field}"] = ("ions", ion_name, field)
+        for slot in shared_field_slots(ion, f"{ion_name}_ion", ion.fields):
+            keys[slot.checkpoint_suffix] = ("ions", ion_name, slot.name)
     for material_name, material in handler.materials.items():
-        for field in material.fields:
-            keys[f"{material_name}_material.{field}"] = (
+        for slot in shared_field_slots(
+            material, f"{material_name}_material", material.fields
+        ):
+            keys[slot.checkpoint_suffix] = (
                 "materials",
                 material_name,
-                field,
+                slot.name,
             )
     for checkpoint_key, public_path in _persistent_shared_local_keys(handler).items():
         keys.setdefault(checkpoint_key, public_path)
@@ -1519,48 +3550,47 @@ def _canonical_handler_keys(handler) -> dict[str, tuple[str, ...]]:
 
 def _local_synchronization_keys(handler) -> set[str]:
     """Return transient local mirrors reconstructed from canonical carry."""
-    keys = set()
-    for ion_map in handler.read_ion.values():
-        for mechanism_name, fields in ion_map.items():
-            keys.update(f"{mechanism_name}.{field}" for field in fields)
-    for material_map in handler.read_material.values():
-        for mechanism_name, fields in material_map.items():
-            keys.update(f"{mechanism_name}.{field}" for field in fields)
-    return keys
+    return {binding.checkpoint_key for binding in read_local_bindings(handler)}
 
 
 def _persistent_shared_local_keys(handler) -> dict[str, tuple[str, ...]]:
     """Classify write/source locals that are not rebound from shared fields."""
     transient = _local_synchronization_keys(handler)
     keys = {}
-    for ion_map in handler.write_ion_c.values():
-        for mechanism_name, fields in ion_map.items():
-            for field in fields:
-                checkpoint_key = f"{mechanism_name}.{field}"
-                if checkpoint_key not in transient:
-                    keys.setdefault(
-                        checkpoint_key,
-                        ("ion_write_buffers", mechanism_name, field),
-                    )
-    for material_map in handler.write_material.values():
-        for mechanism_name, fields in material_map.items():
-            for field in fields:
-                checkpoint_key = f"{mechanism_name}.{field}"
-                if checkpoint_key not in transient:
-                    keys.setdefault(
-                        checkpoint_key,
-                        ("material_write_buffers", mechanism_name, field),
-                    )
-    for material_map in handler.source_material.values():
-        for mechanism_name, field_map in material_map.items():
-            for local_name in field_map.values():
-                checkpoint_key = f"{mechanism_name}.{local_name}"
-                if checkpoint_key not in transient:
-                    keys.setdefault(
-                        checkpoint_key,
-                        ("material_source_buffers", mechanism_name, local_name),
-                    )
+    for mapping_name, group, bindings in (
+        ("write_ion_c", "ion_write_buffers", local_field_bindings),
+        ("write_material", "material_write_buffers", local_field_bindings),
+        ("source_material", "material_source_buffers", local_source_bindings),
+    ):
+        for binding in bindings(getattr(handler, mapping_name).values()):
+            if binding.checkpoint_key not in transient:
+                keys.setdefault(
+                    binding.checkpoint_key,
+                    (group, binding.mechanism_name, binding.name),
+                )
     return keys
+
+
+def _functional_voltage_state_names(integrator):
+    """Separate functional carry from an integrator's solved voltage unknowns.
+
+    ``scnv`` solves no voltage unknowns, but its exposed voltage still belongs
+    to recording, continuation, initialization transforms, and commit. Other
+    integrators retain their existing ``v_vars`` state declaration.
+    """
+    declared = getattr(integrator, "_FUNCTIONAL_STATE_NAMES", None)
+    names = tuple(integrator.v_vars) if declared is None else declared
+    if (
+        type(names) is not tuple
+        or not names
+        or any(type(name) is not str or not name for name in names)
+        or len(names) != len(set(names))
+    ):
+        raise FunctionalizationError(
+            "Integrator v_vars or functional state names must declare unique "
+            "Population tensor-state names."
+        )
+    return names
 
 
 def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
@@ -1571,11 +3601,27 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
     for checkpoint_key, owner, buffer_name in handler._mutable_state_bindings():
         bindings.setdefault(checkpoint_key, []).append((owner, buffer_name))
 
+    from ._mechanism_delays import mechanism_delay_constant_slots
+
+    delay_constant_keys = {
+        f"{name}.{buffer_name}"
+        for collection in (handler.mechanisms, handler.material_processes)
+        for name, owner in collection.items()
+        for buffer_name, _value in mechanism_delay_constant_slots(owner)
+    }
+
     unclassified = (
         set(bindings)
         - set(expected)
         - _local_synchronization_keys(handler)
         - _derived_handler_keys(handler)
+        - delay_constant_keys
+        - {
+            key
+            for key in bindings
+            if ".__dendra_stochastic_state__.random_parameter." in key
+            or ".__dendra_stochastic_state__.runtime_noise." in key
+        }
     )
     if unclassified:
         raise FunctionalizationError(
@@ -1590,13 +3636,15 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
         # first registered path so functional_call receives the same canonical
         # names as named_parameters()/named_buffers().
         module_paths.setdefault(id(module), name)
-    integrator_state_names = tuple(population.integrator.v_vars)
-    if not integrator_state_names or len(integrator_state_names) != len(
-        set(integrator_state_names)
-    ):
-        raise FunctionalizationError(
-            "Integrator v_vars must declare unique Population tensor-state names."
-        )
+    voltage_state_names = _functional_voltage_state_names(population.integrator)
+    # Net transmembrane current is an optional accepted-step observable, not a
+    # voltage unknown. Carry it explicitly so recording, checkpoint/restart,
+    # and committing an already-advanced model preserve the imperative value.
+    # Leaving it out entirely when disabled keeps the ordinary voltage-only
+    # transition and compiled carry schema unchanged.
+    integrator_state_names = voltage_state_names + (
+        ("i_membrane",) if population.integrator.imem else ()
+    )
     leaves = []
     for state_name in integrator_state_names:
         value = getattr(population, state_name, None)
@@ -1654,6 +3702,24 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
             )
         )
 
+    for owner_path, owner in _parameterized_owner_paths(population):
+        for noise_name in owner.runtime_noises:
+            value = owner._buffers[noise_name]
+            leaves.append(
+                _StateLeaf(
+                    public_path=(
+                        "runtime_noise",
+                        f"{owner_path + '.' if owner_path else ''}{noise_name}",
+                    ),
+                    module_path=owner_path,
+                    buffer_name=noise_name,
+                    mapping_slots=((owner_path, noise_name),),
+                    checkpoint_key=None,
+                    shape=_shape_tuple(value),
+                    dtype=value.dtype,
+                    device=value.device,
+                )
+            )
     leaves.extend(
         (
             _StateLeaf(
@@ -1681,14 +3747,24 @@ def _state_layout(population: Population) -> tuple[_StateLeaf, ...]:
     return tuple(leaves)
 
 
+def _tensor_tree_paths(tree, prefix=()):
+    for name, value in tree.items():
+        if torch.is_tensor(value):
+            yield (*prefix, name), value
+        else:
+            yield from _tensor_tree_paths(value, (*prefix, name))
+
+
 def _state_layout_signature(layout: tuple[_StateLeaf, ...]) -> tuple:
     """Return the immutable public/runtime binding contract for carry state."""
     return tuple(
         (
             leaf.public_path,
-            leaf.module_path,
-            leaf.buffer_name,
-            leaf.mapping_slots,
+            None if leaf.public_path[0] == "material_preparation" else leaf.module_path,
+            None if leaf.public_path[0] == "material_preparation" else leaf.buffer_name,
+            None
+            if leaf.public_path[0] == "material_preparation"
+            else leaf.mapping_slots,
             leaf.checkpoint_key,
             leaf.shape,
             leaf.dtype,
@@ -1808,7 +3884,7 @@ def _initialization_transform_signature(population: Population) -> tuple:
                     ),
                     type(action.transform).__module__,
                     type(action.transform).__qualname__,
-                    _initialization_callable_dependency_signature(
+                    _initialization_callable_contract_signature(
                         action.transform.forward,
                         label=f"{phase} initialization transform {action.name}",
                         owner=action.transform,
@@ -1846,10 +3922,38 @@ def _declared_parameter_names(module) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _append_registered_prepared_constants(
+    population, eligible_ids, seen, parameter_ids, destination
+):
+    for module_path, module in population.named_modules():
+        for name, buffer in module._buffers.items():
+            if (
+                buffer is None
+                or id(buffer) not in eligible_ids
+                or id(buffer) in seen
+                or id(buffer) in parameter_ids
+            ):
+                continue
+            seen.add(id(buffer))
+            destination.append(
+                _PreparedBuffer(
+                    f"{module_path}.{name}",
+                    module_path,
+                    name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "constant",
+                )
+            )
+
+
 def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ...]:
     effective = []
     derived = []
     timestep = []
+    material = []
+    tables = []
     for module_path in _parameterized_module_paths(population):
         module = _module_at(population, module_path)
         for name in _declared_parameter_names(module):
@@ -1865,6 +3969,34 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     dtype=buffer.dtype,
                     device=buffer.device,
                     kind="effective_parameter",
+                )
+            )
+        registry = module._modules.get("parametrizations")
+        if registry is not None:
+            for name in registry:
+                value = getattr(module, name)
+                effective.append(
+                    _PreparedBuffer(
+                        f"{module_path}.{name}",
+                        module_path,
+                        name,
+                        _shape_tuple(value),
+                        value.dtype,
+                        value.device,
+                        "torch_parameter",
+                    )
+                )
+        for name in module.random_parameters:
+            buffer = module._buffers[name]
+            effective.append(
+                _PreparedBuffer(
+                    f"{module_path}.{name}",
+                    module_path,
+                    name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "random_parameter",
                 )
             )
         for name in _derived_buffer_names(module):
@@ -1893,7 +4025,109 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                     kind="timestep",
                 )
             )
-    return tuple((*effective, *derived, *timestep))
+        for name in getattr(module, "_functional_material_slots", ()):
+            buffer = module._buffers[name]
+            material.append(
+                _PreparedBuffer(
+                    key=f"{module_path}.{name}",
+                    module_path=module_path,
+                    buffer_name=name,
+                    shape=_shape_tuple(buffer),
+                    dtype=buffer.dtype,
+                    device=buffer.device,
+                    kind="material_process",
+                )
+            )
+    from ._tables import table_owners
+
+    table_ids = {id(table) for _path, _owner, _name, table in table_owners(population)}
+    parameter_ids = {id(value) for value in population.parameters()}
+    seen = set()
+    for module_path, module in population.named_modules():
+        if id(module) not in table_ids:
+            continue
+        for name, buffer in module._buffers.items():
+            if buffer is None or id(buffer) in seen or id(buffer) in parameter_ids:
+                continue
+            seen.add(id(buffer))
+            tables.append(
+                _PreparedBuffer(
+                    key=f"{module_path}.{name}",
+                    module_path=module_path,
+                    buffer_name=name,
+                    shape=_shape_tuple(buffer),
+                    dtype=buffer.dtype,
+                    device=buffer.device,
+                    kind="constant",
+                )
+            )
+    from ._custom_material_processes import custom_material_constant_slots
+    from ._mechanism_delays import mechanism_delay_constant_slots
+    from ._mechanism_injections import mechanism_injection_constant_slots
+
+    for module_path, owner in _parameterized_owner_paths(population):
+        for name, buffer in mechanism_delay_constant_slots(owner):
+            if id(buffer) in seen:
+                continue
+            seen.add(id(buffer))
+            tables.append(
+                _PreparedBuffer(
+                    f"{module_path}.{name}",
+                    module_path,
+                    name,
+                    _shape_tuple(buffer),
+                    buffer.dtype,
+                    buffer.device,
+                    "constant",
+                )
+            )
+        for constant_slots in (
+            mechanism_injection_constant_slots,
+            custom_material_constant_slots,
+        ):
+            for relative_path, buffer in constant_slots(owner):
+                if id(buffer) in seen or id(buffer) in parameter_ids:
+                    continue
+                seen.add(id(buffer))
+                prefix, _separator, buffer_name = relative_path.rpartition(".")
+                path = f"{module_path}.{prefix}" if prefix else module_path
+                tables.append(
+                    _PreparedBuffer(
+                        f"{module_path}.{relative_path}",
+                        path,
+                        buffer_name,
+                        _shape_tuple(buffer),
+                        buffer.dtype,
+                        buffer.device,
+                        "constant",
+                    )
+                )
+    from ._initialization_sources import (
+        initialization_source_constant_slots,
+        initialization_source_roots,
+        initialization_source_runtime_buffer_ids,
+    )
+
+    initial_roots = initialization_source_roots(population)
+    runtime_buffer_ids = (
+        initialization_source_runtime_buffer_ids(population) if initial_roots else set()
+    )
+    initial_buffer_ids = {
+        id(value)
+        for _path, source in initial_roots
+        for _name, value in initialization_source_constant_slots(source)
+        if id(value) not in runtime_buffer_ids
+    }
+    _append_registered_prepared_constants(
+        population, initial_buffer_ids, seen, parameter_ids, tables
+    )
+    from ._torch_parametrizations import buffer_slots as torch_buffer_slots
+
+    torch_buffers = {id(value) for _name, value in torch_buffer_slots(population)}
+    _append_registered_prepared_constants(
+        population, torch_buffers, seen, parameter_ids, tables
+    )
+    return tuple((*effective, *derived, *timestep, *material, *tables))
 
 
 def _geometry_binding_layout(population: Population) -> tuple[_GeometryBinding, ...]:
@@ -1902,8 +4136,7 @@ def _geometry_binding_layout(population: Population) -> tuple[_GeometryBinding, 
     A Mechanism and every nested State share one local diameter tensor in the
     imperative handler. Preserve that identity while making the gather an
     explicit differentiable operation in both preparation and transition
-    mapping. MaterialProcess geometry is deliberately rejected by functional
-    eligibility and therefore cannot silently fall back to dense geometry here.
+    mapping. Globally inserted material processes use full-field geometry.
     """
 
     bindings = [_GeometryBinding("dx", "dx", ("",))]
@@ -1945,6 +4178,22 @@ def _geometry_binding_layout(population: Population) -> tuple[_GeometryBinding, 
                     (*binding.module_paths, *local_paths),
                     binding.support_entry,
                 )
+
+    for process in handler.material_processes.values():
+        local_paths = []
+        for owner in (process, *process.DE.values()):
+            module_path = module_paths.get(id(owner))
+            if module_path in parameterized_paths and "diam" in owner._buffers:
+                local_paths.append(module_path)
+                covered_paths.add(module_path)
+        if local_paths:
+            support_entry = None
+            if process.key is not None:
+                registry = SupportRegistry((process,))
+                support_entry = registry.entry(registry.support_id(process))
+            bindings.append(
+                _GeometryBinding("diam", "diam", tuple(local_paths), support_entry)
+            )
 
     uncovered_paths = sorted(
         module_path
@@ -2054,10 +4303,13 @@ def _local_synchronization_slots(population: Population) -> tuple[str, ...]:
         module_paths.setdefault(id(owner), module_path)
 
     slots = []
-    for checkpoint_key in _local_synchronization_keys(handler):
-        owner_name, separator, buffer_name = checkpoint_key.partition(".")
-        if not separator:
-            continue  # pragma: no cover - handler keys are always qualified
+    keys, bindings = set(), {}
+    for binding in read_local_bindings(handler):
+        keys.add(binding.checkpoint_key)
+        bindings.setdefault(binding.checkpoint_key, binding)
+    for checkpoint_key in keys:
+        binding = bindings[checkpoint_key]
+        owner_name, buffer_name = binding.mechanism_name, binding.name
         owner = (
             handler.mechanisms[owner_name] if owner_name in handler.mechanisms else None
         )
@@ -2081,6 +4333,8 @@ def _ephemeral_assigned_slots(population: Population) -> tuple[str, ...]:
         id(owner): module_path for module_path, owner in population.named_modules()
     }
     slots = []
+    from ._mechanism_injections import mechanism_injection_ephemeral_slots
+
     handler = population.mech
     for collection_name in ("mechanisms", "material_processes"):
         for owner in getattr(handler, collection_name).values():
@@ -2091,6 +4345,10 @@ def _ephemeral_assigned_slots(population: Population) -> tuple[str, ...]:
                 f"population.{module_path}.{name}"
                 for name in owner._assigned
                 if name in owner._buffers
+            )
+            slots.extend(
+                f"population.{module_path}.{name}"
+                for name, _value in mechanism_injection_ephemeral_slots(owner)
             )
     return tuple(sorted(slots))
 
@@ -2112,8 +4370,11 @@ def _resolve_parameter_value(owner, parameter_name: str) -> torch.Tensor:
 
 def _evaluate_derived_buffers(module) -> Mapping[str, torch.Tensor]:
     """Evaluate one pure, statically keyed derived-buffer builder."""
+    from ._noise_workspaces import retained_noise_workspace_frame
+
+    with retained_noise_workspace_frame(module, "derived"):
+        values = module.derive_buffers()
     expected = set(_derived_buffer_names(module))
-    values = module.derive_buffers()
     if not isinstance(values, Mapping):
         raise FunctionalizationError(
             f"{type(module).__qualname__}.derive_buffers() must return a mapping"
@@ -2154,7 +4415,10 @@ def _evaluate_derived_buffers(module) -> Mapping[str, torch.Tensor]:
 def _evaluate_timestep_buffers(module, dt) -> Mapping[str, torch.Tensor]:
     """Evaluate one pure, statically keyed timestep-buffer builder."""
     expected = set(_timestep_buffer_names(module))
-    values = module.derive_timestep_buffers(dt)
+    from ._noise_workspaces import retained_noise_workspace_frame
+
+    with retained_noise_workspace_frame(module, "timestep", dt=dt):
+        values = module.derive_timestep_buffers(dt)
     if not isinstance(values, Mapping):
         raise FunctionalizationError(
             f"{type(module).__qualname__}.derive_timestep_buffers() must return "
@@ -2179,13 +4443,19 @@ def _evaluate_timestep_buffers(module, dt) -> Mapping[str, torch.Tensor]:
 class _PopulationPreparation(torch.nn.Module):
     """Pure materialization of effective parameters and static workspaces."""
 
-    def __init__(self, population: Population, dt):
+    def __init__(
+        self,
+        population: Population,
+        dt,
+        *,
+        retain_initialization_materializations=False,
+    ):
         super().__init__()
         self.population = population
         # Constructor-time materialization is part of the purity boundary too.
         # Audit it immediately so a transform that mutates only on its first
         # call cannot normalize that write into the retained execution clone.
-        self.audit_builder_inputs = True
+        self.audit_builder_inputs = current_check_purity()
         self.dt_value = float(dt)
         bindings = self._registered_input_bindings()
         with torch.no_grad():
@@ -2194,14 +4464,21 @@ class _PopulationPreparation(torch.nn.Module):
             bindings,
             f"{type(population).__qualname__}._derive_parameter_buffers()",
         )
-        self.population_parameter_names = tuple(population_values)
-        self.population_parameter_shapes = {
-            name: _shape_tuple(value) for name, value in population_values.items()
-        }
-        self.uses_diameter_parametrization = (
-            hasattr(population, "parametrizations")
-            and "diam" in population.parametrizations
+        self.population_parameter_names = (
+            *tuple(population_values),
+            *tuple(population.random_parameters),
         )
+        self.population_parameter_shapes = {
+            name: _shape_tuple(value)
+            for name, value in {
+                **population_values,
+                **{
+                    name: population._buffers[name]
+                    for name in population.random_parameters
+                },
+            }.items()
+        }
+        self.uses_diameter_parametrization = isinstance(population, Myelinated)
         self.layout = _prepared_buffer_layout(population)
         self.module_paths = _parameterized_module_paths(population)
         self.geometry_bindings = _geometry_binding_layout(population)
@@ -2220,6 +4497,13 @@ class _PopulationPreparation(torch.nn.Module):
             for module_path in self.module_paths
             if _timestep_buffer_names(_module_at(population, module_path))
         )
+        self.material_module_paths = tuple(
+            module_path
+            for module_path in self.module_paths
+            if getattr(
+                _module_at(population, module_path), "_functional_material_slots", ()
+            )
+        )
         offset_names = []
         # Preserve the exact effective-buffer baseline at the extraction
         # boundary. A post-initialize hook is allowed to update a raw parameter
@@ -2231,10 +4515,20 @@ class _PopulationPreparation(torch.nn.Module):
         with torch.no_grad():
             # Evaluate authored/raw preparation against a disposable clone so
             # an invalid one-shot source cannot taint the retained skeleton.
-            validation_population = _clone_execution_population(population)
+            validation_population = (
+                _clone_execution_population(population)
+                if self.audit_builder_inputs
+                else population
+            )
             owner_parameter_values = {}
             for index, entry in enumerate(self.layout):
-                if entry.kind in {"derived", "timestep"}:
+                if entry.kind in {
+                    "derived",
+                    "timestep",
+                    "material_process",
+                    "random_parameter",
+                    "constant",
+                }:
                     offset_names.append(None)
                     continue
                 owner = _module_at(population, entry.module_path)
@@ -2259,7 +4553,7 @@ class _PopulationPreparation(torch.nn.Module):
                     )
                 evaluated = owner_parameter_values[entry.module_path][entry.buffer_name]
                 evaluated = torch.broadcast_to(evaluated, entry.shape)
-                offset = owner._buffers[entry.buffer_name] - evaluated
+                offset = getattr(owner, entry.buffer_name) - evaluated
                 if bool(torch.count_nonzero(offset).item()):
                     offset_name = f"_effective_offset_{index}"
                     self.register_buffer(offset_name, _clone_tensor(offset))
@@ -2267,10 +4561,10 @@ class _PopulationPreparation(torch.nn.Module):
                     offset_name = None
                 offset_names.append(offset_name)
 
-            # A DERIVED_BUFFER declaration promises that the builder exactly
-            # reconstructs the already-initialized live workspace. Failing here
-            # prevents lowering a post-initialization mutation or incomplete
-            # migration into a silently different transition.
+            # Standalone preparation reconstructs the initialized workspace.
+            # Ordered Network plans also represent retained native values when
+            # a later owner changed a shared computed property. Their explicit
+            # baseline offsets preserve these values without relaxing schemas.
             for module_path in self.derived_module_paths:
                 owner = _module_at(validation_population, module_path)
                 live_owner = _module_at(population, module_path)
@@ -2288,7 +4582,10 @@ class _PopulationPreparation(torch.nn.Module):
                         _shape_tuple(value) != _shape_tuple(live)
                         or value.dtype != live.dtype
                         or value.device != live.device
-                        or not torch.equal(value, live)
+                        or (
+                            not retain_initialization_materializations
+                            and not torch.equal(value, live)
+                        )
                     ):
                         raise FunctionalizationError(
                             f"{type(owner).__qualname__}.derive_buffers()[{name!r}] "
@@ -2326,7 +4623,9 @@ class _PopulationPreparation(torch.nn.Module):
                             "broadcastable to the initialized timestep-buffer "
                             f"shape {_shape_tuple(live)}"
                         ) from exc
-                    if not torch.equal(value, live):
+                    if not retain_initialization_materializations and not torch.equal(
+                        value, live
+                    ):
                         raise FunctionalizationError(
                             f"{type(owner).__qualname__}.derive_timestep_buffers()"
                             f"[{name!r}] does not exactly reconstruct the "
@@ -2398,8 +4697,32 @@ class _PopulationPreparation(torch.nn.Module):
                 "tensors without modifying parameters, constants, or buffers."
             )
 
-    def forward(self, diam, dx, diameters, diam_original, dt):
-        self.population._buffers["dx"] = dx
+    def forward(
+        self,
+        diam,
+        dx,
+        diameters,
+        diam_original,
+        dt,
+        *,
+        for_initialization=False,
+        use_snapshot_offsets=True,
+        material_area=None,
+        cache_values=None,
+        cache_active=None,
+        random_inputs=None,
+        root_only=False,
+        root_random_values=None,
+    ):
+        random_outputs = {}
+        if for_initialization:
+            # INITIAL/defaults and ordinary parameter/derived builders see the
+            # construction-fresh timestep view, even after a previous run.
+            # In particular, a zero workspace is not the result of evaluating
+            # an authored timestep builder at dt=0.
+            self.population.mech._reset_initialization_timestep()
+        if "dx" in self.population._buffers:
+            self.population._buffers["dx"] = dx
         if self.uses_diameter_parametrization:
             if diameters is None or diam_original is None:
                 raise FunctionalizationError(
@@ -2408,23 +4731,78 @@ class _PopulationPreparation(torch.nn.Module):
                 )
             self.population._buffers["diameters"] = diameters
             self.population.parametrizations.diam.original = diam_original
-        else:
+        elif "diam" in self.population._buffers:
             self.population._buffers["diam"] = diam
 
         bindings = self._registered_input_bindings()
-        population_values = self.population._derive_parameter_buffers()
+        population_values = dict(self.population._derive_parameter_buffers())
         self._assert_registered_inputs_unchanged(
             bindings,
             f"{type(self.population).__qualname__}._derive_parameter_buffers()",
         )
+        if random_inputs is not None:
+            from ._random_parameters import materialize_random_parameters
+
+            random_outputs.update(
+                materialize_random_parameters(
+                    self.population,
+                    "",
+                    population_values,
+                    random_inputs,
+                    check_purity=self.audit_builder_inputs,
+                    materialized=root_random_values,
+                )
+            )
+            population_values.update(
+                {
+                    name: self.population._buffers[name]
+                    for name in self.population.random_parameters
+                }
+            )
         for name in self.population_parameter_names:
+            population_values[name] = _cache_materialization(
+                population_values[name], name, cache_values, cache_active
+            )
             if name in self.population._buffers:
                 self.population._buffers[name] = population_values[name]
+        if root_only:
+            # Population sampling precedes pre-initialize transforms. Child
+            # builders belong to the following phase and may require those
+            # transforms to establish their parameter frame first.
+            return population_values, random_outputs
         celsius = population_values["celsius"]
         effective_diam = population_values.get("diam", diam)
+        dx = population_values.get("dx", dx)
+
+        material_geometry = self.population._modules.get("_material_geometry")
+        if material_geometry is not None and self.population.mech.material_processes:
+            for name, value in material_geometry(effective_diam, dx).items():
+                self.population._buffers[name] = value
 
         handler = self.population.mech
         handler._sync_celsius(celsius)
+        # Spatial material weights must follow the explicit live geometry,
+        # not configure-time snapshots. Canonical Tree/Cable areas and packed
+        # component areas are supplied by their physical adapters; analytic
+        # processes derive cylindrical area from the rebound diameter/dx.
+        for process in handler.material_processes.values():
+            for buffer_name, source_name in _material_process_geometry_sources(process):
+                if source_name == "dx":
+                    value = dx
+                elif source_name in {"area", "canonical_area_cm2", "component_area"}:
+                    if material_area is None:
+                        raise FunctionalizationError(
+                            "Material area preparation requires the explicit "
+                            "canonical or packed component area"
+                        )
+                    # Population.area may expose an expanded logical batch
+                    # frame even when its canonical source is compact. Keep
+                    # the established process operand schema without copying
+                    # or severing the source geometry's gradient connection.
+                    value = torch.broadcast_to(material_area, self.population.shape)
+                else:
+                    value = getattr(self.population, source_name)
+                process._buffers[buffer_name] = value
         geometry = {"diam": effective_diam, "dx": dx}
         local_geometry = []
         for binding in self.geometry_bindings:
@@ -2439,7 +4817,7 @@ class _PopulationPreparation(torch.nn.Module):
         outputs = []
         owner_parameter_values = {}
         for index, entry in enumerate(self.layout):
-            if entry.kind in {"derived", "timestep"}:
+            if entry.kind in {"derived", "timestep", "material_process", "constant"}:
                 continue
             owner = _module_at(self.population, entry.module_path)
             if entry.module_path not in owner_parameter_values:
@@ -2451,25 +4829,57 @@ class _PopulationPreparation(torch.nn.Module):
                     bindings,
                     f"{type(owner).__qualname__}._derive_parameter_buffers()",
                 )
+                if random_inputs is not None:
+                    from ._random_parameters import materialize_random_parameters
+
+                    random_outputs.update(
+                        materialize_random_parameters(
+                            owner,
+                            entry.module_path,
+                            owner_parameter_values[entry.module_path],
+                            random_inputs,
+                            check_purity=self.audit_builder_inputs,
+                        )
+                    )
+                    owner_parameter_values[entry.module_path].update(
+                        {name: owner._buffers[name] for name in owner.random_parameters}
+                    )
             value = owner_parameter_values[entry.module_path][entry.buffer_name]
             value = torch.broadcast_to(value, entry.shape)
             offset_name = self.offset_names[index]
-            if offset_name is not None:
+            if (
+                use_snapshot_offsets
+                and offset_name is not None
+                and not for_initialization
+            ):
                 value = value + getattr(self, offset_name)
-            owner._buffers[entry.buffer_name] = value
+            value = _cache_materialization(
+                value,
+                f"{entry.module_path}.{entry.buffer_name}",
+                cache_values,
+                cache_active,
+            )
+            if entry.buffer_name in owner._buffers:
+                owner._buffers[entry.buffer_name] = value
             outputs.append((entry.key, value))
 
         for module_path in self.derived_module_paths:
             owner = _module_at(self.population, module_path)
-            bindings = self._builder_input_bindings(celsius, effective_diam, dt)
-            values = _evaluate_derived_buffers(owner)
-            self._assert_builder_inputs_unchanged(
-                bindings,
-                celsius,
-                effective_diam,
-                dt,
-                f"{type(owner).__qualname__}.derive_buffers()",
+            from ._noise_workspaces import _masked_workspace_builder_inputs
+
+            retained = _retained_workspace_builder(
+                module_path, owner, "derived", cache_values, cache_active
             )
+            with _masked_workspace_builder_inputs(owner, retained, dt):
+                bindings = self._builder_input_bindings(celsius, effective_diam, dt)
+                values = _evaluate_derived_buffers(owner)
+                self._assert_builder_inputs_unchanged(
+                    bindings,
+                    celsius,
+                    effective_diam,
+                    dt,
+                    f"{type(owner).__qualname__}.derive_buffers()",
+                )
             for entry in self.layout:
                 if entry.kind != "derived" or entry.module_path != module_path:
                     continue
@@ -2479,20 +4889,37 @@ class _PopulationPreparation(torch.nn.Module):
                 value = values[entry.buffer_name].clone(
                     memory_format=torch.preserve_format
                 )
+                value = _cache_materialization(
+                    value,
+                    f"{entry.module_path}.{entry.buffer_name}",
+                    cache_values,
+                    cache_active,
+                )
                 owner._buffers[entry.buffer_name] = value
                 outputs.append((entry.key, value))
 
         for module_path in self.timestep_module_paths:
             owner = _module_at(self.population, module_path)
-            bindings = self._builder_input_bindings(celsius, effective_diam, dt)
-            values = _evaluate_timestep_buffers(owner, dt)
-            self._assert_builder_inputs_unchanged(
-                bindings,
-                celsius,
-                effective_diam,
-                dt,
-                f"{type(owner).__qualname__}.derive_timestep_buffers()",
+            if for_initialization:
+                for entry in self.layout:
+                    if entry.kind == "timestep" and entry.module_path == module_path:
+                        outputs.append((entry.key, owner._buffers[entry.buffer_name]))
+                continue
+            from ._noise_workspaces import _masked_workspace_builder_inputs
+
+            retained = _retained_workspace_builder(
+                module_path, owner, "timestep", cache_values, cache_active
             )
+            with _masked_workspace_builder_inputs(owner, retained, dt) as builder_dt:
+                bindings = self._builder_input_bindings(celsius, effective_diam, dt)
+                values = _evaluate_timestep_buffers(owner, builder_dt)
+                self._assert_builder_inputs_unchanged(
+                    bindings,
+                    celsius,
+                    effective_diam,
+                    dt,
+                    f"{type(owner).__qualname__}.derive_timestep_buffers()",
+                )
             for entry in self.layout:
                 if entry.kind != "timestep" or entry.module_path != module_path:
                     continue
@@ -2513,21 +4940,72 @@ class _PopulationPreparation(torch.nn.Module):
                         f"timestep-buffer shape {entry.shape}"
                     ) from exc
                 value = value.clone(memory_format=torch.preserve_format)
+                value = _cache_materialization(
+                    value,
+                    f"{entry.module_path}.{entry.buffer_name}",
+                    cache_values,
+                    cache_active,
+                )
                 owner._buffers[entry.buffer_name] = value
                 outputs.append((entry.key, value))
 
+        for module_path in self.material_module_paths:
+            owner = _module_at(self.population, module_path)
+            bindings = self._builder_input_bindings(celsius, effective_diam, dt)
+            values = owner.prepare_materials(
+                _material_fields(self.population, owner), dt
+            )
+            self._assert_builder_inputs_unchanged(
+                bindings,
+                celsius,
+                effective_diam,
+                dt,
+                f"{type(owner).__qualname__}.prepare_materials()",
+            )
+            leaves, tree_spec = torch.utils._pytree.tree_flatten(values)
+            if tree_spec != owner._functional_material_tree_spec:
+                raise FunctionalizationError(
+                    "Material preparation changed its tensor PyTree structure"
+                )
+            for entry, value in zip(
+                (
+                    entry
+                    for entry in self.layout
+                    if entry.kind == "material_process"
+                    and entry.module_path == module_path
+                ),
+                leaves,
+                strict=True,
+            ):
+                if (
+                    not torch.is_tensor(value)
+                    or _shape_tuple(value) != entry.shape
+                    or value.dtype != entry.dtype
+                    or value.device != entry.device
+                ):
+                    raise FunctionalizationError(
+                        "Material preparation changed its tensor schema"
+                    )
+                value = value.clone(memory_format=torch.preserve_format)
+                owner._buffers[entry.buffer_name] = value
+                outputs.append((entry.key, value))
+
+        for entry in self.layout:
+            if entry.kind == "constant":
+                owner = _module_at(self.population, entry.module_path)
+                outputs.append((entry.key, owner._buffers[entry.buffer_name]))
         by_key = dict(outputs)
         result = (
             tuple(population_values[name] for name in self.population_parameter_names),
             tuple(by_key[entry.key] for entry in self.layout),
         )
         if self.local_geometry_bindings:
-            return (*result, tuple(local_geometry))
-        return result
+            result = (*result, tuple(local_geometry))
+        return (*result, random_outputs) if random_inputs is not None else result
 
 
 class _ComponentPhysicalPreparation(_PopulationPreparation):
-    """Narrow pure physical preparation for one packed scalar component.
+    """Narrow pure physical preparation for one packed component.
 
     The packed parent owns mechanisms, state, stimulation, and numerical
     execution.  Retaining any of those child runtime trees here would make
@@ -2542,6 +5020,7 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
         population: Population,
         *,
         edge_child_orig: torch.Tensor | None = None,
+        edge_parent_orig: torch.Tensor | None = None,
         solver_order: torch.Tensor | None = None,
     ):
         torch.nn.Module.__init__(self)
@@ -2552,16 +5031,20 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             "myelinated",
             "native_cable",
             "scalar_tree",
+            "extcell_axon",
+            "extcell_tree",
         }:
             raise FunctionalizationError(
                 "A packed component physical adapter requires an admitted "
-                "scalar Population topology."
+                "Population topology."
             )
 
         self.topology_kind = topology_kind
-        self.audit_builder_inputs = True
+        self.audit_builder_inputs = current_check_purity()
         device = population.device()
-        authored_classes = _authored_workspace_classes(population)
+        authored_classes = (
+            _authored_workspace_classes(population) if self.audit_builder_inputs else ()
+        )
 
         if topology_kind == "scalar_tree":
             if edge_child_orig is None or solver_order is None:
@@ -2579,6 +5062,18 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
                 _clone_tensor(solver_order),
                 persistent=False,
             )
+        elif topology_kind == "extcell_tree":
+            if edge_child_orig is None or edge_parent_orig is None:
+                raise FunctionalizationError(
+                    "ExtCellTree component preparation requires immutable "
+                    "storage-order edge endpoints."
+                )
+            self.register_buffer(
+                "edge_child_orig", _clone_tensor(edge_child_orig), persistent=False
+            )
+            self.register_buffer(
+                "edge_parent_orig", _clone_tensor(edge_parent_orig), persistent=False
+            )
 
         # The candidate is already an isolated, initialized clone admitted by
         # the scalar functional contract.  Remove the runtime-owned subtrees
@@ -2590,6 +5085,9 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             "diam",
             "diameters",
             "dx",
+            "xraxial",
+            "xc",
+            "xg",
             *_declared_parameter_names(population),
             *population.in_graph_parametrizations,
         }
@@ -2606,6 +5104,11 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
         population._m_list = []
         population.injections = []
         population.mechanism_injections = []
+        # These authoring maps refer to initializer recipes on the removed
+        # handler. They do not participate in component geometry preparation.
+        population._concentrations = {}
+        population._equilibria = {}
+        population._material_configs = {}
         population.mechanism_injection_accepted = []
         population.intra = None
         population.__dict__.pop("_duration_remainder", None)
@@ -2629,59 +5132,55 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
                 f"parameters {leaked_runtime_parameters}."
             )
 
-        self.uses_diameter_parametrization = (
-            hasattr(population, "parametrizations")
-            and "diam" in population.parametrizations
-        )
+        self.uses_diameter_parametrization = isinstance(population, Myelinated)
         self.parametrization_constants = _parametrization_constant_layout_for_owners(
             population, (population,)
         )
 
-        # Constructor-time authored evaluation is audited on the disposable
-        # component clone.  If it is impure, failure cannot contaminate the
-        # user's source or the packed execution skeleton.
-        registered = self._registered_input_bindings()
-        python_state = _transition_python_state_snapshot(self)
-        rng_state = _global_rng_snapshot(device)
-        class_state = _class_state_snapshot(authored_classes)
-        mutated_class_state = set()
-        mutated_python_state = set()
-        try:
+        if self.audit_builder_inputs:
+            # Constructor-time authored evaluation is audited on the disposable
+            # component clone.  If it is impure, failure cannot contaminate the
+            # user's source or the packed execution skeleton.
+            registered = self._registered_input_bindings()
+            python_state = _transition_python_state_snapshot(self)
+            mutated_python_state = set()
+            with (
+                _rng_diagnostic_scope(device, enabled=True) as rng_diagnostic,
+                _class_state_diagnostic_scope(authored_classes) as mutated_class_state,
+            ):
+                with torch.no_grad():
+                    population_values = population._derive_parameter_buffers()
+                self._assert_registered_inputs_unchanged(
+                    registered,
+                    f"{type(population).__qualname__}._derive_parameter_buffers()",
+                )
+                current_python_state = _transition_python_state_snapshot(self)
+                mutated_python_state = {
+                    name
+                    for name in set(python_state) | set(current_python_state)
+                    if python_state.get(name) != current_python_state.get(name)
+                }
+            consumed_rng = rng_diagnostic.changes
+            if mutated_python_state:
+                raise FunctionalizationError(
+                    "Packed component physical preparation observed authored "
+                    "mutation of unregistered Python instance state "
+                    f"{sorted(mutated_python_state)}."
+                )
+            if mutated_class_state:
+                raise FunctionalizationError(
+                    "Packed component physical preparation observed authored "
+                    "mutation of shared Python class state "
+                    f"{sorted(mutated_class_state)}."
+                )
+            if consumed_rng:
+                raise FunctionalizationError(
+                    "Packed component physical preparation observed authored "
+                    f"consumption of {sorted(consumed_rng)} RNG state."
+                )
+        else:
             with torch.no_grad():
                 population_values = population._derive_parameter_buffers()
-            self._assert_registered_inputs_unchanged(
-                registered,
-                f"{type(population).__qualname__}._derive_parameter_buffers()",
-            )
-            current_python_state = _transition_python_state_snapshot(self)
-            mutated_python_state = {
-                name
-                for name in set(python_state) | set(current_python_state)
-                if python_state.get(name) != current_python_state.get(name)
-            }
-        finally:
-            try:
-                mutated_class_state.update(_restore_class_state(class_state))
-            finally:
-                consumed_rng = _global_rng_changes(rng_state, device)
-                _restore_global_rng(rng_state, device)
-        if mutated_python_state:
-            raise FunctionalizationError(
-                "Packed component physical preparation observed authored "
-                "mutation of unregistered Python instance state "
-                f"{sorted(mutated_python_state)}."
-            )
-        if mutated_class_state:
-            raise FunctionalizationError(
-                "Packed component physical preparation observed authored "
-                "mutation of shared Python class state "
-                f"{sorted(mutated_class_state)}."
-            )
-        if consumed_rng:
-            raise FunctionalizationError(
-                "Packed component physical preparation observed authored "
-                f"consumption of {sorted(consumed_rng)} RNG state."
-            )
         if not isinstance(population_values, Mapping) or any(
             not torch.is_tensor(value) for value in population_values.values()
         ):
@@ -2692,9 +5191,19 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
         self.population_parameter_names = tuple(population_values)
         self.audit_builder_inputs = False
 
-    def forward(self, diam, dx, diameters, diam_original):
+    def forward(
+        self,
+        diam,
+        dx,
+        diameters,
+        diam_original,
+        *,
+        cache_values=None,
+        cache_active=None,
+    ):
         """Materialize only effective component-level physical parameters."""
-        self.population._buffers["dx"] = dx
+        if "dx" in self.population._buffers:
+            self.population._buffers["dx"] = dx
         if self.uses_diameter_parametrization:
             if diameters is None or diam_original is None:
                 raise FunctionalizationError(
@@ -2703,7 +5212,7 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
                 )
             self.population._buffers["diameters"] = diameters
             self.population.parametrizations.diam.original = diam_original
-        else:
+        elif "diam" in self.population._buffers:
             self.population._buffers["diam"] = diam
 
         bindings = self._registered_input_bindings()
@@ -2713,7 +5222,10 @@ class _ComponentPhysicalPreparation(_PopulationPreparation):
             f"{type(self.population).__qualname__}._derive_parameter_buffers()",
         )
         return tuple(
-            population_values[name] for name in self.population_parameter_names
+            _cache_materialization(
+                population_values[name], name, cache_values, cache_active
+            )
+            for name in self.population_parameter_names
         )
 
 
@@ -3108,6 +5620,11 @@ def _initialization_receiver_dependency_signature(
         return ("registered-parameter", name)
     if name in owner._buffers:
         return ("registered-buffer", name)
+    from ._torch_parametrizations import property_signature
+
+    parametrized = property_signature(owner, name, label=label, strict=strict)
+    if parametrized is not None:
+        return parametrized
     if name in owner._modules:
         module = owner._modules[name]
         return _unsupported_initialization_dependency(
@@ -3162,6 +5679,8 @@ def _initialization_receiver_dependency_signature(
 def _direct_receiver_attribute_names(
     target,
     receiver_name: str | None,
+    *,
+    super_receiver_offsets: frozenset[int] = frozenset(),
 ) -> tuple[frozenset[str], tuple[str, ...]]:
     """Return direct receiver attributes and any opaque receiver escapes."""
 
@@ -3173,12 +5692,88 @@ def _direct_receiver_attribute_names(
     for index, instruction in enumerate(instructions[:-1]):
         if instruction.opname != "LOAD_FAST" or instruction.argval != receiver_name:
             continue
+        if instruction.offset in super_receiver_offsets:
+            continue
         following = instructions[index + 1]
         if following.opname in {"LOAD_ATTR", "LOAD_METHOD"}:
             names.add(following.argval)
         elif following.opname != "STORE_ATTR":
             escapes.add(following.opname)
     return frozenset(names), tuple(sorted(escapes))
+
+
+def _initialization_super_dependencies(target, owner, receiver_name, closure):
+    """Resolve direct zero-argument ``super().attribute`` reads statically.
+
+    The implicit class cell identifies dispatch, rather than external numerical
+    state. Only canonical bytecode is accepted; explicit class-cell reads and
+    escaped super objects retain the ordinary conservative diagnostic.
+    """
+    defining_class = closure.nonlocals.get("__class__")
+    if (
+        receiver_name is None
+        or not inspect.isclass(defining_class)
+        or defining_class not in type(owner).__mro__
+        or closure.builtins.get("super") is not builtins.super
+    ):
+        return None
+    instructions = tuple(dis.get_instructions(target))
+    class_offsets, receiver_offsets, names = set(), set(), set()
+    for index, instruction in enumerate(instructions):
+        if instruction.opname != "LOAD_GLOBAL" or instruction.argval != "super":
+            continue
+        following = instructions[index + 1 :]
+        # Python 3.12+ emits the implicit class/receiver and LOAD_SUPER_ATTR.
+        if (
+            len(following) >= 3
+            and following[0].opname == "LOAD_DEREF"
+            and following[0].argval == "__class__"
+            and following[1].opname == "LOAD_FAST"
+            and following[1].argval == receiver_name
+            and following[2].opname == "LOAD_SUPER_ATTR"
+            and not (following[2].arg & 2)  # Explicit two-argument super.
+        ):
+            class_offsets.add(following[0].offset)
+            receiver_offsets.add(following[1].offset)
+            names.add(following[2].argval)
+            continue
+        # Python 3.11 materializes super() before the attribute load.
+        if following and following[0].opname == "PRECALL" and following[0].arg == 0:
+            following = following[1:]
+        if (
+            len(following) >= 2
+            and following[0].opname == "CALL"
+            and following[0].arg == 0
+            and following[1].opname in {"LOAD_ATTR", "LOAD_METHOD"}
+        ):
+            names.add(following[1].argval)
+            continue
+        return None
+    if not names or any(
+        instruction.opname == "LOAD_DEREF"
+        and instruction.argval == "__class__"
+        and instruction.offset not in class_offsets
+        for instruction in instructions
+    ):
+        return None
+    inherited = []
+    parents = type(owner).__mro__[type(owner).__mro__.index(defining_class) + 1 :]
+    for name in sorted(names):
+        for parent in parents:
+            if name not in parent.__dict__:
+                continue
+            value = parent.__dict__[name]
+            if isinstance(value, property):
+                value = value.fget
+            if isinstance(value, (staticmethod, classmethod)) or inspect.isfunction(
+                value
+            ):
+                value = value.__get__(owner, type(owner))
+            inherited.append((name, parent, value))
+            break
+        else:
+            return None
+    return defining_class, frozenset(receiver_offsets), tuple(inherited)
 
 
 def _unsafe_initialization_operations(
@@ -3222,7 +5817,7 @@ def _unsafe_initialization_operations(
             and instruction.argval in _FORBIDDEN_INITIALIZATION_PYTHON_ESCAPES
         ):
             unsafe.add(instruction.argval)
-        if instruction.opname not in {"LOAD_ATTR", "LOAD_METHOD"}:
+        if instruction.opname not in {"LOAD_ATTR", "LOAD_METHOD", "LOAD_SUPER_ATTR"}:
             continue
         name = instruction.argval
         if name in (
@@ -3268,6 +5863,56 @@ def _canonical_numerical_current_adapter(
     )
 
 
+def _callable_binding_signature(value, *, include_identity=True):
+    """Freeze call/code bindings without inspecting authored dependencies."""
+    if isinstance(value, property):
+        return (
+            "property",
+            *(
+                None
+                if accessor is None
+                else _callable_binding_signature(
+                    accessor, include_identity=include_identity
+                )
+                for accessor in (value.fget, value.fset, value.fdel)
+            ),
+        )
+    if isinstance(value, (staticmethod, classmethod)):
+        value = value.__func__
+    target = getattr(value, "__func__", value)
+
+    def literal(item):
+        if item is None or isinstance(item, (bool, int, float, complex, str, bytes)):
+            return (type(item), item)
+        if isinstance(item, tuple):
+            return (tuple, tuple(literal(part) for part in item))
+        return (type(item), id(item))
+
+    defaults = getattr(target, "__defaults__", None)
+    kwdefaults = getattr(target, "__kwdefaults__", None)
+    return (
+        "callable-binding",
+        getattr(target, "__module__", None),
+        getattr(target, "__qualname__", None),
+        id(target) if include_identity else None,
+        getattr(target, "__code__", None),
+        literal(defaults),
+        None
+        if kwdefaults is None
+        else tuple((name, literal(item)) for name, item in kwdefaults.items()),
+    )
+
+
+def _initialization_callable_contract_signature(value, *, diagnostic=None, **kwargs):
+    """Retain callable bindings; inspect dependencies only in diagnostic mode."""
+    diagnostic = current_check_purity() if diagnostic is None else diagnostic
+    if diagnostic:
+        return _initialization_callable_dependency_signature(value, **kwargs)
+    return _callable_binding_signature(
+        value, include_identity=kwargs.get("include_identity", True)
+    )
+
+
 def _initialization_callable_dependency_signature(
     value,
     *,
@@ -3284,6 +5929,48 @@ def _initialization_callable_dependency_signature(
         value = value.__func__
     bound_receiver = value.__self__ if inspect.ismethod(value) else None
     target = getattr(value, "__func__", value)
+
+    if bound_receiver is owner and isinstance(owner, Mechanism):
+        from ._mechanism_delays import mechanism_delay_helper
+
+        delay_helper = mechanism_delay_helper(owner, value)
+        if delay_helper is not None:
+            return ("dendra-pure-mechanism-delay", delay_helper)
+        from ._mechanism_injections import mechanism_injection_helper
+
+        injection_helper = mechanism_injection_helper(owner, value)
+        if injection_helper is not None:
+            return ("dendra-pure-mechanism-injection", injection_helper)
+        if isinstance(owner, MaterialProcess):
+            from ._custom_material_processes import custom_material_process_helper
+
+            material_helper = custom_material_process_helper(owner, value)
+            if material_helper is not None:
+                return ("dendra-pure-material-helper", material_helper)
+
+    if bound_receiver is owner and getattr(type(owner), "_table", None):
+        from ._tables import table_wrapper_original
+
+        table_original = table_wrapper_original(owner, value)
+        if table_original is not None:
+            table_name, original = table_original
+            enabled = bool(getattr(owner, f"usetable_{table_name}"))
+            return (
+                "dendra-table-dispatch",
+                table_name,
+                enabled,
+                _initialization_callable_dependency_signature(
+                    original,
+                    label=f"{label}.{table_name}_original",
+                    owner=owner,
+                    strict=strict,
+                    seen=seen,
+                    include_identity=include_identity,
+                    forbidden_receiver_attributes=forbidden_receiver_attributes,
+                )
+                if not enabled
+                else None,
+            )
 
     generated_filename = getattr(target, "__generated_filename__", None)
     conductance_mode = getattr(target, "_dendra_conductance_mode", None)
@@ -3454,6 +6141,7 @@ def _initialization_callable_dependency_signature(
             )
             for name, item in sorted(target.__dict__.items())
         )
+        super_receiver_offsets = frozenset()
         try:
             closure = inspect.getclosurevars(target)
         except (TypeError, ValueError) as exc:
@@ -3465,11 +6153,48 @@ def _initialization_callable_dependency_signature(
                 ) from exc
             closure_signature = (("unsupported-inspection", type(exc).__name__),)
         else:
+            super_dependencies = (
+                _initialization_super_dependencies(
+                    target, owner, receiver_name, closure
+                )
+                if bound_receiver is owner
+                else None
+            )
+            super_signature = None
+            if super_dependencies is not None:
+                defining_class, super_receiver_offsets, inherited = super_dependencies
+                super_signature = (
+                    "implicit-super-class",
+                    defining_class.__module__,
+                    defining_class.__qualname__,
+                    id(defining_class),
+                    tuple(
+                        (
+                            name,
+                            parent.__module__,
+                            parent.__qualname__,
+                            id(parent),
+                            _initialization_dependency_value_signature(
+                                item,
+                                label=f"{label}.super.{name}",
+                                owner=owner,
+                                strict=strict,
+                                seen=seen,
+                                forbidden_receiver_attributes=forbidden_receiver_attributes,
+                            ),
+                        )
+                        for name, parent, item in inherited
+                    ),
+                )
             closure_signature = tuple(
                 (
                     scope,
                     name,
-                    _initialization_dependency_value_signature(
+                    super_signature
+                    if scope == "nonlocal"
+                    and name == "__class__"
+                    and super_signature is not None
+                    else _initialization_dependency_value_signature(
                         item,
                         label=f"{label}.{scope}.{name}",
                         owner=owner,
@@ -3490,6 +6215,7 @@ def _initialization_callable_dependency_signature(
         self_attributes, receiver_escapes = _direct_receiver_attribute_names(
             target,
             receiver_name,
+            super_receiver_offsets=super_receiver_offsets,
         )
         forbidden_receiver_reads = tuple(
             sorted(self_attributes & forbidden_receiver_attributes)
@@ -3596,7 +6322,7 @@ def _initialization_final_frame_dependency_signature(
     return tuple(
         (
             label,
-            _initialization_callable_dependency_signature(
+            _initialization_callable_contract_signature(
                 callable_value,
                 label=label,
                 owner=owner,
@@ -3650,7 +6376,10 @@ def _functional_initialization_transform_failures(
         return failures
     all_state_refs = {f"state.{'.'.join(leaf.public_path)}" for leaf in state_layout}
     pre_state_refs = {
-        "state.integrator.v",
+        *(
+            f"state.integrator.{name}"
+            for name in _functional_voltage_state_names(population.integrator)
+        ),
         *(f"state.{'.'.join(entry.public_path)}" for entry in explicit_layout),
     }
     allowed_by_phase = {
@@ -3707,13 +6436,14 @@ def _functional_initialization_transform_failures(
                     "inputs and compose helper operations in forward()"
                 )
             try:
-                _initialization_callable_dependency_signature(
-                    transform.forward,
-                    label=f"{phase} initialization transform {action_name}",
-                    owner=transform,
-                    strict=True,
-                    include_identity=False,
-                )
+                if current_check_purity():
+                    _initialization_callable_dependency_signature(
+                        transform.forward,
+                        label=f"{phase} initialization transform {action_name}",
+                        owner=transform,
+                        strict=True,
+                        include_identity=False,
+                    )
             except FunctionalizationError as exc:
                 failures.append(str(exc))
 
@@ -3744,6 +6474,19 @@ def _registered_child_value_signature(owner, name: str) -> tuple:
         category = "buffer"
     if value is None:
         return ("missing",)
+    if type(value) is _PackedMaterialInitial:
+        return (
+            category,
+            type(value).__module__,
+            type(value).__qualname__,
+            value.shapes,
+            _effective_hook_identity(value, "forward"),
+            _module_autograd_hook_signature(value),
+            tuple(
+                _registered_child_value_signature(value, f"source_{index}")
+                for index in range(len(value.shapes))
+            ),
+        )
     return (category, type(value).__module__, type(value).__qualname__)
 
 
@@ -3832,7 +6575,7 @@ def _initialization_structure_signature(population: Population) -> tuple:
                         and "state_defaults" not in state.__dict__
                     )
                 )
-                else _initialization_callable_dependency_signature(
+                else _initialization_callable_contract_signature(
                     getattr(state, "state_defaults"),
                     label=f"{mechanism_name}.{state_name}.state_defaults",
                     owner=state,
@@ -3845,7 +6588,7 @@ def _initialization_structure_signature(population: Population) -> tuple:
                 if inspect.getattr_static(type(state), "initial_values")
                 is _STANDARD_STATE_INITIAL_VALUES
                 and "initial_values" not in state.__dict__
-                else _initialization_callable_dependency_signature(
+                else _initialization_callable_contract_signature(
                     state_initial_values,
                     label=f"{mechanism_name}.{state_name}.initial_values",
                     owner=state,
@@ -3893,7 +6636,7 @@ def _initialization_structure_signature(population: Population) -> tuple:
                     if inspect.getattr_static(type(mechanism), "initial_values")
                     is _STANDARD_MECHANISM_INITIAL_VALUES
                     and "initial_values" not in mechanism.__dict__
-                    else _initialization_callable_dependency_signature(
+                    else _initialization_callable_contract_signature(
                         getattr(mechanism, "initial_values"),
                         label=f"{mechanism_name}.initial_values",
                         owner=mechanism,
@@ -3970,13 +6713,15 @@ def _initialization_structure_signature(population: Population) -> tuple:
             for name, material in population.mech.materials.items()
         ),
     )
-    inspect_final_frame = _functional_initialization_profile(
-        population
-    ) is not None and not any(
-        bool(collection)
-        for collection in (
-            population.mech.material_processes,
-            population.mech.voltage_processes,
+    inspect_final_frame = (
+        _functional_initialization_profile(population) is not None
+        and not any(
+            _voltage_process_failures(process)
+            for process in population.mech.voltage_processes.values()
+        )
+        and not any(
+            _material_process_failures(process, population)
+            for process in population.mech.material_processes.values()
         )
     )
     final_frame = (
@@ -4000,8 +6745,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
 
     Functional transition admission is intentionally broader. This initializer
     supports declared State plus canonical Ion/Material tensor transactions on
-    the exact single-compartment and structurally canonical unmyelinated
-    implicit-Euler topologies.
+    admitted canonical scalar, extracellular, and packed implicit topologies.
     Authored shared-field hooks and process initialization remain imperative and
     fail closed until their outputs have an explicit pure contract.
     """
@@ -4010,9 +6754,10 @@ def _functional_initialization_failures(population: Population) -> list[str]:
     profile = _functional_initialization_profile(population)
     if profile is None:
         failures.append(
-            "functional initialization currently supports exact "
-            "SingleCompartment and structurally canonical Unmyelinated "
-            "Populations"
+            "functional initialization currently supports canonical "
+            "Population, SingleCompartment, native Cable, and MultiPopulation, "
+            "plus scalar Tree, Unmyelinated, Myelinated, ExtCellAxon, and "
+            "ExtCellTree models and compatible subclasses"
         )
         population_family = None
         operator_kind = None
@@ -4027,8 +6772,9 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         )
         if spec is None or spec.implementation is not implementation:
             failures.append(
-                "functional initialization currently supports bwd_euler_sc "
-                "for SingleCompartment and bwd_euler_ub for Unmyelinated"
+                "functional initialization requires the canonical "
+                f"integrator for {population_family.__qualname__}: "
+                f"{implementation.__qualname__}"
             )
 
     population_standards = _STANDARD_POPULATION_FRESH_INITIALIZATION.get(
@@ -4064,9 +6810,10 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             )
 
     failures.extend(_functional_initialization_transform_failures(population))
-    if "_steady_state" in population._caches or bool(
-        population.initializing_from_state_cache
-    ):
+    if (
+        "_steady_state" in population._caches
+        or bool(population.initializing_from_state_cache)
+    ) and not population._has_random_parameters_resampled_on_initialize():
         failures.append(
             "steady-state cache restoration is not a fresh deterministic "
             "functional initialization"
@@ -4089,15 +6836,15 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             f"{replaced_handler_hooks}; authored handler initialization needs "
             "an explicit pure output contract"
         )
-    if handler.material_processes:
-        failures.append(
-            "MaterialProcess initialization is not included in the pure "
-            "Ion/Material initializer transaction"
+    for name, process in handler.material_processes.items():
+        failures.extend(
+            f"MaterialProcess {name!r}: {failure}"
+            for failure in _material_process_failures(process, population)
         )
-    if handler.voltage_processes:
-        failures.append(
-            "VoltageProcess initialization is not included in the pure "
-            "Ion/Material initializer transaction"
+    for name, process in handler.voltage_processes.items():
+        failures.extend(
+            f"VoltageProcess {name!r}: {failure}"
+            for failure in _voltage_process_failures(process)
         )
 
     for ion_name, ion in handler.ions.items():
@@ -4127,13 +6874,12 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         unsupported_sources = [
             name
             for name in ("e_init", "i_init", "o_init")
-            if not isinstance(getattr(ion, name), torch.nn.Parameter)
+            if not _is_pure_shared_initial_source(getattr(ion, name))
         ]
         if unsupported_sources:
             failures.append(
                 f"Ion {ion_name!r} initial sources {unsupported_sources} are "
-                "callable Modules; this initializer slice requires direct "
-                "registered Tensor parameters"
+                "not registered Tensor parameters or zero-argument Modules"
             )
 
     for material_name, material in handler.materials.items():
@@ -4159,25 +6905,32 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         unsupported_sources = [
             field
             for field in material.fields
-            if not isinstance(material.initial_source(field), torch.nn.Parameter)
+            if not _is_pure_shared_initial_source(material.initial_source(field))
         ]
         if unsupported_sources:
             failures.append(
                 f"Material {material_name!r} initial sources "
-                f"{unsupported_sources} are callable Modules; this initializer "
-                "slice requires direct registered Tensor parameters"
+                f"{unsupported_sources} are not registered Tensor parameters "
+                "or zero-argument Modules"
             )
 
     if (
         profile is not None
-        and not handler.material_processes
-        and not handler.voltage_processes
+        and not any(
+            _material_process_failures(process, population)
+            for process in handler.material_processes.values()
+        )
+        and not any(
+            _voltage_process_failures(process)
+            for process in handler.voltage_processes.values()
+        )
     ):
         try:
-            _initialization_final_frame_dependency_signature(
-                population,
-                strict=True,
-            )
+            if current_check_purity():
+                _initialization_final_frame_dependency_signature(
+                    population,
+                    strict=True,
+                )
         except FunctionalizationError as exc:
             failures.append(str(exc))
 
@@ -4221,24 +6974,18 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             )
         elif class_has_initial_values:
             try:
-                _initialization_callable_dependency_signature(
-                    getattr(mechanism, "initial_values"),
-                    label=f"{mechanism_name}.initial_values",
-                    owner=mechanism,
-                    strict=True,
-                    forbidden_receiver_attributes=frozenset(
-                        {"celsius"} | shared_local_names.get(id(mechanism), set())
-                    ),
-                )
+                if current_check_purity():
+                    _initialization_callable_dependency_signature(
+                        getattr(mechanism, "initial_values"),
+                        label=f"{mechanism_name}.initial_values",
+                        owner=mechanism,
+                        strict=True,
+                        forbidden_receiver_attributes=frozenset(
+                            {"celsius"} | shared_local_names.get(id(mechanism), set())
+                        ),
+                    )
             except FunctionalizationError as exc:
                 failures.append(str(exc))
-
-        if _timestep_buffer_names(mechanism):
-            failures.append(
-                f"mechanism {mechanism_name!r} has TIMESTEP_BUFFER workspaces; "
-                "imperative initialization does not install timestep workspaces "
-                "before State.state_defaults"
-            )
 
         declared_names = {
             name for state in mechanism.DE.values() for name in state._state
@@ -4278,15 +7025,17 @@ def _functional_initialization_failures(population: Population) -> list[str]:
                 )
             elif class_has_state_initial_values:
                 try:
-                    _initialization_callable_dependency_signature(
-                        getattr(state, "initial_values"),
-                        label=f"{mechanism_name}.{state_name}.initial_values",
-                        owner=state,
-                        strict=True,
-                        forbidden_receiver_attributes=frozenset(
-                            {"celsius"} | shared_local_names.get(id(mechanism), set())
-                        ),
-                    )
+                    if current_check_purity():
+                        _initialization_callable_dependency_signature(
+                            getattr(state, "initial_values"),
+                            label=f"{mechanism_name}.{state_name}.initial_values",
+                            owner=state,
+                            strict=True,
+                            forbidden_receiver_attributes=frozenset(
+                                {"celsius"}
+                                | shared_local_names.get(id(mechanism), set())
+                            ),
+                        )
                 except FunctionalizationError as exc:
                     failures.append(str(exc))
 
@@ -4299,13 +7048,6 @@ def _functional_initialization_failures(population: Population) -> list[str]:
                     "overlap handler-owned shared locals "
                     f"{sorted(shared_state_buffer_overlap)}; use the canonical "
                     "Mechanism shared field through the values mapping"
-                )
-
-            if _timestep_buffer_names(state):
-                failures.append(
-                    f"State {mechanism_name}.{state_name} has TIMESTEP_BUFFER "
-                    "workspaces; imperative initialization does not install them "
-                    "before State.state_defaults"
                 )
 
             missing = set(state._state) - set(mechanism._init_params)
@@ -4324,12 +7066,13 @@ def _functional_initialization_failures(population: Population) -> list[str]:
             ):
                 defaults_callable = getattr(state, "state_defaults")
                 try:
-                    _initialization_callable_dependency_signature(
-                        defaults_callable,
-                        label=f"{mechanism_name}.{state_name}.state_defaults",
-                        owner=state,
-                        strict=True,
-                    )
+                    if current_check_purity():
+                        _initialization_callable_dependency_signature(
+                            defaults_callable,
+                            label=f"{mechanism_name}.{state_name}.state_defaults",
+                            owner=state,
+                            strict=True,
+                        )
                 except FunctionalizationError as exc:
                     failures.append(str(exc))
                 defaults_target = getattr(
@@ -4352,7 +7095,7 @@ def _functional_initialization_failures(population: Population) -> list[str]:
                 hidden_shared_aliases = sorted(
                     receiver_attributes & shared_local_names.get(id(mechanism), set())
                 )
-                if hidden_shared_aliases:
+                if hidden_shared_aliases and current_check_purity():
                     failures.append(
                         f"State {mechanism_name}.{state_name}.state_defaults reads "
                         "support-local shared fields through hidden receiver "
@@ -4391,8 +7134,15 @@ def _functional_initialization_failures(population: Population) -> list[str]:
         unsupported = []
         for leaf in layout:
             path = leaf.public_path
+            if path[0] in {"runtime_noise", "material_preparation", "noise_workspaces"}:
+                continue
             if path in {
                 ("integrator", "v"),
+                ("integrator", "vc"),
+                ("integrator", "v_prev"),
+                ("integrator", "_df_history_valid"),
+                ("integrator", "_df_history_dt"),
+                ("integrator", "i_membrane"),
                 ("clock", "t"),
                 ("control", "duration_remainder"),
             }:
@@ -4461,6 +7211,41 @@ def _set_initialization_transform_value(
     )
 
 
+@torch.compiler.assume_constant_result
+def _has_empty_initialization_vmap_axis(value):
+    """Read only transform/shape metadata, never tensor values.
+
+    Dynamo guards the surrounding transform stack and operand shapes but
+    cannot trace these Functorch inspection builtins. Resolve this boolean at
+    capture time; no tensor data or numerical result is constant-folded.
+    """
+
+    unwrapped = value
+    functorch = torch._C._functorch
+    while functorch.is_functorch_wrapped_tensor(unwrapped):
+        is_batched = functorch.is_batchedtensor(unwrapped)
+        batch_axis = functorch.maybe_get_bdim(unwrapped)
+        unwrapped = functorch.get_unwrapped(unwrapped)
+        if is_batched and unwrapped.shape[batch_axis] == 0:
+            return True
+    return False
+
+
+def _initialization_transform_scalar_input(value):
+    """Avoid empty-vmap scalar broadcasting without changing ordinary ranks.
+
+    PyTorch's scalar batching rule selects lane zero when an empty hidden
+    scalar lane meets an unbatched nonscalar tensor. One visible singleton
+    avoids that rule and still permits authored expand_as calls against both
+    physical voltage and circuit-potential payloads. Other inputs retain the
+    exact authored shape, including normal and nonempty-vmap scalar inputs.
+    """
+
+    if value.ndim == 0 and _has_empty_initialization_vmap_axis(value):
+        return value.reshape(1)
+    return value
+
+
 def _apply_initialization_transforms(
     initialization,
     phase: str,
@@ -4487,32 +7272,24 @@ def _apply_initialization_transforms(
             _initialization_transform_value(parameters, state, reference)
             for reference in action.writes
         )
-        # A scalar BatchedTensor cannot currently broadcast against an
-        # unbatched matrix when vmap has zero lanes. Give explicit inputs the
-        # visible rank of this action, then remove only this framework-created
-        # leading singleton padding from lower-rank outputs below.
-        visible_rank = 0
-        for value in (*read_values, *write_targets):
-            if value.ndim > visible_rank:
-                visible_rank = value.ndim
-        padded_explicit_inputs = any(
-            value.ndim < visible_rank for value in explicit_values
+        values = (*read_values, *explicit_values)
+        padded_values = tuple(
+            _initialization_transform_scalar_input(value) for value in values
         )
-        explicit_values = tuple(
-            (
-                value.reshape((1,) * (visible_rank - value.ndim) + tuple(value.shape))
-                if value.ndim < visible_rank
-                else value
-            )
-            for value in explicit_values
+        padded_inputs = any(
+            value.ndim != padded.ndim
+            for value, padded in zip(values, padded_values, strict=True)
         )
         arguments = tuple(
-            value.clone(memory_format=torch.preserve_format)
-            for value in (*read_values, *explicit_values)
+            value.clone(memory_format=torch.preserve_format) for value in padded_values
         )
         versions = (
             None
-            if torch.compiler.is_compiling() or torch.is_inference_mode_enabled()
+            if (
+                not initialization.check_purity
+                or torch.compiler.is_compiling()
+                or torch.is_inference_mode_enabled()
+            )
             else tuple(value._version for value in arguments)
         )
         outputs = action(*arguments)
@@ -4558,7 +7335,7 @@ def _apply_initialization_transforms(
                     f"initialization transform {action.name!r} output "
                     f"{reference!r} must be a Tensor"
                 )
-            if padded_explicit_inputs:
+            if padded_inputs:
                 while value.ndim > target.ndim and value.shape[0] == 1:
                     value = value.squeeze(0)
             value = value.to(device=target.device, dtype=target.dtype)
@@ -4598,6 +7375,51 @@ def _reset_functional_initialization_clock(state):
     return state
 
 
+def _fresh_initialization_pre_state(template, v_init, *, mechanism_state=None):
+    """Reconstruct init_v's voltage frame before authored pre transforms.
+
+    Extracellular initialization sets intracellular absolute potential to the
+    requested membrane voltage and both shell potentials to zero. Do this
+    before transforms: a pre hook may intentionally replace v and vc
+    independently, just as it can after imperative init_v. Mechanism State
+    retains the previous live values until INITIAL applies defaults and ic.
+    """
+
+    state = torch.utils._pytree.tree_map(lambda value: value, template)
+    if mechanism_state is not None:
+        state["mechanisms"] = torch.utils._pytree.tree_map(
+            lambda value: value, mechanism_state
+        )
+    state["integrator"]["v"] = v_init
+    if "v_prev" in state["integrator"]:
+        state["integrator"]["v_prev"] = v_init
+        state["integrator"]["_df_history_valid"] = torch.zeros_like(
+            state["integrator"]["_df_history_valid"]
+        )
+        state["integrator"]["_df_history_dt"] = torch.full_like(
+            state["integrator"]["_df_history_dt"], torch.nan
+        )
+    if "vc" in state["integrator"]:
+        zero = torch.zeros_like(v_init)
+        state["integrator"]["vc"] = torch.stack((v_init, zero, zero), dim=-1)
+    return state
+
+
+def _initialization_voltage_kwargs(state):
+    """Keep the scalar call signature unchanged while passing block init_v."""
+
+    if "vc" in state["integrator"]:
+        return {"vc_init": state["integrator"]["vc"]}
+    if "v_prev" in state["integrator"]:
+        return {
+            "dufort_init": tuple(
+                state["integrator"][name]
+                for name in ("v_prev", "_df_history_valid", "_df_history_dt")
+            )
+        }
+    return {}
+
+
 def _pad_to_visible_rank(value, reference):
     """Right-align a low-rank tensor with a functional shared-field frame."""
 
@@ -4617,6 +7439,7 @@ class _PopulationInitialization(torch.nn.Module):
     ):
         super().__init__()
         self.population = population
+        self.check_purity = current_check_purity()
         self.layout = layout
         self.explicit_layout = explicit_layout
         self.mechanism_plan = tuple(
@@ -4632,7 +7455,7 @@ class _PopulationInitialization(torch.nn.Module):
             if mechanism.DE
         )
 
-    def forward(self, v_init, *explicit_values):
+    def forward(self, v_init, *explicit_values, vc_init=None, dufort_init=None):
         if len(explicit_values) != len(self.explicit_layout):
             raise FunctionalizationError(
                 "functional initialization received the wrong number of explicit "
@@ -4643,6 +7466,11 @@ class _PopulationInitialization(torch.nn.Module):
         # voltage copy before any Mechanism/State initialization runs. Keep
         # the ownership/layout semantics while retaining the functional graph.
         initial_voltage = v_init.clone(memory_format=torch.contiguous_format)
+        initial_circuit_voltage = (
+            None
+            if vc_init is None
+            else vc_init.clone(memory_format=torch.contiguous_format)
+        )
         state_overrides = {}
         for mechanism_name, override_plan in self.mechanism_plan:
             mechanism = self.population.mech.mechanisms[mechanism_name]
@@ -4661,17 +7489,48 @@ class _PopulationInitialization(torch.nn.Module):
         # rank-padded view exists only to make the shared Ion/Material formulas
         # preserve hidden ``vmap`` lanes, including a zero-sized lane.
         handler._sync_celsius(handler.celsius)
-        handler._initialize_tensor_transaction(
-            initial_voltage,
-            shared_celsius,
-            state_overrides=state_overrides,
-            call_local_currents=True,
+        from ._noise_workspaces import refresh_noise_workspaces
+
+        refresh_noise_workspaces(
+            self.population, self.population.t.new_zeros(()), initialization=True
         )
+        from ._noise_workspaces import audit_noise_workspace_values
+
+        with (
+            audit_noise_workspace_values(self.population)
+            if getattr(self, "_audit_noise_workspaces", False)
+            else nullcontext()
+        ):
+            handler._initialize_tensor_transaction(
+                initial_voltage,
+                shared_celsius,
+                state_overrides=state_overrides,
+                call_local_currents=True,
+            )
 
         outputs = []
         for leaf in self.layout:
             if leaf.public_path == ("integrator", "v"):
                 value = initial_voltage
+            elif leaf.public_path == ("integrator", "vc"):
+                value = initial_circuit_voltage
+            elif (
+                dufort_init is not None
+                and leaf.public_path[0] == "integrator"
+                and (
+                    leaf.public_path[1]
+                    in ("v_prev", "_df_history_valid", "_df_history_dt")
+                )
+            ):
+                value = dufort_init[
+                    ("v_prev", "_df_history_valid", "_df_history_dt").index(
+                        leaf.public_path[1]
+                    )
+                ].clone(memory_format=torch.contiguous_format)
+            elif leaf.public_path == ("integrator", "i_membrane"):
+                # Integrator.init_v resets this diagnostic before the first
+                # accepted step; it is not an initialized ionic-current sum.
+                value = torch.zeros_like(initial_voltage)
             elif leaf.public_path == ("clock", "t") or leaf.public_path == (
                 "control",
                 "duration_remainder",
@@ -4687,6 +7546,8 @@ class _PopulationInitialization(torch.nn.Module):
                     leaf.module_path,
                     leaf.buffer_name,
                 )
+            if leaf.public_path[0] == "runtime_noise":
+                value = value.reshape(leaf.shape)
             if not torch.is_tensor(value):
                 raise FunctionalizationError(
                     "fresh functional initialization returned non-Tensor state "
@@ -4707,58 +7568,162 @@ class _PopulationInitialization(torch.nn.Module):
         return tuple(outputs)
 
 
+class _PopulationNoiseWorkspaceConfiguration(torch.nn.Module):
+    """Configure declared workspaces without stepping or sampling."""
+
+    def __init__(self, population, layout):
+        super().__init__()
+        self.population = population
+        self.layout = tuple(
+            leaf for leaf in layout if leaf.public_path[0] == "noise_workspaces"
+        )
+
+    def forward(self, dt, initialization=False, phases=("timestep",)):
+        from ._noise_workspaces import refresh_noise_workspaces
+
+        refresh_noise_workspaces(
+            self.population, dt, initialization=initialization, phases=phases
+        )
+        return tuple(
+            _buffer_at(self.population, leaf.module_path, leaf.buffer_name)
+            for leaf in self.layout
+        )
+
+
 class _PopulationTransition(torch.nn.Module):
-    """Functional facade over a supported deterministic step implementation."""
+    """Functional facade over a supported step implementation."""
 
     def __init__(self, population: Population, solver, layout):
         super().__init__()
         self.population = population
+        from dendra.models.mechanisms._solver_grouping import _install_solver_grouping
+
+        _install_solver_grouping(population)
         self.solver = solver
         self.layout = layout
-        self.block_voltage_state = tuple(population.integrator.v_vars) == ("v", "vc")
+        self.block_voltage_state = _functional_voltage_state_names(
+            population.integrator
+        ) == ("v", "vc")
+        self.explicit_voltage_step = (
+            population.integrator._FUNCTIONAL_OPERATOR_KIND == "scalar_explicit_path"
+        )
+        self.dufort_voltage_step = (
+            population.integrator._FUNCTIONAL_OPERATOR_KIND == "scalar_dufort_path"
+        )
         object.__setattr__(
             self,
             "_state_owners",
             tuple(_module_at(population, entry.module_path) for entry in layout),
         )
 
-    def forward(self, v, t, duration_remainder, dt, celsius, ve, intra, steps: int):
+    def forward(
+        self,
+        v,
+        t,
+        duration_remainder,
+        dt,
+        celsius,
+        ve,
+        intra,
+        steps: int,
+        noise_values=None,
+        workspace_frames=None,
+    ):
         handler = self.population.mech
         shared_celsius = _pad_to_visible_rank(celsius, v)
         handler._sync_celsius(celsius)
         handler.read_from_ions()
         handler.read_from_materials()
+        from ._noise_workspaces import refresh_noise_workspaces
+
+        refresh_noise_workspaces(
+            self.population, dt, phases=("timestep",), prepared_frames=workspace_frames
+        )
 
         integrator = self.population.integrator
         vc = self.population._buffers.get("vc") if self.block_voltage_state else None
+        i_membrane = self.population._buffers["i_membrane"] if integrator.imem else None
         for index in range(steps):
+            if noise_values is not None:
+                for path, values in noise_values.items():
+                    module_path, _separator, buffer_name = path.rpartition(".")
+                    owner = _module_at(self.population, module_path)
+                    value = values[index]
+                    owner._buffers[buffer_name] = value.reshape(
+                        (1,)
+                        * max(
+                            0, len(getattr(owner, "shape_f", value.shape)) - value.ndim
+                        )
+                        + tuple(value.shape)
+                    )
             ve_step = None if ve is None else ve[index]
             intra_step = None if intra is None else intra[index]
             # Mechanism ``t`` references resolve through the Population buffer.
             # Publish the explicit carry immediately before each authored step,
             # matching imperative execution where the clock advances afterward.
             self.population._buffers["t"] = t
-            if self.block_voltage_state:
-                vc, v, _i_membrane = integrator._step(
-                    vc.reshape(integrator.B, integrator.K, integrator.M),
-                    v,
-                    dt,
-                    shared_celsius,
-                    ve_step,
-                    intra_step,
-                    solver=self.solver,
-                    call_local_currents=True,
-                )
-            else:
-                v, _i_membrane = integrator._step(
-                    v,
-                    dt,
-                    shared_celsius,
-                    ve_step,
-                    intra_step,
-                    solver=self.solver,
-                    call_local_currents=True,
-                )
+            from ._noise_workspaces import audit_noise_workspace_values
+
+            with (
+                audit_noise_workspace_values(self.population)
+                if getattr(self, "_audit_noise_workspaces", False)
+                else nullcontext()
+            ):
+                if self.dufort_voltage_step:
+                    history = tuple(
+                        self.population._buffers[name]
+                        for name in ("v_prev", "_df_history_valid", "_df_history_dt")
+                    )
+                    v, previous, valid, history_dt, i_membrane = (
+                        integrator._functional_step(
+                            v,
+                            dt,
+                            shared_celsius,
+                            ve_step,
+                            intra_step,
+                            history=history,
+                            use_history=torch.all(
+                                integrator._prepare_history(history[1], history[2], dt)[
+                                    0
+                                ]
+                            ),
+                            current_dispatch=(
+                                self._dufort_current_programs.diagnostic
+                                if getattr(self, "_audit_dufort_currents", False)
+                                else self._dufort_current_programs
+                            ),
+                            call_local_currents=True,
+                        )
+                    )
+                    self.population._buffers["v_prev"] = previous
+                    self.population._buffers["_df_history_valid"] = valid
+                    self.population._buffers["_df_history_dt"] = history_dt
+                elif self.block_voltage_state:
+                    vc, v, i_membrane = integrator._step(
+                        vc.reshape(integrator.B, integrator.K, integrator.M),
+                        v,
+                        dt,
+                        shared_celsius,
+                        ve_step,
+                        intra_step,
+                        solver=self.solver,
+                        call_local_currents=True,
+                    )
+                else:
+                    step = (
+                        integrator._functional_step
+                        if self.explicit_voltage_step
+                        else integrator._step
+                    )
+                    v, i_membrane = step(
+                        v,
+                        dt,
+                        shared_celsius,
+                        ve_step,
+                        intra_step,
+                        solver=self.solver,
+                        call_local_currents=True,
+                    )
             # Multiplication by a scalar-shaped tensor preserves hidden vmap
             # lanes (including zero lanes) while keeping dt an explicit
             # differentiable input to both dynamics and the model clock.
@@ -4770,14 +7735,162 @@ class _PopulationTransition(torch.nn.Module):
                 value = v
             elif entry.public_path == ("integrator", "vc") and self.block_voltage_state:
                 value = vc
+            elif entry.public_path == ("integrator", "i_membrane"):
+                value = i_membrane
             elif entry.public_path == ("clock", "t"):
                 value = t
             elif entry.public_path == ("control", "duration_remainder"):
                 value = duration_remainder
             else:
                 value = owner._buffers[entry.buffer_name]
+            if entry.public_path[0] == "runtime_noise":
+                value = value.reshape(entry.shape)
             outputs.append(value)
         return tuple(outputs)
+
+
+def _receiver_state_path(path, target):
+    """Identify the declared state and carry a receive hook can replace."""
+    return (
+        len(path) > 2
+        and path[1] == target
+        and path[0] in {"mechanisms", "mechanism_buffers", "state_buffers"}
+    )
+
+
+class _PopulationReceive(torch.nn.Module):
+    """Apply one synaptic transaction to an explicitly rebound Population."""
+
+    def __init__(self, population, target, layout, *, continuous=False):
+        super().__init__()
+        self.population = population
+        self.target = target
+        self.layout = layout
+        self.continuous = continuous
+        self._state_indices = frozenset(
+            index
+            for index, entry in enumerate(layout)
+            if _receiver_state_path(entry.public_path, target)
+        )
+
+        def registered_owner(path):
+            owner = population
+            for name in path.split(".") if path else ():
+                modules = object.__getattribute__(owner, "__dict__").get("_modules")
+                if type(modules) is not dict:
+                    return None
+                owner = modules.get(name)
+                if owner is None:
+                    return None
+            return owner
+
+        mechanism_path = f"integrator.mech.mechanisms.{target}"
+        mechanism = registered_owner(mechanism_path)
+        states = registered_owner(f"{mechanism_path}.DE")
+        state_modules = (
+            None
+            if states is None
+            else object.__getattribute__(states, "__dict__").get("_modules")
+        )
+        alias_owners = tuple(
+            tuple(registered_owner(path) for path, _name in entry.mapping_slots)
+            for entry in layout
+        )
+        self._copy_indices = None
+        if (
+            mechanism is not None
+            and type(state_modules) is dict
+            and all(owner is not None for owners in alias_owners for owner in owners)
+        ):
+            writable_owners = {
+                id(mechanism),
+                *(id(state) for state in state_modules.values()),
+            }
+            # A checkpoint leaf can also bind a target-owned slot under a
+            # different canonical public path. Copy that whole alias group,
+            # while retaining the existing publication selection below.
+            self._copy_indices = self._state_indices | frozenset(
+                index
+                for index, owners in enumerate(alias_owners)
+                if any(id(owner) in writable_owners for owner in owners)
+            )
+        object.__setattr__(
+            self,
+            "_state_owners",
+            tuple(_module_at(population, entry.module_path) for entry in layout),
+        )
+
+    def forward(
+        self,
+        v,
+        t,
+        duration_remainder,
+        dt,
+        payload,
+        input=None,
+        reduce="sum",
+        mask=None,
+        received=None,
+    ):
+        incoming = []
+        for entry, owner in zip(self.layout, self._state_owners, strict=True):
+            if entry.public_path == ("integrator", "v"):
+                value = v
+            elif entry.public_path == ("clock", "t"):
+                value = t
+            elif entry.public_path == ("control", "duration_remainder"):
+                value = duration_remainder
+            else:
+                value = owner._buffers[entry.buffer_name]
+            incoming.append(value)
+        self.population._buffers["t"] = t
+        handler = self.population.mech
+        handler.read_from_ions()
+        handler.read_from_materials()
+        handler._bind_ion_current_fields()
+        mechanism = handler.mechanisms[self.target]
+        from ._noise_workspaces import audit_noise_workspace_values
+
+        with (
+            audit_noise_workspace_values(self.population)
+            if getattr(self, "_audit_noise_workspaces", False)
+            else nullcontext()
+        ):
+            if self.continuous:
+                updates, received = mechanism._derive_continuous_receive_values(
+                    payload,
+                    dt,
+                    mechanism._continuous_receive_value_frame(),
+                    received,
+                    input=input,
+                    reduce=reduce,
+                    mask=mask,
+                )
+                mechanism._apply_continuous_receive_updates(updates)
+            else:
+                updates = mechanism._derive_net_receive_values(
+                    payload, dt, mechanism._net_receive_value_frame()
+                )
+                mechanism._apply_net_receive_updates(updates)
+        outputs = []
+        for index, (entry, previous) in enumerate(
+            zip(self.layout, incoming, strict=True)
+        ):
+            path = entry.public_path
+            value = previous
+            if index in self._state_indices:
+                if path[0] == "mechanisms":
+                    value = updates.get("states", {}).get(path[2], previous)
+                elif path[0] == "mechanism_buffers":
+                    value = updates.get("carry", {}).get(path[2], previous)
+                elif path[0] == "state_buffers":
+                    value = (
+                        updates.get("state_carry", {})
+                        .get(path[2], {})
+                        .get(path[3], previous)
+                    )
+            outputs.append(value)
+        return (*outputs, received) if self.continuous else tuple(outputs)
 
 
 def _uses_standard_unmyelinated_geometry(population) -> bool:
@@ -4845,7 +7958,7 @@ def _uses_standard_myelinated_parametrizations(population) -> bool:
         return False
 
     parametrizations = getattr(population, "parametrizations", None)
-    if parametrizations is None or set(parametrizations) != {"diam"}:
+    if parametrizations is None or "diam" not in parametrizations:
         return False
     diameter_transforms = parametrizations["diam"]
     if not len(diameter_transforms):
@@ -4920,9 +8033,18 @@ def _uses_standard_single_compartment_geometry(population) -> bool:
     )
 
 
+def _is_scalar_point(population) -> bool:
+    """Identify point families without swallowing cable, tree, or packed models."""
+    return _population_family(population) in (Population, SingleCompartment)
+
+
 def _is_native_cable(population) -> bool:
-    """Return whether ``population`` is an exact canonical generic Cable."""
-    return type(population) is Cable and population.compartment_graph is not None
+    """Return whether ``population`` owns canonical generic Cable geometry."""
+    return (
+        _population_family(population) is Cable
+        and not isinstance(population, Axon)
+        and population.compartment_graph is not None
+    )
 
 
 def _is_scalar_tree(population) -> bool:
@@ -4946,27 +8068,26 @@ def _is_canonical_tree(population) -> bool:
     return _is_scalar_tree(population) or _is_extcell_tree(population)
 
 
-def _is_scalar_multi(population) -> bool:
-    """Return whether ``population`` is the exact packed scalar container."""
-    return type(population) is MultiPopulation
+def _is_multi(population) -> bool:
+    """Identify the canonical packed family, including compatible subclasses."""
+    return _population_family(population) is MultiPopulation
 
 
 def _functional_topology_kind(population) -> str | None:
     """Return the exact audited functional topology implemented by a model."""
-    if _is_scalar_multi(population):
+    if _is_multi(population):
         operator_kind = getattr(
             population.integrator,
             "_FUNCTIONAL_OPERATOR_KIND",
             None,
         )
-        return (
-            "multi_point" if operator_kind == "scalar_multi_point" else "multi_scalar"
-        )
+        profile = _PACKED_OPERATOR_PROFILES.get(operator_kind)
+        return None if profile is None else profile[0]
     if isinstance(population, ExtCellAxon):
         return "extcell_axon"
     if _is_extcell_tree(population):
         return "extcell_tree"
-    if type(population) is SingleCompartment:
+    if _is_scalar_point(population):
         return "single_compartment"
     if _is_scalar_tree(population):
         return "scalar_tree"
@@ -4981,7 +8102,7 @@ def _functional_topology_kind(population) -> str | None:
 
 def _functional_geometry_constant_names(topology_kind: str) -> tuple[str, ...]:
     """Return the explicit immutable geometry leaves for one topology."""
-    if topology_kind in {"multi_point", "multi_scalar"}:
+    if topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
         names = ["diam", "dx"]
     elif topology_kind == "native_cable":
         names = ["diam", "dx"]
@@ -5041,11 +8162,31 @@ def _multi_component_topology_signature(population: MultiPopulation) -> tuple:
                 component.device().type,
                 component.dtype(),
                 canonical,
+                (
+                    int(component.n_layers),
+                    tuple(
+                        (field, _shape_tuple(getattr(component, field)))
+                        for field in ("xraxial", "xc", "xg")
+                    ),
+                )
+                if isinstance(component, (ExtCellAxon, ExtCellTree))
+                else None,
                 tuple(
                     (parameter_name, _shape_tuple(parameter))
                     for parameter_name, parameter in component.named_parameters()
                     if not parameter_name.startswith("integrator.")
                 ),
+            )
+        )
+    material_geometry = population._modules.get("_material_geometry")
+    if material_geometry is not None:
+        result.append(
+            (
+                "material_geometry",
+                _material_configuration_signature(material_geometry.components),
+                _material_configuration_signature(material_geometry.named_geometry),
+                _effective_hook_identity(material_geometry, "forward"),
+                _module_autograd_hook_signature(material_geometry),
             )
         )
     return tuple(result)
@@ -5253,7 +8394,9 @@ def _native_cable_source_binding(population) -> tuple:
     )
 
 
-def _effective_population_parameter_failure(population) -> str | None:
+def _effective_population_parameter_failure(
+    population, *, allow_retained=False
+) -> str | None:
     """Reject live overrides not represented by the functional raw tree."""
     try:
         # Eligibility checks must never execute authored parameter modules on
@@ -5269,7 +8412,7 @@ def _effective_population_parameter_failure(population) -> str | None:
         for name, value in expected.items()
         if not torch.is_tensor(getattr(population, name, None))
         or _shape_tuple(getattr(population, name)) != _shape_tuple(value)
-        or not torch.equal(getattr(population, name), value)
+        or (not allow_retained and not torch.equal(getattr(population, name), value))
     ]
     if mismatched:
         return (
@@ -5348,7 +8491,10 @@ def _parametrization_constant_layout_for_owners(
 
     def registered_buffer_aliases(value):
         aliases = []
-        for module_path, module in modules:
+        # Bind every distinct owning slot, not repeated ergonomic paths to the
+        # same Module. This matches _module_tensor_slots/functional_call and
+        # still preserves tensor aliases shared by different Module owners.
+        for module_path, module in population.named_modules():
             for buffer_name, buffer in module._buffers.items():
                 if buffer is value:
                     aliases.append(
@@ -5387,7 +8533,112 @@ def _parametrization_constant_layout_for_owners(
             )
         record(value, aliases)
 
+    from ._initialization_sources import (
+        initialization_source_constant_slots,
+        initialization_source_roots,
+        initialization_source_runtime_buffer_ids,
+    )
+
+    initial_roots = initialization_source_roots(population)
+    runtime_buffer_ids = (
+        initialization_source_runtime_buffer_ids(population) if initial_roots else set()
+    )
+    initial_buffers = {
+        id(value): value
+        for _path, source in initial_roots
+        for _name, value in initialization_source_constant_slots(source)
+        if id(value) not in runtime_buffer_ids
+    }
+    # Packed sources can retain the same Module under a component and the
+    # packed owner. Only the latter remains in execution after child stripping.
+    initial_aliases = {}
+    seen_initial_modules = set()
+    for path, module in modules:
+        if _is_multi(population) and path.startswith("populations."):
+            continue
+        if id(module) in seen_initial_modules:
+            continue
+        seen_initial_modules.add(id(module))
+        for name, value in module._buffers.items():
+            if id(value) in initial_buffers:
+                initial_aliases.setdefault(id(value), []).append(
+                    f"{path + '.' if path else ''}{name}"
+                )
+    for identity, value in initial_buffers.items():
+        if is_registered_parameter(value):
+            continue
+        aliases = initial_aliases.get(identity, ())
+        if aliases:
+            record(value, aliases)
+            public_constant_by_identity.setdefault(
+                identity, f"initialization_sources.{aliases[0]}"
+            )
+
+    material_geometry = population._modules.get("_material_geometry")
+    if material_geometry is not None and population.mech.material_processes:
+        for name, value in material_geometry.named_buffers():
+            if is_registered_parameter(value):
+                continue
+            record(
+                value,
+                [
+                    alias
+                    for alias in registered_buffer_aliases(value)
+                    if not alias.startswith("populations.")
+                ],
+            )
+            public_constant_by_identity.setdefault(
+                id(value), f"_material_geometry.{name}"
+            )
+
+    from ._custom_material_processes import custom_material_constant_slots
+    from ._mechanism_delays import mechanism_delay_constant_slots
+    from ._mechanism_injections import mechanism_injection_constant_slots
+    from ._tables import table_buffer_slots
+
     for owner in owners:
+        from ._torch_parametrizations import buffer_slots as torch_buffer_slots
+
+        owner_prefix = module_paths[id(owner)]
+        # A registry can also live below a module-valued raw source (for
+        # example PositiveParam.rho), so include its registered descendants.
+        for relative_path, value in torch_buffer_slots(owner):
+            if _is_multi(population) and relative_path.startswith("populations."):
+                continue  # component physical adapters own these private inputs
+            if is_registered_parameter(value):
+                continue
+            full_path = f"{owner_prefix + '.' if owner_prefix else ''}{relative_path}"
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value), f"parametrizations.{full_path}"
+            )
+        for relative_path, value in custom_material_constant_slots(owner):
+            if is_registered_parameter(value):
+                continue
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value), f"material_processes.{owner.name}.{relative_path}"
+            )
+        for relative_path, value in mechanism_injection_constant_slots(owner):
+            if is_registered_parameter(value):
+                continue
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value),
+                f"mechanism_injections.{module_paths[id(owner)]}.{relative_path}",
+            )
+        for buffer_name, value in mechanism_delay_constant_slots(owner):
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value), f"mechanism_delays.{module_paths[id(owner)]}.{buffer_name}"
+            )
+        for relative_path, value in table_buffer_slots(owner):
+            if is_registered_parameter(value):
+                continue
+            record(value, registered_buffer_aliases(value))
+            public_constant_by_identity.setdefault(
+                id(value), f"tables.{module_paths[id(owner)]}.{relative_path}"
+            )
         # Myelinated geometry may append framework-owned passive-end overrides
         # to its standard torch parametrization. Their mask/value buffers must
         # remain explicit inputs, just like authored in-graph dependencies.
@@ -5400,7 +8651,26 @@ def _parametrization_constant_layout_for_owners(
                 for buffer_name, value in transform.named_buffers(recurse=False):
                     record(value, (f"{transform_path}.{buffer_name}",))
         available_names = _parameter_materialization_output_names(owner)
+        available_names.update(owner.random_parameters)
+        available_names.update(owner.runtime_noises)
         available_names.update({"diam", "diameters", "dx", "celsius"})
+        for kind, name in _material_process_operand_references(owner):
+            if kind == "buffer" or (kind == "named" and name not in available_names):
+                route_resident_dependency(owner, name, role="material process operand")
+                value = owner._buffers.get(name)
+                if torch.is_tensor(value) and not name.startswith("_mp_"):
+                    public_constant_by_identity.setdefault(
+                        id(value), f"material_processes.{owner.name}.{name}"
+                    )
+        for _buffer_name, source_name in _material_process_geometry_sources(owner):
+            if source_name in {"dx", "area", "canonical_area_cm2", "component_area"}:
+                continue  # explicit physical-adapter inputs
+            route_resident_dependency(
+                population, source_name, role="material process geometry"
+            )
+            value = population._buffers.get(source_name)
+            if torch.is_tensor(value):
+                public_constant_by_identity.setdefault(id(value), source_name)
         for target_name, transforms in owner.in_graph_parametrizations.items():
             if target_name not in available_names:
                 raise FunctionalizationError(
@@ -5571,6 +8841,9 @@ def _in_graph_transform_parameter_names(population) -> set[str]:
         id(parameter): name for name, parameter in population.named_parameters()
     }
     names = set()
+    from ._torch_parametrizations import parameter_names as torch_parameter_names
+
+    names.update(torch_parameter_names(population))
     for owner in _parameterized_owners(population):
         for transforms in owner.in_graph_parametrizations.values():
             for transform, args in transforms:
@@ -5593,6 +8866,39 @@ def _in_graph_transform_parameter_names(population) -> set[str]:
     return names
 
 
+def _material_preparation_parameter_names(population) -> set[str]:
+    """Raw leaves with an audited declaration/geometry preparation schema.
+
+    Material coefficients may be scalar, node-, or edge-aligned. Their raw
+    shapes are checked by the shared raw-to-effective builder and the pure
+    process preparation, rather than the scalar-only voltage-mechanism slice.
+    Every accepted shape is still frozen into the resulting tensor schema.
+    """
+    canonical_by_identity = {
+        id(parameter): name for name, parameter in population.named_parameters()
+    }
+    identities = set()
+    material_geometry = population._modules.get("_material_geometry")
+    if material_geometry is not None and population.mech.material_processes:
+        identities.update(id(parameter) for parameter in material_geometry.parameters())
+    handler = getattr(population, "mech", None)
+    if handler is None:
+        return set()
+    for process in handler.material_processes.values():
+        if _material_process_contract(process) is None:
+            continue
+        identities.update(id(parameter) for parameter in process.parameters())
+        for _buffer_name, source_name in _material_process_geometry_sources(process):
+            value = population._parameters.get(source_name)
+            if value is not None:
+                identities.add(id(value))
+    return {
+        canonical_by_identity[identity]
+        for identity in identities
+        if identity in canonical_by_identity
+    }
+
+
 def _shared_initial_parameter_target_shapes(
     population,
     parameter_name_by_identity: Mapping[int, str],
@@ -5600,19 +8906,25 @@ def _shared_initial_parameter_target_shapes(
     """Map direct Ion/Material initial Parameters to their runtime frames.
 
     These sources are allowed to carry any visible shape that broadcasts
-    exactly to the corresponding shared field. Other raw Parameters retain the
-    deliberately narrower scalar-or-explicit-regional lowering contract.
+    exactly to the corresponding shared field. Other raw Parameters follow
+    their declaration-specific lowering contracts.
     """
 
     target_shapes: dict[str, set[tuple[int, ...]]] = {}
 
-    def record(source, target) -> None:
+    def record(source, target, *, shape=None) -> None:
+        if type(source) is _PackedMaterialInitial:
+            for index, part_shape in enumerate(source.shapes):
+                record(getattr(source, f"source_{index}"), target, shape=part_shape)
+            return
         if not isinstance(source, torch.nn.Parameter):
             return
         parameter_name = parameter_name_by_identity.get(id(source))
         if parameter_name is None:
             return
-        target_shapes.setdefault(parameter_name, set()).add(_shape_tuple(target))
+        target_shapes.setdefault(parameter_name, set()).add(
+            _shape_tuple(target) if shape is None else tuple(shape)
+        )
 
     handler = getattr(population, "mech", None)
     if handler is None:
@@ -5629,7 +8941,7 @@ def _shared_initial_parameter_target_shapes(
         if sources is None:
             continue
         for field in material._material_fields:
-            record(sources._parameters.get(field), material._buffers[field])
+            record(material.initial_source(field), material._buffers[field])
 
     return {
         parameter_name: tuple(sorted(shapes))
@@ -5675,6 +8987,45 @@ def _parameter_buffer_alias_conflicts(population) -> tuple[tuple, ...]:
             )
 
     consumed_parameter_ids = set()
+    from ._torch_parametrizations import registries as torch_registries
+
+    consumed_parameter_ids.update(
+        id(value)
+        for _path, _owner, registry in torch_registries(population)
+        for value in registry.parameters()
+    )
+    from ._torch_parametrizations import buffer_slots as torch_buffer_slots
+
+    consumed_parameter_ids.update(
+        id(value)
+        for _path, value in torch_buffer_slots(population)
+        if id(value) in parameter_name_by_identity
+    )
+    material_parameter_names = _material_preparation_parameter_names(population)
+    consumed_parameter_ids.update(
+        identity
+        for identity, name in parameter_name_by_identity.items()
+        if name in material_parameter_names
+    )
+    from ._initialization_sources import (
+        _registered_tensor_slots,
+        initialization_source_roots,
+    )
+
+    consumed_parameter_ids.update(
+        id(value)
+        for _path, source in initialization_source_roots(population)
+        for _name, value in _registered_tensor_slots(source)
+        if value is not None and id(value) in parameter_name_by_identity
+    )
+    from ._custom_material_processes import custom_material_constant_slots
+
+    consumed_parameter_ids.update(
+        id(value)
+        for _owner_path, owner in _parameterized_owner_paths(population)
+        for _name, value in custom_material_constant_slots(owner)
+        if id(value) in parameter_name_by_identity
+    )
     for _owner_path, owner in _parameterized_owner_paths(population):
         for transforms in owner.in_graph_parametrizations.values():
             for transform, args in transforms:
@@ -5768,6 +9119,7 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
     forbidden_instance_overrides = {
         "_PREPARED_WORKSPACE_SCHEMA",
         "_FUNCTIONAL_OPERATOR_KIND",
+        "_FUNCTIONAL_STATE_NAMES",
         "_FUNCTIONAL_CRITICAL_METHODS",
         *_FUNCTIONAL_INTEGRATOR_HOOKS,
     }
@@ -5800,6 +9152,12 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
         )
     if not recognized_type:
         return None
+    standards = _STANDARD_EXPLICIT_INTEGRATOR_HOOKS.get(implementation, {})
+    if any(
+        inspect.getattr_static(integrator_type, name) is not standard
+        for name, standard in standards.items()
+    ):
+        return None
 
     try:
         methods_match = all(
@@ -5811,7 +9169,211 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
         return None
     if not methods_match:
         return None
+    if implementation is _bwd_euler_sc_skip and tuple(integrator.v_vars):
+        return None
+    declared_state = inspect.getattr_static(
+        integrator_type, "_FUNCTIONAL_STATE_NAMES", None
+    )
+    expected_state = _STANDARD_FUNCTIONAL_INTEGRATOR_STATE_NAMES.get(implementation)
+    if expected_state is None:
+        if declared_state is not None:
+            return None
+    elif (
+        type(declared_state) is not tuple
+        or any(type(name) is not str for name in declared_state)
+        or declared_state != expected_state
+    ):
+        return None
     return spec
+
+
+_EXPLICIT_STENCIL_CONFIGURATION = (
+    "in_channels",
+    "out_channels",
+    "kernel_size",
+    "stride",
+    "padding",
+    "dilation",
+    "groups",
+    "padding_mode",
+    "_reversed_padding_repeated_twice",
+)
+_STANDARD_EXPLICIT_STENCIL_HOOKS = {
+    name: inspect.getattr_static(SymmetricConv1D, name)
+    for name in ("forward", "_conv_forward")
+}
+
+
+def _explicit_stencil_signature(integrator):
+    """Freeze stencil structure while leaving its raw weights explicit."""
+    if getattr(integrator, "_FUNCTIONAL_OPERATOR_KIND", None) != "scalar_explicit_path":
+        return None
+    stencil = getattr(integrator, "ssd", None)
+    if not isinstance(stencil, torch.nn.Module):
+        return None
+    return (
+        _canonical_type(stencil),
+        tuple(
+            (
+                name,
+                tuple(value) if isinstance(value, (tuple, list)) else value,
+            )
+            for name in _EXPLICIT_STENCIL_CONFIGURATION
+            for value in (getattr(stencil, name, None),)
+        ),
+        tuple(
+            (
+                name,
+                _effective_hook_identity(stencil, name)
+                if hasattr(stencil, name)
+                else None,
+            )
+            for name in ("forward", "_conv_forward")
+        ),
+        getattr(stencil, "bias", False) is None,
+    )
+
+
+def _explicit_stencil_failures(integrator):
+    stencil = getattr(integrator, "ssd", None)
+    if (
+        _canonical_type(stencil) is not SymmetricConv1D
+        or any(name in vars(stencil) for name in ("forward", "_conv_forward"))
+        or any(
+            inspect.getattr_static(type(stencil), name) is not standard
+            for name, standard in _STANDARD_EXPLICIT_STENCIL_HOOKS.items()
+        )
+    ):
+        return [
+            "functional explicit cable integration requires its canonical "
+            "SymmetricConv1D stencil"
+        ]
+    if (
+        stencil.in_channels != 2
+        or stencil.out_channels != 1
+        or stencil.groups != 1
+        or stencil.stride != (1,)
+        or stencil.dilation != (1,)
+        or stencil.padding != "same"
+        or stencil.padding_mode != "reflect"
+        or stencil.bias is not None
+        or len(stencil.kernel_size) != 1
+        or stencil.kernel_size[0] % 2 != 1
+        or tuple(stencil._reversed_padding_repeated_twice)
+        != (stencil.kernel_size[0] // 2,) * 2
+        or _shape_tuple(stencil.weight) != (1, 2, stencil.kernel_size[0])
+    ):
+        return [
+            "functional explicit cable integration requires a two-input, "
+            "one-output, odd-width "
+            "reflection stencil with unit stride/dilation and no bias"
+        ]
+    return []
+
+
+_STANDARD_DUFORT_FILTER_HOOKS = {
+    name: inspect.getattr_static(torch.nn.Conv1d, name)
+    for name in ("forward", "_conv_forward")
+}
+
+
+def _dufort_configuration_signature(integrator):
+    if getattr(integrator, "_FUNCTIONAL_OPERATOR_KIND", None) != "scalar_dufort_path":
+        return None
+    convolutions = []
+    for name in ("ssd", "filter"):
+        module = getattr(integrator, name, None)
+        if module is None:
+            convolutions.append((name, None))
+            continue
+        convolutions.append(
+            (
+                name,
+                _canonical_type(module),
+                tuple(
+                    (
+                        field,
+                        tuple(value) if isinstance(value, (tuple, list)) else value,
+                    )
+                    for field in _EXPLICIT_STENCIL_CONFIGURATION
+                    for value in (getattr(module, field, None),)
+                ),
+                tuple(
+                    (hook, _effective_hook_identity(module, hook))
+                    for hook in ("forward", "_conv_forward")
+                    if hasattr(module, hook)
+                ),
+                getattr(module, "bias", False) is None,
+            )
+        )
+    return (
+        (type(integrator.beta), integrator.beta),
+        (type(integrator.smoothing), integrator.smoothing),
+        (type(integrator.smooth_every), integrator.smooth_every),
+        (type(getattr(integrator, "conv", False)), getattr(integrator, "conv", False)),
+        tuple(convolutions),
+    )
+
+
+def _dufort_configuration_failures(integrator):
+    if (
+        type(integrator.beta) not in (int, float)
+        or not math.isfinite(integrator.beta)
+        or type(integrator.smoothing) is not bool
+        or integrator.smoothing != bool(1 - integrator.beta)
+        or type(integrator.smooth_every) is not int
+        or type(getattr(integrator, "conv", False)) is not bool
+    ):
+        return ["functional Dufort requires canonical fixed smoothing configuration"]
+    convolutions = []
+    if isinstance(integrator, _dufort_frankel_homogeneous):
+        convolutions.append(
+            ("ssd", SymmetricConv1D, 3, 3, "same", _STANDARD_EXPLICIT_STENCIL_HOOKS)
+        )
+    if integrator.smoothing:
+        convolutions.append(
+            ("filter", torch.nn.Conv1d, 1, 5, (2,), _STANDARD_DUFORT_FILTER_HOOKS)
+        )
+    for name, canonical, inputs, width, padding, standards in convolutions:
+        module = getattr(integrator, name, None)
+        if (
+            _canonical_type(module) is not canonical
+            or any(hook in vars(module) for hook in standards)
+            or any(
+                inspect.getattr_static(type(module), hook) is not standard
+                for hook, standard in standards.items()
+            )
+            or module.in_channels != inputs
+            or module.out_channels != 1
+            or module.groups != 1
+            or module.kernel_size != (width,)
+            or module.stride != (1,)
+            or module.dilation != (1,)
+            or module.padding != padding
+            or module.padding_mode != "reflect"
+            or module.bias is not None
+            or tuple(module._reversed_padding_repeated_twice) != (width // 2,) * 2
+            or _shape_tuple(module.weight) != (1, inputs, width)
+        ):
+            return [f"functional Dufort requires its canonical {name} convolution"]
+    return []
+
+
+def _functional_device_failures(device, dtype):
+    """Keep device admission separate from the topology/solver capability.
+
+    Each integrator supplies its own transform-compatible solver facade.
+    MPS uses float32; CPU and CUDA also support float64.
+    """
+    failures = []
+    device_type = torch.device(device).type
+    if device_type not in {"cpu", "cuda", "mps"}:
+        failures.append("the supported functional devices are CPU, CUDA, and MPS")
+    if device_type == "mps" and dtype != torch.float32:
+        failures.append("MPS functional execution requires dtype float32")
+    elif device_type != "mps" and dtype not in (torch.float32, torch.float64):
+        failures.append("dtype must be float32 or float64")
+    return failures
 
 
 def _functionalization_failures(
@@ -5819,14 +9381,31 @@ def _functionalization_failures(
     dt: float,
     *,
     multi_component_candidates: dict[str, Population] | None = None,
+    _retain_initialization_materializations=False,
 ) -> list[str]:
     failures = []
     if not isinstance(population, Population):
         return ["expected an initialized dendra Population"]
+    subclass_failures = _population_subclass_failures(population)
+    if subclass_failures:
+        return subclass_failures
     if not population.initialized:
         failures.append("Population must be initialized before functionalization")
-    is_multi = _is_scalar_multi(population)
-    is_single_compartment = type(population) is SingleCompartment
+    if isinstance(
+        population, Myelinated
+    ) and not _uses_standard_myelinated_parametrizations(population):
+        return [
+            *failures,
+            "Myelinated functionalization requires the standard registered "
+            "diameter and axial-resistivity parametrizations",
+        ]
+    from ._torch_parametrizations import failures as torch_parametrization_failures
+
+    torch_failures = torch_parametrization_failures(population)
+    if torch_failures:
+        return [*failures, *torch_failures]
+    is_multi = _is_multi(population)
+    is_single_compartment = _is_scalar_point(population)
     is_extcell_axon = isinstance(population, ExtCellAxon)
     is_extcell_tree = _is_extcell_tree(population)
     is_unmyelinated = isinstance(population, Unmyelinated)
@@ -5859,6 +9438,19 @@ def _functionalization_failures(
                     "not supported"
                 )
                 continue
+            if getattr(component, "_input_bindings", ()):
+                failures.append(
+                    f"component {name!r} uses same-Population input bindings; "
+                    "packed input-binding consolidation is not supported yet"
+                )
+                continue
+            if isinstance(component.integrator, _bwd_euler_sc_skip):
+                failures.append(
+                    f"component {name!r} uses scnv; packed scnv components are "
+                    "not supported because the packed integrator would solve "
+                    "their voltage"
+                )
+                continue
             if tuple(component.shape[:-2]) != batch_shape:
                 failures.append(
                     f"component {name!r} batch shape {tuple(component.shape[:-2])} "
@@ -5872,7 +9464,13 @@ def _functionalization_failures(
                     f"component {name!r} could not be prepared independently: {exc}"
                 )
                 continue
-            component_failures = _functionalization_failures(candidate, dt)
+            component_failures = _functionalization_failures(
+                candidate,
+                dt,
+                _retain_initialization_materializations=(
+                    _retain_initialization_materializations
+                ),
+            )
             failures.extend(
                 f"component {name!r}: {failure}" for failure in component_failures
             )
@@ -5894,7 +9492,7 @@ def _functionalization_failures(
     elif is_single_compartment:
         if not _uses_standard_single_compartment_geometry(population):
             failures.append(
-                "SingleCompartment area overrides are not supported; standard "
+                "Population/SingleCompartment area overrides are not supported; standard "
                 "Population cylindrical area semantics are required"
             )
     elif is_unmyelinated:
@@ -5932,10 +9530,11 @@ def _functionalization_failures(
             failures.append(canonical_failure)
     else:
         failures.append(
-            "the current supported topologies are exact SingleCompartment and "
-            "Unmyelinated or Myelinated with standard geometry, plus exact "
-            "native Cable, scalar Tree, or ExtCellTree instances built from a "
-            "canonical morphology"
+            "the current supported topologies are Population, SingleCompartment, "
+            "Unmyelinated, Myelinated, ExtCellAxon, and MultiPopulation, plus "
+            "native Cable, scalar Tree, and ExtCellTree models built from a "
+            "canonical morphology; subclasses must inherit native execution "
+            "and geometry behavior"
         )
 
     if is_extcell_axon or is_extcell_tree:
@@ -5987,11 +9586,21 @@ def _functionalization_failures(
                     "lane-specific geometry across explicit Population.batch() "
                     "replicas is not supported yet"
                 )
-    if population.device().type != "cpu":
-        failures.append("the current supported device is CPU")
-    if population.dtype() not in (torch.float32, torch.float64):
-        failures.append("dtype must be float32 or float64")
+    failures.extend(
+        _functional_device_failures(population.device(), population.dtype())
+    )
     if is_multi:
+        material_geometry = population._modules.get("_material_geometry")
+        if material_geometry is not None and (
+            type(material_geometry) is not _PackedMaterialGeometry
+            or "forward" in material_geometry.__dict__
+            or type(material_geometry).forward
+            is not _STANDARD_PACKED_MATERIAL_GEOMETRY_FORWARD
+            or _module_autograd_hook_signature(material_geometry)
+        ):
+            failures.append(
+                "packed chemical geometry requires the canonical pure source adapter"
+            )
         point_spec = _resolve_functional_integrator_spec(
             population.integrator,
             "scalar_multi_point",
@@ -6000,17 +9609,39 @@ def _functionalization_failures(
             population.integrator,
             "scalar_multi",
         )
-        if point_spec is None and packed_spec is None:
+        block_spec = _resolve_functional_integrator_spec(
+            population.integrator,
+            "block_multi_tree",
+        )
+        block_components = [
+            isinstance(component, (ExtCellAxon, ExtCellTree))
+            for component in population.populations.values()
+        ]
+        if any(block_components) and not all(block_components):
+            failures.append(
+                "MultiPopulation cannot mix scalar and finite-extracellular components"
+            )
+        if bool(block_spec is not None) != bool(
+            block_components and all(block_components)
+        ):
+            failures.append(
+                "MultiPopulation component voltage states do not match the "
+                "selected scalar or block multi-integrator"
+            )
+        if block_spec is not None and getattr(population, "n_layers", None) != 2:
+            failures.append(
+                "block MultiPopulation requires exactly two extracellular layers"
+            )
+        if point_spec is None and packed_spec is None and block_spec is None:
             failures.append(
                 "MultiPopulation functionalization requires exactly "
-                "bwd_euler_sc_multi or dhs_multi"
+                "bwd_euler_sc_multi, dhs_multi, or dhs_bt_multi"
             )
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
-        if tuple(population.integrator.v_vars) != ("v",):
+        voltage_names = ("v", "vc") if block_spec is not None else ("v",)
+        if tuple(population.integrator.v_vars) != voltage_names:
             failures.append(
-                "functional MultiPopulation integrators must declare exactly "
-                "the ('v',) voltage-state contract"
+                "functional MultiPopulation integrator voltage-state contract "
+                f"must be exactly {voltage_names}"
             )
     elif is_extcell_axon:
         if (
@@ -6022,12 +9653,6 @@ def _functionalization_failures(
         ):
             failures.append(
                 "ExtCellAxon functionalization requires exactly bwd_euler_bt"
-            )
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
-        elif population.integrator.method == "spd":
-            failures.append(
-                "functional bwd_euler_bt currently supports the Thomas method only"
             )
         if tuple(population.integrator.v_vars) != ("v", "vc"):
             failures.append(
@@ -6043,31 +9668,40 @@ def _functionalization_failures(
             is None
         ):
             failures.append("ExtCellTree functionalization requires exactly dhs_bt")
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
         if tuple(population.integrator.v_vars) != ("v", "vc"):
             failures.append(
                 "functional dhs_bt must declare exactly the ('v', 'vc') "
                 "integrator state contract"
             )
     elif is_single_compartment:
+        point_kind, implementation = _scalar_point_integrator_profile(
+            population.integrator
+        )
         if (
             _resolve_functional_integrator_spec(
                 population.integrator,
-                "scalar_point",
+                point_kind,
             )
             is None
         ):
             failures.append(
-                "SingleCompartment functionalization requires exactly bwd_euler_sc"
+                "Population/SingleCompartment functionalization requires exactly "
+                "bwd_euler_sc, scnv, or canonical Euler/rk1/eulerv1/rk2/rk4/df/dfh"
             )
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
+        elif implementation in _SCALAR_EXPLICIT_INTEGRATORS:
+            failures.extend(_explicit_stencil_failures(population.integrator))
+        elif implementation in _SCALAR_DUFORT_INTEGRATORS:
+            failures.extend(_dufort_configuration_failures(population.integrator))
     elif is_unmyelinated or is_myelinated or is_native_cable:
+        operator_kind, implementation = (
+            _scalar_path_integrator_profile(population.integrator)
+            if not is_native_cable
+            else ("scalar_path", _bwd_euler_ub)
+        )
         if (
             _resolve_functional_integrator_spec(
                 population.integrator,
-                "scalar_path",
+                operator_kind,
             )
             is None
         ):
@@ -6076,11 +9710,18 @@ def _functionalization_failures(
                 if is_native_cable
                 else ("Myelinated" if is_myelinated else "Unmyelinated")
             )
-            failures.append(f"{topology} functionalization requires bwd_euler_ub")
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
-        elif population.integrator.use_gc_variant:
-            failures.append("the gradient-clipped Thomas variant is not supported yet")
+            failures.append(
+                f"{topology} functionalization requires bwd_euler_ub"
+                + (
+                    " or canonical Euler/rk1/eulerv1/rk2/rk4/df/dfh"
+                    if not is_native_cable
+                    else ""
+                )
+            )
+        elif implementation in _SCALAR_EXPLICIT_INTEGRATORS:
+            failures.extend(_explicit_stencil_failures(population.integrator))
+        elif implementation in _SCALAR_DUFORT_INTEGRATORS:
+            failures.extend(_dufort_configuration_failures(population.integrator))
     elif is_scalar_tree:
         if (
             _resolve_functional_integrator_spec(
@@ -6090,18 +9731,17 @@ def _functionalization_failures(
             is None
         ):
             failures.append("scalar Tree functionalization requires exactly dhs")
-        elif population.integrator.imem:
-            failures.append("i_membrane recording is not supported yet")
 
     handler = getattr(population, "mech", None)
     if handler is not None:
+        handler_hooks = _functional_handler_hooks(population)
         handler_contract_matches = (
             type(handler) is MechanismHandler
-            and not (set(_FUNCTIONAL_HANDLER_HOOKS) & set(handler.__dict__))
+            and not (set(handler_hooks) & set(handler.__dict__))
             and all(
                 inspect.getattr_static(type(handler), name)
                 is _STANDARD_FUNCTIONAL_HANDLER_HOOKS[name]
-                for name in _FUNCTIONAL_HANDLER_HOOKS
+                for name in handler_hooks
             )
         )
         if not handler_contract_matches:
@@ -6109,20 +9749,77 @@ def _functionalization_failures(
                 "functionalization requires the standard MechanismHandler "
                 "current-frame evaluator"
             )
+        else:
+            input_failures = _input_binding_failures(population)
+            failures.extend(input_failures)
+            if input_failures:
+                # Subsequent checkpoint/state inventories read registered
+                # slots through the imperative aliases. A rejected source
+                # descriptor must not get another chance to run there.
+                return failures
+        actual_voltage_plan = tuple(
+            process for process, _entry in handler._voltage_process_support_plan
+        )
+        expected_voltage_plan = tuple(handler.voltage_processes.values())
+        if len(actual_voltage_plan) != len(expected_voltage_plan) or any(
+            actual is not expected
+            for actual, expected in zip(
+                actual_voltage_plan, expected_voltage_plan, strict=False
+            )
+        ):
+            failures.append(
+                "MechanismHandler replaces the canonical ordered VoltageProcess "
+                "support plan; rebuild the Population before functionalization"
+            )
     mechanisms = () if handler is None else tuple(handler.mechanisms.values())
     if not mechanisms:
         failures.append("at least one membrane mechanism must be inserted")
     stateful_modules = []
     if handler is not None:
         stateful_modules.extend(handler.mechanisms.values())
-        stateful_modules.extend(handler.material_processes.values())
-        if handler.material_processes:
-            failures.append(
-                "MaterialProcesses have parameter-dependent spatial workspaces "
-                "that are not lowered yet"
+        for name, process in handler.material_processes.items():
+            failures.extend(
+                f"MaterialProcess {name!r}: {failure}"
+                for failure in _material_process_failures(process, population)
             )
+            from ._tables import table_failures
+
+            failures.extend(
+                f"MaterialProcess {name!r}: {failure}"
+                for failure in table_failures(process)
+            )
+            if getattr(process, "_diffusion", None):
+                failures.append(
+                    f"MaterialProcess {name!r} uses stochastic state; "
+                    "MaterialProcess SDE declarations are currently unsupported"
+                )
     for mechanism in stateful_modules:
         mechanism_label = getattr(mechanism, "name", type(mechanism).__qualname__)
+        if isinstance(mechanism, ContinuousSynapse) and all(
+            name not in mechanism.__dict__
+            and inspect.getattr_static(type(mechanism), name)
+            is _STANDARD_CONTINUOUS_RECEIVE_ADAPTERS[name]
+            for name in ("continuous_receive", "reset_continuous_inputs")
+        ):
+            failures.extend(
+                f"ContinuousSynapse {mechanism_label!r}: {failure}"
+                for failure in _continuous_receiver_failures(mechanism)
+            )
+        if (
+            isinstance(mechanism, Synapse)
+            and "net_receive" not in mechanism.__dict__
+            and inspect.getattr_static(type(mechanism), "net_receive")
+            is _STANDARD_RECEIVE_ADAPTERS["net_receive"]
+            and (
+                "net_receive_values" in mechanism.__dict__
+                or inspect.getattr_static(type(mechanism), "net_receive_values")
+                is not _STANDARD_RECEIVE_VALUES
+            )
+        ):
+            failures.extend(
+                f"Synapse {mechanism_label!r}: {failure}"
+                for failure in _event_receiver_failures(mechanism)
+            )
         class_has_assigned_values = (
             inspect.getattr_static(type(mechanism), "assigned_values")
             is not _STANDARD_MECHANISM_ASSIGNED_VALUES
@@ -6186,14 +9883,37 @@ def _functionalization_failures(
             failures.append(
                 f"{mechanism.name} support-key values are unavailable or invalid"
             )
-        if mechanism._delayed_state_specs:
-            failures.append(
-                f"{mechanism.name} uses delayed state, which is not supported yet"
-            )
-        if mechanism._injection_specs:
-            failures.append(f"{mechanism.name} uses a registered waveform injection")
+        from ._mechanism_delays import mechanism_delay_failures
+
+        failures.extend(
+            f"{mechanism.name}: {failure}"
+            for failure in mechanism_delay_failures(mechanism)
+        )
+        from ._mechanism_injections import mechanism_injection_failures
+
+        failures.extend(
+            f"{mechanism.name}: {failure}"
+            for failure in mechanism_injection_failures(mechanism)
+        )
         for state_name, state in mechanism.DE.items():
             state_label = f"{mechanism_label}.{state_name}"
+            if (
+                "_input_value_frame" in state.__dict__
+                or inspect.getattr_static(type(state), "_input_value_frame")
+                is not _STANDARD_STATE_INPUT_FRAME
+            ):
+                failures.append(
+                    f"{state_label} replaces the canonical declared-input adapter; "
+                    "read declared INPUT fields from the values frame instead"
+                )
+            live_references = _state_external_input_signature(state, mechanism)
+            if live_references:
+                failures.append(
+                    f"{state_label} uses live setreference properties or "
+                    "unregistered Tensor attributes "
+                    f"{[name for name, *_identity in live_references]}; nested "
+                    "State references need explicit functional tensor inputs"
+                )
             class_has_state_assigned_values = (
                 inspect.getattr_static(type(state), "assigned_values")
                 is not _STANDARD_STATE_ASSIGNED_VALUES
@@ -6231,28 +9951,32 @@ def _functionalization_failures(
                     f"{list(unresolved_layouts)}; initialize the Population before "
                     "functionalization"
                 )
-            if getattr(module.__class__, "_table", None):
-                failures.append(
-                    f"{mechanism.name} uses TABLE lookup workspaces, which are "
-                    "not lowered yet"
+            from ._tables import table_failures
+
+            failures.extend(
+                f"{mechanism.name}: {failure}" for failure in table_failures(module)
+            )
+            if isinstance(module, State) and (
+                module.method in {"euler_maruyama", "euler_heun"}
+                or getattr(module, "_diffusion", None)
+            ):
+                from ._state_sde import state_sde_failures
+
+                failures.extend(
+                    f"{mechanism.name}: {failure}"
+                    for failure in state_sde_failures(module)
                 )
-            if module.random_parameters:
-                failures.append(
-                    f"{mechanism.name} uses random parameters, which are not supported yet"
-                )
-            if module.runtime_noises or getattr(module, "_diffusion", None):
+            elif getattr(module, "_diffusion", None):
                 failures.append(
                     f"{mechanism.name} uses stochastic state, which is not supported yet"
                 )
 
-    if handler is not None and handler.voltage_processes:
-        failures.append("VoltageProcesses are not supported yet")
-    if any(getattr(population, "mechanism_injection_accepted", ())):
-        failures.append(
-            "mechanism-owned waveform injections are not supported yet; only "
-            "solver-owned model[slice].inject(waveform) registrations can be lowered"
-        )
-
+    if handler is not None:
+        for name, process in handler.voltage_processes.items():
+            failures.extend(
+                f"VoltageProcess {name!r}: {failure}"
+                for failure in _voltage_process_failures(process)
+            )
     parameter_contract_supported = True
     for owner in _parameterized_owners(population):
         if "_derive_parameter_buffers" in owner.__dict__ or inspect.getattr_static(
@@ -6289,7 +10013,8 @@ def _functionalization_failures(
                     parameter_contract_supported = False
                     break
                 try:
-                    _transform_structure_signature(transform, strict=True)
+                    if current_check_purity():
+                        _transform_structure_signature(transform, strict=True)
                 except FunctionalizationError as exc:
                     failures.append(str(exc))
                     parameter_contract_supported = False
@@ -6315,11 +10040,6 @@ def _functionalization_failures(
                 break
         if not parameter_contract_supported:
             break
-        parametrizations = getattr(owner, "parametrizations", None)
-        if parametrizations is not None and len(parametrizations):
-            failures.append("torch parameterizations are not supported yet")
-            parameter_contract_supported = False
-            break
 
     if (
         population.initialized
@@ -6334,7 +10054,9 @@ def _functionalization_failures(
             or is_scalar_tree
         )
     ):
-        effective_failure = _effective_population_parameter_failure(population)
+        effective_failure = _effective_population_parameter_failure(
+            population, allow_retained=_retain_initialization_materializations
+        )
         if effective_failure is not None:
             failures.append(effective_failure)
 
@@ -6379,31 +10101,118 @@ def _functionalization_failures(
             or is_scalar_tree
             else _UNMYELINATED_POPULATION_PARAMETER_NAMES
         )
-    missing_population_parameters = required_population_parameters - set(
-        named_parameters
-    )
+    from ._torch_parametrizations import original_parameter_paths
+
+    missing_population_parameters = {
+        name
+        for name in required_population_parameters
+        if name not in named_parameters
+        and not original_parameter_paths(population, name)
+    }
     if missing_population_parameters:
         failures.append(
             "required Population parameters are missing: "
             f"{sorted(missing_population_parameters)}"
         )
     allowed_shapes = {}
+    profile, _implementation = _scalar_path_integrator_profile(population.integrator)
+    if profile == "scalar_dufort_path" and not _dufort_configuration_failures(
+        population.integrator
+    ):
+        for name in ("ssd", "filter"):
+            module = getattr(population.integrator, name, None)
+            if module is not None:
+                allowed_shapes[f"integrator.{name}.weight"] = _shape_tuple(
+                    module.weight
+                )
+    if _scalar_path_integrator_profile(population.integrator)[
+        0
+    ] == "scalar_explicit_path" and not _explicit_stencil_failures(
+        population.integrator
+    ):
+        allowed_shapes["integrator.ssd.weight"] = _shape_tuple(
+            population.integrator.ssd.weight
+        )
     if is_native_cable or is_scalar_tree or is_extcell_tree:
         compartment_shape = (
             (1, int(population.core_shape()[-1]))
             if is_scalar_tree or is_extcell_tree
             else (int(population.core_shape()[-1]),)
         )
-        allowed_shapes = {
-            "cm_param.rho": compartment_shape,
-            "rhoa_param.rho": compartment_shape,
-        }
+        allowed_shapes.update(
+            {
+                "cm_param.rho": compartment_shape,
+                "rhoa_param.rho": compartment_shape,
+            }
+        )
     regional_parameter_names = _additional_parameter_raw_names(population)
     transform_parameter_names = _in_graph_transform_parameter_names(population)
+    from ._torch_parametrizations import parameter_names as torch_parameter_names
+
+    transform_parameter_names.update(torch_parameter_names(population))
+    transform_parameter_names.update(_material_preparation_parameter_names(population))
+    from ._tables import table_parameter_names
+
+    transform_parameter_names.update(table_parameter_names(population))
+    from ._initialization_sources import (
+        _registered_tensor_slots,
+        initialization_source_roots,
+    )
+
+    transform_parameter_names.update(
+        parameter_name_by_identity[id(parameter)]
+        for _path, source in initialization_source_roots(population)
+        for _name, parameter in _registered_tensor_slots(source)
+        if id(parameter) in parameter_name_by_identity
+    )
+    from ._mechanism_injections import mechanism_injection_owners
+
+    # Waveform axes describe their own recipes (for example interpolation
+    # knots or selected compartments), rather than the mechanism's geometry.
+    # The injection plan audits the recipe and freezes each raw tensor schema.
+    transform_parameter_names.update(
+        parameter_name_by_identity[id(parameter)]
+        for _path, owner in mechanism_injection_owners(population)
+        for parameter in owner.injected_waveforms.parameters()
+        if id(parameter) in parameter_name_by_identity
+    )
     shared_initial_targets = _shared_initial_parameter_target_shapes(
         population,
         parameter_name_by_identity,
     )
+    primary_range_targets = {}
+    non_range_sources = set()
+    for owner in _parameterized_owners(population):
+        for category in (
+            "_global",
+            "_range",
+            "_batch",
+            "_global_p",
+            "_range_p",
+            "_batch_p",
+            "_global_n",
+            "_range_n",
+            "_batch_n",
+        ):
+            for field_name in getattr(type(owner), category):
+                target = getattr(owner, field_name, None)
+                if not torch.is_tensor(target):
+                    continue
+                source = getattr(owner, f"{field_name}_param", None)
+                if not isinstance(source, torch.nn.Parameter):
+                    if isinstance(source, torch.nn.Module):
+                        non_range_sources.update(
+                            parameter_name_by_identity[id(parameter)]
+                            for parameter in source.parameters()
+                        )
+                    continue
+                source_name = parameter_name_by_identity[id(source)]
+                if category == "_range" and isinstance(owner, (Mechanism, State)):
+                    primary_range_targets.setdefault(source_name, []).append(
+                        _shape_tuple(target)
+                    )
+                else:
+                    non_range_sources.add(source_name)
     shape_checked_parameters = (
         {
             name: parameter
@@ -6420,6 +10229,14 @@ def _functionalization_failures(
         actual_shape = _shape_tuple(parameter)
         if name in shared_initial_targets:
             target_shapes = shared_initial_targets[name]
+            if _shape_broadcasts_to_targets(actual_shape, target_shapes):
+                continue
+            expected = f"broadcastable to {target_shapes}"
+        elif name in primary_range_targets and name not in non_range_sources:
+            # The shared raw-to-effective materializer already broadcasts
+            # primary RANGE sources to their support-local buffers. Preserve
+            # every target when a raw leaf is shared by several declarations.
+            target_shapes = tuple(primary_range_targets[name])
             if _shape_broadcasts_to_targets(actual_shape, target_shapes):
                 continue
             expected = f"broadcastable to {target_shapes}"
@@ -6845,6 +10662,7 @@ def _transform_class_structure_signature(
     module: torch.nn.Module,
     *,
     strict: bool,
+    inspect_dependencies: bool = True,
 ) -> tuple:
     """Fingerprint authored transform class behavior and static configuration."""
     signatures = []
@@ -6875,10 +10693,14 @@ def _transform_class_structure_signature(
                 or isinstance(value, (staticmethod, classmethod, property))
                 or inspect.ismethoddescriptor(value)
             ):
-                signature = _transform_callable_structure_signature(
-                    value,
-                    label=label,
-                    strict=strict,
+                signature = (
+                    _transform_callable_structure_signature(
+                        value,
+                        label=label,
+                        strict=strict,
+                    )
+                    if inspect_dependencies
+                    else _callable_binding_signature(value, include_identity=False)
                 )
             elif inspect.isdatadescriptor(value):
                 signature = (
@@ -6904,6 +10726,15 @@ def _transform_structure_signature(
     strict: bool = False,
 ) -> tuple:
     """Fingerprint one transform tree, including immutable Python config."""
+    return _transform_module_structure_signature(
+        transform, strict=strict, inspect_dependencies=True
+    )
+
+
+def _transform_module_structure_signature(
+    transform: torch.nn.Module, *, strict: bool, inspect_dependencies: bool
+) -> tuple:
+    """Share registered/static structure between trusted and checked recipes."""
     modules = []
     for module_path, module in transform.named_modules(remove_duplicate=False):
         hooks = _module_autograd_hook_signature(module)
@@ -6941,11 +10772,27 @@ def _transform_structure_signature(
                 type(module).__qualname__,
                 _effective_hook_identity(module, "forward"),
                 hooks,
-                _transform_class_structure_signature(module, strict=strict),
+                _transform_class_structure_signature(
+                    module, strict=strict, inspect_dependencies=inspect_dependencies
+                ),
                 tuple(configuration),
             )
         )
     return tuple(modules)
+
+
+def _transform_contract_signature(transform):
+    if current_check_purity():
+        return _transform_structure_signature(transform)
+    return _transform_module_structure_signature(
+        transform, strict=False, inspect_dependencies=False
+    )
+
+
+def _callable_structure_contract_signature(value, *, label):
+    if current_check_purity():
+        return _transform_callable_structure_signature(value, label=label, strict=False)
+    return _callable_binding_signature(value, include_identity=False)
 
 
 def _parametrization_signatures(population) -> tuple:
@@ -6959,7 +10806,7 @@ def _parametrization_signatures(population) -> tuple:
                     tuple(
                         (
                             tuple(args),
-                            _transform_structure_signature(transform),
+                            _transform_contract_signature(transform),
                         )
                         for transform, args in transforms
                     ),
@@ -6970,22 +10817,31 @@ def _parametrization_signatures(population) -> tuple:
         for owner_path, owner in _parameterized_owner_paths(population)
         if owner.in_graph_parametrizations
     )
-    parametrizations = getattr(population, "parametrizations", None)
-    torch_registered = (
-        ()
-        if parametrizations is None
-        else tuple(
-            (
-                name,
-                _shape_tuple(transforms.original),
-                _module_autograd_hook_signature(transforms),
-                tuple(
-                    _transform_structure_signature(transform)
-                    for transform in transforms
-                ),
-            )
-            for name, transforms in parametrizations.items()
+    from ._torch_parametrizations import registries as torch_registries
+
+    torch_registered = tuple(
+        (
+            path,
+            name,
+            tuple(
+                (kind, key, _shape_tuple(value), value.dtype, value.device)
+                for kind, values in (
+                    ("parameter", transforms._parameters),
+                    ("buffer", transforms._buffers),
+                )
+                for key, value in values.items()
+                if key.startswith("original") and value is not None
+            ),
+            bool(transforms.is_tensor),
+            bool(transforms.unsafe),
+            _callable_binding_signature(
+                inspect.getattr_static(type(owner), name).fget, include_identity=False
+            ),
+            _module_autograd_hook_signature(transforms),
+            tuple(_transform_contract_signature(transform) for transform in transforms),
         )
+        for path, owner, registry in torch_registries(population)
+        for name, transforms in registry.items()
     )
     return in_graph, torch_registered
 
@@ -7055,7 +10911,7 @@ def _material_signature(name, material) -> tuple:
     field_specs = tuple(
         (
             field,
-            material.field_spec(field).min_value,
+            _material_configuration_signature(material.field_spec(field).min_value),
             material.field_spec(field).conserved,
             material.field_spec(field).domain,
             material.field_spec(field).units,
@@ -7074,11 +10930,55 @@ def _material_signature(name, material) -> tuple:
     )
 
 
+def _membrane_coefficient_signature(module) -> tuple:
+    """Invalidate captured transitions when per-current executable APIs change.
+
+    This is a public-boundary structural check, not a per-timestep proof of a
+    user-declared affine function. Tensor parameters remain live model inputs.
+    """
+    evaluators = getattr(module, "_affine_evaluators", {})
+    names = ["_validate_affine_current"] if evaluators else []
+    for current, evaluator in evaluators.items():
+        names.extend(
+            (
+                current,
+                f"{current}_with_g",
+                evaluator,
+                f"{current}_with_conductance",
+                f"{current}_affine_terms",
+            )
+        )
+    hooks = []
+    for name in dict.fromkeys(names):
+        if not hasattr(module, name):
+            hooks.append((name, ("missing",), None))
+            continue
+        method = getattr(module, name)
+        hooks.append(
+            (
+                name,
+                "instance" if name in module.__dict__ else "class",
+                getattr(method, "__self__", None) is module,
+                _callable_structure_contract_signature(
+                    method, label=f"membrane.{name}"
+                ),
+            )
+        )
+    return (
+        tuple(hooks),
+        tuple(evaluators.items()),
+        tuple(sorted(getattr(module, "_affine", ()))),
+        tuple(sorted(getattr(module, "_explicit", ()))),
+        tuple(sorted(getattr(module, "_numerical", ()))),
+        tuple(getattr(module, "_affine_coefficient_fields", {}).items()),
+    )
+
+
 def _structure_signature(population) -> tuple:
     handler = population.mech
     multi_components = (
         _multi_component_topology_signature(population)
-        if _is_scalar_multi(population)
+        if _is_multi(population)
         else None
     )
     canonical_cable_identity = None
@@ -7108,6 +11008,8 @@ def _structure_signature(population) -> tuple:
                     state_name,
                     type(state).__module__,
                     type(state).__qualname__,
+                    _state_external_input_signature(state, module),
+                    _state_input_signature(state),
                     tuple(state._state),
                     _declared_buffer_layout_signature(
                         state,
@@ -7131,13 +11033,12 @@ def _structure_signature(population) -> tuple:
                             "advance",
                         )
                     ),
-                    _transform_callable_structure_signature(
+                    _callable_structure_contract_signature(
                         state._solve,
                         label=(
                             f"{type(state).__module__}."
                             f"{type(state).__qualname__}._solve"
                         ),
-                        strict=False,
                     ),
                     _effective_hook_identity(state, "derive_buffers"),
                     _effective_hook_identity(state, "derive_timestep_buffers"),
@@ -7175,6 +11076,11 @@ def _structure_signature(population) -> tuple:
                 )
             ),
             tuple(sorted(module._save)),
+            _membrane_coefficient_signature(module),
+            _material_process_signature(module, handler),
+            _voltage_process_signature(module),
+            _event_receiver_signature(module),
+            _continuous_receiver_signature(module),
         )
 
     return (
@@ -7196,10 +11102,12 @@ def _structure_signature(population) -> tuple:
             getattr(population.integrator, "threads", None),
             getattr(population.integrator, "write_back", None),
             bool(population.integrator.imem),
-            bool(getattr(population.integrator, "use_gc_variant", False)),
             tuple(population.integrator.v_vars),
+            getattr(population.integrator, "_FUNCTIONAL_STATE_NAMES", None),
             tuple(population.integrator._PREPARED_WORKSPACE_SCHEMA),
             getattr(population.integrator, "_FUNCTIONAL_OPERATOR_KIND", None),
+            _explicit_stencil_signature(population.integrator),
+            _dufort_configuration_signature(population.integrator),
             tuple(
                 getattr(
                     population.integrator,
@@ -7230,7 +11138,7 @@ def _structure_signature(population) -> tuple:
             type(handler).__qualname__,
             tuple(
                 (name, _effective_hook_identity(handler, name))
-                for name in _FUNCTIONAL_HANDLER_HOOKS
+                for name in _functional_handler_hooks(population)
             ),
         ),
         tuple(
@@ -7247,6 +11155,8 @@ def _structure_signature(population) -> tuple:
             for name, material in handler.materials.items()
         ),
         tuple(handler.voltage_processes),
+        _voltage_process_plan_signature(handler),
+        _input_binding_signature(population),
         _parametrization_signatures(population),
         _parameter_module_signatures(population),
         tuple(
@@ -7263,29 +11173,140 @@ def _structure_ids(population) -> tuple[int, ...]:
     return tuple(id(module) for _name, module in population.named_modules())
 
 
-@torch.compiler.assume_constant_result
-def _compiled_structure_signature_matches(population, fingerprint) -> bool:
-    """Evaluate the Python-only source fingerprint once per compiled graph."""
-    return _structure_signature(population) == fingerprint
+def _structure_for_plan(functional, population=None) -> tuple:
+    """Revalidate bindings with the diagnostic policy retained by the plan."""
+    population = functional._population if population is None else population
+    with ctx(CHECK_PURITY=functional._check_purity), torch._C._DisableFuncTorch():
+        return _structure_signature(population)
 
 
 @torch.compiler.assume_constant_result
-def _compiled_initialization_failures(population) -> tuple[str, ...]:
+def _compiled_structure_signature_matches(functional) -> bool:
+    """Evaluate the Python-only source fingerprint once per compiled graph.
+
+    Keep the retained fingerprint inside its owner: authored material metadata
+    can contain Python values Dynamo cannot convert into constant arguments.
+    """
+    return _structure_for_plan(functional) == functional._fingerprint
+
+
+@torch.compiler.assume_constant_result
+def _compiled_validate_table_source(functional) -> None:
+    """Validate Python TABLE topology before capturing tensor evaluation."""
+    functional._table_plan.validate_source()
+
+
+@torch.compiler.assume_constant_result
+def _compiled_validate_mechanism_delay_source(functional) -> None:
+    """Validate cold delay registration before capturing tensor evaluation."""
+    functional._mechanism_delay_plan.validate_source()
+
+
+@torch.compiler.assume_constant_result
+def _compiled_validate_mechanism_injection_source(functional) -> None:
+    """Validate cold waveform ownership before capturing current evaluation."""
+    functional._mechanism_injection_plan.validate_source()
+
+
+@torch.compiler.assume_constant_result
+def _compiled_validate_initialization_sources(functional) -> None:
+    """Audit cold source recipes before capturing explicit initialization."""
+    functional._initialization_source_plan.validate_source()
+
+
+@torch.compiler.assume_constant_result
+def _compiled_validate_custom_material_sources(functional) -> None:
+    """Qualify custom pure process recipes before capturing tensor evaluation."""
+    for plan in functional._custom_material_plans.values():
+        plan.validate_source()
+
+
+def _initialization_failures_for_plan(functional) -> tuple[str, ...]:
+    """Revalidate with the diagnostic policy retained by the lowered plan."""
+    with ctx(CHECK_PURITY=functional._check_purity), torch._C._DisableFuncTorch():
+        return tuple(_functional_initialization_failures(functional._population))
+
+
+def _initialization_structure_for_plan(functional, population=None) -> tuple:
+    population = functional._population if population is None else population
+    with ctx(CHECK_PURITY=functional._check_purity), torch._C._DisableFuncTorch():
+        return _initialization_structure_signature(population)
+
+
+@torch.compiler.assume_constant_result
+def _compiled_initialization_failures(functional) -> tuple[str, ...]:
     """Evaluate Python-only initializer admission once per compiled graph."""
-    return tuple(_functional_initialization_failures(population))
+    return _initialization_failures_for_plan(functional)
+
+
+def _owned_cache_initialization_failures(population):
+    failures = []
+    profile = _functional_initialization_profile(population)
+    standards = (
+        {} if profile is None else _STANDARD_POPULATION_FRESH_INITIALIZATION[profile[0]]
+    )
+    for name in (
+        "initialize",
+        "build",
+        "build_intra",
+        "_restore_steady_state",
+        "post_initialize",
+        "_clear_duration_remainder",
+    ):
+        if (
+            name not in standards
+            or name in population.__dict__
+            or inspect.getattr_static(type(population), name) is not standards[name]
+        ):
+            failures.append(
+                f"Population steady-state cache replaces canonical {name}; authored cache restoration is currently unsupported"
+            )
+    for name, standard in _STANDARD_OWNED_CACHE_METHODS.items():
+        if (
+            name in population.__dict__
+            or inspect.getattr_static(type(population), name) is not standard
+        ):
+            failures.append(
+                f"Population steady-state cache replaces canonical {name}; authored cache restoration is currently unsupported"
+            )
+    if any(
+        not isinstance(hook, _InitializationTransformHook)
+        for hook in population.post_initialize_hooks
+    ):
+        failures.append(
+            "Population steady-state cache restoration with legacy post-initialize hooks is currently unsupported"
+        )
+    return tuple(failures)
 
 
 @torch.compiler.assume_constant_result
-def _compiled_initialization_structure_matches(population, fingerprint) -> bool:
+def _compiled_owned_cache_initialization_failures(population):
+    return _owned_cache_initialization_failures(population)
+
+
+@torch.compiler.assume_constant_result
+def _compiled_initialization_structure_matches(functional) -> bool:
     """Evaluate initializer-only source freshness once per compiled graph."""
-    return _initialization_structure_signature(population) == fingerprint
+    return (
+        _initialization_structure_for_plan(functional)
+        == functional._initialization_fingerprint
+    )
 
 
 class FunctionalPopulation:
-    """Immutable execution plan for supported deterministic scalar models.
+    """Explicit-state execution plan for a compatible initialized Population.
 
-    Construct instances with :func:`make_functional`. Existing Population
-    execution is not redirected through this reference path.
+    Create with :func:`make_functional`. The plan fixes model structure, tensor
+    schemas and a nominal timestep; parameters, constants and evolving state are
+    explicit arguments. Supported models include point, cable, tree and packed
+    Populations, with deterministic or declared stochastic mechanisms.
+
+    :meth:`extract` reads native sources, :meth:`bind` creates a raw binding, and
+    :func:`run` schedules it. Use :meth:`prepare_and_step` or
+    :meth:`prepare_and_rollout` to keep preparation inside a compiled or transformed
+    tensor function. Execution never redirects or advances the native Population.
+    Unsupported model hooks or configurations raise :class:`FunctionalizationError`
+    when lowered or validated.
     """
 
     @property
@@ -7325,7 +11346,34 @@ class FunctionalPopulation:
         dt: float,
         extra=None,
         _multi_component_candidates: Mapping[str, Population] | None = None,
+        _bind_owned_cache=True,
+        _retain_initialization_materializations=False,
+        _network_stimulation_rng_scope=False,
     ):
+        self._network_stimulation_rng_scope = _network_stimulation_rng_scope
+        subclass_failures = _population_subclass_failures(population)
+        if subclass_failures:
+            raise FunctionalizationError("; ".join(subclass_failures))
+        self._population_contract_family = _population_family(population)
+        self._population_contract_hooks = _STANDARD_POPULATION_EXECUTION_HOOKS[
+            self._population_contract_family
+        ]
+        self._population_slot_contract = _STANDARD_POPULATION_SLOT_CONTRACTS[
+            self._population_contract_family
+        ]
+        source_owners = [population]
+        if _is_multi(population):
+            source_owners.extend(population.populations.values())
+        self._population_source_contracts = tuple(
+            (
+                owner,
+                family,
+                _STANDARD_POPULATION_EXECUTION_HOOKS[family],
+                _STANDARD_POPULATION_SLOT_CONTRACTS[family],
+            )
+            for owner in source_owners
+            for family in (_population_family(owner),)
+        )
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
         ):
@@ -7335,6 +11383,12 @@ class FunctionalPopulation:
             )
         _validate_support_keys(population, context="Source Population")
         self._source_support_key_binding = _support_key_runtime_binding(population)
+        self._source_input_binding_indices = _input_binding_index_signature(population)
+        self._source_input_declarations = _input_binding_declarations(population)
+        self._source_handler_input_declarations = _input_binding_declarations(
+            population.mech
+        )
+        self._source_input_binding_plan = population.mech._input_binding_plan
         self._source_additional_parameter_key_binding = (
             _additional_parameter_key_binding(population)
         )
@@ -7362,7 +11416,7 @@ class FunctionalPopulation:
         self._geometry_constant_shapes = {
             name: (
                 self._shape
-                if self._topology_kind in {"multi_point", "multi_scalar"}
+                if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
                 else (
                     _shape_tuple(population.diameters)
                     if name == "diameters"
@@ -7384,14 +11438,89 @@ class FunctionalPopulation:
         self._dtype = population.dtype()
         self._device = population.device()
         self._population = population
+        from ._noise_workspaces import noise_workspace_constant_values
+
+        self._noise_workspace_constants = noise_workspace_constant_values(population)
+        self._check_purity = current_check_purity()
+        from ._torch_parametrizations import buffer_slots as torch_buffer_slots
+        from ._torch_parametrizations import parameter_names as torch_parameter_names
+
+        self._torch_parameter_names = frozenset(torch_parameter_names(population))
+        torch_buffer_ids = {
+            id(value) for _path, value in torch_buffer_slots(population)
+        }
+        self._torch_constant_names = frozenset(
+            entry.key
+            for entry in self._parametrization_constants
+            if id(_buffer_at(population, entry.module_path, entry.buffer_name))
+            in torch_buffer_ids
+        )
+        from ._torch_parametrizations import source_binding_signature
+
+        self._torch_source_bindings = source_binding_signature(population)
+        from ._custom_material_processes import CustomMaterialProcessPlan
+
+        self._custom_material_plans = {
+            name: CustomMaterialProcessPlan(
+                process,
+                _material_fields(population, process),
+                dt,
+            )
+            for name, process in population.mech.material_processes.items()
+            if _material_process_contract(process).family is MaterialProcess
+        }
+        self._source_custom_material_bindings = tuple(
+            (name, plan.source_binding_signature())
+            for name, plan in self._custom_material_plans.items()
+        )
+        from ._tables import TablePlan
+
+        self._table_plan = TablePlan(population)
+        self._source_table_bindings = self._table_plan.source_binding_signature()
+        from ._mechanism_delays import MechanismDelayPlan
+
+        self._mechanism_delay_plan = MechanismDelayPlan(population)
+        self._source_mechanism_delay_bindings = (
+            self._mechanism_delay_plan.source_binding_signature()
+        )
+        from ._mechanism_injections import MechanismInjectionPlan
+
+        self._mechanism_injection_plan = MechanismInjectionPlan(population)
+        self._source_mechanism_injection_bindings = (
+            self._mechanism_injection_plan.source_binding_signature()
+        )
+        from ._initialization_sources import InitializationSourcePlan
+
+        self._initialization_source_plan = InitializationSourcePlan(population)
+        self._source_initialization_bindings = (
+            self._initialization_source_plan.source_binding_signature()
+        )
         self._source_ids = _structure_ids(population)
+        from dendra.models.rng import RNGMixin
+
+        # Ignored cache payloads are normalized away under this fixed policy.
+        self._source_rng_load_policies = tuple(
+            (name, module, bool(module._ignore_rng_on_load))
+            for name, module in population.named_modules()
+            if isinstance(module, RNGMixin)
+        )
         self._fingerprint = _structure_signature(population)
         self._initialization_fingerprint = _initialization_structure_signature(
             population
         )
+        self._split_stochastic_initialization = bool(
+            (population.random_parameters or population.runtime_noises)
+            and any(
+                reference.startswith("parameters.")
+                for hook in _initialization_transform_hooks(population, "pre")
+                for reference in population._initialization_transforms[
+                    hook.action_name
+                ].writes
+            )
+        )
         self._canonical_source_binding = (
             _multi_canonical_source_binding(population)
-            if self._topology_kind in {"multi_point", "multi_scalar"}
+            if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             else (
                 _native_cable_source_binding(population)
                 if self._topology_kind == "native_cable"
@@ -7400,7 +11529,7 @@ class FunctionalPopulation:
         )
         self._multi_canonical_values = (
             _multi_canonical_value_signature(population)
-            if self._topology_kind in {"multi_point", "multi_scalar"}
+            if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             else None
         )
         self._prepared_token = object()
@@ -7430,28 +11559,71 @@ class FunctionalPopulation:
             )
 
         self._multi_component_plans = ()
+        self._cache_value_specs = ()
+        self._retained_materializations = _RetainedMaterializationInventory()
+        self._has_snapshot_materialization_offsets = None
+        self._retain_initialization_materializations = (
+            _retain_initialization_materializations
+        )
+        self._material_live_parameter_names = frozenset(
+            _material_preparation_parameter_names(population)
+        )
+        self._bind_owned_cache = _bind_owned_cache
+        self._owned_cache_source_present = "_steady_state" in population._caches
+        self._owned_cache_bound = (
+            _bind_owned_cache
+            and self._owned_cache_source_present
+            and not population._has_random_parameters_resampled_on_initialize()
+        )
+        self._owned_cache_plan = None
+        self._owned_cache_error = None
+        self._owned_cache_state_template = None
         self._multi_public_constant_shapes = {}
         self._multi_public_constant_dtypes = {}
         self._multi_public_constant_devices = {}
         self._multi_canonical_parameter_names = None
         self._multi_component_physical_parameter_names = frozenset()
-        self._initialization_failures = tuple(
-            _functional_initialization_failures(population)
+        self._initialization_failures = (
+            tuple(_functional_initialization_failures(population))
+            + self._initialization_source_plan.failures
         )
 
         execution_population = _clone_execution_population(population)
+        from ._poisson_stimulation import configure_execution
+
+        configure_execution(execution_population)
+        from ._torch_parametrizations import install_output_schemas
+
+        install_output_schemas(execution_population)
         dt_tensor = torch.as_tensor(self.dt, device=self.device, dtype=self.dtype)
         has_timestep_buffers = any(
             _timestep_buffer_names(_module_at(execution_population, module_path))
             for module_path in _parameterized_module_paths(execution_population)
         )
+        from dendra.models.mechanisms._noise_workspaces import (
+            retain_noise_workspace_once,
+        )
+
+        from ._material_stochasticity import retained_stochastic_diffusion_noise
+        from ._noise_workspaces import noise_workspace_owners
+
+        for _path, owner in noise_workspace_owners(execution_population):
+            retain_noise_workspace_once(owner)
+
         try:
-            execution_population.integrator._initialize(
-                execution_population,
-                dt_tensor,
-                force=execution_population.force_integrator_reinit(),
-                compile_scope="population",
-            )
+            with retained_stochastic_diffusion_noise(
+                execution_population, population, self.dt
+            ):
+                execution_population.integrator._initialize(
+                    execution_population,
+                    dt_tensor,
+                    force=execution_population.force_integrator_reinit()
+                    or any(
+                        getattr(process, "_spatial_configured", True) is False
+                        for process in execution_population.mech.material_processes.values()
+                    ),
+                    compile_scope="population",
+                )
         except (TypeError, ValueError, RuntimeError) as exc:
             if not has_timestep_buffers:
                 raise
@@ -7459,21 +11631,32 @@ class FunctionalPopulation:
                 "timestep-buffer materialization failed while lowering the "
                 f"Population: {exc}"
             ) from exc
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        for _path, owner in noise_workspace_owners(execution_population):
+            # A warm integrator can reuse its configuration without consuming
+            # the native one-shot checkpoint handoff. Functional execution
+            # represents that provenance in tensor carry instead.
+            owner.__dict__.pop("_noise_workspace_restored_dt", None)
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             # The packed integrator and consolidated MechanismHandler now own
             # the complete transition. Component Populations are source-side
             # configuration/commit objects only; retaining their registered
             # runtime trees would make every functional mapping clone unused
             # voltage, mechanism, ion, and child-integrator tensors.
             _strip_packed_component_runtime_aliases(execution_population)
-        operator_kind = {
-            "single_compartment": "scalar_point",
-            "extcell_axon": "block_path",
-            "extcell_tree": "block_tree",
-            "scalar_tree": "scalar_tree",
-            "multi_point": "scalar_multi_point",
-            "multi_scalar": "scalar_multi",
-        }.get(self._topology_kind, "scalar_path")
+        point_kind, _point_implementation = _scalar_point_integrator_profile(
+            execution_population.integrator
+        )
+        operator_kind = (
+            point_kind
+            if self._topology_kind == "single_compartment"
+            else _FIXED_OPERATOR_PROFILES.get(
+                self._topology_kind, _FIXED_OPERATOR_PROFILES["native_cable"]
+            )[0]
+        )
+        if self._topology_kind in {"unmyelinated", "myelinated"}:
+            operator_kind, _implementation = _scalar_path_integrator_profile(
+                execution_population.integrator
+            )
         integrator_spec = _resolve_functional_integrator_spec(
             execution_population.integrator,
             operator_kind,
@@ -7502,6 +11685,8 @@ class FunctionalPopulation:
             "block_matrix": self._solve_shape + (block_size, block_size),
             "shell_node": self._solve_shape + (block_size - 1,),
         }
+        if operator_kind in {"scalar_explicit_path", "scalar_dufort_path"}:
+            workspace_shapes["node"] = self.shape
         if self._topology_kind == "multi_point":
             workspace_shapes["parameter"] = self.shape
             workspace_shapes["geometry"] = self.shape
@@ -7536,6 +11721,9 @@ class FunctionalPopulation:
             name: workspace_shapes[shape_role]
             for name, shape_role in self._integrator_workspace_schema
         }
+        _install_material_preparation(
+            execution_population, dt_tensor, custom_plans=self._custom_material_plans
+        )
         self._state_layout = _state_layout(execution_population)
         self._state_layout_signature = _state_layout_signature(self._state_layout)
         self._initialization_state_layout = _initialization_state_layout(
@@ -7545,11 +11733,120 @@ class FunctionalPopulation:
         self._initialization_transform_inputs = _initialization_transform_input_layout(
             execution_population
         )
+        self._post_initialization_writes_parameters = any(
+            reference.startswith("parameters.")
+            for hook in _initialization_transform_hooks(execution_population, "post")
+            for reference in execution_population._initialization_transforms[
+                hook.action_name
+            ].writes
+        )
         self._transition = _PopulationTransition(
             execution_population,
             solver,
             self._state_layout,
         )
+        self._noise_workspace_configuration = _PopulationNoiseWorkspaceConfiguration(
+            execution_population, self._state_layout
+        )
+        self._receiver_failures = {
+            name: tuple(_event_receiver_failures(mechanism))
+            for name, mechanism in execution_population.mech.mechanisms.items()
+        }
+        self._receivers = {
+            name: _PopulationReceive(execution_population, name, self._state_layout)
+            for name, failures in self._receiver_failures.items()
+            if not failures
+        }
+        self._receiver_shapes = {
+            name: tuple(
+                execution_population.mech.mechanisms[name]._net_receive_payload_shape()
+            )
+            for name in self._receivers
+        }
+        self._source_receiver_hooks = {
+            name: tuple(
+                (
+                    hook,
+                    tuple(
+                        (cls, hook in vars(cls), vars(cls).get(hook))
+                        for cls in type(population.mech.mechanisms[name]).__mro__
+                    ),
+                )
+                for hook in (*_RECEIVE_ADAPTER_NAMES, "net_receive_values")
+            )
+            for name in self._receivers
+        }
+        self._source_receiver_types = {
+            name: type(population.mech.mechanisms[name]) for name in self._receivers
+        }
+        self._continuous_receiver_failures = {
+            name: tuple(_continuous_receiver_failures(mechanism))
+            for name, mechanism in execution_population.mech.mechanisms.items()
+            if isinstance(mechanism, ContinuousSynapse)
+        }
+        self._continuous_receivers = {
+            name: _PopulationReceive(
+                execution_population, name, self._state_layout, continuous=True
+            )
+            for name, failures in self._continuous_receiver_failures.items()
+            if not failures
+        }
+        self._receiver_state_indices = {
+            name: (
+                receiver._state_indices
+                if receiver._copy_indices is None
+                else receiver._copy_indices
+            )
+            for name, receiver in {
+                **self._receivers,
+                **self._continuous_receivers,
+            }.items()
+        }
+        self._continuous_receiver_inputs = {
+            name: tuple(execution_population.mech.mechanisms[name]._continuous_inputs)
+            for name in self._continuous_receivers
+        }
+        self._continuous_input_shapes = {
+            name: {
+                input: tuple(
+                    execution_population.mech.mechanisms[name]._buffers[input].shape
+                )
+                for input in inputs
+            }
+            for name, inputs in self._continuous_receiver_inputs.items()
+        }
+        self._continuous_receiver_shapes = {
+            name: tuple(
+                execution_population.mech.mechanisms[
+                    name
+                ]._continuous_receive_payload_shape()
+            )
+            for name in self._continuous_receivers
+        }
+        self._continuous_old_names = {
+            name: dict(execution_population.mech.mechanisms[name]._continuous_input_old)
+            for name in self._continuous_receivers
+        }
+        self._source_continuous_receiver_hooks = {
+            name: tuple(
+                (
+                    hook,
+                    tuple(
+                        (cls, hook in vars(cls), vars(cls).get(hook))
+                        for cls in type(population.mech.mechanisms[name]).__mro__
+                    ),
+                )
+                for hook in (
+                    *_CONTINUOUS_RECEIVE_ADAPTER_NAMES,
+                    "continuous_receive_values",
+                )
+            )
+            for name in self._continuous_receivers
+        }
+        self._source_continuous_receiver_types = {
+            name: type(population.mech.mechanisms[name])
+            for name in self._continuous_receivers
+        }
         _validate_support_keys(
             population,
             reference=execution_population,
@@ -7598,8 +11895,8 @@ class FunctionalPopulation:
             )
         )
         # Direct construction remains supported for internal tests and
-        # extensions. Until the one-time purity audit succeeds, transition
-        # mappings defensively isolate every read-only input from the caller.
+        # extensions. Until lowering accepts the purity contract (by trust or
+        # diagnostic audit), isolate read-only transition inputs from callers.
         self._lowering_audit_complete = False
 
         # Multi component runtime trees have already been removed above, so
@@ -7607,7 +11904,13 @@ class FunctionalPopulation:
         # every discarded child mechanism/integrator/state tree a second time
         # merely to construct the parent preparation skeleton.
         preparation_population = _clone_execution_population(execution_population)
-        self._preparation = _PopulationPreparation(preparation_population, dt_tensor)
+        self._preparation = _PopulationPreparation(
+            preparation_population,
+            dt_tensor,
+            retain_initialization_materializations=(
+                _retain_initialization_materializations
+            ),
+        )
         if _geometry_binding_signature(self._preparation.geometry_bindings) != (
             _geometry_binding_signature(self._geometry_bindings)
         ):
@@ -7615,27 +11918,85 @@ class FunctionalPopulation:
                 "Preparation and transition geometry plans do not match."
             )
         self._prepared_buffers = self._preparation.layout
+        self._prepared_constant_aliases = {}
+        for entry in self._prepared_buffers:
+            if entry.kind != "constant":
+                continue
+            constant = next(
+                item
+                for item in self._parametrization_constants
+                if entry.key in item.aliases
+            )
+            self._prepared_constant_aliases[entry.key] = tuple(
+                f"population.{alias}"
+                for alias in constant.aliases
+                if f"population.{alias}" in self._base_mapping
+            )
+        live_constant_slots = {
+            entry.key for entry in self._prepared_buffers if entry.kind == "constant"
+        }
+        self._retained_preparation_constant_names = frozenset(
+            entry.key
+            for entry in self._parametrization_constants
+            if entry.key not in self._torch_constant_names
+            and not live_constant_slots.intersection(entry.aliases)
+            and not any(
+                alias.startswith("_material_geometry.")
+                or ".material_processes." in alias
+                for alias in entry.aliases
+            )
+        )
+        self._mechanism_delay_constant_names = tuple(
+            (
+                f"{path}.{name}",
+                next(
+                    item.key
+                    for item in self._parametrization_constants
+                    if f"{path}.{name}" in item.aliases
+                ),
+            )
+            for path, name, _expected in self._mechanism_delay_plan.constant_entries
+        )
+        self._mechanism_injection_constant_names = tuple(
+            (
+                f"{path}.{name}",
+                next(
+                    item.key
+                    for item in self._parametrization_constants
+                    if f"{path}.{name}" in item.aliases
+                ),
+            )
+            for path, name, _expected in self._mechanism_injection_plan.constant_entries
+        )
         self._prepared_buffer_visible_ranks = {
             entry.key: (
                 len(_module_at(execution_population, entry.module_path).shape_f)
-                if entry.kind == "effective_parameter"
-                else 0
+                if entry.kind in {"effective_parameter", "random_parameter"}
+                else (
+                    _module_at(
+                        execution_population, entry.module_path
+                    )._functional_material_visible_ranks[entry.buffer_name]
+                    if entry.kind == "material_process"
+                    else 0
+                )
             )
             for entry in self._prepared_buffers
         }
         self._prepared_workspace_slots = tuple(
             f"population.{entry.module_path}.{entry.buffer_name}"
             for entry in self._prepared_buffers
-            if entry.kind in {"derived", "timestep"}
+            if entry.kind in {"derived", "timestep", "material_process"}
         )
-        if any(name is not None for name in self._preparation.offset_names):
+        if not _retain_initialization_materializations and any(
+            name is not None for name in self._preparation.offset_names
+        ):
             self._initialization_failures = (
                 *self._initialization_failures,
                 "live effective parameters differ from their raw deterministic "
                 "materialization; initialization-time parameter transforms need "
                 "an explicit pure output contract",
             )
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             self._build_multi_component_plans(
                 population,
                 candidates=_multi_component_candidates,
@@ -7645,7 +12006,7 @@ class FunctionalPopulation:
             for name, value in _module_tensor_slots(self._preparation)
             if not name.startswith("component_physical_preparations.")
         }
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             leaked_component_runtime = sorted(
                 name
                 for mapping in (self._base_mapping, self._preparation_base_mapping)
@@ -7727,6 +12088,28 @@ class FunctionalPopulation:
             *self._population_parameter_names,
             *tuple(stimulation_schema),
         )
+        unavailable_initialization_parameters = sorted(
+            {
+                reference.removeprefix("parameters.")
+                for phase in ("pre", "post")
+                for hook in _initialization_transform_hooks(population, phase)
+                for action in (population._initialization_transforms[hook.action_name],)
+                for reference in (*action.reads, *action.writes)
+                if reference.startswith("parameters.")
+                and reference.removeprefix("parameters.")
+                not in self._population_parameter_names
+            }
+        )
+        if unavailable_initialization_parameters:
+            # Packed parents intentionally omit child runtime parameters such
+            # as their private temperature copies. Transforms may address only
+            # canonical public leaves, not discarded component configuration.
+            self._initialization_failures = (
+                *self._initialization_failures,
+                "initialization transforms reference parameters outside the "
+                "canonical functional parameter mapping: "
+                f"{unavailable_initialization_parameters}",
+            )
         self._parameter_shapes = {
             name: _shape_tuple(parameter)
             for name, parameter in population_parameters.items()
@@ -7746,7 +12129,79 @@ class FunctionalPopulation:
         self._parameter_devices.update(
             {name: contract.device for name, contract in stimulation_schema.items()}
         )
+        from ._poisson_stimulation import PoissonStimulationPlan
+
+        self._poisson_plan = PoissonStimulationPlan(self)
+        if not self._poisson_plan.enabled:
+            self._poisson_plan = None
+        self._stimulation_state_template = (
+            None if self._poisson_plan is None else self._poisson_plan.extract()
+        )
+        self._random_plan = None
+        from ._random_parameters import RandomParameterPlan, random_declarations
+        from ._runtime_noise import RuntimeNoisePlan, noise_declarations
+
+        self._noise_plan = (
+            RuntimeNoisePlan(population)
+            if noise_declarations(population)
+            or any(
+                getattr(owner, "_sde_rng_names", ())
+                for owner in _parameterized_owners(population)
+            )
+            else None
+        )
+        if self._noise_plan is not None:
+            self._initialization_failures = (
+                *self._initialization_failures,
+                *self._noise_plan.initialization_failures(),
+            )
+        if random_declarations(population) or self._noise_plan is not None:
+            self._random_plan = RandomParameterPlan(population)
+            self._random_plan.noise = self._noise_plan
+        from ._stimulation_rng import StimulationRNGPlan
+
+        self._stimulation_rng_plan = StimulationRNGPlan(self)
+        if self._stimulation_state_template is not None:
+            self._stimulation_state_template = self._stimulation_rng_plan.strip_state(
+                {"stimulation": self._stimulation_state_template}
+            )["stimulation"]
         self._state_schema = self._make_state_schema(self._state_layout)
+        if self._poisson_plan is not None:
+            self._state_schema["stimulation"] = {}
+            for path, value in _tensor_tree_paths(self._stimulation_state_template):
+                _put_path(
+                    self._state_schema,
+                    ("stimulation", *path),
+                    _StateLeaf(
+                        ("stimulation", *path),
+                        "",
+                        "",
+                        (),
+                        None,
+                        _shape_tuple(value),
+                        value.dtype,
+                        value.device,
+                    ),
+                )
+        if self._random_plan is not None:
+            _constants, random_state = self._random_plan.extract()
+            self._random_plan.rng_reference = random_state["rng"]
+            self._state_schema["random"] = {"rng": {}, "values": {}}
+            for path, value in _tensor_tree_paths(random_state):
+                _put_path(
+                    self._state_schema,
+                    ("random", *path),
+                    _StateLeaf(
+                        ("random", *path),
+                        "",
+                        "",
+                        (),
+                        None,
+                        _shape_tuple(value),
+                        value.dtype,
+                        value.device,
+                    ),
+                )
         self._initialization = None
         self._initialization_state_template = None
         if not self._initialization_failures:
@@ -7800,6 +12255,43 @@ class FunctionalPopulation:
         self._structured_step_graphs = {}
         self._structured_capture_errors = {}
         self._structured_capture_error = None
+        if _retain_initialization_materializations:
+            self._enable_retained_materializations()
+        if self._owned_cache_bound:
+            from ._population_cache import PopulationCachePlan
+
+            self._enable_cache_materializations()
+            try:
+                self._owned_cache_plan = PopulationCachePlan(
+                    self, population._caches["_steady_state"]
+                )
+                self._owned_cache_plan.bind_parameter_sources(self._parameter_sources())
+                self._owned_cache_state_template = self._extract_native_state(
+                    population
+                )
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                self._owned_cache_error = str(error)
+        if self._noise_plan is not None:
+            # SDE draws are call-local inputs on the owned transition. Install
+            # their temporary bindings after capturing the persistent tensor
+            # contract and creating the separate initialization program.
+            self._noise_plan.install(self._transition.population)
+        if self._transition.dufort_voltage_step:
+            from ._dufort import DufortCurrentPrograms
+
+            object.__setattr__(
+                self._transition,
+                "_dufort_current_programs",
+                DufortCurrentPrograms(
+                    self._transition.population.mech,
+                    self._transition.population.v,
+                    clock_owner=self._transition.population,
+                ),
+            )
+
+        from ._population_draws import PopulationRuntimeDrawPlan
+
+        self._runtime_draw_plan = PopulationRuntimeDrawPlan(self)
 
     def _build_multi_component_plans(
         self,
@@ -7812,11 +12304,38 @@ class FunctionalPopulation:
         canonical_by_identity = {
             id(parameter): name for name, parameter in parent_parameters.items()
         }
+        # A packed integrator can share a raw leaf with a retained component.
+        # Its first registered name then belongs to that component; select the
+        # live integrator's leaves by identity while retaining public names.
         canonical_parameter_names = {
-            name
-            for name in parent_parameters
-            if name == "celsius_param" or name.startswith("integrator.")
+            canonical_by_identity[id(parameter)]
+            for parameter in population.integrator.parameters()
         }
+        if "celsius_param" in parent_parameters:
+            canonical_parameter_names.add("celsius_param")
+        # A packed initial source may alias a built child's trained Ion or
+        # Material leaf. Its first public registration then belongs to that
+        # child, but its packed-parent alias remains an initialization input.
+        canonical_parameter_names.update(
+            _shared_initial_parameter_target_shapes(population, canonical_by_identity)
+        )
+        from ._initialization_sources import (
+            _registered_tensor_slots,
+            initialization_source_roots,
+        )
+
+        canonical_parameter_names.update(
+            canonical_by_identity[id(parameter)]
+            for _path, source in initialization_source_roots(population)
+            for _name, parameter in _registered_tensor_slots(source)
+            if id(parameter) in canonical_by_identity
+        )
+        material_geometry = population._modules.get("_material_geometry")
+        if material_geometry is not None and population.mech.material_processes:
+            canonical_parameter_names.update(
+                canonical_by_identity[id(parameter)]
+                for parameter in material_geometry.parameters()
+            )
 
         public_constant_shapes = {}
         public_constant_dtypes = {}
@@ -7839,13 +12358,17 @@ class FunctionalPopulation:
             if component is None:
                 component = _clone_execution_population(source_component)
                 component.initialize(populate_parameter_buffers=False)
+            from ._torch_parametrizations import install_output_schemas
+
+            install_output_schemas(component)
             topology_kind = _functional_topology_kind(component)
             group_k = (
                 int(packed_integrator.group_K[component_index])
                 if self._topology_kind == "multi_scalar"
                 else math.prod(source_component.core_shape())
             )
-            if topology_kind == "scalar_tree":
+            edge_parent_orig = None
+            if topology_kind in {"scalar_tree", "extcell_tree"}:
                 parent_index = torch.as_tensor(
                     source_component.compartment_graph.topology.parent_index,
                     device=source_component.device(),
@@ -7855,9 +12378,23 @@ class FunctionalPopulation:
                     parent_index >= 0,
                     as_tuple=False,
                 ).flatten()
-                solver_order = packed_integrator.SOLVER_cat[
-                    solver_cursor : solver_cursor + group_k
-                ]
+                edge_parent_orig = parent_index.index_select(0, edge_child_orig)
+                solver_order = (
+                    packed_integrator.SOLVER_cat[
+                        solver_cursor : solver_cursor + group_k
+                    ]
+                    if topology_kind == "scalar_tree"
+                    else None
+                )
+                if topology_kind == "scalar_tree":
+                    # Scalar Multi emits its compact axial/ve edge maps in
+                    # solver-node order, which need not match storage order.
+                    # Keep conductances aligned with those immutable endpoints
+                    # even when the root is not storage row zero.
+                    edge_child_orig = solver_order[
+                        parent_index.index_select(0, solver_order) >= 0
+                    ]
+                    edge_parent_orig = parent_index.index_select(0, edge_child_orig)
             else:
                 edge_child_orig = None
                 solver_order = None
@@ -7865,6 +12402,7 @@ class FunctionalPopulation:
             component_preparation = _ComponentPhysicalPreparation(
                 component,
                 edge_child_orig=edge_child_orig,
+                edge_parent_orig=edge_parent_orig,
                 solver_order=solver_order,
             )
             physical_preparations.append(component_preparation)
@@ -8023,9 +12561,9 @@ class FunctionalPopulation:
                 )
             )
 
-        # Register adapters below the already-audited parent preparation. The
-        # parent purity probe then deep-copies and fingerprints their complete
-        # physical module trees alongside its own workspace builder.
+        # Register adapters below the parent preparation. Optional purity
+        # diagnostics inspect their complete physical module trees alongside
+        # the parent's workspace builder.
         self._preparation.component_physical_preparations = torch.nn.ModuleList(
             physical_preparations
         )
@@ -8093,7 +12631,9 @@ class FunctionalPopulation:
 
     def _ensure_structured_step_graph(self, ve_present, intra_present):
         """Lazily capture one inference graph outside a Dynamo boundary."""
-        signature = (ve_present, intra_present)
+        # make_fx specializes Python assembly policy. A captured inference
+        # graph must never be reused under another ctx policy.
+        signature = (ve_present, intra_present, MEMBRANE_ASSEMBLY.value)
         if signature in self._structured_step_graphs:
             return True
         if signature in self._structured_capture_errors:
@@ -8104,7 +12644,7 @@ class FunctionalPopulation:
             # established unrolled fallback unless it was explicitly prewarmed.
             return False
         try:
-            graph = self._capture_structured_step_graph(*signature)
+            graph = self._capture_structured_step_graph(ve_present, intra_present)
         except Exception as exc:
             # Structured control flow is an inference compilation optimization,
             # not part of the functional semantics. Cache failure per signature
@@ -8144,12 +12684,13 @@ class FunctionalPopulation:
         return FunctionalExtra(self._population, extra)
 
     def make_callbacks(self, callbacks):
-        """Bind named native functional callbacks into an immutable plan.
+        """Bind a named mapping of callback configurations to this plan.
 
-        Callbacks execute in functional rollouts and host runners. A bound
-        compiled chunk fuses each callback update with its model transition.
-        Values must implement :class:`dendra.func.FunctionalCallback`; built-ins
-        such as :class:`dendra.func.Recorder` provide familiar common behavior.
+        Accepts supported built-in Dendra callbacks and pure
+        :class:`FunctionalCallback` implementations. Returns :class:`FunctionalCallbacks`
+        for native/functional execution on compatible models. Live callback carry
+        belongs to the returned collection; use callback export/restore to transfer
+        carry between independently prepared collections.
         """
         from ._callbacks import FunctionalCallbacks
 
@@ -8169,8 +12710,144 @@ class FunctionalPopulation:
                 "FunctionalPopulation plan"
             )
 
+    def _validate_rng_load_policies(self) -> None:
+        for name, rng, ignore in self._source_rng_load_policies:
+            if bool(rng._ignore_rng_on_load) != ignore:
+                raise FunctionalizationError(
+                    f"RNG load policy for {name!r} changed; lower the Population again"
+                )
+
     def _validate_source(self) -> None:
-        if not torch.compiler.is_compiling():
+        for owner, family, hooks, slots in self._population_source_contracts:
+            if (
+                not _subclass_contract_matches(owner, family, hooks)
+                or not _subclass_slot_contract_matches(owner, family, slots)
+                or owner._step is not _standard_population_step
+            ):
+                raise FunctionalizationError(
+                    "The source Population or packed component canonical execution "
+                    "or runtime-attribute contract changed after make_functional(); "
+                    "lower it again"
+                )
+        if self._poisson_plan is not None:
+            self._poisson_plan.validate_source()
+        self._stimulation_rng_plan.validate_source()
+        self._validate_rng_load_policies()
+        if self._torch_source_bindings:
+            from ._torch_parametrizations import source_binding_signature
+
+            if (
+                source_binding_signature(self._population)
+                != self._torch_source_bindings
+            ):
+                raise FunctionalizationError(
+                    "Source torch parametrization structure changed; lower again"
+                )
+        if self._custom_material_plans:
+            if torch.compiler.is_compiling():
+                if (
+                    tuple(
+                        (name, plan.source_binding_signature())
+                        for name, plan in self._custom_material_plans.items()
+                    )
+                    != self._source_custom_material_bindings
+                ):
+                    raise FunctionalizationError(
+                        "The source custom MaterialProcess recipe changed; lower again"
+                    )
+                _compiled_validate_custom_material_sources(self)
+            else:
+                for plan in self._custom_material_plans.values():
+                    plan.validate_source()
+        if torch.compiler.is_compiling():
+            if (
+                self._initialization_source_plan.source_binding_signature()
+                != self._source_initialization_bindings
+            ):
+                raise FunctionalizationError(
+                    "The source initialization recipes, dependencies, or aliases changed; lower again"
+                )
+            _compiled_validate_initialization_sources(self)
+        else:
+            self._initialization_source_plan.validate_source()
+        if torch.compiler.is_compiling():
+            if (
+                self._mechanism_injection_plan.source_binding_signature()
+                != self._source_mechanism_injection_bindings
+            ):
+                raise FunctionalizationError(
+                    "The source mechanism injection registration, ownership, or "
+                    "waveform bindings changed; lower the Population again"
+                )
+            _compiled_validate_mechanism_injection_source(self)
+            self._mechanism_injection_plan.validate_source_tensor_values()
+        else:
+            self._mechanism_injection_plan.validate_source()
+        if torch.compiler.is_compiling():
+            if (
+                self._mechanism_delay_plan.source_binding_signature()
+                != self._source_mechanism_delay_bindings
+            ):
+                raise FunctionalizationError(
+                    "The source mechanism delay registration, layout, or helper "
+                    "bindings changed; lower the Population again"
+                )
+            _compiled_validate_mechanism_delay_source(self)
+            self._mechanism_delay_plan.validate_source_tensor_values()
+        else:
+            self._mechanism_delay_plan.validate_source()
+        if torch.compiler.is_compiling():
+            if (
+                self._table_plan.source_binding_signature()
+                != self._source_table_bindings
+            ):
+                raise FunctionalizationError(
+                    "The source TABLE dispatch, layout, or callable bindings changed; "
+                    "lower the Population again"
+                )
+            _compiled_validate_table_source(self)
+        else:
+            self._table_plan.validate_source()
+        if self._random_plan is None and any(
+            owner.random_parameters
+            or owner.runtime_noises
+            or getattr(owner, "_sde_rng_names", ())
+            for owner in _parameterized_owners(self._population)
+        ):
+            raise FunctionalizationError(
+                "The source random parameter resampling declarations changed; initialize and lower the Population again"
+            )
+        if self._random_plan is not None:
+            from ._random_parameters import validate_random_source
+
+            validate_random_source(
+                self._random_plan
+            ) if torch.compiler.is_compiling() else self._random_plan.validate_source()
+        if torch.compiler.is_compiling():
+            # The general source fingerprint is evaluated once per graph. Keep
+            # public binding paths and their literal plan visible to Dynamo so
+            # a later bind_input() cannot reuse that graph with stale routing.
+            if (
+                _input_binding_declarations(self._population)
+                != self._source_input_declarations
+                or _input_binding_declarations(self._population.mech)
+                != self._source_handler_input_declarations
+                or self._population.mech._input_binding_plan
+                != self._source_input_binding_plan
+            ):
+                raise FunctionalizationError(
+                    "The source Population input bindings changed after "
+                    "make_functional(); rebuild and lower it again."
+                )
+        else:
+            if (
+                _input_binding_index_signature(self._population)
+                != self._source_input_binding_indices
+            ):
+                raise FunctionalizationError(
+                    "The source Population input-binding placement changed after "
+                    "make_functional(); rebuild and lower it again."
+                )
             current_support_binding = _support_key_runtime_binding(self._population)
             if current_support_binding != self._source_support_key_binding:
                 if (
@@ -8236,7 +12913,7 @@ class FunctionalPopulation:
                     "changed after make_functional(); lower it again."
                 )
         if (
-            self._topology_kind in {"multi_point", "multi_scalar"}
+            self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             and not torch.compiler.is_compiling()
         ):
             if (
@@ -8259,9 +12936,9 @@ class FunctionalPopulation:
                     "make_functional(); construct and lower a new Cable."
                 )
         structure_matches = (
-            _compiled_structure_signature_matches(self._population, self._fingerprint)
+            _compiled_structure_signature_matches(self)
             if torch.compiler.is_compiling()
-            else _structure_signature(self._population) == self._fingerprint
+            else _structure_for_plan(self) == self._fingerprint
         )
         if (
             _structure_ids(self._population) != self._source_ids
@@ -8280,8 +12957,23 @@ class FunctionalPopulation:
             self._intra._validate_source()
 
     def _validate_compatible_population(self, population) -> None:
+        subclass_failures = _population_subclass_failures(population)
+        if subclass_failures:
+            raise FunctionalizationError("; ".join(subclass_failures))
+        if self._poisson_plan is not None:
+            self._poisson_plan.validate_compatible_population(population)
         if not isinstance(population, Population):
             raise TypeError("population must be a dendra Population")
+        for name, plan in self._custom_material_plans.items():
+            if name not in population.mech.material_processes:
+                raise FunctionalizationError(
+                    "Population custom MaterialProcess layout does not match this plan"
+                )
+            plan.validate_compatible(population.mech.material_processes[name])
+        self._table_plan.validate_population(population)
+        self._mechanism_delay_plan.validate_population(population)
+        self._mechanism_injection_plan.validate_population(population)
+        self._initialization_source_plan.validate_population(population)
         if not getattr(population, "is_built", False) or getattr(
             population, "_flag_rebuild", False
         ):
@@ -8294,6 +12986,7 @@ class FunctionalPopulation:
             reference=self._transition.population,
             context="Compatible Population",
         )
+        _validate_input_binding_indices(population, self._transition.population)
         if (
             _additional_parameter_layout_signature(population)
             != self._additional_parameter_layout
@@ -8310,10 +13003,10 @@ class FunctionalPopulation:
                 "Population in-graph parametrization buffer layout does not match "
                 "this functional execution plan."
             )
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
-            if not _is_scalar_multi(population):
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
+            if not _is_multi(population):
                 raise FunctionalizationError(
-                    "Population is not an exact scalar MultiPopulation."
+                    "Population is not a compatible MultiPopulation."
                 )
             if _multi_component_topology_signature(
                 population
@@ -8333,12 +13026,15 @@ class FunctionalPopulation:
         elif self._topology_kind == "native_cable":
             if not _is_native_cable(population):
                 raise FunctionalizationError(
-                    "Population is not an exact canonical native Cable."
+                    "Population is not a compatible canonical native Cable."
                 )
             failure = _validate_native_cable_source(population)
             if failure is not None:
                 raise FunctionalizationError(failure)
-            failure = _effective_population_parameter_failure(population)
+            failure = _effective_population_parameter_failure(
+                population,
+                allow_retained=self._retain_initialization_materializations,
+            )
             if failure is not None:
                 raise FunctionalizationError(failure)
         elif self._topology_kind == "scalar_tree":
@@ -8349,7 +13045,10 @@ class FunctionalPopulation:
             failure = _validate_scalar_tree_source(population)
             if failure is not None:
                 raise FunctionalizationError(failure)
-            failure = _effective_population_parameter_failure(population)
+            failure = _effective_population_parameter_failure(
+                population,
+                allow_retained=self._retain_initialization_materializations,
+            )
             if failure is not None:
                 raise FunctionalizationError(failure)
         elif self._topology_kind == "extcell_tree":
@@ -8360,15 +13059,18 @@ class FunctionalPopulation:
             failure = _validate_extcell_tree_source(population)
             if failure is not None:
                 raise FunctionalizationError(failure)
-            failure = _effective_population_parameter_failure(population)
+            failure = _effective_population_parameter_failure(
+                population,
+                allow_retained=self._retain_initialization_materializations,
+            )
             if failure is not None:
                 raise FunctionalizationError(failure)
-        if _structure_signature(population) != self._fingerprint:
+        if _structure_for_plan(self, population) != self._fingerprint:
             raise FunctionalizationError(
                 "Population structure does not match this functional execution plan."
             )
         if (
-            _state_layout_signature(_state_layout(population))
+            _state_layout_signature(self._native_state_layout(population))
             != self._state_layout_signature
         ):
             raise FunctionalizationError(
@@ -8376,6 +13078,9 @@ class FunctionalPopulation:
                 "execution plan. Rebuild and lower the model again after changing "
                 "integrator state buffers or their shape, dtype, or device."
             )
+        if self._random_plan is not None:
+            self._random_plan.validate_compatible_population(population)
+        self._stimulation_rng_plan.validate_compatible_population(population)
 
     def _validate_parameters(self, parameters) -> None:
         if not isinstance(parameters, Mapping):
@@ -8402,6 +13107,129 @@ class FunctionalPopulation:
                     f"parameter {name!r} must use {expected_device}/{expected_dtype}"
                 )
 
+    def _materialization_source_paths(self):
+        """Registered effective operands shared by cache and ordered initialization."""
+        paths = []
+        for name in self._preparation.population_parameter_names:
+            if name in self._population._buffers:
+                paths.append(name)
+        if self._multi_component_plans:
+            # Native packed initialization restores assembled physical buffers
+            # independently of the component getters. Point and block solvers
+            # consume these parent fields; scalar DHS still reads child fields.
+            paths.extend(
+                name
+                for name in ("diam", "dx", "_component_area", "xc", "xg")
+                if name in self._population._buffers
+            )
+        paths.extend(
+            f"{entry.module_path}.{entry.buffer_name}"
+            for entry in self._prepared_buffers
+            if entry.kind in {"effective_parameter", "derived", "random_parameter"}
+        )
+        for record, preparation in zip(
+            self._multi_component_plans,
+            getattr(self._preparation, "component_physical_preparations", ()),
+            strict=True,
+        ):
+            component = self._population.populations[record.name]
+            paths.extend(
+                f"populations.{record.name}.{name}"
+                for name in preparation.population_parameter_names
+                if name in component._buffers
+            )
+        return tuple(dict.fromkeys(paths))
+
+    def _materialization_specs(self, paths, prefix):
+        specs = []
+        for path in paths:
+            value = self._population.get_buffer(path)
+            specs.append(
+                (
+                    f"{prefix}.values.{path}",
+                    path,
+                    _shape_tuple(value),
+                    value.dtype,
+                    value.device,
+                )
+            )
+        return tuple(specs)
+
+    def _enable_cache_materializations(self) -> None:
+        """Expose detached native operands for a cache-bound Population plan."""
+        if not self._cache_value_specs:
+            self._cache_value_specs = self._materialization_specs(
+                self._materialization_source_paths(), "cache"
+            )
+
+    def _enable_retained_materializations(self) -> None:
+        """Expose independently owned, differentiable initialization operands.
+
+        Network initialization captures each owner's values before later owners
+        can write shared sources. Effective buffers and solver workspaces have
+        separate slots: a later in-place buffer write need not rebuild a solver.
+        """
+        if self._retained_materializations.slots:
+            return
+        paths = list(self._materialization_source_paths())
+        paths.extend(
+            f"{entry.module_path}.{entry.buffer_name}"
+            for entry in self._prepared_buffers
+            if entry.kind == "timestep"
+        )
+        paths.extend(f"integrator.{name}" for name in self._integrator_workspace_names)
+        specs = self._materialization_specs(
+            tuple(dict.fromkeys(paths)), "materializations"
+        )
+        prepared_paths = {}
+        for name in self._preparation.population_parameter_names:
+            prepared_paths[name] = ("population", name)
+        for entry in self._prepared_buffers:
+            if entry.kind != "torch_parameter":
+                prepared_paths[f"{entry.module_path}.{entry.buffer_name}"] = (
+                    "mechanisms",
+                    entry.key,
+                )
+        for name in self._integrator_workspace_names:
+            prepared_paths[f"integrator.{name}"] = ("integrator", name)
+        self._retained_materializations = _RetainedMaterializationInventory.from_specs(
+            specs, prepared_paths
+        )
+
+    def _clear_retained_materializations(self, constants):
+        if not self._retained_materializations.slots:
+            return constants
+        return _clear_retained_frame(self._retained_materializations, constants)
+
+    def _retain_materializations(self, parameters, constants, *, prepared=None):
+        """Capture native preparation without detaching fresh initialization graphs."""
+        if not self._retained_materializations.slots:
+            return constants
+        if prepared is None:
+            prepared = self._prepare_values(
+                parameters, constants, use_snapshot_offsets=False
+            )
+        values = prepared.get("materializations", {})
+        return _capture_retained_frame(
+            self._retained_materializations, constants, values
+        )
+
+    def _cache_preparation_inputs(
+        self,
+        constants,
+        *,
+        prefix="",
+        use_snapshot_offsets=True,
+        snapshot_baseline_capture=None,
+    ):
+        return _materialization_overrides(
+            self,
+            constants,
+            prefix=prefix,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=snapshot_baseline_capture,
+        )
+
     def _validate_constants(self, constants) -> None:
         if not isinstance(constants, Mapping):
             raise TypeError("constants must be a mapping of named tensors")
@@ -8411,13 +13239,27 @@ class FunctionalPopulation:
                 *(entry.key for entry in self._parametrization_constants),
                 "dt",
             }
-            if self._topology_kind in {"multi_point", "multi_scalar"}
+            if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             else {
                 *self._geometry_constant_names,
                 *(entry.key for entry in self._parametrization_constants),
                 "dt",
             }
         )
+        if self._random_plan is not None:
+            expected_names.update(self._random_plan.schema)
+        expected_names.update(self._noise_workspace_constants)
+        if self._cache_value_specs:
+            expected_names.update(name for name, *_ in self._cache_value_specs)
+            expected_names.add("cache.active")
+        for slot in self._retained_materializations.slots:
+            expected_names.update(
+                (
+                    slot.value_key,
+                    slot.active_key,
+                    slot.baseline_key,
+                )
+            )
         if set(constants) != expected_names:
             missing = sorted(expected_names - set(constants))
             unexpected = sorted(set(constants) - expected_names)
@@ -8434,7 +13276,7 @@ class FunctionalPopulation:
                 )
                 for name in self._multi_public_constant_shapes
             )
-            if self._topology_kind in {"multi_point", "multi_scalar"}
+            if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}
             else (
                 (
                     name,
@@ -8467,6 +13309,51 @@ class FunctionalPopulation:
                 raise ValueError(
                     f"constant {entry.key!r} must use {entry.device}/{entry.dtype}"
                 )
+        from ._noise_workspaces import validate_noise_workspace_constants
+
+        validate_noise_workspace_constants(self._population, constants)
+        self._mechanism_delay_plan.validate_constant_values(
+            {
+                slot: constants[name]
+                for slot, name in self._mechanism_delay_constant_names
+            }
+        )
+        self._mechanism_injection_plan.validate_constant_values(
+            {
+                slot: constants[name]
+                for slot, name in self._mechanism_injection_constant_names
+            }
+        )
+        for name, _path, shape, dtype, device in self._cache_value_specs:
+            value = constants[name]
+            if not torch.is_tensor(value) or _shape_tuple(value) != shape:
+                raise ValueError(f"constant {name!r} must have cached shape {shape}")
+            if value.dtype != dtype or value.device != device:
+                raise ValueError(f"constant {name!r} must use {device}/{dtype}")
+        if self._cache_value_specs:
+            active = constants["cache.active"]
+            if (
+                not torch.is_tensor(active)
+                or _shape_tuple(active) != ()
+                or active.dtype != torch.bool
+                or active.device != self.device
+            ):
+                raise ValueError(
+                    f"constant 'cache.active' must be a scalar bool on {self.device}"
+                )
+        _validate_retained_constants(self, constants)
+        if self._random_plan is not None:
+            for name, (shape, dtype, device) in self._random_plan.schema.items():
+                value = constants[name]
+                if (
+                    not torch.is_tensor(value)
+                    or _shape_tuple(value) != shape
+                    or value.dtype != dtype
+                    or value.device != device
+                ):
+                    raise ValueError(
+                        f"RAND constant {name!r} has incompatible Tensor schema"
+                    )
         dt = constants["dt"]
         if not torch.is_tensor(dt) or _shape_tuple(dt) != ():
             raise ValueError("constant 'dt' must be a scalar Tensor")
@@ -8484,6 +13371,53 @@ class FunctionalPopulation:
     def _validate_initialization(self, inputs) -> None:
         if not isinstance(inputs, InitializationInput):
             raise TypeError("inputs must be an InitializationInput")
+        if (
+            self._bind_owned_cache
+            and ("_steady_state" in self._population._caches)
+            != self._owned_cache_source_present
+        ):
+            raise FunctionalizationError(
+                "Population steady-state cache presence changed; lower again"
+            )
+        if self._owned_cache_bound:
+            failures = (
+                _compiled_owned_cache_initialization_failures(self._population)
+                if torch.compiler.is_compiling()
+                else _owned_cache_initialization_failures(self._population)
+            )
+            if failures:
+                raise FunctionalizationError("\n".join(failures))
+            if self._owned_cache_error is not None:
+                raise FunctionalizationError(
+                    f"Population steady-state cache cannot be restored: {self._owned_cache_error}"
+                )
+            reference = self._owned_cache_plan._reference
+            if not isinstance(inputs.cache, Mapping) or set(inputs.cache) != set(
+                reference
+            ):
+                raise FunctionalizationError(
+                    "Population steady-state cache schema changed; lower again"
+                )
+            for name, expected in reference.items():
+                value = inputs.cache[name]
+                actual, tree_spec = torch.utils._pytree.tree_flatten(value)
+                reference_leaves, reference_spec = torch.utils._pytree.tree_flatten(
+                    expected
+                )
+                if tree_spec != reference_spec or any(
+                    not torch.is_tensor(leaf)
+                    or _shape_tuple(leaf) != _shape_tuple(target)
+                    or leaf.dtype != target.dtype
+                    or leaf.device != target.device
+                    for leaf, target in zip(actual, reference_leaves, strict=True)
+                ):
+                    raise FunctionalizationError(
+                        f"Population steady-state cache {name!r} has incompatible tensor schema"
+                    )
+        elif inputs.cache is not None:
+            raise FunctionalizationError(
+                "This Population plan has no bound steady-state cache; lower again"
+            )
         value = inputs.v_init
         if not torch.is_tensor(value):
             raise TypeError("initialization v_init must be a Tensor")
@@ -8586,23 +13520,146 @@ class FunctionalPopulation:
             raise TypeError("state must be a mapping")
         self._validate_state_node(state, self._state_schema)
 
+    def _parameter_sources(
+        self, population: Population | None = None
+    ) -> dict[str, torch.Tensor]:
+        """Map execution parameter names to their original authored Tensors.
+
+        Stimulation constants are promoted into the parameter packet alongside
+        raw Population parameters. Their original source identity is retained
+        here even when extraction casts or clones a field or Waveform buffer.
+        Compatible alternate Populations supply their own registered parameters
+        and injections; bound extra remains attached to this plan's raw spec.
+        """
+        population = self._population if population is None else population
+        self._validate_compatible_population(population)
+        sources = dict(population.named_parameters())
+        if self._multi_canonical_parameter_names is not None:
+            sources = {
+                name: sources[name] for name in self._multi_canonical_parameter_names
+            }
+        sources.update(self._intra._tensor_sources(population))
+        sources.update(self._extra._tensor_sources())
+        return sources
+
+    def _parametrization_constant_sources(self, population: Population | None = None):
+        """Project represented configuration keys to original registered buffers."""
+        return {
+            entry.key: (self._population if population is None else population)
+            .get_submodule(entry.module_path)
+            ._buffers[entry.buffer_name]
+            for entry in self._parametrization_constants
+        }
+
+    def _native_state_layout(self, population):
+        """Match configured native workspaces and cold solver templates."""
+        layout = {leaf.public_path: leaf for leaf in _state_layout(population)}
+        for leaf in self._state_layout:
+            if leaf.public_path[0] != "material_preparation":
+                continue
+            if leaf.public_path not in layout:
+                process = population.mech.material_processes[leaf.public_path[1]]
+                if not process._spatial_configured:
+                    # A freshly initialized native Population configures its
+                    # solver at the first run boundary. Lowering has already
+                    # configured an isolated clone at this plan's timestep.
+                    layout[leaf.public_path] = leaf
+        ordered = tuple(
+            layout.pop(leaf.public_path)
+            for leaf in self._state_layout
+            if leaf.public_path in layout
+        )
+        return (*ordered, *layout.values())
+
+    def _extract_native_state(self, population, *, snapshots=None):
+        from ._material_stochasticity import stochastic_diffusion_timestep_matches
+
+        state = {}
+        configured = None
+        if any(
+            leaf.public_path[0] == "material_preparation"
+            and not stochastic_diffusion_timestep_matches(
+                population.mech.material_processes[leaf.public_path[1]], self.dt
+            )
+            for leaf in self._state_layout
+        ):
+            configured = _clone_execution_population(population)
+            for process in configured.mech.material_processes.values():
+                if isinstance(process, DiffusionProcess) and process.runtime_noises:
+                    process.set_dt(
+                        torch.as_tensor(self.dt, device=self.device, dtype=self.dtype)
+                    )
+            configured = {
+                leaf.public_path: _buffer_at(
+                    configured, leaf.module_path, leaf.buffer_name
+                )
+                for leaf in _state_layout(configured)
+                if leaf.public_path[0] == "material_preparation"
+            }
+        for leaf in self._native_state_layout(population):
+            if leaf.public_path[
+                0
+            ] == "material_preparation" and not stochastic_diffusion_timestep_matches(
+                population.mech.material_processes[leaf.public_path[1]], self.dt
+            ):
+                value = configured[leaf.public_path]
+            else:
+                value = _buffer_at(population, leaf.module_path, leaf.buffer_name)
+            _put_path(
+                state,
+                leaf.public_path,
+                _clone_tensor(value)
+                if snapshots is None
+                else snapshots.snapshot(value, value),
+            )
+        if self._poisson_plan is not None:
+            state["stimulation"] = self._poisson_plan.extract(population)
+        return state
+
     def extract(self, population: Population | None = None) -> PopulationTensors:
-        """Extract explicit initialization, constants/state, and raw parameters."""
+        """Read explicit sources and state from a compatible initialized Population.
+
+        ``population`` defaults to the source used during lowering. Raw parameter
+        Tensors retain their native identities; constants, runtime state and
+        initialization values are snapshots. Registered stimulation leaves are included
+        in the source mappings. Use ``tensors.independent_parameters(...)`` for owned
+        optimization leaves, or :func:`capture_continuation` for an owned detached
+        snapshot of the complete execution boundary.
+
+        Returns
+        -------
+        PopulationTensors
+            Parameter, constant, state and initialization-input mappings accepted by
+            this plan. Extraction does not initialize or advance the native model.
+        """
+        return self._extract(population)
+
+    def _extract(self, population=None, *, snapshots=None):
+        """Extract with optional aggregate ownership, retaining public defaults."""
+        self._validate_rng_load_policies()
         population = self._population if population is None else population
         self._validate_compatible_population(population)
         if (
-            _initialization_structure_signature(population)
+            _initialization_structure_for_plan(self, population)
             != self._initialization_fingerprint
         ):
             raise FunctionalizationError(
                 "Population initialization structure does not match this "
                 "functional execution plan."
             )
-        state = {}
-        for leaf in _state_layout(population):
-            value = _buffer_at(population, leaf.module_path, leaf.buffer_name)
-            _put_path(state, leaf.public_path, _clone_tensor(value))
+        state = self._extract_native_state(population, snapshots=snapshots)
+        if self._random_plan is not None:
+            _random_constants, state["random"] = self._random_plan.extract(population)
+        state = self._stimulation_rng_plan.strip_state(state)
         self._validate_state(state)
+
+        def constant_snapshot(value):
+            return (
+                _clone_tensor(value)
+                if snapshots is None
+                else snapshots.snapshot(value, value)
+            )
+
         all_parameters = dict(population.named_parameters())
         parameters = (
             {
@@ -8628,7 +13685,7 @@ class FunctionalPopulation:
             # execution-time tensor inputs. Keep them beside raw parameters so
             # changing stimulation never invalidates the prepared dynamics.
             parameters.update(stimulation.constants)
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             constants = {}
             for component_record in self._multi_component_plans:
                 component = population.populations[component_record.name]
@@ -8660,10 +13717,10 @@ class FunctionalPopulation:
                                 "exactly equal values."
                             )
                         continue
-                    constants[public_name] = _clone_tensor(value)
+                    constants[public_name] = constant_snapshot(value)
             constants.update(
                 {
-                    entry.key: _clone_tensor(
+                    entry.key: constant_snapshot(
                         _buffer_at(population, entry.module_path, entry.buffer_name)
                     )
                     for entry in self._parametrization_constants
@@ -8677,20 +13734,20 @@ class FunctionalPopulation:
         else:
             constants = {
                 **{
-                    name: _clone_tensor(_geometry_constant_value(population, name))
+                    name: constant_snapshot(_geometry_constant_value(population, name))
                     for name in self._geometry_constant_names
                     if name
                     not in {"canonical_area_cm2", "canonical_edge_resistance_ohm"}
                 },
                 **(
                     {
-                        "canonical_area_cm2": _clone_tensor(
+                        "canonical_area_cm2": constant_snapshot(
                             _geometry_constant_value(
                                 population,
                                 "canonical_area_cm2",
                             )
                         ),
-                        "canonical_edge_resistance_ohm": _clone_tensor(
+                        "canonical_edge_resistance_ohm": constant_snapshot(
                             _geometry_constant_value(
                                 population,
                                 "canonical_edge_resistance_ohm",
@@ -8702,7 +13759,7 @@ class FunctionalPopulation:
                     else {}
                 ),
                 **{
-                    entry.key: _clone_tensor(
+                    entry.key: constant_snapshot(
                         _buffer_at(population, entry.module_path, entry.buffer_name)
                     )
                     for entry in self._parametrization_constants
@@ -8713,6 +13770,42 @@ class FunctionalPopulation:
                     dtype=self.dtype,
                 ),
             }
+        from ._noise_workspaces import noise_workspace_constant_values
+
+        constants.update(noise_workspace_constant_values(population))
+        if self._cache_value_specs:
+            constants.update(
+                {
+                    name: population.get_buffer(path).detach().clone()
+                    for name, path, _shape, _dtype, _device in self._cache_value_specs
+                }
+            )
+            constants["cache.active"] = torch.zeros(
+                (), device=self.device, dtype=torch.bool
+            )
+        if self._retained_materializations.slots:
+            _seed_snapshot_frame(self, population, constants)
+        if self._random_plan is not None:
+            constants.update(_random_constants)
+        if self._retained_materializations.slots:
+            baselines = {}
+            with torch.no_grad():
+                self._prepare_values(
+                    parameters,
+                    constants,
+                    _snapshot_baseline_capture=baselines,
+                )
+            _complete_snapshot_baselines(self, constants, baselines)
+            if self._has_snapshot_materialization_offsets is None:
+                self._has_snapshot_materialization_offsets = any(
+                    not torch.equal(
+                        constants[
+                            self._retained_materializations.by_path[path].value_key
+                        ],
+                        baseline,
+                    )
+                    for path, baseline in baselines.items()
+                )
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         initialization_states = {}
@@ -8746,7 +13839,19 @@ class FunctionalPopulation:
             v_init=_clone_tensor(population.expanded_v_init(self.shape)),
             states=initialization_states,
             transforms=initialization_transform_values,
+            cache=(
+                None
+                if self._owned_cache_plan is None
+                else {
+                    name: torch.utils._pytree.tree_map(
+                        lambda leaf: leaf.detach().clone(), value
+                    )
+                    for name, value in self._owned_cache_plan.default.items()
+                }
+            ),
         )
+        if snapshots is not None:
+            parameters = snapshots.tree(self._parameter_sources(population), parameters)
         return PopulationTensors(
             parameters=parameters,
             constants=constants,
@@ -8769,6 +13874,14 @@ class FunctionalPopulation:
         *,
         preparation=None,
         base_mapping=None,
+        for_initialization=False,
+        use_snapshot_offsets=True,
+        material_area=None,
+        cache_values=None,
+        cache_active=None,
+        random_inputs=None,
+        root_only=False,
+        root_random_values=None,
     ):
         preparation = self._preparation if preparation is None else preparation
         base_mapping = (
@@ -8778,6 +13891,16 @@ class FunctionalPopulation:
         # copies. Invalid writes cannot escape into caller tensors or poison
         # the retained preparation skeleton.
         mapping = {name: value.clone() for name, value in base_mapping.items()}
+        from ._noise_workspaces import noise_workspace_preparation_mapping
+
+        mapping.update(
+            {
+                name: value.clone()
+                for name, value in noise_workspace_preparation_mapping(
+                    parametrization_constants
+                ).items()
+            }
+        )
         for name in self._population_parameter_names:
             value = parameters[name].clone()
             for slot in self._preparation_parameter_slots[name]:
@@ -8796,8 +13919,25 @@ class FunctionalPopulation:
                 None if diam_original is None else diam_original.clone(),
                 dt.clone(),
             ),
+            {
+                "for_initialization": for_initialization,
+                "use_snapshot_offsets": use_snapshot_offsets,
+                "material_area": (
+                    None if material_area is None else material_area.clone()
+                ),
+                "cache_values": cache_values,
+                "cache_active": cache_active,
+                "random_inputs": random_inputs,
+                "root_only": root_only,
+                "root_random_values": root_random_values,
+            },
             tie_weights=False,
         )
+        if root_only:
+            return outputs
+        random_outputs = None
+        if random_inputs is not None:
+            *outputs, random_outputs = outputs
         if preparation.local_geometry_bindings:
             population_outputs, mechanism_outputs, local_geometry_outputs = outputs
         else:
@@ -8818,11 +13958,36 @@ class FunctionalPopulation:
                 strict=True,
             )
         }
-        return population_values, mechanism_values, tuple(local_geometry_outputs)
+        return (
+            population_values,
+            mechanism_values,
+            tuple(local_geometry_outputs),
+            random_outputs,
+        )
 
     def prepare(self, parameters, constants):
-        """Materialize an eagerly reusable, freshness-checked tensor plan."""
+        """Materialize reusable coefficients from raw parameters and constants.
+
+        Returns an opaque plan-bound prepared value for :meth:`step` and
+        :meth:`rollout`. Input identities and mutation versions are checked when it is
+        used; changing its sources requires preparing again. Inference tensors without
+        version counters are not accepted as preparation inputs.
+
+        Preparation records gradients under the caller's gradient mode. Recreate it
+        for independent training forwards. For automatic per-invocation ownership use
+        ``bind(parameters, constants=constants)``. Inside ``torch.compile`` use
+        :meth:`prepare_and_step` or :meth:`prepare_and_rollout` instead of transporting
+        an opaque prepared value across the compiled boundary.
+        """
         self._validate_source()
+        return self._prepare_source_validated(parameters, constants)
+
+    def _prepare_source_validated(self, parameters, constants):
+        """Prepare within an owned invocation that just checked its source.
+
+        This is not a reusable validation exemption: independent public
+        prepare, bind and run calls retain their own source checks.
+        """
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         if torch.compiler.is_compiling():
@@ -8861,31 +14026,156 @@ class FunctionalPopulation:
             values,
         )
 
-    def initialize(self, parameters, constants, inputs: InitializationInput):
-        """Purely construct fresh state and initialization-derived parameters.
+    def _execute_initialization(
+        self,
+        initialization,
+        parameters,
+        pre_state,
+        initialization_states,
+        transform_inputs,
+        initialization_template,
+        prepare,
+        initialize,
+    ):
+        """Execute the common tensor phases within a caller-owned transaction.
 
-        Registered pure pre/post transforms consume their explicit
-        ``inputs.transforms`` leaves in imperative registration order. Their
-        raw-parameter and state replacements are returned in the complete
-        bundle; constants pass through unchanged.
+        Runtime and diagnostics supply preparation and invocation boundaries.
+        They retain stochastic binding, output checks and audit observations;
+        neither admission nor completion policies belong to this executor.
+        """
+        initialized_parameters, pre_state = _apply_initialization_transforms(
+            initialization, "pre", parameters, pre_state, transform_inputs
+        )
+        prepared = prepare(initialized_parameters)
+        # Native initialization and its final current frame precede integrator
+        # timestep configuration, including when preparation owns runtime dt.
+        initialization_dt = torch.zeros_like(prepared["integrator"]["dt"])
+        mapping, _dt, _celsius, _v, _t, _remainder = self._mapping(
+            initialized_parameters,
+            prepared,
+            initialization_template,
+            isolate_read_only=True,
+            mechanism_dt=initialization_dt,
+        )
+        # Pre hooks act on live State, not insertion configuration. Their
+        # writes remain visible to later hooks, but INITIAL consumes the
+        # original explicit ic frame after the complete pre phase.
+        for entry in self._initialization_state_layout:
+            _put_path(pre_state, entry.public_path, initialization_states[entry.name])
+        state = initialize(mapping, pre_state, initialization_dt)
+        initialized_parameters, state = _apply_initialization_transforms(
+            initialization, "post", initialized_parameters, state, transform_inputs
+        )
+        return initialized_parameters, state, prepared
+
+    def _initialization_outputs(self, initialization, mapping, pre_state):
+        """Invoke the initializer with the explicit voltage and State frame."""
+        return functional_call(
+            initialization,
+            mapping,
+            (
+                _get_path(pre_state, ("integrator", "v")),
+                *(
+                    _get_path(pre_state, entry.public_path)
+                    for entry in self._initialization_state_layout
+                ),
+            ),
+            _initialization_voltage_kwargs(pre_state),
+            tie_weights=False,
+        )
+
+    def initialize(
+        self,
+        parameters,
+        constants,
+        inputs: InitializationInput,
+        *,
+        state=None,
+        random_draw=None,
+        draws=None,
+    ):
+        """Purely initialize from declared defaults or a bound steady-state cache.
+
+        Without an owned cache, registered pure pre/post transforms consume
+        ``inputs.transforms`` in native registration order. Network-owned plans
+        also return their differentiable per-Population materializations in the
+        constant frame. A bound ``inputs.cache`` restores detached saved
+        state and materializations, skips fresh initialization hooks, and
+        returns effective parameters and constants. Both paths reset the
+        Population clock and duration remainder. RAND declarations consume an
+        explicit ``random_draw`` or ``inputs.random_draw`` packet. Their retained
+        samples and provenance accompany the returned constants; ``state``
+        supplies previous samples for declarations which do not resample and
+        previous mechanism State for pre-transform reads. Without ``state``,
+        those reads use the State captured at lowering. ``inputs.states``
+        supplies insertion-time values applied after the complete pre phase.
+        ``draws`` supplies one explicit initialization packet instead of the
+        legacy stochastic fields. Missing families are not sampled implicitly.
         """
 
+        if draws is not None:
+            from ._initialization_draws import _with_population_initialization_draws
+
+            inputs = _with_population_initialization_draws(
+                inputs, draws, random_draw=random_draw
+            )
+            random_draw = None
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_constants(constants)
         self._validate_initialization(inputs)
+        constants = self._clear_retained_materializations(constants)
+        if self._owned_cache_bound and not (
+            self._random_plan is not None
+            and any(
+                entry.spec.resample_on_initialize for entry in self._random_plan.entries
+            )
+        ):
+            return self._initialize_owned_cache(
+                parameters, constants, inputs, state=state
+            )
+        stimulation_state = (
+            None
+            if self._poisson_plan is None
+            else self._stimulation_state_template
+            if state is None
+            else state["stimulation"]
+        )
+        stimulation_draw = inputs.stimulation
+        if self._poisson_plan is None:
+            if stimulation_draw is not None:
+                raise ValueError(
+                    "This Population has no randomized Poisson stimulation"
+                )
+        elif self._poisson_plan.has_initialization:
+            self._poisson_plan.validate(stimulation_draw)
+        elif stimulation_draw is not None:
+            raise ValueError("This Population has no Poisson initialization draws")
+        selected_random_draw = None
+        if self._random_plan is not None:
+            if random_draw is not None and inputs.random_draw is not None:
+                raise ValueError("Supply the RAND initialization draw only once")
+            selected_random_draw = (
+                inputs.random_draw if random_draw is None else random_draw
+            )
+            if state is not None:
+                self._validate_state(state)
+            constants = self._random_plan.retain_constants(constants, state)
+            constants = self._random_plan.initialize_constants(
+                constants, selected_random_draw
+            )
+        self._stimulation_rng_plan.validate_packets(
+            selected_random_draw, stimulation_draw, initialization=True
+        )
         current_failures = (
-            _compiled_initialization_failures(self._population)
+            _compiled_initialization_failures(self)
             if torch.compiler.is_compiling()
-            else tuple(_functional_initialization_failures(self._population))
+            else _initialization_failures_for_plan(self)
         )
         initialization_structure_matches = (
-            _compiled_initialization_structure_matches(
-                self._population,
-                self._initialization_fingerprint,
-            )
+            _compiled_initialization_structure_matches(self)
             if torch.compiler.is_compiling()
-            else _initialization_structure_signature(self._population)
+            else _initialization_structure_for_plan(self)
             == self._initialization_fingerprint
         )
         initialization_failures = (
@@ -8919,64 +14209,161 @@ class FunctionalPopulation:
         initialization_transform_values = (
             {} if inputs.transforms is None else inputs.transforms
         )
-        pre_state = torch.utils._pytree.tree_map(
-            lambda value: value,
-            self._initialization_state_template,
-        )
-        _put_path(pre_state, ("integrator", "v"), inputs.v_init)
-        for entry in self._initialization_state_layout:
-            _put_path(
-                pre_state,
-                entry.public_path,
-                initialization_states[entry.name],
+        previous_mechanism_state = None
+        if (
+            self._initialization_state_layout
+            and state is not None
+            and "mechanisms" in state
+        ):
+            previous_mechanism_state = state["mechanisms"]
+            self._validate_state_node(
+                previous_mechanism_state,
+                self._state_schema["mechanisms"],
+                ("mechanisms",),
             )
-        initialized_parameters, pre_state = _apply_initialization_transforms(
+        pre_state = _fresh_initialization_pre_state(
+            self._initialization_state_template,
+            inputs.v_init,
+            mechanism_state=previous_mechanism_state,
+        )
+        initialization_template = self._initialization_state_template
+        if state is not None and "noise_workspaces" in state:
+            initialization_template = {
+                **initialization_template,
+                "noise_workspaces": state["noise_workspaces"],
+            }
+        root_random_values = None
+        root_noise_values = {}
+        if self._split_stochastic_initialization:
+            root_values, root_random_values = self._prepare_initialization_root(
+                parameters, constants
+            )
+            if self._noise_plan is not None:
+                self._noise_plan.validate(selected_random_draw, initialization=True)
+                root_noise_values = self._noise_plan.values(
+                    {
+                        f"population.{name}": value
+                        for name, value in root_values.items()
+                    },
+                    selected_random_draw,
+                    torch.ones_like(constants["dt"]),
+                    initialization=True,
+                    owner_paths=("",),
+                )
+
+        def prepare_initialization(initialized_parameters):
+            return self._prepare_values(
+                initialized_parameters,
+                constants,
+                for_initialization=True,
+                root_random_values=root_random_values,
+            )
+
+        def initialize_state(mapping, pre_state, initialization_dt):
+            if self._noise_plan is not None:
+                self._noise_plan.validate(selected_random_draw, initialization=True)
+                noise_values = self._noise_plan.values(
+                    mapping,
+                    selected_random_draw,
+                    torch.ones_like(initialization_dt),
+                    initialization=True,
+                    owner_paths=(
+                        tuple(
+                            entry.path
+                            for entry in self._noise_plan.entries
+                            if entry.path
+                        )
+                        if self._split_stochastic_initialization
+                        else None
+                    ),
+                )
+                for path, value in {**root_noise_values, **noise_values}.items():
+                    module_path, _separator, _name = path.rpartition(".")
+                    owner = _module_at(self._initialization.population, module_path)
+                    mapping[f"population.{path}"] = value.reshape(
+                        (1,)
+                        * max(
+                            0, len(getattr(owner, "shape_f", value.shape)) - value.ndim
+                        )
+                        + tuple(value.shape)
+                    )
+            if stimulation_draw is not None:
+                mapping.update(
+                    self._poisson_plan.initialization_mapping(stimulation_draw)
+                )
+            outputs = self._initialization_outputs(
+                self._initialization, mapping, pre_state
+            )
+            state = {}
+            for leaf, value in zip(self._state_layout, outputs, strict=True):
+                if not torch.is_tensor(value):
+                    raise FunctionalizationError(
+                        "functional initialization returned non-Tensor state leaf "
+                        f"{'.'.join(leaf.public_path)!r}"
+                    )
+                _put_path(state, leaf.public_path, value)
+            return state
+
+        initialized_parameters, state, prepared = self._execute_initialization(
             self._initialization,
-            "pre",
             parameters,
             pre_state,
+            initialization_states,
             initialization_transform_values,
+            initialization_template,
+            prepare_initialization,
+            initialize_state,
         )
-        prepared = self._prepare_values(initialized_parameters, constants)
-        # Imperative Mechanism/State initialization and its final current frame
-        # run before the integrator configures a timestep. Preserve that exact
-        # zero-dt view even though transition preparation already owns runtime dt.
-        initialization_dt = torch.zeros_like(prepared["integrator"]["dt"])
-        mapping, _dt, _celsius, _v, _t, _duration_remainder = self._mapping(
-            initialized_parameters,
-            prepared,
-            self._initialization_state_template,
-            isolate_read_only=True,
-            mechanism_dt=initialization_dt,
+        from ._noise_workspaces import noise_workspace_constants_from_state
+
+        constants = noise_workspace_constants_from_state(
+            self._population, constants, state
         )
-        outputs = functional_call(
-            self._initialization,
-            mapping,
-            (
-                _get_path(pre_state, ("integrator", "v")),
-                *(
-                    _get_path(pre_state, entry.public_path)
-                    for entry in self._initialization_state_layout
-                ),
-            ),
-            tie_weights=False,
-        )
-        state = {}
-        for leaf, value in zip(self._state_layout, outputs, strict=True):
-            if not torch.is_tensor(value):
-                raise FunctionalizationError(
-                    "functional initialization returned non-Tensor state leaf "
-                    f"{'.'.join(leaf.public_path)!r}"
-                )
-            _put_path(state, leaf.public_path, value)
-        initialized_parameters, state = _apply_initialization_transforms(
-            self._initialization,
-            "post",
-            initialized_parameters,
-            state,
-            initialization_transform_values,
-        )
+        if self._post_initialization_writes_parameters:
+            state = self._configure_noise_workspaces(
+                initialized_parameters,
+                constants,
+                state,
+                initialization=True,
+                phases=("derived",),
+            )
+            constants = noise_workspace_constants_from_state(
+                self._population, constants, state
+            )
         state = _reset_functional_initialization_clock(state)
+        if self._random_plan is not None:
+            constants = self._random_plan.finish_constants(
+                constants, prepared["random"]
+            )
+            state["random"] = self._random_plan.state(
+                constants, selected_random_draw.rng
+            )
+        if self._poisson_plan is not None:
+            state["stimulation"] = (
+                stimulation_state
+                if stimulation_draw is None
+                else self._poisson_plan.advance(
+                    stimulation_state, stimulation_draw, initialization=True
+                )
+            )
+        state = self._stimulation_rng_plan.publish(
+            state, noise=selected_random_draw, stimulation=stimulation_draw
+        )
+        state = {name: state[name] for name in self._state_schema}
+        state = self._initialize_material_workspace(
+            initialized_parameters, constants, state
+        )
+        constants = self._retain_materializations(
+            initialized_parameters,
+            constants,
+            prepared=(
+                None
+                if self._post_initialization_writes_parameters
+                or self._preparation.timestep_module_paths
+                or self._noise_workspace_constants
+                else prepared
+            ),
+        )
         self._validate_parameters(initialized_parameters)
         self._validate_state(state)
         return PopulationTensors(
@@ -8989,8 +14376,467 @@ class FunctionalPopulation:
                 v_init=inputs.v_init,
                 states=initialization_states,
                 transforms=initialization_transform_values,
+                random_draw=selected_random_draw,
+                stimulation=stimulation_draw,
             ),
         )
+
+    def sample_initialization_draw(self, parameters, state):
+        """Sample owned initialization draws without changing the source or carry."""
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        if self._stimulation_rng_plan.enabled and not self._owned_cache_bound:
+            return self._stimulation_rng_plan.sample_initialization(state)[0]
+        return (
+            None
+            if self._random_plan is None or self._owned_cache_bound
+            else self._random_plan.sample(state)
+        )
+
+    def sample_stimulation_initialization_draw(self, state):
+        """Sample Poisson draws for native fresh-initialization current evaluation."""
+        self._validate_source()
+        self._validate_state(state)
+        if self._stimulation_rng_plan.enabled:
+            return (
+                None
+                if self._owned_cache_bound
+                else self._stimulation_rng_plan.sample_initialization(state)[1]
+            )
+        return (
+            None
+            if self._poisson_plan is None or not self._poisson_plan.has_initialization
+            else self._poisson_plan.sample_initialization(state)
+        )
+
+    def sample_runtime_draws(self, state, *, steps=None):
+        """Sample one canonical runtime packet without changing source or carry.
+
+        Omit ``steps`` for one accepted step, or supply a non-negative count
+        for a time-leading tape. Named draw families share one physical RNG
+        frame authority; initialization draws retain their separate API.
+        """
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError("Sample runtime draws outside torch.compile")
+        from ._network_bindings import _canonicalize_mapping_tree
+
+        (state,), _ = _canonicalize_mapping_tree((state,))
+        self._validate_source()
+        return self._sample_runtime_draws_source_validated(state, steps=steps)
+
+    def _sample_runtime_draws_source_validated(self, state, *, steps=None):
+        self._validate_state(state)
+        return self._runtime_draw_plan.sample(state, steps=steps)
+
+    def sample_stimulation_draw(self, state):
+        """Sample one Poisson invocation packet from explicit generator carry."""
+        self._validate_source()
+        self._validate_state(state)
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_runtime(state)[1]
+        return None if self._poisson_plan is None else self._poisson_plan.sample(state)
+
+    def sample_stimulation_draw_tape(self, state, steps):
+        """Sample a time-first Poisson draw and generator-state tape."""
+        self._validate_source()
+        return self._sample_stimulation_draw_tape_source_validated(state, steps)
+
+    def _sample_stimulation_draw_tape_source_validated(self, state, steps):
+        """Sample within an invocation whose source structure is already checked."""
+        self._validate_state(state)
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("steps must be a non-negative integer")
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_runtime(state, steps=steps)[1]
+        return (
+            None
+            if self._poisson_plan is None
+            else self._poisson_plan.sample(state, steps=steps)
+        )
+
+    def _validate_stimulation_draw(self, draw, *, steps=None):
+        if self._poisson_plan is None:
+            if draw is not None:
+                raise ValueError(
+                    "This Population has no randomized Poisson stimulation"
+                )
+            return
+        if steps == 0 and draw is None:
+            return
+        self._poisson_plan.validate(draw, steps=steps)
+
+    def sample_noise_draw(self, state):
+        """Sample NOISE/SDE draws without changing the source or carry."""
+        self._validate_source()
+        self._validate_state(state)
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_runtime(state)[0]
+        return (
+            None
+            if self._noise_plan is None or not self._noise_plan.runtime
+            else self._noise_plan.sample(state)
+        )
+
+    def sample_noise_draw_tape(self, state, steps):
+        """Sample a bounded time-first draw and RNG tape from an explicit carry."""
+        self._validate_source()
+        return self._sample_noise_draw_tape_source_validated(state, steps)
+
+    def _sample_noise_draw_tape_source_validated(self, state, steps):
+        """Sample within an invocation whose source structure is already checked."""
+        self._validate_state(state)
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
+            raise ValueError("steps must be a non-negative integer")
+        if self._stimulation_rng_plan.enabled:
+            return self._stimulation_rng_plan.sample_runtime(state, steps=steps)[0]
+        return (
+            None
+            if self._noise_plan is None or not self._noise_plan.runtime
+            else self._noise_plan.sample(state, steps=steps)
+        )
+
+    def _validate_noise_draw(self, draw, *, steps=None):
+        if isinstance(draw, RuntimeDraws):
+            self._runtime_draw_plan.validate(draw, steps=steps)
+            return
+        if self._noise_plan is None or not self._noise_plan.runtime:
+            if draw is not None:
+                raise ValueError(
+                    "This Population has no recurrent NOISE or State SDE draws"
+                )
+            return
+        if steps == 0 and draw is None:
+            return
+        self._noise_plan.validate(draw, steps=steps)
+        reference = self._random_plan.rng_reference
+        if set(draw.rng) != set(reference):
+            raise ValueError("NOISE RNG stream names do not match the lowered plan")
+        for stream, leaves in reference.items():
+            if set(draw.rng[stream]) != set(leaves):
+                raise ValueError("NOISE RNG state schema is incompatible")
+            for name, target in leaves.items():
+                value = draw.rng[stream][name]
+                shape = tuple(target.shape) if steps is None else (steps, *target.shape)
+                if (
+                    not torch.is_tensor(value)
+                    or tuple(value.shape) != shape
+                    or value.dtype != target.dtype
+                    or value.device != target.device
+                ):
+                    raise ValueError("NOISE RNG state has incompatible Tensor schema")
+
+    def _sample_missing_runtime_draws(self, state, inputs, steps):
+        """Sample coupled families together at an existing host boundary."""
+        sharing = self._stimulation_rng_plan
+        inputs = _population_inputs(inputs)
+        if inputs.draws is not None:
+            if inputs.noise is not None or inputs.stimulation is not None:
+                raise ValueError(
+                    "draws cannot be combined with legacy stochastic packets"
+                )
+            self._runtime_draw_plan.validate(inputs.draws, steps=steps)
+            return inputs
+        if not sharing.enabled:
+            return inputs
+        if inputs.noise is not None:
+            self._validate_noise_draw(inputs.noise, steps=steps)
+        if inputs.stimulation is not None:
+            self._validate_stimulation_draw(inputs.stimulation, steps=steps)
+        sharing.validate_packets(inputs.noise, inputs.stimulation)
+        if inputs.stimulation is not None:
+            return inputs
+        if any(
+            getattr(method, "__func__", None) is not original
+            for method, original in (
+                (self.sample_noise_draw_tape, _OWNED_POPULATION_NOISE_TAPE),
+                (self.sample_stimulation_draw_tape, _OWNED_POPULATION_STIMULATION_TAPE),
+            )
+        ):
+            return inputs
+        noise, stimulation = sharing.sample_runtime(state, steps=steps)
+        return inputs._replace(noise=noise, stimulation=stimulation)
+
+    def initialize_host(
+        self,
+        parameters,
+        constants,
+        inputs,
+        *,
+        state=None,
+        draws=None,
+        _draws_capture=None,
+    ):
+        """Sample missing draws at a cold boundary, or replay an explicit packet."""
+        if draws is not None:
+            from ._initialization_draws import _with_population_initialization_draws
+
+            inputs = _with_population_initialization_draws(inputs, draws)
+        if (
+            draws is None
+            and self._stimulation_rng_plan.enabled
+            and not self._owned_cache_bound
+        ):
+            needs_random = self._random_plan is not None
+            needs_stimulation = self._poisson_plan.has_initialization
+            supplied = (inputs.random_draw is not None, inputs.stimulation is not None)
+            if needs_stimulation and supplied[0] != supplied[1]:
+                raise ValueError(
+                    "Shared initialization RNG requires both random and stimulation packets, or automatic sampling for both"
+                )
+            if needs_random and not supplied[0]:
+                self._validate_source()
+                self._validate_parameters(parameters)
+                if state is None:
+                    state = self.extract().state
+                self._validate_state(state)
+                random_draw, stimulation = (
+                    self._stimulation_rng_plan.sample_initialization(state)
+                )
+                inputs = inputs._replace(
+                    random_draw=random_draw, stimulation=stimulation
+                )
+        if (
+            draws is None
+            and self._random_plan is not None
+            and not self._owned_cache_bound
+            and inputs.random_draw is None
+        ):
+            if state is None:
+                state = self.extract().state
+            inputs = inputs._replace(
+                random_draw=self.sample_initialization_draw(parameters, state)
+            )
+        if (
+            draws is None
+            and self._poisson_plan is not None
+            and self._poisson_plan.has_initialization
+            and not self._owned_cache_bound
+            and inputs.stimulation is None
+        ):
+            if state is None:
+                state = self.extract().state
+            inputs = inputs._replace(
+                stimulation=self.sample_stimulation_initialization_draw(state)
+            )
+        initialized = self.initialize(parameters, constants, inputs, state=state)
+        if _draws_capture is not None:
+            consumed = initialized.initialization
+            cached = consumed.cache is not None
+            _draws_capture["random"] = None if cached else consumed.random_draw
+            _draws_capture["stimulation"] = None if cached else consumed.stimulation
+        return initialized
+
+    def _initialize_owned_cache(self, parameters, constants, inputs, *, state=None):
+        if self._owned_cache_error is not None:
+            raise FunctionalizationError(
+                f"Population steady-state cache cannot be restored: {self._owned_cache_error}"
+            )
+        failures = (
+            _compiled_owned_cache_initialization_failures(self._population)
+            if torch.compiler.is_compiling()
+            else _owned_cache_initialization_failures(self._population)
+        )
+        if failures:
+            raise FunctionalizationError("\n".join(failures))
+        incoming = self._owned_cache_state_template
+        if self._random_plan is not None:
+            if state is not None:
+                self._validate_state(state)
+            # Cached fields replace ordinary carry; ignored streams inherit
+            # the caller's frame or the captured default when it is omitted.
+            incoming = {
+                **incoming,
+                "random": {
+                    "rng": self._random_plan.rng_reference
+                    if state is None
+                    else state["random"]["rng"]
+                },
+            }
+        if self._poisson_plan is not None:
+            incoming = {
+                **incoming,
+                "stimulation": (
+                    self._stimulation_state_template
+                    if state is None
+                    else state["stimulation"]
+                ),
+            }
+        packet = self._owned_cache_plan.restore_owned(
+            parameters, constants, incoming, inputs.cache
+        )
+        state = _reset_functional_initialization_clock(packet.state)
+        state = self._stimulation_rng_plan.strip_state(state)
+        from ._noise_workspaces import noise_workspace_constants_from_state
+
+        constants = noise_workspace_constants_from_state(
+            self._population, packet.constants, state
+        )
+        if not self._retain_initialization_materializations:
+            state = self._initialize_material_workspace(
+                packet.parameters, constants, state
+            )
+        # Network plans configure after publishing the cache's shared alias
+        # transaction at this Population's initialization boundary.
+        return packet._replace(
+            constants=constants,
+            state=state,
+            initialization=inputs,
+        )
+
+    def _configure_integrator_state(self, state, dt):
+        """Apply native solver-configuration changes to explicit carry."""
+        integrator = self._transition.population.integrator
+        if integrator._FUNCTIONAL_OPERATOR_KIND != "scalar_dufort_path":
+            return state
+        previous = state["integrator"]
+        valid, history_dt = integrator._prepare_history(
+            previous["_df_history_valid"], previous["_df_history_dt"], dt
+        )
+        return {
+            **state,
+            "integrator": {
+                **previous,
+                "_df_history_valid": valid,
+                "_df_history_dt": history_dt,
+            },
+        }
+
+    def _preparation_constants(self, constants):
+        return {
+            **{
+                entry.key: constants[entry.key]
+                for entry in self._parametrization_constants
+            },
+            **{name: constants[name] for name in self._noise_workspace_constants},
+        }
+
+    def _configure_noise_workspaces(
+        self,
+        parameters,
+        constants,
+        state,
+        *,
+        initialization=False,
+        phases=("timestep",),
+    ):
+        """Materialize a native initialization/configuration boundary purely."""
+        configuration = self._noise_workspace_configuration
+        if not configuration.layout:
+            return state
+        prepared = self._prepare_values(parameters, constants)
+        mapping, dt, *_rest = self._mapping(
+            parameters, prepared, state, isolate_read_only=True
+        )
+        if "derived" in phases and "timestep" not in phases:
+            for leaf in configuration.layout:
+                if leaf.public_path[2].startswith("timestep.buffer."):
+                    mapping[f"population.{leaf.module_path}.{leaf.buffer_name}"] = (
+                        _get_path(state, leaf.public_path).clone()
+                    )
+        outputs = functional_call(
+            configuration,
+            mapping,
+            (dt, initialization, phases),
+            tie_weights=False,
+        )
+        frames = {}
+        for leaf, value in zip(configuration.layout, outputs, strict=True):
+            _put_path(frames, leaf.public_path[1:], value)
+        return {**state, "noise_workspaces": frames}
+
+    def _initialize_noise_workspaces(self, parameters, constants, state):
+        """Configure workspaces at a Network's per-Population solver boundary."""
+        if not self._noise_workspace_configuration.layout:
+            return constants, state
+        from ._noise_workspaces import noise_workspace_constants_from_state
+
+        constants = noise_workspace_constants_from_state(
+            self._population, constants, state
+        )
+        state = self._configure_noise_workspaces(
+            parameters, constants, state, initialization=True
+        )
+        state = self._configure_noise_workspaces(parameters, constants, state)
+        constants = noise_workspace_constants_from_state(
+            self._population, constants, state
+        )
+        # A cache or earlier initializer can already retain an older timestep
+        # value. Native solver setup replaces just these numerical workspaces.
+        constants = dict(constants)
+        for leaf in self._noise_workspace_configuration.layout:
+            if not leaf.public_path[2].startswith("timestep.buffer."):
+                continue
+            path = f"{leaf.module_path}.{leaf.buffer_name}"
+            slot = self._retained_materializations.by_path.get(path)
+            if slot is not None and slot.value_key in constants:
+                constants[slot.value_key] = _get_path(state, leaf.public_path)
+                constants[slot.active_key] = torch.ones_like(constants[slot.active_key])
+                constants[slot.baseline_key] = torch.zeros_like(
+                    constants[slot.baseline_key]
+                )
+        return constants, state
+
+    def _prepare_initialization_root(
+        self, parameters, constants, *, for_initialization=True
+    ):
+        """Evaluate Population samples independently of inserted-owner builders."""
+        return self._prepare_parameter_buffers(
+            parameters,
+            constants.get(
+                "diam", self._preparation_base_mapping.get("population.diam")
+            ),
+            constants.get("dx", self._preparation_base_mapping.get("population.dx")),
+            constants.get("diameters"),
+            constants.get("diam_original"),
+            constants["dt"],
+            self._preparation_constants(constants),
+            for_initialization=for_initialization,
+            use_snapshot_offsets=False,
+            random_inputs=(
+                None
+                if self._random_plan is None
+                else self._random_plan.inputs(constants)
+            ),
+            root_only=True,
+        )
+
+    def _initialize_material_workspace(self, parameters, constants, state):
+        """Configure held diffusion coefficients from the initialized NOISE frame."""
+        leaves = tuple(
+            leaf
+            for leaf in self._state_layout
+            if leaf.public_path[0] == "material_preparation"
+        )
+        if not leaves:
+            return state
+        mapping = dict(self._preparation_base_mapping)
+        mapping.update(
+            {
+                f"population.{path}": value
+                for path, value in state.get("runtime_noise", {}).items()
+            }
+        )
+        prepared = self._prepare_values(
+            parameters,
+            constants,
+            preparation_base_mapping=mapping,
+            use_snapshot_offsets=False,
+        )
+        workspace = {}
+        for leaf in leaves:
+            key = f"{leaf.module_path}.{leaf.buffer_name}"
+            suffix = leaf.public_path[2]
+            value = (
+                state["runtime_noise"][
+                    f"integrator.mech.material_processes.{leaf.public_path[1]}."
+                    f"{suffix.removeprefix('noise.')}"
+                ].clone()
+                if suffix.startswith("noise.")
+                else prepared["mechanisms"][key]
+            )
+            _put_path(workspace, leaf.public_path[1:], value)
+        return {**state, "material_preparation": workspace}
 
     def _prepare_values(
         self,
@@ -8999,13 +14845,104 @@ class FunctionalPopulation:
         *,
         preparation=None,
         preparation_base_mapping=None,
+        for_initialization=False,
+        use_snapshot_offsets=True,
+        _snapshot_baseline_capture=None,
+        root_random_values=None,
     ):
-        if self._topology_kind in {"multi_point", "multi_scalar"}:
+        if for_initialization:
+            use_snapshot_offsets = False
+        if self._retained_materializations.slots:
+            retained_active = torch.stack(
+                tuple(
+                    constants[slot.active_key]
+                    for slot in self._retained_materializations.slots
+                )
+            ).any()
+            # An inactive rematerialization may have a nonfinite derivative
+            # at a source written by a later owner. Stop that discarded raw
+            # route before authored arithmetic; retained values keep their own
+            # differentiable initialization graphs. Native Torch properties
+            # remain live and consume their explicit original parameters.
+            parameters = {
+                name: (
+                    value
+                    if name in self._torch_parameter_names
+                    or name in self._material_live_parameter_names
+                    else torch.where(retained_active, value.detach(), value)
+                )
+                for name, value in parameters.items()
+            }
+            constants = {
+                name: (
+                    torch.where(retained_active, value.detach(), value)
+                    if name in self._retained_preparation_constant_names
+                    else value
+                )
+                for name, value in constants.items()
+            }
+        if self._cache_value_specs:
+            active = constants["cache.active"]
+            # Native cache restoration detaches effective Population buffers.
+            # Cut the raw route before authored transforms as well: masking
+            # only their outputs can multiply a zero adjoint by an inactive
+            # nonfinite derivative and produce a spurious NaN gradient.
+            parameters = {
+                **parameters,
+                **{
+                    name: torch.where(
+                        active, parameters[name].detach(), parameters[name]
+                    )
+                    for name in self._population_parameter_names
+                    if name not in self._torch_parameter_names
+                },
+            }
+            constants = {
+                name: (
+                    value
+                    if name == "dt"
+                    or name.startswith("cache.")
+                    or name.startswith("materializations.")
+                    or name in self._torch_constant_names
+                    else torch.where(active, value.detach(), value)
+                )
+                for name, value in constants.items()
+            }
+        if (
+            self._split_stochastic_initialization
+            and self._population.random_parameters
+            and root_random_values is None
+        ):
+            held_frame = torch.stack(
+                tuple(
+                    constants[f"random.initialization_frame.{entry.key}"]
+                    for entry in self._random_plan.entries
+                    if not entry.path
+                )
+            ).any()
+            # The held distribution operands own their pre-transform graphs.
+            # Stop discarded raw routes before authored parametrizations: a
+            # later write can place an inactive source at a singularity. Keep
+            # the ordinary physical preparation below live, including any
+            # physical parameters sharing those same raw sources.
+            _root_values, root_random_values = self._prepare_initialization_root(
+                {
+                    name: torch.where(held_frame, value.detach(), value)
+                    for name, value in parameters.items()
+                },
+                constants,
+                for_initialization=for_initialization,
+            )
+        if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             return self._prepare_multi_values(
                 parameters,
                 constants,
                 preparation=preparation,
                 preparation_base_mapping=preparation_base_mapping,
+                for_initialization=for_initialization,
+                use_snapshot_offsets=use_snapshot_offsets,
+                _snapshot_baseline_capture=_snapshot_baseline_capture,
+                root_random_values=root_random_values,
             )
 
         shape = self.shape
@@ -9020,8 +14957,13 @@ class FunctionalPopulation:
         xg = constants.get("xg")
         dx = constants["dx"]
         dt = constants["dt"]
+        cache_values, cache_active = self._cache_preparation_inputs(
+            constants,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=_snapshot_baseline_capture,
+        )
 
-        population_values, mechanism_values, local_geometry_values = (
+        population_values, mechanism_values, local_geometry_values, random_outputs = (
             self._prepare_parameter_buffers(
                 parameters,
                 diam,
@@ -9029,15 +14971,28 @@ class FunctionalPopulation:
                 diameters,
                 diam_original,
                 dt,
-                {
-                    entry.key: constants[entry.key]
-                    for entry in self._parametrization_constants
-                },
+                self._preparation_constants(constants),
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
+                for_initialization=for_initialization,
+                use_snapshot_offsets=(
+                    use_snapshot_offsets
+                    and len(self._retained_materializations.slots) == 0
+                ),
+                material_area=constants.get("canonical_area_cm2"),
+                cache_values=cache_values,
+                cache_active=cache_active,
+                random_inputs=None
+                if self._random_plan is None
+                else self._random_plan.inputs(constants),
+                root_random_values=root_random_values,
             )
         )
         diam = population_values.get("diam", diam)
+        dx = population_values.get("dx", dx)
+        xraxial = population_values.get("xraxial", xraxial)
+        xc = population_values.get("xc", xc)
+        xg = population_values.get("xg", xg)
         cm = population_values["cm"]
         rhoa = population_values["rhoa"]
         rhoa_scale = population_values["rhoa_scale"]
@@ -9045,7 +15000,23 @@ class FunctionalPopulation:
         area_scale = population_values["area_scale"]
 
         integrator = self._transition.population.integrator
-        if self._topology_kind == "single_compartment":
+        if integrator._FUNCTIONAL_OPERATOR_KIND in {
+            "scalar_explicit_path",
+            "scalar_dufort_path",
+        }:
+            # Native explicit integration uses cylindrical node geometry and
+            # raw effective cm/rhoa, including Myelinated's node transforms.
+            # These coefficients do not apply the implicit family's independent
+            # scale modifiers.
+            point_area = _cylindrical_membrane_area(diam, dx)
+            integrator_workspace = integrator._derive_prepared_workspace(
+                dt,
+                dx=torch.broadcast_to(dx, shape),
+                diam=torch.broadcast_to(diam, shape),
+                cm=torch.broadcast_to(cm, shape),
+                rhoa=torch.broadcast_to(rhoa, shape),
+            )
+        elif self._topology_kind == "single_compartment":
             # The scalar integrator deliberately retains two different
             # broadcastable layouts: capacitance follows RANGE parameter shape
             # (including singleton explicit-batch prefixes), while membrane
@@ -9304,7 +15275,14 @@ class FunctionalPopulation:
         }
         if self._local_geometry_bindings:
             values["local_geometry"] = local_geometry_values
-        return values
+        if random_outputs is not None:
+            values["random"] = random_outputs
+        return self._finish_retained_preparation(
+            values,
+            constants,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=_snapshot_baseline_capture,
+        )
 
     def _prepare_multi_values(
         self,
@@ -9313,6 +15291,10 @@ class FunctionalPopulation:
         *,
         preparation=None,
         preparation_base_mapping=None,
+        for_initialization=False,
+        use_snapshot_offsets=True,
+        _snapshot_baseline_capture=None,
+        root_random_values=None,
     ):
         """Derive one differentiable packed workspace from component sources."""
         dt = constants["dt"]
@@ -9341,6 +15323,10 @@ class FunctionalPopulation:
         }
         axial_rows = []
         compact_edges = []
+        block_shell_edges = []
+        block_xc = []
+        block_xg = []
+        component_materializations = {}
 
         for index, component_record in enumerate(self._multi_component_plans):
             component_preparation = physical_preparations[index]
@@ -9374,6 +15360,12 @@ class FunctionalPopulation:
             component_diam = component_constants.get("diam")
             component_diameters = component_constants.get("diameters")
             component_diam_original = component_constants.get("diam_original")
+            cache_values, cache_active = self._cache_preparation_inputs(
+                constants,
+                prefix=f"populations.{component_record.name}.",
+                use_snapshot_offsets=use_snapshot_offsets,
+                snapshot_baseline_capture=_snapshot_baseline_capture,
+            )
             component_outputs = functional_call(
                 component_preparation,
                 component_mapping,
@@ -9391,6 +15383,10 @@ class FunctionalPopulation:
                         else component_diam_original.clone()
                     ),
                 ),
+                {
+                    "cache_values": cache_values,
+                    "cache_active": cache_active,
+                },
                 tie_weights=False,
             )
             population_values = dict(
@@ -9400,7 +15396,14 @@ class FunctionalPopulation:
                     strict=True,
                 )
             )
-            geometry_values = component_constants
+            if self._retained_materializations.slots:
+                component_materializations.update(
+                    {
+                        f"populations.{component_record.name}.{name}": value
+                        for name, value in population_values.items()
+                    }
+                )
+            geometry_values = {**component_constants, **population_values}
 
             def expanded(value):
                 return torch.broadcast_to(value, component_shape)
@@ -9416,6 +15419,7 @@ class FunctionalPopulation:
             if component_record.topology_kind in {
                 "native_cable",
                 "scalar_tree",
+                "extcell_tree",
             }:
                 point_area = expanded(geometry_values["canonical_area_cm2"])
             else:
@@ -9441,6 +15445,54 @@ class FunctionalPopulation:
                 )
 
             if self._topology_kind == "multi_point":
+                continue
+
+            if self._topology_kind == "multi_block":
+                # The packed block system is a disconnected forest. Component
+                # cell/fiber replicas become separate roots within K, whereas
+                # explicit Population.batch() axes remain solver batch lanes.
+                cells, nodes = component_record.core_shape
+                node_shape = (planes, cells, nodes)
+                shell_shape = (*component_shape, 2)
+                dx_solve = dx.reshape(node_shape)
+                shell = {
+                    name: torch.broadcast_to(
+                        geometry_values[name], shell_shape
+                    ).reshape(*node_shape, 2)
+                    for name in ("xraxial", "xc", "xg")
+                }
+                if component_record.topology_kind == "extcell_tree":
+                    edge_child = component_preparation.edge_child_orig
+                    edge_parent = component_preparation.edge_parent_orig
+                    resistance = expanded(
+                        geometry_values["canonical_edge_resistance_ohm"]
+                    ).reshape(node_shape)
+                    intracellular_edge = (
+                        resistance.index_select(-1, edge_child)
+                        * rhoa_scale.reshape(node_shape).index_select(-1, edge_child)
+                    ).reciprocal()
+                    extracellular_edge = _tree_layered_edge_conductance(
+                        shell["xraxial"], dx_solve, edge_child, edge_parent
+                    )
+                else:
+                    intracellular_edge = _cylindrical_edge_conductance(
+                        diam.reshape(node_shape),
+                        dx_solve,
+                        (rhoa * rhoa_scale).reshape(node_shape),
+                    )
+                    extracellular_edge = _layered_edge_conductance(
+                        shell["xraxial"], dx_solve
+                    )
+                # Explicit sizes also admit an empty hidden vmap lane: an
+                # inferred -1 is ambiguous when the physical tensor is empty.
+                edge_count = cells * intracellular_edge.shape[-1]
+                node_count = cells * nodes
+                compact_edges.append(intracellular_edge.reshape(planes, edge_count))
+                block_shell_edges.append(
+                    extracellular_edge.reshape(planes, edge_count, 2)
+                )
+                block_xc.append(shell["xc"].reshape(planes, node_count, 2))
+                block_xg.append(shell["xg"].reshape(planes, node_count, 2))
                 continue
 
             group_b = int(packed_integrator.group_B[index])
@@ -9521,10 +15573,28 @@ class FunctionalPopulation:
             name: torch.cat(parts, dim=-1).unsqueeze(-2)
             for name, parts in packed_fields.items()
         }
-        packed_diam = full_fields["diam"]
-        packed_dx = full_fields["dx"]
+        cache_values, cache_active = self._cache_preparation_inputs(
+            constants,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=_snapshot_baseline_capture,
+        )
+        parent_fields = {
+            name: _cache_materialization(
+                value,
+                "_component_area" if name == "point_area" else name,
+                cache_values,
+                cache_active,
+            )
+            for name, value in full_fields.items()
+            if name != "area"
+        }
+        parent_fields["area"] = (
+            parent_fields["point_area"] * parent_fields["area_scale"]
+        )
+        packed_diam = parent_fields["diam"]
+        packed_dx = parent_fields["dx"]
 
-        population_values, mechanism_values, local_geometry_values = (
+        population_values, mechanism_values, local_geometry_values, random_outputs = (
             self._prepare_parameter_buffers(
                 parameters,
                 packed_diam,
@@ -9532,12 +15602,21 @@ class FunctionalPopulation:
                 None,
                 None,
                 dt,
-                {
-                    entry.key: constants[entry.key]
-                    for entry in self._parametrization_constants
-                },
+                self._preparation_constants(constants),
                 preparation=preparation,
                 base_mapping=preparation_base_mapping,
+                for_initialization=for_initialization,
+                use_snapshot_offsets=(
+                    use_snapshot_offsets
+                    and len(self._retained_materializations.slots) == 0
+                ),
+                material_area=parent_fields["point_area"],
+                cache_values=cache_values,
+                cache_active=cache_active,
+                random_inputs=None
+                if self._random_plan is None
+                else self._random_plan.inputs(constants),
+                root_random_values=root_random_values,
             )
         )
         for name in (
@@ -9547,13 +15626,39 @@ class FunctionalPopulation:
             "rhoa_scale",
             "area_scale",
         ):
-            population_values[name] = full_fields[name]
+            population_values[name] = parent_fields[name]
 
         if self._topology_kind == "multi_point":
             integrator_workspace = packed_integrator._derive_prepared_workspace(
                 dt,
-                cm=full_fields["cm"] * full_fields["cm_scale"],
-                area=full_fields["area"],
+                cm=parent_fields["cm"] * parent_fields["cm_scale"],
+                area=parent_fields["area"],
+            )
+        elif self._topology_kind == "multi_block":
+            packed_xc = _cache_materialization(
+                torch.cat(block_xc, dim=-2).reshape(*self.shape, 2),
+                "xc",
+                cache_values,
+                cache_active,
+            )
+            packed_xg = _cache_materialization(
+                torch.cat(block_xg, dim=-2).reshape(*self.shape, 2),
+                "xg",
+                cache_values,
+                cache_active,
+            )
+            integrator_workspace = packed_integrator._derive_prepared_workspace(
+                dt,
+                cm=(parent_fields["cm"] * parent_fields["cm_scale"]).reshape(
+                    self._solve_shape
+                ),
+                area=parent_fields["area"].reshape(self._solve_shape),
+                intracellular_edge_conductance=torch.cat(compact_edges, dim=-1),
+                extracellular_edge_conductance=torch.cat(block_shell_edges, dim=-2),
+                xc=packed_xc.reshape(*self._solve_shape, 2),
+                xg=packed_xg.reshape(*self._solve_shape, 2),
+                edge_child_orig=packed_integrator.edge_child_orig,
+                solver_order=packed_integrator.solver_order,
             )
         else:
             a_geom_flat = torch.cat(axial_rows, dim=-2)
@@ -9568,7 +15673,7 @@ class FunctionalPopulation:
 
         for entry in self._point_area_factors:
             mechanism_values[entry.key] = 1e6 * entry.support_entry.gather(
-                full_fields["point_area"]
+                parent_fields["point_area"]
             )
 
         values = {
@@ -9579,6 +15684,69 @@ class FunctionalPopulation:
         }
         if self._local_geometry_bindings:
             values["local_geometry"] = local_geometry_values
+        if random_outputs is not None:
+            values["random"] = random_outputs
+        component_materializations.update(
+            {
+                "diam": parent_fields["diam"],
+                "dx": parent_fields["dx"],
+                "_component_area": parent_fields["point_area"],
+                **(
+                    {
+                        "xc": packed_xc,
+                        "xg": packed_xg,
+                    }
+                    if self._topology_kind == "multi_block"
+                    else {}
+                ),
+            }
+        )
+        return self._finish_retained_preparation(
+            values,
+            constants,
+            extras=component_materializations,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=_snapshot_baseline_capture,
+        )
+
+    def _finish_retained_preparation(
+        self,
+        values,
+        constants,
+        *,
+        extras=None,
+        use_snapshot_offsets=True,
+        snapshot_baseline_capture=None,
+    ):
+        if self._noise_workspace_constants:
+            from ._noise_workspaces import noise_workspace_preparation_frames
+
+            values["noise_workspaces"] = noise_workspace_preparation_frames(
+                self._population, constants, constants["dt"]
+            )
+        if not self._retained_materializations.slots:
+            return values
+        overrides, active = self._cache_preparation_inputs(
+            constants,
+            use_snapshot_offsets=use_snapshot_offsets,
+            snapshot_baseline_capture=snapshot_baseline_capture,
+        )
+        values["integrator"] = {
+            name: (
+                value
+                if name == "dt"
+                else _cache_materialization(
+                    value,
+                    f"integrator.{name}",
+                    overrides,
+                    active,
+                )
+            )
+            for name, value in values["integrator"].items()
+        }
+        values["materializations"] = _project_retained_frame(
+            self._retained_materializations, values, extras
+        )
         return values
 
     def _validate_prepared_freshness(self, prepared, parameters) -> Mapping:
@@ -9649,6 +15817,12 @@ class FunctionalPopulation:
         }
         if self._local_geometry_bindings:
             expected_sections.add("local_geometry")
+        if self._random_plan is not None:
+            expected_sections.add("random")
+        if self._retained_materializations.slots:
+            expected_sections.add("materializations")
+        if self._noise_workspace_constants:
+            expected_sections.add("noise_workspaces")
         if not isinstance(values, Mapping) or set(values) != expected_sections:
             raise FunctionalizationError("prepared tensor schema is invalid")
         if not isinstance(values["geometry"], Mapping) or set(
@@ -9748,13 +15922,14 @@ class FunctionalPopulation:
                     f"prepared PointProcess area factor {entry.key} must use "
                     f"{self.device}/{self.dtype}"
                 )
+        if self._retained_materializations.slots:
+            _validate_retained_prepared(self, values)
         return values
 
-    def _mapping(
+    def _read_only_mapping(
         self,
         parameters,
         prepared,
-        state,
         *,
         isolate_read_only: bool | None = None,
         mechanism_dt=None,
@@ -9812,6 +15987,14 @@ class FunctionalPopulation:
             mapping[slot] = mechanism_dt
         for entry in self._prepared_buffers:
             value = read_only(prepared["mechanisms"][entry.key])
+            if entry.kind == "torch_parameter":
+                # Native getters consume the same explicit original/transform
+                # leaves. Binding the property itself would run right_inverse.
+                continue
+            if entry.kind == "constant":
+                for slot in self._prepared_constant_aliases[entry.key]:
+                    mapping[slot] = value
+                continue
             visible_rank = self._prepared_buffer_visible_ranks[entry.key]
             if value.ndim < visible_rank:
                 # A hidden zero-sized vmap lane on a logical scalar effective
@@ -9837,14 +16020,56 @@ class FunctionalPopulation:
                 prepared["integrator"][name]
             )
 
+        return mapping, dt, celsius
+
+    def _mapping(
+        self,
+        parameters,
+        prepared,
+        state,
+        *,
+        isolate_read_only: bool | None = None,
+        mechanism_dt=None,
+    ):
+        mapping, dt, celsius = self._read_only_mapping(
+            parameters,
+            prepared,
+            isolate_read_only=isolate_read_only,
+            mechanism_dt=mechanism_dt,
+        )
+        return self._state_mapping(mapping, dt, celsius, state)
+
+    def _receiver_mapping(self, parameters, prepared, state, indices):
+        # The Network's first receive already owns every logical state leaf.
+        # Subsequent transactions copy the current and previously updated
+        # targets, preserving their version boundaries and view normalization.
+        mapping, dt, celsius = self._read_only_mapping(parameters, prepared)
+        return self._state_mapping(
+            mapping, dt, celsius, state, receiver_indices=indices
+        )
+
+    def _state_mapping(self, mapping, dt, celsius, state, *, receiver_indices=None):
+        prefix = "population."
         state_positionals = {}
-        for leaf in self._state_layout:
+        for index, leaf in enumerate(self._state_layout):
+            if (
+                leaf.public_path[0] == "noise_workspaces"
+                and ".buffer." in leaf.public_path[2]
+            ):
+                # Preparation preserves cache detachment and independently
+                # retained Population materializations. Its numerical workspace
+                # value owns the current parameter graph; carried provenance
+                # selects whether timestep preparation can be reused or must
+                # be rebuilt from a later configuration realization.
+                continue
             # Authored accepted-step code may legally update declared carry in
             # place. Give the private execution skeleton one
             # differentiable working copy, shared by every registered alias, so
             # those updates become output carry without modifying (or
             # leaf-in-place invalidating) the caller's explicit state tensor.
-            value = _get_path(state, leaf.public_path).clone()
+            value = _get_path(state, leaf.public_path)
+            if receiver_indices is None or index in receiver_indices:
+                value = value.clone()
             state_positionals[leaf.public_path] = value
             for module_path, buffer_name in leaf.mapping_slots:
                 path = f"{module_path}." if module_path else ""
@@ -9854,6 +16079,8 @@ class FunctionalPopulation:
                 # explicit transition input.
                 if key in self._base_mapping:
                     mapping[key] = value
+        if self._poisson_plan is not None and "stimulation" in state:
+            mapping.update(self._poisson_plan.state_mapping(state["stimulation"]))
         return (
             mapping,
             dt,
@@ -9863,8 +16090,141 @@ class FunctionalPopulation:
             state_positionals[("control", "duration_remainder")],
         )
 
+    def _audit_event_receivers(self, tensors: PopulationTensors) -> None:
+        if not self._check_purity:
+            return
+        self._audit_receivers(tensors, continuous=False)
+        self._audit_receivers(tensors, continuous=True)
+
+    def _audit_receivers(self, tensors: PopulationTensors, *, continuous) -> None:
+        """Exercise pure receivers on disposable, independently rebound frames."""
+        receivers = self._continuous_receivers if continuous else self._receivers
+        if not receivers:
+            return
+        with (
+            _rng_diagnostic_scope(self.device, enabled=True) as rng_diagnostic,
+            _class_state_diagnostic_scope(
+                _authored_workspace_classes(self._transition)
+            ) as mutated_class_state,
+        ):
+            with torch.inference_mode(False), torch.no_grad():
+                parameters = {
+                    name: value.detach().clone()
+                    for name, value in tensors.parameters.items()
+                }
+                constants = {
+                    name: value.detach().clone()
+                    for name, value in tensors.constants.items()
+                }
+                state = self._clone_state_tree(tensors.state)
+                prepared = self._prepare_values(parameters, constants)
+                cases = (
+                    (target, input, reduction)
+                    for target in receivers
+                    for input in (
+                        self._continuous_receiver_inputs[target]
+                        if continuous
+                        else (None,)
+                    )
+                    for reduction in (
+                        ("sum", "set", "min", "max") if continuous else ("sum",)
+                    )
+                )
+                for target, input, reduction in cases:
+                    population = _deepcopy_execution_module(self._transition.population)
+                    _rebind_population_time_references(population)
+                    process = population.mech.mechanisms[target]
+                    _install_receiver_audit(
+                        process,
+                        "continuous_receive_values"
+                        if continuous
+                        else "net_receive_values",
+                    )
+                    facade = _PopulationReceive(
+                        population, target, self._state_layout, continuous=continuous
+                    )
+                    facade._audit_noise_workspaces = True
+                    python_state = _transition_python_state_snapshot(facade)
+                    registered = _registered_tensor_bindings(facade)
+                    repeated = []
+                    for weight in (0.0, 0.25, 0.25):
+                        mapping, dt, _celsius, v, t, remainder = self._mapping(
+                            parameters, prepared, state, isolate_read_only=True
+                        )
+                        payload = torch.full(
+                            self._continuous_input_shapes[target][input]
+                            if continuous
+                            else self._receiver_shapes[target],
+                            weight,
+                            dtype=self.dtype,
+                            device=self.device,
+                        )
+                        arguments = (v, t, remainder, dt, payload)
+                        if continuous:
+                            arguments += (
+                                input,
+                                reduction,
+                                torch.ones_like(payload, dtype=torch.bool),
+                                torch.zeros_like(payload, dtype=torch.bool),
+                            )
+                        argument_before = _audit_python_value_signature(
+                            arguments, set()
+                        )
+                        payload_before = _audit_tensor_binding(payload)
+                        read_only = {
+                            name: _audit_tensor_binding(value)
+                            for name, value in mapping.items()
+                            if name not in self._mutable_mapping_slots
+                        }
+                        try:
+                            outputs = functional_call(
+                                facade,
+                                mapping,
+                                arguments,
+                                tie_weights=False,
+                            )
+                        except Exception as exc:
+                            raise FunctionalizationError(
+                                f"Synapse {target!r} pure receive audit failed: {exc}"
+                            ) from exc
+                        if (
+                            _audit_tensor_binding(payload) != payload_before
+                            or _audit_python_value_signature(arguments, set())
+                            != argument_before
+                            or any(
+                                name not in mapping
+                                or _audit_tensor_binding(mapping[name]) != binding
+                                for name, binding in read_only.items()
+                            )
+                            or _registered_tensor_bindings(facade) != registered
+                            or _transition_python_state_snapshot(facade) != python_state
+                        ):
+                            raise FunctionalizationError(
+                                f"Synapse {target!r} receiver mutated read-only "
+                                "inputs or retained hidden module/Python state"
+                            )
+                        if weight:
+                            repeated.append(
+                                tuple(_audit_tensor_value(value) for value in outputs)
+                            )
+                    if repeated[0] != repeated[1]:
+                        raise FunctionalizationError(
+                            f"Synapse {target!r} receiver returned "
+                            "non-deterministic results from identical explicit inputs"
+                        )
+        consumed_rng = rng_diagnostic.changes
+        if mutated_class_state or consumed_rng:
+            raise FunctionalizationError(
+                "pure receiver audit observed class mutation or RNG "
+                f"consumption: classes={sorted(mutated_class_state)}, "
+                f"RNG={sorted(consumed_rng)}"
+            )
+
     def _audit_read_only_workspaces(self, tensors: PopulationTensors) -> None:
         """Prove preparation/transition purity before exposing a hot-path plan."""
+        if not self._check_purity:
+            self._lowering_audit_complete = True
+            return
         # A failed re-audit leaves even directly constructed/internal plans on
         # the defensive mapping path rather than trusting an earlier result.
         self._lowering_audit_complete = False
@@ -9891,6 +16251,9 @@ class FunctionalPopulation:
                 audit_preparation = _deepcopy_execution_module(self._preparation)
                 _rebind_population_time_references(audit_preparation.population)
                 audit_preparation.audit_builder_inputs = True
+                from ._custom_material_processes import install_custom_material_audits
+
+                install_custom_material_audits(audit_preparation.population)
                 for component_preparation in getattr(
                     audit_preparation,
                     "component_physical_preparations",
@@ -9898,7 +16261,12 @@ class FunctionalPopulation:
                 ):
                     component_preparation.audit_builder_inputs = True
                 audit_transition = copy.deepcopy(self._transition)
+                audit_transition._audit_noise_workspaces = True
+                audit_transition._audit_dufort_currents = True
                 _rebind_population_time_references(audit_transition.population)
+                _install_voltage_process_audits(audit_transition.population)
+                _install_state_input_audits(audit_transition.population)
+                install_custom_material_audits(audit_transition.population)
                 preparation_python_state = _transition_python_state_snapshot(
                     audit_preparation
                 )
@@ -10120,13 +16488,22 @@ class FunctionalPopulation:
 
     def _audit_initialization(self, tensors: PopulationTensors) -> None:
         """Prove admitted initialization and final-current-frame purity."""
+        if not self._check_purity:
+            return
 
         if self._initialization is None:
             return
 
         rng_state = _global_rng_snapshot(self.device)
         class_state = _class_state_snapshot(
-            _authored_workspace_classes(self._initialization)
+            tuple(
+                dict.fromkeys(
+                    (
+                        *_authored_workspace_classes(self._initialization),
+                        *_authored_workspace_classes(self._preparation),
+                    )
+                )
+            )
         )
         mutated_registered = set()
         mutated_read_only = set()
@@ -10138,14 +16515,60 @@ class FunctionalPopulation:
         transform_outputs = {}
         caught_error = None
         audit_initialization = None
+        audit_preparation = None
         registered = {}
         python_state = {}
+
+        def registered_bindings():
+            bindings = {}
+            for prefix, module in (
+                ("", audit_initialization),
+                ("preparation:", audit_preparation),
+            ):
+                if module is not None:
+                    bindings.update(
+                        (f"{prefix}{name}", value)
+                        for name, value in _registered_tensor_bindings(module).items()
+                    )
+            return bindings
+
+        def python_bindings():
+            bindings = {}
+            for prefix, module in (
+                ("", audit_initialization),
+                ("preparation:", audit_preparation),
+            ):
+                if module is not None:
+                    bindings.update(
+                        (f"{prefix}{name}", value)
+                        for name, value in _transition_python_state_snapshot(
+                            module
+                        ).items()
+                    )
+            return bindings
+
         try:
             with torch.inference_mode(False):
                 audit_initialization = _deepcopy_execution_module(self._initialization)
+                audit_initialization._audit_noise_workspaces = True
                 _rebind_population_time_references(audit_initialization.population)
-                registered = _registered_tensor_bindings(audit_initialization)
-                python_state = _transition_python_state_snapshot(audit_initialization)
+                # Initialization exposes zero timestep workspaces to ordinary
+                # builders, unlike runtime preparation. Audit that distinct
+                # context too, on a disposable input-audited preparation tree.
+                audit_preparation = _deepcopy_execution_module(self._preparation)
+                _rebind_population_time_references(audit_preparation.population)
+                audit_preparation.audit_builder_inputs = True
+                for component in getattr(
+                    audit_preparation, "component_physical_preparations", ()
+                ):
+                    component.audit_builder_inputs = True
+                preparation_base_mapping = {
+                    name: _clone_tensor(value)
+                    for name, value in _module_tensor_slots(audit_preparation)
+                    if not name.startswith("component_physical_preparations.")
+                }
+                registered = registered_bindings()
+                python_state = python_bindings()
                 parameter_names = tuple(tensors.parameters)
                 constant_names = tuple(tensors.constants)
                 explicit_names = tuple(
@@ -10190,17 +16613,13 @@ class FunctionalPopulation:
                     return cloned
 
                 def record_module_side_effects():
-                    current_registered = _registered_tensor_bindings(
-                        audit_initialization
-                    )
+                    current_registered = registered_bindings()
                     mutated_registered.update(
                         key
                         for key in set(registered) | set(current_registered)
                         if registered.get(key) != current_registered.get(key)
                     )
-                    current_python_state = _transition_python_state_snapshot(
-                        audit_initialization
-                    )
+                    current_python_state = python_bindings()
                     mutated_python_state.update(
                         name
                         for name in set(python_state) | set(current_python_state)
@@ -10213,6 +16632,7 @@ class FunctionalPopulation:
                     constants,
                     v_init,
                     explicit_values,
+                    previous_values,
                     transform_values,
                     *,
                     track_read_only: bool,
@@ -10232,6 +16652,14 @@ class FunctionalPopulation:
                             for name, value in zip(
                                 explicit_names,
                                 explicit_values,
+                                strict=True,
+                            )
+                        },
+                        **{
+                            f"previous_state:{name}": value
+                            for name, value in zip(
+                                explicit_names,
+                                previous_values,
                                 strict=True,
                             )
                         },
@@ -10259,68 +16687,80 @@ class FunctionalPopulation:
                             strict=True,
                         )
                     )
-                    pre_state = torch.utils._pytree.tree_map(
-                        lambda value: value,
+                    pre_state = _fresh_initialization_pre_state(
                         self._initialization_state_template,
+                        v_init,
                     )
-                    _put_path(pre_state, ("integrator", "v"), v_init)
                     for entry, value in zip(
-                        self._initialization_state_layout,
-                        explicit_values,
-                        strict=True,
+                        self._initialization_state_layout, previous_values, strict=True
                     ):
                         _put_path(pre_state, entry.public_path, value)
-                    initialized_parameters, pre_state = (
-                        _apply_initialization_transforms(
+                    initialization_states = dict(
+                        zip(explicit_names, explicit_values, strict=True)
+                    )
+
+                    def prepare_initialization(initialized_parameters):
+                        preparation_modules = (
+                            audit_preparation,
+                            *getattr(
+                                audit_preparation, "component_physical_preparations", ()
+                            ),
+                        )
+                        # Storage/version fingerprints are meaningful for the
+                        # ordinary probes, not hidden vmap/JVP tensor wrappers.
+                        for module in preparation_modules:
+                            module.audit_builder_inputs = track_read_only
+                        try:
+                            return self._prepare_values(
+                                initialized_parameters,
+                                constants,
+                                preparation=audit_preparation,
+                                preparation_base_mapping=preparation_base_mapping,
+                                for_initialization=True,
+                            )
+                        finally:
+                            for module in preparation_modules:
+                                module.audit_builder_inputs = True
+
+                    def initialize_state(bound_mapping, pre_state, initialization_dt):
+                        nonlocal mapping, read_only_bindings
+                        nonlocal state_outputs, initialized_v
+                        mapping = bound_mapping
+                        initialized_v = _get_path(pre_state, ("integrator", "v"))
+                        if track_read_only:
+                            read_only_bindings = {
+                                slot: _audit_tensor_binding(value)
+                                for slot, value in mapping.items()
+                                if slot not in self._mutable_mapping_slots
+                            }
+                        audit_initialization._audit_noise_workspaces = track_read_only
+                        try:
+                            state_outputs = self._initialization_outputs(
+                                audit_initialization, mapping, pre_state
+                            )
+                        finally:
+                            audit_initialization._audit_noise_workspaces = True
+                        state = {}
+                        for leaf, value in zip(
+                            self._state_layout,
+                            state_outputs,
+                            strict=True,
+                        ):
+                            _put_path(state, leaf.public_path, value)
+                        return state
+
+                    mapping = read_only_bindings = state_outputs = initialized_v = None
+                    initialized_parameters, state, _prepared = (
+                        self._execute_initialization(
                             audit_initialization,
-                            "pre",
                             parameters,
                             pre_state,
+                            initialization_states,
                             transform_inputs,
+                            self._initialization_state_template,
+                            prepare_initialization,
+                            initialize_state,
                         )
-                    )
-                    initialized_v = _get_path(pre_state, ("integrator", "v"))
-                    initialized_explicit = tuple(
-                        _get_path(pre_state, entry.public_path)
-                        for entry in self._initialization_state_layout
-                    )
-                    prepared = self._prepare_values(
-                        initialized_parameters,
-                        constants,
-                    )
-                    initialization_dt = torch.zeros_like(prepared["integrator"]["dt"])
-                    mapping, _dt, _celsius, _v, _t, _remainder = self._mapping(
-                        initialized_parameters,
-                        prepared,
-                        self._initialization_state_template,
-                        isolate_read_only=True,
-                        mechanism_dt=initialization_dt,
-                    )
-                    if track_read_only:
-                        read_only_bindings = {
-                            slot: _audit_tensor_binding(value)
-                            for slot, value in mapping.items()
-                            if slot not in self._mutable_mapping_slots
-                        }
-                    state_outputs = functional_call(
-                        audit_initialization,
-                        mapping,
-                        (initialized_v, *initialized_explicit),
-                        tie_weights=False,
-                    )
-                    state = {}
-                    for leaf, value in zip(
-                        self._state_layout,
-                        state_outputs,
-                        strict=True,
-                    ):
-                        _put_path(state, leaf.public_path, value)
-                    initialized_parameters, state = _apply_initialization_transforms(
-                        audit_initialization,
-                        "post",
-                        initialized_parameters,
-                        state,
-                        transform_inputs,
                     )
                     state = _reset_functional_initialization_clock(state)
                     outputs = (
@@ -10371,6 +16811,18 @@ class FunctionalPopulation:
                         )
                         for name in explicit_names
                     }
+                    # Previous State and insertion configuration are distinct
+                    # inputs. Probe both frames under autograd/vmap/JVP so pre
+                    # hooks retain the same diagnostic coverage as INITIAL.
+                    previous = tuple(
+                        audit_input(
+                            _get_path(
+                                self._initialization_state_template, entry.public_path
+                            ),
+                            requires_grad=requires_grad,
+                        )
+                        for entry in self._initialization_state_layout
+                    )
                     v_init = audit_input(
                         tensors.initialization.v_init,
                         requires_grad=requires_grad,
@@ -10387,6 +16839,7 @@ class FunctionalPopulation:
                         constants,
                         v_init,
                         tuple(explicit.values()),
+                        previous,
                         tuple(transforms.values()),
                     )
 
@@ -10401,6 +16854,7 @@ class FunctionalPopulation:
                             constants,
                             v_init,
                             explicit_values,
+                            previous_values,
                             transform_values,
                         ) = make_inputs(requires_grad=grad_enabled)
                         outputs = evaluate(
@@ -10408,6 +16862,7 @@ class FunctionalPopulation:
                             constants,
                             v_init,
                             explicit_values,
+                            previous_values,
                             transform_values,
                             track_read_only=True,
                         )
@@ -10429,6 +16884,7 @@ class FunctionalPopulation:
                     constants,
                     v_init,
                     explicit_values,
+                    previous_values,
                     transform_values,
                 ) = make_inputs(requires_grad=False)
                 flat_inputs = (
@@ -10436,6 +16892,7 @@ class FunctionalPopulation:
                     *(constants[name] for name in constant_names),
                     v_init,
                     *explicit_values,
+                    *previous_values,
                     *transform_values,
                 )
                 parameter_count = len(parameter_names)
@@ -10449,12 +16906,15 @@ class FunctionalPopulation:
                     local_v_init = values[constant_stop]
                     explicit_stop = constant_stop + 1 + explicit_count
                     local_explicit = values[constant_stop + 1 : explicit_stop]
-                    local_transforms = values[explicit_stop:]
+                    previous_stop = explicit_stop + explicit_count
+                    local_previous = values[explicit_stop:previous_stop]
+                    local_transforms = values[previous_stop:]
                     outputs = evaluate(
                         dict(zip(parameter_names, parameter_values, strict=True)),
                         dict(zip(constant_names, constant_values, strict=True)),
                         local_v_init,
                         local_explicit,
+                        local_previous,
                         local_transforms,
                         track_read_only=False,
                     )
@@ -10464,7 +16924,7 @@ class FunctionalPopulation:
                     # their values or their meaningful derivatives.
                     lane_anchor = local_v_init.sum() * 0.0
                     return tuple(
-                        outputs[index] + lane_anchor
+                        outputs[index] + lane_anchor.to(dtype=outputs[index].dtype)
                         for index in transform_output_indices
                     )
 
@@ -10477,14 +16937,35 @@ class FunctionalPopulation:
                     value[0].detach().clone() for value in vmapped_outputs
                 )
 
-                # A joint forward-mode probe through every explicit tensor input
-                # establishes that initialization has the same primal result
-                # inside JVP. The tangent may legitimately be zero or nonzero.
+                # Structural integer/bool inputs (for example material masks)
+                # remain explicit in the probe but cannot acquire AD tangents.
+                # Vmap above still exercises independent lanes for all inputs.
+                differentiable_indices = tuple(
+                    index
+                    for index, value in enumerate(flat_inputs)
+                    if value.is_floating_point() or value.is_complex()
+                )
+
+                def evaluate_differentiable(*values):
+                    full_inputs = list(flat_inputs)
+                    for index, value in zip(
+                        differentiable_indices, values, strict=True
+                    ):
+                        full_inputs[index] = value
+                    return evaluate_flat(*full_inputs)
+
+                differentiable_inputs = tuple(
+                    flat_inputs[index] for index in differentiable_indices
+                )
+                # A joint forward-mode probe establishes primal consistency;
+                # individual tangents may legitimately be zero or nonzero.
                 with torch.set_grad_enabled(True):
                     jvp_outputs, _tangents = torch.func.jvp(
-                        evaluate_flat,
-                        flat_inputs,
-                        tuple(torch.ones_like(value) for value in flat_inputs),
+                        evaluate_differentiable,
+                        differentiable_inputs,
+                        tuple(
+                            torch.ones_like(value) for value in differentiable_inputs
+                        ),
                     )
                 record_module_side_effects()
                 transform_outputs["jvp"] = tuple(
@@ -10495,17 +16976,13 @@ class FunctionalPopulation:
         finally:
             try:
                 if audit_initialization is not None:
-                    current_registered = _registered_tensor_bindings(
-                        audit_initialization
-                    )
+                    current_registered = registered_bindings()
                     mutated_registered.update(
                         key
                         for key in set(registered) | set(current_registered)
                         if registered.get(key) != current_registered.get(key)
                     )
-                    current_python_state = _transition_python_state_snapshot(
-                        audit_initialization
-                    )
+                    current_python_state = python_bindings()
                     mutated_python_state.update(
                         name
                         for name in set(python_state) | set(current_python_state)
@@ -10612,6 +17089,15 @@ class FunctionalPopulation:
     def _stimulus_values(plan, parameters):
         stimulus_parameters = {name: parameters[name] for name in plan.parameter_names}
         stimulus_constants = {name: parameters[name] for name in plan.constant_names}
+        # Per-call stacks accompany their registered schedule leaves without
+        # becoming part of the public parameter or checkpoint schema.
+        stimulus_constants.update(
+            {
+                name + ".__invocations": parameters[name + ".__invocations"]
+                for name in plan.constant_names
+                if name + ".__invocations" in parameters
+            }
+        )
         return stimulus_parameters, stimulus_constants
 
     def _stimulation_times(self, state, steps: int, dt=None) -> torch.Tensor:
@@ -10619,6 +17105,11 @@ class FunctionalPopulation:
         start = state["clock"]["t"]
         if dt is None:
             dt = start.new_tensor(self.dt)
+        if self.device.type == "mps":
+            dt_cpu = dt.to(device="cpu").to(dtype=torch.float64)
+            return _time_grid_from_step_count(
+                start, steps, dt_cpu, device=self.device
+            ).to(self.dtype)
         offsets = torch.arange(
             steps,
             device=self.device,
@@ -10634,7 +17125,12 @@ class FunctionalPopulation:
         intra,
         steps: int,
         dt,
+        stimulation=None,
+        *,
+        sampling_times=None,
     ):
+        if stimulation is not None:
+            parameters = self._poisson_plan.parameters(parameters, stimulation)
         if self._intra.enabled and intra is not None:
             raise ValueError(
                 "explicit intra cannot be combined with registered functional intra"
@@ -10644,7 +17140,11 @@ class FunctionalPopulation:
         if not self._intra.enabled and not self._extra.enabled:
             return ve, intra
 
-        times = self._stimulation_times(state, steps, dt)
+        times = (
+            self._stimulation_times(state, steps, dt)
+            if sampling_times is None
+            else sampling_times
+        )
         if self._intra.enabled:
             stimulus_parameters, stimulus_constants = self._stimulus_values(
                 self._intra,
@@ -10670,68 +17170,14 @@ class FunctionalPopulation:
     def _normalize_rollout_value(self, value, *, name: str, steps: int | None):
         if value is None:
             return None, steps
-        if not torch.is_tensor(value):
-            raise TypeError(f"{name} must be a Tensor or None")
-        if value.ndim == 0:
-            raise ValueError(f"{name} needs a leading time axis; got a scalar tensor")
-        if value.device != self.device or value.dtype != self.dtype:
-            raise ValueError(f"{name} must use {self.device}/{self.dtype}")
-        value_steps = int(value.shape[0])
-        if steps is not None and value_steps != steps:
-            raise ValueError(
-                f"{name} has {value_steps} steps, but the rollout expects {steps}"
-            )
-
-        # Match Population's direct-drive contract. Ordinary trailing
-        # broadcasting is authoritative, so a payload whose size happens to
-        # equal an explicit batch axis retains its established spatial suffix
-        # meaning. Only when that fails may a low-rank payload be interpreted
-        # as batch-only and padded with singleton population/compartment axes.
-        payload_shape = tuple(value.shape[1:])
-        target_shape = (value_steps, *self.shape)
-        trailing_error = None
-        if len(payload_shape) <= len(self.shape):
-            aligned_shape = (
-                value_steps,
-                *((1,) * (len(self.shape) - len(payload_shape))),
-                *payload_shape,
-            )
-            try:
-                normalized = torch.broadcast_to(
-                    value.reshape(aligned_shape),
-                    target_shape,
-                )
-                return normalized.contiguous(), value_steps
-            except RuntimeError as exc:
-                trailing_error = exc
-
-        batch_shape = self.shape[:-2]
-        if batch_shape and 0 < len(payload_shape) <= len(batch_shape):
-            batch_aligned_shape = (
-                value_steps,
-                *((1,) * (len(batch_shape) - len(payload_shape))),
-                *payload_shape,
-            )
-            try:
-                batch_value = torch.broadcast_to(
-                    value.reshape(batch_aligned_shape),
-                    (value_steps, *batch_shape),
-                )
-                normalized = torch.broadcast_to(
-                    batch_value.reshape(value_steps, *batch_shape, 1, 1),
-                    target_shape,
-                )
-                return normalized.contiguous(), value_steps
-            except RuntimeError:
-                pass
-
-        raise ValueError(
-            f"{name} per-step shape {payload_shape} is not broadcastable to "
-            f"Population shape {self.shape}. Ordinary trailing PyTorch "
-            "broadcasting is tried first; a batch-only fallback accepts "
-            f"payloads broadcastable to explicit batch shape {batch_shape}. "
-            "Use singleton axes to disambiguate batch and spatial intent."
-        ) from trailing_error
+        return normalize_input_tape(
+            value,
+            name=name,
+            steps=steps,
+            shape=self.shape,
+            device=self.device,
+            dtype=self.dtype,
+        )
 
     def _transition_rollout_values(
         self,
@@ -10741,13 +17187,62 @@ class FunctionalPopulation:
         ve,
         intra,
         steps,
+        noise=None,
+        stimulation=None,
+        draws=None,
+        *,
+        poisson_schedules=None,
     ):
         """Execute the established authored transition with a Python loop."""
+        runtime_draws = draws
+        if runtime_draws is not None:
+            noise, stimulation = self._runtime_draw_plan.arithmetic(runtime_draws)
         mapping, dt, celsius, v, t, duration_remainder = self._mapping(
             parameters,
             prepared,
             state,
         )
+        noise_values = None
+        if noise is not None:
+            noise_values = {}
+            for index in range(steps):
+                packet = torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value[index], noise
+                )
+                values = self._noise_plan.values(mapping, packet, dt)
+                sde_values = self._noise_plan.sde_values(packet)
+                if index == 0:
+                    # Binding these registered temporary slots makes
+                    # functional_call restore them when the recurrence exits.
+                    mapping.update(sde_values)
+                values.update(
+                    (slot.removeprefix("population."), value)
+                    for slot, value in sde_values.items()
+                )
+                for name, value in values.items():
+                    noise_values.setdefault(name, []).append(value)
+            noise_values = {
+                name: torch.stack(values) for name, values in noise_values.items()
+            }
+        if stimulation is not None:
+            if noise_values is None:
+                noise_values = {}
+            schedule_values = {}
+            for index in range(steps):
+                packet = torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value[index], stimulation
+                )
+                for slot, value in self._poisson_plan.mapping(
+                    packet, schedules=poisson_schedules
+                ).items():
+                    if index == 0:
+                        mapping[slot] = value
+                    schedule_values.setdefault(
+                        slot.removeprefix("population."), []
+                    ).append(value)
+            noise_values.update(
+                {name: torch.stack(values) for name, values in schedule_values.items()}
+            )
         outputs = functional_call(
             self._transition,
             mapping,
@@ -10760,6 +17255,8 @@ class FunctionalPopulation:
                 ve,
                 intra,
                 steps,
+                noise_values,
+                prepared.get("noise_workspaces"),
             ),
             tie_weights=False,
         )
@@ -10784,22 +17281,341 @@ class FunctionalPopulation:
                     "initialized tensor schema across every timestep."
                 )
             _put_path(next_state, leaf.public_path, value)
+        if runtime_draws is not None:
+            if self._random_plan is not None:
+                next_state["random"] = state["random"]
+            if self._poisson_plan is not None:
+                next_state["stimulation"] = state["stimulation"]
+            if steps:
+                next_state = self._runtime_draw_plan.publish(
+                    next_state,
+                    runtime_draws,
+                    tape=True,
+                    schedules=poisson_schedules,
+                )
+        else:
+            if self._random_plan is not None:
+                next_state["random"] = (
+                    state["random"]
+                    if noise is None or not steps
+                    else {
+                        **state["random"],
+                        "rng": torch.utils._pytree.tree_map_only(
+                            torch.Tensor, lambda value: value[-1].clone(), noise.rng
+                        ),
+                    }
+                )
+            if self._poisson_plan is not None:
+                next_state["stimulation"] = (
+                    state["stimulation"]
+                    if stimulation is None or not steps
+                    else self._poisson_plan.advance(
+                        state["stimulation"],
+                        stimulation,
+                        tape=True,
+                        schedules=poisson_schedules,
+                    )
+                )
+            if steps:
+                next_state = self._stimulation_rng_plan.publish(
+                    next_state, noise=noise, stimulation=stimulation, tape=True
+                )
+        next_state = {name: next_state[name] for name in self._state_schema}
         return next_state, {"v": next_state["integrator"]["v"]}
 
-    def _clone_state_tree(self, state):
+    def _map_state_tree(self, state, function):
         # while_loop requires the carry's pytree order and every tensor's
         # metadata, including strides, to match the body output exactly.
         # Public state is key-addressed and may arrive with a different Mapping
         # insertion order or valid non-contiguous views. Rebuild it from the
-        # immutable layout so initial and returned carry have one owned,
-        # canonical representation.
+        # immutable layout so initial and returned carry have canonical order.
+        # The leaf transform supplies ownership when cloning is requested.
         cloned = {}
         for leaf in self._state_layout:
-            value = _get_path(state, leaf.public_path).clone(
-                memory_format=torch.contiguous_format
-            )
+            value = function(_get_path(state, leaf.public_path))
             _put_path(cloned, leaf.public_path, value)
-        return cloned
+        if self._random_plan is not None:
+            cloned["random"] = torch.utils._pytree.tree_map(
+                function,
+                state["random"],
+            )
+        if self._poisson_plan is not None:
+            cloned["stimulation"] = torch.utils._pytree.tree_map(
+                function,
+                state["stimulation"],
+            )
+        return {name: cloned[name] for name in self._state_schema}
+
+    def _clone_state_tree(self, state):
+        return self._map_state_tree(state, _clone_state_leaf)
+
+    @_state_projection(_clone_state_tree)
+    def _project_state_tree(self, state):
+        """Read state leaves in canonical order without copying them."""
+        return self._map_state_tree(state, _identity_state_leaf)
+
+    def _validate_receive(self, target, payload):
+        if not isinstance(target, str):
+            raise TypeError("event target must be a mechanism name")
+        if target not in self._receiver_failures:
+            raise ValueError(f"unknown event target {target!r}")
+        failures = self._receiver_failures[target]
+        if failures:
+            raise FunctionalizationError(
+                f"Synapse {target!r} cannot receive functional events: "
+                + "; ".join(failures)
+            )
+        if not torch.is_tensor(payload):
+            raise TypeError("event payload must be a Tensor")
+        if payload.device != self.device or payload.dtype != self.dtype:
+            raise ValueError(f"event payload must use {self.device}/{self.dtype}")
+        shape = self._receiver_shapes[target]
+        try:
+            projected_shape = torch.broadcast_shapes(_shape_tuple(payload), shape)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"event payload shape {_shape_tuple(payload)} cannot broadcast to "
+                f"target {target!r} shape {shape}"
+            ) from exc
+        if projected_shape != shape:
+            raise ValueError(
+                f"event payload shape {_shape_tuple(payload)} cannot broadcast to "
+                f"target {target!r} shape {shape}"
+            )
+        self._validate_receiver_hooks(target)
+
+    def _validate_receiver_hooks(self, target, *, continuous=False):
+        # Keep source-hook bindings visible to Dynamo, including instance
+        # replacement. The larger structural fingerprint is checked once per
+        # compiled graph, whereas these ordinary guards invalidate warm graphs.
+        source = self._population.mech.mechanisms[target]
+        types = (
+            self._source_continuous_receiver_types
+            if continuous
+            else self._source_receiver_types
+        )
+        hooks = (
+            self._source_continuous_receiver_hooks
+            if continuous
+            else self._source_receiver_hooks
+        )
+        if type(source) is not types[target]:
+            raise FunctionalizationError(
+                f"Synapse {target!r} event receiver changed after make_functional(); "
+                "lower the Population again."
+            )
+        compiling = torch.compiler.is_compiling()
+        for name, class_bindings in hooks[target]:
+            expected = next(value for _cls, present, value in class_bindings if present)
+            changed = (
+                any(
+                    (name in cls.__dict__) != present
+                    or not (cls.__dict__ == _RawClassHookIdentity(name, original))
+                    for cls, present, original in class_bindings
+                )
+                if compiling
+                else any(
+                    (name in cls.__dict__) != present
+                    or cls.__dict__.get(name) is not original
+                    for cls, present, original in class_bindings
+                )
+            )
+            if name in source.__dict__ or changed:
+                raise FunctionalizationError(
+                    f"Synapse {target!r} event receiver changed after "
+                    "make_functional(); lower the Population again."
+                )
+            method = getattr(source, name)
+            if method.__self__ is not source or method.__func__ is not expected:
+                raise FunctionalizationError(
+                    f"Synapse {target!r} event receiver changed after "
+                    "make_functional(); lower the Population again."
+                )
+
+    def _validate_continuous_scratch(self, scratch):
+        if not isinstance(scratch, Mapping) or set(scratch) != set(
+            self._continuous_receiver_inputs
+        ):
+            raise ValueError(
+                "continuous scratch must match this Population's receiver schema"
+            )
+        for target, inputs in self._continuous_receiver_inputs.items():
+            local = scratch[target]
+            if not isinstance(local, Mapping) or set(local) != set(inputs):
+                raise ValueError(
+                    f"continuous scratch for {target!r} must match its inputs"
+                )
+            for input in inputs:
+                value = local[input]
+                if (
+                    not torch.is_tensor(value)
+                    or value.dtype != torch.bool
+                    or value.device != self.device
+                    or _shape_tuple(value)
+                    != self._continuous_input_shapes[target][input]
+                ):
+                    raise ValueError(
+                        f"continuous scratch {target!r}.{input} must be a local Boolean Tensor"
+                    )
+
+    def _validate_continuous_receive(self, target, payload, input, reduce, mask):
+        if not isinstance(target, str):
+            raise TypeError("continuous target must be a mechanism name")
+        if target not in self._continuous_receiver_failures:
+            raise ValueError(f"unknown continuous target {target!r}")
+        failures = self._continuous_receiver_failures[target]
+        if failures:
+            raise FunctionalizationError(
+                f"ContinuousSynapse {target!r} cannot receive functionally: "
+                + "; ".join(failures)
+            )
+        inputs = self._continuous_receiver_inputs[target]
+        if input is None:
+            if len(inputs) != 1:
+                raise ValueError(
+                    "continuous_receive requires input= when the target has multiple inputs"
+                )
+            input = inputs[0]
+        if input not in inputs:
+            raise ValueError(f"target {target!r} has no continuous input {input!r}")
+        if reduce not in ("sum", "add", "set", "replace", "last", "min", "max"):
+            raise ValueError(f"Unsupported continuous reduction mode: {reduce!r}")
+        shape = self._continuous_input_shapes[target][input]
+        for label, value, dtype in (
+            ("payload", payload, self.dtype),
+            ("mask", mask, torch.bool),
+        ):
+            if label == "mask" and value is None:
+                continue
+            if not torch.is_tensor(value):
+                raise TypeError(f"continuous {label} must be a Tensor")
+            if value.device != self.device or value.dtype != dtype:
+                raise ValueError(f"continuous {label} must use {self.device}/{dtype}")
+            try:
+                projected = torch.broadcast_shapes(_shape_tuple(value), shape)
+            except RuntimeError as exc:
+                raise ValueError(
+                    f"continuous {label} cannot broadcast to input {input!r} shape {shape}"
+                ) from exc
+            if projected != shape:
+                raise ValueError(
+                    f"continuous {label} cannot broadcast to input {input!r} shape {shape}"
+                )
+        self._validate_receiver_hooks(target, continuous=True)
+        return input
+
+    def reset_continuous_inputs(self, state):
+        """Reset every continuous receiver once and return fresh per-step scratch.
+
+        ``x`` and ``x_old`` remain ordinary Population CARRY. Scratch contains
+        only Boolean first-delivery masks, is reset at the network step boundary,
+        and is deliberately separate from checkpoint carry. Preserve it when
+        pausing between deliveries within the same timestep.
+        """
+        self._validate_source()
+        self._validate_state(state)
+        for target, failures in self._continuous_receiver_failures.items():
+            if failures:
+                raise FunctionalizationError(
+                    f"ContinuousSynapse {target!r} cannot reset functionally: "
+                    + "; ".join(failures)
+                )
+        return self._reset_continuous_inputs_values(
+            state, tuple(self._continuous_receiver_inputs)
+        )
+
+    def _reset_continuous_inputs_values(self, state, targets):
+        """Shared reset for an explicitly selected native target schedule."""
+        result = {"random": state["random"]} if self._random_plan is not None else {}
+        if self._poisson_plan is not None:
+            result["stimulation"] = state["stimulation"]
+        for leaf in self._state_layout:
+            _put_path(result, leaf.public_path, _get_path(state, leaf.public_path))
+        scratch = {}
+        for target in targets:
+            inputs = self._continuous_receiver_inputs[target]
+            self._validate_receiver_hooks(target, continuous=True)
+            values = state.get("mechanism_buffers", {}).get(target, {})
+            updates, scratch[target] = reset_continuous_values(
+                values, inputs, self._continuous_old_names[target]
+            )
+            for name, value in updates.items():
+                _put_path(result, ("mechanism_buffers", target, name), value)
+        return result, scratch
+
+    def _continuous_receive_values(
+        self,
+        parameters,
+        prepared,
+        state,
+        scratch,
+        target,
+        payload,
+        input,
+        reduce,
+        mask,
+        *,
+        _binding_indices=None,
+    ):
+        mapping, dt, _celsius, v, t, remainder = (
+            self._mapping(parameters, prepared, state)
+            if _binding_indices is None
+            else self._receiver_mapping(parameters, prepared, state, _binding_indices)
+        )
+        outputs = functional_call(
+            self._continuous_receivers[target],
+            mapping,
+            (v, t, remainder, dt, payload, input, reduce, mask, scratch[target][input]),
+            tie_weights=False,
+        )
+        result = {"random": state["random"]} if self._random_plan is not None else {}
+        if self._poisson_plan is not None:
+            result["stimulation"] = state["stimulation"]
+        for leaf, value in zip(self._state_layout, outputs[:-1], strict=True):
+            if (
+                not torch.is_tensor(value)
+                or _shape_tuple(value) != leaf.shape
+                or value.dtype != leaf.dtype
+                or value.device != leaf.device
+            ):
+                raise FunctionalizationError(
+                    f"functional continuous receive changed the state schema for {'.'.join(leaf.public_path)!r}"
+                )
+            _put_path(result, leaf.public_path, value)
+        next_scratch = {name: dict(values) for name, values in scratch.items()}
+        next_scratch[target][input] = outputs[-1]
+        return result, next_scratch
+
+    def _receive_values(
+        self, parameters, prepared, state, target, payload, *, _binding_indices=None
+    ):
+        mapping, dt, _celsius, v, t, duration_remainder = (
+            self._mapping(parameters, prepared, state)
+            if _binding_indices is None
+            else self._receiver_mapping(parameters, prepared, state, _binding_indices)
+        )
+        outputs = functional_call(
+            self._receivers[target],
+            mapping,
+            (v, t, duration_remainder, dt, payload),
+            tie_weights=False,
+        )
+        result = {"random": state["random"]} if self._random_plan is not None else {}
+        if self._poisson_plan is not None:
+            result["stimulation"] = state["stimulation"]
+        for leaf, value in zip(self._state_layout, outputs, strict=True):
+            if (
+                not torch.is_tensor(value)
+                or _shape_tuple(value) != leaf.shape
+                or value.dtype != leaf.dtype
+                or value.device != leaf.device
+            ):
+                raise FunctionalizationError(
+                    "functional event receive changed the state schema for "
+                    f"{'.'.join(leaf.public_path)!r}"
+                )
+            _put_path(result, leaf.public_path, value)
+        return result
 
     def _structured_rollout_values(
         self,
@@ -10811,7 +17627,9 @@ class FunctionalPopulation:
         steps,
     ):
         """Run compiled inference with graph size bounded by a small step block."""
-        step_graph = self._structured_step_graphs[(ve is not None, intra is not None)]
+        step_graph = self._structured_step_graphs[
+            (ve is not None, intra is not None, MEMBRANE_ASSEMBLY.value)
+        ]
         carry = self._clone_state_tree(state)
         chunk = _STRUCTURED_ROLLOUT_CHUNK
         full_chunks = steps // chunk
@@ -10885,11 +17703,8 @@ class FunctionalPopulation:
         return carry, {"v": carry["integrator"]["v"]}
 
     def _resolve_rollout_inputs(self, inputs, steps):
-        """Validate public rollout inputs and resolve their common length."""
-        if inputs is None:
-            inputs = RolloutInput()
-        if not isinstance(inputs, RolloutInput):
-            raise TypeError("inputs must be a RolloutInput or None")
+        """Normalize rollout drives and resolve their common time axis."""
+        inputs = _population_inputs(inputs)
         if steps is not None:
             if isinstance(steps, bool) or not isinstance(steps, int) or steps < 0:
                 raise ValueError("steps must be a non-negative integer")
@@ -10910,9 +17725,52 @@ class FunctionalPopulation:
             name="intra",
             steps=resolved_steps,
         )
+        stochastic_inputs = (inputs.noise, inputs.stimulation, inputs.draws)
+        if any(value is not None for value in stochastic_inputs):
+            leaves = [
+                value
+                for value in torch.utils._pytree.tree_leaves(stochastic_inputs)
+                if value is not None
+            ]
+            if any(not torch.is_tensor(value) for value in leaves):
+                raise TypeError("Stochastic draw tapes must contain Tensors")
+            if any(value.ndim < 1 for value in leaves):
+                raise ValueError("Stochastic draw tapes need a leading time axis")
+            lengths = [int(value.shape[0]) for value in leaves]
+            if lengths and (
+                len(set(lengths)) != 1
+                or resolved_steps is not None
+                and resolved_steps != lengths[0]
+            ):
+                raise ValueError("Stochastic tape length does not match rollout steps")
+            if lengths:
+                resolved_steps = lengths[0]
         if resolved_steps is None:
             raise ValueError("steps is required when both rollout inputs are None")
         return ve, intra, resolved_steps
+
+    def _resolve_rollout_input_packets(self, inputs, steps):
+        """Resolve a strict rollout and validate the packets it consumes.
+
+        Host schedules use the normalizer separately while stochastic tapes
+        may still be omitted for automatic sampling.
+        """
+        inputs = _population_inputs(inputs)
+        ve, intra, resolved_steps = self._resolve_rollout_inputs(inputs, steps)
+        noise, stimulation, draws = inputs.noise, inputs.stimulation, inputs.draws
+        if draws is not None:
+            if noise is not None or stimulation is not None:
+                raise ValueError(
+                    "draws cannot be combined with legacy stochastic packets"
+                )
+            self._runtime_draw_plan.validate(draws, steps=resolved_steps)
+        else:
+            self._validate_noise_draw(noise, steps=resolved_steps)
+            self._validate_stimulation_draw(stimulation, steps=resolved_steps)
+            self._stimulation_rng_plan.validate_packets(noise, stimulation)
+        return _RuntimeInputs(
+            ve, intra, noise, stimulation, draws, inputs.sampling_time
+        ), resolved_steps
 
     def _execute_rollout_values(
         self,
@@ -10922,8 +17780,75 @@ class FunctionalPopulation:
         ve,
         intra,
         steps,
+        noise=None,
+        stimulation=None,
+        draws=None,
+        sampling_times=None,
     ):
         """Execute already validated tensor inputs through the selected path."""
+        if _has_runtime_stimulation(stimulation, draws):
+            auxiliary = {"v": state["integrator"]["v"]}
+            for index in range(steps):
+                packet = (
+                    self._runtime_draw_plan.arithmetic(
+                        torch.utils._pytree.tree_map_only(
+                            torch.Tensor, lambda value: value[index], draws
+                        )
+                    )[1]
+                    if draws is not None
+                    else torch.utils._pytree.tree_map_only(
+                        torch.Tensor, lambda value: value[index], stimulation
+                    )
+                )
+                # Keep argument reads and the first parameter copy/validation
+                # in their established order. Share only immutable schedule
+                # stacks; mechanism binding still owns fresh invocation cursors.
+                ve_input = None if ve is None else ve[index : index + 1]
+                intra_input = None if intra is None else intra[index : index + 1]
+                dt = prepared["integrator"]["dt"]
+                bound, poisson_schedules = self._poisson_plan._parameters_and_schedules(
+                    parameters, packet
+                )
+                ve_step, intra_step = self._assemble_bound_inputs(
+                    bound,
+                    state,
+                    ve_input,
+                    intra_input,
+                    1,
+                    dt,
+                    sampling_times=(
+                        None
+                        if sampling_times is None
+                        else sampling_times[index : index + 1]
+                    ),
+                )
+                state, auxiliary = self._transition_rollout_values(
+                    parameters,
+                    prepared,
+                    state,
+                    ve_step,
+                    intra_step,
+                    1,
+                    None
+                    if noise is None
+                    else torch.utils._pytree.tree_map_only(
+                        torch.Tensor, lambda value: value[index : index + 1], noise
+                    ),
+                    None
+                    if stimulation is None
+                    else torch.utils._pytree.tree_map_only(
+                        torch.Tensor,
+                        lambda value: value[index : index + 1],
+                        stimulation,
+                    ),
+                    None
+                    if draws is None
+                    else torch.utils._pytree.tree_map_only(
+                        torch.Tensor, lambda value: value[index : index + 1], draws
+                    ),
+                    poisson_schedules=poisson_schedules,
+                )
+            return state, auxiliary
         ve, intra = self._assemble_bound_inputs(
             parameters,
             state,
@@ -10931,10 +17856,17 @@ class FunctionalPopulation:
             intra,
             steps,
             prepared["integrator"]["dt"],
+            sampling_times=sampling_times,
         )
-        structured_signature = (ve is not None, intra is not None)
+        structured_signature = (
+            ve is not None,
+            intra is not None,
+            MEMBRANE_ASSEMBLY.value,
+        )
         if (
-            torch.compiler.is_compiling()
+            noise is None
+            and draws is None
+            and torch.compiler.is_compiling()
             and not torch.is_grad_enabled()
             and torch.autograd.forward_ad._current_level < 0
             and not torch._C._are_functorch_transforms_active()
@@ -10955,6 +17887,9 @@ class FunctionalPopulation:
             ve,
             intra,
             steps,
+            noise,
+            stimulation,
+            draws,
         )
 
     def _execute_rollout_values_with_callbacks(
@@ -10967,62 +17902,40 @@ class FunctionalPopulation:
         steps,
         callbacks,
         callback_state,
+        noise=None,
+        stimulation=None,
+        draws=None,
+        sampling_times=None,
     ):
         """Execute a fixed-step rollout while threading pure callback carry."""
 
-        from ._callbacks import FunctionalCallbackResults
+        from ._callback_recurrence import _execute_callback_steps
+        from ._callbacks import _complete_callback_results, _setup_callback_state
+        from ._recording import _require_recording_host
 
+        _require_recording_host(callbacks)
         callbacks._validate_owner(self)
         callbacks._validate_runtime_dt_tensor(prepared["integrator"]["dt"])
-        parts = []
-        if callback_state is None:
-            callback_state, initial_emission = callbacks._initialize(state)
-            initial_part = callbacks._stack([initial_emission])
-            if callbacks._has_emissions(initial_part):
-                parts.append(initial_part)
-        else:
-            callback_state = callbacks._validate_state(callback_state)
+        callback_state, parts = _setup_callback_state(callbacks, callback_state, state)
 
-        # Bound stimulation is evaluated once for the complete time horizon,
-        # then sliced beside explicit drives. The no-callback rollout remains
-        # on its established fused transition path.
-        ve, intra = self._assemble_bound_inputs(
+        state, auxiliary, callback_state, emitted_part = _execute_callback_steps(
+            self,
             parameters,
+            prepared,
             state,
             ve,
             intra,
             steps,
-            prepared["integrator"]["dt"],
+            callback_state,
+            lambda carry, current, auxiliary: callbacks._update(
+                carry, current, auxiliary
+            ),
+            lambda emissions: callbacks._stack(emissions),
+            noise,
+            stimulation,
+            draws,
+            sampling_times=sampling_times,
         )
-        emissions = []
-        auxiliary = {"v": state["integrator"]["v"]}
-        if steps == 0:
-            state, auxiliary = self._transition_rollout_values(
-                parameters,
-                prepared,
-                state,
-                ve,
-                intra,
-                0,
-            )
-        else:
-            for index in range(steps):
-                state, auxiliary = self._transition_rollout_values(
-                    parameters,
-                    prepared,
-                    state,
-                    None if ve is None else ve[index : index + 1],
-                    None if intra is None else intra[index : index + 1],
-                    1,
-                )
-                callback_state, emitted = callbacks._update(
-                    callback_state,
-                    state,
-                    auxiliary,
-                )
-                if emitted is not None:
-                    emissions.append(emitted)
-        emitted_part = callbacks._stack(emissions)
         if callbacks._has_emissions(emitted_part):
             parts.append(emitted_part)
 
@@ -11038,20 +17951,12 @@ class FunctionalPopulation:
             raise FunctionalizationError(
                 "rollout auxiliary output uses the reserved 'callbacks' key"
             )
-        stacked = callbacks._concatenate(parts)
-        callback_state = callbacks._capture_emission_schemas(
-            callback_state,
-            stacked,
-        )
-        outputs = callbacks._finalize(callback_state, stacked)
-        callback_state = callbacks._materialize_state(callback_state)
-        result["callbacks"] = FunctionalCallbackResults(
-            state=callback_state,
-            outputs=outputs,
+        result["callbacks"] = _complete_callback_results(
+            callbacks, callback_state, parts
         )
         return state, result
 
-    def _step_values(self, parameters, prepared, state, inputs: StepInput):
+    def _step_values(self, parameters, prepared, state, inputs: _RuntimeInputs):
         """Advance one already-validated host step using tensor values only.
 
         Host runners use this private boundary after validating the source,
@@ -11060,6 +17965,7 @@ class FunctionalPopulation:
         repeating those Python freshness/schema walks at every timestep while
         preserving :meth:`step` as the fully checked public entrypoint.
         """
+        inputs = _population_inputs(inputs, step=True)
         ve = None if inputs.ve is None else inputs.ve.unsqueeze(0)
         intra = None if inputs.intra is None else inputs.intra.unsqueeze(0)
         return self._execute_rollout_values(
@@ -11069,6 +17975,22 @@ class FunctionalPopulation:
             ve,
             intra,
             1,
+            None
+            if inputs.noise is None
+            else torch.utils._pytree.tree_map_only(
+                torch.Tensor, lambda value: value.unsqueeze(0), inputs.noise
+            ),
+            None
+            if inputs.stimulation is None
+            else torch.utils._pytree.tree_map_only(
+                torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
+            ),
+            None
+            if inputs.draws is None
+            else torch.utils._pytree.tree_map_only(
+                torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
+            ),
+            None if inputs.sampling_time is None else inputs.sampling_time.unsqueeze(0),
         )
 
     def _rollout_values(
@@ -11076,14 +17998,17 @@ class FunctionalPopulation:
         parameters,
         prepared,
         state,
-        inputs: RolloutInput | None = None,
+        inputs: Inputs | RolloutInput | None = None,
         *,
         steps: int | None = None,
         extra=None,
         callbacks=None,
         callback_state=None,
+        draws=None,
     ):
-        ve, intra, resolved_steps = self._resolve_rollout_inputs(inputs, steps)
+        inputs = _with_runtime_draws(inputs, draws)
+        resolved, resolved_steps = self._resolve_rollout_input_packets(inputs, steps)
+        ve, intra, noise, stimulation, draws, sampling_times = resolved
         if extra is not None:
             if self._extra.enabled:
                 raise ValueError(
@@ -11096,6 +18021,7 @@ class FunctionalPopulation:
                 extra if isinstance(extra, FunctionalExtra) else self.make_extra(extra)
             )
             self._validate_extra_plan(extra_plan)
+            extra_plan._validate_deterministic_assembly()
             if extra_plan.enabled:
                 extra_tensors = extra_plan.extract()
                 ve = extra_plan.assemble_tensors(
@@ -11116,6 +18042,10 @@ class FunctionalPopulation:
                 ve,
                 intra,
                 resolved_steps,
+                noise,
+                stimulation,
+                draws,
+                sampling_times,
             )
         from ._callbacks import FunctionalCallbacks
 
@@ -11133,6 +18063,10 @@ class FunctionalPopulation:
             resolved_steps,
             callbacks,
             callback_state,
+            noise,
+            stimulation,
+            draws,
+            sampling_times,
         )
 
     def rollout(
@@ -11140,19 +18074,29 @@ class FunctionalPopulation:
         parameters,
         prepared,
         state,
-        inputs: RolloutInput | None = None,
+        inputs: Inputs | RolloutInput | None = None,
         *,
         steps: int | None = None,
         extra=None,
         callbacks=None,
         callback_state=None,
+        draws=None,
     ):
-        """Run an eager/torch.func rollout from an opaque prepared plan.
+        """Advance explicit state using a prepared Population and time-leading inputs.
 
-        A plan from :meth:`make_callbacks` returns finalized callback values
-        under ``auxiliary["callbacks"]``. Its explicit result state may be
-        supplied as ``callback_state`` when continuing without reinitializing.
+        ``parameters`` and ``prepared`` must match the identities/versions used by
+        :meth:`prepare`. ``steps`` selects the accepted count; supplied input/draw
+        tapes must have that leading length. Omitted inputs retain registered
+        stimulation. Stochastic values are explicit through ``draws=RuntimeDraws(...)``.
+
+        Returns ``(state, auxiliary)`` without mutating its inputs or native model.
+        Named callbacks produce ``auxiliary["callbacks"]``; pass their returned state
+        as ``callback_state`` to continue without another initial sample. This is the
+        explicit prepared form for eager execution and supported ``torch.func``
+        transforms. Use :func:`run` for duration scheduling and automatic host sampling.
         """
+        if draws is not None:
+            inputs = _with_runtime_draws(inputs, draws)
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_state(state)
@@ -11173,14 +18117,24 @@ class FunctionalPopulation:
         parameters,
         constants,
         state,
-        inputs: RolloutInput | None = None,
+        inputs: Inputs | RolloutInput | None = None,
         *,
         steps: int | None = None,
         extra=None,
         callbacks=None,
         callback_state=None,
+        draws=None,
     ):
-        """Derive and consume coefficients atomically, including under compile."""
+        """Prepare raw sources and execute an explicit Population rollout in one call.
+
+        Arguments and results follow :meth:`rollout`, with raw ``constants`` replacing
+        the opaque prepared value. Preparation belongs to this invocation, preserving
+        its source gradients. This combined tensor operation can be used inside
+        ``torch.compile`` or supported ``torch.func`` transforms. Draws must be explicit;
+        use :func:`run` for host-side automatic sampling and duration scheduling.
+        """
+        if draws is not None:
+            inputs = _with_runtime_draws(inputs, draws)
         self._validate_source()
         self._validate_parameters(parameters)
         self._validate_constants(constants)
@@ -11202,15 +18156,22 @@ class FunctionalPopulation:
         parameters,
         prepared,
         state,
-        inputs: StepInput | None = None,
+        inputs: Inputs | StepInput | None = None,
         *,
         extra=None,
+        callbacks=None,
+        callback_state=None,
+        draws=None,
     ):
-        """Advance one functional timestep without mutating the Population."""
-        if inputs is None:
-            inputs = StepInput()
-        if not isinstance(inputs, StepInput):
-            raise TypeError("inputs must be a StepInput or None")
+        """Advance one timestep from explicit state and one input/draw frame.
+
+        Uses the parameters and opaque value returned by :meth:`prepare`. ``inputs``
+        is one :class:`Inputs` frame; ``draws`` is one :class:`RuntimeDraws` frame.
+        Returns ``(state, auxiliary)`` using the same callback contract as
+        :meth:`rollout`, without changing native model state or supplied tensor values.
+        """
+        inputs = _with_runtime_draws(inputs, draws, step=True)
+        inputs = _population_inputs(inputs, step=True)
         for name, value in zip(("ve", "intra"), inputs):
             if value is not None and not torch.is_tensor(value):
                 raise TypeError(f"{name} must be a Tensor or None")
@@ -11220,9 +18181,29 @@ class FunctionalPopulation:
             parameters,
             prepared,
             state,
-            RolloutInput(ve=ve, intra=intra),
+            _RuntimeInputs(
+                ve=ve,
+                intra=intra,
+                noise=None
+                if inputs.noise is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.noise
+                ),
+                stimulation=None
+                if inputs.stimulation is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
+                ),
+                draws=None
+                if inputs.draws is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
+                ),
+            ),
             steps=1,
             extra=extra,
+            callbacks=callbacks,
+            callback_state=callback_state,
         )
 
     def prepare_and_step(
@@ -11230,15 +18211,22 @@ class FunctionalPopulation:
         parameters,
         constants,
         state,
-        inputs: StepInput | None = None,
+        inputs: Inputs | StepInput | None = None,
         *,
         extra=None,
+        callbacks=None,
+        callback_state=None,
+        draws=None,
     ):
-        """Derive coefficients and advance one atomic, compile-safe step."""
-        if inputs is None:
-            inputs = StepInput()
-        if not isinstance(inputs, StepInput):
-            raise TypeError("inputs must be a StepInput or None")
+        """Prepare raw sources and advance one pure Population timestep.
+
+        This is :meth:`step` with raw constants in place of an opaque prepared value.
+        It returns ``(state, auxiliary)`` and preserves gradients through both
+        preparation and execution. Use this combined form inside ``torch.compile`` or
+        supported ``torch.func`` transforms; supply stochastic draws explicitly.
+        """
+        inputs = _with_runtime_draws(inputs, draws, step=True)
+        inputs = _population_inputs(inputs, step=True)
         for name, value in zip(("ve", "intra"), inputs):
             if value is not None and not torch.is_tensor(value):
                 raise TypeError(f"{name} must be a Tensor or None")
@@ -11248,38 +18236,163 @@ class FunctionalPopulation:
             parameters,
             constants,
             state,
-            RolloutInput(ve=ve, intra=intra),
+            _RuntimeInputs(
+                ve=ve,
+                intra=intra,
+                noise=None
+                if inputs.noise is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.noise
+                ),
+                stimulation=None
+                if inputs.stimulation is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.stimulation
+                ),
+                draws=None
+                if inputs.draws is None
+                else torch.utils._pytree.tree_map_only(
+                    torch.Tensor, lambda value: value.unsqueeze(0), inputs.draws
+                ),
+            ),
             steps=1,
             extra=extra,
+            callbacks=callbacks,
+            callback_state=callback_state,
         )
 
-    def bind(self, parameters, prepared):
-        """Bind one eager step to explicit parameters and reusable preparation.
+    def receive(self, parameters, prepared, state, *, target: str, payload):
+        """Apply one ordered event, including zero payloads, without stepping."""
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        self._validate_receive(target, payload)
+        prepared_values = self._validate_prepared(prepared, parameters)
+        return self._receive_values(parameters, prepared_values, state, target, payload)
 
-        The binding snapshots the parameter mapping, retains its tensor leaves,
-        and carries this functional plan into the host runners. Prepare and bind
-        again for each new forward/backward graph when training.
+    def prepare_and_receive(
+        self, parameters, constants, state, *, target: str, payload
+    ):
+        """Derive coefficients and apply one event atomically under compilation."""
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_constants(constants)
+        self._validate_state(state)
+        self._validate_receive(target, payload)
+        prepared = self._prepare_values(parameters, constants)
+        return self._receive_values(parameters, prepared, state, target, payload)
+
+    def continuous_receive(
+        self,
+        parameters,
+        prepared,
+        state,
+        scratch,
+        *,
+        target: str,
+        payload,
+        input=None,
+        reduce="sum",
+        mask=None,
+    ):
+        """Apply one ordered analog delivery without advancing the Population.
+
+        ``mask`` distinguishes absent scatter slots from actual zero deliveries.
+        Return the new Population carry and scratch for the next delivery in
+        native connection order. Reset once before the first delivery, including
+        timesteps with no active connections.
+        """
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_state(state)
+        self._validate_continuous_scratch(scratch)
+        input = self._validate_continuous_receive(target, payload, input, reduce, mask)
+        prepared_values = self._validate_prepared(prepared, parameters)
+        return self._continuous_receive_values(
+            parameters,
+            prepared_values,
+            state,
+            scratch,
+            target,
+            payload,
+            input,
+            reduce,
+            mask,
+        )
+
+    def prepare_and_continuous_receive(
+        self,
+        parameters,
+        constants,
+        state,
+        scratch,
+        *,
+        target: str,
+        payload,
+        input=None,
+        reduce="sum",
+        mask=None,
+    ):
+        """Prepare coefficients and apply an analog delivery under compilation."""
+        self._validate_source()
+        self._validate_parameters(parameters)
+        self._validate_constants(constants)
+        self._validate_state(state)
+        self._validate_continuous_scratch(scratch)
+        input = self._validate_continuous_receive(target, payload, input, reduce, mask)
+        prepared = self._prepare_values(parameters, constants)
+        return self._continuous_receive_values(
+            parameters, prepared, state, scratch, target, payload, input, reduce, mask
+        )
+
+    def bind(self, parameters, prepared=_BINDING_UNSET, *, constants=_BINDING_UNSET):
+        """Bind one eager step to raw constants or explicit preparation.
+
+        ``bind(parameters, constants=constants)`` snapshots raw mapping
+        containers and retains live tensor leaves. Each complete forward or
+        host run owns its preparation graph, with safe inference reuse.
+        ``bind(parameters, prepared)`` retains an explicit prepared value;
+        prepare and bind again for independent backward graphs in that form.
+
+        ``bind(tensors)`` or ``bind(continuation)`` selects both raw source
+        frames from an exact matching bundle or Continuation. Packet forms
+        cannot be combined with ``prepared`` or ``constants``, including
+        ``None``. State and callback carry remain explicit operands of ``run``.
         """
         from ._binding import BoundPopulation
 
-        return BoundPopulation(self, parameters, prepared)
+        return BoundPopulation(self, parameters, prepared, constants=constants)
 
     def compile_rollout_chunk(
         self, steps: int, *, execution: str = "default", **compile_options
     ):
-        """Create a freshness-checked fixed-length compiled rollout.
+        """Create a fixed-width compiled Population kernel.
 
-        Preparation remains outside the compiled boundary and can therefore be
-        reused across calls. Grad-enabled calls compose through ordinary
-        autograd, allowing a Python loop over this callable to build exact BPTT
-        without statically compiling the complete time horizon.
+        Parameters
+        ----------
+        steps : int
+            Positive number of accepted steps in each direct kernel invocation.
+        execution : {"default", "scan", "unrolled", "while"}, default "default"
+            Scan supports first-order training; while is inference-only. Unrolled
+            execution expands the fixed-width recurrence. Default selects inference
+            looping when supported and otherwise retains the differentiable recurrence.
+        **compile_options
+            Options for ``torch.compile``, including ``backend``, ``fullgraph`` and
+            ``disable``.
 
-        ``execution="scan"`` opts into a horizon-independent loop graph on
-        supported PyTorch 2.14 installations. Dendra installs a narrowly scoped
-        process-local compatibility fix when this mode is selected. Ordinary
-        backward is supported; ``create_graph=True`` raises explicitly. Calls
-        inside ``torch.func`` or forward AD use the ordinary eager recurrence.
-        The default preserves the existing compiled execution strategy.
+        Returns
+        -------
+        CompiledPopulationChunk
+            Bind raw sources with ``kernel.bind(tensors_or_continuation)`` and call
+            :func:`run` for arbitrary horizons, cached shorter tails and callbacks.
+
+        Notes
+        -----
+        Population while kernels of at least four steps require capturable inference
+        loops; smaller widths/tails use bounded unrolled execution. Transform and
+        forward-AD calls use eager fallback. Higher-order reverse-mode differentiation
+        through compiled scan/while is unsupported. Inspect ``execution_report()``
+        after execution to see the actual dispatch.
         """
         from ._compiled import CompiledPopulationChunk
 
@@ -11294,12 +18407,48 @@ class FunctionalPopulation:
         """Explicitly commit validated functional carry into a compatible model."""
         self._validate_compatible_population(population)
         self._validate_state(state)
+        poisson_state = self._stimulation_rng_plan.expand_state(state).get(
+            "stimulation"
+        )
+        if self._poisson_plan is not None:
+            self._poisson_plan.validate_state(poisson_state)
         remainder = state["control"]["duration_remainder"]
         remainder_value = remainder.item()
         if not math.isfinite(remainder_value) or remainder_value < 0.0:
             raise ValueError("duration_remainder must be finite and non-negative")
 
+        random_commit = (
+            None
+            if self._random_plan is None
+            else self._random_plan.prepare_commit(population, state["random"])
+        )
         staged_population = _clone_execution_population(population)
+        if self._random_plan is not None:
+            self._random_plan.commit(staged_population, state["random"])
+        spatial_owners = []
+        if "material_preparation" in state:
+            for name in state["material_preparation"]:
+                process = staged_population.mech.material_processes[name]
+                if not process._spatial_configured:
+                    current_noise = {
+                        noise_name: process._buffers[noise_name]
+                        for noise_name in process.runtime_noises
+                    }
+                    try:
+                        for noise_name in current_noise:
+                            process._buffers[noise_name] = state[
+                                "material_preparation"
+                            ][name][f"noise.{noise_name}"]
+                        process.set_dt(
+                            torch.as_tensor(
+                                self.dt, device=self.device, dtype=self.dtype
+                            )
+                        )
+                    finally:
+                        process._buffers.update(current_noise)
+                target = population.mech.material_processes[name]
+                if not target._spatial_configured:
+                    spatial_owners.append(target)
         staged_layout = _state_layout(staged_population)
         for leaf in staged_layout:
             _set_buffer(
@@ -11311,30 +18460,80 @@ class FunctionalPopulation:
         staged_population.mech.read_from_ions()
         staged_population.mech.read_from_materials()
         checkpoint = staged_population.state_dict_for_checkpoint()
-        if self._topology_kind not in {"multi_point", "multi_scalar"}:
-            population.restore_dict_from_checkpoint(checkpoint)
+        previous_spatial = tuple(
+            (
+                owner,
+                owner._spatial_operators,
+                owner._spatial_configured,
+                dict(owner._buffers),
+                set(owner._non_persistent_buffers_set),
+                owner.__dict__.get("_material_restored_workspace_dt"),
+            )
+            for owner in spatial_owners
+        )
+
+        def restore_spatial_layout():
+            for (
+                owner,
+                operators,
+                configured,
+                buffers,
+                nonpersistent,
+                restored_dt,
+            ) in previous_spatial:
+                owner._spatial_operators = operators
+                owner._spatial_configured = configured
+                owner._buffers = buffers
+                owner._non_persistent_buffers_set = nonpersistent
+                if restored_dt is None:
+                    owner.__dict__.pop("_material_restored_workspace_dt", None)
+                else:
+                    owner._material_restored_workspace_dt = restored_dt
+
+        if self._topology_kind not in {"multi_point", "multi_scalar", "multi_block"}:
+            try:
+                population.restore_dict_from_checkpoint(checkpoint)
+            except Exception:
+                restore_spatial_layout()
+                raise
+            if self._random_plan is not None:
+                self._random_plan.publish_commit(population, random_commit)
+            if isinstance(population.integrator, _bwd_euler_sc_skip):
+                # scnv's imperative checkpoint deliberately has no solved
+                # voltage unknowns. Functional continuation nevertheless owns
+                # the exposed voltage separately from mechanism carry. Publish
+                # its staged, validated copy only after checkpoint restoration
+                # succeeds; the remaining assignment cannot invoke authored code.
+                population._buffers["v"] = staged_population._buffers["v"]
+            if self._poisson_plan is not None:
+                self._poisson_plan.commit(population, poisson_state)
             return population
 
         write_back = bool(population.integrator.write_back)
         component_voltages = []
+        voltage_names = ("v", "vc") if self._topology_kind == "multi_block" else ("v",)
         if write_back:
-            packed_voltage = _get_path(state, ("integrator", "v"))
             offset = 0
             for name, component in population.populations.items():
                 width = math.prod(component.core_shape())
-                value = packed_voltage[..., 0, offset : offset + width].reshape(
-                    component.shape
-                )
-                if (
-                    _shape_tuple(value) != tuple(component.shape)
-                    or value.device != component.device()
-                    or value.dtype != component.dtype()
-                ):
-                    raise FunctionalizationError(
-                        f"Committed voltage for component {name!r} does not match "
-                        "its shape, device, or dtype."
-                    )
-                component_voltages.append((component, value))
+                for voltage_name in voltage_names:
+                    packed_voltage = _get_path(state, ("integrator", voltage_name))
+                    tail = (3,) if voltage_name == "vc" else ()
+                    value = packed_voltage[
+                        (..., 0, slice(offset, offset + width), slice(None))
+                        if tail
+                        else (..., 0, slice(offset, offset + width))
+                    ].reshape(*component.shape, *tail)
+                    if (
+                        _shape_tuple(value) != (*component.shape, *tail)
+                        or value.device != component.device()
+                        or value.dtype != component.dtype()
+                    ):
+                        raise FunctionalizationError(
+                            f"Committed {voltage_name} for component {name!r} "
+                            "does not match its shape, device, or dtype."
+                        )
+                component_voltages.append(component)
                 offset += width
             if offset != self.shape[-1]:  # pragma: no cover - structure preflight
                 raise FunctionalizationError(
@@ -11368,7 +18567,9 @@ class FunctionalPopulation:
             module_path, _separator, buffer_name = relative_slot.rpartition(".")
             remember_binding(_module_at(population, module_path), buffer_name)
         for component in population.populations.values():
-            remember_binding(component, "v")
+            for voltage_name in voltage_names:
+                if hasattr(component, voltage_name):
+                    remember_binding(component, voltage_name)
 
         def restore_previous_bindings():
             for owner, name, registered, value in previous_bindings.values():
@@ -11379,24 +18580,37 @@ class FunctionalPopulation:
 
         try:
             population.restore_dict_from_checkpoint(checkpoint)
+            if self._random_plan is not None:
+                self._random_plan.publish_commit(population, random_commit)
             if write_back:
                 offset = 0
-                for component, _value in component_voltages:
+                for component in component_voltages:
                     width = math.prod(component.core_shape())
                     component.v = population.v[..., 0, offset : offset + width].reshape(
                         component.shape
                     )
+                    if self._topology_kind == "multi_block":
+                        component.vc = population.vc[
+                            ..., 0, offset : offset + width, :
+                        ].reshape(*component.shape, 3)
                     offset += width
         except Exception:
             try:
                 restore_previous_bindings()
+                restore_spatial_layout()
             except Exception as rollback_error:  # pragma: no cover - catastrophic
                 raise RuntimeError(
                     "MultiPopulation functional commit failed and rollback could "
                     "not recover the previous packed/component state."
                 ) from rollback_error
             raise
+        if self._poisson_plan is not None:
+            self._poisson_plan.commit(population, poisson_state)
         return population
+
+
+_OWNED_POPULATION_NOISE_TAPE = FunctionalPopulation.sample_noise_draw_tape
+_OWNED_POPULATION_STIMULATION_TAPE = FunctionalPopulation.sample_stimulation_draw_tape
 
 
 def make_functional(
@@ -11404,8 +18618,11 @@ def make_functional(
     *,
     dt: float,
     extra=None,
+    _bind_owned_cache=True,
+    _retain_initialization_materializations=False,
+    _network_stimulation_rng_scope=False,
 ) -> tuple[FunctionalPopulation, PopulationTensors]:
-    """Lower an initialized deterministic Population into a pure transition."""
+    """Lower an initialized Population into a pure transition."""
     if isinstance(dt, bool):
         raise TypeError("dt must be a finite positive scalar")
     try:
@@ -11417,16 +18634,28 @@ def make_functional(
             "Population cannot be functionalized by the current capability slice:\n"
             "- expected an initialized dendra Population"
         )
+    subclass_failures = _population_subclass_failures(population)
+    if subclass_failures:
+        details = "\n".join(f"- {failure}" for failure in subclass_failures)
+        raise FunctionalizationError(
+            "Population cannot be functionalized by the current capability "
+            f"slice:\n{details}"
+        )
     device = population.device()
-    rng_state = _global_rng_snapshot(device)
+    check_purity = current_check_purity()
+    rng_state = _global_rng_snapshot(device) if check_purity else None
     class_state = {}
     try:
-        class_state = _class_state_snapshot(_authored_workspace_classes(population))
-        multi_component_candidates = {} if _is_scalar_multi(population) else None
+        if check_purity:
+            class_state = _class_state_snapshot(_authored_workspace_classes(population))
+        multi_component_candidates = {} if _is_multi(population) else None
         failures = _functionalization_failures(
             population,
             dt_value,
             multi_component_candidates=multi_component_candidates,
+            _retain_initialization_materializations=(
+                _retain_initialization_materializations
+            ),
         )
         if failures:
             details = "\n".join(f"- {failure}" for failure in dict.fromkeys(failures))
@@ -11444,9 +18673,18 @@ def make_functional(
                 dt=dt_value,
                 extra=extra,
                 _multi_component_candidates=multi_component_candidates,
+                _bind_owned_cache=_bind_owned_cache,
+                _retain_initialization_materializations=(
+                    _retain_initialization_materializations
+                ),
+                _network_stimulation_rng_scope=_network_stimulation_rng_scope,
             )
-            construction_rng = _global_rng_changes(rng_state, device)
-            construction_class_state = _restore_class_state(class_state)
+            construction_rng = (
+                _global_rng_changes(rng_state, device) if check_purity else ()
+            )
+            construction_class_state = (
+                _restore_class_state(class_state) if check_purity else ()
+            )
             if construction_class_state or construction_rng:
                 details = []
                 if construction_class_state:
@@ -11461,9 +18699,18 @@ def make_functional(
                     + "."
                 )
             tensors = functional.extract(population)
-        functional._audit_read_only_workspaces(tensors)
+            from ._poisson_invocations import validate_poisson_invocations
+
+            validate_poisson_invocations(functional, tensors)
+            functional._stimulation_rng_plan.configure(tensors)
+        if check_purity:
+            functional._audit_read_only_workspaces(tensors)
+            functional._audit_event_receivers(tensors)
+        else:
+            functional._lowering_audit_complete = True
         try:
-            functional._audit_initialization(tensors)
+            if check_purity:
+                functional._audit_initialization(tensors)
         except FunctionalizationError as exc:
             # Initialization is an optional capability layered over the broader
             # pure transition. Preserve that separation while retaining the
@@ -11475,12 +18722,15 @@ def make_functional(
             functional._initialization = None
             functional._initialization_state_template = None
     except Exception:
-        try:
-            _restore_class_state(class_state)
-        finally:
-            _restore_global_rng(rng_state, device)
+        if check_purity:
+            try:
+                _restore_class_state(class_state)
+            finally:
+                _restore_global_rng(rng_state, device)
         raise
 
+    if not check_purity:
+        return functional, tensors
     consumed_rng = _global_rng_changes(rng_state, device)
     try:
         mutated_class_state = _restore_class_state(class_state)
@@ -11503,3 +18753,62 @@ def make_functional(
 
 
 __all__ = ["FunctionalPopulation", "make_functional"]
+
+_OWNED_POPULATION_PREPARE = FunctionalPopulation.prepare
+
+_RECEIVER_FRAME_METHODS = tuple(
+    (name, method, method.__code__)
+    for name in (
+        "_mapping",
+        "_read_only_mapping",
+        "_state_mapping",
+        "_receiver_mapping",
+        "_receive_values",
+        "_continuous_receive_values",
+    )
+    for method in (getattr(FunctionalPopulation, name),)
+)
+_RECEIVER_FORWARD = _PopulationReceive.forward
+_RECEIVER_FORWARD_CODE = _RECEIVER_FORWARD.__code__
+_RECEIVER_HANDLER_METHODS = tuple(
+    (name, method, method.__code__)
+    for name in ("read_from_ions", "read_from_materials", "_bind_ion_current_fields")
+    for method in (inspect.getattr_static(MechanismHandler, name),)
+)
+
+
+def _receiver_binding_frame_supported(plan):
+    """Admit canonical receive binding without invoking authored overrides."""
+    if type(plan) is not FunctionalPopulation or not plan._lowering_audit_complete:
+        return False
+    for name, method, code in _RECEIVER_FRAME_METHODS:
+        if (
+            name in plan.__dict__
+            or inspect.getattr_static(type(plan), name) is not method
+            or method.__code__ is not code
+        ):
+            return False
+    for handler in (plan._population.mech, plan._transition.population.mech):
+        for name, method, code in _RECEIVER_HANDLER_METHODS:
+            if method.__code__ is not code:
+                return False
+            if name != "_bind_ion_current_fields":
+                if not _handler_initialization_hook_is_standard(handler, name):
+                    return False
+            elif (
+                name in handler.__dict__
+                or inspect.getattr_static(type(handler), name) is not method
+            ):
+                return False
+    for receiver in (*plan._receivers.values(), *plan._continuous_receivers.values()):
+        if (
+            type(receiver) is not _PopulationReceive
+            or "forward" in receiver.__dict__
+            or inspect.getattr_static(type(receiver), "forward")
+            is not _RECEIVER_FORWARD
+            or _RECEIVER_FORWARD.__code__ is not _RECEIVER_FORWARD_CODE
+            or receiver._copy_indices is None
+            or _module_autograd_hook_signature(receiver)
+        ):
+            return False
+    return True

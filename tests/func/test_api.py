@@ -5,7 +5,7 @@ import torch
 
 import dendra as dn
 from dendra.models.mechanisms import Mechanism, State
-from dendra.models.mechanisms._material_process import DiffusionProcess
+from dendra.models.mechanisms._material_process import MaterialProcess
 from dendra.models.mod import hh, pas
 
 DT = 0.01
@@ -131,9 +131,19 @@ def _model(*, dtype=torch.float64, method="pcr", jit=0):
 def test_func_namespace_exports_the_functional_population_api():
     assert "func" in dn.__all__
     assert set(dn.func.__all__) == {
+        "Active",
+        "ActiveAL",
+        "ActiveALCount",
         "APCount",
         "BoundPopulation",
+        "BoundNetwork",
+        "CompiledNetworkChunk",
+        "CompiledNetworkRunner",
         "CompiledPopulationChunk",
+        "CompiledRunner",
+        "ContinuousConTensors",
+        "Continuation",
+        "ConnectionSamplingDraw",
         "AnomalyDetector",
         "ExecutionCapabilities",
         "ExecutionReport",
@@ -141,21 +151,61 @@ def test_func_namespace_exports_the_functional_population_api():
         "FunctionalCallbackResults",
         "FunctionalCallbackState",
         "FunctionalCallbacks",
+        "FunctionalContinuousCon",
         "FunctionalExtra",
         "FunctionalIntra",
+        "FunctionalNetCon",
+        "FunctionalNetStim",
+        "FunctionalNetwork",
         "FunctionalPopulation",
         "FunctionalizationError",
+        "InitializationDraws",
         "InitializationInput",
+        "Inputs",
+        "LFP",
+        "NetConTensors",
+        "NetStimDraw",
+        "NetStimOutputs",
+        "NetStimTensors",
+        "NetworkInitializationInput",
+        "NetworkInitializationCache",
+        "NetworkRolloutInput",
+        "NetworkTensors",
         "PopulationTensors",
+        "RandomParameterDraw",
+        "PopulationCallback",
         "Raster",
         "Recorder",
         "RolloutInput",
+        "RuntimeNoiseDraw",
+        "RuntimeDraws",
+        "SourceEntry",
+        "SourceReport",
+        "StimulationDraw",
         "StepInput",
         "StimulusTensors",
+        "TensorScheduleTensors",
+        "VarInput",
+        "capture_continuation",
+        "compile",
+        "commit_continuation_",
+        "detach_continuation",
+        "export_continuation",
+        "inspect_sources",
+        "initialize",
         "longrun",
         "longrun_checkpointed",
+        "make_callbacks",
         "make_functional",
+        "make_functional_continuous_con",
+        "make_functional_netcon",
+        "make_functional_netstim",
+        "make_functional_network",
+        "resolve_steps",
+        "restore_continuation",
         "run",
+        "sample_initialization_draws",
+        "sample_runtime_draws",
     }
 
 
@@ -263,21 +313,20 @@ def test_make_functional_rejects_mismatched_topology_integrator_pairs(
         dn.func.make_functional(model, dt=DT)
 
 
-def test_make_functional_rejects_single_compartment_imem_recording():
-    with dn.ctx(JIT=0):
+def test_make_functional_preserves_single_compartment_imem_recording():
+    with dn.ctx(JIT=0, IMEM=True):
         model = dn.SingleCompartment(N=1, C=1, dtype=torch.float64)
-        model.imem = True
         model.insert(pas)
         model.initialize()
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="i_membrane recording is not supported yet",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    _, tensors = dn.func.make_functional(model, dt=DT)
+    assert model.integrator.imem
+    torch.testing.assert_close(
+        tensors.state["integrator"]["i_membrane"], model.i_membrane
+    )
 
 
-def test_make_functional_rejects_single_compartment_subclasses():
+def test_make_functional_accepts_single_compartment_construction_subclasses():
     class CustomSingleCompartment(dn.SingleCompartment):
         pass
 
@@ -286,11 +335,11 @@ def test_make_functional_rejects_single_compartment_subclasses():
         model.insert(pas)
         model.initialize()
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="exact SingleCompartment",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    initialized = functional.initialize(
+        tensors.parameters, tensors.constants, tensors.initialization
+    )
+    torch.testing.assert_close(initialized.state["integrator"]["v"], model.v)
 
 
 def test_make_functional_rejects_uninitialized_population():
@@ -310,10 +359,12 @@ def test_make_functional_rejects_uninitialized_population():
 
 
 def test_make_functional_rejects_unlowered_material_process_workspaces():
-    class Diff(DiffusionProcess):
-        DiffusionProcess.GLOBAL(D=0.125)
-        DiffusionProcess.METHOD("explicit", solver="dense")
-        DiffusionProcess.DIFFUSE("solute", field="c", D="D")
+    class CustomTransport(MaterialProcess):
+        MaterialProcess.GLOBAL(D=0.125)
+
+        def advance_materials(self, dt):
+            # Custom processes use pure field hooks and the shared lifecycle.
+            return None
 
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
         model = dn.Unmyelinated(
@@ -330,18 +381,18 @@ def test_make_functional_rejects_unlowered_material_process_workspaces():
             domain="intracellular",
         )
         model.insert(pas)
-        model.insert(Diff)
+        model.insert(CustomTransport)
         model.initialize()
         model.train()
 
     with pytest.raises(
         dn.func.FunctionalizationError,
-        match="MaterialProcesses.*workspaces",
+        match="Custom MaterialProcess replaces canonical lifecycle adapter 'advance_materials'",
     ):
         dn.func.make_functional(model, dt=DT)
 
 
-def test_make_functional_rejects_unlowered_table_workspaces():
+def test_make_functional_table_workspaces_match_native_execution():
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
         model = dn.Unmyelinated(
             [1.0],
@@ -354,11 +405,14 @@ def test_make_functional_rejects_unlowered_table_workspaces():
         model.initialize()
         model.train()
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="TABLE lookup workspaces",
-    ):
-        dn.func.make_functional(model, dt=DT)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    assert any(name.startswith("tables.") for name in tensors.constants)
+    actual, _ = functional.prepare_and_step(
+        tensors.parameters, tensors.constants, tensors.state
+    )
+    with torch.no_grad():
+        model.step(DT)
+    torch.testing.assert_close(actual, functional.extract(model).state)
 
 
 def test_mechanism_timestep_configuration_is_not_a_public_author_hook():
@@ -767,7 +821,7 @@ def test_make_functional_rejects_subclasses_with_unlowered_geometry_semantics():
     model.insert(hh)
     model.initialize()
 
-    with pytest.raises(dn.func.FunctionalizationError, match="exactly Unmyelinated"):
+    with pytest.raises(dn.func.FunctionalizationError, match="area|geometry"):
         dn.func.make_functional(model, dt=DT)
 
 

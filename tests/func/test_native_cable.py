@@ -615,7 +615,7 @@ def test_native_cable_rejects_live_effective_parameter_overrides(name):
         dn.func.make_functional(model, dt=DT)
 
 
-def test_native_cable_rejects_noncanonical_constructor_and_subclass():
+def test_native_cable_requires_canonical_geometry_and_admits_construction_subclass():
     low_level = dn.Cable(
         2,
         4,
@@ -636,12 +636,13 @@ def test_native_cable_rejects_noncanonical_constructor_and_subclass():
     subclass.insert(pas)
     subclass.initialize()
 
-    for unsupported in (low_level, subclass):
-        with pytest.raises(
-            dn.func.FunctionalizationError,
-            match="current supported topologies",
-        ):
-            dn.func.make_functional(unsupported, dt=DT)
+    with pytest.raises(
+        dn.func.FunctionalizationError,
+        match="current supported topologies",
+    ):
+        dn.func.make_functional(low_level, dt=DT)
+    _, tensors = dn.func.make_functional(subclass, dt=DT)
+    torch.testing.assert_close(tensors.state["integrator"]["v"], subclass.v)
 
 
 def test_native_cable_rejects_integrator_subclasses_outside_audited_contract():

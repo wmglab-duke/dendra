@@ -13,6 +13,7 @@ from ._euler_maruyama import (
     _rhs_from_derivative,
     _unique_preserve_order,
 )
+from ._sde import state_sde_draw, state_sde_dt
 from ._solve_utils import (
     TORCH_OPS,
     extract_vars,
@@ -50,6 +51,7 @@ def build_euler_heun(
     derivative,
     eliminate=None,
     diffusion=None,
+    inputs=(),
     **method_kwargs,
 ):
     """Build an explicit Euler-Heun State solver for Stratonovich SDEs.
@@ -73,7 +75,8 @@ def build_euler_heun(
         )
 
     states = list(states)
-    assigned = list(assigned)
+    inputs = tuple(inputs)
+    assigned = [*assigned, *inputs]
     eliminate = _normalize_eliminate(eliminate)
     derivative_map = match_derivative_to_states(derivative, states)
     diffusion_map = _match_diffusion_to_states(diffusion, states)
@@ -84,18 +87,16 @@ def build_euler_heun(
         )
 
     assigned_list_sorted = sorted(assigned)
-    lines = ["def solve(self, v, dt, values):"]
+    lines = ["def solve(self, v, dt, values, __draws, __assigned_old):"]
     lines.append("    __dt_ref = None")
     for state in states:
         lines.append(f"    __old_{state} = values[{state!r}]")
         lines.append(f"    if __dt_ref is None: __dt_ref = __old_{state}")
-    lines.append(
-        "    __dt = torch.as_tensor(dt, dtype=__dt_ref.dtype, device=__dt_ref.device)"
-    )
+    lines.append("    __dt = state_sde_dt(dt, __dt_ref)")
     lines.append("    __sqrt_dt = torch.sqrt(__dt)")
-    lines.append("    __assigned_old = self._derive_assigned_values(v, values)")
     for name in assigned_list_sorted:
-        lines.append(f"    __old_assigned_{name} = __assigned_old[{name!r}]")
+        frame = "values" if name in inputs else "__assigned_old"
+        lines.append(f"    __old_assigned_{name} = {frame}[{name!r}]")
 
     returns = []
     for state in states:
@@ -108,6 +109,10 @@ def build_euler_heun(
                 assigned_prefix="__old_assigned_",
             )
             lines.append(f"    _{state} = {rhs_line}")
+            # The predictor frame retains the eliminated state's old-stage
+            # algebraic value. Corrector expressions need its corresponding
+            # local name as well as the entry in __pred_values.
+            lines.append(f"    __pred_{state} = _{state}")
             returns.append(f"'{state}': _{state}")
             continue
 
@@ -134,7 +139,7 @@ def build_euler_heun(
         lines.append(f"    __drift_old_{state} = {drift_old}")
         lines.append(f"    __diff_old_{state} = {diff_old}")
         lines.append(
-            f"    __dW_{state} = __sqrt_dt * self._sde_randn_like({state!r}, __old_{state})"
+            f"    __dW_{state} = __sqrt_dt * state_sde_draw(__draws, {state!r}, __old_{state})"
         )
         lines.append(
             f"    __pred_{state} = __old_{state} + __drift_old_{state} * __dt + "
@@ -150,7 +155,8 @@ def build_euler_heun(
     lines.append("    }")
     lines.append("    __assigned_pred = self._derive_assigned_values(v, __pred_values)")
     for name in assigned_list_sorted:
-        lines.append(f"    __pred_assigned_{name} = __assigned_pred[{name!r}]")
+        frame = "__pred_values" if name in inputs else "__assigned_pred"
+        lines.append(f"    __pred_assigned_{name} = {frame}[{name!r}]")
 
     for state in states:
         if state in eliminate:

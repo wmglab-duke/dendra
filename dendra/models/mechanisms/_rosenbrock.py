@@ -239,6 +239,8 @@ def solve(self, dt, {states_and_assigned}, **kwargs):
     {locals}
     __ref = {reference_state}
     dt = torch.as_tensor(dt, dtype=__ref.dtype, device=__ref.device)
+    if dt.ndim == 0 and __ref.ndim > 0:
+        dt = dt.reshape((1,) * __ref.ndim)
     {body}
     {eliminate}
     return {returns}

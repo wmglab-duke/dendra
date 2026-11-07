@@ -10,9 +10,7 @@ from hypothesis import strategies as st
 from dendra.models.fields.line import line3d
 
 # ---------------------------------------------------------------------------
-MODULE_NAME = "dendra.models.fields.analytic"
-
-point_src = importlib.import_module(MODULE_NAME)
+point_src = importlib.import_module("dendra.models.fields.analytic")
 
 isotropic_point = point_src.isotropic_point
 anisotropic_point = point_src.anisotropic_point

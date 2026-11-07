@@ -3,7 +3,7 @@ import math
 
 import pytest
 import torch
-from hypothesis import given, settings
+from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 # ---- Import the module under test -------------------------------------------------
@@ -101,7 +101,8 @@ def test_functional_with_key_and_fill_scalar():
     n=st.integers(1, 8),
     indices=st.lists(st.integers(0, 24), min_size=1, max_size=8),
 )
-@settings(max_examples=80)
+# Keep generated-value coverage independent of host scheduling in full runs.
+@settings(max_examples=80, suppress_health_check=(HealthCheck.too_slow,))
 def test_expander_presized_and_scalar(H, W, n, indices):
     HW = H * W
     key = torch.tensor([i % HW for i in indices], dtype=torch.long)

@@ -1,0 +1,351 @@
+"""Cold capability checks for fixed Poisson waveform invocation profiles."""
+
+from __future__ import annotations
+
+from contextlib import contextmanager
+from types import MethodType
+
+import torch
+from torch.func import functional_call
+from torch.utils import _pytree
+
+from dendra.helpers import current_check_purity
+
+from ._types import FunctionalizationError
+
+
+def _instrument(module, bindings):
+    counts, names, order = {}, {}, []
+    for name, path in bindings:
+        node = module.get_submodule(path) if path else module
+        identity = id(node)
+        names.setdefault(identity, []).append(name)
+        if identity in counts:
+            continue
+        counts[identity] = 0
+        original = node.fn
+
+        def counted(self, *args, _original=original, _identity=identity, **kwargs):
+            del self
+            counts[_identity] += 1
+            order.append(_identity)
+            return _original(*args, **kwargs)
+
+        node.fn = MethodType(counted, node)
+    return counts, names, order
+
+
+def _check(counts, names, order, phase):
+    ambiguous = [
+        aliases
+        for identity, aliases in names.items()
+        if counts[identity] and len(aliases) > 1
+    ]
+    if ambiguous:
+        raise FunctionalizationError(
+            "Multiple registrations of one physical randomized Poisson waveform "
+            f"during {phase} are currently unsupported; registrations={ambiguous}."
+        )
+    return (
+        {
+            name: counts[identity]
+            for identity, aliases in names.items()
+            for name in aliases
+        },
+        tuple(names[identity][0] for identity in order),
+    )
+
+
+def profile_waveform_invocations(waveform, node_paths, times, *, check_purity=None):
+    """Observe registered child calls on a disposable fixed-schedule recipe.
+
+    ``waveform`` is an isolated execution root whose randomized Poisson nodes
+    already consume explicit schedules. The returned paths retain the authored
+    call order and repetitions, rather than the module registration order.
+    Registered operands, including shared tensors, are owned by this probe.
+    Class-state and global-RNG diagnostics follow the frozen purity policy;
+    the trusted path does not inventory authored Python state.
+    """
+    from ._population import (
+        _authored_workspace_classes,
+        _class_state_snapshot,
+        _deepcopy_execution_module,
+        _global_rng_snapshot,
+        _restore_class_state,
+        _restore_global_rng,
+    )
+
+    device = times.device
+    if check_purity is None:
+        check_purity = current_check_purity()
+    snapshot = _global_rng_snapshot(device) if check_purity else None
+    classes = (
+        _class_state_snapshot(_authored_workspace_classes(waveform))
+        if check_purity
+        else None
+    )
+    try:
+        with torch.inference_mode(False), torch.no_grad():
+            execution = _deepcopy_execution_module(waveform)
+            aliases, operands = {}, {}
+            for name, value in (
+                *execution.named_parameters(remove_duplicate=False),
+                *execution.named_buffers(remove_duplicate=False),
+            ):
+                if id(value) not in aliases:
+                    aliases[id(value)] = value.detach().clone(
+                        memory_format=torch.preserve_format
+                    )
+                operands[name] = aliases[id(value)]
+            counts, names, order = _instrument(
+                execution, ((path, path) for path in node_paths)
+            )
+            functional_call(
+                execution,
+                operands,
+                (times.detach().clone(),),
+                tie_weights=False,
+                strict=True,
+            )
+            _counts, paths = _check(counts, names, order, "waveform evaluation")
+            return paths
+    finally:
+        try:
+            if classes is not None:
+                _restore_class_state(classes)
+        finally:
+            if snapshot is not None:
+                _restore_global_rng(snapshot, device)
+
+
+def validate_poisson_invocations(functional, tensors):
+    """Capture a fixed, ordered invocation recipe on disposable operands.
+
+    This is a capability check, independent of optional authored-purity
+    diagnostics. Disposable fixed-schedule programs preserve their normal
+    numerical call paths while counters observe the number of evaluations.
+    Source tensors and random streams are never used as mutable operands.
+    """
+    plan = functional._poisson_plan
+    if plan is None:
+        return
+    entries = tuple(entry for entry in plan.entries if entry.kind == "mechanism")
+    if not entries:
+        return
+    bindings = tuple((entry.key, entry.mapping.rsplit(".", 1)[0]) for entry in entries)
+    from ._population import (
+        _authored_workspace_classes,
+        _class_state_snapshot,
+        _deepcopy_execution_module,
+        _functional_probe_restore_scope,
+        _global_rng_snapshot,
+        _initialization_voltage_kwargs,
+        _rebind_population_time_references,
+    )
+
+    snapshot = (
+        _global_rng_snapshot(functional.device) if functional._check_purity else None
+    )
+    classes = (
+        _class_state_snapshot(_authored_workspace_classes(functional._transition))
+        if functional._check_purity
+        else None
+    )
+    with _functional_probe_restore_scope(functional, classes, snapshot):
+        with torch.inference_mode(False), torch.no_grad():
+            parameters, constants, state = _pytree.tree_map_only(
+                torch.Tensor,
+                lambda value: value.detach().clone(),
+                (tensors.parameters, tensors.constants, tensors.state),
+            )
+            prepared = functional._prepare_values(parameters, constants)
+            mapping, dt, celsius, voltage, time, remainder = functional._mapping(
+                parameters, prepared, state, isolate_read_only=True
+            )
+            transition = _deepcopy_execution_module(functional._transition)
+            _rebind_population_time_references(transition.population)
+            counts, names, order = _instrument(transition, bindings)
+            functional_call(
+                transition,
+                mapping,
+                (
+                    voltage,
+                    time,
+                    remainder,
+                    dt,
+                    celsius,
+                    None,
+                    None,
+                    1,
+                    None,
+                    prepared.get("noise_workspaces"),
+                ),
+                tie_weights=False,
+            )
+            runtime, runtime_order = _check(counts, names, order, "an accepted step")
+            initialization_profile = {entry.key: 0 for entry in entries}
+            initialization_order = ()
+            if functional._initialization is not None:
+                initialization = _deepcopy_execution_module(functional._initialization)
+                _rebind_population_time_references(initialization.population)
+                counts, names, order = _instrument(initialization, bindings)
+                # Rebuild every mapping tensor after the step so even a trusted
+                # authored in-place write cannot become initializer input.
+                parameters, constants, state = _pytree.tree_map_only(
+                    torch.Tensor,
+                    lambda value: value.detach().clone(),
+                    (tensors.parameters, tensors.constants, tensors.state),
+                )
+                state["clock"] = {
+                    **state["clock"],
+                    "t": torch.zeros_like(state["clock"]["t"]),
+                }
+                prepared = functional._prepare_values(parameters, constants)
+                mapping, *_rest = functional._mapping(
+                    parameters, prepared, state, isolate_read_only=True
+                )
+                functional_call(
+                    initialization,
+                    mapping,
+                    (
+                        tensors.initialization.v_init.detach().clone(),
+                        *(
+                            tensors.initialization.states[entry.name].detach().clone()
+                            for entry in initialization.explicit_layout
+                        ),
+                    ),
+                    _initialization_voltage_kwargs(state),
+                    tie_weights=False,
+                )
+                initialization_profile, initialization_order = _check(
+                    counts, names, order, "fresh initialization"
+                )
+            plan.set_invocation_profile(
+                runtime=runtime,
+                initialization=initialization_profile,
+                runtime_order=runtime_order,
+                initialization_order=initialization_order,
+            )
+
+
+@contextmanager
+def native_invocation_probe(population, *, check_purity, prepare_initialization=False):
+    """Lend disposable fixed-schedule copies to native invocation observers."""
+    from dendra.helpers import ctx
+
+    from ._poisson_stimulation import configure_execution
+    from ._population import (
+        _authored_workspace_classes,
+        _class_state_snapshot,
+        _deepcopy_execution_module,
+        _global_rng_snapshot,
+        _rebind_population_time_references,
+        _restore_class_state,
+        _restore_global_rng,
+    )
+
+    device = population.device()
+    snapshot = _global_rng_snapshot(device) if check_purity else None
+    classes = (
+        _class_state_snapshot(_authored_workspace_classes(population))
+        if check_purity
+        else None
+    )
+
+    def execution_copy():
+        execution = _deepcopy_execution_module(population)
+        _rebind_population_time_references(execution)
+        configure_execution(execution)
+        execution.jit = execution.jit_network_solves = False
+        execution.integrator.clear_jit_cache()
+        if prepare_initialization:
+            execution.t = torch.zeros_like(execution.t).detach()
+            execution.integrator.init_v(execution)
+            execution.mech._reset_initialization_timestep()
+            execution.pre_initialize()
+        return execution
+
+    try:
+        with (
+            torch.inference_mode(False),
+            torch.no_grad(),
+            ctx(JIT=0, JIT_NETWORK_SOLVES=0),
+        ):
+            yield execution_copy
+    finally:
+        try:
+            if classes is not None:
+                _restore_class_state(classes)
+        finally:
+            if snapshot is not None:
+                _restore_global_rng(snapshot, device)
+
+
+def profile_native_mechanism_invocations(
+    plan, *, dt=None, initialization=False, prepare_initialization=False
+):
+    """Freeze native runtime or lazily reserved initialization invocations."""
+    entries = tuple(entry for entry in plan.entries if entry.kind == "mechanism")
+    if not entries:
+        return
+    from dendra.models.backend import Backend
+
+    from ._noise_workspaces import refresh_noise_workspaces
+
+    bindings = tuple((entry.key, entry.node_path) for entry in entries)
+    with native_invocation_probe(
+        plan.population,
+        check_purity=plan.check_purity,
+        prepare_initialization=prepare_initialization,
+    ) as copy:
+        if initialization and not prepare_initialization:
+            runtime_profile = {
+                entry.key: plan._runtime_counts[entry.key] for entry in entries
+            }
+            runtime_order = tuple(
+                entry.key
+                for entry in plan._runtime_entries
+                if entry.kind == "mechanism"
+            )
+        else:
+            runtime = copy()
+            timestep = runtime.t.new_tensor(Backend.dt if dt is None else dt)
+            runtime.integrator._initialize(runtime, timestep)
+            counts, names, order = _instrument(runtime, bindings)
+            runtime.integrator.step(runtime, timestep)
+            runtime_profile, runtime_order = _check(
+                counts, names, order, "an accepted step"
+            )
+        initialization_profile = {entry.key: 0 for entry in entries}
+        initialization_order = ()
+        if initialization:
+            initial = copy()
+            if not prepare_initialization:
+                initial.t = torch.zeros_like(initial.t)
+                initial.integrator.init_v(initial)
+            handler = initial.mech
+            if not prepare_initialization:
+                handler._reset_initialization_timestep()
+            handler._sync_celsius(initial.celsius)
+            refresh_noise_workspaces(
+                initial, initial.t.new_zeros(()), initialization=True
+            )
+            counts, names, order = _instrument(initial, bindings)
+            handler._initialize_tensor_transaction(
+                initial.v,
+                initial.celsius,
+                state_overrides={
+                    mechanism.name: mechanism._init_params
+                    for mechanism in handler.mechanisms.values()
+                },
+                call_local_currents=True,
+            )
+            initialization_profile, initialization_order = _check(
+                counts, names, order, "fresh initialization"
+            )
+        plan.set_invocation_profile(
+            runtime=runtime_profile,
+            initialization=initialization_profile,
+            runtime_order=runtime_order,
+            initialization_order=initialization_order,
+        )

@@ -139,7 +139,17 @@ def test_functional_lowering_uses_state_runtime_output_validation(
     match,
 ):
     model = _model(mechanism_type)
-    with pytest.raises(error, match=match):
+    # Trusted lowering defers output inspection to execution; the same schema
+    # remains mandatory when the authored State hook first runs.
+    with dn.ctx(CHECK_PURITY=False):
+        functional, tensors = dn.func.make_functional(model, dt=DT)
+        prepared = functional.prepare(tensors.parameters, tensors.constants)
+        with pytest.raises(error, match=match):
+            functional.step(tensors.parameters, prepared, tensors.state)
+    with (
+        dn.ctx(CHECK_PURITY=True),
+        pytest.raises(error, match=match),
+    ):
         dn.func.make_functional(model, dt=DT)
 
 

@@ -1,6 +1,6 @@
 import hashlib
-import math
 import warnings
+from numbers import Real
 from typing import Any, Dict, Literal
 
 import torch
@@ -8,8 +8,72 @@ import torch
 from ...helpers import current_native_extension_policy
 from ...utils.tensor_ops import _logical_tensor_bytes
 from ..parametric import Referency
-from .netstim import NetStim, _causal_step_index
-from .spiking import update_active, update_active_diff
+from ._cache_translation import (
+    _round_half_up_time_index,
+    _round_half_up_time_indices,
+)
+from ._connection_initialization import (
+    continuous_initial_step,
+    continuous_runtime_reset,
+    event_initial_step,
+    event_runtime_reset,
+)
+from ._continuous_cache import (
+    _resample_continuous_history_age_rows as _resample_continuous_history_age_rows,
+)
+from ._continuous_cache import (
+    _resample_continuous_time_rows as _resample_continuous_time_rows,
+)
+from ._continuous_cache import (
+    continuous_cache_routes,
+    continuous_history_delivery,
+    normalize_continuous_cache,
+    restore_continuous_cache,
+)
+from ._continuous_delivery import (
+    continuous_clear,
+    continuous_counters,
+    continuous_due,
+    continuous_enqueue,
+    continuous_project,
+    gather_continuous_source,
+)
+from ._event_cache import (
+    event_cache_metadata,
+    event_cache_pending_count,
+    normalize_event_cache,
+    restore_event_cache,
+)
+from ._event_delivery import (
+    _clear_dense_slot,
+    _enqueue_dense_values,
+    _fixed_delay_indices,
+    connection_event_counts,
+    dense_due,
+    dense_fixed_delay_transition,
+    dense_interpolated_delay_transition,
+    gather_source_gates,
+)
+from ._pending_calendar import (
+    CalendarState,
+    PendingCalendarMapping,
+    pending_calendar_append,
+    pending_calendar_empty,
+    pending_calendar_from_legacy,
+    pending_calendar_pop,
+)
+from ._runtime_detach import _detach_runtime_tree, _promote_inference_runtime_tree
+from ._source_history import (
+    read_float_history,
+    read_packed_history,
+    source_history_gates,
+    source_history_project,
+    source_history_record,
+)
+from ._tensor_schedules import causal_step_index as _causal_step_index
+from ._tensor_schedules import netcon_tensor_schedule, resolve_schedule_values
+from .netstim import NetStim
+from .spiking import threshold_transition
 from .utils import make_getattr
 
 
@@ -49,44 +113,6 @@ def _cache_current_slot(step) -> int:
     return int(step)
 
 
-def _round_half_up_time_indices(
-    count: int,
-    numerator_dt: float,
-    denominator_dt: float,
-    *,
-    device,
-) -> torch.Tensor:
-    """Return robust nearest-step indices without device float64 requirements.
-
-    Cache translation is a cold path, so calculate the floating-point positions
-    on CPU.  This keeps the operation compatible with devices such as MPS and a
-    small scale-aware tolerance makes documented half-up ties stable when a
-    decimal ratio (for example 0.3 / 0.2) lands one ULP below its ideal value.
-    """
-    count = int(count)
-    if count <= 0:
-        return torch.empty(0, device=device, dtype=torch.long)
-    positions = torch.arange(count, dtype=torch.float64) * (
-        float(numerator_dt) / float(denominator_dt)
-    )
-    tolerance = (
-        torch.maximum(positions.abs(), torch.ones_like(positions))
-        * torch.finfo(torch.float64).eps
-        * 8.0
-    )
-    indices = torch.floor(positions + 0.5 + tolerance).to(torch.long)
-    return indices.to(device=device)
-
-
-def _round_half_up_time_index(
-    index: int, numerator_dt: float, denominator_dt: float
-) -> int:
-    """Scalar counterpart of :func:`_round_half_up_time_indices`."""
-    value = float(index) * float(numerator_dt) / float(denominator_dt)
-    tolerance = max(abs(value), 1.0) * torch.finfo(torch.float64).eps * 8.0
-    return int(math.floor(value + 0.5 + tolerance))
-
-
 def _dilate_time_rows(
     rows: torch.Tensor,
     old_dt: float,
@@ -121,44 +147,6 @@ def _dilate_time_rows(
     out = torch.zeros((n_limit, E), device=rows.device, dtype=rows.dtype)
     out.index_add_(0, idx, rows)
     return out
-
-
-def _resample_continuous_time_rows(
-    rows: torch.Tensor,
-    old_dt: float,
-    new_dt: float,
-    *,
-    n_limit: int,
-) -> torch.Tensor:
-    """Nearest-neighbor resample a future continuous-signal delay line.
-
-    Continuous projections represent one analog sample at each time row.  Unlike
-    event payloads, two old samples that map to one coarser row must not be
-    summed, and a finer grid must not insert zero-valued gaps.  The connection
-    delays themselves use nearest-step quantization, so nearest-neighbor sampling
-    gives the matching deterministic cache-translation rule.
-    """
-    if rows.ndim != 2:
-        raise ValueError("cached continuous time rows must be 2D")
-    n_limit = int(n_limit)
-    T, E = rows.shape
-    if n_limit <= 0:
-        return rows.new_zeros((0, E))
-    if T == 0:
-        return rows.new_zeros((n_limit, E))
-    if float(old_dt) == float(new_dt) and T == n_limit:
-        return rows.detach().clone()
-
-    old_idx = _round_half_up_time_indices(
-        n_limit,
-        new_dt,
-        old_dt,
-        device=rows.device,
-    )
-    # Endpoint hold is the only stable reconstruction when timestep rounding
-    # makes the new physical horizon slightly longer than the cached one.
-    old_idx.clamp_(0, T - 1)
-    return rows.index_select(0, old_idx).detach().clone()
 
 
 def _dilate_packed_time_rows(
@@ -263,48 +251,6 @@ def _dilate_history_age_rows(
     idx.clamp_(0, n_limit - 1)
     out = torch.zeros((n_limit, E), device=rows.device, dtype=rows.dtype)
     out.index_add_(0, idx, rows)
-    return out
-
-
-def _resample_continuous_history_age_rows(
-    rows: torch.Tensor,
-    old_dt: float,
-    new_dt: float,
-    *,
-    n_limit: int,
-) -> torch.Tensor:
-    """Nearest-neighbor resample age-ordered continuous source values.
-
-    Age row 0 is the next-write ring slot and is not a historical sample.  For
-    finer grids, ages younger than the newest cached sample therefore hold that
-    newest sample.  Requests just outside the cached physical horizon hold the
-    oldest endpoint instead of introducing a discontinuous zero.
-    """
-    if rows.ndim != 2:
-        raise ValueError("cached continuous age rows must be 2D")
-    n_limit = int(n_limit)
-    T, E = rows.shape
-    if n_limit <= 0:
-        return rows.new_zeros((0, E))
-    if T <= 1:
-        return rows.new_zeros((n_limit, E))
-    if float(old_dt) == float(new_dt) and T == n_limit:
-        return rows.detach().clone()
-
-    out = rows.new_zeros((n_limit, E))
-    if n_limit <= 1:
-        return out
-    old_ages = _round_half_up_time_indices(
-        n_limit,
-        new_dt,
-        old_dt,
-        device=rows.device,
-    )[1:]
-    # Age zero is not a sample.  Hold the newest/oldest cached endpoint when a
-    # finer grid or quantized horizon asks just outside the available interval.
-    old_ages.clamp_(1, T - 1)
-    target_ages = torch.arange(1, n_limit, device=rows.device, dtype=torch.long)
-    out.index_copy_(0, target_ages, rows.index_select(0, old_ages))
     return out
 
 
@@ -501,6 +447,7 @@ class ContinuousCon(Referency):
         pre_dtype=None,
     ):
         super().__init__()
+        self._continuous_delivery_initialized = False
         self.weight = weight
         self.delay_ms = delay
         self.syn = post_syn
@@ -660,6 +607,13 @@ class ContinuousCon(Referency):
         self._configure_advance_impl()
         return self
 
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+        self._continuous_delivery_generation = (
+            getattr(self, "_continuous_delivery_generation", 0) + 1
+        )
+        return result
+
     # ------------------------------------------------------------------
     # Delay metadata / specialization
     # ------------------------------------------------------------------
@@ -673,6 +627,9 @@ class ContinuousCon(Referency):
 
     def _rebuild_delay_metadata(self):
         """Precompute masks/indices/offsets used by the continuous hot path."""
+        self._continuous_delivery_generation = (
+            getattr(self, "_continuous_delivery_generation", 0) + 1
+        )
         delay_steps = self.delay_steps.flatten().to(self.device, dtype=torch.long)
         n_conn = int(delay_steps.numel())
         self._n_conn = n_conn
@@ -814,31 +771,71 @@ class ContinuousCon(Referency):
     # ------------------------------------------------------------------
 
     def zero(self, clear_deliveries=True):
-        self.current_time_step.fill_(0)
-        self.global_step.fill_(0)
-        if clear_deliveries:
-            self.delivery_buffer.zero_()
-            self.delivery_mask.zero_()
+        continuous_runtime_reset(
+            {
+                name: getattr(self, name)
+                for name in (
+                    "current_time_step",
+                    "global_step",
+                    "delivery_buffer",
+                    "delivery_mask",
+                )
+            },
+            clear_deliveries=clear_deliveries,
+            _inplace=True,
+        )
 
     def detach(self):
-        for n, b in self.named_buffers():
-            setattr(self, n, b.detach())
+        """Detach continued state while preserving raw parameter sources."""
+        memo = {}
+        self._detach_runtime(memo)
+        self.weight._detach_for_continuation(memo)
+        self.delay_ms._detach_for_continuation(memo)
+
+    def _detach_runtime(self, memo=None, *, _promote_inference=False):
+        memo = {} if memo is None else memo
+        transform = (
+            _promote_inference_runtime_tree
+            if _promote_inference
+            else _detach_runtime_tree
+        )
+        for name in (
+            "delivery_buffer",
+            "delivery_mask",
+            "current_time_step",
+            "global_step",
+            "state_cache_pre_value_history",
+        ):
+            if name in self._buffers:
+                setattr(self, name, transform(self._buffers[name], memo))
+
+    def _validate_detached_parameter_values(self, weights, delays):
+        for name, value in (("weights", weights), ("delays", delays)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (self._n_conn,):
+                raise ValueError(
+                    f"ContinuousCon {name} must preserve the initialized connection shape."
+                )
 
     def initialize(
         self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
     ):
+        self._continuous_delivery_generation = (
+            getattr(self, "_continuous_delivery_generation", 0) + 1
+        )
         self.zero(clear_deliveries=clear_deliveries)
         self.weight.init(reinit=reinit_weights)
         self.delay_ms.init(reinit=reinit_delays)
         if reinit_delays:
             self._rebuild_delay_buffers()
         if hasattr(self, "t"):
-            step = torch.round(
-                self.t.to(self.device, dtype=self.dtype) / self.dt.to(self.dtype)
-            ).long()
-            self.global_step.copy_(step.reshape_as(self.global_step))
-        self.detach()
+            self.global_step.copy_(
+                continuous_initial_step(
+                    self.t, self.dt, self.global_step, dtype=self.dtype
+                )
+            )
+        self._detach_runtime()
         self._configure_advance_impl()
+        self._continuous_delivery_initialized = True
         return self
 
     def enable_state_cache_recording(self, *, horizon_steps: int | None = None):
@@ -899,45 +896,23 @@ class ContinuousCon(Referency):
     def _materialize_delivery_from_pre_value_history(
         self, age_history: torch.Tensor, *, apply_transform: bool = True
     ):
-        """Rebuild the dense continuous delay buffer from unweighted value history."""
-        age_history = age_history.detach().to(device=self.device, dtype=self.dtype)
-        if age_history.ndim != 2 or age_history.shape[1] != self._n_conn:
-            raise ValueError(
-                "Cached ContinuousCon pre-value history has incompatible shape: "
-                f"{tuple(age_history.shape)} vs (*, {self._n_conn})."
-            )
-        self.delivery_buffer.zero_()
-        self.delivery_mask.zero_()
-        if self._n_conn == 0 or age_history.shape[0] <= 1:
-            return
-        flat = self.delivery_buffer.view(-1)
-        weight = self.weight().detach().to(device=self.device, dtype=self.dtype)
-        delay_steps = self.delay_steps.to(device=self.device, dtype=torch.long)
-        post_idx = self.post_idx.to(device=self.device, dtype=torch.long)
-        max_age = min(int(age_history.shape[0]), int(self.max_delay_steps))
-        for age in range(1, max_age):
-            remaining = delay_steps - int(age)
-            keep = remaining >= 0
-            if not bool(keep.any()):
-                continue
-            row = age_history[age]
-            if apply_transform and self._has_transform:
-                # Cache reconstruction initializes detached runtime state. Apply
-                # the current memoryless transform to the complete connection
-                # row before selecting the edges whose deliveries remain pending.
-                row = self.transform(row).detach()
-            vals = row.index_select(0, torch.nonzero(keep, as_tuple=False).flatten())
-            if vals.numel() == 0:
-                continue
-            con_idx = torch.nonzero(keep, as_tuple=False).flatten()
-            vals = vals * weight.index_select(0, con_idx)
-            flat_idx = remaining.index_select(
-                0, con_idx
-            ) * self._syn_numel + post_idx.index_select(0, con_idx)
-            flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
-            self.delivery_mask.view(-1).index_fill_(0, flat_idx.reshape(-1), True)
+        """Rebuild detached continuous traffic with the shared pure replay."""
+        queue, presence = continuous_history_delivery(
+            age_history.detach().to(device=self.device, dtype=self.dtype),
+            self.weight(),
+            depth=int(self.max_delay_steps),
+            width=self._syn_numel,
+            delay_steps=self.delay_steps,
+            post_idx=self.post_idx,
+            transform=self.transform
+            if apply_transform and self._has_transform
+            else None,
+        )
+        self.delivery_buffer.copy_(queue)
+        self.delivery_mask.copy_(presence)
 
     def n_connections(self):
+        """Return the number of directed continuous connections as a Python integer."""
         return int(self.n.item())
 
     def state_cache(self):
@@ -980,115 +955,57 @@ class ContinuousCon(Referency):
     def initialize_from_state_cache(
         self, state_cache, *, dt=None, rebuild_delays: bool = True
     ):
-        """Restore a cache produced by state_cache() after initialize().
+        """Restore detached cached traffic using current weights and integer delays.
 
-        Network calls this after ``initialize(...)`` has already refreshed
-        ``WeightExpander.w`` and, when requested, rebuilt delay metadata.
-        ``rebuild_delays`` remains True for direct calls so the method is
-        self-contained; Network passes False to avoid a redundant second rebuild.
+        Network initialization has already refreshed expanded weights and delay
+        storage. Direct callers retain the default delay rebuild policy.
         """
         if not isinstance(state_cache, dict):
             raise TypeError("ContinuousCon state cache must be a dict")
-        # Cached histories are replayed through the current expanded weights and
-        # current integer delays.  If Network.initialize(...) just rebuilt delay
-        # storage, only clear the buffer; otherwise rebuild from delay_ms.w now.
         if rebuild_delays:
             self._rebuild_delay_buffers()
         else:
             self._align_buffer_devices()
-            self.delivery_buffer.zero_()
-            self.delivery_mask.zero_()
-        old_dt = float(state_cache.get("dt", _cache_dt_value(self.dt)))
-        new_dt = float(_cache_dt_value(self.dt) if dt is None else dt)
-        if "pre_value_history" in state_cache:
-            hist = (
-                state_cache["pre_value_history"]
-                .detach()
-                .to(device=self.device, dtype=self.dtype)
-            )
-            hist = _resample_continuous_history_age_rows(
-                hist,
-                old_dt,
-                new_dt,
-                n_limit=int(self.max_delay_steps),
-            )
-            # Version 2 caches recorded already-transformed values.  Keep those
-            # loadable without applying the transform twice; version 3 stores raw
-            # source values and deliberately replays the current transform.
-            raw_values = (
-                state_cache.get("value_layout") == "raw"
-                or int(state_cache.get("version", 2)) >= 3
-            )
-            self._materialize_delivery_from_pre_value_history(
-                hist, apply_transform=raw_values
-            )
-        else:
-            cached = (
-                state_cache["delivery_buffer"]
-                .detach()
-                .to(device=self.device, dtype=self.dtype)
-            )
-            if cached.ndim != 2 or cached.shape[1] != self._syn_numel:
-                raise ValueError(
-                    "Cached ContinuousCon delivery_buffer has incompatible shape: "
-                    f"{tuple(cached.shape)} vs (*, {self._syn_numel})."
-                )
-            restored = _resample_continuous_time_rows(
-                cached,
-                old_dt,
-                new_dt,
-                n_limit=int(self.delivery_buffer.shape[0]),
-            )
-            if tuple(self.delivery_buffer.shape) != tuple(restored.shape):
-                self._set_buffer(
-                    "delivery_buffer",
-                    torch.zeros_like(restored, device=self.device, dtype=self.dtype),
-                )
-            self.delivery_buffer.copy_(restored)
-            cached_mask = state_cache.get("delivery_mask", None)
-            if cached_mask is None:
-                # Version 3 and older caches did not retain delivery presence.
-                # A nonzero payload is the only recoverable evidence; genuine
-                # scheduled zeros necessarily remain a best-effort limitation.
-                cached_mask = cached != 0
-            elif not torch.is_tensor(cached_mask):
-                raise TypeError("Cached ContinuousCon delivery_mask must be a tensor")
-            else:
-                cached_mask = cached_mask.detach().to(
-                    device=self.device, dtype=torch.bool
-                )
-                if tuple(cached_mask.shape) != tuple(cached.shape):
-                    raise ValueError(
-                        "Cached ContinuousCon delivery_mask has incompatible shape: "
-                        f"{tuple(cached_mask.shape)} vs {tuple(cached.shape)}."
-                    )
-            restored_mask = _resample_continuous_time_rows(
-                cached_mask,
-                old_dt,
-                new_dt,
-                n_limit=int(self.delivery_mask.shape[0]),
-            )
-            if tuple(self.delivery_mask.shape) != tuple(restored_mask.shape):
-                self._set_buffer(
-                    "delivery_mask",
-                    torch.zeros_like(
-                        restored_mask, device=self.device, dtype=torch.bool
-                    ),
-                )
-            self.delivery_mask.copy_(restored_mask)
-        self.current_time_step.zero_()
-        if hasattr(self, "t"):
-            step = torch.round(
-                self.t.to(self.device, dtype=self.dtype) / self.dt.to(self.dtype)
-            ).long()
-            self.global_step.copy_(step.reshape_as(self.global_step))
-        else:
-            self.global_step.zero_()
-        self.detach()
+        cache = normalize_continuous_cache(
+            state_cache,
+            dt=_cache_dt_value(self.dt),
+            resample_dt=dt,
+            device=self.device,
+            dtype=self.dtype,
+            connections=int(self._n_conn),
+            depth=int(self.max_delay_steps),
+            width=self._syn_numel,
+        )
+        routes = continuous_cache_routes(
+            self.delay_steps,
+            self.post_idx,
+            depth=int(self.max_delay_steps),
+            width=self._syn_numel,
+        )
+        state = restore_continuous_cache(
+            self.state_dict_for_checkpoint(),
+            cache,
+            self.weight(),
+            dt=self.dt,
+            t=self.t if hasattr(self, "t") else 0.0,
+            routes=routes,
+            transform=self.transform if self._has_transform else None,
+        )
+        for name, value in state.items():
+            getattr(self, name).copy_(value)
+        self._detach_runtime()
         self._configure_advance_impl()
         return self
 
     def state_dict_for_checkpoint(self):
+        """Return the live delay queue, masks, and clock tensors for exact continuation.
+
+        Returns
+        -------
+        dict
+            Runtime tensors retained by reference. Use :meth:`state_cache` for a
+            detached initialization cache instead.
+        """
         return {
             "delivery_buffer": self.delivery_buffer,
             "delivery_mask": self.delivery_mask,
@@ -1097,6 +1014,13 @@ class ContinuousCon(Referency):
         }
 
     def restore_dict_from_checkpoint(self, state_dict):
+        """Validate and restore an exact runtime checkpoint in place.
+
+        Parameters
+        ----------
+        state_dict : dict
+            Runtime queue and clock tensors compatible with this connection's layout.
+        """
         if not isinstance(state_dict, dict):
             raise TypeError("ContinuousCon checkpoint state must be a dict.")
         delivery = _require_checkpoint_tensor(
@@ -1170,9 +1094,14 @@ class ContinuousCon(Referency):
         # by Network before advancing continuous projections.
         return None
 
-    def _advance_counters(self):
-        self.current_time_step.add_(1).remainder_(self.max_delay_steps)
-        self.global_step.add_(1)
+    def _advance_counters(self, *, all_immediate=False):
+        self.current_time_step, self.global_step = continuous_counters(
+            self.current_time_step,
+            self.global_step,
+            depth=self.max_delay_steps,
+            all_immediate=all_immediate,
+            _inplace=not torch.is_grad_enabled(),
+        )
 
     def _pre_value(self):
         # The presynaptic variable should already live on the source device; only
@@ -1181,7 +1110,7 @@ class ContinuousCon(Referency):
         x_full = self.get_pre_var(self.pre)
         if x_full.device != self.pre_device or x_full.dtype != self.pre_dtype:
             x_full = x_full.to(device=self.pre_device, dtype=self.pre_dtype)
-        x = x_full.reshape(-1).index_select(0, self.pre_idx)
+        x = gather_continuous_source(x_full, self.pre_idx)
         if x.device != self.device or x.dtype != self.dtype:
             x = x.to(device=self.device, dtype=self.dtype)
         # Record raw selected values. Restore reapplies the current memoryless
@@ -1198,25 +1127,30 @@ class ContinuousCon(Referency):
         return torch.zeros(self._syn_numel, device=self.device, dtype=self.dtype)
 
     def _scatter_all(self, values):
-        if self._direct_all:
-            return values
-        out = self._zeros_delivery()
-        out.index_add_(0, self.post_idx, values)
-        return out
+        return continuous_project(
+            values, self.post_idx, width=self._syn_numel, direct=self._direct_all
+        )
 
     def _scatter_zero_subset(self, values):
-        out = self._zeros_delivery()
         vals = values.index_select(0, self.zero_con_idx)
-        out.index_add_(0, self.post_idx_zero, vals)
-        return out
+        return continuous_project(vals, self.post_idx_zero, width=self._syn_numel)
 
     def _read_and_clear_current_row(self):
         cur_idx = self.current_time_step
-        delayed_delivery = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)
-        delayed_mask = self.delivery_mask.index_select(0, cur_idx).squeeze(0)
-        self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
-        self.delivery_mask.index_fill_(0, cur_idx, False)
-        return cur_idx, delayed_delivery, delayed_mask
+        due = continuous_due(self.delivery_buffer, self.delivery_mask, cur_idx)
+        reuse = (
+            not torch.is_grad_enabled()
+            and self.delivery_buffer.is_contiguous()
+            and self.delivery_mask.is_contiguous()
+        )
+        self.delivery_buffer, self.delivery_mask = continuous_clear(
+            self.delivery_buffer,
+            self.delivery_mask,
+            cur_idx,
+            _inplace=reuse,
+            _clone_once=not reuse,
+        )
+        return cur_idx, due.payload, due.mask
 
     def _deliver(self, flat_delivery, flat_mask):
         self.syn.continuous_receive(
@@ -1228,34 +1162,34 @@ class ContinuousCon(Referency):
         )
 
     def _schedule_all_delayed_uniform(self, cur_idx, weighted):
-        future = (cur_idx + int(self._uniform_delay_step)).remainder(
-            self.max_delay_steps
-        )
-        flat = future * self._syn_numel + self.post_idx
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
-        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
+        self._schedule_delayed(cur_idx, weighted, all_connections=True, uniform=True)
 
     def _schedule_selected_delayed_uniform(self, cur_idx, weighted):
-        vals = weighted.index_select(0, self.nonzero_con_idx)
-        future = (cur_idx + int(self._uniform_delay_step)).remainder(
-            self.max_delay_steps
-        )
-        flat = future * self._syn_numel + self.post_idx_nz
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
-        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
+        self._schedule_delayed(cur_idx, weighted, all_connections=False, uniform=True)
 
     def _schedule_all_delayed_mixed(self, cur_idx, weighted):
-        base = cur_idx * self._syn_numel
-        flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted)
-        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
+        self._schedule_delayed(cur_idx, weighted, all_connections=True, uniform=False)
 
     def _schedule_selected_delayed_mixed(self, cur_idx, weighted):
-        vals = weighted.index_select(0, self.nonzero_con_idx)
-        base = cur_idx * self._syn_numel
-        flat = (base + self.flat_delay_offsets_nz).remainder(self._delivery_numel)
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), vals)
-        self.delivery_mask.view(-1).index_fill_(0, flat.reshape(-1), True)
+        self._schedule_delayed(cur_idx, weighted, all_connections=False, uniform=False)
+
+    def _schedule_delayed(self, cur_idx, weighted, *, all_connections, uniform):
+        self.delivery_buffer, self.delivery_mask = continuous_enqueue(
+            self.delivery_buffer,
+            self.delivery_mask,
+            cur_idx,
+            weighted,
+            post_idx=self.post_idx if all_connections else self.post_idx_nz,
+            delay_steps=self.delay_steps_nz,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            connection_idx=None if all_connections else self.nonzero_con_idx,
+            uniform_delay=int(self._uniform_delay_step) if uniform else None,
+            flat_offsets=None if uniform else self.flat_delay_offsets_nz,
+            # Read/clear already allocated an owned training ring. Inference
+            # owns the persistent ring, so both paths can enqueue into it.
+            _inplace=True,
+        )
 
     # ------------------------------------------------------------------
     # Specialized advance paths
@@ -1267,8 +1201,7 @@ class ContinuousCon(Referency):
     def _advance_all_immediate(self):
         weighted = self._weighted_pre_value()
         self._deliver(self._scatter_all(weighted), self.post_delivery_mask)
-        # All delays are zero, so current_time_step remains zero modulo one.
-        self.global_step.add_(1)
+        self._advance_counters(all_immediate=True)
 
     def _advance_all_delayed_uniform(self):
         cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
@@ -1673,7 +1606,7 @@ class NetCon(Referency):
             syn_numel]`` ring buffer, but uses precomputed integer-delay routing
             metadata and specialized uniform-/mixed-delay hot paths. The
             ``"sparse_calendar"`` backend stores pending nonzero inference
-            deliveries in Python-side calendar buckets and uses only a reusable
+            deliveries in a compact tensor calendar and uses only a reusable
             one-row dense scratch buffer before calling ``syn.net_receive(...)``.
             ``"bitpacked_history"`` is an inference-only source-spike history
             backend for large SNNs: it stores only packed source spikes over the
@@ -1703,6 +1636,9 @@ class NetCon(Referency):
         """
         super().__init__()
 
+        self._event_delivery_initialized = False
+        self._event_delivery_generation = 0
+        self._schedule_config_generation = 0
         self.weight = weight
         self.syn = post_syn
         self.pre = pre
@@ -3123,143 +3059,147 @@ class NetCon(Referency):
             )
         self.bitpack_source_has_spiked.copy_(src_state)
 
+    @property
+    def _sparse_calendar(self):
+        return PendingCalendarMapping(self, "_pending_calendar")
+
+    @_sparse_calendar.setter
+    def _sparse_calendar(self, chunks):
+        previous = getattr(self, "_pending_calendar", None)
+        count = sum(value.numel() for bucket in chunks.values() for _, value in bucket)
+        capacity = max(16, count, 0 if previous is None else previous.values.numel())
+        self._pending_calendar = pending_calendar_from_legacy(
+            chunks, capacity=capacity, device=self.device, dtype=self.dtype
+        )
+        self._pending_calendar_size = count
+
+    @property
+    def _sparse_event_calendar(self):
+        return PendingCalendarMapping(self, "_pending_event_calendar")
+
+    @_sparse_event_calendar.setter
+    def _sparse_event_calendar(self, chunks):
+        previous = getattr(self, "_pending_event_calendar", None)
+        count = sum(value.numel() for bucket in chunks.values() for _, value in bucket)
+        capacity = max(16, count, 0 if previous is None else previous.values.numel())
+        self._pending_event_calendar = pending_calendar_from_legacy(
+            chunks, capacity=capacity, device=self.device, dtype=torch.int32
+        )
+        self._pending_event_calendar_size = count
+
     def _clear_sparse_calendar(self):
-        """Drop all pending sparse-calendar deliveries and event counts."""
+        """Drop pending payloads and counts while retaining allocated capacity."""
         self._sparse_calendar.clear()
         self._sparse_event_calendar.clear()
 
     def _move_sparse_calendar_to_device(self):
-        """Move Python-side calendar chunks after ``.to(...)`` or device realignment."""
-        if not hasattr(self, "_sparse_calendar"):
-            return
-
-        def move_payload(chunks):
-            return [
-                (
-                    idx.to(device=self.device, dtype=torch.long),
-                    val.to(device=self.device, dtype=self.dtype),
+        """Move persistent calendars after ``.to(...)`` or device realignment."""
+        for name, dtype in (
+            ("_pending_calendar", self.dtype),
+            ("_pending_event_calendar", torch.int32),
+        ):
+            state = getattr(self, name, None)
+            if state is not None:
+                setattr(
+                    self,
+                    name,
+                    CalendarState(
+                        state.slots.to(device=self.device),
+                        state.indices.to(device=self.device),
+                        state.values.to(device=self.device, dtype=dtype),
+                        state.size.to(device=self.device),
+                        state.overflow.to(device=self.device),
+                    ),
                 )
-                for idx, val in chunks
-            ]
-
-        def move_events(chunks):
-            return [
-                (
-                    idx.to(device=self.device, dtype=torch.long),
-                    cnt.to(device=self.device, dtype=torch.int32),
-                )
-                for idx, cnt in chunks
-            ]
-
-        self._sparse_calendar = {
-            int(slot): move_payload(chunks)
-            for slot, chunks in self._sparse_calendar.items()
-            if len(chunks) > 0
-        }
-        self._sparse_event_calendar = {
-            int(slot): move_events(chunks)
-            for slot, chunks in self._sparse_event_calendar.items()
-            if len(chunks) > 0
-        }
 
     def _compact_sparse_payload_slot(self, slot: int):
-        chunks = self._sparse_calendar.get(slot)
-        if not chunks or len(chunks) <= 1:
-            return
-        self._sparse_calendar[slot] = [
-            (
-                torch.cat([idx for idx, _ in chunks], dim=0),
-                torch.cat([val for _, val in chunks], dim=0),
-            )
-        ]
+        """Tensor calendars already keep one stable compact prefix."""
 
     def _compact_sparse_event_slot(self, slot: int):
-        chunks = self._sparse_event_calendar.get(slot)
-        if not chunks or len(chunks) <= 1:
-            return
-        self._sparse_event_calendar[slot] = [
-            (
-                torch.cat([idx for idx, _ in chunks], dim=0),
-                torch.cat([cnt for _, cnt in chunks], dim=0),
-            )
-        ]
+        """Tensor calendars already keep one stable compact prefix."""
 
-    def _append_sparse_payloads(
-        self,
-        future_slots: torch.Tensor,
-        post_idx: torch.Tensor,
-        values: torch.Tensor,
-    ):
-        """Append nonzero dense-payload contributions to sparse calendar buckets."""
+    def _append_pending_calendar(self, attribute, future_slots, indices, values):
         if values.numel() == 0:
             return
-
-        for slot in torch.unique(future_slots.detach()).detach().cpu().tolist():
-            slot_i = int(slot)
-            mask = future_slots == slot_i
-            self._sparse_calendar.setdefault(slot_i, []).append(
-                (
-                    post_idx[mask].detach(),
-                    values[mask].detach(),
-                )
+        state = getattr(self, attribute)
+        required = getattr(self, f"{attribute}_size") + values.numel()
+        capacity = state.values.numel()
+        if required > capacity:
+            # Grow before invoking the atomic transition, retaining all existing
+            # entries and their order without converting through Python buckets.
+            expanded = pending_calendar_empty(
+                max(required, capacity * 2, 16),
+                device=state.values.device,
+                dtype=state.values.dtype,
             )
-            if len(self._sparse_calendar[slot_i]) > self._calendar_compact_threshold:
-                self._compact_sparse_payload_slot(slot_i)
-
-    def _append_sparse_events(
-        self,
-        future_slots: torch.Tensor,
-        con_idx: torch.Tensor,
-        counts: torch.Tensor,
-    ):
-        """Append per-connection event counts for optional sparse introspection."""
-        if counts.numel() == 0:
-            return
-
-        for slot in torch.unique(future_slots.detach()).detach().cpu().tolist():
-            slot_i = int(slot)
-            mask = future_slots == slot_i
-            self._sparse_event_calendar.setdefault(slot_i, []).append(
-                (
-                    con_idx[mask].detach(),
-                    counts[mask].detach(),
-                )
+            pad = expanded.values.numel() - capacity
+            state = CalendarState(
+                torch.cat((state.slots, expanded.slots[:pad])),
+                torch.cat((state.indices, expanded.indices[:pad])),
+                torch.cat((state.values, expanded.values[:pad])),
+                state.size,
+                state.overflow,
             )
-            if (
-                len(self._sparse_event_calendar[slot_i])
-                > self._calendar_compact_threshold
-            ):
-                self._compact_sparse_event_slot(slot_i)
+        # Legacy buckets were created in sorted physical-slot order on each
+        # append. Stable sorting retains connection order inside each bucket.
+        order = torch.argsort(future_slots, stable=True)
+        updated = pending_calendar_append(
+            state,
+            future_slots.index_select(0, order).detach(),
+            indices.index_select(0, order).detach(),
+            values.index_select(0, order).detach(),
+        )
+        if bool(updated.overflow.any()):
+            raise RuntimeError("Native pending calendar could not grow safely.")
+        setattr(self, attribute, updated)
+        setattr(self, f"{attribute}_size", required)
+
+    def _append_sparse_payloads(self, future_slots, post_idx, values):
+        """Append enqueue-time weighted payloads using the shared pure calendar."""
+        self._append_pending_calendar(
+            "_pending_calendar", future_slots, post_idx, values
+        )
+
+    def _append_sparse_events(self, future_slots, con_idx, counts):
+        """Append event counts independently of zero or cancelling payloads."""
+        self._append_pending_calendar(
+            "_pending_event_calendar", future_slots, con_idx, counts
+        )
 
     def _pop_sparse_calendar_to_dense(self, slot: int) -> torch.Tensor:
-        """Reduce due sparse payload chunks into the reusable dense scratch row."""
-        scratch = self.delivery_buffer.squeeze(0)
-        scratch.zero_()
-        chunks = self._sparse_calendar.pop(slot, None)
-        if chunks:
-            for post_idx, values in chunks:
-                if values.numel() > 0:
-                    scratch.index_add_(0, post_idx, values)
-        return scratch
+        """Reduce due pending contributions into the reusable dense scratch row."""
+        scratch = self.delivery_buffer.squeeze(0).zero_()
+        # Host metadata avoids a device synchronization in idle packed paths.
+        if not self._pending_calendar_size:
+            return scratch
+        self._pending_calendar, payload = pending_calendar_pop(
+            self._pending_calendar, slot, width=self._syn_numel, _scratch=scratch
+        )
+        self._pending_calendar_size = int(self._pending_calendar.size.item())
+        return payload
 
     def _pop_sparse_events(self, slot: int):
-        """Populate ``self.events`` from sparse event-count chunks due now."""
+        """Populate current per-connection counts using the shared pure calendar."""
         self.events.zero_()
-        if not self.track_events:
-            return
-        chunks = self._sparse_event_calendar.pop(slot, None)
-        if chunks:
-            for con_idx, counts in chunks:
-                if counts.numel() > 0:
-                    self.events.index_add_(0, con_idx, counts)
+        if self.track_events and self._pending_event_calendar_size:
+            self._pending_event_calendar, _ = pending_calendar_pop(
+                self._pending_event_calendar,
+                slot,
+                width=self._n_conn,
+                _scratch=self.events,
+            )
+            self._pending_event_calendar_size = int(
+                self._pending_event_calendar.size.item()
+            )
 
     def _add_sparse_calendar_to_dense(self, slot: int, scratch: torch.Tensor):
-        """Add due sparse side-calendar payloads into an existing dense scratch row."""
-        chunks = self._sparse_calendar.pop(slot, None)
-        if chunks:
-            for post_idx, values in chunks:
-                if values.numel() > 0:
-                    scratch.index_add_(0, post_idx, values)
+        """Add due scheduled payloads to the packed-history receive payload."""
+        if not self._pending_calendar_size:
+            return
+        self._pending_calendar, _ = pending_calendar_pop(
+            self._pending_calendar, slot, width=self._syn_numel, _scratch=scratch
+        )
+        self._pending_calendar_size = int(self._pending_calendar.size.item())
 
     def _ensure_source_history_conn_source_pos(self):
         """Ensure connection→unique-source positions exist for float source history."""
@@ -3350,78 +3290,46 @@ class NetCon(Referency):
         self, *, diff_spiking: bool, tau: float
     ) -> torch.Tensor:
         """Return one source-level gate value per unique presynaptic source."""
-        if isinstance(self.pre, NetStim):
-            attr = self.pre.spike_gate if diff_spiking else self.pre.spikes
-            gate = (
-                attr.to(self.pre_device)
-                .reshape(-1)
-                .index_select(0, self.bitpack_source_pre_idx)
-            )
-            return gate.to(device=self.device, dtype=self.dtype)
-
-        x_full = self.get_pre_var(self.pre)
+        x_full = (
+            (self.pre.spike_gate if diff_spiking else self.pre.spikes)
+            if isinstance(self.pre, NetStim)
+            else self.get_pre_var(self.pre)
+        )
         if x_full.device != self.pre_device:
             x_full = x_full.to(device=self.pre_device)
-        x = x_full.reshape(-1).index_select(0, self.bitpack_source_pre_idx)
-
-        if self._bitpack_mode == "pre_var":
-            if x.dtype == torch.bool:
-                gate = x.to(self.pre_dtype)
-            else:
-                gate = x.to(self.pre_dtype)
-                if not diff_spiking:
-                    gate = (gate > 0).to(self.pre_dtype)
-            return gate.to(device=self.device, dtype=self.dtype)
-
-        if self._bitpack_mode == "threshold":
-            x = x.to(self.pre_dtype)
-            if diff_spiking:
-                ge_hard, _ge_gate, spk_gate = update_active_diff(
-                    self.bitpack_source_has_spiked,
-                    x,
-                    self.bitpack_source_threshold,
-                    tau,
-                )
-                # ``has_spiked`` is the hard above-threshold state used for the next
-                # rising-edge decision; keep it out of the differentiable graph.
-                self.bitpack_source_has_spiked = ge_hard.detach()
-                return spk_gate.to(device=self.device, dtype=self.dtype)
-            self.bitpack_source_has_spiked, spikes = update_active(
-                self.bitpack_source_has_spiked,
-                x,
-                self.bitpack_source_threshold,
-            )
-            return spikes.to(device=self.device, dtype=self.dtype)
-
-        raise RuntimeError("source-history training backend is not configured")
+        self.bitpack_source_has_spiked, gate = source_history_gates(
+            x_full,
+            self.bitpack_source_has_spiked,
+            source_idx=self.bitpack_source_pre_idx,
+            mode=self._bitpack_mode,
+            threshold=self.bitpack_source_threshold,
+            diff_spiking=diff_spiking,
+            tau=tau,
+            dtype=None if isinstance(self.pre, NetStim) else self.pre_dtype,
+        )
+        return gate.to(device=self.device, dtype=self.dtype)
 
     def _source_history_read_packed_connection_gates(
         self, rows: torch.Tensor
     ) -> torch.Tensor:
         """Read hard source-spike gates from packed history for connection rows."""
-        if rows.ndim == 1:
-            words = self.spike_history_packed[
-                rows.reshape(-1), self.bitpack_conn_word_idx
-            ]
-            gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0
-            return gate.to(device=self.device, dtype=self.dtype)
-        word_idx = self.bitpack_conn_word_idx.unsqueeze(-1).expand_as(rows)
-        mask = self.bitpack_conn_bit_mask.unsqueeze(-1).expand_as(rows)
-        words = self.spike_history_packed[
-            rows.reshape(-1), word_idx.reshape(-1)
-        ].view_as(rows)
-        gate = torch.bitwise_and(words, mask) != 0
-        return gate.to(device=self.device, dtype=self.dtype)
+        return read_packed_history(
+            self.spike_history_packed,
+            rows,
+            self.bitpack_conn_word_idx,
+            self.bitpack_conn_bit_mask,
+            dtype=self.dtype,
+        )
 
     def _source_history_read_float_connection_gates(
         self, rows: torch.Tensor
     ) -> torch.Tensor:
         """Read differentiable source gates for connection rows."""
-        source_pos = self._ensure_source_history_conn_source_pos()
-        if rows.ndim == 1:
-            return self.source_gate_history[rows.reshape(-1), source_pos]
-        src = source_pos.unsqueeze(-1).expand_as(rows)
-        return self.source_gate_history[rows.reshape(-1), src.reshape(-1)].view_as(rows)
+        return read_float_history(
+            self.source_gate_history,
+            rows,
+            self._ensure_source_history_conn_source_pos(),
+        )
 
     def _source_history_build_delivery_from_history(
         self,
@@ -3433,54 +3341,31 @@ class NetCon(Referency):
         sigma: float,
     ) -> torch.Tensor:
         """Construct the current dense payload from compact source history."""
-        out = torch.zeros(self._syn_numel, device=self.device, dtype=self.dtype)
         if self._n_conn == 0:
-            return out
-
+            return torch.zeros(self._syn_numel, device=self.device, dtype=self.dtype)
         wvals = self.weight()
         if not diff_weights:
             wvals = wvals.detach()
-
-        read_gates = (
-            self._source_history_read_float_connection_gates
-            if self._source_history_diff_spiking_enabled()
-            else self._source_history_read_packed_connection_gates
+        floating = self._source_history_diff_spiking_enabled()
+        return source_history_project(
+            self.source_gate_history if floating else self.spike_history_packed,
+            cur_idx,
+            wvals,
+            post_idx=self.post_idx,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            source_pos=self._ensure_source_history_conn_source_pos()
+            if floating
+            else None,
+            word_idx=self.bitpack_conn_word_idx,
+            bit_mask=self.bitpack_conn_bit_mask,
+            delay_steps=self.inference_delay_steps,
+            delays=self.delay_ms().to(self.dtype) if diff_delays else None,
+            dt=self.dt,
+            taps=taps,
+            sigma=sigma,
+            _owned_output=True,
         )
-
-        if diff_delays:
-            d_ms = self.delay_ms().to(self.dtype)
-            lam = (d_ms / self.dt.to(self.dtype)).clamp_min(1.0)
-            k = torch.floor(lam)
-            kL = k.to(torch.long)
-
-            if taps == 2:
-                alpha = (lam - k).to(self.dtype)
-                row0 = (cur_idx - kL).remainder(self.max_delay_steps)
-                row1 = (row0 - 1).remainder(self.max_delay_steps)
-                gate0 = read_gates(row0.reshape(-1))
-                gate1 = read_gates(row1.reshape(-1))
-                vals = wvals * (gate0 * (1.0 - alpha) + gate1 * alpha)
-                out.index_add_(0, self.post_idx, vals)
-            else:
-                offs = torch.stack([kL - 1, kL, kL + 1], dim=-1)
-                centers = offs.to(self.dtype)
-                lam_e = lam.unsqueeze(-1)
-                weights = torch.softmax(
-                    -0.5 * ((lam_e - centers) / (sigma + 1e-6)) ** 2,
-                    dim=-1,
-                )
-                # Future-write offset ``o`` corresponds at delivery time to source
-                # history row ``cur_idx - o``.
-                rows = (cur_idx - offs).remainder(self.max_delay_steps)
-                gates = read_gates(rows)
-                vals = wvals * (gates * weights).sum(dim=-1)
-                out.index_add_(0, self.post_idx, vals)
-        else:
-            delay_steps = self.inference_delay_steps
-            rows = (cur_idx - delay_steps).remainder(self.max_delay_steps)
-            vals = wvals * read_gates(rows.reshape(-1))
-            out.index_add_(0, self.post_idx, vals)
-        return out
 
     def _source_history_record_current_gate(
         self,
@@ -3491,13 +3376,12 @@ class NetCon(Referency):
     ):
         """Append the current source-level event/gate into compact history."""
         if diff_spiking:
-            hist_next = self.source_gate_history.clone()
-            hist_next.index_copy_(
-                0,
-                cur_idx.reshape(-1),
-                source_gate.to(device=self.device, dtype=self.dtype).reshape(1, -1),
+            self.source_gate_history = source_history_record(
+                self.source_gate_history,
+                cur_idx,
+                source_gate.to(device=self.device, dtype=self.dtype),
+                _clone_once=True,
             )
-            self.source_gate_history = hist_next
             return
         self._bitpack_pack_source_spikes(source_gate.to(torch.bool), cur_idx)
 
@@ -3517,36 +3401,22 @@ class NetCon(Referency):
 
     def _bitpack_source_spikes_this_step(self) -> torch.Tensor:
         """Return one binary spike/event value per unique presynaptic source."""
-        if self._bitpack_mode == "netstim":
-            spikes = (
-                self.pre.spikes.to(self.pre_device)
-                .reshape(-1)
-                .index_select(0, self.bitpack_source_pre_idx)
-            )
-            return spikes.to(torch.bool)
-
-        x_full = self.get_pre_var(self.pre)
+        mode = self._bitpack_mode
+        if mode not in ("netstim", "pre_var", "threshold"):
+            raise RuntimeError("bitpacked_history backend is not configured")
+        x_full = self.pre.spikes if mode == "netstim" else self.get_pre_var(self.pre)
         if x_full.device != self.pre_device:
             x_full = x_full.to(device=self.pre_device)
-        x = x_full.reshape(-1).index_select(0, self.bitpack_source_pre_idx)
-
-        if self._bitpack_mode == "pre_var":
-            # Explicit pre-side event variables are interpreted as binary gates.
-            # bool tensors are used directly; numeric tensors fire when > 0.
-            if x.dtype == torch.bool:
-                return x
-            return x.to(self.pre_dtype) > 0
-
-        if self._bitpack_mode == "threshold":
-            x = x.to(self.pre_dtype)
-            self.bitpack_source_has_spiked, spikes = update_active(
-                self.bitpack_source_has_spiked,
-                x,
-                self.bitpack_source_threshold,
-            )
-            return spikes.to(torch.bool)
-
-        raise RuntimeError("bitpacked_history backend is not configured")
+        self.bitpack_source_has_spiked, spikes = source_history_gates(
+            x_full,
+            self.bitpack_source_has_spiked,
+            source_idx=self.bitpack_source_pre_idx,
+            mode=mode,
+            threshold=self.bitpack_source_threshold,
+            dtype=self.pre_dtype,
+            binary=True,
+        )
+        return spikes
 
     def _try_bitpack_pack_kernel(
         self, source_spikes: torch.Tensor, cur_idx: torch.Tensor
@@ -3624,19 +3494,28 @@ class NetCon(Referency):
     ):
         """Pack current source spikes into the current circular history row."""
         if source_spikes.numel() == 0:
-            slot = int(cur_idx.item())
-            self.spike_history_packed[slot].zero_()
+            source_history_record(
+                self.spike_history_packed,
+                cur_idx,
+                source_spikes,
+                source_word_idx=self.bitpack_source_word_idx,
+                source_bit_mask=self.bitpack_source_bit_mask,
+                _inplace=True,
+            )
             return
         if self._try_bitpack_pack_kernel(source_spikes, cur_idx):
             return
 
         # Pure-PyTorch fallback.  This is correct and memory-light in source
         # space; the lazy C++/CUDA extension above is the normal CUDA hot path.
-        slot = int(cur_idx.item())
-        row = self.spike_history_packed[slot]
-        row.zero_()
-        vals = self.bitpack_source_bit_mask * source_spikes.to(torch.int64)
-        row.index_add_(0, self.bitpack_source_word_idx, vals)
+        source_history_record(
+            self.spike_history_packed,
+            cur_idx,
+            source_spikes,
+            source_word_idx=self.bitpack_source_word_idx,
+            source_bit_mask=self.bitpack_source_bit_mask,
+            _inplace=True,
+        )
 
     def _bitpack_build_delivery_from_history(
         self, cur_idx: torch.Tensor, scratch: torch.Tensor
@@ -3653,13 +3532,18 @@ class NetCon(Referency):
         # is unavailable or cannot handle the current launch. A failed native
         # launch may have written a partial result before reporting failure, so
         # reset the output again before constructing the complete fallback result.
-        scratch.zero_()
-        rows = (cur_idx - self.inference_delay_steps).remainder(self.max_delay_steps)
-        words = self.spike_history_packed[rows.reshape(-1), self.bitpack_conn_word_idx]
-        gate = torch.bitwise_and(words, self.bitpack_conn_bit_mask) != 0
-        values = self.weight() * gate.to(dtype=self.dtype)
-        scratch.index_add_(0, self.post_idx, values)
-        return scratch
+        return source_history_project(
+            self.spike_history_packed,
+            cur_idx,
+            self.weight(),
+            post_idx=self.post_idx,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            word_idx=self.bitpack_conn_word_idx,
+            bit_mask=self.bitpack_conn_bit_mask,
+            delay_steps=self.inference_delay_steps,
+            _scratch=scratch,
+        )
 
     def _bitpack_schedule_due_scheduled_events(self, cur_idx: torch.Tensor):
         """Route explicit scheduled per-connection events through sparse side buckets."""
@@ -3908,16 +3792,22 @@ class NetCon(Referency):
                 # traffic during an incompatible mode transition.
                 if self.training:
                     self._use_source_history_training_runtime()
-                return
-            # Re-select storage immediately for interactive/training-loop workflows.
-            # This is especially important for ``diff_spiking=True`` source-history
-            # training, which needs floating source-gate history rather than packed
-            # hard spikes.
-            self._refresh_training_advance_after_diff_config(clear_histories=True)
+            else:
+                # Re-select storage immediately for interactive/training-loop workflows.
+                # This is especially important for ``diff_spiking=True`` source-history
+                # training, which needs floating source-gate history rather than packed
+                # hard spikes.
+                self._refresh_training_advance_after_diff_config(clear_histories=True)
         except Exception:
             self.train_delay_backend = previous_backend
             self.train_flags = previous_flags
             raise
+        # A public configuration call invalidates frozen functional plans even
+        # when the values compare equal. It may change storage or replace a
+        # scalar with a Tensor that Dynamo's equality guards treat as equal.
+        self._event_delivery_generation = (
+            getattr(self, "_event_delivery_generation", 0) + 1
+        )
 
     @property
     def w(self):
@@ -4004,16 +3894,17 @@ class NetCon(Referency):
         pre_indices=None,
         times_ms=None,
         weight=1.0,
+        time_idx=None,
+        weight_idx=None,
         allow_past: bool = False,
     ):
         """
-        Schedule value-mode events on specific connections or pre indices.
+        Schedule events with direct values or indexed bound sources.
 
-        This API attaches *value-mode* scheduled events, where weights and
-        times are stored directly as tensors owned by the ``NetCon``. It is
-        suitable when you want event-specific weights/times that are not
-        shared by reference with other structures, or when you are fine
-        managing these tensors directly.
+        Direct weights and times are declaration-time tensors owned by the
+        ``NetCon``. Indexed values are gathered from the corresponding bound
+        source during simulation; both quantities can use indexed sources on
+        the same events.
 
         Exactly one of ``con_indices`` or ``pre_indices`` must be provided.
 
@@ -4028,13 +3919,13 @@ class NetCon(Referency):
             connection indices using the pre→connection CSR map (see
             :meth:`_expand_pre_to_con`). Mutually exclusive with
             ``con_indices``.
-        times_ms : Sequence[float] or torch.Tensor
+        times_ms : Sequence[float] or torch.Tensor, optional
             Event times in milliseconds. Must be broadcast-compatible with
             the selected connections *after* filtering out past events (see
             ``allow_past``). Times are converted to steps via
             the first grid step at or after the event for non-differentiable
             scheduling, and interpreted as continuous values when
-            ``diff_scheduled_times=True``.
+            ``diff_scheduled_times=True``. Omit when using ``time_idx``.
         weight : float or torch.Tensor, optional
             Dimensionless scalar or per-event weight *multiplier* applied on
             top of the base connection weights returned by ``self.weight()``.
@@ -4049,6 +3940,14 @@ class NetCon(Referency):
             When provided as a tensor requiring gradients, and when
             differentiable scheduling is enabled, gradients will flow into
             this tensor.
+        time_idx : Sequence[int] or torch.Tensor, optional
+            Nonnegative per-event indices into the tensor supplied to
+            :meth:`bind_time_source`. Mutually exclusive with ``times_ms``.
+        weight_idx : Sequence[int] or torch.Tensor, optional
+            Nonnegative per-event indices into the tensor supplied to
+            :meth:`bind_weight_source`. Referenced weights use that source
+            alone: omit ``weight`` or pass ``None``. The default numeric
+            ``weight=1.0`` is treated as omitted.
         allow_past : bool, optional
             If False (default), events whose scheduled integer step is smaller
             than the current ``global_step`` are dropped. If True, no such
@@ -4056,22 +3955,61 @@ class NetCon(Referency):
 
         Notes
         -----
-        * This is a *value-mode* scheduling API: weights and times are stored
-          directly in ``self.sched_weight`` and ``self.sched_time_ms``.
-        * For *reference-mode* weights or times (where event metadata lives in
-          a separate trainable tensor), use :meth:`schedule_ref` and
-          :meth:`schedule_time_ref` after binding sources with
-          :meth:`bind_weight_source` and :meth:`bind_time_source`.
+        * Direct values are stored in ``self.sched_weight`` and
+          ``self.sched_time_ms``; indexed quantities have zero value slots.
+        * :meth:`schedule_ref` and :meth:`schedule_time_ref` are compatible
+          adapters for declarations with one indexed quantity.
         * This method can be called multiple times; new events are appended.
         """
+        return self._schedule_tensor_events(
+            con_indices=con_indices,
+            pre_indices=pre_indices,
+            times_ms=times_ms,
+            weight=weight,
+            time_idx=time_idx,
+            weight_idx=weight_idx,
+            allow_past=allow_past,
+            api="schedule",
+        )
+
+    def _schedule_tensor_events(
+        self,
+        *,
+        con_indices,
+        pre_indices,
+        times_ms=None,
+        weight=1.0,
+        time_idx=None,
+        weight_idx=None,
+        allow_past,
+        api,
+    ):
+        """Declare aligned event columns with caller-specific diagnostics."""
+        reference_time = time_idx is not None or api == "schedule_time_ref"
+        reference_weight = weight_idx is not None or api == "schedule_ref"
+        if api == "schedule":
+            if reference_time and times_ms is not None:
+                raise ValueError("Provide only one of times_ms or time_idx")
+            if (
+                reference_weight
+                and weight is not None
+                and not (isinstance(weight, Real) and weight == 1.0)
+            ):
+                raise ValueError("Provide only one of weight or weight_idx")
+        if reference_weight and self._sched_w_source is None:
+            raise RuntimeError(f"call bind_weight_source(...) before {api}(...)")
+        if reference_time and self._sched_t_source is None:
+            raise RuntimeError(f"call bind_time_source(...) before {api}(...)")
         if (con_indices is None) == (pre_indices is None):
             raise ValueError("Provide exactly one of con_indices or pre_indices")
-        if times_ms is None:
+        if api == "schedule_ref" and (times_ms is None or weight_idx is None):
+            raise ValueError("times_ms and weight_idx are required")
+        if api == "schedule_time_ref" and time_idx is None:
+            raise ValueError("time_idx is required")
+        if not reference_time and times_ms is None:
             raise ValueError("times_ms is required")
 
         device, dtype = self.device, self.dtype
-
-        # → connection indices (raw, before any filtering)
         if pre_indices is not None:
             con_idx_raw = self._expand_pre_to_con(pre_indices).to(device)
         else:
@@ -4079,69 +4017,125 @@ class NetCon(Referency):
                 con_indices, device=device, dtype=torch.long
             ).view(-1)
 
-        tms_raw = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
-
-        if con_idx_raw.numel() != tms_raw.numel():
+        if reference_time:
+            tidx_raw = torch.as_tensor(time_idx, device=device, dtype=torch.long).view(
+                -1
+            )
+            if con_idx_raw.numel() != tidx_raw.numel():
+                raise ValueError(
+                    "con_indices/pre_indices and time_idx must match length"
+                )
+        else:
+            tms_raw = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
+        if reference_weight:
+            widx_raw = torch.as_tensor(
+                weight_idx, device=device, dtype=torch.long
+            ).view(-1)
+            if api == "schedule_ref" and not (
+                con_idx_raw.numel() == tms_raw.numel() == widx_raw.numel()
+            ):
+                raise ValueError(
+                    "indices, times_ms, and weight_idx must have same length"
+                )
+        if not reference_time and con_idx_raw.numel() != tms_raw.numel():
             raise ValueError("con_indices/pre_indices and times_ms must match length")
+        if reference_weight and con_idx_raw.numel() != widx_raw.numel():
+            raise ValueError("con_indices/pre_indices and weight_idx must match length")
         if (con_idx_raw < 0).any() or (con_idx_raw >= self.pre_idx.numel()).any():
             raise IndexError("connection index out of range")
+        if reference_time and (
+            (tidx_raw < 0).any() or (tidx_raw >= self._sched_t_source.numel()).any()
+        ):
+            raise IndexError("time_idx out of range for bound time source")
+        if reference_weight and (
+            (widx_raw < 0).any() or (widx_raw >= self._sched_w_source.numel()).any()
+        ):
+            raise IndexError("weight_idx out of range for bound weight source")
+        if reference_time:
+            tms_raw = self._sched_t_source.index_select(0, tidx_raw).to(dtype=dtype)
 
-        # legacy step field (used when diff_scheduled_times=False)
         steps_raw = _causal_step_index(tms_raw, self.dt.to(tms_raw.dtype))
-
-        # optional filtering of past events
         if not allow_past:
             cur = self.global_step.view(())
             keep = steps_raw >= cur
-            if not bool(keep.any()):
+            if not reference_time and not reference_weight and not bool(keep.any()):
                 return
             con_idx = con_idx_raw[keep]
-            tms = tms_raw[keep]
-            steps = steps_raw[keep]
+            if reference_time:
+                steps = steps_raw[keep]
+                tidx = tidx_raw[keep]
+                tms = tms_raw[keep]
+            else:
+                tms = tms_raw[keep]
+                steps = steps_raw[keep]
+            if reference_weight:
+                widx = widx_raw[keep]
+            if (reference_time or reference_weight) and con_idx.numel() == 0:
+                return
         else:
             con_idx = con_idx_raw
             tms = tms_raw
             steps = steps_raw
+            if reference_time:
+                tidx = tidx_raw
+            if reference_weight:
+                widx = widx_raw
 
         E_before = con_idx_raw.numel()
         E_after = con_idx.numel()
 
-        # Normalize weight (supports scalar, pre-filter length, or post-filter length)
-        if torch.is_tensor(weight):
+        if reference_weight:
+            w = torch.zeros(E_after, device=device, dtype=dtype)
+        elif torch.is_tensor(weight):
             w_raw = weight.to(device=device, dtype=dtype).view(-1)
             if w_raw.numel() == 1:
-                w = w_raw.expand(E_after)  # scalar → broadcast
+                w = w_raw.expand(E_after)
             elif w_raw.numel() == E_before:
-                w = (
-                    w_raw[keep] if not allow_past else w_raw
-                )  # per-event (pre-filter) → slice if filtered
+                w = w_raw[keep] if not allow_past else w_raw
             elif w_raw.numel() == E_after:
-                w = w_raw  # per-event (post-filter) already aligned
+                w = w_raw
             else:
+                if api == "schedule_time_ref":
+                    raise ValueError(
+                        f"weight must be scalar or have length {E_before} "
+                        f"(pre-filter) or {E_after} (post-filter)"
+                    )
                 raise ValueError(
                     f"weight tensor length must be 1, {E_before} (pre-filter), or {E_after} (post-filter)"
                 )
         else:
             w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
 
-        # append (outside compiled loop: changing E is fine)
+        if reference_time:
+            tms = torch.zeros(E_after, device=device, dtype=dtype)
+        elif api == "schedule_ref":
+            tms = tms.to(dtype=dtype)
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
         self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
         self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
         self.sched_time_ms = torch.cat([self.sched_time_ms, tms], dim=0)
+        if api == "schedule_time_ref":
+            self.sched_time_idx = torch.cat([self.sched_time_idx, tidx], dim=0)
         self.sched_weight = torch.cat([self.sched_weight, w], dim=0)
-
-        # keep ref-index arrays aligned (sentinel -1)
         filler = torch.full((E_after,), -1, device=device, dtype=torch.long)
-        self.sched_weight_idx = torch.cat([self.sched_weight_idx, filler], dim=0)
-        self.sched_time_idx = torch.cat([self.sched_time_idx, filler], dim=0)
+        self.sched_weight_idx = torch.cat(
+            [self.sched_weight_idx, widx if reference_weight else filler], dim=0
+        )
+        if api != "schedule_time_ref":
+            self.sched_time_idx = torch.cat(
+                [self.sched_time_idx, tidx if reference_time else filler], dim=0
+            )
 
     def bind_weight_source(self, source: torch.Tensor):
         """
         Bind a tensor providing per-event weights for reference-mode scheduling.
 
-        This method enables *reference-mode* scheduled weights used by
-        :meth:`schedule_ref`. Instead of storing per-event weights directly
-        inside ``NetCon``, you bind a tensor (usually a parameter) and then
+        This method supplies live indexed weights for :meth:`schedule` through
+        ``weight_idx`` and for its :meth:`schedule_ref` adapter. Instead of
+        storing per-event weights directly inside ``NetCon``, you bind a tensor
+        (usually a parameter) and then
         refer to entries in that tensor by integer indices.
 
         Parameters
@@ -4153,7 +4147,7 @@ class NetCon(Referency):
 
             * reside on the same device as the synapse (``self.device``), and
             * have a size at least as large as any ``weight_idx`` used in
-              :meth:`schedule_ref`.
+              :meth:`schedule` or :meth:`schedule_ref`.
 
             Typically this is a ``torch.nn.Parameter`` or another tensor that
             participates in the training loop.
@@ -4165,26 +4159,31 @@ class NetCon(Referency):
             1. Construct the weight source tensor (e.g. ``nn.Parameter``).
             2. Call ``netcon.bind_weight_source(weight_source)`` exactly once (or
                whenever you want to replace the source).
-            3. Use :meth:`schedule_ref` with ``weight_idx`` values indexing into
+            3. Use :meth:`schedule` with ``weight_idx`` values indexing into
                the bound tensor.
 
         * Calling this replaces any previously bound weight source.
         * The tensor is not copied; ``NetCon`` keeps a reference and reads from
           it during simulation.
-        * Gradients flow into the bound tensor whenever
-          ``diff_weights=True`` and the scheduling path is differentiable.
+        * Gradients flow into the bound tensor through differentiable schedule
+          evaluation. ``diff_weights`` separately controls base connection
+          weight gradients.
         """
         if source.device != self.device:
             raise ValueError("weight source must be on same device")
         self._sched_w_source = source
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
 
     def bind_time_source(self, source: torch.Tensor):
         """
         Bind a tensor providing per-event times (ms) for reference-mode scheduling.
 
-        This method enables *reference-mode* scheduled times used by
-        :meth:`schedule_time_ref`. Instead of storing times directly in
-        ``NetCon``, you bind a tensor (usually a parameter) and then reference
+        This method supplies live indexed times for :meth:`schedule` through
+        ``time_idx`` and for its :meth:`schedule_time_ref` adapter. Instead of
+        storing times directly in ``NetCon``, you bind a tensor (usually a
+        parameter) and then reference
         entries in that tensor by integer indices.
 
         Parameters
@@ -4194,7 +4193,7 @@ class NetCon(Referency):
 
             * reside on the same device as the synapse (``self.device``), and
             * have a size at least as large as any ``time_idx`` used in
-              :meth:`schedule_time_ref`.
+              :meth:`schedule` or :meth:`schedule_time_ref`.
 
             Typically this is a ``torch.nn.Parameter`` or another tensor that
             participates in the training loop.
@@ -4205,7 +4204,7 @@ class NetCon(Referency):
 
             1. Construct the time source tensor (e.g. ``nn.Parameter`` in ms).
             2. Call ``netcon.bind_time_source(time_source)``.
-            3. Use :meth:`schedule_time_ref` with ``time_idx`` values indexing into
+            3. Use :meth:`schedule` with ``time_idx`` values indexing into
                the bound tensor.
 
         * Calling this replaces any previously bound time source.
@@ -4217,6 +4216,9 @@ class NetCon(Referency):
         if source.device != self.device:
             raise ValueError("time source must be on same device")
         self._sched_t_source = source
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
 
     def schedule_ref(
         self,
@@ -4229,6 +4231,8 @@ class NetCon(Referency):
     ):
         """
         Schedule reference-mode events with weights drawn from a bound source.
+
+        This is the compatible adapter for :meth:`schedule` with ``weight_idx``.
 
         This API is the reference-mode counterpart to :meth:`schedule`. Instead
         of passing explicit weights, you pass integer indices into a tensor
@@ -4247,8 +4251,8 @@ class NetCon(Referency):
             map (see :meth:`_expand_pre_to_con`). Mutually exclusive with
             ``con_indices``.
         times_ms : Sequence[float] or torch.Tensor
-            Event times in milliseconds, one per event. Converted to integer
-            steps via rounding for non-differentiable behavior; used as
+            Event times in milliseconds, one per event. Assigned to the first
+            grid step at or after each event for non-differentiable behavior; used as
             continuous times when ``diff_scheduled_times=True``.
         weight_idx : Sequence[int] or torch.Tensor
             Integer indices into the tensor bound by :meth:`bind_weight_source`.
@@ -4296,61 +4300,13 @@ class NetCon(Referency):
         * The value-mode slots for weights are still allocated but set to zero;
           only reference-mode contributions are active for these events.
         """
-        if self._sched_w_source is None:
-            raise RuntimeError("call bind_weight_source(...) before schedule_ref(...)")
-        if (con_indices is None) == (pre_indices is None):
-            raise ValueError("Provide exactly one of con_indices or pre_indices")
-        if times_ms is None or weight_idx is None:
-            raise ValueError("times_ms and weight_idx are required")
-
-        device, dtype = self.device, self.dtype
-        if pre_indices is not None:
-            con_idx = self._expand_pre_to_con(pre_indices).to(device)
-        else:
-            con_idx = torch.as_tensor(
-                con_indices, device=device, dtype=torch.long
-            ).view(-1)
-
-        tms = torch.as_tensor(times_ms, device=device, dtype=dtype).view(-1)
-        widx = torch.as_tensor(weight_idx, device=device, dtype=torch.long).view(-1)
-        if not (con_idx.numel() == tms.numel() == widx.numel()):
-            raise ValueError("indices, times_ms, and weight_idx must have same length")
-
-        if (con_idx < 0).any() or (con_idx >= self.pre_idx.numel()).any():
-            raise IndexError("connection index out of range")
-        if (widx < 0).any() or (widx >= self._sched_w_source.numel()).any():
-            raise IndexError("weight_idx out of range for bound weight source")
-
-        steps = _causal_step_index(tms, self.dt.to(tms.dtype))
-        if not allow_past:
-            cur = self.global_step.view(())
-            keep = steps >= cur
-            con_idx, tms, steps, widx = (
-                con_idx[keep],
-                tms[keep],
-                steps[keep],
-                widx[keep],
-            )
-            if con_idx.numel() == 0:
-                return
-
-        self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
-        self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
-        self.sched_time_ms = torch.cat([self.sched_time_ms, tms.to(dtype=dtype)], dim=0)
-        self.sched_weight = torch.cat(
-            [
-                self.sched_weight,
-                torch.zeros(con_idx.numel(), device=device, dtype=dtype),
-            ],
-            dim=0,
-        )
-        self.sched_weight_idx = torch.cat([self.sched_weight_idx, widx], dim=0)
-        self.sched_time_idx = torch.cat(
-            [
-                self.sched_time_idx,
-                torch.full((con_idx.numel(),), -1, device=device, dtype=torch.long),
-            ],
-            dim=0,
+        return self._schedule_tensor_events(
+            con_indices=con_indices,
+            pre_indices=pre_indices,
+            times_ms=times_ms,
+            weight_idx=weight_idx,
+            allow_past=allow_past,
+            api="schedule_ref",
         )
 
     def schedule_time_ref(
@@ -4364,6 +4320,8 @@ class NetCon(Referency):
     ):
         """
         Schedule events whose times come by reference from a bound tensor.
+
+        This is the compatible adapter for :meth:`schedule` with ``time_idx``.
 
         This API is the time-reference analogue of :meth:`schedule`. Instead
         of providing explicit event times, you provide integer indices into a
@@ -4430,88 +4388,13 @@ class NetCon(Referency):
           the actual times are obtained at runtime from the bound tensor via
           ``sched_time_idx``.
         """
-        if self._sched_t_source is None:
-            raise RuntimeError(
-                "call bind_time_source(...) before schedule_time_ref(...)"
-            )
-        if (con_indices is None) == (pre_indices is None):
-            raise ValueError("Provide exactly one of con_indices or pre_indices")
-        if time_idx is None:
-            raise ValueError("time_idx is required")
-
-        device, dtype = self.device, self.dtype
-
-        # -> connection indices
-        if pre_indices is not None:
-            con_idx = self._expand_pre_to_con(pre_indices).to(device)
-        else:
-            con_idx = torch.as_tensor(
-                con_indices, device=device, dtype=torch.long
-            ).view(-1)
-
-        tidx = torch.as_tensor(time_idx, device=device, dtype=torch.long).view(-1)
-        if con_idx.numel() != tidx.numel():
-            raise ValueError("con_indices/pre_indices and time_idx must match length")
-
-        if (con_idx < 0).any() or (con_idx >= self.pre_idx.numel()).any():
-            raise IndexError("connection index out of range")
-        if (tidx < 0).any() or (tidx >= self._sched_t_source.numel()).any():
-            raise IndexError("time_idx out of range for bound time source")
-
-        # Use a zeros value slot for times and record sched_time_idx. Keep the
-        # legacy hard-step field populated from the current reference values.
-        tms_now = self._sched_t_source.index_select(0, tidx).to(dtype=dtype)
-        steps = _causal_step_index(tms_now, self.dt.to(dtype))
-        E_before = con_idx.numel()
-        if not allow_past:
-            cur = self.global_step.view(())
-            keep = steps >= cur
-            con_idx, steps, tidx, tms_now = (
-                con_idx[keep],
-                steps[keep],
-                tidx[keep],
-                tms_now[keep],
-            )
-            if con_idx.numel() == 0:
-                return
-        E_after = con_idx.numel()
-
-        # weight value-mode (optional)
-        if torch.is_tensor(weight):
-            w_raw = weight.to(device=device, dtype=dtype).view(-1)
-            if w_raw.numel() == 1:
-                w = w_raw.expand(E_after)
-            elif w_raw.numel() == E_before:
-                w = w_raw[keep] if not allow_past else w_raw
-            elif w_raw.numel() == E_after:
-                w = w_raw
-            else:
-                raise ValueError(
-                    f"weight must be scalar or have length {E_before} "
-                    f"(pre-filter) or {E_after} (post-filter)"
-                )
-        else:
-            w = torch.full((E_after,), float(weight), device=device, dtype=dtype)
-
-        self.sched_con_idx = torch.cat([self.sched_con_idx, con_idx], dim=0)
-        self.sched_abs_step = torch.cat([self.sched_abs_step, steps], dim=0)
-        self.sched_time_ms = torch.cat(
-            [
-                self.sched_time_ms,
-                torch.zeros(E_after, device=device, dtype=dtype),
-            ],
-            dim=0,
-        )  # value slot 0
-        self.sched_time_idx = torch.cat([self.sched_time_idx, tidx], dim=0)
-        self.sched_weight = torch.cat([self.sched_weight, w], dim=0)
-
-        # keep weight ref index aligned (no weight-ref here, so -1)
-        self.sched_weight_idx = torch.cat(
-            [
-                self.sched_weight_idx,
-                torch.full((con_idx.numel(),), -1, device=device, dtype=torch.long),
-            ],
-            dim=0,
+        return self._schedule_tensor_events(
+            con_indices=con_indices,
+            pre_indices=pre_indices,
+            time_idx=time_idx,
+            weight=weight,
+            allow_past=allow_past,
+            api="schedule_time_ref",
         )
 
     def clear_schedule(self):
@@ -4536,6 +4419,9 @@ class NetCon(Referency):
           to reuse the same ``NetCon`` instance but with a fresh schedule.
         """
         device, dtype = self.device, self.dtype
+        self._schedule_config_generation = (
+            getattr(self, "_schedule_config_generation", 0) + 1
+        )
         self.sched_con_idx = torch.empty(0, device=device, dtype=torch.long)
         self.sched_abs_step = torch.empty(0, device=device, dtype=torch.long)
         self.sched_weight = torch.empty(0, device=device, dtype=dtype)
@@ -4585,48 +4471,26 @@ class NetCon(Referency):
                 torch.zeros(n_conn, device=device, dtype=torch.int32),
             )
 
-        # --- scheduled weights (value + ref) ---
-        w_val = self.sched_weight
-        if self._sched_w_source is not None:
-            idxw = torch.clamp(self.sched_weight_idx, min=0)
-            w_src = self._sched_w_source.index_select(0, idxw)
-            w_ref_mask = (self.sched_weight_idx >= 0).to(dtype)
-            w_val = w_val + w_src * w_ref_mask  # combine if both present
-
-        # --- scheduled times (value + ref) -> float ms ---
-        t_val = self.sched_time_ms  # may be zeros if using time-by-ref only
-        if self._sched_t_source is not None:
-            idxt = torch.clamp(self.sched_time_idx, min=0)
-            t_src = self._sched_t_source.index_select(0, idxt).to(dtype=dtype)
-            t_ref_mask = (self.sched_time_idx >= 0).to(t_src.dtype)
-            t_val = t_val + t_src * t_ref_mask
-
-        if use_tri_kernel:
-            # Differentiable triangular kernel in *steps*
-            lam = t_val.to(dtype) / self.dt.to(dtype)  # [E] float
-            # gs_long is int64; cast to float
-            x = lam - gs_long.to(dtype).view(())
-            # width in steps (half-width). <=0 disables contribution
-            _, _, _, _, _, _, _, sched_width = self.train_flags
-            tri = (1.0 - (x.abs() / (sched_width + 1e-6))).clamp(
-                min=0.0, max=1.0
-            )  # [E]
-            amp_evt = w_val * tri  # [E]
-            # counts (bookkeeping): event "active" if tri>0
-            cnt_evt = (tri > 0).to(torch.int32)  # [E]
-        else:
-            # Step-exact, causal firing: first grid step >= event time.
-            abs_step = _causal_step_index(t_val.to(dtype), self.dt.to(dtype))
-            now_mask = abs_step == gs_long.view(())
-            amp_evt = w_val * now_mask.to(dtype)  # [E]
-            cnt_evt = now_mask.to(torch.int32)  # [E]
-
-        # Aggregate to connections
-        sched_wsum_conn = torch.zeros(n_conn, device=device, dtype=dtype)
-        sched_counts_conn = torch.zeros(n_conn, device=device, dtype=torch.int32)
-        sched_wsum_conn.index_add_(0, self.sched_con_idx, amp_evt)
-        sched_counts_conn.index_add_(0, self.sched_con_idx, cnt_evt)
-        return sched_wsum_conn, sched_counts_conn
+        times, weights = resolve_schedule_values(
+            self.sched_time_ms,
+            self.sched_weight,
+            self.sched_time_idx,
+            self.sched_weight_idx,
+            time_source=self._sched_t_source,
+            weight_source=self._sched_w_source,
+            time_dtype=dtype,
+        )
+        width = self.train_flags[7] if use_tri_kernel else 1.0
+        return netcon_tensor_schedule(
+            self.sched_con_idx,
+            times,
+            weights,
+            gs_long,
+            self.dt.to(dtype),
+            connections=n_conn,
+            differentiable_times=use_tri_kernel,
+            width=width,
+        )
 
     def advance_diff_source_history(self):
         """Differentiable source-history training path.
@@ -4749,9 +4613,14 @@ class NetCon(Referency):
         # 1) deliver today's payload and expose the matching hard-event counts.
         # Ambiguous surrogate/fractional event tracking is rejected by
         # set_diff_config(), so track_events here always has integer semantics.
-        todays = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)  # [n_syn]
+        due = dense_due(
+            self.delivery_buffer,
+            cur_idx,
+            self.event_queue if self.track_events else None,
+        )
+        todays = due.payload
         if self.track_events:
-            self.events.copy_(self.event_queue.index_select(0, cur_idx).squeeze(0))
+            self.events.copy_(due.event_counts)
         else:
             self.events.zero_()
         self.syn.net_receive(todays.view(*self.syn.shape_f), self)
@@ -4777,111 +4646,72 @@ class NetCon(Referency):
         self._record_gate_for_state_cache(gate)
         event_counts = None
         if self.track_events:
-            event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
+            event_counts = connection_event_counts(intrinsic_gate, sched_counts_conn)
 
         # weights (optionally detach)
         wvals = self.weight()
         if not diff_weights:
             wvals = wvals.detach()
-        weighted_spikes = wvals * gate  # [n_conn]
-
-        # ------------------------------------------------------------------
-        # Build next delivery buffer WITHOUT allocating a full-size "contrib"
-        # buffer and WITHOUT constructing a full-size dense mask.
-        #
-        # We clone once (this is the output buffer), clear the delivered row,
-        # then scatter-add into it.
-        #
-        # This reduces per-step peak memory substantially compared to:
-        #   contrib=zeros_like(buf_flat) + mask2d + (buf_flat*mask2d + contrib)
-        # ------------------------------------------------------------------
-        buf_next = self.delivery_buffer.clone()
-        buf_next.index_fill_(0, cur_idx, 0.0)  # clear the row we just delivered
-        buf_flat = buf_next.view(-1)
-        event_queue_next = None
-        if self.track_events:
-            event_queue_next = self.event_queue.clone()
-            event_queue_next.index_fill_(0, cur_idx, 0)
-
-        if diff_delays:
-            d_ms = self.delay_ms().to(dtype)  # [n_conn]
-            # Detection happens after the current receive slot has already been
-            # delivered.  Consequently, even a sub-timestep physical delay can
-            # arrive no earlier than the next simulation step.  Keep the
-            # differentiable dense path aligned with inference and the compact
-            # source-history training backend; otherwise a rounded-zero delay
-            # is written into the cleared current slot and is not seen again
-            # until the circular buffer wraps.
-            lam = (d_ms / self.dt.to(dtype)).clamp_min(1.0)
-            k = torch.floor(lam)
-            kL = k.to(torch.long)
-
-            if taps == 2:
-                alpha = (lam - k).to(dtype)
-                idx0 = (cur_idx + kL).remainder(self.max_delay_steps)
-                idx1 = (idx0 + 1).remainder(self.max_delay_steps)
-                flat0 = idx0 * self.syn_numel + self.post_idx
-                flat1 = idx1 * self.syn_numel + self.post_idx
-                # Vectorized 2-tap write
-                buf_flat.index_add_(0, flat0, weighted_spikes * (1.0 - alpha))
-                buf_flat.index_add_(0, flat1, weighted_spikes * alpha)
-            else:
-                offs = torch.stack([kL - 1, kL, kL + 1], dim=-1)
-                centers = offs.to(dtype)
-                lam_e = lam.unsqueeze(-1)
-                w = torch.softmax(
-                    -0.5 * ((lam_e - centers) / (sigma + 1e-6)) ** 2, dim=-1
-                )
-
-                idxs = (cur_idx + offs).remainder(self.max_delay_steps)
-                # Vectorized 3-tap write
-                flat_idx = idxs * self.syn_numel + self.post_idx.unsqueeze(
-                    -1
-                )  # [n_conn,3]
-                vals = weighted_spikes.unsqueeze(-1) * w  # [n_conn,3]
-                buf_flat.index_add_(0, flat_idx.reshape(-1), vals.reshape(-1))
-        else:
-            future_steps = (cur_idx + self.inference_delay_steps).remainder(
-                self.max_delay_steps
+        if not diff_delays:
+            # The same pure transport transition backs functional projections.
+            # Source detection and scheduled-event aggregation stay here, after
+            # reception, so recurrent Network invocation order is unchanged.
+            transition = dense_fixed_delay_transition(
+                self.delivery_buffer,
+                cur_idx,
+                gs,
+                wvals,
+                gate,
+                post_idx=self.post_idx,
+                delay_steps=self.inference_delay_steps,
+                depth=self.max_delay_steps,
+                width=self._syn_numel,
+                event_queue=self.event_queue if self.track_events else None,
+                event_counts=event_counts,
+                _clone_once=True,
             )
-            flat = future_steps * self.syn_numel + self.post_idx
-            # Integer delay: single destination per connection
-            buf_flat.index_add_(0, flat, weighted_spikes)
-            if event_queue_next is not None:
-                flat_events = future_steps * self._n_conn + self.con_range
-                event_queue_next.view(-1).index_add_(0, flat_events, event_counts)
-
-        # Commit next buffer (already cleared + updated)
-        self.delivery_buffer = buf_next
-        if event_queue_next is not None:
-            self.event_queue = event_queue_next
-
-        # advance counters (no grad)
-        with torch.no_grad():
-            # Rebind buffers (out-of-place) to avoid version bumps on saved tensors
-            self.current_time_step = (
-                (self.current_time_step + 1).remainder(self.max_delay_steps).detach()
-            )
-            self.global_step = (self.global_step + 1).detach()
+            self.delivery_buffer = transition.queue
+            if self.track_events:
+                self.event_queue = transition.event_queue
+            self.current_time_step = transition.slot.detach()
+            self.global_step = transition.global_step.detach()
+            return
+        transition = dense_interpolated_delay_transition(
+            self.delivery_buffer,
+            cur_idx,
+            gs,
+            wvals,
+            gate,
+            self.delay_ms(),
+            self.dt,
+            post_idx=self.post_idx,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            taps=taps,
+            sigma=sigma,
+            _clone_once=True,
+        )
+        self.delivery_buffer = transition.queue
+        self.current_time_step = transition.slot.detach()
+        self.global_step = transition.global_step.detach()
 
     def _dense_current_delivery(self):
         """Return the dense delivery row due at the current slot."""
         cur_idx = self.current_time_step
-        todays_delivery = self.delivery_buffer.index_select(0, cur_idx).squeeze(0)
-        return cur_idx, todays_delivery
+        return cur_idx, dense_due(self.delivery_buffer, cur_idx).payload
 
     def _dense_current_events(self, cur_idx):
         """Expose per-connection event counts for the current slot if enabled."""
         if self.track_events:
-            self.events.copy_(self.event_queue.index_select(0, cur_idx).squeeze(0))
+            self.events.copy_(dense_due(self.event_queue, cur_idx).payload)
         else:
             self.events.zero_()
 
     def _dense_clear_current_slot(self, cur_idx):
         """Clear the dense delivery/event row after it has been delivered."""
-        self.delivery_buffer.index_fill_(0, cur_idx, 0.0)
+        _clear_dense_slot(self.delivery_buffer, cur_idx, inplace=True)
         if self.track_events:
-            self.event_queue.index_fill_(0, cur_idx, 0)
+            _clear_dense_slot(self.event_queue, cur_idx, inplace=True)
 
     def _dense_gate_and_event_counts(self):
         """Compute this step's connection gate and optional event counts."""
@@ -4897,13 +4727,15 @@ class NetCon(Referency):
                 self.sched_counts.copy_(sched_counts_conn)
             gate = intrinsic_gate + sched_wsum_conn
             if self.track_events:
-                event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
+                event_counts = connection_event_counts(
+                    intrinsic_gate, sched_counts_conn
+                )
             else:
                 event_counts = None
         else:
             gate = intrinsic_gate
             if self.track_events:
-                event_counts = (intrinsic_gate > 0).to(torch.int32)
+                event_counts = connection_event_counts(intrinsic_gate)
             else:
                 event_counts = None
 
@@ -4911,29 +4743,52 @@ class NetCon(Referency):
         return gate, event_counts
 
     def _dense_schedule_uniform(self, cur_idx, weighted_spikes, event_counts=None):
-        """Schedule all connections into one future dense delay row."""
-        future = (cur_idx + int(self._dense_uniform_delay_step)).remainder(
-            self.max_delay_steps
+        """Schedule into one future row without copying owned inference rings."""
+        flat = _fixed_delay_indices(
+            cur_idx,
+            self.post_idx,
+            self.inference_delay_steps,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            uniform_delay=self._dense_uniform_delay_step,
         )
-        flat = future * self._syn_numel + self.post_idx
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted_spikes)
-
+        _enqueue_dense_values(self.delivery_buffer, flat, weighted_spikes, inplace=True)
         if self.track_events and event_counts is not None:
-            flat_e = future * self._n_conn + self.con_range
-            self.event_queue.view(-1).index_add_(0, flat_e.reshape(-1), event_counts)
+            flat_events = _fixed_delay_indices(
+                cur_idx,
+                self.con_range,
+                self.inference_delay_steps,
+                depth=self.max_delay_steps,
+                width=self._n_conn,
+                uniform_delay=self._dense_uniform_delay_step,
+            )
+            _enqueue_dense_values(
+                self.event_queue, flat_events, event_counts, inplace=True
+            )
 
     def _dense_schedule_mixed(self, cur_idx, weighted_spikes, event_counts=None):
-        """Schedule all connections using precomputed per-connection offsets."""
-        base = cur_idx * self._syn_numel
-        flat = (base + self.flat_delay_offsets).remainder(self._delivery_numel)
-        self.delivery_buffer.view(-1).index_add_(0, flat.reshape(-1), weighted_spikes)
-
+        """Schedule mixed delays using the same routing and owned-buffer writes."""
+        flat = _fixed_delay_indices(
+            cur_idx,
+            self.post_idx,
+            self.inference_delay_steps,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            flat_offsets=self.flat_delay_offsets,
+        )
+        _enqueue_dense_values(self.delivery_buffer, flat, weighted_spikes, inplace=True)
         if self.track_events and event_counts is not None:
-            base_e = cur_idx * self._n_conn
-            flat_e = (base_e + self.flat_event_offsets).remainder(
-                self._event_queue_numel
+            flat_events = _fixed_delay_indices(
+                cur_idx,
+                self.con_range,
+                self.inference_delay_steps,
+                depth=self.max_delay_steps,
+                width=self._n_conn,
+                flat_offsets=self.flat_event_offsets,
             )
-            self.event_queue.view(-1).index_add_(0, flat_e.reshape(-1), event_counts)
+            _enqueue_dense_values(
+                self.event_queue, flat_events, event_counts, inplace=True
+            )
 
     def _advance_dense_counters(self):
         self.current_time_step.add_(1).remainder_(self.max_delay_steps)
@@ -4981,14 +4836,14 @@ class NetCon(Referency):
     @torch.no_grad()
     def advance_non_diff_sparse_calendar(self):
         """
-        Advance one inference step using sparse calendar buckets.
+        Advance one inference step using the shared pure pending calendar.
 
         This path preserves the existing ``syn.net_receive(payload, self)``
         contract by reducing due sparse deliveries into a reusable dense scratch
         row before delivery.  Unlike :meth:`advance_non_diff`, it does not keep
         a dense ``[max_delay_steps, syn_numel]`` pending-delivery ring.  Pending
-        future deliveries are stored only as nonzero ``(post_idx, value)``
-        chunks in ``self._sparse_calendar``.
+        future deliveries use compact tensor entries containing their physical
+        ring slot, target index, and enqueue-time weighted value.
         """
         cur_idx = self.current_time_step
         cur_slot = int(cur_idx.item())
@@ -5038,7 +4893,7 @@ class NetCon(Referency):
         # 5) Optional per-connection event introspection, without allocating the
         # dense ``[max_delay_steps, n_conn]`` debug queue.
         if self.track_events:
-            event_counts = (intrinsic_gate > 0).to(torch.int32) + sched_counts_conn
+            event_counts = connection_event_counts(intrinsic_gate, sched_counts_conn)
             active_events = torch.nonzero(event_counts != 0, as_tuple=False).flatten()
             if active_events.numel() > 0:
                 delay_steps = self.inference_delay_steps.index_select(0, active_events)
@@ -5066,8 +4921,7 @@ class NetCon(Referency):
 
         # 2) Optional explicit scheduled per-connection events are handled by a
         # sparse side calendar so they do not force a dense delay buffer.
-        if self._sparse_calendar:
-            self._add_sparse_calendar_to_dense(int(cur_idx.item()), scratch)
+        self._add_sparse_calendar_to_dense(cur_idx, scratch)
         if self.events.numel() > 0:
             self.events.zero_()
         self.syn.net_receive(scratch.view(*self.syn.shape_f), self)
@@ -5113,18 +4967,11 @@ class NetCon(Referency):
         # (or spikes_gate for differentiable spiking)
         if diff_spiking:
             # surrogate / soft gate, already float
-            gate = (
-                pre.spike_gate.to(self.pre_device)
-                .view(-1)
-                .index_select(0, self.pre_idx)
-            )
+            gate = gather_source_gates(pre.spike_gate.to(self.pre_device), self.pre_idx)
         else:
             # hard spikes; usually bool → cast to float gate {0, 1}
-            gate = (
-                pre.spikes.to(self.pre_device)
-                .view(-1)
-                .index_select(0, self.pre_idx)
-                .to(self.pre_dtype)
+            gate = gather_source_gates(pre.spikes.to(self.pre_device), self.pre_idx).to(
+                self.pre_dtype
             )
 
         # Ensure dtype is always self.dtype
@@ -5166,13 +5013,9 @@ class NetCon(Referency):
           are NaN.
         """
         # Always work in the module's float dtype
-        v_selected = (
-            self.get_pre_var(pre)
-            .to(self.pre_device)
-            .view(-1)
-            .index_select(0, self.pre_idx)
-            .to(self.pre_dtype)
-        )
+        v_selected = gather_source_gates(
+            self.get_pre_var(pre).to(self.pre_device), self.pre_idx
+        ).to(self.pre_dtype)
 
         if self.skip_thresholding:
             # Just mirror v as a continuous "gate"
@@ -5181,28 +5024,14 @@ class NetCon(Referency):
             )
             return
 
-        if diff_spiking:
-            # Surrogate / differentiable spiking
-            self.has_spiked, _, gate = update_active_diff(
-                self.has_spiked, v_selected, self.threshold, tau=tau
-            )
-            # gate is typically float already, but enforce dtype
-            gate = gate.to(self.pre_dtype)
-        else:
-            # Hard threshold spiking; usually returns Bool spikes
-            self.has_spiked, spikes = update_active(
-                self.has_spiked, v_selected, self.threshold
-            )
-            # Turn {False,True} into {0.0,1.0} float gate
-            gate = spikes.to(self.pre_dtype)
-
-        if self.apply_masking:
-            # thresh_is_nan: bool mask; choose between v_selected and gate (both float)
-            gate = torch.where(
-                self.thresh_is_nan,
-                v_selected,
-                gate,
-            )
+        self.has_spiked, gate = threshold_transition(
+            v_selected,
+            self.has_spiked,
+            self.threshold,
+            diff_spiking=diff_spiking,
+            tau=tau,
+            nan_mask=self.thresh_is_nan if self.apply_masking else None,
+        )
 
         self.is_spiking = gate.to(device=self.pre_device, dtype=self.pre_dtype)
 
@@ -5290,50 +5119,96 @@ class NetCon(Referency):
         * ``initialize`` calls this internally, so explicit calls are only
           needed when manually resetting state mid-simulation.
         """
-        self.current_time_step.fill_(0)
+        reset_fields = (
+            "current_time_step",
+            "global_step",
+            "delivery_buffer",
+            "events",
+            "has_spiked",
+            "is_spiking",
+            "spike_history_packed",
+            "source_gate_history",
+            "bitpack_source_has_spiked",
+        )
+        if (
+            clear_delivery_buffers
+            and hasattr(self, "source_gate_history")
+            and self.source_gate_history.numel() > 0
+        ):
+            self.source_gate_history = self.source_gate_history.detach()
+        reset_state = {
+            name: getattr(self, name) for name in reset_fields if hasattr(self, name)
+        }
+        if self.track_events and hasattr(self, "event_queue"):
+            reset_state["event_queue"] = self.event_queue
+        event_runtime_reset(
+            reset_state, clear_deliveries=clear_delivery_buffers, _inplace=True
+        )
         if clear_delivery_buffers:
-            self.delivery_buffer.zero_()
             self._clear_sparse_calendar()
-            if (
-                hasattr(self, "spike_history_packed")
-                and self.spike_history_packed.numel() > 0
-            ):
-                self.spike_history_packed.zero_()
-            if (
-                hasattr(self, "source_gate_history")
-                and self.source_gate_history.numel() > 0
-            ):
-                self.source_gate_history = self.source_gate_history.detach()
-                self.source_gate_history.zero_()
-            if (
-                hasattr(self, "bitpack_source_has_spiked")
-                and self.bitpack_source_has_spiked.numel() > 0
-            ):
-                self.bitpack_source_has_spiked.zero_()
-            if self.track_events and hasattr(self, "event_queue"):
-                self.event_queue.zero_()
-            self.events.zero_()
-            self.has_spiked.fill_(False)
-            self.is_spiking.zero_()  # float buffer, reset to 0.0
 
     def detach(self):
         """
-        Detach internal buffers from the current computation graph.
+        Detach runtime history and defer fresh effective parameter graphs.
 
-        This simply calls ``.detach()`` on all registered buffers and rebinds
-        them. It is useful when:
-
-        * starting a fresh forward pass between episodes,
-        * freezing the internal state for inference,
-        * or avoiding backpropagation through previous simulation windows.
-
-        Notes
-        -----
-        * This does not change the values of buffers; it only affects their
-          ``grad_fn`` and autograd history.
+        Pending deliveries retain their enqueue-time values. Raw parameter and
+        schedule sources remain unchanged; initialized quantized routing stays
+        fixed until initialization. Network execution reconnects pending weight
+        and delay materializations at its next gradient-enabled training boundary.
         """
-        for n, b in self.named_buffers():
-            setattr(self, n, b.detach())
+        memo = {}
+        self._detach_runtime(memo)
+        self.weight._detach_for_continuation(memo)
+        self.delay_ms._detach_for_continuation(memo)
+
+    def _detach_runtime(self, memo=None, *, _promote_inference=False):
+        memo = {} if memo is None else memo
+        transform = (
+            _promote_inference_runtime_tree
+            if _promote_inference
+            else _detach_runtime_tree
+        )
+        for name in (
+            "delivery_buffer",
+            "current_time_step",
+            "global_step",
+            "has_spiked",
+            "is_spiking",
+            "spike_history_packed",
+            "source_gate_history",
+            "bitpack_source_has_spiked",
+            "events",
+            "event_queue",
+            "sched_wsum",
+            "sched_counts",
+            "state_cache_gate_history",
+        ):
+            if name in self._buffers:
+                setattr(self, name, transform(self._buffers[name], memo))
+        for name in ("_pending_calendar", "_pending_event_calendar"):
+            value = getattr(self, name, None)
+            if value is not None:
+                setattr(self, name, transform(value, memo))
+
+    def _validate_detached_parameter_values(self, weights, delays):
+        for name, value in (("weights", weights), ("delays", delays)):
+            if not torch.is_tensor(value) or tuple(value.shape) != (self._n_conn,):
+                raise ValueError(
+                    f"NetCon {name} must preserve the initialized connection shape."
+                )
+        if self.training and self.train_flags is not None and self.train_flags[1]:
+            with torch.no_grad():
+                steps = delays.to(dtype=self.dtype) / self.dt.to(
+                    device=delays.device, dtype=self.dtype
+                )
+                if not bool(torch.isfinite(steps).all()) or bool(
+                    (steps >= self.max_delay_steps).any()
+                ):
+                    raise ValueError(
+                        "Updated differentiable NetCon delays must be finite and fit "
+                        "the initialized delay capacity; repair the values or call "
+                        "Network.initialize(..., max_delay_ms=...) with a larger capacity."
+                    )
 
     def initialize(
         self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
@@ -5392,6 +5267,7 @@ class NetCon(Referency):
         * This method is invoked automatically by higher-level simulation
           loops in Dendra (e.g., :class:`dendra.models.networks.Network.initialize`).
         """
+        self._event_delivery_initialized = False
         if self.training:
             if self._use_source_history_training_runtime():
                 self._ensure_source_history_training_storage(clear=False)
@@ -5438,9 +5314,18 @@ class NetCon(Referency):
                 self._ensure_connection_spike_buffers()
                 self.advance = self._dense_advance_target()
         with torch.no_grad():
-            self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
-        self.detach()
+            self.global_step.copy_(
+                event_initial_step(self.t, self.dt, self.global_step)
+            )
+        self._detach_runtime()
         self._mode_requires_initialize = False
+        self._schedule_config_generation = getattr(
+            self, "_schedule_config_generation", 0
+        )
+        self._event_delivery_generation = (
+            getattr(self, "_event_delivery_generation", 0) + 1
+        )
+        self._event_delivery_initialized = True
 
     def numel(self):
         """
@@ -5545,254 +5430,101 @@ class NetCon(Referency):
     def initialize_from_state_cache(
         self, state_cache, *, dt=None, rebuild_delays: bool = True
     ):
-        """Restore a cache produced by state_cache() after initialize().
-
-        Network calls this after ``NetCon.initialize(...)`` has already refreshed
-        ``WeightExpander.w`` and, when requested, rebuilt integer delay metadata.
-        ``rebuild_delays`` remains True for direct calls so the method is
-        self-contained; Network passes False to avoid a redundant second rebuild
-        and peak-memory spike.
-        """
-        # Backward compatibility with the legacy Network._syn_cache tuple:
-        # (old_dt, has_spiked, is_spiking, rolled_delivery_buffer).
-        if isinstance(state_cache, tuple):
-            old_dt, has_spiked, is_spiking, delivery_buffer = state_cache
-            state_cache = {
-                "kind": "netcon",
-                "version": 0,
-                "backend": "dense",
-                "dt": float(old_dt),
-                "has_spiked": has_spiked,
-                "is_spiking": is_spiking,
-                "backend_state": {"delivery_buffer": delivery_buffer},
-            }
-
-        if not isinstance(state_cache, dict):
-            raise TypeError("NetCon state cache must be a dict or legacy tuple")
-        cache_backend = state_cache.get("backend", "dense")
-        if cache_backend != self.delay_backend:
-            raise ValueError(
-                "Cannot restore NetCon state cache from backend "
-                f"{cache_backend!r} into backend {self.delay_backend!r}."
-            )
-
-        # Delay parameters may have changed since steady_state() was cached, for
-        # example after an optimizer step.  The expanded delay buffer
-        # ``delay_ms.w`` must already reflect the desired current parameters.
-        # Direct callers can leave rebuild_delays=True; Network.initialize()
-        # passes False because syn.initialize(reinit_delays=True) has already
-        # refreshed metadata.
+        """Restore detached cache history through the shared tensor restorer."""
         if rebuild_delays:
             self._rebuild_delay_buffers()
+        runtime = self._checkpoint_runtime_kind()
+        metadata = event_cache_metadata(self, copy=False)
+        cache = normalize_event_cache(
+            state_cache,
+            backend=self.delay_backend,
+            runtime=runtime,
+            depth=self.max_delay_steps,
+            delivery_depth=self._desired_delivery_buffer_depth(),
+            width=self._syn_numel,
+            dt=float(_cache_dt_value(self.dt) if dt is None else dt),
+            device=self.device,
+            dtype=self.dtype,
+            source_device=self.pre_device,
+            source_dtype=self.pre_dtype,
+            track_events=self.track_events,
+            metadata=metadata,
+            binary_history=not self._source_history_diff_spiking_enabled(),
+        )
         self._ensure_delivery_storage_for_current_mode(clear=True)
-
-        old_dt = float(state_cache.get("dt", _cache_dt_value(self.dt)))
-        new_dt = float(_cache_dt_value(self.dt) if dt is None else dt)
-        backend_state = state_cache.get("backend_state", {})
-
-        if "is_spiking" in state_cache and self.is_spiking.numel() > 0:
-            isp = (
-                state_cache["is_spiking"]
-                .detach()
-                .to(device=self.pre_device, dtype=self.pre_dtype)
-            )
-            if isp.numel() == self.is_spiking.numel():
-                self.is_spiking.copy_(isp.reshape_as(self.is_spiking))
-            else:
-                self.is_spiking = isp.clone()
-
-        # Preferred parameter-invariant cache formats.  These store the
-        # presynaptic event/gate history, not already-weighted future payloads,
-        # so pending deliveries are rebuilt using the *current* weights, delays,
-        # and dt.
-        if (
-            "source_spike_history_packed" in backend_state
-            or "spike_history_packed" in backend_state
-        ):
-            hist = backend_state.get(
-                "source_spike_history_packed",
-                backend_state.get("spike_history_packed", None),
-            )
-            if hist is None:
-                raise KeyError("Bitpacked NetCon cache is missing source spike history")
-            hist = hist.detach().to(device=self.device, dtype=torch.int64)
-            layout = backend_state.get("history_layout", "ring_zero")
-            if layout == "age":
-                age_hist = _dilate_packed_history_age_rows(
-                    hist,
-                    old_dt,
-                    new_dt,
-                    n_limit=int(self.max_delay_steps),
-                )
-            else:
-                # Backward-compatible best effort for caches produced by the
-                # first steady-state refactor, where row 0 was the current ring
-                # slot rather than explicit age 0.
-                ring_hist = _dilate_packed_time_rows(
-                    hist,
-                    old_dt,
-                    new_dt,
-                    n_limit=int(self.max_delay_steps),
-                )
-                age_hist = _ring_rows_to_age_rows(ring_hist, 0)
-
-            if (
-                hasattr(self, "spike_history_packed")
-                and self.spike_history_packed.numel() > 0
+        fields = (
+            "delivery_buffer",
+            "has_spiked",
+            "is_spiking",
+            "events",
+            "event_queue",
+            "current_time_step",
+            "global_step",
+            "source_gate_history",
+            "spike_history_packed",
+            "bitpack_source_has_spiked",
+        )
+        state = {name: getattr(self, name) for name in fields if hasattr(self, name)}
+        if runtime in {"sparse_calendar", "bitpacked_history"}:
+            for prefix, mapping, required in (
+                (
+                    "pending_",
+                    self._sparse_calendar,
+                    event_cache_pending_count(
+                        cache,
+                        self.inference_delay_steps,
+                        metadata,
+                        self.max_delay_steps,
+                    )
+                    if runtime == "sparse_calendar"
+                    else (0 if cache.pending is None else cache.pending.values.numel()),
+                ),
+                (
+                    "event_pending_",
+                    self._sparse_event_calendar,
+                    0
+                    if cache.event_pending is None
+                    else cache.event_pending.values.numel(),
+                ),
             ):
-                if age_hist.shape[1] != self.spike_history_packed.shape[1]:
-                    raise ValueError(
-                        "Cached bitpacked spike history has incompatible word count: "
-                        f"{age_hist.shape[1]} vs {self.spike_history_packed.shape[1]}."
-                    )
-                ring_hist = _age_rows_to_ring_rows(
-                    age_hist,
-                    depth=int(self.spike_history_packed.shape[0]),
+                previous = mapping.tensor_state
+                empty = pending_calendar_empty(
+                    max(previous.values.numel(), required),
+                    device=self.device,
+                    dtype=previous.values.dtype,
                 )
-                self.spike_history_packed.copy_(ring_hist)
-
-            if self._use_bitpacked_history_runtime():
-                self.delivery_buffer.zero_()
-                self._sparse_calendar = _restore_calendar_chunks(
-                    backend_state.get("sparse_calendar", {}),
-                    old_dt=old_dt,
-                    new_dt=new_dt,
-                    depth=self.max_delay_steps,
-                    idx_device=self.device,
-                    idx_dtype=torch.long,
-                    val_device=self.device,
-                    val_dtype=self.dtype,
+                state.update(
+                    (prefix + name, value)
+                    for name, value in zip(CalendarState._fields, empty, strict=True)
                 )
-                self._sparse_event_calendar.clear()
-            elif self._use_source_history_training_runtime():
-                # Source-history training has only a one-row receive scratch.
-                # Restore compact source history rather than materializing future
-                # deliveries into a dense delay ring.
-                self._restore_source_history_training_from_packed_age_history(age_hist)
-            else:
-                # Training/dense runtime: materialize an ordinary future delivery
-                # buffer from the source history and current weights/delays.
-                self._materialize_delivery_from_packed_source_history(age_hist)
-
-        elif "gate_history" in backend_state:
-            gate_hist = (
-                backend_state["gate_history"]
-                .detach()
-                .to(device=self.device, dtype=self.dtype)
-            )
-            gate_hist = _dilate_history_age_rows(
-                gate_hist,
-                old_dt,
-                new_dt,
-                n_limit=int(self.max_delay_steps),
-            )
-            if self._use_source_history_training_runtime():
-                self._restore_source_history_training_from_gate_history(gate_hist)
-            else:
-                self._materialize_delivery_from_gate_history(gate_hist)
-
-        elif self._use_sparse_calendar_runtime():
-            self.delivery_buffer.zero_()
-            self._sparse_calendar = _restore_calendar_chunks(
-                backend_state.get("sparse_calendar", {}),
-                old_dt=old_dt,
-                new_dt=new_dt,
-                depth=self.max_delay_steps,
-                idx_device=self.device,
-                idx_dtype=torch.long,
-                val_device=self.device,
-                val_dtype=self.dtype,
-            )
-            if self.track_events:
-                self._sparse_event_calendar = _restore_calendar_chunks(
-                    backend_state.get("sparse_event_calendar", {}),
-                    old_dt=old_dt,
-                    new_dt=new_dt,
-                    depth=self.max_delay_steps,
-                    idx_device=self.device,
-                    idx_dtype=torch.long,
-                    val_device=self.device,
-                    val_dtype=torch.int32,
-                )
-            else:
-                self._sparse_event_calendar.clear()
-        else:
-            # Legacy/compatibility path: restore already-weighted future payloads.
-            # This is dt-adjustable, but it is tied to the weights/delays that
-            # produced the cache.
-            cached = backend_state.get("delivery_buffer", None)
-            if cached is None:
-                raise KeyError("Dense NetCon cache is missing delivery_buffer")
-            cached = cached.detach().to(device=self.device, dtype=self.dtype)
-            if cached.ndim != 2 or cached.shape[1] != self._syn_numel:
-                raise ValueError(
-                    "Cached NetCon delivery_buffer has incompatible shape: "
-                    f"{tuple(cached.shape)} vs (*, {self._syn_numel})."
-                )
-            restored = _dilate_time_rows(
-                cached,
-                old_dt,
-                new_dt,
-                n_limit=int(self.delivery_buffer.shape[0]),
-            )
-            self.delivery_buffer.copy_(restored)
-            if self.track_events and hasattr(self, "event_queue"):
-                ev = backend_state.get("event_queue", None)
-                if ev is not None:
-                    ev = ev.detach().to(device=self.device, dtype=torch.int32)
-                    ev_restored = _dilate_time_rows(
-                        ev,
-                        old_dt,
-                        new_dt,
-                        n_limit=int(self.event_queue.shape[0]),
-                    )
-                    self.event_queue.copy_(ev_restored)
-
-        # Reapply threshold latches only after reconstructing runtime history.
-        # Compact-history allocation clears these latches as part of its normal
-        # fresh-episode setup; restoring them earlier would spuriously re-arm a
-        # source that was already above threshold at the cache boundary.
-        if "has_spiked" in state_cache:
-            hs = (
-                state_cache["has_spiked"]
-                .detach()
-                .to(device=self.pre_device, dtype=torch.bool)
-            )
-            self._restore_source_has_spiked_from_connection_cache(hs)
-            if self.has_spiked.numel() > 0:
-                if hs.numel() == self.has_spiked.numel():
-                    self.has_spiked.copy_(hs.reshape_as(self.has_spiked))
-                else:
-                    self.has_spiked = hs.clone()
-
-        if (
-            "bitpack_source_has_spiked" in backend_state
-            and hasattr(self, "bitpack_source_has_spiked")
-            and self.bitpack_source_has_spiked.numel() > 0
+        restored = restore_event_cache(
+            state,
+            cache,
+            self.weight(),
+            delay_steps=self.inference_delay_steps,
+            post_idx=self.post_idx,
+            metadata=metadata,
+            runtime=runtime,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            t=self.t if hasattr(self, "t") else 0.0,
+            dt=self.dt,
+            binary_history=not self._source_history_diff_spiking_enabled(),
+        )
+        for name in fields:
+            if name in restored:
+                setattr(self, name, restored[name])
+        for prefix, mapping in (
+            ("pending_", self._sparse_calendar),
+            ("event_pending_", self._sparse_event_calendar),
         ):
-            src_hs = (
-                backend_state["bitpack_source_has_spiked"]
-                .detach()
-                .to(device=self.pre_device, dtype=torch.bool)
-            )
-            self.bitpack_source_has_spiked.copy_(
-                src_hs.reshape_as(self.bitpack_source_has_spiked)
-            )
-            if self.has_spiked.numel() == self._n_conn and src_hs.numel() > 0:
-                source_pos = torch.searchsorted(
-                    self.bitpack_source_pre_idx.to(
-                        device=self.pre_device, dtype=torch.long
-                    ),
-                    self.pre_idx.to(device=self.pre_device, dtype=torch.long),
+            if prefix + "size" in restored:
+                mapping.replace_tensor_state(
+                    CalendarState(
+                        *(restored[prefix + name] for name in CalendarState._fields)
+                    )
                 )
-                self.has_spiked.copy_(src_hs.index_select(0, source_pos))
-
-        self.current_time_step.zero_()
-        if hasattr(self, "t"):
-            self.global_step.fill_(int(round(float(self.t) / float(self.dt))))
-        else:
-            self.global_step.zero_()
-        self.detach()
+        self._detach_runtime()
         return self
 
     def state_dict_for_checkpoint(self):

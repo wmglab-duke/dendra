@@ -2,10 +2,10 @@
 
 Historical descriptor imports remain available for compatibility.  New code
 should prefer the ``differentiable_*`` hard-forward, branch-conditioned
-interfaces for AP width, activity-dependent slowing, spike timing, and firing
-rate trajectories.  Threshold-derived helpers attach validated local training
-directions to complete hard-protocol values and compose them into activation,
-chronaxie, and paired-pulse objectives.
+interfaces for AP width, conduction velocity, activity-dependent slowing,
+spike timing, and firing-rate trajectories.  Threshold-derived helpers attach
+validated local training directions to complete hard-protocol values and
+compose them into activation, chronaxie, and paired-pulse objectives.
 
 Additional research diagnostics remain available from their named submodules.
 """
@@ -13,6 +13,7 @@ Additional research diagnostics remain available from their named submodules.
 from .branch_conditioned_metrics import (
     branch_conditioned_action_potential_width,
     branch_conditioned_activity_dependent_slowing,
+    branch_conditioned_conduction_velocity,
     compare_branch_signatures,
 )
 from .descriptors import (
@@ -87,6 +88,7 @@ differentiable_action_potential_width = branch_conditioned_action_potential_widt
 differentiable_activity_dependent_slowing = (
     branch_conditioned_activity_dependent_slowing
 )
+differentiable_conduction_velocity = branch_conditioned_conduction_velocity
 differentiable_spike_timing = branch_conditioned_spike_timing
 differentiable_firing_rate_trajectory = branch_conditioned_firing_rate_trajectory
 
@@ -98,6 +100,7 @@ __all__ = [
     "activity_dependent_slowing",
     "branch_conditioned_action_potential_width",
     "branch_conditioned_activity_dependent_slowing",
+    "branch_conditioned_conduction_velocity",
     "branch_conditioned_firing_rate_trajectory",
     "branch_conditioned_spike_timing",
     "chronaxie_from_trials",
@@ -107,6 +110,7 @@ __all__ = [
     "conduction_velocity",
     "differentiable_action_potential_width",
     "differentiable_activity_dependent_slowing",
+    "differentiable_conduction_velocity",
     "differentiable_firing_rate_trajectory",
     "differentiable_spike_timing",
     "firing_rate",

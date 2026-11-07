@@ -101,7 +101,5 @@ def test_integrate2c_extra(diff_eq, params, expected_fn):
 
 
 def test_integrate2c_unsupported_raises():
-    # SymPy 1.12 returns a list from dsolve for this ODE, which our wrapper
-    # does not handle → AttributeError.  Either way, we expect an *exception*.
-    with pytest.raises(Exception):
+    with pytest.raises(NotImplementedError):
         integrate2c("x' = sin(x) + t", "dt", {"t"})

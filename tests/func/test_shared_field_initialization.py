@@ -674,7 +674,8 @@ def test_state_initial_values_reject_hidden_shared_alias_reads():
         model.insert(_HiddenSharedAliasMechanism)
         model.initialize()
 
-    functional, tensors = dn.func.make_functional(model, dt=DT)
+    with dn.ctx(CHECK_PURITY=True):
+        functional, tensors = dn.func.make_functional(model, dt=DT)
     with pytest.raises(
         dn.func.FunctionalizationError,
         match=r"reads receiver attributes.*nai.*values mapping",
@@ -739,18 +740,30 @@ def test_replaced_outer_initialization_hooks_fail_closed(
 ):
     model = _model()
     owner = model if owner_kind == "population" else model.integrator
+    calls = []
 
     def replacement(self, *args, **kwargs):
         del self, args, kwargs
+        calls.append(hook_name)
 
     setattr(owner, hook_name, MethodType(replacement, owner))
-    functional, tensors = dn.func.make_functional(model, dt=DT)
-    with pytest.raises(dn.func.FunctionalizationError, match=message):
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
+    if owner_kind == "population":
+        # Canonical Population lifecycle bindings are required at admission,
+        # before a functional plan or initializer can invoke the replacement.
+        with pytest.raises(
+            dn.func.FunctionalizationError,
+            match=rf"{type(model).__name__} replaces canonical .*execution hooks.*{hook_name}",
+        ):
+            dn.func.make_functional(model, dt=DT)
+    else:
+        functional, tensors = dn.func.make_functional(model, dt=DT)
+        with pytest.raises(dn.func.FunctionalizationError, match=message):
+            functional.initialize(
+                tensors.parameters,
+                tensors.constants,
+                tensors.initialization,
+            )
+    assert calls == []
 
 
 @pytest.mark.parametrize("owner_kind", ["ion", "material"])
@@ -846,17 +859,22 @@ def test_replaced_handler_initialization_hooks_fail_closed(hook_name):
         )
 
 
-def test_callable_material_initial_source_remains_fail_closed():
+def test_positive_material_initial_source_preserves_raw_parameter_gradient():
     source = PositiveParam(torch.tensor(1.25, dtype=DTYPE), requires_grad=True)
     model = _model(material_source=source)
     functional, tensors = dn.func.make_functional(model, dt=DT)
 
-    with pytest.raises(
-        dn.func.FunctionalizationError,
-        match="initial sources.*callable Modules",
-    ):
-        functional.initialize(
-            tensors.parameters,
-            tensors.constants,
-            tensors.initialization,
-        )
+    initialized = functional.initialize(
+        tensors.parameters,
+        tensors.constants,
+        tensors.initialization,
+    )
+    parameter_name = _parameter_name(
+        tensors.parameters, "pool._initial_sources.amount.rho"
+    )
+    expected = source._compute()
+    amount = initialized.state["materials"]["pool"]["amount"]
+    torch.testing.assert_close(amount, expected.expand_as(amount))
+    gradient = torch.autograd.grad(amount.sum(), tensors.parameters[parameter_name])[0]
+    expected_gradient = torch.autograd.grad(expected, source.rho)[0]
+    torch.testing.assert_close(gradient, expected_gradient * amount.numel())

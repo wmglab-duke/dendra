@@ -274,7 +274,7 @@ def test_checkpointed_return_shape_is_additive_only_when_plan_is_present():
     assert isinstance(expanded[2], dn.func.FunctionalCallbackResults)
 
 
-def test_imperative_bridge_rejects_unbound_state_and_another_source_model():
+def test_imperative_bridge_rejects_unbound_state_and_incompatible_model():
     source = _model()
     plan = _callbacks(source)
     _loss, results = _checkpoint(source, plan, steps=0)
@@ -288,9 +288,11 @@ def test_imperative_bridge_rejects_unbound_state_and_another_source_model():
         )
 
     other = _model()
+    other.eval()
+    other.initialize()
     with pytest.raises(
         dn.func.FunctionalizationError,
-        match="exact source Population",
+        match="mode|structure",
     ):
         _checkpoint(other, plan, steps=0)
 
@@ -370,7 +372,9 @@ def test_threshold_callback_bridge_preserves_raster_and_count_carry():
     resumed_raster = torch.cat((first["raster"], second["raster"]))
     torch.testing.assert_close(resumed_raster, expected["raster"])
     torch.testing.assert_close(second["count"], expected["count"])
-    torch.testing.assert_close(expected["count"], expected["raster"].sum(dim=0))
+    torch.testing.assert_close(
+        expected["count"], expected["raster"].sum(dim=0, dtype=torch.int32)
+    )
     assert torch.all(expected["raster"][0])
     assert not torch.any(expected["raster"][1:])
 

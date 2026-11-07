@@ -6,15 +6,12 @@ from functools import partial
 import pytest
 import torch
 from test_compiled_chunk import _assert_tree_close, _model
-from test_runner_stimulation_clock import DT, STEPS, _case
+from test_runner_stimulation_clock import DT, STEPS, _case, _native_invocation
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 
-pytestmark = pytest.mark.skipif(
-    torch.__version__.split("+")[0] != "2.14.0",
-    reason="scan compatibility is validated against PyTorch 2.14.0",
-)
+pytestmark = pytest.mark.cpu
 
 
 @pytest.fixture(autouse=True)
@@ -48,6 +45,17 @@ def test_scan_preserves_atomic_and_runner_waveform_clocks(stimulus_kind):
     with torch_compiler_warning_context():
         actual_atomic, _ = chunk(parameters, prepared, tensors.state)
         _assert_tree_close(actual_atomic, atomic)
+        accepted_chunk = functional.compile_rollout_chunk(
+            1, execution="scan", backend="aot_eager"
+        )
+        accepted = tensors.state
+        for _ in range(STEPS):
+            accepted, _ = accepted_chunk(parameters, prepared, accepted)
+        _assert_tree_close(accepted, expected)
+        accepted_gradient = torch.autograd.grad(
+            accepted["integrator"]["v"].square().mean(), amplitude, retain_graph=True
+        )[0]
+        torch.testing.assert_close(accepted_gradient, expected_gradient)
         for runner in (dn.func.run, dn.func.longrun, dn.func.longrun_checkpointed):
             options = {} if runner is dn.func.run else {"chunklength": 5}
             actual, auxiliary = runner(
@@ -58,18 +66,23 @@ def test_scan_preserves_atomic_and_runner_waveform_clocks(stimulus_kind):
                 callbacks=callbacks,
                 **options,
             )
+            native_voltage, native_time, native_gradient = _native_invocation(
+                stimulus_kind, runner, chunklength=5
+            )
             gradient = torch.autograd.grad(
                 actual["integrator"]["v"].square().mean(), amplitude, retain_graph=True
             )[0]
             assert torch.isfinite(gradient).all()
             assert torch.isfinite(actual["integrator"]["v"]).all()
-            torch.testing.assert_close(
+            torch.testing.assert_close(actual["integrator"]["v"], native_voltage)
+            torch.testing.assert_close(gradient, native_gradient)
+            assert not torch.equal(
                 actual["integrator"]["v"], expected["integrator"]["v"]
             )
-            torch.testing.assert_close(gradient, expected_gradient)
+            assert torch.count_nonzero(gradient) == 0
             trace = auxiliary["callbacks"]["trace"]
             assert trace["v"].shape[0] == STEPS + 1
-            torch.testing.assert_close(trace["t"][-1], expected["clock"]["t"])
+            torch.testing.assert_close(trace["t"][-1], native_time)
 
 
 def test_scan_graph_size_does_not_grow_with_horizon():
@@ -82,7 +95,9 @@ def test_scan_graph_size_does_not_grow_with_horizon():
         return graph.forward
 
     with torch.no_grad(), torch_compiler_warning_context():
-        for steps in (2, 9):
+        # Compare equal bounded tails after at least one full inference block.
+        # Increasing the number of blocks must not grow the captured program.
+        for steps in (9, 17):
             chunk = functional.compile_rollout_chunk(
                 steps, execution="scan", backend=backend
             )

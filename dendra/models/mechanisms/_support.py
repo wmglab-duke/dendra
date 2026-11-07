@@ -71,7 +71,10 @@ def _slice_size(item: tuple[int, int, int]) -> int:
 
 
 def _flat_key_tensor(key) -> torch.Tensor:
-    tensor = torch.as_tensor(key, dtype=torch.long)
+    # Preserve real selector values even inside another default-device context.
+    # In particular, a meta default must not erase an existing CPU/CUDA key.
+    device = key.device if torch.is_tensor(key) else "cpu"
+    tensor = torch.as_tensor(key, dtype=torch.long, device=device)
     if tensor.device.type == "meta":
         return tensor.reshape(-1)
     return tensor.detach().to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
@@ -369,19 +372,25 @@ class SupportSpec:
 
         population, compartments = self.source_core_shape
         if self.kind is SupportKind.DENSE:
-            result = torch.arange(population * compartments, dtype=torch.long)
+            result = torch.arange(
+                population * compartments, dtype=torch.long, device=device
+            )
         elif self.kind is SupportKind.RECTANGULAR:
             row_slice, column_slice = self.normalized_slices
-            rows = torch.tensor(list(range(*row_slice)), dtype=torch.long)
-            columns = torch.tensor(list(range(*column_slice)), dtype=torch.long)
+            rows = torch.tensor(
+                list(range(*row_slice)), dtype=torch.long, device=device
+            )
+            columns = torch.tensor(
+                list(range(*column_slice)), dtype=torch.long, device=device
+            )
             result = (rows[:, None] * compartments + columns[None, :]).reshape(-1)
         elif self.kind is SupportKind.SHARED_COLUMNS:
             rows = (
-                torch.arange(population, dtype=torch.long)
+                torch.arange(population, dtype=torch.long, device=device)
                 if self.all_populations
-                else torch.tensor(self.row_indices, dtype=torch.long)
+                else torch.tensor(self.row_indices, dtype=torch.long, device=device)
             )
-            columns = torch.tensor(self.column_indices, dtype=torch.long)
+            columns = torch.tensor(self.column_indices, dtype=torch.long, device=device)
             result = (rows[:, None] * compartments + columns[None, :]).reshape(-1)
         else:
             if runtime_key is None:
@@ -419,7 +428,9 @@ class SupportSpec:
                 f"got {key.numel()}. Structural selector keys are immutable."
             )
         if self.kind is SupportKind.SHARED_COLUMNS:
-            expected = self.materialized_flat_indices()
+            # ``key`` is canonical host metadata; an ambient CUDA default
+            # must not move the structural reference to another device.
+            expected = self.materialized_flat_indices(device=key.device)
             if not torch.equal(key, expected):
                 raise ValueError(
                     f"{context} key no longer matches its compiled placement. "

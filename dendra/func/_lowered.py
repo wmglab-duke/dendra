@@ -12,8 +12,11 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
+from ._callback_recurrence import _execute_callback_steps
 from ._callbacks import _stack_callback_emissions, _update_callback_values
-from ._types import RolloutInput, StepInput
+from ._draws import _has_runtime_stimulation
+from ._inputs import Inputs, _index_runtime_inputs
+from ._types import RolloutInput
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -29,6 +32,11 @@ class _PopulationChunkOperands(NamedTuple):
     state: Mapping[str, object]
     ve: torch.Tensor | None
     intra: torch.Tensor | None
+    carries: object = None
+    noise: object = None
+    stimulation: object = None
+    draws: object = None
+    sampling_times: torch.Tensor | None = None
 
 
 class _LoweredPopulationChunk:
@@ -45,7 +53,7 @@ class _LoweredPopulationChunk:
     remain implementation details during the functional campaign.
     """
 
-    __slots__ = ("_functional", "_steps", "_stepwise_stimulation")
+    __slots__ = ("_functional", "_steps", "_stepwise_stimulation", "_force_unrolled")
 
     def __init__(
         self,
@@ -53,6 +61,7 @@ class _LoweredPopulationChunk:
         *,
         steps: int,
         stepwise_stimulation: bool = False,
+        force_unrolled: bool = False,
     ):
         if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
             raise ValueError("steps must be a positive integer")
@@ -60,6 +69,7 @@ class _LoweredPopulationChunk:
         self._functional = functional
         self._steps = steps
         self._stepwise_stimulation = stepwise_stimulation
+        self._force_unrolled = force_unrolled
 
     @property
     def steps(self) -> int:
@@ -70,7 +80,7 @@ class _LoweredPopulationChunk:
         parameters,
         prepared: _PreparedPopulation,
         state,
-        inputs: RolloutInput | None = None,
+        inputs: Inputs | RolloutInput | None = None,
     ) -> _PopulationChunkOperands:
         """Validate and unwrap one call without entering the tensor kernel."""
         functional = self._functional
@@ -78,7 +88,7 @@ class _LoweredPopulationChunk:
         functional._validate_parameters(parameters)
         functional._validate_state(state)
         prepared_values = functional._validate_prepared(prepared, parameters)
-        ve, intra, _resolved_steps = functional._resolve_rollout_inputs(
+        resolved, _resolved_steps = functional._resolve_rollout_input_packets(
             inputs,
             self._steps,
         )
@@ -86,28 +96,63 @@ class _LoweredPopulationChunk:
             parameters,
             prepared_values,
             state,
-            ve,
-            intra,
+            resolved.ve,
+            resolved.intra,
+            None,
+            resolved.noise,
+            resolved.stimulation,
+            resolved.draws,
+            resolved.sampling_time,
         )
 
-    def __call__(self, parameters, prepared, state, ve, intra):
+    def __call__(
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries=None,
+        noise=None,
+        stimulation=None,
+        draws=None,
+        sampling_times=None,
+    ):
         """Execute the pure tensor transition for exactly ``steps`` steps."""
-        if self._stepwise_stimulation:
-            # A host step samples bound Waveforms at its accepted clock. A
-            # vector start + arange * dt can round differently from repeated
-            # clock additions and miss narrow pulses. Preserve that recurrence
-            # inside the fixed compiled chunk; compiler size is bounded by C.
+        if self._stepwise_stimulation or _has_runtime_stimulation(stimulation, draws):
+            # Each evaluation retains its authored order; the host can supply
+            # native invocation-grid times independently of accepted clocks.
             for index in range(self._steps):
                 state, auxiliary = self._functional._step_values(
                     parameters,
                     prepared,
                     state,
-                    StepInput(
-                        ve=None if ve is None else ve[index],
-                        intra=None if intra is None else intra[index],
+                    _index_runtime_inputs(
+                        ve, intra, noise, stimulation, index, draws, sampling_times
                     ),
                 )
             return state, auxiliary
+        if self._force_unrolled:
+            ve, intra = self._functional._assemble_bound_inputs(
+                parameters,
+                state,
+                ve,
+                intra,
+                self._steps,
+                prepared["integrator"]["dt"],
+                sampling_times=sampling_times,
+            )
+            return self._functional._transition_rollout_values(
+                parameters,
+                prepared,
+                state,
+                ve,
+                intra,
+                self._steps,
+                noise,
+                stimulation,
+                draws,
+            )
         return self._functional._execute_rollout_values(
             parameters,
             prepared,
@@ -115,6 +160,10 @@ class _LoweredPopulationChunk:
             ve,
             intra,
             self._steps,
+            noise,
+            stimulation,
+            draws,
+            sampling_times,
         )
 
 
@@ -126,37 +175,49 @@ class _LoweredCallbackPopulationChunk:
     differentiable preparation belongs to this static callable.
     """
 
-    __slots__ = ("_functional", "_steps", "_plans")
+    __slots__ = ("_functional", "_steps", "_plans", "_stepwise_stimulation")
 
-    def __init__(self, functional, *, steps, plans):
+    def __init__(self, functional, *, steps, plans, stepwise_stimulation=True):
         self._functional = functional
         self._steps = steps
         self._plans = plans
+        self._stepwise_stimulation = stepwise_stimulation
 
-    def __call__(self, parameters, prepared, state, ve, intra, carries):
-        emissions = []
-        for index in range(self._steps):
-            # Sample bound waveforms at the accepted clock each time, matching
-            # the host recurrence even at floating-point pulse boundaries.
-            state, auxiliary = self._functional._step_values(
-                parameters,
-                prepared,
-                state,
-                StepInput(
-                    ve=None if ve is None else ve[index],
-                    intra=None if intra is None else intra[index],
-                ),
-            )
-            carries, emitted = _update_callback_values(
-                self._plans, carries, state, auxiliary
-            )
-            if emitted is not None:
-                emissions.append(emitted)
-        return (
+    def __call__(
+        self,
+        parameters,
+        prepared,
+        state,
+        ve,
+        intra,
+        carries,
+        noise=None,
+        stimulation=None,
+        draws=None,
+        sampling_times=None,
+    ):
+        def update(carries, state, auxiliary):
+            return _update_callback_values(self._plans, carries, state, auxiliary)
+
+        def stack(emissions):
+            return _stack_callback_emissions(self._plans, emissions)
+
+        return _execute_callback_steps(
+            self._functional,
+            parameters,
+            prepared,
             state,
-            auxiliary,
+            ve,
+            intra,
+            self._steps,
             carries,
-            _stack_callback_emissions(self._plans, emissions),
+            update,
+            stack,
+            noise,
+            stimulation,
+            draws,
+            stepwise_stimulation=self._stepwise_stimulation,
+            sampling_times=sampling_times,
         )
 
 

@@ -41,7 +41,7 @@ Getting started
        dn.mono_rect(amp=0.1 * nA, delay=1.0 * ms, pw=1.0 * ms)
    )
 
-   recorder = dn.callbacks.Recorder(["v"], node_indices=[0])
+   recorder = dn.Recorder(["v"], node_indices=[0])
    dt = 0.01 * ms
    model.initialize()
    model.run(
@@ -62,7 +62,7 @@ Getting started
 Installation
 ------------
 
-Dendra targets Python 3.11 or newer and PyTorch 2.12 or newer.
+Dendra targets Python 3.11 or newer and PyTorch 2.14 or newer.
 
 On Windows, run these commands inside WSL2 because the required NEURON package does not publish native Windows wheels on PyPI.
 

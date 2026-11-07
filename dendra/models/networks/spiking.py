@@ -40,6 +40,39 @@ def update_active_diff(
     return ge_hard, ge_gate, spk_gate
 
 
+def threshold_transition(
+    selected_values: torch.Tensor,
+    previous_above: torch.Tensor,
+    thresholds: torch.Tensor,
+    *,
+    diff_spiking: bool = False,
+    tau: float = 0.1,
+    nan_mask: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Advance NetCon's rising-edge detector without changing its inputs.
+
+    ``previous_above`` is the boolean above-threshold latch, initially false.
+    Equality counts as above threshold. The returned latch stays boolean and
+    outside autograd; surrogate gradients follow only the current observation,
+    multiplied by the complement of the previous latch.
+
+    Mixed threshold/raw projections pass sanitized ``thresholds`` and the
+    original NaN mask. Masked lanes return their raw observations while still
+    updating the latch, as native NetCon does. An entirely raw projection
+    bypasses this detector and does not need a latch. Hard gates without a
+    mask remain boolean for compact inference backends.
+    """
+    if diff_spiking:
+        next_above, _, gates = update_active_diff(
+            previous_above, selected_values, thresholds, tau=tau
+        )
+    else:
+        next_above, gates = update_active(previous_above, selected_values, thresholds)
+    if nan_mask is not None:
+        gates = torch.where(nan_mask, selected_values, gates)
+    return next_above.detach(), gates
+
+
 def sigmoid_ste(x: torch.Tensor, tau: torch.Tensor):
     # Ensure positivity without clamp-induced flat regions (optional)
     tau = F.softplus(tau) + 1e-6

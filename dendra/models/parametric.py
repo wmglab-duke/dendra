@@ -2,6 +2,7 @@
 
 import itertools
 import math
+import weakref
 from dataclasses import dataclass
 from numbers import Integral
 from types import MethodType
@@ -26,9 +27,13 @@ from .modular import DNModule, matches_any_pattern
 from .random_parameters import (
     RandomParameterSpec,
     RuntimeNoiseSpec,
+    clone_random_parameter_tree,
+    evaluate_runtime_noise,
+    get_random_distribution,
     make_random_parameter_spec,
     make_runtime_noise_spec,
-    sample_random_parameter,
+    prepare_rng_for_random_parameter,
+    sample_random_parameter_with_draw,
     sample_runtime_noise,
 )
 from .rng import RNGModule
@@ -490,13 +495,13 @@ def ste_clamp(y, *, lo=None, hi=None, alpha_lo: float = 1.0, alpha_hi: float = 1
 
 # --- modules ---
 class Bounded(cacheable):
-    """
-    Trainable tensor constrained by optional lower and upper bounds.
+    """Trainable tensor constrained by optional lower and upper bounds.
 
     Parameters
     ----------
     init : array_like
-        Initial value for the unconstrained parameter ``rho``.
+        Initial constrained value. The raw parameter ``rho`` is initialized
+        by inverting the selected transform.
     min_val : float, optional
         Lower bound. When ``None``, no lower constraint is enforced.
     max_val : float, optional
@@ -513,6 +518,10 @@ class Bounded(cacheable):
         Strategy for enforcing the upper bound.
     cap_beta : float, optional
         Softcap temperature. Defaults to ``beta`` when ``None``.
+
+    requires_grad : bool or None, optional
+        Whether the raw parameter tracks gradients. ``None`` uses the
+        ``REQUIRE_GRAD`` context setting.
 
     Notes
     -----
@@ -852,8 +861,7 @@ class Bounded(cacheable):
 
 
 class PositiveParam(Bounded):
-    """
-    Bounded parameter constrained to non-negative values.
+    """Bounded parameter constrained to non-negative values.
 
     Parameters
     ----------
@@ -873,6 +881,9 @@ class PositiveParam(Bounded):
         Strategy for the optional upper bound.
     cap_beta : float, optional
         Softcap temperature. Defaults to ``beta`` when ``None``.
+    requires_grad : bool or None, optional
+        Whether the raw parameter tracks gradients. ``None`` uses the
+        ``REQUIRE_GRAD`` context setting.
     """
 
     def __init__(
@@ -914,8 +925,7 @@ class PositiveParam(Bounded):
 
 
 class NegativeParam(Bounded):
-    """
-    Bounded parameter constrained to non-positive values.
+    """Bounded parameter constrained to non-positive values.
 
     Parameters
     ----------
@@ -935,6 +945,9 @@ class NegativeParam(Bounded):
         Strategy for the optional lower bound.
     cap_beta : float, optional
         Softcap temperature. Defaults to ``beta`` when ``None``.
+    requires_grad : bool or None, optional
+        Whether the raw parameter tracks gradients. ``None`` uses the
+        ``REQUIRE_GRAD`` context setting.
     """
 
     def __init__(
@@ -1336,6 +1349,65 @@ class staticproperty:
         return self.func()  # ignore obj / objtype
 
 
+_instance_property_proxies = {}
+
+
+def _instance_property_proxy(cls):
+    """Look up generated provenance without invoking metaclass hash/equality."""
+    entry = _instance_property_proxies.get(id(cls))
+    return entry[1:] if entry is not None and entry[0]() is cls else None
+
+
+def _remember_instance_property_proxy(cls, parent, references):
+    identity = id(cls)
+
+    def discard(reference):
+        entry = _instance_property_proxies.get(identity)
+        if entry is not None and entry[0] is reference:
+            del _instance_property_proxies[identity]
+
+    _instance_property_proxies[identity] = (
+        weakref.ref(cls, discard),
+        weakref.ref(parent),
+        tuple((name, weakref.ref(value)) for name, value in references.items()),
+        _instance_property_namespace_signature(vars(cls)),
+    )
+
+
+def _instance_property_namespace_signature(namespace):
+    """Fingerprint generated metadata without retaining classes or callbacks."""
+    active = set()
+
+    def signature(value):
+        identity = id(value)
+        kind = type(value)
+        if identity in active:
+            return ("cycle", identity)
+        if (
+            kind is dict
+            or kind is list
+            or kind is tuple
+            or kind is set
+            or kind is frozenset
+        ):
+            active.add(identity)
+            try:
+                if kind is dict:
+                    contents = tuple(
+                        (signature(key), signature(item)) for key, item in value.items()
+                    )
+                elif kind is set or kind is frozenset:
+                    contents = frozenset(signature(item) for item in value)
+                else:
+                    contents = tuple(signature(item) for item in value)
+                return (id(kind), identity, contents)
+            finally:
+                active.remove(identity)
+        return (id(kind), identity)
+
+    return tuple((key, signature(value)) for key, value in namespace.items())
+
+
 def add_instance_property(obj, name, func):
     """
     Attach a computed property to a single instance.
@@ -1349,11 +1421,33 @@ def add_instance_property(obj, name, func):
     func : Callable[[], Any]
         Zero-argument callable returning the property value.
     """
-    sub = type(
-        f"_{obj.__class__.__name__}Proxy",
-        (obj.__class__,),
-        {name: staticproperty(func)},
-    )
+    # References live on private proxy classes because Python resolves
+    # descriptors on the class. Replacing a reference must not inherit its old
+    # proxy: that would retain the previous callback (and its owner) forever,
+    # and grow the MRO every time a copied object is rebound. Collapse only
+    # the exact proxies created here, leaving authored classes untouched.
+    # Dendra declaration hooks add their own class metadata, so record the
+    # complete generated namespace instead of assuming it contains only the
+    # attached descriptors. Weak references avoid a global registry retaining
+    # a callback's owner through the owner's generated class.
+    base = type(obj)
+    references = {}
+    while (entry := _instance_property_proxy(base)) is not None:
+        parent_ref, members, namespace_signature = entry
+        parent = parent_ref()
+        if (
+            parent is None
+            or len(base.__bases__) != 1
+            or base.__bases__[0] is not parent
+            or _instance_property_namespace_signature(vars(base)) != namespace_signature
+        ):
+            break
+        for key, descriptor_ref in members:
+            references.setdefault(key, descriptor_ref())
+        base = parent
+    references[name] = staticproperty(func)
+    sub = type(f"_{base.__name__}Proxy", (base,), references)
+    _remember_instance_property_proxy(sub, base, references)
     obj.__class__ = sub  # replace the instance’s class in‑place
 
 
@@ -2547,6 +2641,7 @@ class Parameterized(SimpleParameterized):
         seed: int | None = None,
         reparameterized: bool = True,
         rng_name: str | None = None,
+        reseed_on_initialize: bool = False,
         **distribution_parameters,
     ):
         """Declare a sampled scalar buffer with parametric distribution parameters."""
@@ -2560,6 +2655,7 @@ class Parameterized(SimpleParameterized):
                 seed=seed,
                 reparameterized=reparameterized,
                 rng_name=rng_name,
+                reseed_on_initialize=reseed_on_initialize,
                 **distribution_parameters,
             ),
             Parameterized._global_rand_declarations,
@@ -2574,6 +2670,7 @@ class Parameterized(SimpleParameterized):
         seed: int | None = None,
         reparameterized: bool = True,
         rng_name: str | None = None,
+        reseed_on_initialize: bool = False,
         **distribution_parameters,
     ):
         """Declare a sampled per-compartment buffer.
@@ -2594,6 +2691,7 @@ class Parameterized(SimpleParameterized):
                 seed=seed,
                 reparameterized=reparameterized,
                 rng_name=rng_name,
+                reseed_on_initialize=reseed_on_initialize,
                 **distribution_parameters,
             ),
             Parameterized._range_rand_declarations,
@@ -2608,6 +2706,7 @@ class Parameterized(SimpleParameterized):
         seed: int | None = None,
         reparameterized: bool = True,
         rng_name: str | None = None,
+        reseed_on_initialize: bool = False,
         **distribution_parameters,
     ):
         """Declare a sampled buffer with BATCH-shaped distribution parameters."""
@@ -2621,6 +2720,7 @@ class Parameterized(SimpleParameterized):
                 seed=seed,
                 reparameterized=reparameterized,
                 rng_name=rng_name,
+                reseed_on_initialize=reseed_on_initialize,
                 **distribution_parameters,
             ),
             Parameterized._batch_rand_declarations,
@@ -2828,6 +2928,8 @@ class Parameterized(SimpleParameterized):
         self.runtime_noises = self.__class__._runtime_noises.copy()
         self._random_parameter_generation = {}
         self._random_parameter_initialized = {}
+        self._random_parameter_draws = {}
+        self._random_parameter_parameters = {}
 
         self.in_graph_parametrizations = {}
 
@@ -3082,6 +3184,8 @@ class Parameterized(SimpleParameterized):
             )
             self._random_parameter_generation.pop(name, None)
             self._random_parameter_initialized[name] = False
+            self._random_parameter_draws.pop(name, None)
+            self._random_parameter_parameters.pop(name, None)
             if not hasattr(self, spec.effective_rng_name):
                 setattr(
                     self,
@@ -3160,6 +3264,99 @@ class Parameterized(SimpleParameterized):
             if isinstance(rng_module, RNGModule):
                 rng_module.reset()
 
+    def _random_parameter_state_for_checkpoint(self):
+        """Snapshot detached sample provenance and retained-sample policy."""
+        return {
+            "version": 1,
+            "initialized": dict(self._random_parameter_initialized),
+            "draws": clone_random_parameter_tree(
+                self._random_parameter_draws, detach=True
+            ),
+            "parameters": clone_random_parameter_tree(
+                self._random_parameter_parameters, detach=True
+            ),
+        }
+
+    def _prepare_random_parameter_state(self, provenance):
+        """Validate provenance without mutating sampled buffers or RNG streams."""
+        if provenance is None:
+            return {
+                "version": 1,
+                "initialized": dict(self._random_parameter_initialized),
+                "draws": {},
+                "parameters": {},
+            }
+        expected = set(self.random_parameters)
+        if not isinstance(provenance, dict) or provenance.get("version") != 1:
+            raise ValueError("unsupported random-parameter provenance version")
+        initialized = provenance["initialized"]
+        draws, parameters = provenance["draws"], provenance["parameters"]
+        if (
+            not isinstance(initialized, dict)
+            or set(initialized) != expected
+            or any(type(value) is not bool for value in initialized.values())
+        ):
+            raise ValueError(
+                "random-parameter initialized flags must match the declarations"
+            )
+        if (
+            not isinstance(draws, dict)
+            or not isinstance(parameters, dict)
+            or not set(draws) <= expected
+            or not set(parameters) <= expected
+        ):
+            raise ValueError(
+                "random-parameter provenance names must match the declarations"
+            )
+        for name, values in parameters.items():
+            if not isinstance(values, dict) or set(values) != set(
+                self.random_parameters[name].params
+            ):
+                raise ValueError(
+                    f"random-parameter provenance parameters for {name!r} do not match its distribution"
+                )
+            if any(not torch.is_tensor(value) for value in values.values()):
+                raise TypeError(
+                    "random-parameter provenance parameters must be tensors"
+                )
+        return clone_random_parameter_tree(provenance, detach=True)
+
+    def _apply_random_parameter_state(self, provenance):
+        self._random_parameter_initialized = provenance["initialized"]
+        self._random_parameter_draws = provenance["draws"]
+        self._random_parameter_parameters = provenance["parameters"]
+        self._random_parameter_generation = {}
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if self.random_parameters:
+            destination[f"{prefix}_random_parameter_state"] = (
+                self._random_parameter_state_for_checkpoint()
+            )
+
+    def _apply(self, fn, recurse=True):
+        result = super()._apply(fn, recurse=recurse)
+
+        def apply(value):
+            if torch.is_tensor(value):
+                return fn(value)
+            if isinstance(value, dict):
+                return {name: apply(child) for name, child in value.items()}
+            if isinstance(value, tuple):
+                children = tuple(apply(child) for child in value)
+                return type(value)(*children) if hasattr(value, "_fields") else children
+            if isinstance(value, list):
+                return [apply(child) for child in value]
+            return value
+
+        self._random_parameter_draws = apply(
+            getattr(self, "_random_parameter_draws", {})
+        )
+        self._random_parameter_parameters = apply(
+            getattr(self, "_random_parameter_parameters", {})
+        )
+        return result
+
     def _load_from_state_dict(
         self,
         state_dict,
@@ -3171,6 +3368,17 @@ class Parameterized(SimpleParameterized):
         error_msgs,
     ):
         """Load checkpoints across registrations of shared tensor aliases."""
+        provenance_key = f"{prefix}_random_parameter_state"
+        has_provenance = provenance_key in state_dict
+        provenance = state_dict.pop(provenance_key, None)
+        prepared_provenance = None
+        if has_provenance:
+            try:
+                prepared_provenance = self._prepare_random_parameter_state(provenance)
+            except (KeyError, TypeError, ValueError) as error:
+                error_msgs.append(
+                    f"Invalid random-parameter provenance {provenance_key!r}: {error}"
+                )
         # Registering an authored transform can expose a second state-dict path
         # to a parameter or persistent buffer that already has a stable public
         # path. Older checkpoints store that tensor only once. Materialize
@@ -3196,15 +3404,45 @@ class Parameterized(SimpleParameterized):
                 if alias_key not in state_dict and canonical_key in state_dict:
                     state_dict[alias_key] = state_dict[canonical_key]
 
-        return super()._load_from_state_dict(
-            state_dict,
-            prefix,
-            local_metadata,
-            strict,
-            missing_keys,
-            unexpected_keys,
-            error_msgs,
-        )
+        try:
+            result = super()._load_from_state_dict(
+                state_dict,
+                prefix,
+                local_metadata,
+                strict,
+                missing_keys,
+                unexpected_keys,
+                error_msgs,
+            )
+        finally:
+            if has_provenance:
+                state_dict[provenance_key] = provenance
+        if not has_provenance:
+            # Older checkpoints retain their sampled values and initialized
+            # policy, but cannot attest to the constructor's unrelated draws.
+            prepared_provenance = self._prepare_random_parameter_state(None)
+        if prepared_provenance is not None:
+            for name in self.random_parameters:
+                if f"{prefix}{name}" in state_dict:
+                    continue
+                # Partial loads, including Population.load's shape filtering,
+                # retain this sample. Keep its own provenance paired with it
+                # even when other compatible distribution parameters load.
+                prepared_provenance["initialized"][name] = (
+                    self._random_parameter_initialized.get(name, False)
+                )
+                for label, retained in (
+                    ("draws", self._random_parameter_draws),
+                    ("parameters", self._random_parameter_parameters),
+                ):
+                    if name in retained:
+                        prepared_provenance[label][name] = clone_random_parameter_tree(
+                            retained[name], detach=True
+                        )
+                    else:
+                        prepared_provenance[label].pop(name, None)
+            self._apply_random_parameter_state(prepared_provenance)
+        return result
 
     def register_parametrization_in_graph(self, name: str, param: Callable, args=None):
         """
@@ -3557,8 +3795,8 @@ class Parameterized(SimpleParameterized):
         This is the shared raw-to-effective boundary for ordinary population
         and functional preparation. It preserves the established deterministic
         order: declared defaults, regional overrides, then authored in-graph
-        transforms. Stochastic parameter and noise sampling remain later
-        imperative-only phases.
+        transforms. Stochastic parameter and noise sampling remain separate
+        phases after this deterministic materialization.
         """
         categories = (
             self.__class__._global,
@@ -3743,6 +3981,7 @@ class Parameterized(SimpleParameterized):
         selected = (
             tuple(self.random_parameters) if not names else tuple(str(n) for n in names)
         )
+        initialization_draws = getattr(self, "_native_initialization_draws", None)
         any_sampled = False
         for name in selected:
             if name not in self.random_parameters:
@@ -3761,20 +4000,45 @@ class Parameterized(SimpleParameterized):
                         continue
             buffer = getattr(self, name)
             rng = getattr(self, spec.effective_rng_name)
-            if isinstance(rng, RNGModule):
-                rng.init(buffer.device)
-            distribution_params = {
-                p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
-            }
-            sample = sample_random_parameter(
-                spec,
-                distribution_params,
-                rng,
-                tuple(buffer.shape),
-                device=buffer.device,
-                dtype=buffer.dtype,
-            )
+            if initialization_draws is None:
+                if isinstance(rng, RNGModule):
+                    rng.init(buffer.device)
+                prepare_rng_for_random_parameter(spec, rng, random_generation)
+                distribution_params = {
+                    p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
+                }
+                sample, draw = sample_random_parameter_with_draw(
+                    spec,
+                    distribution_params,
+                    rng,
+                    tuple(buffer.shape),
+                    device=buffer.device,
+                    dtype=buffer.dtype,
+                )
+            else:
+                distribution_params = {
+                    p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
+                }
+                sample, draw = initialization_draws.random(
+                    self,
+                    name,
+                    spec,
+                    distribution_params,
+                    rng,
+                    buffer,
+                    random_generation,
+                )
             setattr(self, name, sample.to(device=buffer.device, dtype=buffer.dtype))
+            if get_random_distribution(spec.distribution).draw_sampler is not None:
+                self._random_parameter_draws[name] = clone_random_parameter_tree(
+                    draw, detach=True
+                )
+                self._random_parameter_parameters[name] = clone_random_parameter_tree(
+                    distribution_params, detach=True
+                )
+            else:
+                self._random_parameter_draws.pop(name, None)
+                self._random_parameter_parameters.pop(name, None)
             self._random_parameter_initialized[name] = True
             if random_generation is not None:
                 self._random_parameter_generation[name] = random_generation
@@ -3806,6 +4070,8 @@ class Parameterized(SimpleParameterized):
             tuple(self.runtime_noises) if not names else tuple(str(n) for n in names)
         )
         phase_norm = None if phase is None else str(phase).strip().lower()
+        draws = getattr(self, "_native_runtime_noise_draws", None)
+        initialization_draws = getattr(self, "_native_initialization_draws", None)
         any_sampled = False
         with torch.no_grad():
             for name in selected:
@@ -3818,21 +4084,43 @@ class Parameterized(SimpleParameterized):
                 if phase_norm is not None and spec.phase != phase_norm:
                     continue
                 buffer = getattr(self, name)
-                rng = getattr(self, spec.effective_rng_name)
-                if isinstance(rng, RNGModule):
-                    rng.init(buffer.device)
+                if draws is None and initialization_draws is None:
+                    rng = getattr(self, spec.effective_rng_name)
+                    if isinstance(rng, RNGModule):
+                        rng.init(buffer.device)
                 distribution_params = {
                     p: getattr(self, spec.full_parameter_name(p)) for p in spec.params
                 }
-                sample = sample_runtime_noise(
-                    spec,
-                    distribution_params,
-                    rng,
-                    tuple(buffer.shape),
-                    device=buffer.device,
-                    dtype=buffer.dtype,
-                    dt=dt,
-                )
+                if initialization_draws is not None:
+                    sample = initialization_draws.noise(
+                        self,
+                        name,
+                        spec,
+                        distribution_params,
+                        getattr(self, spec.effective_rng_name),
+                        buffer,
+                        dt,
+                    )
+                elif draws is None:
+                    sample = sample_runtime_noise(
+                        spec,
+                        distribution_params,
+                        rng,
+                        tuple(buffer.shape),
+                        device=buffer.device,
+                        dtype=buffer.dtype,
+                        dt=dt,
+                    )
+                else:
+                    # One-step replay binds validated base draws temporarily.
+                    # Reuse the native detached transform and buffer write;
+                    # supplied draws never initialize or consume an RNG.
+                    sample = evaluate_runtime_noise(
+                        spec,
+                        distribution_params,
+                        clone_random_parameter_tree(draws[name], detach=True),
+                        dt=dt,
+                    )
                 buffer.copy_(sample.to(device=buffer.device, dtype=buffer.dtype))
                 any_sampled = True
         return any_sampled
@@ -3919,7 +4207,21 @@ class Parameterized(SimpleParameterized):
                     f"Function '{func_name}' not found in class '{self.__class__.__name__}' for table instantiation."
                 )
             func = getattr(self, func_name)
-            x = torch.linspace(low, high, n, dtype=torch.float64)
+            reference = next(self.parameters(), None)
+            if reference is None:
+                reference = next(
+                    (value for value in self.buffers() if value.is_floating_point()),
+                    None,
+                )
+            table_dtype = self._init_dtype if reference is None else reference.dtype
+            table_device = self._init_device if reference is None else reference.device
+            # Keep the established float64 construction samples. CUDA-owned
+            # generators must evaluate beside their registered parameters;
+            # MPS retains CPU sampling because it has no float64 support.
+            sample_device = (
+                "cpu" if torch.device(table_device).type == "mps" else table_device
+            )
+            x = torch.linspace(low, high, n, dtype=torch.float64, device=sample_device)
             y = func(x).flatten()
             setattr(
                 self,
@@ -3931,7 +4233,7 @@ class Parameterized(SimpleParameterized):
                     exact_clamp=False,
                     learnable_y=learnable,
                     uniform="always",
-                ).to(dtype=self.dtype(), device=self.device()),
+                ).to(dtype=table_dtype, device=table_device),
             )
             setattr(self, f"usetable_{func_name}", True)
 
@@ -4153,7 +4455,7 @@ class Parameterized(SimpleParameterized):
 table_function_template = """
 def {func_name}_with_table(self, x):
     if self.usetable_{func_name}:
-        return self.{func_name}_table(x)
+        return self.{func_name}_table(x.reshape(x.numel())).reshape(x.shape)
     return self.{func_name}_original(x)
 """
 

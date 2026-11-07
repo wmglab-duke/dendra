@@ -5,9 +5,10 @@ import math
 import os
 from collections.abc import Mapping
 from contextlib import nullcontext
-from typing import Dict, Literal, Optional
+from typing import Dict, Literal, NamedTuple, Optional
 
 import torch
+from torch.utils import _pytree as pytree
 from tqdm.auto import tqdm
 
 from dendra._bootstrap import reset_torch_compiler
@@ -24,19 +25,46 @@ from dendra.helpers import (
     jit_enabled_for_scope,
 )
 
-from ..callbacks import CallbackList
+from .._checkpoint import _checkpoint_recompute_contexts
+from .._execution_horizons import execution_step_budget, native_horizon_request
+from .._runtime_inputs import (
+    native_input_sources,
+    normalize_input_frame,
+    normalize_input_tape,
+)
+from ..callbacks import CallbackList, _bind_callback_dt
 from ..core import (
     Population,
     _duration_step_budget,
     _load_compatible_state_dict_transactionally,
+    _load_population_cache_transactionally,
+    _native_callback_arguments,
+    _native_callback_storage,
     _time_grid_from_step_count,
     _validate_time_scalar,
     make_intra,
 )
+from ..distributions import (
+    Distribution,
+    Normal,
+    connection_distribution_draw_schema,
+    connection_distribution_is_supported,
+    connection_distribution_validate_draw,
+)
 from ..multi import concat_models, offsets
-from ..parametric import is_parametric, to_param
-from ..rng import RNGMixin
+from ..parametric import cacheable, is_parametric, to_param
+from ..rng import RNGMixin, _restore_rng_lifecycle, _snapshot_rng_lifecycle
 from ..slice import SynapseSlots
+from ..stim.waveform._poisson import (
+    borrow_pending_poisson_rng,
+    coalesce_pending_poisson_rng,
+    reconcile_extra_poisson_rng,
+    restore_poisson_rng_lifecycle,
+    snapshot_poisson_rng_lifecycle,
+    validate_poisson_checkpoint_stream_aliases,
+)
+from ._connection_sampling import clone_connection_sampling_rng
+from ._population_cache import restore_population_cache_values
 from .netcon import ContinuousCon, NetCon
 from .netstim import NetStim
 
@@ -162,9 +190,61 @@ def _accelerator_first_step_items(collection):
     return tuple(sorted(items, key=priority))
 
 
-def advance_populations(populations, dt, extra, intra):
+class _NetworkStepSchedule(NamedTuple):
+    """Immutable launch order shared by native and functional Network adapters."""
+
+    populations: tuple
+    synapses: tuple
+    continuous_synapses: tuple
+    continuous_targets: tuple
+
+
+def _network_step_schedule(network):
+    """Describe the existing ordered phases without changing runtime state.
+
+    NetStim advances first, then continuous targets reset, continuous and event
+    projections advance, and populations solve. These item tuples preserve the
+    stable order within each phase, including accelerator-first placement.
+    """
+    return _NetworkStepSchedule(
+        _accelerator_first_step_items(network.populations),
+        _accelerator_first_step_items(network.synapses),
+        _accelerator_first_step_items(network.continuous_synapses),
+        _accelerator_first_step_items(network.continuous_targets),
+    )
+
+
+def advance_populations(populations, dt, extra, intra, runtime_draws=None):
     for n, pop in _named_items(populations):
-        step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
+        if runtime_draws is None:
+            step_pop(pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None))
+        else:
+            replay = runtime_draws.populations[n]
+            with replay.scope(poisson=False):
+                step_pop(
+                    pop.integrator, pop, dt, extra.get(n, None), intra.get(n, None)
+                )
+            replay.publish()
+
+
+def _refresh_detached_population_materializations(populations, dt):
+    """Reconnect continued training sources without changing recurrent state."""
+    for population in populations.values():
+        if not population._refresh_detached_materializations():
+            continue
+        try:
+            timestep = torch.tensor(
+                dt, device=population.device(), dtype=population.dtype()
+            )
+            population.integrator._initialize(
+                population,
+                timestep,
+                force=True,
+                compile_scope="network_population",
+            )
+        except Exception:
+            population._detached_materializations_pending = True
+            raise
 
 
 def _advance_network_component(component, *, compile_network_ops: bool = False):
@@ -180,6 +260,66 @@ def _advance_network_component(component, *, compile_network_ops: bool = False):
     return component.advance()
 
 
+def _network_runtime_inputs(network, inputs, *, extra, intra, steps=None, frame=False):
+    """Normalize deterministic operands before sampling any native Waveform."""
+    if inputs is None:
+        return None
+    if not isinstance(inputs, Mapping):
+        raise TypeError("Network inputs must map Population names to Inputs packets")
+    unknown = [name for name in inputs if name not in network.populations]
+    if unknown:
+        raise KeyError(f"inputs specified for unknown populations: {unknown!r}")
+    result = {}
+    for name, value in inputs.items():
+        # Conflict depends on whether an extra declaration exists for this
+        # Population; leave its value and legacy validation to the caller.
+        legacy_extra = () if extra is not None and name in extra else None
+        packet = native_input_sources(value, extra=legacy_extra)
+        if packet.intra is not None and name in intra:
+            raise ValueError(
+                "explicit intra cannot be combined with registered intracellular stimulation"
+            )
+        population = network.populations[name]
+        values = {}
+        for field in ("ve", "intra"):
+            options = {
+                "name": f"inputs[{name!r}].{field}",
+                "shape": tuple(population.shape),
+                "device": population.device(),
+                "dtype": population.dtype(),
+            }
+            if frame:
+                values[field] = normalize_input_frame(getattr(packet, field), **options)
+            else:
+                values[field], _ = normalize_input_tape(
+                    getattr(packet, field), steps=steps, **options
+                )
+        result[name] = packet._replace(**values)
+    return result
+
+
+def _slice_network_runtime_inputs(inputs, start, stop):
+    if inputs is None:
+        return None
+    return {
+        name: packet._replace(
+            ve=None if packet.ve is None else packet.ve[start:stop],
+            intra=None if packet.intra is None else packet.intra[start:stop],
+        )
+        for name, packet in inputs.items()
+    }
+
+
+def _apply_network_runtime_inputs(extra, intra, inputs, index=None):
+    if inputs is not None:
+        for name, packet in inputs.items():
+            if packet.ve is not None:
+                extra[name] = packet.ve if index is None else packet.ve[index]
+            if packet.intra is not None:
+                intra[name] = packet.intra if index is None else packet.intra[index]
+    return extra, intra
+
+
 def step(
     populations,
     synapses,
@@ -191,11 +331,18 @@ def step(
     extra: Dict[str, torch.Tensor | None] = {},
     intra: Dict[str, torch.Tensor | None] = {},
     compile_network_ops=False,
+    runtime_draws=None,
 ):
     if netstim is not None:
         # NetStim has explicit heap/schedule side effects; keep it eager unless
         # NetStim grows a compile-safe method of its own.
-        netstim(t, bptt=netstim.training, dt=dt)
+        if runtime_draws is None:
+            netstim(t, bptt=netstim.training, dt=dt)
+        else:
+            netstim(
+                t, bptt=netstim.training, dt=dt, exp_rand=runtime_draws.netstim_draw
+            )
+            runtime_draws.publish_netstim()
     for _, target in _named_items(continuous_targets):
         target.reset_continuous_inputs()
     for _, c in _named_items(continuous_synapses):
@@ -205,13 +352,21 @@ def step(
 
     # Population/integrator compilation is handled inside each integrator with
     # scope="network_population". The stateful Python wrapper remains eager.
-    advance_populations(populations, dt, extra, intra)
+    if runtime_draws is None:
+        advance_populations(populations, dt, extra, intra)
+    else:
+        with runtime_draws.bank_scope():
+            advance_populations(
+                populations, dt, extra, intra, runtime_draws=runtime_draws
+            )
 
 
 def get_local_index(population, mech, index):
-    indices = torch.full_like(
-        population.v, -1, dtype=torch.long, device=population.device()
-    ).flatten()
+    # Lookup storage must not inherit expanded voltage strides: MPS
+    # index_copy_ does not update a singleton zero-stride destination.
+    indices = torch.full(
+        (population.v.numel(),), -1, dtype=torch.long, device=population.device()
+    )
     mech_key_flat = to_flat_idx_mech(population.shape, mech, population.device())
     indices.index_copy_(
         0,
@@ -295,6 +450,11 @@ def _packed_synapse_local_index_map(
     return mapping
 
 
+def _bind_clock_reference(module, owner):
+    """Resolve a runtime clock from its current owner, including buffer rebinding."""
+    module.setreference("t", lambda owner=owner: owner.t)
+
+
 def _rebind_cloned_population_clocks(populations):
     """Point dynamic mechanism clocks at cloned owners after deepcopy."""
     visited = set()
@@ -307,11 +467,11 @@ def _rebind_cloned_population_clocks(populations):
         mechanism_handler = getattr(population, "mech", None)
         if mechanism_handler is not None:
             for mechanism in mechanism_handler.mechanisms.values():
-                mechanism.setreference("t", lambda population=population: population.t)
+                _bind_clock_reference(mechanism, population)
             for process in getattr(
                 mechanism_handler, "material_processes", {}
             ).values():
-                process.setreference("t", lambda population=population: population.t)
+                _bind_clock_reference(process, population)
 
         for component in getattr(population, "populations", {}).values():
             rebind(component)
@@ -622,62 +782,389 @@ def batchify_index(old_shape, n: int, i: torch.Tensor) -> torch.Tensor:
     return i_n.reshape(-1)
 
 
-def make_weight(weights, n, *, device=None, dtype=None):
-    class ParameterOrDistributionWrapper(torch.nn.Module):
-        """A simple wrapper for parameters or distributions that can be sampled."""
+def _connection_source_can_compute_uncached(source):
+    """Bypass only the unmodified, hook-free cacheable call adapter."""
+    if not (
+        isinstance(source, cacheable)
+        and type(source).repeat is cacheable.repeat
+        and type(source).forward is cacheable.forward
+        and "repeat" not in vars(source)
+        and "forward" not in vars(source)
+    ):
+        return False
+    hook_names = (
+        "_forward_pre_hooks",
+        "_forward_hooks",
+        "_backward_pre_hooks",
+        "_backward_hooks",
+    )
+    if any(getattr(source, name) for name in hook_names):
+        return False
+    module_hooks = torch.nn.modules.module
+    return not any(getattr(module_hooks, "_global" + name) for name in hook_names)
 
-        def __init__(self, param):
-            super().__init__()
-            if isinstance(param, torch.nn.Module) and (
-                device is not None or dtype is not None
-            ):
-                try:
-                    param = param.to(device=device, dtype=dtype)
-                except TypeError:
-                    param = param.to(device=device)
+
+class ParameterOrDistributionWrapper(torch.nn.Module):
+    """One deterministic parameter source or explicitly sampled distribution."""
+
+    def __init__(self, param, *, device=None, dtype=None):
+        super().__init__()
+        if isinstance(param, torch.nn.Module) and (
+            device is not None or dtype is not None
+        ):
+            try:
+                param = param.to(device=device, dtype=dtype)
+            except TypeError:
+                param = param.to(device=device)
+        if torch.is_tensor(param) and not isinstance(param, torch.nn.Parameter):
+            # Tensor sources were ordinary attributes in native checkpoints.
+            # Register them for explicit functional binding/device placement
+            # without adding a required state-dict key.
+            self.register_buffer("param", param, persistent=False)
+        else:
             self.param = param
+        self.output_device = None if device is None else torch.device(device)
+        self.output_dtype = dtype
 
-        def sample(self, n):
-            if is_parametric(self.param):
-                out = self.param.repeat(n)
-            else:
-                out = self.param.sample(n)
-            if torch.is_tensor(out) and (device is not None or dtype is not None):
-                out = out.to(
-                    device=device if device is not None else out.device,
-                    dtype=(
-                        dtype
-                        if dtype is not None and torch.is_floating_point(out)
-                        else out.dtype
-                    ),
+    def deterministic(self):
+        return (
+            torch.is_tensor(self.param)
+            or is_parametric(self.param)
+            or (
+                isinstance(self.param, torch.nn.Module)
+                and not callable(getattr(self.param, "sample", None))
+            )
+        )
+
+    def _convert(self, value):
+        if not torch.is_tensor(value):
+            raise TypeError("Connection parameter sources must return a Tensor.")
+        return value.to(
+            device=self.output_device
+            if self.output_device is not None
+            else value.device,
+            dtype=(
+                self.output_dtype
+                if self.output_dtype is not None and value.is_floating_point()
+                else value.dtype
+            ),
+        )
+
+    def sampling_draw_schema(self, n):
+        """Describe a supported distribution's independent draw without RNG."""
+        if not connection_distribution_is_supported(self.param):
+            raise TypeError("Connection source has no shared pure sampling recipe.")
+        return connection_distribution_draw_schema(self.param, (n,))
+
+    def sample_draw(self, n, *, generator=None):
+        """Draw explicit independent noise for a shared distribution recipe."""
+        if not connection_distribution_is_supported(self.param):
+            raise TypeError("Connection source has no shared pure sampling recipe.")
+        with torch.no_grad():
+            draw = self.param.sample_draw((n,), generator=generator)
+        return connection_distribution_validate_draw(self.param, draw, (n,)).detach()
+
+    def derive_values(self, n, draw=None):
+        """Evaluate deterministic sources or a supplied independent draw."""
+        if torch.is_tensor(self.param):
+            value = self.param.repeat(n)
+        elif _connection_source_can_compute_uncached(self.param):
+            # Parameter materialization must not reuse an inference cache from
+            # an older raw tensor generation.
+            value = self.param._compute().repeat(n)
+        elif is_parametric(self.param):
+            value = self.param.repeat(n)
+        elif self.deterministic():
+            value = self.param().repeat(n)
+        elif connection_distribution_is_supported(self.param) and draw is not None:
+            if type(self.param).sample_with_draw is Distribution.sample_with_draw:
+                shape, _dtype, device = connection_distribution_draw_schema(
+                    self.param, (n,)
                 )
-            return out
+                # A retained draw can precede a change to the default sampling
+                # dtype. Its original dtype belongs to that sample's recipe.
+                if not torch.is_tensor(draw) or (
+                    draw.shape != shape
+                    or not draw.is_floating_point()
+                    or draw.device != device
+                ):
+                    raise ValueError(
+                        "Connection distribution draw does not match its shape, floating dtype, and device schema."
+                    )
+            value = self.param.sample_from_draw(draw)
+        else:
+            raise TypeError("Stochastic connection parameters need explicit sampling.")
+        return self._convert(value)
 
-    class WeightExpander(torch.nn.Module):
-        def __init__(self, weights, n):
-            super(WeightExpander, self).__init__()
-            self.weights = torch.nn.ModuleList(
-                [ParameterOrDistributionWrapper(w) for w in weights]
+    def sample(self, n):
+        if self.deterministic():
+            return self.derive_values(n)
+        return self._convert(self.param.sample(n))
+
+
+class WeightExpander(torch.nn.Module):
+    """Materialize connection blocks while keeping initialized reads stable."""
+
+    _effective_value_buffer = "w"
+
+    def __init__(self, weights, n, *, device=None, dtype=None):
+        super().__init__()
+        self.weights = torch.nn.ModuleList(
+            [
+                ParameterOrDistributionWrapper(w, device=device, dtype=dtype)
+                for w in weights
+            ]
+        )
+        self.n = tuple(n)
+        if len(self.weights) != len(self.n):
+            raise ValueError(
+                "Connection parameter blocks and repeat counts must match."
             )
-            self.n = n
-            self.register_buffer(
-                "w",
-                torch.empty(
-                    0,
-                    device=device if device is not None else None,
-                    dtype=dtype if dtype is not None else torch.float32,
-                ),
+        self.register_buffer(
+            "w",
+            torch.empty(
+                0,
+                device=device if device is not None else None,
+                dtype=dtype if dtype is not None else torch.float32,
+            ),
+        )
+        self._sampling_draws = None
+        self._block_lengths = ()
+        self._detached_materializations_pending = False
+
+    def forward(self):
+        return self.w
+
+    def deterministic(self):
+        return all(source.deterministic() for source in self.weights)
+
+    @property
+    def sampling_draws(self):
+        """Detached base draws for the current sample, or missing legacy data."""
+        return {} if self.deterministic() else self._sampling_draws
+
+    def sample_draws(self, *, generator=None):
+        """Draw stochastic blocks in native order without committing storage.
+
+        ``generator`` may be one Torch generator or a device-to-generator mapping.
+        """
+        draws = {}
+        for index, (source, n) in enumerate(zip(self.weights, self.n, strict=True)):
+            if source.deterministic():
+                continue
+            block_generator = generator
+            if isinstance(generator, Mapping):
+                device = source.sampling_draw_schema(n)[2]
+                block_generator = generator.get(device, generator.get(str(device)))
+                if block_generator is None:
+                    raise ValueError(f"No connection sampling generator for {device}.")
+            draws[str(index)] = source.sample_draw(n, generator=block_generator)
+        return draws
+
+    def derive_values(self, draws=None):
+        """Return effective values without committing storage or consuming RNG."""
+        expected = {
+            str(index)
+            for index, source in enumerate(self.weights)
+            if not source.deterministic()
+        }
+        if expected and (draws is None or set(draws) != expected):
+            raise ValueError("Connection sampling draws must match stochastic blocks.")
+        if not expected and draws:
+            raise ValueError("Deterministic connection sources do not take draws.")
+        return torch.cat(
+            [
+                source.derive_values(
+                    n, None if draws is None else draws.get(str(index))
+                )
+                for index, (source, n) in enumerate(
+                    zip(self.weights, self.n, strict=True)
+                )
+            ]
+        )
+
+    def _detach_for_continuation(self, memo):
+        from ._runtime_detach import _detach_runtime_tree
+
+        self.w = _detach_runtime_tree(self.w, memo)
+        self._detached_materializations_pending = True
+
+    def _derive_detached_values(self):
+        """Reconnect current raw inputs without drawing another realization."""
+        draws = self.sampling_draws
+        if draws is not None:
+            value = self.derive_values(draws)
+        else:
+            # Legacy native samplers may have no explicit-draw contract. Frozen
+            # blocks retain their numerical sample; inventing a pathwise
+            # derivative for a trainable block would silently give wrong grads.
+            block_lengths = getattr(self, "_block_lengths", ())
+            if len(block_lengths) != len(self.weights):
+                raise RuntimeError(
+                    "Cannot reconnect detached connection parameters without "
+                    "their initialized block layout. Call initialize()."
+                )
+            values = []
+            stored = self.w.split(block_lengths)
+            for source, n, previous in zip(self.weights, self.n, stored, strict=True):
+                if source.deterministic():
+                    values.append(source.derive_values(n))
+                elif any(
+                    tensor.requires_grad
+                    for tensor in (*source.parameters(), *source.buffers())
+                ):
+                    raise RuntimeError(
+                        "Cannot reconnect detached trainable connection sampling "
+                        "without retained explicit draws. Use a distribution "
+                        "with pure draw/transform hooks and initialize()."
+                    )
+                else:
+                    values.append(previous)
+            value = torch.cat(values)
+        if not torch.is_tensor(value) or (
+            value.shape != self.w.shape
+            or value.dtype != self.w.dtype
+            or value.device != self.w.device
+        ):
+            raise RuntimeError(
+                "Detached connection materialization changed shape, dtype, or "
+                "device. Call initialize()."
             )
+        return value
 
-        def forward(self):
-            return self.w
+    def init(self, reinit=True):
+        initialization_draws = vars(self).get("_native_initialization_draws")
+        if initialization_draws is not None:
+            initialization_draws.begin_connection(self, reinit=reinit)
+        if reinit or not self.w.numel():
+            values, draws = [], {}
+            supported = True
+            for index, (source, n) in enumerate(zip(self.weights, self.n, strict=True)):
+                if source.deterministic():
+                    values.append(source.derive_values(n))
+                elif connection_distribution_is_supported(source.param):
+                    if initialization_draws is None:
+                        value, draw = source.param.sample_with_draw((n,))
+                        value = source._convert(value)
+                    else:
+                        value, draw = initialization_draws.connection_sample(
+                            self, index, source, n
+                        )
+                    values.append(value)
+                    draws[str(index)] = draw.detach().clone()
+                else:
+                    values.append(source.sample(n))
+                    supported = False
+            self.w = torch.cat(values)
+            self._block_lengths = tuple(value.shape[0] for value in values)
+            self._sampling_draws = draws if supported else None
+        self._detached_materializations_pending = False
+        if initialization_draws is not None:
+            initialization_draws.complete_connection(self)
+        return self
 
-        def init(self, reinit=True):
-            if reinit or not self.w.numel():
-                self.w = torch.cat([w.sample(n) for w, n in zip(self.weights, self.n)])
-            return self
+    def get_extra_state(self):
+        """Serialize independent draws alongside their effective sample buffer."""
+        return (
+            None
+            if self._sampling_draws is None
+            else {
+                key: value.detach().clone()
+                for key, value in self._sampling_draws.items()
+            }
+        )
 
-    return WeightExpander(weights, n)
+    def set_extra_state(self, state):
+        """Restore draw provenance, accepting checkpoints without provenance."""
+        if state is None:
+            self._sampling_draws = None
+            return
+        expected = {
+            str(index): connection_distribution_draw_schema(source.param, (n,))
+            for index, (source, n) in enumerate(zip(self.weights, self.n, strict=True))
+            if not source.deterministic()
+        }
+        if not isinstance(state, Mapping) or set(state) != set(expected):
+            raise ValueError("Invalid connection sampling provenance blocks.")
+        draws = {}
+        for key, value in state.items():
+            shape, dtype, device = expected[key]
+            if (
+                not torch.is_tensor(value)
+                or value.shape != shape
+                or not value.is_floating_point()
+            ):
+                raise ValueError(
+                    f"Invalid connection sampling provenance for block {key}."
+                )
+            # The built-in Normal recipe follows source dtype. Other recipes
+            # retain the sampled dtype: fresh schema metadata can depend on an
+            # ambient default that differs from the saved sample's recipe.
+            target_dtype = (
+                dtype
+                if type(self.weights[int(key)].param).sample_with_draw
+                is Normal.sample_with_draw
+                else value.dtype
+            )
+            draws[key] = value.detach().to(device=device, dtype=target_dtype).clone()
+        self._sampling_draws = draws
+
+    def _save_to_state_dict(self, destination, prefix, keep_vars):
+        super()._save_to_state_dict(destination, prefix, keep_vars)
+        if not self._sampling_draws:
+            # Preserve deterministic checkpoint keys and legacy custom samplers.
+            destination.pop(prefix + "_extra_state", None)
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
+        if prefix + "_extra_state" not in state_dict:
+            self._sampling_draws = None
+            if prefix + "_extra_state" in missing_keys:
+                missing_keys.remove(prefix + "_extra_state")
+
+    def _apply(self, fn, recurse=True):
+        super()._apply(fn, recurse=recurse)
+        if self._sampling_draws is not None:
+            draws = {}
+            for key, value in self._sampling_draws.items():
+                converted = fn(value)
+                source = self.weights[int(key)].param
+                if type(source).sample_with_draw is not Normal.sample_with_draw:
+                    # Draw dtype belongs to the sampled recipe. Move the
+                    # original draw so a temporary lower-precision conversion
+                    # cannot round its retained values before casting back.
+                    converted = value.to(device=converted.device)
+                else:
+                    converted = value.to(
+                        device=converted.device,
+                        dtype=connection_distribution_draw_schema(
+                            source, (self.n[int(key)],)
+                        )[1],
+                    )
+                draws[key] = converted
+            self._sampling_draws = draws
+        return self
+
+
+def make_weight(weights, n, *, device=None, dtype=None):
+    return WeightExpander(weights, n, device=device, dtype=dtype)
 
 
 def dilate(
@@ -913,6 +1400,7 @@ class Network(RNGMixin):
         self.dt = None
         self.built = False
         self._mode_requires_initialize = False
+        self._detached_materializations_pending = False
 
         self.backend = BACKEND.value
         self.fullgraph = bool(FULLGRAPH)
@@ -927,8 +1415,6 @@ class Network(RNGMixin):
         self.compile_options_key = compile_options_key(self.compile_options)
 
         self.is_batched = False
-
-        reset_torch_compiler(prefer_public=False)
 
         # Keep the stateful network/population wrapper eager. Population JIT is
         # now handled by each integrator, which compiles only its tensor kernel
@@ -1101,6 +1587,168 @@ class Network(RNGMixin):
         state["_step"] = step
         return state
 
+    def __deepcopy__(self, memo):
+        """Clone runtime values while severing the source's live training graph.
+
+        Population and NetStim already use detached value copies for non-leaf
+        runtime tensors. Seed the same memo for connection state and the
+        Network clock so all children preserve their intentional tensor aliases
+        without asking PyTorch to deepcopy an active autograd graph.
+        """
+        existing = memo.get(id(self))
+        if existing is not None:
+            return existing
+        for module in self.modules():
+            for value in module._buffers.values():
+                if (
+                    torch.is_tensor(value)
+                    and not value.is_leaf
+                    and id(value) not in memo
+                ):
+                    memo[id(value)] = value.detach().clone()
+            for value in vars(module).values():
+                if (
+                    torch.is_tensor(value)
+                    and not value.is_leaf
+                    and id(value) not in memo
+                ):
+                    memo[id(value)] = value.detach().clone()
+        result = self.__class__.__new__(self.__class__)
+        memo[id(self)] = result
+        if self.__class__.__module__ == "torch.nn.utils.parametrize":
+            # PyTorch's generated hook blocks serialization, while a runtime
+            # copy retains the authored Network state/compile cleanup policy.
+            getstate = next(
+                owner.__dict__["__getstate__"]
+                for owner in self.__class__.__mro__[1:]
+                if "__getstate__" in owner.__dict__
+            )
+            source_state = getstate(self)
+        else:
+            source_state = self.__getstate__()
+        state = copy.deepcopy(source_state, memo)
+        result.__setstate__(state)
+        return result
+
+    def __setstate__(self, state):
+        """Restore owner references after the complete module graph is copied."""
+        super().__setstate__(state)
+        self._bind_runtime_clocks()
+
+    def _bind_runtime_clocks(self):
+        """Bind dynamic clocks without resetting queues, RNG, or clock metadata."""
+        _rebind_cloned_population_clocks(self.populations)
+        for synapse in self.synapses.values():
+            _bind_clock_reference(synapse, self)
+        for connection in self.continuous_synapses.values():
+            _bind_clock_reference(connection, self)
+
+    def detach(self):
+        """Truncate simulation history while retaining live raw parameter sources.
+
+        Populations, connection histories, queued payloads and NetStim carry
+        retain their values. Clocks, duration remainder, RNG streams, schedules
+        and raw parameter/Tensor identities are unchanged. Callback carry has
+        separate ownership; use its collection's ``detach_state`` method.
+
+        The next positive-step, gradient-enabled training call reconnects
+        effective connection parameters from current raw sources and retained
+        independent sampling draws, without resampling or initializing state.
+        Evaluation, no-grad, inference-mode and zero-step calls defer this work.
+        Quantized delay routes remain initialization configuration; dynamic
+        differentiable event delays must fit the allocated history capacity.
+        Externally computed nonleaf sources remain caller-owned.
+
+        Returns
+        -------
+        Network
+            Self, for chaining.
+        """
+        memo = {}
+        seen = set()
+        with torch.inference_mode(False), torch.no_grad():
+            for population in self.populations.values():
+                if id(population) not in seen:
+                    seen.add(id(population))
+                    population.detach()
+            for collection in (self.synapses, self.continuous_synapses):
+                for connection in collection.values():
+                    if id(connection) in seen:
+                        continue
+                    seen.add(id(connection))
+                    connection._detach_runtime(memo)
+                    for materializer in (connection.weight, connection.delay_ms):
+                        if id(materializer) not in seen:
+                            seen.add(id(materializer))
+                            materializer._detach_for_continuation(memo)
+            if self.netstim is not None:
+                self.netstim._detach_runtime(memo)
+        self._detached_materializations_pending = True
+        return self
+
+    def detach_(self):
+        """In-place alias of :meth:`detach` that returns ``None``."""
+        self.detach()
+
+    def _refresh_detached_materializations(self, dt, *, grad_enabled=None):
+        if not (
+            self.training
+            and torch.is_grad_enabled()
+            and not torch.is_inference_mode_enabled()
+            and grad_enabled is not False
+        ):
+            return
+        connections = tuple(
+            dict.fromkeys((*self.synapses.values(), *self.continuous_synapses.values()))
+        )
+        pending = tuple(
+            dict.fromkeys(
+                materializer
+                for connection in connections
+                for materializer in (connection.weight, connection.delay_ms)
+                if getattr(materializer, "_detached_materializations_pending", False)
+            )
+        )
+        refresh = getattr(self, "_detached_materializations_pending", False) or bool(
+            pending
+        )
+        if refresh:
+            # Clear authored parameter-wrapper caches before either population
+            # or connection materialization; shared sources see one generation.
+            for module in self.modules():
+                clear_cache = getattr(module, "clear_cache", None)
+                if callable(clear_cache):
+                    clear_cache()
+        pending_populations = tuple(
+            population
+            for population in self.populations.values()
+            if getattr(population, "_detached_materializations_pending", False)
+        )
+        try:
+            _refresh_detached_population_materializations(self.populations, dt)
+            if not refresh:
+                return
+            values = {
+                materializer: materializer._derive_detached_values()
+                for materializer in pending
+            }
+            # Validate all outputs before publishing any new connection values.
+            # Failure preserves queued traffic and leaves the entire attempted
+            # refresh pending, including already rebuilt Population workspaces.
+            for connection in connections:
+                connection._validate_detached_parameter_values(
+                    values.get(connection.weight, connection.weight.w),
+                    values.get(connection.delay_ms, connection.delay_ms.w),
+                )
+            for materializer, value in values.items():
+                materializer.w = value
+                materializer._detached_materializations_pending = False
+            self._detached_materializations_pending = False
+        except Exception:
+            for population in pending_populations:
+                population._detached_materializations_pending = True
+            raise
+
     def train(self, mode=True):
         """
         Switch populations and synapses into training mode.
@@ -1262,7 +1910,43 @@ class Network(RNGMixin):
             return self.t.detach().clone()
         return self._clock_origin + self._clock_step.to(self.t.dtype) * float(self.dt)
 
+    def _promote_pending_inference_runtime(self):
+        if not (
+            getattr(self, "_detached_materializations_pending", False)
+            and not torch.is_inference_mode_enabled()
+        ):
+            return
+        from ._runtime_detach import _promote_inference_runtime_tree
+
+        memo = {}
+        with torch.no_grad():
+            for name in ("t", "_clock_origin", "_clock_step", "_duration_remainder"):
+                value = getattr(self, name)
+                if torch.is_inference(value):
+                    setattr(self, name, _promote_inference_runtime_tree(value, memo))
+            for population in self.populations.values():
+                if any(
+                    torch.is_tensor(value) and torch.is_inference(value)
+                    for value in (
+                        population.t,
+                        population.v,
+                        getattr(population, "vc", None),
+                    )
+                ):
+                    # The existing runtime restoration owns all integrator,
+                    # mechanism, material, delay and stochastic carry fields.
+                    # It preserves raw sources and consumes no random draws.
+                    population.restore_dict_from_checkpoint(
+                        population.state_dict_for_checkpoint()
+                    )
+            for collection in (self.synapses, self.continuous_synapses):
+                for connection in collection.values():
+                    connection._detach_runtime(memo, _promote_inference=True)
+            if self.netstim is not None:
+                self.netstim._detach_runtime(memo, _promote_inference=True)
+
     def _sync_runtime_clock(self):
+        self._promote_pending_inference_runtime()
         with torch.no_grad():
             self.t.copy_(self._runtime_clock_value())
             self._sync_population_clocks()
@@ -2820,7 +3504,7 @@ class Network(RNGMixin):
                 pre_dtype=pre_dtype,
             )
 
-            syn.setreference("t", lambda: self.t)
+            _bind_clock_reference(syn, self)
 
             if self.training:
                 syn.train()
@@ -2915,7 +3599,7 @@ class Network(RNGMixin):
                 pre_dtype=pre_dtype,
             )
 
-            con.setreference("t", lambda: self.t)
+            _bind_clock_reference(con, self)
 
             if self.training:
                 con.train()
@@ -2933,14 +3617,11 @@ class Network(RNGMixin):
 
     def _refresh_step_schedule(self):
         """Cache accelerator-first launch order for timestep execution."""
-        self._population_step_items = _accelerator_first_step_items(self.populations)
-        self._synapse_step_items = _accelerator_first_step_items(self.synapses)
-        self._continuous_synapse_step_items = _accelerator_first_step_items(
-            self.continuous_synapses
-        )
-        self._continuous_target_step_items = _accelerator_first_step_items(
-            self.continuous_targets
-        )
+        schedule = _network_step_schedule(self)
+        self._population_step_items = schedule.populations
+        self._synapse_step_items = schedule.synapses
+        self._continuous_synapse_step_items = schedule.continuous_synapses
+        self._continuous_target_step_items = schedule.continuous_targets
 
     def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """
@@ -2967,7 +3648,6 @@ class Network(RNGMixin):
         dt_changed = self.dt is not None and self.dt != dt_f
 
         if not self.built or self.dt != dt_f or force_rebuild or devices_changed:
-            reset_torch_compiler(prefer_public=False)
             self.dt = dt_f
             if dt_changed:
                 # A step count anchored to the previous dt cannot be reused with
@@ -2991,6 +3671,8 @@ class Network(RNGMixin):
         t=0.0,
         max_delay_ms=None,
         force_rebuild: bool = False,
+        *,
+        draws=None,
     ):
         """
         Initialize populations, synapses, and optional NetStim for simulation.
@@ -3017,12 +3699,32 @@ class Network(RNGMixin):
             Maximum allowed synaptic delay. Default is None.
         force_rebuild : bool, optional
             If True, rebuild NetCons even if already built. Default is False.
+        draws : dendra.func.InitializationDraws, optional
+            Replay explicit Population, connection and NetStim initialization
+            draws without automatic sampling. The packet's RNG boundaries
+            remain authoritative for subsequent execution. Omission retains
+            automatic native initialization.
 
         Returns
         -------
         Network
             Self, for chaining.
         """
+        if draws is not None:
+            from dendra.func._native_initialization_draws import initialize_native
+
+            return initialize_native(
+                self,
+                draws=draws,
+                options={
+                    "dt": dt,
+                    "reinit_weights": reinit_weights,
+                    "reinit_delays": reinit_delays,
+                    "t": t,
+                    "max_delay_ms": max_delay_ms,
+                    "force_rebuild": force_rebuild,
+                },
+            )
         dt_f = _validate_time_scalar(dt, name="dt", positive=True)
         t_f = _validate_time_scalar(t, name="t", positive=None)
         self._refresh_compile_config_from_ctx()
@@ -3068,7 +3770,12 @@ class Network(RNGMixin):
                 self.netstim.set_dt(dt_f)
             self.netstim.initialize()
             self.netstim.detach()
+        # Native initialization uses the ambient Torch generators. Explicit
+        # functional stream checkpoints apply until this new native boundary.
+        if vars(self).get("_native_initialization_draws") is None:
+            self.__dict__.pop("_functional_connection_sampling_rng", None)
         self._mode_requires_initialize = False
+        self._detached_materializations_pending = False
         return self
 
     def initialize_pops_from_state_cache(self, *, dt=None):
@@ -3086,8 +3793,14 @@ class Network(RNGMixin):
                     force=pop.force_integrator_reinit(),
                     compile_scope="network_population",
                 )
-            pop.load_state_dict(self._state_cache[name])
+            cached = restore_population_cache_values(
+                pop.state_dict(keep_vars=True),
+                self._state_cache[name],
+                parameter_names=dict(pop.named_parameters(remove_duplicate=False)),
+            )
+            _load_population_cache_transactionally(pop, cached)
             pop.detach()
+            pop._detached_materializations_pending = False
             pop.initialized = True
             pop.initializing_from_state_cache = True
             pop._integrator_reinit_pending = True
@@ -3202,7 +3915,18 @@ class Network(RNGMixin):
                 clear_deliveries=clear_deliveries,
             )
 
-    def step(self, *, extra=None, callbacks=None, loop_hooks: bool = False):
+    def step(
+        self,
+        *,
+        extra=None,
+        inputs=None,
+        draws=None,
+        callbacks=None,
+        loop_hooks: bool = False,
+        callback_state=None,
+        functional_callbacks=None,
+        functional_callback_state=None,
+    ):
         """Advance this network by exactly one timestep.
 
         The timestep is the network timestep established by ``initialize(dt)``
@@ -3220,17 +3944,47 @@ class Network(RNGMixin):
             Waveform output to ``[*batch, np, 1]``. Ordinary trailing
             broadcasting is tried first, followed only on failure by a
             low-rank, right-aligned batch-only fallback.
-        callbacks : sequence of Callback, optional
-            Callbacks to execute around this single step. By default ``step``
-            calls ``pre_step_hook`` and ``post_step_hook`` only.
+        inputs : mapping of str to dendra.func.Inputs, optional
+            Deterministic extracellular voltage and intracellular current frames
+            keyed by exact Population names. A supplied ``ve`` conflicts with
+            ``extra`` for that Population; supplied ``intra`` conflicts with
+            registered solver stimulation. Omitted fields retain those sources.
+        draws : dendra.func.RuntimeDraws, optional
+            One explicit NOISE/SDE and NetStim frame with authoritative RNG
+            boundaries. Solver-owned intracellular and call-local extracellular
+            Poisson banks, and mechanism-owned waveform injections, consume
+            invocation-indexed draws in native Network order.
+            Omission retains automatic sampling; supplied base draws and
+            schedules remain detached.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this Network or a compatible initialized
+            Network with matching timestep and mode. Pure observations read this
+            receiver's state with fixed prepared paths, scopes and selections.
+            They run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         loop_hooks : bool, optional
             If ``True``, also call ``pre_loop_hook`` before the step and
             ``post_loop_hook`` after the step.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
-        Network
-            ``self``, for chaining.
+        Network or dendra.func.FunctionalCallbackResults
+            Returns ``self`` for chaining when pure observations are omitted.
+            With pure observations, returns their named results and explicit
+            callback carry. Model state remains on the Network. Observations
+            preserve gradients and own their sampled tensor values.
         """
         if self.dt is None:
             raise RuntimeError(
@@ -3243,9 +3997,23 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before step()."
             )
         self._require_mode_runtime_ready()
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
+        )
         self._validate_population_runtime_contracts()
 
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
+        if observer is not None:
+            observer.validate_dt(dt_f)
+        replay = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import bind_network_runtime_draws
+
+            replay = bind_network_runtime_draws(self, draws, extra=extra, dt=dt_f)
         self._refresh_compile_config_from_ctx()
         self._sync_runtime_clock()
 
@@ -3261,9 +4029,17 @@ class Network(RNGMixin):
             if p.intra is not None:
                 intra[n] = p.intra
 
+        with nullcontext() if self.training else torch.no_grad():
+            runtime_inputs = _network_runtime_inputs(
+                self, inputs, extra=extra, intra=intra, frame=True
+            )
         extra = extra if extra is not None else {}
         extra_prepped = {}
-        with nullcontext() if self.training else torch.no_grad():
+        with (
+            nullcontext() if self.training else torch.no_grad(),
+            nullcontext() if replay is None else replay.bank_scope(finish=False),
+        ):
+            reconcile_extra_poisson_rng(self, extra)
             for n, (v, t) in extra.items():
                 pop = self.populations[n]
                 dev, dtp = pop.device(), pop.dtype()
@@ -3271,7 +4047,12 @@ class Network(RNGMixin):
                 t0 = self.t.to(device=dev, dtype=dtp)
                 t_grid = _time_grid_from_step_count(t0, 1, dt_f, device=dev).to(dtp)
                 values = _evaluate_extra_waveform(
-                    pop, t, t_grid, n_steps=1, name=f"extra[{n!r}] Waveform output"
+                    pop,
+                    t,
+                    t_grid,
+                    n_steps=1,
+                    name=f"extra[{n!r}] Waveform output",
+                    rng_owner=self,
                 )
                 extra_prepped[n] = (v_dev, values)
         extra = extra_prepped
@@ -3284,22 +4065,31 @@ class Network(RNGMixin):
         if not isinstance(callbacks, CallbackList):
             callbacks = CallbackList(callbacks)
         for c in callbacks:
-            c.dt = self.dt
+            _bind_callback_dt(c, self.dt)
 
-        with ctx:
-            if with_intra:
-                intra = {
-                    n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
-                    for n, intra_ in intra.items()
-                }
+        with _native_callback_storage(observer) as observer, ctx:
+            self._refresh_detached_materializations(dt_f)
+            with nullcontext() if replay is None else replay.bank_scope(finish=False):
+                if with_intra:
+                    intra = {
+                        n: (intra_, *self.populations[n].prep_intra(intra_, 1, dt_f))
+                        for n, intra_ in intra.items()
+                    }
 
             if loop_hooks:
                 pre_loop_hook(callbacks, self)
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
             pre_step_hook(callbacks, self)
 
             intra_c = prepare_intra({}, intra, 0) if with_intra else {}
             extra_c = prepare_extra(extra, 0) if with_extra else {}
+            if runtime_inputs is not None:
+                extra_c, intra_c = _apply_network_runtime_inputs(
+                    extra_c, intra_c, runtime_inputs
+                )
 
+            draw_options = {} if replay is None else {"runtime_draws": replay}
             self._step(
                 self._population_step_items,
                 self._synapse_step_items,
@@ -3311,26 +4101,57 @@ class Network(RNGMixin):
                 extra=extra_c,
                 intra=intra_c,
                 compile_network_ops=self.compile_network_ops,
+                **draw_options,
             )
+            if replay is not None:
+                replay.publish_stimulation()
             self._advance_runtime_clock()
 
+            if observer is not None:
+                observed_state, emitted = observer.update(observed_state)
+                observer.collect(
+                    observed_state, observed_parts, observer.stack([emitted]), steps=1
+                )
             post_step_hook(callbacks, self)
             if loop_hooks:
                 post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
         return self
 
-    def run(self, tstop, extra=None, callbacks=None, progressbar=False):
+    def run(
+        self,
+        tstop=None,
+        extra=None,
+        callbacks=None,
+        progressbar=False,
+        *,
+        steps=None,
+        duration=None,
+        inputs=None,
+        draws=None,
+        callback_state=None,
+        functional_callbacks=None,
+        functional_callback_state=None,
+    ):
         """
-        Advance the network for a fixed duration.
+        Advance the network for a timestep count or physical duration.
 
         Parameters
         ----------
-        tstop : float
-            Requested simulation duration in milliseconds. Only complete
+        tstop : float, optional
+            Compatibility spelling for ``duration``. Only complete
             timesteps are executed. Any fractional remainder is retained and
             combined with the next duration-based call, so partitioned calls
             advance the same number of steps as their combined duration.
+        steps : int, optional
+            Exact non-negative timestep count. Leaves any retained fractional
+            duration unchanged. Supply only one of ``steps``, ``duration``, or
+            ``tstop``.
+        duration : float, optional
+            Requested simulation duration in milliseconds, using the same
+            retained-duration budget as ``tstop``.
         extra : dict[str, tuple[torch.Tensor, object]], optional
             Optional mapping of population name to extracellular stimulus tuple
             ``(v, waveform)``. For each population, ``v`` is normalized to
@@ -3339,14 +4160,46 @@ class Network(RNGMixin):
             tried first; only on failure may low-rank value axes use a
             right-aligned batch-only fallback. Explicit singleton axes
             disambiguate equal-size batch and spatial dimensions.
-        callbacks : list[Callback], optional
-            Callbacks invoked each step (wrapped in :class:`CallbackList`).
+        inputs : mapping of str to dendra.func.Inputs, optional
+            Deterministic time-leading voltage/current tapes keyed by exact
+            Population names. Tape lengths must equal the selected horizon's
+            timestep count. Fields share the conflict rules of :meth:`step`.
+        draws : dendra.func.RuntimeDraws, optional
+            Explicit time-leading NOISE/SDE, NetStim and Poisson waveform draws,
+            including mechanism-owned injections.
+            Populations with randomized Poisson banks consume one bank recipe per
+            accepted step, independently of execution chunking. Other banks retain
+            native bulk waveform preparation. Base draws and schedules remain
+            detached; model and stimulation parameters retain their gradients.
+            Omission retains automatic sampling and native bank preparation cadence.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this Network or a compatible initialized
+            Network with matching timestep and mode. Pure observations read this
+            receiver's state with fixed prepared paths, scopes and selections.
+            They run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool or tqdm.tqdm, optional
             If truthy, show a progress bar (auto-created if True). Default False.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
-        None
+        None or dendra.func.FunctionalCallbackResults
+            Returns named pure observations and explicit callback carry when
+            supplied; otherwise returns ``None``. Model state remains on the
+            Network. Retained observations preserve gradients and are isolated
+            from subsequent native state mutation.
 
         Notes
         -----
@@ -3365,13 +4218,36 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before run()."
             )
         self._require_mode_runtime_ready()
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
+        )
         self._validate_population_runtime_contracts()
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        self._refresh_compile_config_from_ctx()
-        self._sync_runtime_clock()
+        if observer is not None:
+            observer.validate_dt(dt_f)
+        request_steps, request_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
+        if draws is None:
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
 
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        n_steps, duration_remainder = execution_step_budget(
+            request_steps, request_duration, dt_f, self._duration_budget
+        )
+        draw_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import bind_network_runtime_draw_tape
+
+            draw_tape = bind_network_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra, dt=dt_f
+            )
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -3382,46 +4258,76 @@ class Network(RNGMixin):
             if p.intra is not None:
                 intra[n] = p.intra
 
+        with nullcontext() if self.training else torch.no_grad():
+            runtime_inputs = _network_runtime_inputs(
+                self, inputs, extra=extra, intra=intra, steps=n_steps
+            )
         extra = extra if extra is not None else {}
+        replay_names = (
+            ()
+            if draw_tape is None
+            else tuple(
+                name
+                for name, plan in draw_tape.plan.populations.items()
+                if plan.has_bank_poisson
+            )
+        )
         extra_prepped = {}
         with nullcontext() if self.training else torch.no_grad():
+            if draw_tape is None:
+                reconcile_extra_poisson_rng(self, extra)
             for n, (v, t) in extra.items():
                 pop = self.populations[n]
                 dev, dtp = pop.device(), pop.dtype()
                 v_dev = pop._normalize_spatial(v)
-                t0 = self.t.to(device=dev, dtype=dtp)
-                t_grid = _time_grid_from_step_count(t0, n_steps, dt_f, device=dev).to(
-                    dtp
-                )
-                values = _evaluate_extra_waveform(
-                    pop,
-                    t,
-                    t_grid,
-                    n_steps=n_steps,
-                    name=f"extra[{n!r}] Waveform output",
-                )
+                values = t
+                if draw_tape is None or (n_steps and n not in replay_names):
+                    t0 = self.t.to(device=dev, dtype=dtp)
+                    t_grid = _time_grid_from_step_count(
+                        t0, n_steps, dt_f, device=dev
+                    ).to(dtp)
+                    values = _evaluate_extra_waveform(
+                        pop,
+                        t,
+                        t_grid,
+                        n_steps=n_steps,
+                        name=f"extra[{n!r}] Waveform output",
+                        rng_owner=self,
+                    )
                 extra_prepped[n] = (v_dev, values)
         extra = extra_prepped
 
         with_intra = bool(intra)
         with_extra = bool(extra)
+        replay_intra = {
+            name: source for name, source in intra.items() if name in replay_names
+        }
+        bulk_extra = {
+            name: value for name, value in extra.items() if name not in replay_names
+        }
         tstart = self.t.item()
 
-        with ctx:
-            self._set_duration_remainder(duration_remainder)
+        with _native_callback_storage(observer) as observer, ctx:
+            if n_steps:
+                self._refresh_detached_materializations(dt_f)
+            if duration_remainder is not None:
+                self._set_duration_remainder(duration_remainder)
 
             if with_intra:
                 intra = {
                     n: (intra_, *self.populations[n].prep_intra(intra_, n_steps, dt_f))
                     for n, intra_ in intra.items()
+                    if draw_tape is None or (n_steps and n not in replay_names)
                 }
 
             if callbacks is None:
                 callbacks = []
             for c in callbacks:
-                c.dt = self.dt
+                _bind_callback_dt(c, self.dt)
             callbacks = CallbackList(callbacks)
             pre_loop_hook(callbacks, self)
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -3430,16 +4336,33 @@ class Network(RNGMixin):
             local_ind = 0
 
             for _ in range(n_steps):
-                intra_c = {}
-                extra_c = {}
-
-                if with_intra:
-                    intra_c = prepare_intra(intra_c, intra, local_ind)
-
-                if with_extra:
-                    extra_c = prepare_extra(extra, local_ind)
+                replay = None if draw_tape is None else draw_tape.frame(local_ind)
+                if replay is None:
+                    intra_c = {}
+                    extra_c = {}
+                    if with_intra:
+                        intra_c = prepare_intra(intra_c, intra, local_ind)
+                    if with_extra:
+                        extra_c = prepare_extra(extra, local_ind)
+                else:
+                    extra_c = prepare_extra(bulk_extra, local_ind)
+                    intra_c = prepare_intra({}, intra, local_ind)
+                    extra_c, intra_c = _prepare_network_replay_banks(
+                        self,
+                        replay,
+                        replay_intra,
+                        extra,
+                        dt_f,
+                        extra_c=extra_c,
+                        intra_c=intra_c,
+                    )
+                if runtime_inputs is not None:
+                    extra_c, intra_c = _apply_network_runtime_inputs(
+                        extra_c, intra_c, runtime_inputs, local_ind
+                    )
 
                 pre_step_hook(callbacks, self)
+                draw_options = {} if replay is None else {"runtime_draws": replay}
                 self._step(
                     self._population_step_items,
                     self._synapse_step_items,
@@ -3451,8 +4374,19 @@ class Network(RNGMixin):
                     extra=extra_c,
                     intra=intra_c,
                     compile_network_ops=self.compile_network_ops,
+                    **draw_options,
                 )
+                if replay is not None:
+                    replay.publish_stimulation()
                 self._advance_runtime_clock()
+                if observer is not None:
+                    observed_state, emitted = observer.update(observed_state)
+                    observer.collect(
+                        observed_state,
+                        observed_parts,
+                        observer.stack([emitted]),
+                        steps=1,
+                    )
                 post_step_hook(callbacks, self)
                 local_ind += 1
 
@@ -3467,14 +4401,24 @@ class Network(RNGMixin):
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
     def longrun(
         self,
-        tstop,
-        chunklength,
+        tstop=None,
+        chunklength=None,
         extra=None,
         callbacks=None,
         progressbar=False,
+        *,
+        steps=None,
+        duration=None,
+        inputs=None,
+        draws=None,
+        callback_state=None,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         """Advance the network in bounded-memory chunks without resetting state.
 
@@ -3486,26 +4430,58 @@ class Network(RNGMixin):
 
         Parameters
         ----------
-        tstop : float
-            Requested simulation duration in milliseconds. Only complete
+        tstop : float, optional
+            Compatibility spelling for ``duration``. Only complete
             timesteps are executed; a fractional remainder is retained and
             combined with the next :meth:`run`, :meth:`longrun`, or
             :meth:`longrun_checkpointed` call.
+        steps : int, optional
+            Exact non-negative timestep count, leaving retained fractional
+            duration unchanged. Supply only one horizon argument.
+        duration : float, optional
+            Requested simulation duration in milliseconds, using the same
+            retained-duration budget as ``tstop``.
         chunklength : int
             Positive number of timesteps per chunk. The final chunk may be
             shorter.
         extra : dict[str, tuple[torch.Tensor, object]], optional
             Population-specific extracellular stimuli with the same public
             ``(v, waveform)`` format and shape contract as :meth:`run`.
-        callbacks : sequence of Callback, optional
-            Callbacks invoked around the complete loop, each chunk, and each
-            timestep.
+        inputs : mapping of str to dendra.func.Inputs, optional
+            Deterministic time-leading voltage/current tapes with the same
+            contract as :meth:`run`. Chunk boundaries retain tape views and
+            gradients; all tape lengths match the selected timestep count.
+        draws : dendra.func.RuntimeDraws, optional
+            Explicit time-leading draws with the same contract as :meth:`run`.
+            Each accepted step consumes its own waveform recipe and RNG frame;
+            changing ``chunklength`` does not change replayed stochastic values.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this Network or a compatible initialized
+            Network with matching timestep and mode. Pure observations read this
+            receiver's state with fixed prepared paths, scopes and selections.
+            They run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar : bool or tqdm.tqdm, optional
             If truthy, display progress over completed timesteps.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
 
         Returns
         -------
-        None
+        None or dendra.func.FunctionalCallbackResults
+            Returns named pure observations and carry when supplied; otherwise
+            returns ``None``. Cadence and gradients continue across chunks and
+            calls without resetting the live Network state.
         """
         if self.dt is None:
             raise RuntimeError(
@@ -3518,6 +4494,13 @@ class Network(RNGMixin):
                 "initialize(dt) (recommended) or build(dt) before longrun()."
             )
         self._require_mode_runtime_ready()
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
+        )
         self._validate_population_runtime_contracts()
         if not isinstance(chunklength, int) or isinstance(chunklength, bool):
             raise ValueError("chunklength must be a positive integer.")
@@ -3525,9 +4508,26 @@ class Network(RNGMixin):
             raise ValueError("chunklength must be a positive integer.")
 
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        self._refresh_compile_config_from_ctx()
-        self._sync_runtime_clock()
+        if observer is not None:
+            observer.validate_dt(dt_f)
+        request_steps, request_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
+        draw_tape = None
+        if draws is None:
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
+        else:
+            from dendra.func._native_runtime_draws import bind_network_runtime_draw_tape
+
+            n_steps, duration_remainder = execution_step_budget(
+                request_steps, request_duration, dt_f, self._duration_budget
+            )
+            draw_tape = bind_network_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra, dt=dt_f
+            )
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
 
         ctx = nullcontext() if self.training else torch.no_grad()
 
@@ -3538,6 +4538,16 @@ class Network(RNGMixin):
             if pop.intra is not None:
                 intra[name] = pop.intra
 
+        runtime_inputs = None
+        if inputs is not None:
+            if draw_tape is None:
+                n_steps, duration_remainder = execution_step_budget(
+                    request_steps, request_duration, dt_f, self._duration_budget
+                )
+            with nullcontext() if self.training else torch.no_grad():
+                runtime_inputs = _network_runtime_inputs(
+                    self, inputs, extra=extra, intra=intra, steps=n_steps
+                )
         extra = extra if extra is not None else {}
         extra_sources = {}
         with nullcontext() if self.training else torch.no_grad():
@@ -3553,15 +4563,32 @@ class Network(RNGMixin):
         if not isinstance(callbacks, CallbackList):
             callbacks = CallbackList(callbacks)
         for callback in callbacks:
-            callback.dt = self.dt
+            _bind_callback_dt(callback, self.dt)
 
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        if inputs is None and draw_tape is None:
+            n_steps, duration_remainder = execution_step_budget(
+                request_steps, request_duration, dt_f, self._duration_budget
+            )
+        replay_names = (
+            ()
+            if draw_tape is None
+            else tuple(
+                name
+                for name, plan in draw_tape.plan.populations.items()
+                if plan.has_bank_poisson
+            )
+        )
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
-        with ctx:
-            self._set_duration_remainder(duration_remainder)
+        with _native_callback_storage(observer) as observer, ctx:
+            if n_steps:
+                self._refresh_detached_materializations(dt_f)
+            if duration_remainder is not None:
+                self._set_duration_remainder(duration_remainder)
             pre_loop_hook(callbacks, self)
+            if observer is not None:
+                observed_state, observed_parts = observer.start()
 
             if progressbar:
                 if not isinstance(progressbar, tqdm):
@@ -3569,7 +4596,14 @@ class Network(RNGMixin):
 
             completed_steps = 0
             for chunk_start in range(0, n_steps, chunklength):
+                if draw_tape is not None:
+                    draw_tape.validate_fresh()
+                if observer is not None:
+                    observed_emissions = []
                 n_chunk = min(chunklength, n_steps - chunk_start)
+                inputs_chunk = _slice_network_runtime_inputs(
+                    runtime_inputs, chunk_start, chunk_start + n_chunk
+                )
                 time_chunk = initial_time + dt_f * torch.arange(
                     chunk_start,
                     chunk_start + n_chunk,
@@ -3577,16 +4611,20 @@ class Network(RNGMixin):
                     dtype=torch.double,
                 )
                 time_chunk = time_chunk.to(dtype=self.t.dtype)
+                if draw_tape is None:
+                    reconcile_extra_poisson_rng(self, extra)
                 intra_chunk = {
                     name: (
                         source,
                         *self.populations[name].prep_intra(source, n_chunk, dt_f),
                     )
                     for name, source in intra.items()
+                    if name not in replay_names
                 }
-
                 extra_chunk = {}
                 for name, (spatial, temporal) in extra_sources.items():
+                    if name in replay_names:
+                        continue
                     pop = self.populations[name]
                     device, dtype = pop.device(), pop.dtype()
                     start = self.t.to(device=device, dtype=dtype)
@@ -3599,6 +4637,7 @@ class Network(RNGMixin):
                         t_grid,
                         n_steps=n_chunk,
                         name=f"extra[{name!r}] Waveform output",
+                        rng_owner=self,
                     )
                     extra_chunk[name] = (
                         spatial,
@@ -3607,14 +4646,34 @@ class Network(RNGMixin):
 
                 pre_chunk_hook(callbacks, self, time_chunk)
                 for local_ind in range(n_chunk):
+                    replay = (
+                        None
+                        if draw_tape is None
+                        else draw_tape.frame(chunk_start + local_ind)
+                    )
                     intra_c = (
                         prepare_intra({}, intra_chunk, local_ind) if intra_chunk else {}
                     )
                     extra_c = (
                         prepare_extra(extra_chunk, local_ind) if extra_chunk else {}
                     )
+                    if replay is not None:
+                        extra_c, intra_c = _prepare_network_replay_banks(
+                            self,
+                            replay,
+                            intra,
+                            extra_sources,
+                            dt_f,
+                            extra_c=extra_c,
+                            intra_c=intra_c,
+                        )
+                    if inputs_chunk is not None:
+                        extra_c, intra_c = _apply_network_runtime_inputs(
+                            extra_c, intra_c, inputs_chunk, local_ind
+                        )
 
                     pre_step_hook(callbacks, self)
+                    draw_options = {} if replay is None else {"runtime_draws": replay}
                     self._step(
                         self._population_step_items,
                         self._synapse_step_items,
@@ -3626,11 +4685,25 @@ class Network(RNGMixin):
                         extra=extra_c,
                         intra=intra_c,
                         compile_network_ops=self.compile_network_ops,
+                        **draw_options,
                     )
+                    if replay is not None:
+                        replay.publish_stimulation()
                     self._advance_runtime_clock()
+                    if observer is not None:
+                        observed_state, emitted = observer.update(observed_state)
+                        if emitted is not None:
+                            observed_emissions.append(emitted)
                     post_step_hook(callbacks, self)
                     completed_steps += 1
 
+                if observer is not None:
+                    observer.collect(
+                        observed_state,
+                        observed_parts,
+                        observer.stack(observed_emissions),
+                        steps=n_chunk,
+                    )
                 post_chunk_hook(callbacks, self, time_chunk)
 
                 if progressbar:
@@ -3643,6 +4716,8 @@ class Network(RNGMixin):
                 progressbar.close()
 
             post_loop_hook(callbacks, self)
+            if observer is not None:
+                return observer.finish(observed_state, observed_parts)
 
     def batch(self, n, include_netstim=True):
         """
@@ -4233,16 +5308,56 @@ class Network(RNGMixin):
         self._syn_cache["continuous"] = continuous_cache
 
     def clear_state_cache(self):
+        """Clear Network-owned Population and connection initialization caches.
+
+        Returns
+        -------
+        None
+            The running model state is unchanged. Later initialization no longer
+            restores Network-owned caches. Individual Populations' steady-state
+            caches are retained and can still restore during initialization;
+            clear those separately with ``population.clear_steady_state()``.
+        """
         self._state_cache.clear()
         self._syn_cache.clear()
 
     def load_state_cache(self, state_cache=None, syn_cache=None):
+        """Install initialization caches without restoring running state immediately.
+
+        Parameters
+        ----------
+        state_cache : mapping, optional
+            Population-state cache assigned directly. Omission retains the current
+            Population cache.
+        syn_cache : mapping, optional
+            Event/continuous connection cache assigned directly. Omission retains the
+            current connection cache.
+
+        Notes
+        -----
+        The supplied mappings are retained by identity. :meth:`initialize` performs
+        restoration using the active parameter and cache policies.
+        """
         if state_cache is not None:
             self._state_cache = state_cache
         if syn_cache is not None:
             self._syn_cache = syn_cache
 
     def set_synaptic_diff_config(self, **kwargs):
+        """Configure differentiation for existing event connections and NetStim schedules.
+
+        Parameters
+        ----------
+        **kwargs
+            Keyword arguments forwarded to :meth:`NetCon.set_diff_config`. Only
+            ``diff_scheduled_times`` and ``sched_width`` are forwarded to an attached
+            NetStim; omitted values for those controls use True and 1.0 respectively.
+
+        Notes
+        -----
+        This changes connection differentiation controls, not the Network's
+        training/evaluation mode.
+        """
         for syn in self.synapses.values():
             syn.set_diff_config(**kwargs)
         if self.netstim is not None and hasattr(self.netstim, "set_diff_config"):
@@ -4462,11 +5577,23 @@ class Network(RNGMixin):
             "clock_step": self._clock_step,
             "duration_remainder": self._duration_remainder,
             "structure": self.checkpoint_structure(),
+            **(
+                {
+                    "connection_sampling_rng": clone_connection_sampling_rng(
+                        self._functional_connection_sampling_rng
+                    )
+                }
+                if "_functional_connection_sampling_rng" in vars(self)
+                else {}
+            ),
         }
 
     def _restore_dict_from_checkpoint_unchecked(self, state_dict):
         if not isinstance(state_dict, Mapping):
             raise TypeError("Network checkpoint state must be a mapping.")
+        sampling_rng = clone_connection_sampling_rng(
+            state_dict.get("connection_sampling_rng")
+        )
         missing = [
             name
             for name in ("populations", "netcons", "netstim", "t")
@@ -4478,6 +5605,10 @@ class Network(RNGMixin):
             raise TypeError("Network checkpoint populations must be a mapping.")
         if not isinstance(state_dict["netcons"], Mapping):
             raise TypeError("Network checkpoint netcons must be a mapping.")
+        if set(state_dict["populations"]) == set(self.populations):
+            validate_poisson_checkpoint_stream_aliases(
+                self.populations, state_dict["populations"]
+            )
 
         checkpoint_t = state_dict["t"]
         if not torch.is_tensor(checkpoint_t):
@@ -4677,16 +5808,25 @@ class Network(RNGMixin):
         self._clock_origin = restored_origin
         self._clock_step = restored_step
         self._duration_remainder = restored_remainder
+        if sampling_rng is None:
+            self.__dict__.pop("_functional_connection_sampling_rng", None)
+        else:
+            self._functional_connection_sampling_rng = sampling_rng
         self._sync_runtime_clock()
+        coalesce_pending_poisson_rng(self)
 
     def restore_dict_from_checkpoint(self, state_dict):
         """Restore a whole-network runtime checkpoint atomically."""
         previous = _clone_checkpoint_state(self.state_dict_for_checkpoint())
+        rng_lifecycle = _snapshot_rng_lifecycle(self)
+        poisson_lifecycle = snapshot_poisson_rng_lifecycle(self)
         try:
             self._restore_dict_from_checkpoint_unchecked(state_dict)
         except Exception as restore_error:
             try:
+                _restore_rng_lifecycle(rng_lifecycle)
                 self._restore_dict_from_checkpoint_unchecked(previous)
+                restore_poisson_rng_lifecycle(poisson_lifecycle)
             except Exception as rollback_error:
                 raise RuntimeError(
                     "Network checkpoint restore failed and rollback could not "
@@ -4699,15 +5839,22 @@ class Network(RNGMixin):
 
     def longrun_checkpointed(
         self,
-        tstop: float,
-        chunklength: int,
+        tstop: Optional[float] = None,
+        chunklength: Optional[int] = None,
         extra=None,
         callbacks=None,
         progressbar=False,
         *,
+        steps=None,
+        duration=None,
+        inputs=None,
+        draws=None,
         safe_checkpoint: bool = False,
         restore_state_after_backward: bool = True,
         return_final_state: bool = False,
+        callback_state=None,
+        functional_callbacks=None,
+        functional_callback_state=None,
     ):
         """Run the network for a long horizon using activation checkpointing.
 
@@ -4723,27 +5870,70 @@ class Network(RNGMixin):
         Parameters
         ----------
         tstop:
-            Requested simulation duration in milliseconds. Only complete
+            Compatibility spelling for ``duration``. Only complete
             timesteps are executed; fractional time is retained for the next
             duration-based network call.
+        steps:
+            Exact non-negative timestep count, leaving retained fractional
+            duration unchanged. Supply only one horizon argument.
+        duration:
+            Requested simulation duration in milliseconds, using the same
+            retained-duration budget as ``tstop``.
         chunklength:
             Number of time steps per checkpoint chunk.
         extra:
             Optional population-specific ``(v, waveform)`` mapping with the
             same shape and broadcasting contract as :meth:`run`.
-        callbacks:
-            Optional list of callbacks.
+        inputs : mapping of str to dendra.func.Inputs, optional
+            Deterministic time-leading voltage/current tapes with the same
+            contract as :meth:`run`. Checkpoint chunks retain their own tape
+            slices so replay uses the same frames and preserves input gradients.
+        draws : dendra.func.RuntimeDraws, optional
+            Explicit time-leading draws with the same contract as :meth:`run`.
+            Checkpoint replay consumes the same accepted-step recipes and RNG
+            frames. Keep the tape unchanged until backward has completed.
+            Checkpointed training requires mutation counters; clone inference
+            tensors outside ``torch.inference_mode()`` before passing them here.
+        callbacks : sequence of Callback or dendra.func.FunctionalCallbacks, optional
+            Native hook sequence, or a pure collection prepared once with
+            ``dn.func.make_callbacks`` for this Network or a compatible initialized
+            Network with matching timestep and mode. Pure observations read this
+            receiver's state with fixed prepared paths, scopes and selections.
+            They run after clock advancement and before native
+            post-step hooks. Native hooks retain their loop/chunk/step timing.
         progressbar:
             If ``True``, displays a tqdm progress bar over chunks.
         safe_checkpoint:
             If ``True``, clone checkpoint input tensors at each chunk boundary
             to guard against inadvertent in-place mutation.
         restore_state_after_backward:
-            If ``True``, restores the forward final state after backward
-            completes (useful because checkpointing replays forward during
-            backward and mutates module state).
+            If ``True``, isolate checkpoint recomputation from the live Network
+            state, including differentiation through pure callback results.
+            Backward, ``autograd.grad`` and higher-order derivatives preserve
+            the state visible before replay, including later simulation calls.
         return_final_state:
             If ``True``, return ``(loss, final_state_dict)``.
+        callback_state : dendra.func.FunctionalCallbackState, optional
+            Carry from the same prepared collection supplied through
+            ``callbacks`` or ``functional_callbacks``. Resumes sampling
+            phase and reducer totals without another initial observation.
+        functional_callbacks : dendra.func.FunctionalCallbacks, optional
+            Compatibility spelling for the prepared pure collection. Use it
+            alongside ``callbacks=[...]`` to combine native hooks and pure
+            observations. Supply the collection through only one argument.
+        functional_callback_state : dendra.func.FunctionalCallbackState, optional
+            Compatibility spelling for ``callback_state``. Supply carry
+            through only one argument; either collection spelling is accepted.
+
+        Returns
+        -------
+        loss or tuple
+            Without pure observations, retains the ordinary loss or
+            ``(loss, final_state_dict)`` return. With pure observations, returns
+            ``(loss_or_none, results)``, or
+            ``(loss_or_none, final_state_dict, results)`` when
+            ``return_final_state=True``. Results contain named observations
+            and explicit callback carry; model state remains on the Network.
 
         Notes
         -----
@@ -4771,28 +5961,54 @@ class Network(RNGMixin):
                 "longrun_checkpointed()."
             )
         self._require_mode_runtime_ready()
+        callbacks, observer = _native_callback_arguments(
+            self,
+            callbacks,
+            callback_state,
+            functional_callbacks,
+            functional_callback_state,
+        )
         self._validate_population_runtime_contracts()
         if isinstance(chunklength, bool) or not isinstance(chunklength, int):
             raise TypeError("chunklength must be a positive integer")
         if chunklength <= 0:
             raise ValueError("chunklength must be a positive integer")
         dt_f = _validate_time_scalar(self.dt, name="dt", positive=True)
-        tstop_f = _validate_time_scalar(tstop, name="tstop", positive=False)
-        self._refresh_compile_config_from_ctx()
-        self._sync_runtime_clock()
+        if observer is not None:
+            observer.validate_dt(dt_f)
+        request_steps, request_duration = native_horizon_request(
+            tstop, steps=steps, duration=duration
+        )
+        if draws is None:
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
 
         # Normalize callbacks.
         if callbacks is None:
             callbacks = []
         if not isinstance(callbacks, CallbackList):
             callbacks = CallbackList(callbacks)
-        for c in callbacks:
-            c.dt = self.dt
+        if draws is None:
+            for c in callbacks:
+                _bind_callback_dt(c, self.dt)
 
         # Use the same retained-duration budget as run()/longrun(). Exact
         # decimal-form arithmetic keeps common decimal multiples composable
         # without promoting a genuinely just-before-grid duration.
-        n_steps, duration_remainder = self._duration_budget(tstop_f, dt_f)
+        n_steps, duration_remainder = execution_step_budget(
+            request_steps, request_duration, dt_f, self._duration_budget
+        )
+        draw_tape = None
+        if draws is not None:
+            from dendra.func._native_runtime_draws import bind_network_runtime_draw_tape
+
+            draw_tape = bind_network_runtime_draw_tape(
+                self, draws, steps=n_steps, extra=extra, dt=dt_f, checkpointed=True
+            )
+            self._refresh_compile_config_from_ctx()
+            self._sync_runtime_clock()
+            for c in callbacks:
+                _bind_callback_dt(c, self.dt)
         initial_time = self.t.double().detach().clone()
         t_grid = initial_time + dt_f * torch.arange(
             n_steps,
@@ -4824,6 +6040,24 @@ class Network(RNGMixin):
                 pop.intra = pop.build_intra()
             if pop.intra is not None:
                 intra_sources[name] = pop.intra
+
+        with torch.set_grad_enabled(self.training):
+            runtime_inputs = _network_runtime_inputs(
+                self, inputs, extra=extra, intra=intra_sources, steps=n_steps
+            )
+        replay_extra = {
+            name: (spatial, temporal)
+            for name, (spatial, temporal, _device, _dtype) in extra_prepped.items()
+        }
+        replay_names = (
+            ()
+            if draw_tape is None
+            else tuple(
+                name
+                for name, plan in draw_tape.plan.populations.items()
+                if plan.has_bank_poisson
+            )
+        )
 
         def _as_loss_tensor(x):
             if x is None:
@@ -4869,27 +6103,31 @@ class Network(RNGMixin):
 
             return _clone_any(sd)
 
-        def _copy_state_containers(sd):
-            """Deep-copy container structure while preserving tensor identity."""
-
-            def _copy_any(v):
-                if isinstance(v, dict):
-                    return {kk: _copy_any(vv) for kk, vv in v.items()}
-                if isinstance(v, list):
-                    return [_copy_any(vv) for vv in v]
-                if isinstance(v, tuple):
-                    return tuple(_copy_any(vv) for vv in v)
-                return v
-
-            return _copy_any(sd)
+        def _checkpoint_contexts():
+            return (
+                _checkpoint_recompute_contexts(self)
+                if draw_tape is None
+                else draw_tape.checkpoint_contexts()
+            )
 
         total_loss = None
         saw_any_loss = False
+        ambient_grad_enabled = torch.is_grad_enabled()
 
-        with torch.nn.utils.parametrize.cached():
+        with (
+            _native_callback_storage(observer) as observer,
+            torch.nn.utils.parametrize.cached(),
+        ):
             with torch.set_grad_enabled(self.training):
-                self._set_duration_remainder(duration_remainder)
+                if n_steps:
+                    self._refresh_detached_materializations(
+                        dt_f, grad_enabled=ambient_grad_enabled
+                    )
+                if duration_remainder is not None:
+                    self._set_duration_remainder(duration_remainder)
                 pre_loop_hook(callbacks, self)
+                if observer is not None:
+                    observed_state, observed_parts = observer.start()
 
                 # Snapshot boundary state after pre-loop hooks.
                 state = self.state_dict_for_checkpoint()
@@ -4902,12 +6140,43 @@ class Network(RNGMixin):
 
                 # Local alias for speed
                 _checkpoint = torch.utils.checkpoint.checkpoint
+                checkpoint_options = {
+                    "use_reentrant": False,
+                    "determinism_check": "none",
+                }
+                if restore_state_after_backward:
+                    checkpoint_options["context_fn"] = _checkpoint_contexts
 
+                input_offset = 0
                 for chunk_idx, t_chunk in enumerate(t_chunks):
+                    draw_start = input_offset
+                    inputs_chunk = _slice_network_runtime_inputs(
+                        runtime_inputs, input_offset, input_offset + len(t_chunk)
+                    )
+                    checkpoint_inputs, input_spec = (
+                        ((), None)
+                        if inputs_chunk is None
+                        else pytree.tree_flatten(inputs_chunk)
+                    )
+                    input_offset += len(t_chunk)
                     if pbar is not None:
                         pbar.set_description(f"{t_chunk[0].item():.1f} ms")
 
-                    def _run_chunk(state_in, t_chunk_local=t_chunk):
+                    def _run_chunk(
+                        state_in,
+                        observed_state_in=None,
+                        *input_values,
+                        t_chunk_local=t_chunk,
+                        input_spec_local=input_spec,
+                        draw_start_local=draw_start,
+                    ):
+                        if draw_tape is not None:
+                            draw_tape.validate_fresh()
+                        inputs_local = (
+                            None
+                            if input_spec_local is None
+                            else pytree.tree_unflatten(input_values, input_spec_local)
+                        )
                         # Optional safety: clone checkpoint inputs to avoid
                         # in-place mutation of checkpoint input tensors.
                         state_local = state_in
@@ -4919,8 +6188,12 @@ class Network(RNGMixin):
 
                         # Prepare per-chunk intra specs (bounded to chunklength).
                         intra_chunk = {}
+                        if draw_tape is None:
+                            reconcile_extra_poisson_rng(self, extra)
                         if len(intra_sources) > 0:
                             for name, intra_obj in intra_sources.items():
+                                if name in replay_names:
+                                    continue
                                 stims, indices = self.populations[name].prep_intra(
                                     intra_obj, len(t_chunk_local), dt_f
                                 )
@@ -4935,6 +6208,8 @@ class Network(RNGMixin):
                                 dev,
                                 dtp,
                             ) in extra_prepped.items():
+                                if name in replay_names:
+                                    continue
                                 t0 = self.t.to(device=dev, dtype=dtp)
                                 chunk_steps = int(len(t_chunk_local))
                                 t_grid_local = _time_grid_from_step_count(
@@ -4946,6 +6221,7 @@ class Network(RNGMixin):
                                     t_grid_local,
                                     n_steps=chunk_steps,
                                     name=f"extra[{name!r}] Waveform output",
+                                    rng_owner=self,
                                 )
                                 extra_ts[name] = (
                                     v_dev,
@@ -4954,8 +6230,16 @@ class Network(RNGMixin):
 
                         chunk_loss = None
                         saw_loss_local = False
+                        if observer is not None:
+                            observed_state_local = observed_state_in
+                            emissions = []
 
                         for i_t in range(len(t_chunk_local)):
+                            replay = (
+                                None
+                                if draw_tape is None
+                                else draw_tape.frame(draw_start_local + i_t)
+                            )
                             # Intra for this step.
                             intra_c = {}
                             if len(intra_chunk) > 0:
@@ -4971,8 +6255,25 @@ class Network(RNGMixin):
                             if len(extra_ts) > 0:
                                 for name, (v_dev, ts) in extra_ts.items():
                                     extra_c[name] = v_dev * ts[..., i_t].unsqueeze(-1)
+                            if replay is not None:
+                                extra_c, intra_c = _prepare_network_replay_banks(
+                                    self,
+                                    replay,
+                                    intra_sources,
+                                    replay_extra,
+                                    dt_f,
+                                    extra_c=extra_c,
+                                    intra_c=intra_c,
+                                )
+                            if inputs_local is not None:
+                                extra_c, intra_c = _apply_network_runtime_inputs(
+                                    extra_c, intra_c, inputs_local, i_t
+                                )
 
                             # Advance network dynamics.
+                            draw_options = (
+                                {} if replay is None else {"runtime_draws": replay}
+                            )
                             self._step(
                                 self.populations,
                                 self.synapses,
@@ -4984,8 +6285,17 @@ class Network(RNGMixin):
                                 extra=extra_c,
                                 intra=intra_c,
                                 compile_network_ops=self.compile_network_ops,
+                                **draw_options,
                             )
+                            if replay is not None:
+                                replay.publish_stimulation()
                             self._advance_runtime_clock()
+                            if observer is not None:
+                                observed_state_local, emitted = observer.update(
+                                    observed_state_local
+                                )
+                                if emitted is not None:
+                                    emissions.append(emitted)
 
                             # Replay-safe loss aggregation via callback returns.
                             for cb in callbacks:
@@ -5013,14 +6323,50 @@ class Network(RNGMixin):
                             device=chunk_loss.device,
                             dtype=torch.int32,
                         )
+                        if observer is not None:
+                            return (
+                                state_out,
+                                observed_state_local,
+                                observer.stack(emissions),
+                                chunk_loss,
+                                saw_loss_flag,
+                            )
                         return state_out, chunk_loss, saw_loss_flag
 
-                    state, chunk_loss, saw_loss_flag = _checkpoint(
-                        _run_chunk,
-                        state,
-                        use_reentrant=False,
-                        determinism_check="none",
-                    )
+                    if observer is None:
+                        if runtime_inputs is None:
+                            state, chunk_loss, saw_loss_flag = _checkpoint(
+                                _run_chunk, state, **checkpoint_options
+                            )
+                        else:
+                            state, chunk_loss, saw_loss_flag = _checkpoint(
+                                _run_chunk,
+                                state,
+                                None,
+                                *checkpoint_inputs,
+                                **checkpoint_options,
+                            )
+                    else:
+                        (
+                            state,
+                            observed_state,
+                            emitted_part,
+                            chunk_loss,
+                            saw_loss_flag,
+                        ) = _checkpoint(
+                            _run_chunk,
+                            state,
+                            observed_state,
+                            *checkpoint_inputs,
+                            **checkpoint_options,
+                        )
+                        observer.collect(
+                            observed_state,
+                            observed_parts,
+                            emitted_part,
+                            steps=len(t_chunk),
+                        )
+                        del emitted_part
 
                     total_loss, _ = _add_loss(total_loss, chunk_loss)
                     saw_any_loss = saw_any_loss or bool(int(saw_loss_flag.item()))
@@ -5036,30 +6382,22 @@ class Network(RNGMixin):
 
                 if pbar is not None:
                     pbar.close()
+                if observer is not None:
+                    functional_results = observer.finish(observed_state, observed_parts)
 
         if not saw_any_loss:
+            total_loss = None
+            if observer is None:
+                if return_final_state:
+                    return None, self.state_dict_for_checkpoint()
+                return None
+
+        final_state = self.state_dict_for_checkpoint() if return_final_state else None
+
+        if observer is not None:
             if return_final_state:
-                return None, self.state_dict_for_checkpoint()
-            return None
-
-        final_state = None
-        if restore_state_after_backward or return_final_state:
-            final_state = self.state_dict_for_checkpoint()
-
-        if (
-            restore_state_after_backward
-            and isinstance(total_loss, torch.Tensor)
-            and total_loss.requires_grad
-        ):
-            final_state_for_hook = _copy_state_containers(final_state)
-
-            def _queue_restore(grad, fs=final_state_for_hook):
-                torch.autograd.Variable._execution_engine.queue_callback(
-                    lambda: self.restore_dict_from_checkpoint(fs)
-                )
-                return grad
-
-            total_loss.register_hook(_queue_restore)
+                return total_loss, final_state, functional_results
+            return total_loss, functional_results
 
         if return_final_state:
             return total_loss, final_state
@@ -5083,7 +6421,42 @@ def prepare_extra(extra, local_ind: int):
     return {n: v * t[..., local_ind].unsqueeze(-1) for n, (v, t) in extra.items()}
 
 
-def _evaluate_extra_waveform(pop, waveform, time_grid, *, n_steps, name):
+def _prepare_network_replay_banks(
+    network, replay, intra, extra, dt, *, extra_c=None, intra_c=None
+):
+    """Evaluate accepted-step banks using one ordered explicit invocation cursor."""
+    prepared_extra = {}
+    with replay.bank_scope(finish=False):
+        for name, (spatial, waveform) in extra.items():
+            if not replay.populations[name].plan.has_bank_poisson:
+                continue
+            population = network.populations[name]
+            device, dtype = population.device(), population.dtype()
+            start = network.t.to(device=device, dtype=dtype)
+            times = _time_grid_from_step_count(start, 1, dt, device=device).to(dtype)
+            values = _evaluate_extra_waveform(
+                population,
+                waveform,
+                times,
+                n_steps=1,
+                name=f"extra[{name!r}] Waveform output",
+                rng_owner=network,
+            )
+            prepared_extra[name] = (spatial, values)
+        prepared_intra = {
+            name: (source, *network.populations[name].prep_intra(source, 1, dt))
+            for name, source in intra.items()
+            if replay.populations[name].plan.has_bank_poisson
+        }
+    extra_c = {} if extra_c is None else extra_c
+    intra_c = {} if intra_c is None else intra_c
+    extra_c.update(prepare_extra(prepared_extra, 0))
+    return extra_c, prepare_intra(intra_c, prepared_intra, 0)
+
+
+def _evaluate_extra_waveform(
+    pop, waveform, time_grid, *, n_steps, name, rng_owner=None
+):
     """Place and evaluate one Network waveform before another can move it.
 
     ``Module.to`` mutates a waveform in place.  Evaluating immediately is
@@ -5092,7 +6465,8 @@ def _evaluate_extra_waveform(pop, waveform, time_grid, *, n_steps, name):
     placement requested for the final population.
     """
     waveform = waveform.to(device=pop.device(), dtype=pop.dtype())
-    values = waveform(time_grid)
+    with borrow_pending_poisson_rng(pop if rng_owner is None else rng_owner, waveform):
+        values = waveform(time_grid)
     return pop._normalize_temporal_values(
         values,
         n_steps=n_steps,

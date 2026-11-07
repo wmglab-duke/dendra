@@ -16,6 +16,7 @@
 
 import inspect
 import os
+import re
 from pathlib import Path
 
 # -- Project information -----------------------------------------------------
@@ -127,23 +128,68 @@ autodoc_typehints_description_target = "documented"
 add_module_names = False
 autodoc_member_order = "bysource"
 
-autoclass_content = "class"
+autoclass_content = "both"
 autodoc_inherit_docstrings = False
 
 
-def skip_inplace_methods(app, what, name, obj, skip, options):
-    # Only touch class members
-    if what == "class":
-        # Skip methods like `initialize_`, `fit_`, etc.
-        # but do NOT skip dunder methods like __init__
-        if name.endswith("_") and not name.endswith("__"):
-            # Optionally also ensure it's a routine (method/function)
-            if inspect.isroutine(obj):
-                return True  # tell Sphinx to skip this member
+def _signature_parts(body):
+    """Split a displayed signature without splitting defaults or annotations."""
+    parts, start, depth, quote, escaped = [], 0, 0, None, False
+    for index, char in enumerate(body):
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif char in "\"'":
+            quote = char
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth -= 1
+        elif char == "," and depth == 0:
+            parts.append(body[start:index].strip())
+            start = index + 1
+    parts.append(body[start:].strip())
+    return [part for part in parts if part]
 
-    # Fall back to the default behavior for everything else
-    return None  # or `return skip` is also acceptable
+
+def public_api_signature(app, what, name, obj, options, signature, return_annotation):
+    """Display public arguments and stable omission defaults in the reference."""
+    if signature is None:
+        return None
+    signature = re.sub(r"<[\w.]+ object(?: at 0x[0-9a-fA-F]+)?>", "...", signature)
+    try:
+        parameters = inspect.signature(obj).parameters.values()
+    except (TypeError, ValueError):
+        return signature, return_annotation
+    private = {
+        parameter.name for parameter in parameters if parameter.name.startswith("_")
+    }
+    if any(
+        parameter.name in private
+        and parameter.default is inspect.Parameter.empty
+        and parameter.kind
+        not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+        for parameter in parameters
+    ):
+        return "", None
+    if private and signature.startswith("(") and signature.endswith(")"):
+        parts = _signature_parts(signature[1:-1])
+        parts = [
+            part
+            for part in parts
+            if re.split(r"\s*[:=]", part, maxsplit=1)[0] not in private
+        ]
+        if "*" in parts:
+            index = parts.index("*")
+            if all(part.startswith("**") for part in parts[index + 1 :]):
+                parts.pop(index)
+        signature = "(" + ", ".join(parts) + ")"
+    return signature, return_annotation
 
 
 def setup(app):
-    app.connect("autodoc-skip-member", skip_inplace_methods)
+    app.connect("autodoc-process-signature", public_api_signature)

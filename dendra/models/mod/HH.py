@@ -5,11 +5,16 @@ from ..mechanisms.ops import exp, vtrap
 
 
 class mhn(S):
+    """Independent HH gates in canonical rate form ``x' = x_a - x_b*x``.
+
+    Assigned fields contain only the temperature-adjusted source and decay
+    rates. Equilibrium initialization uses the unscaled rates directly; the
+    former public ``minf``/``mtau`` (and h/n equivalents) are not computed.
+    """
+
     S.STATE("m", "h", "n")
-    S.DERIVATIVE(
-        "m' = (minf - m) / mtau", "h' = (hinf - h) / htau", "n' = (ninf - n) / ntau"
-    )
-    S.ASSIGNED("minf", "mtau", "hinf", "htau", "ninf", "ntau")
+    S.DERIVATIVE("m' = m_a - m_b * m", "h' = h_a - h_b * h", "n' = n_a - n_b * n")
+    S.ASSIGNED("m_a", "m_b", "h_a", "h_b", "n_a", "n_b")
     S.DERIVED_BUFFER("q10")
     S.GLOBAL(am1=0.1, am2=4.0, ah1=0.07, ah2=1.0, an1=0.01, an2=0.125)
 
@@ -18,34 +23,37 @@ class mhn(S):
 
     def assigned_values(self, v, values):
         del values
-        q10 = self.q10
         alpha_m = self.am1 * vtrap(-(v + 40), 10)
         beta_m = self.am2 * exp(-(v + 65) / 18)
-        tot = alpha_m + beta_m
-        mtau = 1 / (q10 * tot)
-        minf = alpha_m / tot
         alpha_h = self.ah1 * exp(-(v + 65) / 20)
         beta_h = self.ah2 / (exp(-(v + 35) / 10) + 1)
-        tot = alpha_h + beta_h
-        htau = 1 / (q10 * tot)
-        hinf = alpha_h / tot
         alpha_n = self.an1 * vtrap(-(v + 55), 10)
         beta_n = self.an2 * exp(-(v + 65) / 80)
-        tot = alpha_n + beta_n
-        ntau = 1 / (q10 * tot)
-        ninf = alpha_n / tot
+        q10 = self.q10
         return {
-            "minf": minf,
-            "mtau": mtau,
-            "hinf": hinf,
-            "htau": htau,
-            "ninf": ninf,
-            "ntau": ntau,
+            "m_a": q10 * alpha_m,
+            "m_b": q10 * (alpha_m + beta_m),
+            "h_a": q10 * alpha_h,
+            "h_b": q10 * (alpha_h + beta_h),
+            "n_a": q10 * alpha_n,
+            "n_b": q10 * (alpha_n + beta_n),
         }
 
     def state_defaults(self, v, values):
-        states = self.assigned_values(v, values)
-        return {"m": states["minf"], "h": states["hinf"], "n": states["ninf"]}
+        del values
+        alpha_m = self.am1 * vtrap(-(v + 40), 10)
+        beta_m = self.am2 * exp(-(v + 65) / 18)
+        alpha_h = self.ah1 * exp(-(v + 65) / 20)
+        beta_h = self.ah2 / (exp(-(v + 35) / 10) + 1)
+        alpha_n = self.an1 * vtrap(-(v + 55), 10)
+        beta_n = self.an2 * exp(-(v + 65) / 80)
+        # Temperature scales both rates equally. Avoid a q10 ratio here so
+        # initial equilibrium remains exactly independent of temperature.
+        return {
+            "m": alpha_m / (alpha_m + beta_m),
+            "h": alpha_h / (alpha_h + beta_h),
+            "n": alpha_n / (alpha_n + beta_n),
+        }
 
 
 class hh(M):
@@ -74,23 +82,35 @@ class hh(M):
 
     Notes
     -----
-    ``ina(v)``, ``ik(v)``, and ``il(v)`` return outward-positive current
-    densities in mA/cm². Their voltage derivatives are conductance densities in
-    S/cm².
+    The single registered nonspecific current ``i(v)`` is the sum of sodium,
+    potassium, and leak currents. ``i_affine_terms(v)`` supplies conductance
+    density ``G`` in S/cm² and source density ``J`` in mA/cm², with the
+    outward-positive convention ``i(v) = G*v - J``. Dendra generates the
+    ordinary current and conductance methods from these same coefficients.
+
+    There are no separate ``ina``, ``ik``, or ``il`` methods. Subclasses
+    changing membrane physics should override ``i_affine_terms``
+    and redeclare ``AFFINE("i")``, or provide their own current declaration.
+
+    Gates use rate coefficients ``m_a, m_b, h_a, h_b, n_a, n_b`` in
+    ``x' = x_a - x_b*x``.
     """
 
     M.STATE_BUNDLE(mhn)
     M.GLOBAL(gnabar=0.12, gkbar=0.036, gl=0.0003, ena=50.0, ek=-77.0, el=-54.3)
 
-    M.NONSPECIFIC_CURRENT("il", "ina", "ik")
+    M.NONSPECIFIC_CURRENT("i")
+    M.AFFINE("i")
 
-    def il(self, v):
-        return self.gl * (v - self.el)
+    def i(self, v):
+        G, J = self.i_affine_terms(v)
+        return G * v - J
 
-    def ina(self, v):
+    def i_affine_terms(self, v):
+        """Return total HH ``(G, J)`` with the local gates held fixed."""
         gna = self.gnabar * self.m**3 * self.h
-        return gna * (v - self.ena)
-
-    def ik(self, v):
         gk = self.gkbar * self.n**4
-        return gk * (v - self.ek)
+        return (
+            self.gl + gna + gk,
+            self.gl * self.el + gna * self.ena + gk * self.ek,
+        )

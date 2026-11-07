@@ -161,7 +161,7 @@ def test_no_grad_compiled_chunk_lazily_captures_only_its_drive_signature():
             dn.func.RolloutInput(ve=ve),
         )
 
-    assert set(functional._structured_step_graphs) == {(True, False)}
+    assert set(functional._structured_step_graphs) == {(True, False, "auto")}
     assert len(graphs) == 1
     assert any(
         node.op == "call_function" and node.target is torch.ops.higher_order.while_loop
@@ -721,7 +721,7 @@ def test_inference_mode_lowering_and_structured_capture_own_versioned_tensors():
         for tree in owned_trees
         for value in torch.utils._pytree.tree_leaves(tree)
     )
-    assert set(functional._structured_step_graphs) == {(True, False)}
+    assert set(functional._structured_step_graphs) == {(True, False, "auto")}
 
 
 def test_prepare_rejects_unversioned_inference_tensor_sources():

@@ -270,12 +270,11 @@ def energy(
 
 
 class sin(Waveform):
-    """
-    Sinusoidal waveform generator.
+    """Sinusoidal waveform generator.
 
     Generates either a single sinusoid or a sum of sinusoidal oscillator
-    components. The waveform is zero before each component's delay and after
-    each component's effective off time.
+    components. Each component is active on the half-open interval
+    ``delay <= t < min(off, delay + off_after)`` and zero elsewhere.
 
     Parameters
     ----------
@@ -308,9 +307,17 @@ class sin(Waveform):
     - ``[K]``: ``K`` oscillator components, summed to output shape ``[T]``.
     - ``[B, K]``: ``B`` batches of ``K`` oscillator components, summed over
       components to output shape ``[B, T]``.
-    - ``[..., K, T]`` or ``[..., K, 1]``: explicit time axis; the component
-      axis is the dimension immediately before time, and the output shape is
-      ``[..., T]``.
+    - For rank three or higher, a final dimension of length ``1`` or ``T``
+      is an explicit time axis. The preceding axis contains components, which
+      are summed, leaving output shape ``[..., T]``.
+    - Otherwise a time axis is appended and the final parameter axis contains
+      components. Include an explicit time axis to avoid ambiguity when the
+      component count equals ``T``.
+
+    A trailing singleton is therefore not an additional batch axis. For one
+    component over two leading axes, use parameter shape ``[B, N, 1, 1]``;
+    ``[B, N, 1]`` instead treats ``N`` as the component axis and sums it.
+    These conventions describe evaluation on a one-dimensional time grid.
 
     Timing parameters use surrogate gradients while the forward waveform keeps
     abrupt edges. ``delay`` moves both the onset gate and the carrier phase;
@@ -383,12 +390,11 @@ class sin(Waveform):
 
 
 class cos(Waveform):
-    """
-    Cosine waveform generator.
+    """Cosine waveform generator.
 
     Generates either a single cosine or a sum of cosine oscillator components.
-    The waveform is zero before each component's delay and after each
-    component's effective off time.
+    Each component is active on the half-open interval
+    ``delay <= t < min(off, delay + off_after)`` and zero elsewhere.
 
     Parameters
     ----------
@@ -421,9 +427,17 @@ class cos(Waveform):
     - ``[K]``: ``K`` oscillator components, summed to output shape ``[T]``.
     - ``[B, K]``: ``B`` batches of ``K`` oscillator components, summed over
       components to output shape ``[B, T]``.
-    - ``[..., K, T]`` or ``[..., K, 1]``: explicit time axis; the component
-      axis is the dimension immediately before time, and the output shape is
-      ``[..., T]``.
+    - For rank three or higher, a final dimension of length ``1`` or ``T``
+      is an explicit time axis. The preceding axis contains components, which
+      are summed, leaving output shape ``[..., T]``.
+    - Otherwise a time axis is appended and the final parameter axis contains
+      components. Include an explicit time axis to avoid ambiguity when the
+      component count equals ``T``.
+
+    A trailing singleton is therefore not an additional batch axis. For one
+    component over two leading axes, use parameter shape ``[B, N, 1, 1]``;
+    ``[B, N, 1]`` instead treats ``N`` as the component axis and sums it.
+    These conventions describe evaluation on a one-dimensional time grid.
 
     Timing parameters use surrogate gradients while the forward waveform keeps
     abrupt edges. ``delay`` moves both the onset gate and the carrier phase;
@@ -496,42 +510,38 @@ class cos(Waveform):
 
 
 class mono_rect(Waveform):
-    """
-    Monophasic rectangular pulse waveform generator.
-
-    Generates a single rectangular pulse with configurable amplitude,
-    delay, and pulse width (duration). The waveform is zero outside the pulse
-    duration.
+    """A rectangular pulse on the half-open interval ``[delay, delay + pw)``.
 
     Parameters
     ----------
-    amp : float, optional
-        Amplitude of the rectangular pulse. Default is -1.0.
-    delay : float, optional
-        Time delay before the pulse starts in ms. Default is 0.0.
-    pw : float, optional
-        Width of the pulse in ms. Default is 1.0.
-    tau : float, optional
-        Sigmoid temperature for differentiable edges in ms. Default is 0.1.
+    amp : float or Tensor, default 1.0
+        Pulse amplitude in the desired output units, such as mA for current.
+    delay : float or Tensor, default 0.0
+        Pulse onset in milliseconds.
+    pw : float or Tensor, default 1.0
+        Pulse width in milliseconds.
+    tau : float or Tensor, default 0.1
+        Sigmoid temperature in milliseconds for surrogate edge gradients.
 
     Notes
     -----
-    The waveform is defined as:
+    The forward value is ``amp`` when ``delay <= t < delay + pw`` and zero
+    elsewhere. The forward edges remain abrupt; backward evaluation uses the
+    sigmoid gate, with ``tau`` clamped to at least 1e-6 ms.
 
-    .. math::
-        f(t) =
-        \\begin{cases}
-        \\text{amp} & \\text{if } \\text{delay} \\leq t \\leq \\text{delay} + \\text{duration} \\\\
-        0 & \\text{otherwise}
-        \\end{cases}
+    For a one-dimensional time grid of length ``T``, scalar parameters produce
+    ``[T]``. Non-scalar parameters gain a final time axis unless they already end
+    in a singleton dimension. That trailing ``1`` is the explicit time axis even
+    for tensors of rank three or higher. For example, ``[B, N, C, 1]`` retains
+    all three leading axes and produces ``[B, N, C, T]``, including when ``C=1``.
+    Parameter dimensions broadcast together before evaluation.
 
     Examples
     --------
     >>> import torch
     >>> import dendra as dn
     >>> waveform = dn.mono_rect(amp=-2.0, pw=0.5)
-    >>> t = torch.linspace(0, 2, 100)
-    >>> values = waveform(t)
+    >>> values = waveform(torch.linspace(0, 2, 100))
     """
 
     FUNCTIONAL_PURE = True
@@ -549,49 +559,40 @@ class mono_rect(Waveform):
 
 
 class bi_rect(Waveform):
-    """
-    Biphasic rectangular pulse waveform generator.
-
-    Generates a two-phase rectangular pulse with configurable amplitudes,
-    pulse widths, delay, and inter-phase interval. The waveform is zero
-    outside the pulse durations.
+    """Two rectangular phases with independently configured amplitudes and widths.
 
     Parameters
     ----------
-    amp1 : float, optional
-        Amplitude of the first phase. Default is -1.0.
-    amp2 : float, optional
-        Amplitude of the second phase. Default is 1.0.
-    delay : float, optional
-        Time delay before the pulse starts in ms. Default is 0.0.
-    pw1 : float, optional
-        Pulse width of the first phase in ms. Default is 1.0.
-    pw2 : float, optional
-        Pulse width of the second phase in ms. Default is 1.0.
-    interval : float, optional
-        Time interval between the two phases in ms. Default is 0.0.
-    tau : float, optional
-        Sigmoid temperature for differentiable edges in ms. Default is 0.1.
+    amp1 : float or Tensor, default -1.0
+        First-phase amplitude in the desired output units.
+    amp2 : float or Tensor, default 1.0
+        Second-phase amplitude in the same units.
+    delay : float or Tensor, default 0.0
+        First-phase onset in milliseconds.
+    pw1 : float or Tensor, default 1.0
+        First-phase width in milliseconds.
+    pw2 : float or Tensor, default 1.0
+        Second-phase width in milliseconds.
+    interval : float or Tensor, default 0.0
+        Gap between the first-phase stop and second-phase start, in milliseconds.
+    tau : float or Tensor, default 0.1
+        Sigmoid temperature in milliseconds for surrogate edge gradients.
 
     Notes
     -----
-    The waveform is defined as:
+    The phases occupy ``[delay, delay + pw1]`` and
+    ``[delay + pw1 + interval, delay + pw1 + interval + pw2]``. Both endpoints
+    are included and the phase contributions add wherever they overlap. Thus
+    ``interval=0`` returns ``amp1 + amp2`` at the shared boundary.
 
-    .. math::
-        f(t) =
-        \\begin{cases}
-        \\text{amp1} & \\text{if } \\text{delay} \\leq t \\leq \\text{delay} + \\text{pw1} \\\\
-        \\text{amp2} & \\text{if } \\text{delay} + \\text{pw1} + \\text{interval} \\leq t \\leq \\text{delay} + \\text{pw1} + \\text{interval} + \\text{pw2} \\\\
-        0 & \\text{otherwise}
-        \\end{cases}
+    Parameter broadcasting and the hard-forward/surrogate-gradient edge contract
+    follow :class:`~dendra.models.stim.waveform.mono_rect`. In particular, a
+    trailing singleton parameter dimension is an explicit time axis.
 
     Examples
     --------
-    >>> import torch
     >>> import dendra as dn
     >>> waveform = dn.bi_rect(amp1=-2.0, amp2=1.0, pw1=0.5, pw2=1.0)
-    >>> t = torch.linspace(0, 3, 100)
-    >>> values = waveform(t)
     """
 
     FUNCTIONAL_PURE = True
@@ -627,52 +628,40 @@ class bi_rect(Waveform):
 
 
 class bi_rect_balanced(Waveform):
-    """
-    Charge-balanced biphasic rectangular pulse waveform generator.
-
-    Generates a two-phase rectangular pulse where the second phase amplitude
-    is automatically adjusted to maintain charge balance based on the pulse widths.
-    The waveform is zero outside the pulse durations.
+    """Biphasic rectangular pulse with equal and opposite continuous phase areas.
 
     Parameters
     ----------
-    amp : float, optional
-        Amplitude of the first phase. Default is 1.0.
-    delay : float, optional
-        Time delay before the pulse starts in ms. Default is 0.0.
-    pw1 : float, optional
-        Pulse width of the first phase in ms. Default is 1.0.
-    pw2 : float, optional
-        Pulse width of the second phase in ms. Default is 1.0.
-    interval : float, optional
-        Time interval between the two phases in ms. Default is 0.0.
-    tau : float, optional
-        Sigmoid temperature for differentiable edges in ms. Default is 0.1.
+    amp : float or Tensor, default 1.0
+        First-phase amplitude in the desired output units.
+    delay : float or Tensor, default 0.0
+        First-phase onset in milliseconds.
+    pw1 : float or Tensor, default 1.0
+        First-phase width in milliseconds.
+    pw2 : float or Tensor, default 1.0
+        Second-phase width in milliseconds. Use positive widths for charge balance.
+    interval : float or Tensor, default 0.0
+        Gap between the phases in milliseconds.
+    tau : float or Tensor, default 0.1
+        Sigmoid temperature in milliseconds for surrogate edge gradients.
 
     Notes
     -----
-    The waveform is defined as:
+    The first phase has amplitude ``amp`` and the second has amplitude
+    ``-amp * pw1 / max(pw2, 1e-12)``. The phases occupy the same inclusive
+    intervals as :class:`~dendra.models.stim.waveform.bi_rect`; contributions
+    add at overlapping endpoints. Charge balance describes the continuous pulse
+    areas for widths above the denominator's 1e-12 ms floor, rather than an
+    exact sum on every sampled grid.
 
-    .. math::
-        f(t) =
-        \\begin{cases}
-        \\text{amp} & \\text{if } \\text{delay} \\leq t \\leq \\text{delay} + \\text{pw1} \\\\
-        -\\text{amp} \\cdot \\frac{\\text{pw1}}{\\text{pw2}} & \\text{if } \\text{delay} + \\text{pw1} + \\text{interval} \\leq t \\leq \\text{delay} + \\text{pw1} + \\text{interval} + \\text{pw2} \\\\
-        0 & \\text{otherwise}
-        \\end{cases}
-
-    The amplitude of the second phase is scaled to ensure charge balance, where:
-
-    .. math::
-        \\text{amp2} = -\\text{amp} \\cdot \\frac{\\text{pw1}}{\\text{pw2}}
+    Parameter broadcasting and surrogate gradients follow
+    :class:`~dendra.models.stim.waveform.mono_rect`, including the explicit
+    trailing singleton time axis.
 
     Examples
     --------
-    >>> import torch
     >>> import dendra as dn
     >>> waveform = dn.bi_rect_balanced(amp=2.0, pw1=0.5, pw2=1.0)
-    >>> t = torch.linspace(0, 3, 100)
-    >>> values = waveform(t)
     """
 
     FUNCTIONAL_PURE = True
@@ -702,47 +691,36 @@ class bi_rect_balanced(Waveform):
 
 
 class bi_rect_symm(Waveform):
-    """
-    Symmetric biphasic rectangular pulse waveform generator.
-
-    Generates a two-phase rectangular pulse with equal but opposite amplitudes
-    and identical pulse widths. The waveform is zero outside the pulse durations.
+    """Biphasic rectangular pulse with equal widths and opposite amplitudes.
 
     Parameters
     ----------
-    amp : float, optional
-        Amplitude of the first phase. Default is 1.0.
-    delay : float, optional
-        Time delay before the pulse starts in ms. Default is 0.0.
-    pw : float, optional
-        Pulse width for each phase in ms. Default is 1.0.
-    interval : float, optional
-        Time interval between the two phases in ms. Default is 0.0.
-    tau : float, optional
-        Sigmoid temperature for differentiable edges in ms. Default is 0.1.
+    amp : float or Tensor, default 1.0
+        First-phase amplitude; the second phase has amplitude ``-amp``.
+    delay : float or Tensor, default 0.0
+        First-phase onset in milliseconds.
+    pw : float or Tensor, default 1.0
+        Width of each phase in milliseconds.
+    interval : float or Tensor, default 0.0
+        Gap between the phases in milliseconds.
+    tau : float or Tensor, default 0.1
+        Sigmoid temperature in milliseconds for surrogate edge gradients.
 
     Notes
     -----
-    The waveform is defined as:
+    The phases occupy ``[delay, delay + pw]`` and
+    ``[delay + pw + interval, delay + 2*pw + interval]``. Both endpoints are
+    included; opposite contributions cancel at the shared boundary when
+    ``interval=0``. The continuous phase areas are equal and opposite.
 
-    .. math::
-        f(t) =
-        \\begin{cases}
-        \\text{amp} & \\text{if } \\text{delay} \\leq t \\leq \\text{delay} + \\text{pw} \\\\
-        -\\text{amp} & \\text{if } \\text{delay} + \\text{pw} + \\text{interval} \\leq t \\leq \\text{delay} + 2\\text{pw} + \\text{interval} \\\\
-        0 & \\text{otherwise}
-        \\end{cases}
-
-    This waveform is charge-balanced by design due to the equal duration and
-    opposite amplitude of the two phases.
+    Parameter broadcasting and surrogate gradients follow
+    :class:`~dendra.models.stim.waveform.mono_rect`, including the explicit
+    trailing singleton time axis.
 
     Examples
     --------
-    >>> import torch
     >>> import dendra as dn
     >>> waveform = dn.bi_rect_symm(amp=2.0, pw=0.5, interval=0.1)
-    >>> t = torch.linspace(0, 3, 100)
-    >>> values = waveform(t)
     """
 
     FUNCTIONAL_PURE = True
@@ -768,34 +746,33 @@ class bi_rect_symm(Waveform):
 
 
 class arbitrary(Waveform):
-    """
-    Arbitrary waveform generator using linear interpolation.
-
-    Generates a waveform by linearly interpolating between specified amplitude
-    values at given time points. Values outside the specified time range are
-    set to zero.
+    """Piecewise-linear waveform through supplied time/amplitude samples.
 
     Parameters
     ----------
-    values : list or torch.Tensor, optional
-        List of amplitude values at specified time points. Default is [0.0, 0.0].
-    tpoints : list or torch.Tensor, optional
-        List of time points in ms corresponding to amplitude values. Default is [0.0, 1.0].
+    values : array-like or Tensor, optional
+        Amplitudes at the interpolation knots. Shape ``[Q]`` or ``[B, Q]``;
+        defaults to ``[0.0, 0.0]``.
+    tpoints : array-like or Tensor, optional
+        Corresponding knot times in milliseconds, sorted in ascending order.
+        Shape ``[Q]`` or ``[B, Q]``; defaults to ``[0.0, 1.0]``. Use at least
+        two distinct knots. One shared row can broadcast over amplitude rows.
 
     Notes
     -----
-    The waveform is defined by linear interpolation between the specified points.
-    For a time point t, if t is within the range of tpoints, the value is linearly interpolated;
-    if t is outside the range of tpoints, the value is 0.
+    Values outside the knot range are zero; values at the endpoints are retained.
+    A one-dimensional evaluation grid of length ``T`` produces ``[T]`` for one
+    unbatched table, or ``[B, T]`` for batched tables. Knot values and times must
+    have matching final dimensions and broadcastable row counts.
+
+    Gradients propagate through amplitudes, knot times, and query times within
+    the selected interpolation segments. Segment selection is discrete; preserve
+    sorted knot order when optimizing times.
 
     Examples
     --------
-    >>> import torch
     >>> import dendra as dn
-    >>> # Create a triangular pulse
     >>> waveform = dn.arbitrary(tpoints=[0.0, 0.5, 1.0], values=[0.0, 1.0, 0.0])
-    >>> t = torch.linspace(0, 1.5, 100)
-    >>> values = waveform(t)
     """
 
     FUNCTIONAL_PURE = True
@@ -813,6 +790,11 @@ class arbitrary(Waveform):
         transformed = (
             torch.compiler.is_compiling() or torch._C._are_functorch_transforms_active()
         )
+        if not transformed:
+            # Direct make_fx scan capture sets neither flag above.
+            from torch.fx.experimental.proxy_tensor import get_proxy_mode
+
+            transformed = get_proxy_mode() is not None
         if transformed:
             differentiate_tpoints = True
         else:
@@ -825,30 +807,26 @@ class arbitrary(Waveform):
 
 
 class constant(Waveform):
-    """
-    Constant waveform generator.
-
-    Generates a constant value over time.
+    """Constant amplitude broadcast over the evaluation time grid.
 
     Parameters
     ----------
-    value : float, optional
-        The constant value to generate. Default is 0.0.
+    value : float or Tensor, default 0.0
+        Output amplitude, in units determined by the stimulation target.
 
     Notes
     -----
-    The waveform is defined as:
-
-    .. math::
-        f(t) = \\text{value}
+    For a one-dimensional time grid of length ``T``, a scalar produces ``[T]``.
+    A non-scalar value gains a final time axis unless it already ends in a
+    singleton dimension. That trailing ``1`` is an explicit time axis even for
+    rank-three or higher values: ``[B, N, C, 1]`` produces ``[B, N, C, T]``.
+    The value is not interpreted as time-varying because an axis happens to have
+    length ``T``.
 
     Examples
     --------
-    >>> import torch
     >>> import dendra as dn
     >>> waveform = dn.constant(value=5.0)
-    >>> t = torch.linspace(0, 1, 100)
-    >>> values = waveform(t)
     """
 
     FUNCTIONAL_PURE = True

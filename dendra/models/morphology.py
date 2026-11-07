@@ -729,6 +729,9 @@ class CompartmentGraph:
 class Section:
     """One named cable section in a native :class:`Morphology`.
 
+    Obtain sections through :meth:`Morphology.section`. Each section is a handle
+    owned by its Morphology; users do not construct Section objects directly.
+
     ``name`` is the Section's unique authored identity. ``labels`` is its
     read-only set of structural region tags and always includes ``name``.
     Attribute assignment is disabled; :meth:`update` performs a validated,
@@ -851,6 +854,15 @@ class SectionLocation:
                 "Section locations must lie in the closed interval [0, 1]."
             )
         object.__setattr__(self, "x", x)
+
+    def connect(self, parent: SectionLocation) -> Section:
+        """Connect this child endpoint to a parent location and return its Section.
+
+        Only authored endpoints ``0`` and ``1`` can be child locations. Parent
+        locations may lie anywhere on their Section.
+        """
+        self.section._owner.connect(parent, self)
+        return self.section
 
     def update(self, *, diam: float) -> Section:
         """Edit or insert a pt3d diameter control point at this location.
@@ -1225,9 +1237,9 @@ class Morphology:
         compiled graphs and instantiated models remain independent snapshots;
         compile or construct a new model to use the new discretization.
 
-        The calculation and odd-count rounding rule match Dendra's
-        NEURON-backed ``apply_d_lambda`` helper, but operate directly on native
-        stylized or pt3d geometry and require no NEURON objects.
+        The calculation uses the standard AC space-constant estimate and
+        odd-count rounding rule on native stylized or pt3d geometry. It requires
+        no NEURON objects.
         """
         d_lambda = _positive(d_lambda, name="d_lambda")
         freq_hz = _positive(freq_hz, name="freq_hz")

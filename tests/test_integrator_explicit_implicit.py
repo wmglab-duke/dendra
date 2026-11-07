@@ -4,6 +4,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from dendra.models.integrators import bwd_euler_ub
 from dendra.models.integrators.explicit import (
     SymmetricConv1D,
     _conv_last,
@@ -846,7 +847,7 @@ def test_unbranched_implicit_single_compartment_injection_and_imem_balance():
     assert torch.allclose(model.i_membrane, injection, atol=1e-20, rtol=1e-10)
 
 
-def test_unbranched_solver_selection_alias_fallbacks_and_clip_configuration():
+def test_unbranched_solver_selection_alias_and_fallbacks():
     model = CableModel(shape=(1, 3))
     inv = _bwd_euler_ub(model, LinearMechanism(), method="inv")
     assert inv.method == "thomas"
@@ -857,16 +858,29 @@ def test_unbranched_solver_selection_alias_fallbacks_and_clip_configuration():
         assert inv._solve is pcr_solve_t
         assert any("Falling back to PCR" in str(item.message) for item in caught)
 
-    with pytest.warns(UserWarning, match="only supported"):
-        clipped = _bwd_euler_ub(
-            model, LinearMechanism(), method="pcr", clip_scale_backward=2.0
-        )
-    assert clipped.use_gc_variant is False
-
     unknown = _bwd_euler_ub(model, LinearMechanism(), method="not-a-solver")
     with pytest.warns(UserWarning, match="Unknown or unsupported"):
         unknown._select_solver(model.device())
     assert unknown.method == "thomas"
+
+
+@pytest.mark.parametrize("method", ("thomas", "pcr", "spd"))
+@pytest.mark.parametrize("public_factory", (False, True))
+def test_unbranched_solver_rejects_removed_gradient_clipping_option(
+    method, public_factory
+):
+    model = CableModel(shape=(1, 3))
+    with pytest.raises(
+        TypeError, match="unexpected keyword argument 'clip_scale_backward'"
+    ):
+        if public_factory:
+            bwd_euler_ub(method=method, clip_scale_backward=2.0)(
+                model, LinearMechanism()
+            )
+        else:
+            _bwd_euler_ub(
+                model, LinearMechanism(), method=method, clip_scale_backward=2.0
+            )
 
 
 def test_unbranched_spd_selection_uses_solver_or_warns_and_falls_back():

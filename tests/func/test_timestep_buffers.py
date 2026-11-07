@@ -13,6 +13,14 @@ from dendra._bootstrap import torch_compiler_warning_context
 from dendra.models.mechanisms import Mechanism, State
 from dendra.models.mod import pas
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.03125
 ALT_DT = 0.078125
 STEPS = 3

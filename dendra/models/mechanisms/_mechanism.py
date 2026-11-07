@@ -19,8 +19,22 @@ from dendra.models._class_declarations import (
 )
 from dendra.models.parametric import Parameterized
 
+from ._continuous_receive import reduce_continuous_values, reset_continuous_values
+from ._delays import (
+    circular_history_plan,
+    delay_history_values,
+    gather_history_values,
+    initial_delay_history_values,
+    resolve_delay_mode,
+    shifted_history_values,
+)
+from ._injections import expand_injection_value
 from ._ions import VALENCES
 from ._materials import _canonical_material_name
+from ._noise_workspaces import (
+    complete_legacy_noise_workspace_state,
+    ensure_noise_workspace_slots,
+)
 from ._state import (
     State,
     _canonical_timestep_buffer_shape,
@@ -39,7 +53,16 @@ from ._state import (
     _validate_runtime_outputs,
 )
 from ._support import SupportMap, SupportSpec
-from ._symbolic import build_current_eq
+from ._symbolic import (
+    affine_hook_name,
+    build_affine_coefficients,
+    build_affine_current_adapter,
+    build_affine_pair_coefficients,
+    build_current_eq,
+    current_contract_owner,
+    validate_affine_current,
+)
+from .compilers.ast import EXPECTED_FACTORIZATION_ERRORS
 
 
 def _merge_list_dict(dst, src):
@@ -126,6 +149,7 @@ def _nonnegative_integer_steps(value, *, device=None, label="delay_steps"):
 
 def _mechanism_advance_signature(mech) -> tuple:
     """Static layout signature for a generated mechanism advance fast path."""
+    history_only = set(mech._delay_history_buffer_names) - set(mech._carry)
     state_layout = []
     for state_name, state_module in mech.DE.items():
         state_carry = tuple(state_module._carry)
@@ -134,6 +158,7 @@ def _mechanism_advance_signature(mech) -> tuple:
                 state_name,
                 tuple(state_module._state),
                 state_carry,
+                tuple(state_module._input_defaults.items()),
                 getattr(type(state_module), "advance", None) is State.advance,
                 getattr(type(state_module), "assigned_values", None)
                 is State.assigned_values,
@@ -142,9 +167,13 @@ def _mechanism_advance_signature(mech) -> tuple:
         )
     return (
         tuple(state_layout),
-        tuple(mech._transition_input_names),
+        tuple(
+            name for name in mech._transition_input_names if name not in history_only
+        ),
         tuple(mech._carry),
-        tuple(mech._advance_output_names()),
+        tuple(
+            name for name in mech._advance_output_names() if name not in history_only
+        ),
         bool(mech._has_authored_assigned_values),
         bool(mech._has_authored_advance),
     )
@@ -172,13 +201,16 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
     func_name = f"_advance_states_{cls_name}_{mech_name}_{id(cls):x}"
 
     lines = [
-        f"def {func_name}(self, v, dt):",
+        f"def {func_name}(self, v, dt, inputs=None):",
         "    __buffers = self._buffers",
     ]
 
     if mech.DE or mech._has_authored_advance:
         lines.append("    self._evaluate_assigned(v)")
-    transition_names = tuple(mech._transition_input_names)
+    history_only = set(mech._delay_history_buffer_names) - set(mech._carry)
+    transition_names = tuple(
+        name for name in mech._transition_input_names if name not in history_only
+    )
     if transition_names:
         lines.append("    __values = {")
         for name in transition_names:
@@ -186,6 +218,15 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
         lines.append("    }")
     else:
         lines.append("    __values = {}")
+    # A generated class may have several live instances with different cold
+    # registrations. Read each instance's fixed history inventory rather than
+    # baking the most recently constructed instance's names into the class.
+    lines.extend(
+        [
+            "    for __history_name in self._delay_history_buffer_names:",
+            "        __values[__history_name] = __buffers[__history_name]",
+        ]
+    )
     lines.append("    __values['celsius'] = self.celsius")
     lines.append("    __values['diam'] = self.diam")
     lines.append("    __DE = self.DE")
@@ -194,10 +235,12 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
     for idx, (state_key, state_module) in enumerate(mech.DE.items()):
         state_var_names = tuple(state_module._state)
         state_carry_names = tuple(state_module._carry)
-        uses_default_advance = (
-            getattr(type(state_module), "advance", None) is State.advance
-            and getattr(state_module, "method", None) != "euler_heun"
-        )
+        uses_default_advance = getattr(
+            type(state_module), "advance", None
+        ) is State.advance and getattr(state_module, "method", None) not in {
+            "euler_maruyama",
+            "euler_heun",
+        }
         uses_default_assigned = (
             getattr(type(state_module), "assigned_values", None)
             is State.assigned_values
@@ -213,6 +256,12 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
             lines.append(
                 f"    __state_values_{idx}[{carry_name!r}] = "
                 f"__state_module_{idx}._buffers[{carry_name!r}]"
+            )
+        if state_module._inputs:
+            lines.append(
+                f"    __state_values_{idx}.update(__state_module_{idx}."
+                f"_input_value_frame(v, None if inputs is None else "
+                f"inputs.get({state_key!r})))"
             )
 
         if uses_default_advance:
@@ -260,8 +309,17 @@ def _compile_monomorphic_mechanism_advance(mech, signature: tuple):
         )
         lines.extend(commit_lines)
     for name in mech._advance_output_names():
+        if name in history_only:
+            continue
         lines.append(f"    if {name!r} in __mechanism_updates:")
         lines.append(f"        setattr(self, {name!r}, __mechanism_updates[{name!r}])")
+    lines.extend(
+        [
+            "    for __history_name in self._delay_history_buffer_names:",
+            "        if __history_name not in self._carry and __history_name in __mechanism_updates:",
+            "            setattr(self, __history_name, __mechanism_updates[__history_name])",
+        ]
+    )
     lines.append("    return None")
 
     source = "\n".join(lines) + "\n"
@@ -582,6 +640,17 @@ class Mechanism(Parameterized):
                 "names; "
                 f"duplicates: {sorted(duplicate_state_names)}"
             )
+        overlapping_inputs = {
+            name
+            for state_type in new_state
+            for name in state_type._inputs
+            if name in flattened_state_names
+        }
+        if overlapping_inputs:
+            raise ValueError(
+                "State INPUT names conflict with flattened State variables: "
+                f"{sorted(overlapping_inputs)}"
+            )
         for i_list in consume_class_values(
             cls, "mechanism.ion", Mechanism._ion_declarations
         ):
@@ -682,10 +751,13 @@ class Mechanism(Parameterized):
             "_current_conductance_fallback_reason",
             "_current_conductance_mode",
             "_current_factorable",
+            "_affine_evaluators",
+            "_affine_coefficient_fields",
             "_delayed_state_specs",
             "_init_params",
             "_injection_specs",
             "_name",
+            "_voltage_schema_validated",
             "_support_key_values_valid",
             "base_ndim",
             "celsius",
@@ -811,18 +883,18 @@ class Mechanism(Parameterized):
             # their namespace. Rebind those exact metadata/method clones to the
             # owner selected in the alias's new MRO.
             for current in cls.__dict__["_affine"]:
-                owner = _mro_attribute_owner(cls, current)
+                owner = current_contract_owner(cls, current)
                 new_affine.add(current)
                 new_affine_method_owners[current] = owner
         else:
             for current, asserted_owners in inherited_affine_method_owners.items():
-                owner = _mro_attribute_owner(cls, current)
+                owner = current_contract_owner(cls, current)
                 if owner in asserted_owners:
                     new_affine.add(current)
                     new_affine_method_owners[current] = owner
 
         for current in declared_affine:
-            owner = _mro_attribute_owner(cls, current)
+            owner = current_contract_owner(cls, current)
             new_affine.add(current)
             new_affine_method_owners[current] = owner
 
@@ -848,6 +920,11 @@ class Mechanism(Parameterized):
             for currents in (*new_currents.values(), *new_write_ion.values())
             for current in currents
         }
+        current_runtime_slots.update(
+            f"_affine_{current}"
+            for currents in (*new_currents.values(), *new_write_ion.values())
+            for current in currents
+        )
         overlap = (workspace_buffers | nested_workspace_buffers) & runtime_local_slots
         overlap.update(workspace_buffers & current_runtime_slots)
         if overlap:
@@ -889,6 +966,22 @@ class Mechanism(Parameterized):
                 f"execution slots: {sorted(overlap)}"
             )
 
+        input_names = {name for state_type in new_state for name in state_type._inputs}
+        overlap = input_names & (
+            state_names
+            | set(new_carry)
+            | set(new_assigned)
+            | workspace_buffers
+            | runtime_local_slots
+            | saved_current_buffer_names
+            | reserved_execution_slots
+        )
+        if overlap:
+            raise ValueError(
+                "State INPUT names conflict with parent Mechanism runtime "
+                f"fields: {sorted(overlap)}"
+            )
+
         cls.state_classes = {s.__name__: s for s in new_state}
 
         cls._state = tuple(new_state)
@@ -914,6 +1007,13 @@ class Mechanism(Parameterized):
         cls._affine = new_affine
         cls._affine_method_owners = new_affine_method_owners
         cls._name = None
+
+        # Coefficients are a complete current definition. Authors need not
+        # duplicate I=G*v-J merely to support explicit integration, current
+        # recording, or the original assembly path.
+        for current in declared_current_names:
+            if not hasattr(cls, current) and affine_hook_name(cls, current):
+                setattr(cls, current, build_affine_current_adapter(current))
 
         set_dt_owner = _mro_attribute_owner(cls, "set_dt")
         if set_dt_owner is not None and not getattr(
@@ -1003,6 +1103,7 @@ class Mechanism(Parameterized):
         # state delays.  Each entry in _delayed_state_specs maps a user-facing
         # delay name to registered buffer/pointer names and update policy.
         self._delayed_state_specs = {}
+        self._delay_history_buffer_names = ()
 
         if key is not None:
             if is_composable:
@@ -1164,8 +1265,10 @@ class Mechanism(Parameterized):
         self._assigned_schema_validated = False
         self._advance_schema_validated = False
         self._advance_return_names = ()
+        self._voltage_schema_validated = False
 
         self._timestep_buffer_schema = _timestep_buffer_schema(self)
+        ensure_noise_workspace_slots(self)
 
         self._all_states = []
         for state_module in self.DE.values():
@@ -1192,6 +1295,8 @@ class Mechanism(Parameterized):
         self._current_factorable = {}
         self._current_conductance_mode = {}
         self._current_conductance_fallback_reason = {}
+        self._affine_evaluators = {}
+        self._affine_coefficient_fields = {}
         current_eqs = []
         for _, v in self._currents.items():
             current_eqs.extend(v)
@@ -1208,6 +1313,35 @@ class Mechanism(Parameterized):
             self._current_conductance_fallback_reason[k] = (
                 eq._dendra_conductance_fallback_reason
             )
+            if not factorable or k in self._explicit:
+                continue
+            hook = affine_hook_name(type(self), k)
+            if hook is not None:
+                self._affine_evaluators[k] = hook
+                self._affine_coefficient_fields[k] = None
+                continue
+            coefficient_name = f"_affine_{k}"
+            # Keep preexisting private instance/class attributes intact.
+            if hasattr(self, coefficient_name):
+                continue
+            coefficients = None
+            fields = None
+            if eq._dendra_conductance_mode == "symbolic":
+                try:
+                    coefficients, fields = build_affine_coefficients(self, k)
+                except EXPECTED_FACTORIZATION_ERRORS:
+                    # A valid symbolic derivative need not permit omitting
+                    # authored I: canceled denominators/powers can be singular.
+                    pass
+            if coefficients is None and k in self._affine:
+                # AFFINE is the user's contract. Existing analytic/numerical
+                # pairs remain sufficient; an authored coefficient hook is an
+                # optional arithmetic improvement, not extra required metadata.
+                coefficients = build_affine_pair_coefficients(k)
+            if coefficients is not None:
+                setattr(self, coefficient_name, MethodType(coefficients, self))
+                self._affine_evaluators[k] = coefficient_name
+                self._affine_coefficient_fields[k] = fields
 
         # Retain the legacy aggregate attribute for downstream callers while
         # keeping the per-current truth needed by mixed mechanisms.
@@ -1218,6 +1352,10 @@ class Mechanism(Parameterized):
         for state in self.DE.values():
             state.instantiate_tables()
         self._install_monomorphic_advance()
+
+    def _validate_affine_current(self, current, v, g, j):
+        """Diagnostic frozen-state checks for the optional coefficient path."""
+        validate_affine_current(self, current, v, g, j)
 
     @staticmethod
     def _refresh_support_after_load(module, incompatible_keys):
@@ -1280,6 +1418,8 @@ class Mechanism(Parameterized):
     ):
         """Resolve fresh deferred layouts once from incoming checkpoint tensors."""
 
+        self.__dict__.pop("_noise_workspace_restored_dt", None)
+        state_dict = complete_legacy_noise_workspace_state(self, state_dict, prefix)
         _resolve_deferred_buffers_from_state_dict(self, state_dict, prefix)
         return super()._load_from_state_dict(
             state_dict,
@@ -1426,7 +1566,7 @@ class Mechanism(Parameterized):
         dt_tensor, staged = configuration
         self._buffers["dt"] = dt_tensor
         for module, values in staged:
-            _install_timestep_buffers(module, values)
+            _install_timestep_buffers(module, values, dt=dt_tensor)
 
     def put_no_op(self, ion_conc_u, ion_conc_o, v, clone=True):
         """
@@ -1824,6 +1964,7 @@ class Mechanism(Parameterized):
                 state_module.celsius, v_init
             )
             state_values["diam"] = state_module.diam
+            state_values.update(state_module._input_value_frame(v_init))
             state_values_out = state_module._derive_initial_values(
                 v_init,
                 state_values,
@@ -1880,6 +2021,7 @@ class Mechanism(Parameterized):
         }
         carry_names = (
             *self._initial_carry_names,
+            *self._delay_history_buffer_names,
             *tuple(shared_value_names),
         )
         frame.update(
@@ -1918,6 +2060,7 @@ class Mechanism(Parameterized):
         valid_names = (
             *self._initial_state_names,
             *self._initial_carry_names,
+            *self._delay_history_buffer_names,
             *tuple(shared_value_names),
         )
         references = {
@@ -1958,7 +2101,7 @@ class Mechanism(Parameterized):
 
     def _advance_output_names(self):
         """Return ordered persistent/shared names authored advance may update."""
-        names = list(self._carry)
+        names = list(dict.fromkeys((*self._carry, *self._delay_history_buffer_names)))
         for fields in self._write_ion_c.values():
             _extend_unique(names, fields)
         for fields in self._write_material.values():
@@ -2374,7 +2517,10 @@ class Mechanism(Parameterized):
     @staticmethod
     def EXPLICIT(*args):
         """
-        Mark currents as voltage independent when assembling the RHS.
+        Select explicit treatment of currents when assembling the RHS.
+
+        These currents do not contribute an implicit conductance term. This
+        declaration does not assert that the current is voltage independent.
 
         Parameters
         ----------
@@ -2392,17 +2538,25 @@ class Mechanism(Parameterized):
         Parameters
         ----------
         *args : str
-            Current names satisfying ``I(v) = g * v + b``, where ``g`` and
-            ``b`` do not depend on ``v`` during a solver evaluation.
+            Current names satisfying ``I(v) = G * v - J``, where ``G`` and
+            ``J`` do not depend on ``v`` with gates and assigned values held
+            fixed during the solver stage.
 
         Notes
         -----
-        Dufort--Frankel can center an affine current exactly between its two
-        stored voltage levels. Analytic and numerically differentiated current
-        pairs do not by themselves prove this stronger property: a nonlinear
-        current may have a perfectly valid local derivative. Use ``AFFINE``
-        when source analysis cannot establish the affine form. An incorrect
-        declaration can produce an incorrect Dufort--Frankel trajectory.
+        This declaration authorizes coefficient assembly and exact affine
+        centering in Dufort--Frankel. Existing currents and analytic/numerical
+        conductance pairs remain sufficient. Optionally define
+        ``<current>_affine_terms(self, v) -> (G, J)`` to calculate coefficients
+        directly; an ordinary current is synthesized when it is omitted.
+        Automatically recognized symbolic affine currents need no declaration.
+
+        ``dn.ctx(MEMBRANE_ASSEMBLY="off")`` selects original current assembly;
+        ``"validate"`` diagnoses coefficient mismatches and nonlinear voltage
+        dependence using frozen-state probes. These probes do not prove
+        arbitrary code globally affine. Incorrect assertions can produce
+        incorrect trajectories. Inherited assertions and coefficient hooks do
+        not silently carry across an overridden current definition.
         """
         declare_class_value("mechanism.affine", args, Mechanism._affine_declarations)
 
@@ -2481,7 +2635,7 @@ class Mechanism(Parameterized):
         cls._dendra_monomorphic_advance_signature = signature
         cls._dendra_monomorphic_advance_source = source
 
-    def _advance_states(self, v, dt):
+    def _advance_states(self, v, dt, inputs=None):
         """Advance nested State and Mechanism carry from one shared snapshot.
 
         Parameters
@@ -2503,10 +2657,16 @@ class Mechanism(Parameterized):
             self._evaluate_assigned(v)
         values = self._runtime_value_frame()
         state_updates = []
-        for state_module in self.DE.values():
+        for state_name, state_module in self.DE.items():
             local_values = dict(values)
             for name in state_module._carry:
                 local_values[name] = state_module._buffers[name]
+            if state_module._inputs:
+                local_values.update(
+                    state_module._input_value_frame(
+                        v, None if inputs is None else inputs.get(state_name)
+                    )
+                )
             state_updates.append(
                 (
                     state_module,
@@ -2594,26 +2754,60 @@ class Mechanism(Parameterized):
     def initial_values(self, v, values):
         """Return a pure partial overlay for declared initial values.
 
+        Return flattened bundle STATE names, direct Mechanism CARRY, or owned
+        writable Ion/Material locals. Omitted fields keep their earlier value.
+        State defaults and insertion-time ``ic`` run before this overlay;
+        nested State overlays run afterward. This hook does not advance time.
+        Tensor outputs must use the declared dtype/device and have shapes
+        broadcastable to each declared output's storage shape.
+
         ``values`` includes initialized STATE/CARRY values, support-visible
         ``celsius`` and ``diam``, and the support-local Ion/Material/current
-        aliases installed for this ordered initialization phase.
+        aliases installed for this ordered initialization phase. Treat inputs
+        and module state as read-only; read parameters/workspaces through self.
         """
         return {}
 
     def assigned_values(self, v, values):
-        """Return every ephemeral value declared with :meth:`ASSIGNED`."""
+        """Return exactly the ephemeral values declared with :meth:`ASSIGNED`.
+
+        This pure algebra may be evaluated repeatedly at different solver
+        stages. Outputs must preserve their exact shape, dtype, and device.
+        Persistent timers, counters, and history belong in CARRY and advance.
+        """
         return {}
 
     def advance(self, v, dt, values):
-        """Return a partial accepted-step CARRY/shared-field update mapping."""
+        """Return a partial accepted-step CARRY/shared-field update mapping.
+
+        Runs once per accepted timestep. Update direct Mechanism CARRY and
+        owned writable/additive Ion/Material locals; omitted carry is retained.
+        This hook reads the same incoming snapshot as the State bundles, not
+        their newly solved values, and does not replace their solver. Return
+        new Tensors with each output's exact shape, dtype, and device instead
+        of mutating the value frame or module state.
+        """
         return {}
 
     def derive_buffers(self):
-        """Return initialization-static buffers declared by DERIVED_BUFFER."""
+        """Return exactly the workspaces declared by DERIVED_BUFFER.
+
+        Build from populated parameters, temperature, and local geometry.
+        Do not read evolving state, voltage, timestep, or implicit randomness,
+        or mutate the module. Ordinary initialization refreshes these values;
+        functional preparation builds them from its explicit inputs.
+        """
         return {}
 
     def derive_timestep_buffers(self, dt):
-        """Return timestep workspaces declared by TIMESTEP_BUFFER."""
+        """Return exactly the workspaces declared by TIMESTEP_BUFFER.
+
+        Build from parameters, static derived workspaces, and scalar Tensor
+        ``dt`` in ms when the integrator configures its timestep. Fresh
+        initialization leaves these buffers zero and does not call this hook.
+        Do not read evolving state or another installed timestep workspace,
+        use implicit randomness, or mutate module tensors.
+        """
         return {}
 
     @classmethod
@@ -3117,6 +3311,7 @@ class Mechanism(Parameterized):
             "value_shape": tuple(like.shape),
             "mode": mode,
         }
+        self._refresh_delay_history_layout()
         return getattr(self, buffer_name)
 
     def register_delayed_states(
@@ -3326,7 +3521,133 @@ class Mechanism(Parameterized):
             "has_zero_delay": has_zero_delay,
             "all_zero_delay": all_zero_delay,
         }
+        self._refresh_delay_history_layout()
         return getattr(self, buffer_name)
+
+    def _refresh_delay_history_layout(self):
+        """Expose registered histories to returned-value hooks after registration."""
+        previous = set(self._delay_history_buffer_names) - set(self._carry)
+        names = tuple(
+            dict.fromkeys(
+                name
+                for spec in self._delayed_state_specs.values()
+                for name in (spec["buffer"], spec["pointer"])
+            )
+        )
+        self._delay_history_buffer_names = names
+        self._transition_input_names = tuple(
+            dict.fromkeys(
+                (
+                    *(n for n in self._transition_input_names if n not in previous),
+                    *names,
+                )
+            )
+        )
+        self._sync_delay_history_shapes()
+        _reset_runtime_output_validation(self)
+        # Generated transitions already read the instance's history inventory.
+        # Reinstalling here would create distinct functions on each handler's
+        # reference proxy despite identical authored transitions and layouts.
+
+    def _sync_delay_history_shapes(self):
+        """Track capacities installed by registration or checkpoint restoration."""
+        for name in self._delay_history_buffer_names:
+            if name in self._carry_specs and self._carry_specs[name][1] == "deferred":
+                self._carry_resolved_shapes[name] = tuple(self._buffers[name].shape)
+
+    def initial_delay_values(self, values, *names):
+        """Return a pure zero-history overlay for registered delay lines.
+
+        Use this from :meth:`initial_values` to clear registered histories on
+        initialization. Histories declared as CARRY already receive ordinary
+        zero defaults. Undeclared registered histories retain their values
+        unless an initialization hook returns an explicit replacement.
+        """
+        if not names:
+            names = tuple(self._delayed_state_specs)
+        updates = {}
+        for name in names:
+            spec = self._delayed_state_specs[name]
+            buffer_name, pointer_name = spec["buffer"], spec["pointer"]
+            buffer, pointer = initial_delay_history_values(
+                values[buffer_name], values[pointer_name]
+            )
+            updates[buffer_name] = buffer
+            updates[pointer_name] = pointer
+        return updates
+
+    def delayed_state_values(self, name, value, values, *, mode=None):
+        """Return ``(delayed, updates)`` for one registered fixed-step history.
+
+        Read the queue and pointer from the explicit ``values`` frame and
+        return their replacements for :meth:`advance`, :meth:`initial_values`
+        or :meth:`~VoltageProcess.voltage_values`. Neither inputs nor module
+        state are mutated. Registration and capacity are fixed; use the native
+        :meth:`delayed_state` adapter for runtime capacity changes.
+        """
+        spec = self._delay_values_spec(name, value, batched=False)
+        selected = resolve_delay_mode(
+            spec["mode"] if mode is None else mode, training=self.training
+        )
+        buffer_name, pointer_name = spec["buffer"], spec["pointer"]
+        delayed, buffer, pointer = delay_history_values(
+            values[buffer_name],
+            values[pointer_name],
+            value,
+            int(spec["steps"]),
+            axis=int(spec["axis"]),
+            mode=selected,
+            all_zero=int(spec["steps"]) == 0,
+        )
+        return delayed, {buffer_name: buffer, pointer_name: pointer}
+
+    def delayed_states_values(self, name, payload, values, *, mode=None):
+        """Return ``(delayed, updates)`` for a registered multi-stream history.
+
+        Each stream uses its registered integer delay. Shift mode preserves
+        gradients through history; circular mode detaches queued writes while
+        zero-delay streams retain the current payload's gradient.
+        """
+        spec = self._delay_values_spec(name, payload, batched=True)
+        selected = resolve_delay_mode(
+            spec["mode"] if mode is None else mode,
+            training=self.training,
+            batched=True,
+        )
+        buffer_name, pointer_name = spec["buffer"], spec["pointer"]
+        delayed, buffer, pointer = delay_history_values(
+            values[buffer_name],
+            values[pointer_name],
+            payload,
+            getattr(self, spec["steps_buffer"]),
+            axis=int(spec["axis"]),
+            mode=selected,
+            stream_axis=int(spec["stream_axis"]),
+            value_stream_axis=int(spec["value_stream_axis"]),
+            all_zero=bool(spec["all_zero_delay"]),
+        )
+        return delayed, {buffer_name: buffer, pointer_name: pointer}
+
+    def _delay_values_spec(self, name, value, *, batched):
+        if name not in self._delayed_state_specs:
+            raise KeyError(f"No delayed state named {name!r} has been registered.")
+        spec = self._delayed_state_specs[name]
+        if bool(spec.get("batched", False)) != batched:
+            method = (
+                "delayed_states_values"
+                if spec.get("batched", False)
+                else "delayed_state_values"
+            )
+            raise ValueError(f"Delayed state {name!r} requires {method}(...).")
+        if not torch.is_tensor(value):
+            raise TypeError("Delayed-state values must be a torch.Tensor.")
+        expected_shape = tuple(spec["value_shape"])
+        if tuple(value.shape) != expected_shape:
+            raise ValueError(
+                f"Delayed state {name!r} expected value shape {expected_shape}, "
+                f"but received {tuple(value.shape)}."
+            )
+        return spec
 
     def reset_delayed_states(self, *names):
         """Zero registered delayed-state buffers and reset circular pointers."""
@@ -3340,8 +3661,9 @@ class Mechanism(Parameterized):
             # and avoids invalidating an outstanding backward pass in place.
             buffer = getattr(self, spec["buffer"])
             pointer = getattr(self, spec["pointer"])
-            setattr(self, spec["buffer"], torch.zeros_like(buffer).detach())
-            setattr(self, spec["pointer"], torch.zeros_like(pointer).detach())
+            buffer, pointer = initial_delay_history_values(buffer, pointer)
+            setattr(self, spec["buffer"], buffer)
+            setattr(self, spec["pointer"], pointer)
         return self
 
     def delayed_state(self, name, value, *, delay_steps=None, mode=None):
@@ -3371,18 +3693,9 @@ class Mechanism(Parameterized):
                 raise ValueError("delay_steps must be one non-negative integer.")
             steps = int(steps_t.reshape(()).item())
 
-        selected_mode = str(spec["mode"] if mode is None else mode).lower()
-        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
-        selected_mode = aliases.get(selected_mode, selected_mode)
-        if selected_mode == "auto":
-            selected_mode = (
-                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
-            )
-        if selected_mode not in {"shift", "circular"}:
-            raise ValueError(
-                "delayed-state mode must be 'auto', 'shift', or 'circular'; "
-                f"got {selected_mode!r}."
-            )
+        selected_mode = resolve_delay_mode(
+            spec["mode"] if mode is None else mode, training=self.training
+        )
 
         if not torch.is_tensor(value):
             raise TypeError("delayed_state value must be a torch.Tensor.")
@@ -3429,11 +3742,9 @@ class Mechanism(Parameterized):
             buf = getattr(self, buf_name)
             depth = int(buf.shape[axis])
 
-        sl = [slice(None)] * buf.ndim
-        sl[axis] = slice(0, depth - 1)
-        buf_new = torch.cat((value.unsqueeze(axis), buf[tuple(sl)]), dim=axis)
+        buf_new = shifted_history_values(buf, value, axis=axis)
         setattr(self, buf_name, buf_new)
-        return buf_new.select(axis, depth - 1)
+        return gather_history_values(buf_new, steps, axis=axis)
 
     def _delayed_state_circular(self, spec, value, steps: int):
         """Fast eval delayed-state update using an in-place circular buffer."""
@@ -3447,16 +3758,16 @@ class Mechanism(Parameterized):
                 "re-registering the delayed state."
             )
 
-        read_idx = torch.remainder(ptr - int(steps), depth).reshape(1)
-        delayed = buf.index_select(axis, read_idx).squeeze(axis)
+        delayed, write_idx, payload, next_pointer = circular_history_plan(
+            buf, ptr, value, int(steps), axis=axis
+        )
 
         # Evaluation-only fast path: mutate the circular buffer without building
         # autograd history. In training/grad mode, delayed_state(..., mode='auto')
         # selects the graph-safe shift backend instead.
         with torch.no_grad():
-            write_idx = ptr.reshape(1)
-            buf.index_copy_(axis, write_idx, value.detach().unsqueeze(axis))
-            ptr.add_(1).remainder_(depth)
+            buf.index_copy_(axis, write_idx, payload)
+            ptr.copy_(next_pointer)
         return delayed
 
     def delayed_states(self, name, values, *, delay_steps=None, mode=None):
@@ -3479,18 +3790,11 @@ class Mechanism(Parameterized):
                 "use delayed_state(...) instead."
             )
 
-        selected_mode = str(spec["mode"] if mode is None else mode).lower()
-        aliases = {"functional": "shift", "queue": "shift", "shift_queue": "shift"}
-        selected_mode = aliases.get(selected_mode, selected_mode)
-        if selected_mode == "auto":
-            selected_mode = (
-                "shift" if (self.training or torch.is_grad_enabled()) else "circular"
-            )
-        if selected_mode not in {"shift", "circular"}:
-            raise ValueError(
-                "batched delayed-state mode must be 'auto', 'shift', or 'circular'; "
-                f"got {selected_mode!r}."
-            )
+        selected_mode = resolve_delay_mode(
+            spec["mode"] if mode is None else mode,
+            training=self.training,
+            batched=True,
+        )
 
         if not torch.is_tensor(values):
             raise TypeError("delayed_states values must be a torch.Tensor.")
@@ -3543,19 +3847,12 @@ class Mechanism(Parameterized):
         return steps
 
     def _delayed_states_gather(self, buf, spec, read_idx):
-        axis = int(spec["axis"])
-        stream_axis = int(spec["stream_axis"])
-        n_streams = int(spec["n_streams"])
-
-        index_shape = [1] * buf.ndim
-        index_shape[axis] = 1
-        index_shape[stream_axis] = n_streams
-
-        expand_shape = list(buf.shape)
-        expand_shape[axis] = 1
-
-        idx = read_idx.reshape(index_shape).expand(expand_shape)
-        return torch.gather(buf, dim=axis, index=idx).squeeze(axis)
+        return gather_history_values(
+            buf,
+            read_idx,
+            axis=int(spec["axis"]),
+            stream_axis=int(spec["stream_axis"]),
+        )
 
     def _delayed_states_zero_mask(self, spec, values, steps):
         value_stream_axis = int(spec["value_stream_axis"])
@@ -3592,9 +3889,7 @@ class Mechanism(Parameterized):
             buf = getattr(self, buf_name)
             depth = int(buf.shape[axis])
 
-        sl = [slice(None)] * buf.ndim
-        sl[axis] = slice(0, depth - 1)
-        buf_new = torch.cat((values.unsqueeze(axis), buf[tuple(sl)]), dim=axis)
+        buf_new = shifted_history_values(buf, values, axis=axis)
         setattr(self, buf_name, buf_new)
         return self._delayed_states_gather(buf_new, spec, steps)
 
@@ -3611,19 +3906,19 @@ class Mechanism(Parameterized):
                 f"capacity of {depth - 1} steps. Re-register the delayed state."
             )
 
-        read_idx = torch.remainder(ptr - steps, depth)
-        delayed = self._delayed_states_gather(buf, spec, read_idx)
-
-        # A stream with zero delay should deliver the current value, not the
-        # previous content of the circular slot that will be overwritten below.
-        delayed = torch.where(
-            self._delayed_states_zero_mask(spec, values, steps), values, delayed
+        delayed, write_idx, payload, next_pointer = circular_history_plan(
+            buf,
+            ptr,
+            values,
+            steps,
+            axis=axis,
+            stream_axis=int(spec["stream_axis"]),
+            value_stream_axis=int(spec["value_stream_axis"]),
         )
 
         with torch.no_grad():
-            write_idx = ptr.reshape(1)
-            buf.index_copy_(axis, write_idx, values.detach().unsqueeze(axis))
-            ptr.add_(1).remainder_(depth)
+            buf.index_copy_(axis, write_idx, payload)
+            ptr.copy_(next_pointer)
         return delayed
 
     # -- mechanism-level waveform injections ---------------------------------
@@ -3696,9 +3991,10 @@ class Mechanism(Parameterized):
         :meth:`inject`.  It computes the overlap between a population-level
         injection index and the compartments occupied by this mechanism, stores
         the waveform as a submodule, and records a boolean local mask.  Later,
-        :meth:`evaluate_injections` evaluates all registered waveforms at the
-        current mechanism time and returns a tensor shaped like the local voltage
-        argument, with zeros outside the targeted compartments.
+        :meth:`injection_values` evaluates registered waveforms at an explicit
+        time and returns a tensor shaped like the local voltage argument, with
+        zeros outside the targeted compartments. :meth:`evaluate_injections`
+        additionally assigns the named current for native compatibility.
 
         Registration succeeds only when this mechanism covers every targeted
         population location.  Partial overlap returns ``False`` without storing
@@ -3732,14 +4028,15 @@ class Mechanism(Parameterized):
         # complete population-level injection.  Reject partial overlap before
         # registering anything so the solver fallback can safely deliver the
         # whole stimulus without duplicating covered locations.
-        local_coverage = local_mask.to(dtype=torch.bool)
-        full_coverage = self.put(
-            local_coverage,
-            torch.zeros_like(full_mask),
-            full_mask,
-        ).to(dtype=torch.bool)
-        if not bool(torch.all(full_coverage[full_mask]).item()):
-            return False
+        if model_shape is not None:
+            local_coverage = local_mask.to(dtype=torch.bool)
+            full_coverage = self.put(
+                local_coverage,
+                torch.zeros_like(full_mask),
+                full_mask,
+            ).to(dtype=torch.bool)
+            if not bool(torch.all(full_coverage[full_mask]).item()):
+                return False
 
         k = len(self.injected_waveforms)
         mask_name = f"_injection_mask_{k}"
@@ -3785,121 +4082,35 @@ class Mechanism(Parameterized):
         n_local_selected=None,
     ):
         """Return ``value`` padded/broadcast into ``out`` at ``mask`` locations."""
-        value = torch.as_tensor(value, device=out.device, dtype=out.dtype)
+        return expand_injection_value(
+            value,
+            mask,
+            out,
+            selected_index=selected_index,
+            n_local_selected=n_local_selected,
+        )
 
-        # Bring an unbatched mask up to the current local state shape.
-        local_mask = mask.to(device=out.device, dtype=torch.bool)
-        mask = local_mask
-        while mask.ndim < out.ndim:
-            mask = mask.unsqueeze(0)
-        mask = mask.expand_as(out)
+    def injection_values(self, v, *, t, current_name="i_inj"):
+        """Return registered waveform currents without changing mechanism state.
 
-        if value.ndim == 0 or value.numel() == 1:
-            return value.reshape(()) * mask.to(out.dtype)
+        ``v`` supplies the local output shape, device and dtype. ``t`` is an
+        explicit scalar evaluation time in ms. The returned tensor sums matching
+        registrations, with zeros outside their masks. Waveform outputs may
+        be scalar, broadcast over the local shape, or contain one value per
+        selected compartment, optionally preceded by batch axes. Scales multiply
+        waveform outputs before the singleton time axis is removed, so tensor
+        scales must broadcast with that time-last output.
 
-        if tuple(value.shape) == tuple(out.shape):
-            return value * mask.to(out.dtype)
-
-        # Common case: waveform returns the unbatched local mechanism shape.
-        if value.ndim <= out.ndim:
-            v = value
-            while v.ndim < out.ndim:
-                v = v.unsqueeze(0)
-            if tuple(v.shape) == tuple(out.shape) or all(
-                a == b or a == 1 for a, b in zip(v.shape, out.shape)
-            ):
-                return v.expand_as(out) * mask.to(out.dtype)
-
-        # Vector over selected compartments.  This supports either a single
-        # unbatched vector of length n_selected or a batched tensor whose last
-        # dimension is n_selected.
-        # If the mask describes the local (unbatched) suffix, accept either one
-        # selected vector shared across batches or one vector per batch.
-        if local_mask.ndim <= out.ndim and tuple(
-            out.shape[out.ndim - local_mask.ndim :]
-        ) == tuple(local_mask.shape):
-            batch_shape = tuple(out.shape[: out.ndim - local_mask.ndim])
-            if n_local_selected is None:
-                n_local_selected = int(local_mask.reshape(-1).sum().item())
-            selected_shape = batch_shape + (n_local_selected,)
-            selected = None
-            if value.numel() == n_local_selected:
-                selected = value.reshape(
-                    (1,) * len(batch_shape) + (n_local_selected,)
-                ).expand(selected_shape)
-            else:
-                try:
-                    selected = value.expand(selected_shape)
-                except RuntimeError:
-                    pass
-            if selected is not None:
-                if selected_index is None:
-                    selected_index = torch.nonzero(
-                        local_mask.reshape(-1), as_tuple=False
-                    ).reshape(-1)
-                padded = torch.zeros_like(out).reshape(-1, local_mask.numel())
-                padded = padded.index_copy(
-                    1,
-                    selected_index.to(device=out.device),
-                    selected.reshape(-1, n_local_selected),
-                )
-                return padded.reshape_as(out)
-
-        n_selected = int(mask.reshape(-1).sum().item())
-        if value.numel() == n_selected:
-            padded = torch.zeros_like(out)
-            padded.reshape(-1)[mask.reshape(-1)] = value.reshape(-1)
-            return padded
-
-        # Last-resort attempt: rely on PyTorch broadcasting, then mask.
-        try:
-            return value.expand_as(out) * mask.to(out.dtype)
-        except RuntimeError as exc:
-            raise ValueError(
-                f"Waveform output shape {tuple(value.shape)} cannot be broadcast "
-                f"or padded into mechanism-local shape {tuple(out.shape)}."
-            ) from exc
-
-    def evaluate_injections(self, v=None, *, t=None, current_name="i_inj"):
-        """Evaluate registered waveform injections and expose the result.
-
-        Parameters
-        ----------
-        v : torch.Tensor, optional
-            Local voltage/state tensor that defines the desired output shape.  If
-            omitted, the first injection mask shape is used.
-        t : torch.Tensor or float, optional
-            Evaluation time in ms.  Defaults to the mechanism's ``t`` reference,
-            which :class:`Population` sets during build.
-        current_name : str, optional
-            Name of the exposed current variable.  Defaults to ``i_inj``.
-
-        Returns
-        -------
-        torch.Tensor
-            Sum of all registered waveform currents, padded to ``v``'s shape.
+        Waveforms must evaluate without mutating their module or inputs when
+        this helper is used from a pure hook. Parameters and tensor-valued times
+        remain differentiable. This helper does not assign ``current_name``;
+        return the result from ``assigned_values`` or use it in current algebra.
         """
-        if v is None:
-            if self._injection_specs:
-                v = getattr(self, self._injection_specs[0]["mask"]).to(self.diam.dtype)
-            elif hasattr(self, current_name):
-                v = getattr(self, current_name)
-            else:
-                v = self.diam
-
-        out = torch.zeros_like(v, dtype=v.dtype, device=v.device)
+        out = torch.zeros_like(v)
         if not self._injection_specs:
-            setattr(self, current_name, out)
             return out
 
-        if t is None:
-            t = (
-                self.t
-                if hasattr(self, "t")
-                else torch.zeros((), device=v.device, dtype=v.dtype)
-            )
-        t = torch.as_tensor(t, device=v.device, dtype=v.dtype)
-        t = torch.atleast_1d(t)
+        t = torch.atleast_1d(torch.as_tensor(t, device=v.device, dtype=v.dtype))
         if t.numel() != 1:
             raise ValueError(
                 "Mechanism waveform injections are evaluated one timestep at a "
@@ -3912,21 +4123,48 @@ class Mechanism(Parameterized):
             mask = getattr(self, spec["mask"])
             scale = getattr(self, spec["scale"])
             selected_index = getattr(self, spec["index"])
-            value = self.injected_waveforms[k](t) * scale
-            # Dendra Waveforms always return time on the last axis.  This
-            # method evaluates one timestep, so remove that singleton before
-            # applying spatial/batch broadcasting.  Custom modules that return
-            # a spatial value directly remain supported.
+            value = torch.as_tensor(
+                self.injected_waveforms[k](t) * scale,
+                device=v.device,
+                dtype=v.dtype,
+            )
+            # Waveforms put time last; this call evaluates one timestep. Custom
+            # modules may also return a spatial value directly.
             if value.ndim > 0 and value.shape[-1] == 1:
                 value = value.squeeze(-1)
-            out = out + self._expand_injection_value(
+            current = self._expand_injection_value(
                 value,
                 mask,
                 out,
                 selected_index=selected_index,
                 n_local_selected=int(spec["n_selected"]),
             )
+            out = out + current
+        return out
 
+    def evaluate_injections(self, v=None, *, t=None, current_name="i_inj"):
+        """Evaluate registered waveform currents and assign ``current_name``.
+
+        This native compatibility adapter uses :meth:`injection_values` for
+        numerical evaluation. ``v`` defaults to the first injection mask, an
+        existing named current, or ``diam``. ``t`` defaults to the mechanism's
+        clock, or zero when it has no clock. Pure hooks use
+        :meth:`injection_values` with explicit ``v`` and ``t`` instead.
+        """
+        if v is None:
+            if self._injection_specs:
+                v = getattr(self, self._injection_specs[0]["mask"]).to(self.diam.dtype)
+            elif hasattr(self, current_name):
+                v = getattr(self, current_name)
+            else:
+                v = self.diam
+        if t is None and self._injection_specs:
+            t = (
+                self.t
+                if hasattr(self, "t")
+                else torch.zeros((), device=v.device, dtype=v.dtype)
+            )
+        out = self.injection_values(v, t=t, current_name=current_name)
         setattr(self, current_name, out)
         return out
 
@@ -3935,28 +4173,88 @@ class VoltageProcess(Mechanism):
     """
     Mechanism subtype that updates the membrane potential ``v``.
 
-    Subclasses must implement :meth:`update_v` to return a new membrane potential
-    tensor each time step. Both its input and return value are in mV.
+    Implement :meth:`voltage_values` to return a new voltage and a mapping of
+    declared nested :class:`State` variable and :meth:`CARRY` replacements. The
+    hook is pure: its voltage, timestep, and ``values`` inputs are read-only,
+    and it must not mutate the module.
+    Dendra uses the same hook in imperative and functional execution.
+
+    Voltage processes run in their existing ordered, support-local phase before
+    gating and membrane-current assembly. They do not run during initialization.
+    Both input and returned voltage are in mV.
+
+    Legacy subclasses overriding :meth:`update_v` continue to work imperatively,
+    but need the pure hook to participate in functional execution.
     """
 
-    def update_v(self, v: torch.Tensor) -> torch.Tensor:
+    def voltage_values(self, v, dt, values):
         """
-        Compute the updated membrane potential. Avoid in-place modification
-        to preserve autograd compatibility.
+        Return ``(voltage, updates)`` without modifying inputs or ``self``.
 
-        Parameters
-        ----------
-        v : torch.Tensor
-            Membrane potential tensor in mV to be advanced.
-
-        Returns
-        -------
-        torch.Tensor
-            New membrane potential values in mV.
+        ``values`` follows the ordinary Mechanism runtime frame: declared
+        persistent/assigned values, prepared workspaces, local shared fields,
+        ``celsius``, and ``diam``. Parameters may be read through ``self``.
+        ``updates`` may replace any subset of this process's declared nested
+        State variables and direct CARRY values, preserving each value's shape,
+        dtype, and device. Nested State CARRY, ASSIGNED values, workspaces, and
+        shared fields cannot be replaced here.
+        The returned voltage must match ``v`` in shape, dtype, and device.
         """
         raise NotImplementedError(
-            "VoltageProcess.update_v() must be implemented in subclasses."
+            "VoltageProcess.voltage_values() must be implemented in subclasses."
         )
+
+    def _derive_voltage_values(self, v, dt, values):
+        """Evaluate the pure hook and validate its fixed output schema once."""
+        result = self.voltage_values(v, dt, values)
+        if not torch.compiler.is_compiling() and not self._voltage_schema_validated:
+            if not isinstance(result, tuple) or len(result) != 2:
+                raise TypeError(
+                    f"{type(self).__qualname__}.voltage_values() must return "
+                    "a (voltage, updates) tuple"
+                )
+            voltage, updates = result
+            _validate_runtime_outputs(
+                self,
+                "voltage_values",
+                {"voltage": voltage},
+                {"voltage": v},
+                required=("voltage",),
+            )
+            _validate_runtime_outputs(
+                self,
+                "voltage_values",
+                updates,
+                {
+                    name: self._buffers[name]
+                    for name in (
+                        *self._initial_state_names,
+                        *self._initial_carry_names,
+                        *self._delay_history_buffer_names,
+                    )
+                },
+            )
+            self._voltage_schema_validated = True
+        return result
+
+    def update_v(self, v: torch.Tensor) -> torch.Tensor:
+        """Imperative adapter committing the pure hook's declared state outputs.
+
+        Functional execution lifts these same buffer replacements into explicit
+        state. User-authored voltage algebra belongs in :meth:`voltage_values`,
+        not in this adapter.
+        """
+        voltage, updates = self._derive_voltage_values(
+            v, self.dt, self._runtime_value_frame()
+        )
+        for name in (
+            *self._initial_state_names,
+            *self._initial_carry_names,
+            *self._delay_history_buffer_names,
+        ):
+            if name in updates:
+                self._buffers[name] = updates[name]
+        return voltage
 
 
 class PointProcess(Mechanism):
@@ -4015,18 +4313,15 @@ class PointProcess(Mechanism):
 
 
 class Synapse(Mechanism):
-    """
-    A Synapse is a Mechanism that receives spikes and delivers a synaptic current.
-    Synapses implement the `net_receive` method, which is called every timestep
-    and accepts `weights` (the sum of all incoming weighted spike events at that
-    timestep) and `netcon` (the `NetCon` instance for which the synapse is the target)
-    as arguments.
+    """A Mechanism that receives weighted events and delivers synaptic current.
 
-    Note that a given synapse may be the target for multiple `NetCon`s, and as such its
-    `net_receive` method may be executed multiple times per timestep.
+    Implement the pure :meth:`net_receive_values` hook to return declared
+    state/carry replacements. The standard :meth:`net_receive` adapter commits
+    those replacements in existing NetCon delivery order, including calls with
+    a zero payload. Multiple connections may call it during one timestep.
 
-    The `net_receive` method must be overridden in subclasses to implement
-    specific behavior for how the synapse responds to incoming spikes.
+    Legacy subclasses overriding :meth:`net_receive` retain their imperative
+    behavior; they must adopt the pure hook for functional event delivery.
 
     ``NetCon`` weights inherit their units from the target synapse. For the
     built-in point-process ``expsyn`` and ``exp2syn`` mechanisms, weights are
@@ -4034,29 +4329,160 @@ class Synapse(Mechanism):
     different weight contract and should document it explicitly.
     """
 
-    def net_receive(self, weights, netcon):
-        """
-        Handle weighted spike arrivals. Avoid in-place modifications of
-        state buffers to preserve autograd compatibility.
+    def net_receive_values(self, weights, dt, values):
+        """Return event updates without modifying inputs or the module.
 
-        Example: increment an internal synaptic conductance ``g_syn`` by the
-        incoming weight without in-place ops:
+        ``weights`` is a Tensor broadcast to this mechanism's local runtime
+        shape. ``dt`` is the configured timestep as a broadcastable one-element
+        Tensor of shape ``(1,)``. Scalar structural CARRY updates should reshape
+        their result to the declared scalar shape after arithmetic.
+        ``values`` contains the
+        Mechanism state, prepared workspace, and shared-field frame plus a
+        ``state_carry`` mapping from State bundle names to their declared CARRY
+        tensors. Ephemeral ASSIGNED values are excluded: derive event algebra
+        in this hook, or declare CARRY when a value must persist. Parameters
+        may be read through ``self``.
 
-        .. code-block:: python
-
-            def net_receive(self, weights, netcon):
-                self.g_syn = self.g_syn + weights
-
-        Parameters
-        ----------
-        weights : torch.Tensor
-            Aggregate weights of incoming spike events at the current step.
-        netcon : NetCon
-            Connectivity handle delivering the spikes.
+        Return any subset of ``{"states": {...}, "carry": {...},
+        "state_carry": {StateName: {...}}}``. These sections update flat STATE
+        variables, direct Mechanism CARRY, and nested State CARRY respectively.
+        Omitted fields remain unchanged. Every replacement must preserve its
+        declared shape, dtype, and device. Shared fields, ASSIGNED values,
+        prepared workspaces, and INPUT values cannot be updated here.
         """
         raise NotImplementedError(
-            "Synapse.net_receive() must be implemented in subclasses."
+            "Synapse.net_receive_values() must be implemented in subclasses."
         )
+
+    def _net_receive_payload_shape(self):
+        """Return actual local storage shape, including explicit batch axes."""
+        if self._initial_state_names:
+            return tuple(self._buffers[self._initial_state_names[0]].shape)
+        for name in self._carry:
+            if self._carry_specs[name][1] == "local":
+                return tuple(self._buffers[name].shape)
+        return tuple(self.shape_f)
+
+    def _net_receive_value_frame(self):
+        """Build an explicit event frame without retaining runtime aliases."""
+        values = self._runtime_value_frame()
+        if "state_carry" in values:
+            raise ValueError(
+                "Pure Synapse receive frames reserve 'state_carry'; rename the "
+                "conflicting flat runtime field."
+            )
+        for name in self._assigned:
+            values.pop(name, None)
+        values.update(
+            {name: self._buffers[name] for name in self._saved_current_buffer_names}
+        )
+        if values["celsius"].ndim == 0:
+            values["celsius"] = values["celsius"].reshape(1)
+        values["state_carry"] = {
+            state_name: {name: state._buffers[name] for name in state._carry}
+            for state_name, state in self.DE.items()
+        }
+        return values
+
+    def _derive_net_receive_values(self, weights, dt, values):
+        """Evaluate the pure hook and validate all replacements before writes."""
+        if not torch.is_tensor(weights):
+            raise TypeError("Synapse receive weights must be a Tensor.")
+        if weights.dtype != self.diam.dtype or weights.device != self.diam.device:
+            raise ValueError(
+                "Synapse receive weights must match the mechanism dtype and device."
+            )
+        if not torch.is_tensor(dt) or tuple(dt.shape) != ():
+            raise TypeError("Synapse receive dt must be a scalar Tensor.")
+        if dt.dtype != self.diam.dtype or dt.device != self.diam.device:
+            raise ValueError(
+                "Synapse receive dt must match the mechanism dtype and device."
+            )
+        weights = torch.broadcast_to(weights, self._net_receive_payload_shape())
+        updates = self.net_receive_values(weights, dt.reshape(1), values)
+        return self._validate_net_receive_updates(updates)
+
+    def _validate_net_receive_updates(
+        self, updates, *, allow_continuous_inputs=False, hook_name="net_receive_values"
+    ):
+        """Validate event and continuous transactions before committing any leaf."""
+        if not isinstance(updates, Mapping):
+            raise TypeError(f"Synapse.{hook_name}() must return a mapping.")
+        unknown = set(updates) - {"states", "carry", "state_carry"}
+        if unknown:
+            raise KeyError(
+                f"Synapse.{hook_name}() returned unknown sections {sorted(map(str, unknown))}."
+            )
+        shared_names = set(self._runtime_shared_local_names())
+        if not allow_continuous_inputs:
+            shared_names.update(getattr(self, "_continuous_inputs", ()))
+            shared_names.update(getattr(self, "_continuous_input_old", {}).values())
+        _validate_runtime_outputs(
+            self,
+            f"{hook_name}.states",
+            updates.get("states", {}),
+            {
+                name: self._buffers[name]
+                for name in self._initial_state_names
+                if name not in shared_names
+            },
+        )
+        _validate_runtime_outputs(
+            self,
+            f"{hook_name}.carry",
+            updates.get("carry", {}),
+            {
+                name: self._buffers[name]
+                for name in self._carry
+                if name not in shared_names
+            },
+        )
+        state_carry = updates.get("state_carry", {})
+        if not isinstance(state_carry, Mapping):
+            raise TypeError("Synapse receive state_carry must be a mapping.")
+        unknown_states = set(state_carry) - set(self.DE)
+        if unknown_states:
+            raise KeyError(
+                f"Synapse receive state_carry names unknown States {sorted(map(str, unknown_states))}."
+            )
+        for state_name, outputs in state_carry.items():
+            state = self.DE[state_name]
+            _validate_runtime_outputs(
+                state,
+                f"{hook_name}.state_carry",
+                outputs,
+                {
+                    name: state._buffers[name]
+                    for name in state._carry
+                    if name not in shared_names
+                },
+            )
+        return updates
+
+    def _apply_net_receive_updates(self, updates):
+        """Commit a previously validated event transaction in declared slots."""
+        states = updates.get("states", {})
+        for name in self._initial_state_names:
+            if name in states:
+                self._buffers[name] = states[name]
+        carry = updates.get("carry", {})
+        for name in self._carry:
+            if name in carry:
+                self._buffers[name] = carry[name]
+        state_carry = updates.get("state_carry", {})
+        for state_name, state in self.DE.items():
+            local = state_carry.get(state_name, {})
+            for name in state._carry:
+                if name in local:
+                    state._buffers[name] = local[name]
+
+    def net_receive(self, weights, netcon):
+        """Apply a pure receive hook once at the existing NetCon boundary."""
+        del netcon
+        updates = self._derive_net_receive_values(
+            weights, self.dt, self._net_receive_value_frame()
+        )
+        self._apply_net_receive_updates(updates)
 
 
 class ContinuousSynapse(Mechanism):
@@ -4109,7 +4535,9 @@ class ContinuousSynapse(Mechanism):
         old_map = {}
         for base in reversed(cls.__mro__):
             if "_continuous_inputs" in base.__dict__:
-                inputs.extend(list(base._continuous_inputs))
+                inputs.extend(
+                    name for name in base._continuous_inputs if name not in inputs
+                )
             if "_continuous_input_old" in base.__dict__:
                 old_map.update(dict(base._continuous_input_old))
 
@@ -4169,44 +4597,14 @@ class ContinuousSynapse(Mechanism):
             ContinuousSynapse._continuous_input_declarations,
         )
 
-    def reset_continuous_inputs(self):
-        """Reset continuous input buffers before new analog deliveries.
+    # Event and analog receivers share explicit frames, transaction validation,
+    # and commit rules. Only continuous receivers may update declared INPUT carry.
+    _continuous_receive_payload_shape = Synapse._net_receive_payload_shape
+    _continuous_receive_value_frame = Synapse._net_receive_value_frame
+    _validate_net_receive_updates = Synapse._validate_net_receive_updates
+    _apply_continuous_receive_updates = Synapse._apply_net_receive_updates
 
-        For each declared input ``x``, ``x_old`` is first updated to the current
-        value when available, and ``x`` is then reset to zeros.  Rebinding rather
-        than in-place mutation keeps the operation compatible with autograd.
-        """
-        self._continuous_received_masks.clear()
-        for name in self._continuous_inputs:
-            current = getattr(self, name)
-            old_name = self._continuous_input_old.get(name, None)
-            if old_name is not None and hasattr(self, old_name):
-                setattr(self, old_name, current)
-            setattr(self, name, torch.zeros_like(current))
-        self._continuous_reset_count = self._continuous_reset_count + 1
-
-    def continuous_receive(self, value, con=None, input=None, reduce=None, mask=None):
-        """Receive a continuously valued presynaptic projection.
-
-        Parameters
-        ----------
-        value : torch.Tensor
-            Delivered value in the synapse-local shape.
-        con : ContinuousCon, optional
-            Connectivity object delivering the value.
-        input : str, optional
-            Name of the input buffer to update.  If omitted, the first declared
-            input is used.
-        reduce : {"sum", "set", "max", "min"}, optional
-            Reduction used when multiple continuous projections target the same
-            input.  Defaults to the connection's ``reduce`` attribute if present,
-            otherwise ``"sum"``.
-        mask : torch.Tensor, optional
-            Boolean tensor identifying elements actually targeted by this
-            delivery. If omitted, every element is treated as delivered. This is
-            supplied by :class:`ContinuousCon` so its zero-filled scatter slots do
-            not participate in non-additive reductions.
-        """
+    def _continuous_input_name(self, input):
         if input is None:
             if len(self._continuous_inputs) != 1:
                 raise ValueError(
@@ -4214,55 +4612,137 @@ class ContinuousSynapse(Mechanism):
                     f"{len(self._continuous_inputs)} declared inputs."
                 )
             input = self._continuous_inputs[0]
-
         if input not in self._continuous_inputs:
             raise ValueError(
                 f"{self.name!r} has no continuous input {input!r}. "
                 f"Declared inputs are {self._continuous_inputs!r}."
             )
+        return input
 
-        if reduce is None:
-            reduce = getattr(con, "reduce", "sum")
+    def reset_continuous_inputs(self):
+        """Move inputs into their old-value carry and reset once before delivery.
 
-        current = getattr(self, input)
-        value = value.to(device=current.device, dtype=current.dtype)
-        if mask is None:
-            delivery_mask = torch.ones_like(current, dtype=torch.bool)
-        else:
-            delivery_mask = torch.as_tensor(
-                mask, device=current.device, dtype=torch.bool
+        Native Network owns the reset boundary. Functional callers use the same
+        pure reset with explicit per-step delivery scratch, outside checkpoint carry.
+        """
+        values = {name: self._buffers[name] for name in self._continuous_inputs}
+        updates, received = reset_continuous_values(
+            values, self._continuous_inputs, self._continuous_input_old
+        )
+        self._apply_continuous_receive_updates({"carry": updates})
+        self._continuous_received_masks = received
+        self._continuous_reset_count = self._continuous_reset_count + 1
+
+    def continuous_receive_values(
+        self, value, dt, values, *, input, reduce, mask, received
+    ):
+        """Return declared state/carry updates for one ordered analog delivery.
+
+        ``value`` and Boolean ``mask`` have the named input's local shape.
+        ``received`` marks elements delivered earlier in this timestep, including
+        actual zero deliveries. ``dt`` has shape ``(1,)``. ``values`` uses the
+        event-receive frame, including input/old-input CARRY and nested State
+        CARRY. Return event-style ``states``, ``carry`` and ``state_carry``
+        mappings without modifying any input or module state.
+
+        The default hook implements sum/add, set/replace/last, min and max.
+        Override this pure hook to add synaptic dynamics at delivery time;
+        legacy imperative ``continuous_receive`` overrides remain native-only.
+        """
+        del dt
+        return {
+            "carry": {
+                input: reduce_continuous_values(
+                    values[input], value, received, mask, reduce
+                )
+            }
+        }
+
+    def _derive_continuous_receive_values(
+        self, value, dt, values, received, *, input=None, reduce="sum", mask=None
+    ):
+        input = self._continuous_input_name(input)
+        current = values[input]
+        if not torch.is_tensor(value):
+            raise TypeError("Continuous receive payload must be a Tensor.")
+        if value.device != current.device or value.dtype != current.dtype:
+            raise ValueError(
+                "Continuous receive payload must match the input dtype and device."
             )
+        value = torch.broadcast_to(value, current.shape)
+        if not torch.is_tensor(dt) or tuple(dt.shape) != ():
+            raise TypeError("Continuous receive dt must be a scalar Tensor.")
+        if dt.device != current.device or dt.dtype != current.dtype:
+            raise ValueError(
+                "Continuous receive dt must match the input dtype and device."
+            )
+        if mask is None:
+            mask = torch.ones_like(current, dtype=torch.bool)
+        for label, operand in (("mask", mask), ("received", received)):
+            if not torch.is_tensor(operand) or operand.dtype != torch.bool:
+                raise TypeError(f"Continuous receive {label} must be a Boolean Tensor.")
+            if operand.device != current.device:
+                raise ValueError(
+                    f"Continuous receive {label} must match the input device."
+                )
             try:
-                delivery_mask = torch.broadcast_to(delivery_mask, current.shape)
+                projected = torch.broadcast_to(operand, current.shape)
             except RuntimeError as error:
                 raise ValueError(
-                    f"Continuous delivery mask with shape {tuple(delivery_mask.shape)} "
+                    f"Continuous delivery {label} with shape {tuple(operand.shape)} "
                     f"cannot be broadcast to input {input!r} with shape "
                     f"{tuple(current.shape)}."
                 ) from error
+            if label == "mask":
+                mask = projected
+            else:
+                received = projected
+        updates = self.continuous_receive_values(
+            value,
+            dt.reshape(1),
+            values,
+            input=input,
+            reduce=reduce,
+            mask=mask,
+            received=received,
+        )
+        updates = self._validate_net_receive_updates(
+            updates, allow_continuous_inputs=True, hook_name="continuous_receive_values"
+        )
+        return updates, received | mask
 
+    def continuous_receive(self, value, con=None, input=None, reduce=None, mask=None):
+        """Apply the shared pure receive hook at the native connection boundary."""
+        input = self._continuous_input_name(input)
+        current = self._buffers[input]
+        value = value.to(device=current.device, dtype=current.dtype)
+        if reduce is None:
+            reduce = getattr(con, "reduce", "sum")
+        if mask is not None:
+            mask = torch.as_tensor(mask, device=current.device, dtype=torch.bool)
         received = self._continuous_received_masks.get(input)
         if received is None or tuple(received.shape) != tuple(current.shape):
             received = torch.zeros_like(current, dtype=torch.bool)
-        elif received.device != current.device:
-            received = received.to(device=current.device)
-
-        if reduce in ("sum", "add"):
-            update = torch.where(delivery_mask, value, torch.zeros_like(value))
-            setattr(self, input, current + update)
-        elif reduce in ("set", "replace", "last"):
-            setattr(self, input, torch.where(delivery_mask, value, current))
-        elif reduce == "max":
-            reduced = torch.maximum(current, value)
-            update = torch.where(received, reduced, value)
-            setattr(self, input, torch.where(delivery_mask, update, current))
-        elif reduce == "min":
-            reduced = torch.minimum(current, value)
-            update = torch.where(received, reduced, value)
-            setattr(self, input, torch.where(delivery_mask, update, current))
         else:
-            raise ValueError(f"Unsupported continuous reduction mode: {reduce!r}.")
-        self._continuous_received_masks[input] = received | delivery_mask
+            received = received.to(device=current.device)
+        # Initialized mechanisms expose their own timestep; direct native calls
+        # need no connection object. The default reducer also works on manually
+        # supplied input buffers before a clock has been bound.
+        dt = getattr(self, "dt", None)
+        if dt is None:
+            dt = current.new_zeros(())
+        dt = torch.as_tensor(dt, device=current.device, dtype=current.dtype).reshape(())
+        updates, received = self._derive_continuous_receive_values(
+            value,
+            dt,
+            self._continuous_receive_value_frame(),
+            received,
+            input=input,
+            reduce=reduce,
+            mask=mask,
+        )
+        self._apply_continuous_receive_updates(updates)
+        self._continuous_received_masks[input] = received
 
 
 def rename(mechanism, new_name=None):

@@ -1,0 +1,229 @@
+"""Clearance phases, fresh initialization, and AD on a real CUDA device.
+
+Run ``pytest tests/func/test_cuda_clearance_process.py -W error -m cuda``.
+The shared device-generic fixture checks all recorded state against actual
+imperative execution, an independent material recurrence, and explicit
+functional initialization/recurrence. Two tiny cases compile GPU kernels;
+CPU collection/skips do not establish CUDA correctness.
+"""
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+from dendra._bootstrap import torch_compiler_warning_context
+from tests.func.test_clearance_process import (
+    NAI,
+    POOL,
+    STEPS,
+    _arguments,
+    _close,
+    _exercise,
+    _explicit_reference,
+    _gradients,
+    _model,
+    _runner,
+)
+from tests.func.test_cuda_convenience_initialization import _cross_precision_close
+from tests.func.test_functional_initialization import (
+    _assert_module_snapshot,
+    _assert_tree_close,
+    _module_snapshot,
+)
+
+pytestmark = [
+    pytest.mark.cuda,
+    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable"),
+    pytest.mark.filterwarnings(r"ignore:`torch\.jit\.script` is deprecated.*"),
+    pytest.mark.filterwarnings(r"ignore:`torch\.jit\.script_method` is deprecated.*"),
+]
+
+
+@pytest.fixture(autouse=True)
+def _compiler_warnings():
+    with torch_compiler_warning_context():
+        yield
+
+
+def _assert_coverage(recorded, gradients, *, block, dtype, steps=STEPS):
+    assert {
+        "v",
+        "i_membrane",
+        "t",
+        "hh.m",
+        "hh.h",
+        "hh.n",
+        POOL,
+        NAI,
+        "na_ion.ena",
+        "na_ion.ina",
+    } <= recorded.keys()
+    for name, value in recorded.items():
+        assert value.shape[0] == steps + 1, name
+        assert torch.isfinite(value).all(), name
+        # The accepted clock has its own schema; physical leaves remain CUDA
+        # model-dtype tensors. Host-control duration_remainder is not recorded.
+        if name != "t":
+            assert value.device.type == "cuda" and value.dtype == dtype, name
+    assert recorded["t"][0].item() == 0
+    assert torch.count_nonzero(recorded["i_membrane"][0]) == 0
+    if block:
+        assert recorded["vc"].shape == (*recorded["v"].shape, 3)
+        torch.testing.assert_close(
+            recorded["vc"][0, ..., 0], recorded["v"][0], rtol=0, atol=0
+        )
+        assert torch.count_nonzero(recorded["vc"][0, ..., 1:]) == 0
+    if not gradients:
+        return
+    assert len(gradients) == 18
+    assert {
+        "stimulus",
+        "initial_voltage",
+        "gnabar",
+        "gkbar",
+        "gl",
+        "ena",
+        "ek",
+        "el",
+        "geometry",
+        "dt",
+        "initial_pool",
+        "initial_nai",
+        "_ExactClearance.rate",
+        "_ExactClearance.target",
+        "_ExactClearance.na_rate",
+        "_ExactClearance.na_target",
+        "_FinalClearance.rate",
+        "_FinalClearance.target",
+    } == gradients.keys()
+    for name, value in gradients.items():
+        assert value.device.type == "cuda", name
+        assert torch.isfinite(value).all() and torch.count_nonzero(value), name
+
+
+@pytest.mark.parametrize(
+    ("kind", "checkpoint_every"), (("path", None), ("multi_block", 2))
+)
+def test_cuda_clearance_full_traces_fresh_initialization_and_all_gradients(
+    kind, checkpoint_every
+):
+    recorded, gradients = _exercise(
+        kind,
+        device="cuda",
+        dtype=torch.float64,
+        shell_resistance_scale=100.0,
+        checkpoint_every=checkpoint_every,
+    )
+    _assert_coverage(
+        recorded, gradients, block=kind == "multi_block", dtype=torch.float64
+    )
+
+
+@pytest.mark.parametrize("kind", ("path", "multi_block"))
+def test_cuda_clearance_float32_matches_cpu_float64_traces_and_all_gradients(kind):
+    pytest.importorskip("dendra_solvers")
+    results = [
+        _exercise(
+            kind,
+            device=device,
+            dtype=dtype,
+            shell_resistance_scale=100.0,
+            checkpoint_every=2,
+        )
+        for device, dtype in (("cpu", torch.float64), ("cuda", torch.float32))
+    ]
+    expected, actual = results
+    _assert_coverage(
+        actual[0], actual[1], block=kind == "multi_block", dtype=torch.float32
+    )
+    _cross_precision_close(actual[0], expected[0])
+    assert actual[1].keys() == expected[1].keys()
+    for name, value in actual[1].items():
+        reference = expected[1][name].detach().to(device="cpu", dtype=torch.float64)
+        value = value.detach().to(device="cpu", dtype=torch.float64)
+        scale = reference.abs().amax()
+        assert torch.isfinite(scale) and scale > 0, name
+        torch.testing.assert_close(
+            value / scale,
+            reference / scale,
+            rtol=5e-3,
+            atol=5e-4,
+            msg=lambda message: f"{name}: {message}",
+        )
+
+
+@pytest.mark.parametrize("kind", ("path", "multi_block"))
+def test_cuda_clearance_checkpointed_continuation_full_traces_and_all_gradients(kind):
+    model = _model(
+        kind, device="cuda", dtype=torch.float64, shell_resistance_scale=100.0
+    )
+    runner = _runner(model, checkpoint_every=2)
+    source = _module_snapshot(model)
+    parameters, initialization, inputs, targets = _arguments(runner, model)
+    state, auxiliary = runner(
+        parameters=parameters, initialization=initialization, inputs=inputs
+    )
+    final, continued = runner(
+        state,
+        parameters=auxiliary["parameters"],
+        inputs=inputs,
+        callback_state=auxiliary["callbacks"].state,
+    )
+    recorded = {
+        name: torch.cat((value, continued["callbacks"]["trace"][name]))
+        for name, value in auxiliary["callbacks"]["trace"].items()
+    }
+    gradients = _gradients(recorded, targets)
+    (
+        reference_parameters,
+        reference_initialization,
+        reference_inputs,
+        reference_targets,
+    ) = _arguments(runner, model)
+    doubled = type(reference_inputs)(
+        *(torch.cat((value, value)) for value in reference_inputs)
+    )
+    expected = _explicit_reference(
+        runner,
+        reference_parameters,
+        reference_initialization,
+        doubled,
+        steps=2 * STEPS,
+    )
+    _assert_tree_close(final, expected[0], rtol=3e-9, atol=3e-10)
+    reference_recorded = dict(expected[1]["callbacks"]["trace"])
+    _close(recorded, reference_recorded)
+    _close(gradients, _gradients(reference_recorded, reference_targets))
+    _assert_coverage(
+        recorded,
+        gradients,
+        block=kind == "multi_block",
+        dtype=torch.float64,
+        steps=2 * STEPS,
+    )
+    _assert_module_snapshot(model, source)
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize(
+    ("kind", "execution", "checkpoint_every"),
+    (("path", "scan", 2), ("multi_block", "while", None)),
+)
+def test_cuda_inductor_clearance_checkpointed_scan_and_while_full_traces(
+    kind, execution, checkpoint_every
+):
+    recorded, gradients = _exercise(
+        kind,
+        device="cuda",
+        dtype=torch.float32,
+        shell_resistance_scale=100.0,
+        backend="inductor",
+        execution=execution,
+        checkpoint_every=checkpoint_every,
+    )
+    _assert_coverage(
+        recorded, gradients, block=kind == "multi_block", dtype=torch.float32
+    )
+    if execution == "while":
+        assert not gradients and not recorded["v"].requires_grad

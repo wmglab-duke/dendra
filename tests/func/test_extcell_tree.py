@@ -248,7 +248,9 @@ def _while_loop_nodes(graph_module):
 
 
 def test_extcell_tree_state_topology_geometry_and_workspace_schema():
-    from dendra_solvers import dhs_bt_solve
+    import dendra_solvers as solvers
+
+    from dendra.models.integrators.tree_bt import _functional_dhs_bt_plan_solve
 
     model = _model()
     topology = model.compartment_graph.topology
@@ -258,7 +260,25 @@ def test_extcell_tree_state_topology_geometry_and_workspace_schema():
     functional, tensors = dn.func.make_functional(model, dt=DT)
     prepared = functional.prepare(tensors.parameters, tensors.constants)
 
-    assert functional._transition.solver is dhs_bt_solve
+    if callable(getattr(solvers, "DHSPlan", None)) and callable(
+        getattr(solvers, "dhs_bt_solve_plan", None)
+    ):
+        solver = functional._transition.solver
+        assert isinstance(solver, partial)
+        assert solver.func is _functional_dhs_bt_plan_solve
+        assert set(solver.keywords) == {"plan"}
+        assert isinstance(solver.keywords["plan"], solvers.DHSPlan)
+        for actual, expected in zip(
+            solver.keywords["plan"].topology(),
+            (
+                functional._base_mapping[f"population.integrator.{name}"]
+                for name in ("parent_idx", "order", "layer_ptr")
+            ),
+            strict=True,
+        ):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    else:
+        assert functional._transition.solver is solvers.dhs_bt_solve
     assert set(tensors.state) == {"integrator", "clock", "control"}
     assert set(tensors.state["integrator"]) == {"v", "vc"}
     assert tensors.state["integrator"]["v"].shape == model.shape
@@ -802,9 +822,18 @@ def test_extcell_tree_compiled_chunk_uses_one_bounded_native_dhs_bt_loop():
         for module in graphs[0].modules()
         if isinstance(module, torch.fx.GraphModule)
     )
+    import dendra_solvers as solvers
+
+    expected_solve = (
+        torch.ops.dendra_solvers.dhs_bt_solve_plan.default
+        if (
+            callable(getattr(solvers, "DHSPlan", None))
+            and callable(getattr(solvers, "dhs_bt_solve_plan", None))
+        )
+        else torch.ops.dendra_solvers.dhs_bt_solve.default
+    )
     assert any(
-        node.op == "call_function"
-        and node.target is torch.ops.dendra_solvers.dhs_bt_solve.default
+        node.op == "call_function" and node.target is expected_solve
         for graph_module in graph_modules
         for node in graph_module.graph.nodes
     )
@@ -887,10 +916,17 @@ def test_extcell_tree_requires_exact_v_and_vc_integrator_state_contract():
         dn.func.make_functional(model, dt=DT)
 
 
+def test_extcell_tree_imem_is_explicit_functional_state():
+    model = _model(imem=True)
+    _, tensors = dn.func.make_functional(model, dt=DT)
+    torch.testing.assert_close(
+        tensors.state["integrator"]["i_membrane"], model.i_membrane
+    )
+
+
 @pytest.mark.parametrize(
     ("model_factory", "message"),
     [
-        (lambda: _model(imem=True), "i_membrane recording is not supported yet"),
         (
             lambda: _build_model(
                 _branched_nonzero_root_graph(),
@@ -903,7 +939,7 @@ def test_extcell_tree_requires_exact_v_and_vc_integrator_state_contract():
                 _branched_nonzero_root_graph(),
                 model_type=_AreaOverrideExtCellTree,
             ),
-            "standard exact area",
+            "area",
         ),
     ],
 )

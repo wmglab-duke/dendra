@@ -10,6 +10,14 @@ import torch
 import dendra as dn
 from dendra.models.mechanisms import Mechanism, State
 
+
+@pytest.fixture(autouse=True)
+def _check_purity_diagnostics():
+    """Exercise purity contracts explicitly; production defaults trust hooks."""
+    with dn.ctx(CHECK_PURITY=True):
+        yield
+
+
 DT = 0.0125
 DTYPE = torch.float64
 MECHANISM_NAME = "_AuthoredInitializationMechanism"

@@ -83,8 +83,8 @@ pre-commit run --all-files
 ```
 
 Use a [Conventional Commit](https://www.conventionalcommits.org/) message in
-the form `type(optional-scope): summary` so the automated release process can
-classify the change. For example:
+the form `type(optional-scope): summary` so continuous integration can select
+the next version. For example:
 
 ```text
 fix(analysis): retain events inside the requested window
@@ -93,8 +93,27 @@ docs: clarify CPU solver installation
 ```
 
 `cz commit` can guide you through this format. Do not edit the package version
-or changelog manually; continuous integration handles both after changes reach
-`main`.
+manually; continuous integration updates it and creates the version tag after
+changes reach `main`. Maintainers curate `CHANGELOG.md`: summarize related
+changes as user-facing capabilities, fixes and upgrade notes rather than
+listing every implementation commit. See [release preparation](RELEASING.md#curate-release-notes).
+
+## Write user documentation
+
+Describe what Dendra supports and how users can use it. State current behavior
+directly, using phrases such as "uses" or "supports" rather than "now uses" or
+"previously used". Explain implementation details when they help users choose
+an API, understand results, or use a feature correctly.
+
+Describe feature limitations as "currently unsupported" without implying a
+roadmap. When support is implemented, replace those limitations with usage
+guidance and links to the supported APIs. Keep related tutorials and API
+references consistent.
+
+Put version comparisons and change history in release notes or the
+[upgrading guide](docs/upgrading.rst). Tutorials and API references should
+describe the current interface without requiring knowledge of its development
+history.
 
 ## Test the change
 
@@ -104,6 +123,17 @@ and non-CUDA NEURON test lane before opening a pull or merge request:
 ```sh
 python -m pytest tests -W error -m "cpu or (neuron and not cuda)"
 ```
+
+GitLab CI divides this complete lane into forty duration-balanced units,
+one per job, then combines their coverage data and enforces the existing
+global and module coverage floors.
+Every shard and the coverage aggregation job must pass before merging; a
+shorter development pass does not replace them. The [testing and code coverage
+guide](docs/testing.md) explains how to reproduce the shards locally and inspect
+their test inventories and timings. Merge-request pipelines and pushes to
+`develop` or `main` always run the full checks. A documentation-only feature
+branch push runs the documentation checks; set the CI/CD variable
+`RUN_FULL_TESTS=1` to request the full checks on that push as well.
 
 If your change affects CUDA behavior, run the relevant CUDA tests on a machine
 with a supported GPU:

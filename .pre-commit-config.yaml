@@ -7,7 +7,9 @@ repos:
     - id: check-toml
     - id: requirements-txt-fixer
     - id: end-of-file-fixer           # newline at end of file
+      exclude: ^LICENSES/            # Keep upstream license files verbatim.
     - id: trailing-whitespace
+      exclude: ^LICENSES/
     - id: check-merge-conflict
     - id: check-case-conflict
     - id: check-illegal-windows-names

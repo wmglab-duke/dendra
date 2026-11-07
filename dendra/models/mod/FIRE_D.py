@@ -65,7 +65,7 @@ class fire_d(VoltageProcess):
     def initial_values(self, v, values):
         return {"reset_gate": torch.zeros_like(v)}
 
-    def update_v(self, v):
+    def voltage_values(self, v, dt, values):
         threshold = self._tensor_like(self.threshold, v)
         rest = self._tensor_like(self.rest, v)
         tau = self._tensor_like(self.tau_gate, v).clamp_min(1.0e-3)
@@ -77,8 +77,10 @@ class fire_d(VoltageProcess):
         smooth_gate = torch.sigmoid((v - threshold) / tau)
         smooth_v = v + smooth_gate * (rest - v)
 
-        self.reset_gate = hard_reset.to(dtype=v.dtype) + ste * (
+        reset_gate = hard_reset.to(dtype=v.dtype) + ste * (
             smooth_gate - smooth_gate.detach()
         )
 
-        return hard_v.detach() + ste * (smooth_v - smooth_v.detach())
+        return hard_v.detach() + ste * (smooth_v - smooth_v.detach()), {
+            "reset_gate": reset_gate
+        }

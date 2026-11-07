@@ -1,0 +1,320 @@
+(functional-execution)=
+# Run models with explicit state
+
+Use `dn.compile` when you want a reusable simulation function for inference or
+training. Define and initialize an ordinary Dendra Population or Network, then
+compile it. The function returns tensors and an explicit continuation;
+it does not advance the original model.
+
+Use native `model.run(...)` when you want the model itself to own its evolving
+state. Both interfaces support deterministic inputs, stochastic replay and
+the same callback configurations. You can also
+{doc}`move between them <initialization_and_checkpoints>`.
+
+## Start with one Population
+
+This complete example stimulates a passive compartment and records its voltage.
+It selects the `eager` compiler backend for quick startup; omit `backend` to use
+the default optimizing backend.
+
+```python
+import torch
+import dendra as dn
+from dendra.models.mod import pas
+from dendra.units import nA
+
+DT = 0.025  # ms
+with dn.ctx(DEVICE="cpu", DTYPE=torch.float64, JIT=0):
+    model = dn.SingleCompartment(
+        N=1, C=1, v_init=-65.0, integrator=dn.bwd_euler_sc(imem=False)
+    )
+    model.insert(pas, g=0.001, e=-70.0)
+    model[..., 0].inject(dn.mono_rect(amp=0.1 * nA, delay=0.1, pw=0.2))
+    model.initialize()
+    original = model.v.detach().clone()
+
+    program = dn.compile(
+        model, dt=DT, steps=40, chunk_steps=8,
+        callbacks={"trace": dn.Recorder(("v", "t"))},
+        backend="eager",
+    )
+    state, auxiliary = dn.func.run(program)
+    trace = auxiliary["callbacks"]["trace"]
+    print(trace["t"].shape, trace["v"].shape)
+    torch.testing.assert_close(model.v, original)
+```
+
+`state` contains the final simulation tensors. The named Recorder returns its
+sampled values at `auxiliary["callbacks"]["trace"]`. A fresh recording includes
+the initial boundary, so this trace has 41 samples.
+
+The source model is unchanged. Calling `program()` is equivalent to
+`dn.func.run(program)` and starts again from its captured initial snapshot.
+Pass the returned continuation to advance the same simulation:
+
+```python
+# Continue the previous example for another 40 accepted steps.
+state, following = dn.func.run(program, auxiliary["continuation"])
+```
+
+The continuation carries the effective parameters, constants, simulation/RNG
+state and callback phase together. Continued recordings contain only the new
+samples, without repeating the joining boundary.
+
+## Warm a program before its first timed call
+
+`warm()` executes and discards a representative forward run, retaining the
+compiled kernels and returning the same program:
+
+```python
+program = dn.compile(model, dt=DT, steps=40).warm(verbose=True)
+state, auxiliary = program()
+```
+
+It accepts the same invocation arguments as `program(...)`. Supply representative
+inputs or runtime `extra` bindings when those are needed, or pass a continuation
+to warm that execution boundary:
+
+```python
+example_inputs = dn.func.Inputs(ve=torch.zeros(
+    (40, *model.v.shape), dtype=model.v.dtype, device=model.v.device
+))
+program.warm(inputs=example_inputs, verbose=True)
+program.warm(auxiliary["continuation"], inputs=example_inputs, verbose=True)
+```
+
+The selected run uses the configured initialization policy and horizon. Its
+simulation results are discarded; source/model state, RNG carry and parameter
+gradients retain their values. Recorder callbacks follow their usual cadence
+and chunk schedule, with recording-file publication suppressed. Verbose mode
+prints to standard error, including elapsed-time updates during long calls.
+Accelerator work completes before `warm()` returns.
+
+Warming covers the encountered execution variants. Different input shapes,
+gradient flags or horizons can require more compilation. Training programs warm
+their forward path; the first backward pass can still compile. `warm()` executes
+the simulation, so its cost includes execution as well as compilation.
+
+## Find activation thresholds
+
+`Thresholder` searches for the stimulus amplitude that satisfies an activity
+criterion for each independent Population lane. Pass a native Population and
+its activity callback, or pass a compiled Population runner and the name of its
+Boolean callback result. The same bound fixing and bisection search applies to
+both interfaces.
+
+For an initialized `model`, a spatial `field` and a `waveform`, compile the
+activity criterion with a runtime stimulation slot:
+
+```python
+from dendra.models.instruments import Thresholder
+
+program = dn.compile(
+    model,
+    dt=DT,
+    duration=5.0,
+    extra=dn.VarInput(),
+    callbacks={
+        "activation": dn.callbacks.Active(
+            threshold=0.0, node_check=[5, -5],
+        ),
+    },
+    inference=True,
+    initialization="snapshot",
+)
+search = Thresholder(
+    program, active="activation", space=field, time=waveform,
+    ub=0.2, rtol=0.01,
+)
+upper, lower = search.calculate_thresholds()
+```
+
+The search inherits the program's timestep and default horizon. Supply `ub`
+explicitly for a compiled runner. An explicit `dt` must match its timestep;
+`tstop` selects an absolute simulation stop time. The search scales the spatial
+field by each candidate amplitude and supplies the field/waveform pair through
+`extra`.
+Amplitudes remain tensor data while the callback configuration and compiled
+kernel shapes stay fixed. Precomputed time-first `bases` use `Inputs.ve` and
+their own tape length, ignoring `tstop`; compile that program without an
+extracellular `extra` binding. Choose dtype and device before compilation.
+
+Every amplitude starts an independent trial with fresh callback history. A
+snapshot program restarts the same simulation and RNG state. A program configured
+with `initialization="fresh"` runs its fresh initialization policy on each trial.
+Returned continuations are not chained between amplitudes. Threshold search is
+a hard inference measurement and runs without gradients.
+
+For `block_possible=True`, configure a second callback before compiling:
+`"peak_voltage": dn.Recorder(("v",), max_only=True)`. Supply
+`peak="peak_voltage"` to `Thresholder`. Its full-cadence voltage maximum helps
+bound fixing distinguish a subthreshold response from suspected conduction
+block. The voltage cutoff comes from a built-in activity callback; custom pure
+activity callbacks also need an explicit `block_threshold=`. A custom activity
+result must be Boolean and have exactly one value per searched lane, including
+any configured partitions. Configure compiled callback partitions before
+binding; `set_partition` validates that they match the search partitions.
+
+The complete
+{download}`functional_thresholding.py <../../examples/training/functional_thresholding.py>`
+example compares native and compiled threshold brackets on short passive cables,
+including the peak-voltage diagnostic. It supports scan and while inference.
+Compiled Network threshold searches are currently unsupported.
+
+## Compile a connected Network
+
+Connections are configured before compilation using the ordinary Network API.
+This complete example sends NetStim events into one Population; its voltage
+crossings drive an event synapse on another Population.
+
+```python
+import torch
+import dendra as dn
+from dendra.models.mod import expsyn, pas
+
+DT = 0.025
+with dn.ctx(DEVICE="cpu", DTYPE=torch.float64, JIT=0):
+    def cell():
+        value = dn.SingleCompartment(
+            N=1, C=1, v_init=-65.0, integrator=dn.bwd_euler_sc(imem=False)
+        )
+        value.insert(pas, g=0.001, e=-65.0)
+        value.insert(expsyn.rename("exc"), tau=2.0, e=0.0)
+        return value
+
+    source, target = cell(), cell()
+    stimulus = dn.NetStim(N=1, start=0.0, interval=0.5, noise=0.0, seed=17)
+    network = dn.Network({"source": source, "target": target}, netstim=stimulus)
+    network.connect(
+        stimulus[:], source[:], source.mech.exc, conn_spec="one_to_one",
+        threshold=None, weight=0.002, delay=DT,
+    )
+    network.connect(
+        source[:], target[:], target.mech.exc, conn_spec="one_to_one",
+        threshold=-20.0, weight=0.002, delay=0.1,
+    )
+    network.eval()
+    network.initialize(DT)
+    program = dn.compile(
+        network, dt=DT, steps=80, chunk_steps=16,
+        callbacks={"trace": dn.Recorder(("source.v", "target.v", "t"))},
+        backend="eager",
+    )
+    state, auxiliary = dn.func.run(program)
+    trace = auxiliary["callbacks"]["trace"]
+    print(trace["source.v"].shape, trace["target.v"].shape)
+```
+
+Recorder field names use the Network's Population names. Event-connection
+weights are defined by their target mechanism: `expsyn` uses bare numerical
+values in µS. Networks can also use continuous connections, custom deterministic
+release transforms, schedules and delays; see {doc}`custom_models` and the
+{doc}`Network API <../api/dendra.models.networks>`.
+
+## Use ordinary connection and scheduling APIs
+
+Configure connectivity on the native Network, then compile that configuration:
+
+| What you want to model | Interface |
+| --- | --- |
+| Discrete events from a NetStim or voltage crossings | `network.connect(...)` with an event-driven target such as `expsyn`. |
+| A continuous signal between Populations | `network.connect_continuous(...)` with a receiving input, optional deterministic function or module, weight and delay. |
+| Predetermined event times and amplitudes | `NetStim.schedule(...)` or the connection's `schedule(...)`. |
+
+Schedules accept values or indexed live time/amplitude sources. Supply one time
+form and one amplitude form; incompatible alternatives are rejected. This is
+useful for optimizing a stimulation protocol without replacing its connectivity.
+Bind shared Tensor leaves with `bind_time_source(times)` and
+`bind_weight_source(amplitudes)`, then schedule using `time_idx=` and
+`weight_idx=`. The live indexed form is useful across repeated optimizer
+segments because each execution reads the current leaves. See the complete
+{download}`shared_schedule_bindings.py <../../examples/inputs/shared_schedule_bindings.py>`
+example for native and functional training. Continuous transforms can contain
+trainable parameters, so an optimizer can fit a release curve or another
+conversion of the presynaptic signal.
+
+Delays and their interpolation policies are configured with the Network before
+compilation. `dn.compile` uses that ordinary Network configuration.
+Runtime randomness and replay are described in
+{doc}`inputs_and_randomness`; connection signatures and source bindings are in the
+{doc}`Network API <../api/dendra.models.networks>`.
+
+## Choose the amount of simulation
+
+`steps=N` accepts exactly N solver steps. `duration=T` requests elapsed time in
+ms and retains any fraction smaller than a complete timestep. Supply one of
+them at compile time; a call may override that default:
+
+```python
+# Uses the program and continuation from either example above.
+state, auxiliary = dn.func.run(program, steps=10)
+state, auxiliary = dn.func.run(
+    program, auxiliary["continuation"], duration=0.25,
+)
+```
+
+With `dt=0.1`, two continued requests of `duration=0.25` accept two and three
+steps. Exact step requests leave the pending fraction available for later
+duration requests. A no-state call restarts the selected initialization policy.
+
+Explicit input and draw tapes must contain the accepted number of steps.
+Use `dn.func.resolve_steps` when constructing a tape for a duration request;
+see {doc}`inputs_and_randomness`.
+
+## Choose inference or training
+
+The default runner uses `inference=True`, so simulation outputs do not retain
+training graphs. This flag does not change the source model's training/evaluation
+configuration; call `model.train()` or `model.eval()` before initialization and
+compilation as appropriate. Set `inference=False` and select trainable sources for
+optimization; see {doc}`training_and_parameters`.
+
+`execution="scan"` supports training and inference. `execution="while"` is
+an inference option for both Population and Network runners, including custom
+pure callbacks. Population while runners require a compiled width of at least
+four steps. Supported models and authoring requirements are described in
+{doc}`custom_models`.
+
+`chunk_steps` controls the compiled width. It need not divide the requested
+horizon: the host scheduler executes full chunks and the remaining tail.
+Changing the call's horizon reuses the runner; a previously unseen tail width
+may require compilation. Chunking bounds execution workspaces, but requested
+recordings still require storage for their retained samples.
+
+Compilation is lazy, so the first call includes compilation work. Inspect
+`program.execution_report()` after a call when diagnosing its selected strategy.
+On recognized CPU compiler builds, large timestep loops in C++ wrappers compile
+as separate functions to reduce startup cost. This applies to `execution="while"`
+and C++-wrapped scan forward/backward graphs. Numerical kernels retain their
+configured optimization level. Training scans keep their default Python wrapper;
+explicit C++ wrappers can have different cold-start and warm-runtime costs.
+Source structure and connectivity are captured at compilation: after structural
+model changes, construct a new program.
+
+## Bound pending event storage
+
+Inference event calendars use fixed-capacity storage. For dense event bursts or
+long delays, supply `pending_capacity=N` to Network compilation, or a mapping
+from connection names to capacities. Overflow raises before a result is
+published. Recompile from the unchanged native snapshot with enough capacity. For an
+already continued simulation, transfer its pre-call continuation into a compatible
+native receiver with `commit_continuation_`, then compile that receiver with the
+larger capacity. Calendar shapes belong to the plan; a small-plan packet is not
+directly interchangeable with a larger-plan packet. Do not continue from a
+partial result. The complete
+{download}`functional_pending_calendar.py <../../examples/networks/functional_pending_calendar.py>`
+example demonstrates this recovery. Delivery and parameter-lookup timing follow
+the Network's selected connection policy.
+
+## Next steps
+
+- {doc}`inputs_and_randomness`: stimulation, tensor inputs and reproducible draws.
+- {doc}`recording_and_callbacks`: fields, regions, cadence, analysis and HDF5.
+- {doc}`training_and_parameters`: parameter selection, optimizers and gradients.
+- {doc}`initialization_and_checkpoints`: fresh trials, portable saves and handoff.
+- {doc}`custom_models`: model hooks, supported components and explicit lowering.
+
+The complete
+{download}`functional_api_overview.py <../../examples/getting_started/functional_api_overview.py>`
+example combines Population inference, connected-Network training, explicit
+bindings, stochastic replay and runtime extracellular stimulation.

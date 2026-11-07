@@ -1,4 +1,4 @@
-"""Pure callback reducers for functional Population execution.
+"""Pure callback reducers for functional Population and Network execution.
 
 Functional callbacks are a parallel API to Dendra's mutable callback classes.
 They own explicit tensor carry, return optional tensor emissions, and finalize a
@@ -11,53 +11,59 @@ from __future__ import annotations
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from dataclasses import FrozenInstanceError, dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
+from dendra.models._callback_scopes import (
+    _population_callback_target,
+    _validate_population_callback_name,
+)
+from dendra.models._lfp_callbacks import (
+    _materialize_lfp_fields,
+    _project_lfp,
+    _validate_lfp_fields,
+)
+from dendra.models._threshold_callbacks import (
+    _COUNT_DTYPE,
+    _anomaly_flags,
+    _validate_activity_target,
+    accumulate_count,
+    activity_from_counts,
+    threshold_crossing,
+)
+
+from ._tree_paths import _get_path, _put_path
 from ._types import FunctionalizationError
 
 if TYPE_CHECKING:
     from ._population import FunctionalPopulation
 
 
-def _get_path(tree: Mapping[str, object], path: tuple[str, ...]):
-    value: Any = tree
-    for part in path:
-        value = value[part]
-    return value
-
-
-def _put_path(tree: dict[str, object], path: tuple[str, ...], value) -> None:
-    cursor = tree
-    for part in path[:-1]:
-        cursor = cursor.setdefault(part, {})
-    cursor[path[-1]] = value
-
-
 class FunctionalCallback(ABC):
-    """Base contract for a pure functional callback.
+    """Pure observation/reduction protocol shared by native and functional execution.
 
-    Callback objects are immutable configuration. All values that evolve
-    during execution must be returned in ``carry``. Carry, emissions, and the
-    finalized result must be tensor PyTrees with stable structure, leaf shape,
-    dtype, and device. An emission may be ``None`` when a callback is a
-    constant-memory reducer.
+    Callback objects hold static configuration. Every evolving value must be
+    returned in ``carry``. Carry and per-step emissions are Tensor PyTrees with
+    stable structure, leaf shapes, dtype and device. A constant-memory reducer
+    can emit None. Final results are Tensor PyTrees; a recording's leading sample
+    length can vary with the execution horizon and sampling selection.
 
-    ``initialize`` runs exactly once for a fresh callback execution. Its
-    ``auxiliary`` argument is ``None`` because no transition has occurred.
-    ``update`` runs after each successful model step and receives that step's
-    auxiliary mapping. Dendra stacks non-``None`` emissions on a leading
-    sample axis before calling ``finalize`` once for each public runner result.
-    If a segment has no samples and no initial emission schema, ``finalize``
-    receives ``None`` and must still return its normal result PyTree (for
-    example, an explicitly shaped empty recording).
+    ``initialize(state, None)`` runs once for fresh callback state and returns
+    ``(carry, initial_emission_or_none)``. ``update(carry, state, auxiliary)`` runs
+    after every accepted model step and returns the next pair. Per-step emissions
+    are stacked on a leading time axis before ``finalize(carry, emissions)`` runs
+    for each public execution result. Continued calls reuse carry without another
+    initial sample. Finalize must handle None when a segment has no emissions or
+    known initial emission layout, returning a correctly shaped empty result if
+    appropriate.
 
-    Implementations must be deterministic and side-effect-free: do not mutate
-    callback objects, perform I/O, consume hidden randomness, call ``.item()``,
-    or branch in Python on tensor values. These constraints make callbacks
-    safe for autograd, ``torch.func``, compilation, and checkpoint replay.
+    Implement tensor-only, deterministic, side-effect-free methods: do not mutate
+    the callback, perform I/O, consume hidden randomness or branch in Python on
+    Tensor values. This makes the same callback usable with gradients, compiled
+    scan, inference-only while and checkpoint replay. Sparse per-step observations
+    use fixed tensors/masks rather than changing emission structure.
     """
 
     @abstractmethod
@@ -72,6 +78,26 @@ class FunctionalCallback(ABC):
     def finalize(self, carry, emissions):
         """Return the public tensor result for this execution segment."""
 
+    def checkpoint_configuration(self):
+        """Describe static compatibility for portable callback checkpoints.
+
+        Return a plain dict with ``kind`` (a nonempty stable string), ``version`` (a
+        positive integer), and ``fields`` (a string-keyed dict). Fields may contain
+        plain scalars, acyclic dict/list/tuple containers and ordinary Tensor/Parameter
+        values. Include every static setting affecting carry, emissions or results.
+        Change the version when their interpretation changes.
+
+        The receiving application constructs a compatible callback; checkpoint data
+        does not instantiate or import implementations. This deterministic,
+        side-effect-free hook runs only during host export/restore. If a custom binding
+        hook returns a prepared callback, implement this declaration on that returned
+        object. It is optional for execution/in-memory continuation; custom portable
+        export requires it. The default handles built-in callback configurations.
+        """
+        from ._callback_checkpoints import _builtin_callback_configuration
+
+        return _builtin_callback_configuration(self)
+
     def _bind(self, functional: FunctionalPopulation):
         """Resolve static plan-specific configuration for a built-in callback."""
 
@@ -79,14 +105,300 @@ class FunctionalCallback(ABC):
         return self
 
 
-class Recorder(FunctionalCallback):
-    """Record explicit functional state at the initial boundary and each step.
+class _PreparedCallback(FunctionalCallback):
+    """Separate authored configuration from immutable resolved execution data."""
 
-    The constructor mirrors the ordinary :class:`dendra.callbacks.Recorder`
-    where the pure in-memory semantics overlap. ``dt`` and
-    ``sliding_window`` are reserved but not yet supported because their phase
-    must remain explicit across segmented and transformed executions.
+    _prepared = False
+    _checkpoint_fields = ()
+    _preparation_error = (
+        "functional callbacks must be bound with functional.make_callbacks(...)"
+    )
+
+    def _require_prepared(self):
+        if not self._prepared:
+            raise FunctionalizationError(self._preparation_error)
+
+    def __setattr__(self, name, value):
+        if object.__getattribute__(self, "__dict__").get("_prepared", False):
+            raise FrozenInstanceError(f"cannot assign to field {name!r}")
+        object.__setattr__(self, name, value)
+
+    def __delattr__(self, name):
+        if object.__getattribute__(self, "__dict__").get("_prepared", False):
+            raise FrozenInstanceError(f"cannot delete field {name!r}")
+        object.__delattr__(self, name)
+
+
+def _prepare_callback(cls, values):
+    prepared = object.__new__(cls)
+    object.__getattribute__(prepared, "__dict__").update(values, _prepared=True)
+    return prepared
+
+
+def _is_prepared_callback(callback):
+    return issubclass(type(callback), _PreparedCallback) and callback._prepared
+
+
+def _native_callback_implementations():
+    from dendra.models import callbacks as native
+
+    return (
+        (native.PopulationCallback, PopulationCallback),
+        (native.Recorder, Recorder),
+        (native.LFP, LFP),
+        (native.APCount, APCount),
+        (native.Raster, Raster),
+        (native.Active, ActiveAL),
+        (native.ActiveAL, ActiveAL),
+        (native.ActiveALCount, ActiveALCount),
+        (native.AnomalyDetector, AnomalyDetector),
+    )
+
+
+def _native_callback_implementation(callback):
+    return next(
+        (
+            implementation
+            for source, implementation in _native_callback_implementations()
+            if type(callback) is source
+        ),
+        None,
+    )
+
+
+def _is_callback_configuration(callback):
+    return (
+        isinstance(callback, FunctionalCallback)
+        or _native_callback_implementation(callback) is not None
+    )
+
+
+def _coerce_callback_configuration(callback):
+    """Capture authored native settings without importing runtime history."""
+    from dendra.models.callbacks import Recorder as NativeRecorder
+
+    if isinstance(callback, FunctionalCallback):
+        return callback
+    implementation = _native_callback_implementation(callback)
+    if implementation is None:
+        raise TypeError(
+            "functional callback values must be FunctionalCallback objects or supported built-in Dendra callback configurations"
+        )
+    for name in (
+        "pre_loop_hook",
+        "post_loop_hook",
+        "pre_step_hook",
+        "post_step_hook",
+        "pre_chunk_hook",
+        "post_chunk_hook",
+    ):
+        if getattr(getattr(callback, name), "__func__", None) is not getattr(
+            type(callback), name
+        ):
+            raise FunctionalizationError(
+                f"custom imperative {type(callback).__name__} hooks cannot be lowered; implement a FunctionalCallback"
+            )
+    if implementation is PopulationCallback:
+        return PopulationCallback(callback.population, callback.callback)
+    if type(callback) is not NativeRecorder:
+        if implementation is AnomalyDetector:
+            return implementation()
+        if implementation is LFP:
+            configured = implementation(**callback._functional_lfp_configuration())
+            configured._stacked_source = callback._lfp_stacked_source()
+            return configured
+        if implementation is ActiveAL or implementation is ActiveALCount:
+            for name in ("is_active", "numpy"):
+                if getattr(getattr(callback, name), "__func__", None) is not getattr(
+                    type(callback), name
+                ):
+                    raise FunctionalizationError(
+                        f"custom imperative {type(callback).__name__} queries cannot be lowered; implement a FunctionalCallback"
+                    )
+            return implementation(**callback._functional_activity_configuration())
+        return implementation(**callback._functional_threshold_configuration())
+    generated = getattr(callback, "_recorder_generated_hooks", ())
+    if (
+        tuple(
+            getattr(getattr(callback, name), "__func__", None)
+            for name in ("_pre_loop_hook", "_post_step_hook")
+        )
+        != generated
+    ):
+        raise FunctionalizationError(
+            "custom imperative Recorder hooks cannot be lowered; implement a FunctionalCallback"
+        )
+    recorder = Recorder(
+        tuple(callback.states),
+        max_only=callback.max_only,
+        node_indices=callback.node_indices,
+        dt=callback.save_dt,
+        partition=callback.partition,
+        region=callback.region,
+    )
+    if callback.cache_with_hdf5:
+        recorder._host_storage = (
+            callback,
+            callback.queue,
+            callback.hdf5_path,
+            callback.cache_every,
+            tuple(callback.states),
+        )
+    return recorder
+
+
+@dataclass(frozen=True)
+class PopulationCallback(FunctionalCallback):
+    """Apply one callback configuration to a named Population in a Network.
+
+    Parameters
+    ----------
+    population : str
+        Exact top-level Population name. A concatenated MultiPopulation is one
+        owner; a scoped Recorder can select its named Slice regions.
+    callback : FunctionalCallback or supported built-in configuration
+        Observation configured against that Population. Recorder state names are
+        local, for example ``v`` or ``hh.m``. The outer callback mapping's key names
+        the returned result stream.
+
+    Notes
+    -----
+    Local result shape, gradients, cadence and carry follow the ordinary Population
+    callback contract. Scopes cannot be nested. ``dn.callbacks.PopulationCallback``
+    is the shared configuration accepted by native and functional Networks; this
+    functional class is also supported.
     """
+
+    population: str
+    callback: FunctionalCallback
+
+    def __post_init__(self):
+        from dendra.models.callbacks import (
+            PopulationCallback as NativePopulationCallback,
+        )
+
+        _validate_population_callback_name(self.population)
+        if not _is_callback_configuration(self.callback):
+            raise TypeError(
+                "PopulationCallback requires a pure FunctionalCallback or supported built-in Dendra callback configuration"
+            )
+        if isinstance(self.callback, (PopulationCallback, NativePopulationCallback)):
+            raise ValueError("PopulationCallback scopes cannot be nested")
+
+    def _bind(self, functional):
+        from ._network import FunctionalNetwork
+
+        if not isinstance(functional, FunctionalNetwork):
+            raise FunctionalizationError(
+                "PopulationCallback must be bound to a functional Network; "
+                "use the inner callback directly for a Population"
+            )
+        population = _population_callback_target(
+            functional.populations, self.population, error_type=FunctionalizationError
+        )
+        bound = _coerce_callback_configuration(self.callback)._bind(population)
+        if not isinstance(bound, FunctionalCallback):
+            raise FunctionalizationError(
+                "PopulationCallback inner callback returned an invalid bound object"
+            )
+        if isinstance(bound, _BoundPopulationCallback):
+            raise FunctionalizationError("PopulationCallback scopes cannot be nested")
+        return _BoundPopulationCallback(self.population, bound)
+
+    def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
+        del state, auxiliary
+        raise FunctionalizationError(
+            "PopulationCallback must be bound with functional.make_callbacks(...)"
+        )
+
+    def update(self, carry, state, auxiliary):  # pragma: no cover - guarded by bind
+        del carry, state, auxiliary
+        raise FunctionalizationError(
+            "PopulationCallback must be bound with functional.make_callbacks(...)"
+        )
+
+    def finalize(self, carry, emissions):  # pragma: no cover - guarded by bind
+        del carry, emissions
+        raise FunctionalizationError(
+            "PopulationCallback must be bound with functional.make_callbacks(...)"
+        )
+
+
+@dataclass(frozen=True)
+class _BoundPopulationCallback(FunctionalCallback):
+    """Project a Network frame without changing the inner callback contract."""
+
+    population: str
+    callback: FunctionalCallback
+
+    def _auxiliary(self, auxiliary):
+        return None if auxiliary is None else auxiliary["populations"][self.population]
+
+    def initialize(self, state, auxiliary):
+        return self.callback.initialize(
+            state["populations"][self.population], self._auxiliary(auxiliary)
+        )
+
+    def update(self, carry, state, auxiliary):
+        return self.callback.update(
+            carry, state["populations"][self.population], self._auxiliary(auxiliary)
+        )
+
+    def finalize(self, carry, emissions):
+        return self.callback.finalize(carry, emissions)
+
+
+class Recorder(_PreparedCallback):
+    """Record selected state tensors at an optional sampling cadence.
+
+    Parameters
+    ----------
+    states : sequence of str
+        Population-local state names such as ``v`` or ``hh.m``. A Network Recorder
+        uses qualified names such as ``left.v``; a PopulationCallback scope uses
+        local names.
+    max_only : bool, default False
+        Record the maximum over the final compartment/support axis.
+    node_indices : sequence of int, optional
+        Select entries on that final axis when max_only is False.
+    partition : sequence of int, optional
+        With max_only, reduce contiguous final-axis groups separately. Positive
+        lengths must cover that axis completely.
+    dt : float, optional
+        Positive recording interval in ms, spanning at least one solver step.
+        Omission records the initial boundary and every
+        accepted post-step state. An interval uses stride
+        ``int(dt / simulation_dt)``; the initial sample is retained and continuation
+        preserves the stride phase without another initial sample.
+    region : Slice, optional
+        Physical selection belonging to the source Population, including named
+        regions of a concatenated MultiPopulation. Regions select voltage,
+        extracellular voltage and membrane current; mechanism-local state region
+        selection is currently unsupported. Mutually exclusive with
+        ``node_indices``, ``max_only`` and ``partition``.
+
+    Notes
+    -----
+    Other selection arguments follow :class:`dendra.models.callbacks.Recorder`.
+    In-memory recordings retain gradients. For HDF5 output, configure
+    ``dn.Recorder(...).set_hdf5(...)`` and pass that shared configuration. Host
+    execution writes detached samples and retains callback carry; direct tensor
+    kernels do not support HDF5 storage. Bind with
+    :func:`make_callbacks` or supply the configuration to :func:`compile`.
+    """
+
+    _preparation_error = (
+        "dn.func.Recorder must be bound with functional.make_callbacks(...)"
+    )
+    _host_storage = None
+    _checkpoint_fields = (
+        "states",
+        "paths",
+        "max_only",
+        "node_indices",
+        "partition",
+        "region",
+    )
 
     def __init__(
         self,
@@ -94,8 +406,9 @@ class Recorder(FunctionalCallback):
         max_only=False,
         node_indices=None,
         dt=None,
-        sliding_window=None,
         partition=None,
+        *,
+        region=None,
     ) -> None:
         if isinstance(states, str):
             states = (states,)
@@ -111,21 +424,18 @@ class Recorder(FunctionalCallback):
         self.max_only = bool(max_only)
         self.node_indices = node_indices
         self.dt = dt
-        self.sliding_window = sliding_window
         self.partition = partition
+        self.region = region
 
     def _bind(self, functional: FunctionalPopulation):
-        if self.dt is not None:
-            raise FunctionalizationError(
-                "dn.func.Recorder does not yet support dt; it records the "
-                "initial boundary and every post-step value"
-            )
-        if self.sliding_window is not None:
-            raise FunctionalizationError(
-                "dn.func.Recorder does not yet support sliding_window; apply a "
-                "pure tensor reduction to the finalized recording"
-            )
+        if self._prepared:
+            return self
+        paths = self._resolve_paths(functional)
+        region = self._bind_region(functional, paths)
+        return self._bind_paths(functional, paths, region)
 
+    def _resolve_paths(self, functional):
+        """Resolve public selections through a Population or Network layout."""
         available = {}
         for leaf in functional._state_layout:
             if leaf.public_path[0] == "integrator":
@@ -140,7 +450,49 @@ class Recorder(FunctionalCallback):
                 "dn.func.Recorder can only observe explicit transition state; "
                 f"unsupported selection(s): {missing}"
             )
-        paths = tuple(available[state] for state in self.states)
+        return tuple(available[state] for state in self.states)
+
+    def _bind_region(self, functional, paths):
+        """Bind physical paths relative to the region's owning Population."""
+        if self.region is None:
+            return None
+        from ._regions import _RecorderRegion
+
+        if self.max_only or self.node_indices is not None or self.partition is not None:
+            raise FunctionalizationError(
+                "dn.func.Recorder region cannot be combined with "
+                "node_indices, max_only, or partition"
+            )
+        for state_name, path in zip(self.states, paths, strict=True):
+            if path not in {
+                ("integrator", "v"),
+                ("integrator", "vc"),
+                ("integrator", "i_membrane"),
+                ("clock", "t"),
+            }:
+                raise FunctionalizationError(
+                    "dn.func.Recorder region only selects physical v, vc, "
+                    "or i_membrane state (and leaves clock t unchanged); "
+                    f"{state_name!r} is mechanism-local state"
+                )
+        return _RecorderRegion.bind(functional, self.region)
+
+    def _bind_paths(self, functional, paths, region):
+        """Bind shared recording options after path and region resolution."""
+        save_every = None
+        if self.dt is not None:
+            from dendra.models._recorder_cadence import _recorder_stride
+
+            interval = float(self.dt)
+            if not math.isfinite(interval) or interval <= 0:
+                raise FunctionalizationError(
+                    "dn.func.Recorder dt must be positive and finite"
+                )
+            save_every = _recorder_stride(self.dt, functional.dt)
+            if save_every < 1:
+                raise FunctionalizationError(
+                    "dn.func.Recorder dt must span at least one simulation timestep"
+                )
         selected_schemas = []
         for state_name, path in zip(self.states, paths, strict=True):
             schema = functional._state_schema
@@ -191,40 +543,21 @@ class Recorder(FunctionalCallback):
                         f"and {schema.shape[-1]}"
                     )
 
-        return _BoundRecorder(
-            states=self.states,
-            paths=paths,
-            max_only=self.max_only,
-            node_indices=node_indices,
-            partition=partition,
+        recorder = _prepare_callback(
+            Recorder,
+            {
+                "states": self.states,
+                "paths": paths,
+                "max_only": self.max_only,
+                "node_indices": node_indices,
+                "partition": partition,
+                "region": region,
+                "_host_storage": self._host_storage,
+            },
         )
-
-    def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
-        del state, auxiliary
-        raise FunctionalizationError(
-            "dn.func.Recorder must be bound with functional.make_callbacks(...)"
-        )
-
-    def update(self, carry, state, auxiliary):  # pragma: no cover - guarded
-        del carry, state, auxiliary
-        raise FunctionalizationError(
-            "dn.func.Recorder must be bound with functional.make_callbacks(...)"
-        )
-
-    def finalize(self, carry, emissions):  # pragma: no cover - guarded by bind
-        del carry, emissions
-        raise FunctionalizationError(
-            "dn.func.Recorder must be bound with functional.make_callbacks(...)"
-        )
-
-
-@dataclass(frozen=True)
-class _BoundRecorder(FunctionalCallback):
-    states: tuple[str, ...]
-    paths: tuple[tuple[str, ...], ...]
-    max_only: bool
-    node_indices: torch.Tensor | None
-    partition: tuple[int, ...] | None
+        if save_every is None:
+            return recorder
+        return _BoundCadencedRecorder(recorder, save_every, functional.dt)
 
     def _observe(self, state: Mapping[str, object]) -> dict[str, torch.Tensor]:
         output = {}
@@ -233,6 +566,10 @@ class _BoundRecorder(FunctionalCallback):
             if not torch.is_tensor(value):  # pragma: no cover - plan owns schema
                 raise FunctionalizationError(
                     f"functional Recorder state {name!r} is no longer a Tensor"
+                )
+            if self.region is not None and path[-2:] != ("clock", "t"):
+                value = self.region.select(
+                    value, payload_ndim=int(path[-2:] == ("integrator", "vc"))
                 )
             if self.max_only:
                 if self.partition is None:
@@ -249,15 +586,159 @@ class _BoundRecorder(FunctionalCallback):
         return output
 
     def initialize(self, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         observed = self._observe(state)
         return (), observed
 
     def update(self, carry, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         return carry, self._observe(state)
 
     def finalize(self, carry, emissions):
+        self._require_prepared()
+        del carry
+        return emissions
+
+
+@dataclass(frozen=True)
+class _BoundCadencedRecorder(FunctionalCallback):
+    recorder: Recorder
+    save_every: int
+    callback_dt: float
+
+    def initialize(self, state, auxiliary):
+        del auxiliary
+        observed = self.recorder._observe(state)
+        device = next(iter(observed.values())).device
+        return torch.zeros((), dtype=torch.int64, device=device), observed
+
+    def update(self, carry, state, auxiliary):
+        del auxiliary
+        return carry + 1, self.recorder._observe(state)
+
+    def finalize(self, carry, emissions):
+        return self._select_emissions(carry, emissions)
+
+    def _select_emissions(self, carry, emissions):
+        from dendra.models._recorder_cadence import _recorder_indices
+
+        if emissions is None:
+            return None
+        size = next(iter(emissions.values())).shape[0]
+        indices = _recorder_indices(carry, size, self.save_every)
+        return {
+            name: value.index_select(0, indices.to(device=value.device))
+            for name, value in emissions.items()
+        }
+
+
+class LFP(_PreparedCallback):
+    """Record extracellular potentials from reciprocal lead fields.
+
+    Parameters
+    ----------
+    v_unit : sequence of Tensor
+        Non-empty, equally shaped lead fields, one per contact. Fields in mV/mA
+        (numerically ohms) project absolute membrane current in mA to mV. Conversion
+        to the model dtype/device preserves field gradients.
+    rule : str, optional
+        Explicit ``torch.einsum`` reduction. Without a rule, fields broadcast to
+        Population voltage shape and cell/compartment axes are summed, preserving
+        explicit batch axes.
+
+    Notes
+    -----
+    Construct the source model under ``dn.ctx(IMEM=1)`` to enable membrane current.
+    Default results have shape ``(samples, *batch, contacts)`` and include the
+    initial boundary. Native and functional projection conventions match.
+    Continuation retains callback phase; :func:`detach_continuation` preserves
+    fresh suffix gradients to bound fields. Only electrode projections are
+    recorded, although autograd can retain current intermediates for backward.
+    """
+
+    _preparation_error = "dn.func.LFP must be bound with functional.make_callbacks(...)"
+    _checkpoint_fields = ("fields", "rule", "padding", "device", "dtype")
+    _stacked_source = None
+
+    def __init__(self, v_unit: list[torch.Tensor], rule=None):
+        fields = _validate_lfp_fields(v_unit)
+        if rule is not None and not isinstance(rule, str):
+            raise TypeError("functional LFP rule must be a string or None")
+        self.v_unit = fields
+        self.rule = rule
+
+    def _bind(self, functional: FunctionalPopulation):
+        if self._prepared:
+            return self
+        path = ("integrator", "i_membrane")
+        if not any(leaf.public_path == path for leaf in functional._state_layout):
+            raise FunctionalizationError(
+                "dn.func.LFP requires membrane-current output; construct the "
+                "Population inside dn.ctx(IMEM=1)"
+            )
+        padding = 0
+        if self.rule is None:
+            try:
+                shape = torch.broadcast_shapes(self.v_unit[0].shape, functional.shape)
+            except RuntimeError as error:
+                raise FunctionalizationError(
+                    "dn.func.LFP lead fields must broadcast to the Population "
+                    f"shape {functional.shape}; got {tuple(self.v_unit[0].shape)}"
+                ) from error
+            if tuple(shape) != functional.shape:
+                raise FunctionalizationError(
+                    "dn.func.LFP lead fields must broadcast to the Population "
+                    f"shape {functional.shape}; got {tuple(self.v_unit[0].shape)}"
+                )
+            padding = len(functional.shape) - self.v_unit[0].ndim
+        return _prepare_callback(
+            LFP,
+            {
+                "fields": self.v_unit,
+                "rule": self.rule,
+                "padding": padding,
+                "device": functional.device,
+                "dtype": functional.dtype,
+                "_stacked_source": self._stacked_source,
+            },
+        )
+
+    def _materialization_fields(self):
+        source = self._stacked_source
+        if source is None:
+            return self.fields
+        # Read a public stacked source afresh: cached views of a leaf view can
+        # lose their AD connection when its owner is updated between runs.
+        return tuple(source[index] for index in range(source.shape[0]))
+
+    def _materialize_carry(self):
+        return _materialize_lfp_fields(
+            self._materialization_fields(),
+            device=self.device,
+            dtype=self.dtype,
+            padding=self.padding if self.rule is None else None,
+        )
+
+    def _observe(self, state, fields):
+        return _project_lfp(state["integrator"]["i_membrane"], fields, rule=self.rule)
+
+    def initialize(self, state, auxiliary):
+        self._require_prepared()
+        del auxiliary
+        # Build this at execution, not binding/probing: each fresh run needs
+        # its own differentiable stack even after an earlier backward freed AD.
+        fields = self._materialize_carry()
+        return fields, self._observe(state, fields)
+
+    def update(self, carry, state, auxiliary):
+        self._require_prepared()
+        del auxiliary
+        return carry, self._observe(state, carry)
+
+    def finalize(self, carry, emissions):
+        self._require_prepared()
         del carry
         return emissions
 
@@ -285,7 +766,7 @@ class AnomalyDetector(FunctionalCallback):
     def update(self, carry, state, auxiliary):
         del auxiliary
         voltage = self._voltage(state)
-        return carry | ~torch.isfinite(voltage).all(dim=-1), None
+        return _anomaly_flags(carry, voltage), None
 
     def finalize(self, carry, emissions):
         if emissions is not None:  # pragma: no cover - collection owns schema
@@ -336,11 +817,12 @@ def _bind_threshold_configuration(
             "node_check entries must be valid compartment indices in "
             f"[-{compartments}, {compartments - 1}]; got {invalid_values}"
         )
-    node_indices = torch.where(
-        node_indices < 0,
-        node_indices + compartments,
-        node_indices,
-    )
+    with torch.inference_mode(False):
+        node_indices = torch.where(
+            node_indices < 0,
+            node_indices + compartments,
+            node_indices,
+        )
 
     try:
         threshold = float(threshold)
@@ -376,10 +858,18 @@ def _bind_threshold_configuration(
     return node_indices, threshold, start_step, end_step, callback_dt
 
 
-class _ThresholdCallback(FunctionalCallback):
+class _ThresholdCallback(_PreparedCallback):
     """Static user-facing configuration shared by threshold built-ins."""
 
     _bound_type = None
+    _preparation_error = "functional threshold callbacks must be bound with functional.make_callbacks(...)"
+    _checkpoint_fields = (
+        "node_indices",
+        "threshold",
+        "start_step",
+        "end_step",
+        "callback_dt",
+    )
 
     def __init__(
         self,
@@ -396,6 +886,8 @@ class _ThresholdCallback(FunctionalCallback):
         self.dt = dt
 
     def _bind(self, functional: FunctionalPopulation):
+        if self._prepared:
+            return self
         configuration = _bind_threshold_configuration(
             functional,
             threshold=self.threshold,
@@ -404,28 +896,23 @@ class _ThresholdCallback(FunctionalCallback):
             node_check=self.node_check,
             dt=self.dt,
         )
-        return self._bound_type(*configuration)
+        return _prepare_threshold_callback(self._bound_type, configuration)
 
-    def initialize(self, state, auxiliary):  # pragma: no cover - guarded by bind
-        del state, auxiliary
-        raise FunctionalizationError(
-            "functional threshold callbacks must be bound with "
-            "functional.make_callbacks(...)"
-        )
 
-    def update(self, carry, state, auxiliary):  # pragma: no cover - guarded
-        del carry, state, auxiliary
-        raise FunctionalizationError(
-            "functional threshold callbacks must be bound with "
-            "functional.make_callbacks(...)"
-        )
+def _prepare_threshold_callback(factory, configuration, activity=()):
+    # Custom factories retain the normalized positional argument contract.
+    if not any(factory is cls for cls in (Raster, APCount, ActiveAL, ActiveALCount)):
+        return factory(*configuration, *activity)
+    values = dict(
+        zip(_ThresholdCallback._checkpoint_fields, configuration, strict=True)
+    )
+    if activity:
+        values.update(zip(("at_least", "inv", "partition"), activity, strict=True))
+    return _prepare_callback(factory, values)
 
-    def finalize(self, carry, emissions):  # pragma: no cover - guarded by bind
-        del carry, emissions
-        raise FunctionalizationError(
-            "functional threshold callbacks must be bound with "
-            "functional.make_callbacks(...)"
-        )
+
+def _is_prepared_threshold_callback(callback):
+    return issubclass(type(callback), _ThresholdCallback) and callback._prepared
 
 
 def _selected_voltage(state, node_indices):
@@ -446,31 +933,37 @@ def _threshold_crossing(
     end_step,
 ):
     selected = _selected_voltage(state, node_indices)
-    above = selected >= threshold
+    next_below, spikes = threshold_crossing(below, selected, threshold)
     within_window = (step >= start_step) & (step < end_step)
-    spikes = above & below & within_window
-    next_below = torch.where(within_window, ~above, below)
+    spikes = spikes & within_window
+    next_below = torch.where(within_window, next_below, below)
     return next_below, spikes
 
 
-@dataclass(frozen=True)
-class _BoundRaster(FunctionalCallback):
-    node_indices: torch.Tensor
-    threshold: float
-    start_step: int
-    end_step: int
-    callback_dt: float
+class Raster(_ThresholdCallback):
+    """Record post-step threshold crossings inside a time window.
+
+    The Boolean result has shape ``(samples, *batch, N, K)`` for ``K`` selected
+    compartments. Only accepted samples inside the checked window are returned;
+    the initial model state is not sampled. Constructor arguments follow
+    :class:`dendra.models.callbacks.Raster`: ``threshold`` is a voltage threshold,
+    ``t_start_check``/``t_end_check`` bound the window in ms, ``node_check`` selects
+    compartments and ``dt`` sets the solver timing used for that window.
+    Continuation preserves crossing and window phase.
+    """
 
     def initialize(self, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         selected = _selected_voltage(state, self.node_indices)
         carry = (
             torch.ones_like(selected, dtype=torch.bool),
-            selected.new_zeros((), dtype=torch.int64),
+            torch.zeros((), device=selected.device, dtype=torch.int64),
         )
         return carry, None
 
     def update(self, carry, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         below, step = carry
         next_below, spikes = _threshold_crossing(
@@ -484,45 +977,45 @@ class _BoundRaster(FunctionalCallback):
         )
         return (next_below, step + 1), spikes
 
-    def finalize(self, carry, emissions):
-        below, _step = carry
+    def _select_emissions(self, carry, emissions):
+        below, step = carry
         if emissions is None:
             return below.new_empty((0, *below.shape))
-        return emissions
+        if self.start_step <= 0 and self.end_step == torch.iinfo(torch.int64).max:
+            return emissions
+        indices = torch.arange(emissions.shape[0], device=step.device, dtype=torch.long)
+        positions = indices + step - emissions.shape[0]
+        indices = indices[(positions >= self.start_step) & (positions < self.end_step)]
+        return emissions.index_select(0, indices.to(device=emissions.device))
+
+    def finalize(self, carry, emissions):
+        self._require_prepared()
+        return self._select_emissions(carry, emissions)
 
 
-class Raster(_ThresholdCallback):
-    """Record post-step upward threshold crossings as a Boolean trajectory.
+class APCount(_ThresholdCallback):
+    """Count post-step threshold crossings without retaining a trajectory.
 
-    The constructor mirrors :class:`dendra.callbacks.Raster`. The result has
-    shape ``(steps, *batch, N, K)`` for ``K`` selected compartments. Unlike the
-    mutable callback, the functional result retains every simulated step and
-    masks events outside ``[t_start_check, t_end_check)`` to preserve a static,
-    transform-friendly time axis.
+    The int32 result has shape ``(*batch, N, K)`` for ``K`` checked compartments.
+    ``threshold``, ``t_start_check``, ``t_end_check``, ``node_check`` and ``dt`` use
+    the same meanings as :class:`Raster`. Crossing state, cumulative counts and
+    window phase continue through returned callback carry. Hard counts are
+    nondifferentiable; recording them does not detach model state or other outputs.
     """
 
-    _bound_type = _BoundRaster
-
-
-@dataclass(frozen=True)
-class _BoundAPCount(FunctionalCallback):
-    node_indices: torch.Tensor
-    threshold: float
-    start_step: int
-    end_step: int
-    callback_dt: float
-
     def initialize(self, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         selected = _selected_voltage(state, self.node_indices)
         carry = (
             torch.ones_like(selected, dtype=torch.bool),
-            torch.zeros_like(selected, dtype=torch.int64),
+            torch.zeros_like(selected, dtype=_COUNT_DTYPE),
             selected.new_zeros((), dtype=torch.int64),
         )
         return carry, None
 
     def update(self, carry, state, auxiliary):
+        self._require_prepared()
         del auxiliary
         below, count, step = carry
         next_below, spikes = _threshold_crossing(
@@ -534,34 +1027,196 @@ class _BoundAPCount(FunctionalCallback):
             self.start_step,
             self.end_step,
         )
-        return (next_below, count + spikes.to(count.dtype), step + 1), None
+        return (next_below, accumulate_count(count, spikes), step + 1), None
 
     def finalize(self, carry, emissions):
+        self._require_prepared()
         if emissions is not None:  # pragma: no cover - collection owns schema
             raise FunctionalizationError("APCount does not emit samples")
         _below, count, _step = carry
         return count
 
 
-class APCount(_ThresholdCallback):
-    """Count upward voltage-threshold crossings in constant callback memory.
+def _bind_activity_partition(partition, checked_nodes: int, at_least):
+    """Resolve contiguous checked-slot groups before transformed execution."""
+    if partition is None:
+        return None
+    try:
+        lengths = torch.as_tensor(partition, dtype=torch.long, device="cpu")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("partition must be a 1D sequence of integers") from exc
+    if lengths.ndim != 1:
+        raise ValueError("partition must be a 1D sequence of integers")
+    values = tuple(lengths.tolist())
+    if not values:
+        raise ValueError("partition must be non-empty")
+    if sum(values) != checked_nodes:
+        raise ValueError(
+            "sum(partition) must equal the number of checked compartments; "
+            f"got {sum(values)} and {checked_nodes}"
+        )
+    if min(values) < at_least:
+        raise ValueError("all partition values must be at least `at_least`")
+    return values
 
-    The returned integer tensor has shape ``(*batch, N, K)`` for ``K``
-    selected compartments. Crossing state, counts, and timestep phase all live
-    in explicit carry, so segmented and checkpointed execution resume exactly.
+
+def _activity_from_counts(count, at_least, inv, partition, *, total):
+    active = activity_from_counts(count, at_least, partition, total=total)
+    return ~active if inv else active
+
+
+class ActiveAL(APCount):
+    """Detect activity at at least ``at_least`` distinct checked slots.
+
+    A slot qualifies after any upward threshold crossing. Repeated crossings
+    at one slot do not satisfy a multi-slot target; use :class:`ActiveALCount`
+    for a total-spike target. The finalized Boolean result preserves all
+    batch/population axes and removes only the checked-slot axis.
+
+    ``partition`` optionally groups contiguous checked slots and appends a
+    group axis to the result. Unlike imperative ``is_active(partition)``, it
+    is fixed when callbacks are bound, so execution remains pure and compiled.
+    ``inv`` complements the final result. Hard activity is nondifferentiable;
+    adding this callback does not detach model state or Recorder outputs.
+    ``at_least`` must be a positive integer, using the same validation as
+    native activity callbacks.
     """
 
-    _bound_type = _BoundAPCount
+    _checkpoint_fields = _ThresholdCallback._checkpoint_fields + (
+        "at_least",
+        "inv",
+        "partition",
+    )
+
+    def __init__(
+        self,
+        threshold=0.0,
+        t_start_check=0.0,
+        t_end_check=None,
+        node_check=(5, -5),
+        dt=None,
+        at_least=1,
+        inv=False,
+        *,
+        partition=None,
+    ) -> None:
+        super().__init__(threshold, t_start_check, t_end_check, node_check, dt)
+        self.at_least = _validate_activity_target(at_least)
+        self.inv = inv
+        self.partition = partition
+
+    def _bind(self, functional: FunctionalPopulation):
+        if self._prepared:
+            return self
+        configuration = _bind_threshold_configuration(
+            functional,
+            threshold=self.threshold,
+            t_start_check=self.t_start_check,
+            t_end_check=self.t_end_check,
+            node_check=self.node_check,
+            dt=self.dt,
+        )
+        target = _validate_activity_target(self.at_least)
+        partition = _bind_activity_partition(
+            self.partition, configuration[0].numel(), target
+        )
+        return _prepare_threshold_callback(
+            self._bound_type, configuration, (target, bool(self.inv), partition)
+        )
+
+    def finalize(self, carry, emissions):
+        self._require_prepared()
+        if emissions is not None:  # pragma: no cover - collection owns schema
+            raise FunctionalizationError("ActiveAL does not emit samples")
+        _below, count, _step = carry
+        return _activity_from_counts(
+            count, self.at_least, self.inv, self.partition, total=False
+        )
+
+
+class ActiveALCount(ActiveAL):
+    """Detect at least ``at_least`` total crossings across checked slots.
+
+    Repeated spikes at one checked slot contribute separately. Configuration,
+    window phase, inversion, partitioning, and explicit continuation follow
+    :class:`ActiveAL`. The returned tensor is Boolean, not a spike count.
+    """
+
+    def finalize(self, carry, emissions):
+        self._require_prepared()
+        if emissions is not None:  # pragma: no cover - collection owns schema
+            raise FunctionalizationError("ActiveALCount does not emit samples")
+        _below, count, _step = carry
+        return _activity_from_counts(
+            count, self.at_least, self.inv, self.partition, total=True
+        )
+
+
+class Active(ActiveAL):
+    """Detect whether any checked compartment crosses threshold at least once."""
+
+    def __init__(
+        self,
+        threshold=0.0,
+        t_start_check=0.0,
+        t_end_check=None,
+        node_check=(5, -5),
+        dt=None,
+        inv=False,
+        *,
+        partition=None,
+    ) -> None:
+        super().__init__(
+            threshold,
+            t_start_check,
+            t_end_check,
+            node_check,
+            dt,
+            at_least=1,
+            inv=inv,
+            partition=partition,
+        )
+
+
+# Default binding canonicalizes authored subclasses just as the existing factory
+# contract does; custom _bind hooks and _bound_type factories remain explicit.
+Raster._bound_type = Raster
+APCount._bound_type = APCount
+ActiveAL._bound_type = ActiveAL
+ActiveALCount._bound_type = ActiveALCount
+
+
+def _callback_implementation(callback):
+    """Expose built-in policy through an exact, trusted Population adapter."""
+    return callback.callback if type(callback) is _BoundPopulationCallback else callback
+
+
+def _is_prepared_lfp(callback):
+    return type(callback) is LFP and _is_prepared_callback(callback)
+
+
+def _is_builtin_callback(callback):
+    callback = _callback_implementation(callback)
+    if _is_prepared_callback(callback):
+        return any(
+            type(callback) is cls
+            for cls in (Recorder, LFP, Raster, APCount, ActiveAL, ActiveALCount)
+        )
+    return type(callback) in {
+        _BoundCadencedRecorder,
+        AnomalyDetector,
+    }
 
 
 @dataclass(frozen=True)
 class FunctionalCallbackResults(Mapping[str, object]):
-    """Immutable finalized result envelope for one callback execution segment.
+    """Finalized named callback outputs and carry for one execution segment.
 
-    Functional runners place it under ``auxiliary["callbacks"]``; the
-    imperative checkpoint bridge returns it directly. ``state`` is the
-    explicit callback carry to pass when continuing. Mapping access forwards
-    to finalized ``outputs``.
+    Functional execution returns this mapping at ``auxiliary["callbacks"]``.
+    Native pure-callback execution returns it directly. ``results[name]`` reads
+    that callback's finalized output; ``results.state`` is the carry for the next
+    call's ``callback_state=``. Recording outputs contain this segment's samples;
+    the carry retains cumulative reductions and sampling phase.
     """
 
     state: FunctionalCallbackState
@@ -592,10 +1247,12 @@ class FunctionalCallbackState(Mapping[str, object]):
 
     @property
     def plan_token(self) -> object:
+        """Collection identity used to validate live callback continuation."""
         return self._token
 
     @property
     def emission_schemas(self):
+        """Recorded emission layouts used to validate continued callback results."""
         return self._emission_schemas
 
     def __getitem__(self, key: str):
@@ -775,7 +1432,14 @@ def _stack_emissions(values, schema, *, label: str):
     return torch.utils._pytree.tree_unflatten(stacked, schema.spec)
 
 
-def _concatenate_emissions(parts, schema, *, label: str):
+def _concatenate_emissions(parts, schema, *, label: str, borrow_single=False):
+    """Validate stacked emissions and optionally borrow one internal part.
+
+    The host's final assembly must keep the default copying behavior: callback
+    results must not expose a compiled chunk's storage or an earlier result's
+    emissions. Only an intermediate assembly that is subsequently materialized
+    by the host may opt into borrowing. Schema checks are identical either way.
+    """
     if not parts:
         return None if schema is None else _empty_emissions(schema)
     parts = [part for part in parts if part is not None]
@@ -785,6 +1449,11 @@ def _concatenate_emissions(parts, schema, *, label: str):
         first_leaves, spec = torch.utils._pytree.tree_flatten(parts[0])
         if not first_leaves:
             raise FunctionalizationError(f"{label} must contain at least one Tensor")
+        for index, leaf in enumerate(first_leaves):
+            if not torch.is_tensor(leaf) or leaf.ndim < 1:
+                raise FunctionalizationError(
+                    f"{label} stacked leaf {index} must be a Tensor with a sample axis"
+                )
         expected_leaves = tuple(
             _TensorLeafSchema(
                 shape=tuple(leaf.shape),
@@ -826,6 +1495,8 @@ def _concatenate_emissions(parts, schema, *, label: str):
                     "or trailing shape"
                 )
         flattened.append(leaves)
+    if borrow_single and len(parts) == 1:
+        return parts[0]
     concatenated = [
         torch.cat([leaves[index] for leaves in flattened], dim=0)
         for index in range(len(expected_leaves))
@@ -892,6 +1563,125 @@ def _stack_callback_emissions(plans, emissions):
     }
 
 
+def _setup_callback_state(callbacks, callback_state, state):
+    """Initialize or validate carry and collect a segment's initial part."""
+    if callback_state is None:
+        callback_state, initial_emission = callbacks._initialize(state)
+        initial_part = callbacks._stack([initial_emission])
+        parts = [initial_part] if callbacks._has_emissions(initial_part) else []
+    else:
+        callback_state = callbacks._validate_state(callback_state)
+        parts = []
+    return callback_state, parts
+
+
+class _CallbackCollector:
+    """Invocation-local sampled history outside the numerical loop boundary."""
+
+    def __init__(self, callbacks, selections):
+        self._callbacks = callbacks
+        self._selections = selections
+        self.parts = []
+
+    def append(self, callback_state, emitted, *, retained=False):
+        if not retained:
+            emitted = dict(emitted)
+            for name, selector in self._selections:
+                if emitted[name] is not None:
+                    emitted[name] = selector._select_emissions(
+                        callback_state[name], emitted[name]
+                    )
+        # Empty selections still own a connected zero VJP. Retain their tensor
+        # parts instead of synthesizing detached empties during completion.
+        self.parts.append(emitted)
+
+    def concatenate(self, *, borrow_single=False):
+        return self._callbacks._concatenate(self.parts, borrow_single=borrow_single)
+
+
+def _host_callback_parts(callbacks, callback_state, parts, *, storage=None):
+    """Opt owned host collections into retention without changing atomic calls."""
+    if type(callbacks) is not FunctionalCallbacks:
+        if storage and getattr(callbacks, "_storage", None):
+            raise FunctionalizationError(
+                "HDF5 recording requires the standard host callback collector"
+            )
+        return parts
+    for name, original in _CALLBACK_RETENTION_HOOKS:
+        method = getattr(callbacks, name)
+        if getattr(method, "__func__", method) is not original:
+            if storage and callbacks._storage:
+                raise FunctionalizationError(
+                    "HDF5 recording requires the standard host callback collector"
+                )
+            return parts
+    selections = []
+    for plan in callbacks._plans:
+        implementation = _callback_implementation(plan.callback)
+        if type(implementation) in (_BoundCadencedRecorder, Raster):
+            selections.append((plan.name, implementation))
+    if storage and callbacks._storage:
+        from ._recording import _recording_collector
+
+        return _recording_collector(
+            callbacks, callback_state, tuple(selections), parts, storage
+        )
+    if not selections:
+        return parts
+    collector = _CallbackCollector(callbacks, tuple(selections))
+    for part in parts:
+        collector.append(callback_state, part)
+    return collector
+
+
+def _collect_callback_emissions(
+    callbacks, callback_state, parts, emitted, *, retained=False, steps=None
+):
+    if callbacks._has_emissions(emitted):
+        if isinstance(parts, _CallbackCollector):
+            options = {"steps": steps} if hasattr(parts, "storage_names") else {}
+            parts.append(callback_state, emitted, retained=retained, **options)
+        else:
+            parts.append(emitted)
+
+
+def _concatenate_callback_parts(callbacks, parts, *, borrow_single=False):
+    if isinstance(parts, _CallbackCollector):
+        return parts.concatenate(borrow_single=borrow_single)
+    if borrow_single:
+        return callbacks._concatenate(parts, borrow_single=True)
+    return callbacks._concatenate(parts)
+
+
+def _complete_callback_results(
+    callbacks, callback_state, parts
+) -> FunctionalCallbackResults:
+    """Finalize one segment before materializing its continuation carry."""
+    if isinstance(parts, _CallbackCollector):
+        stacked = parts.concatenate()
+    else:
+        stacked = callbacks._concatenate(parts)
+    callback_state = callbacks._capture_emission_schemas(
+        callback_state,
+        stacked,
+    )
+    if isinstance(parts, _CallbackCollector):
+        outputs = callbacks._finalize(callback_state, stacked, _retained=True)
+    else:
+        outputs = callbacks._finalize(callback_state, stacked)
+    if isinstance(parts, _CallbackCollector) and hasattr(parts, "storage_names"):
+        outputs = {
+            name: value
+            for name, value in outputs.items()
+            if name not in parts.storage_names
+        }
+    callback_state = callbacks._materialize_state(callback_state)
+    return FunctionalCallbackResults(
+        state=callback_state,
+        outputs=outputs,
+    )
+
+
 @dataclass(frozen=True)
 class _ImperativeCallbackBinding:
     callbacks: FunctionalCallbacks
@@ -906,13 +1696,93 @@ class _ImperativeCallbackBinding:
             _put_path(state, public_path, value)
         return state
 
+    @staticmethod
+    def auxiliary(state):
+        return {"v": state["integrator"]["v"]}
+
+
+def _native_population_readers(functional, population):
+    readers = []
+    for leaf in functional._state_layout:
+        owner = (
+            population
+            if not leaf.module_path
+            else population.get_submodule(leaf.module_path)
+        )
+        if leaf.buffer_name not in owner._buffers and not hasattr(
+            owner, leaf.buffer_name
+        ):
+            raise FunctionalizationError(
+                "functional callback state binding lost runtime tensor "
+                f"{leaf.module_path}.{leaf.buffer_name}"
+            )
+        readers.append((leaf.public_path, owner, leaf.buffer_name))
+    return tuple(readers)
+
 
 class FunctionalCallbacks:
-    """An immutable named collection of native functional callbacks.
+    """Prepared named observations with explicit callback state.
 
-    Construct a collection with :meth:`FunctionalPopulation.make_callbacks`.
-    Callback objects supply static configuration only and are never mutated.
+    Create with :func:`dendra.func.make_callbacks` for a native model or functional
+    plan, or with a plan's ``make_callbacks`` method. The collection binds callback
+    configuration, scopes and state selections; execution stores evolving values
+    in returned :class:`FunctionalCallbackState`, not in callback objects.
+
+    Reuse a collection and its state to preserve recording cadence and reductions.
+    Portable ``export_state``/``restore_state`` transfers carry between equivalent
+    independently prepared collections. Recording payloads themselves are not part
+    of callback-state checkpoints.
     """
+
+    def detach_state(self, state: FunctionalCallbackState) -> FunctionalCallbackState:
+        """Truncate callback history while retaining its values and sampling phase.
+
+        Recurrent carry tensors detach with shared storage, preserving tensor
+        aliases, views, callback identity, emission metadata, sampling phase and
+        accumulated values. Built-in LFP fields are rematerialized from current
+        bound sources with the caller's gradient mode; keep gradients enabled
+        when training those fields in the next segment.
+
+        Model state, parameters, constants and previous results are untouched.
+        Detach model history separately for native or explicit-state execution;
+        use ``dn.func.detach_continuation`` for a complete functional packet.
+        Custom callback carry is recurrent. Externally computed nonleaf field
+        sources remain caller-owned when their upstream graphs are consumed.
+
+        The state must belong to this collection. No model validation,
+        initialization, sampling, numerical execution, checkpoint configuration
+        hooks or storage I/O runs. This host operation runs outside compilation,
+        function transforms and forward AD. Resume through ``callback_state=``.
+        """
+        from ._callback_detach import _detach_callback_state
+
+        return _detach_callback_state(self, state)
+
+    def export_state(self, state: FunctionalCallbackState):
+        """Export owned detached carry for equivalent reconstructed callbacks.
+
+        The versioned plain data/Tensor packet can be saved with ``torch.save``
+        and loaded with ``torch.load(..., weights_only=True)``. It contains
+        callback carry and emission metadata, without recording history.
+        Built-in callbacks, Population scopes and custom bound callbacks with
+        ``checkpoint_configuration()`` support portable restoration.
+        Export runs outside compilation, function transforms and forward AD.
+        """
+        from ._callback_checkpoints import export_state
+
+        return export_state(self, state)
+
+    def restore_state(self, packet) -> FunctionalCallbackState:
+        """Restore a checkpoint into this compatible callback collection.
+
+        Configuration, tensor structure, dtype and device must match. The
+        returned carry owns detached ordinary tensors and uses this collection's
+        identity; pass it through the existing ``callback_state=`` argument.
+        Restoring does not initialize callbacks or mutate this collection.
+        """
+        from ._callback_checkpoints import restore_state
+
+        return restore_state(self, packet)
 
     def __init__(
         self,
@@ -942,14 +1812,26 @@ class FunctionalCallbacks:
                 )
             plans.append(self._probe(name, bound, example_state))
         self._plans = tuple(plans)
+        storage = {}
+        seen = set()
+        for plan in self._plans:
+            implementation = _callback_implementation(plan.callback)
+            if type(implementation) is _BoundCadencedRecorder:
+                implementation = implementation.recorder
+            if (
+                type(implementation) is Recorder
+                and implementation._host_storage is not None
+            ):
+                binding = implementation._host_storage
+                if id(binding[0]) in seen:
+                    raise FunctionalizationError(
+                        "an HDF5 Recorder can name only one output in a callback collection"
+                    )
+                seen.add(id(binding[0]))
+                storage[plan.name] = binding
+        self._storage = storage
 
-    @staticmethod
-    def _coerce_callback(callback) -> FunctionalCallback:
-        if not isinstance(callback, FunctionalCallback):
-            raise TypeError(
-                "functional callback values must be FunctionalCallback objects"
-            )
-        return callback
+    _coerce_callback = staticmethod(_coerce_callback_configuration)
 
     @staticmethod
     def _pair(value, *, label: str):
@@ -1005,25 +1887,25 @@ class FunctionalCallbacks:
             emission_schema=emission_schema,
             result_schema=result_schema,
             initial_emits=initial_emits,
-            validate_updates=type(callback)
-            not in {
-                _BoundRecorder,
-                AnomalyDetector,
-                _BoundRaster,
-                _BoundAPCount,
-            },
+            validate_updates=not _is_builtin_callback(callback),
         )
 
     def _validate_owner(self, functional: FunctionalPopulation) -> None:
         if functional is not self._functional:
             raise FunctionalizationError(
-                "callbacks belong to a different FunctionalPopulation plan"
+                "callbacks belong to a different functional execution plan"
             )
 
     def _validate_runtime_dt(self, dt: float) -> None:
         for plan in self._plans:
-            callback = plan.callback
-            if isinstance(callback, (_BoundRaster, _BoundAPCount)) and (
+            callback = _callback_implementation(plan.callback)
+            if isinstance(callback, _BoundCadencedRecorder):
+                if dt != callback.callback_dt:
+                    raise FunctionalizationError(
+                        "functional Recorder dt does not match the "
+                        f"runtime timestep: expected {callback.callback_dt}, got {dt}"
+                    )
+            if _is_prepared_threshold_callback(callback) and (
                 dt != callback.callback_dt
             ):
                 raise FunctionalizationError(
@@ -1033,12 +1915,21 @@ class FunctionalCallbacks:
 
     def _validate_runtime_dt_tensor(self, dt: torch.Tensor) -> None:
         for plan in self._plans:
-            callback = plan.callback
-            if not isinstance(callback, (_BoundRaster, _BoundAPCount)):
+            callback = _callback_implementation(plan.callback)
+            if not (
+                _is_prepared_threshold_callback(callback)
+                or isinstance(callback, _BoundCadencedRecorder)
+            ):
                 continue
             expected = dt.new_tensor(callback.callback_dt)
             message = (
-                "functional threshold callback dt does not match the prepared "
+                "functional "
+                + (
+                    "Recorder"
+                    if isinstance(callback, _BoundCadencedRecorder)
+                    else "threshold callback"
+                )
+                + " dt does not match the prepared "
                 f"timestep {callback.callback_dt}"
             )
             if (
@@ -1050,29 +1941,26 @@ class FunctionalCallbacks:
                 raise FunctionalizationError(message)
 
     def _bind_imperative(self, population):
-        if population is not self._functional._population:
-            raise FunctionalizationError(
-                "functional callbacks must be bound to the exact source "
-                "Population used by make_functional()"
-            )
-        self._functional._validate_source()
-        readers = []
-        for leaf in self._functional._state_layout:
-            owner = (
-                population
-                if not leaf.module_path
-                else population.get_submodule(leaf.module_path)
-            )
-            if leaf.buffer_name not in owner._buffers and not hasattr(
-                owner,
-                leaf.buffer_name,
-            ):
+        from ._network import FunctionalNetwork
+
+        if isinstance(self._functional, FunctionalNetwork):
+            from ._network_callbacks import _bind_native_network_callbacks
+
+            return _bind_native_network_callbacks(self, population)
+        original = population is self._functional._population
+        if not original:
+            from dendra.models.core import Population
+
+            if not isinstance(population, Population):
                 raise FunctionalizationError(
-                    "functional callback state binding lost runtime tensor "
-                    f"{leaf.module_path}.{leaf.buffer_name}"
+                    "functional callbacks require a compatible native Population"
                 )
-            readers.append((leaf.public_path, owner, leaf.buffer_name))
-        return _ImperativeCallbackBinding(self, tuple(readers))
+        self._functional._validate_source()
+        if not original:
+            self._functional._validate_compatible_population(population)
+        return _ImperativeCallbackBinding(
+            self, _native_population_readers(self._functional, population)
+        )
 
     def _initialize(self, state):
         carries = {}
@@ -1206,12 +2094,13 @@ class FunctionalCallbacks:
                     )
         return state
 
-    def _concatenate(self, parts):
+    def _concatenate(self, parts, *, borrow_single=False):
         return {
             plan.name: _concatenate_emissions(
                 [part[plan.name] for part in parts],
                 plan.emission_schema,
                 label=f"functional callback {plan.name!r} emission",
+                borrow_single=borrow_single,
             )
             for plan in self._plans
         }
@@ -1270,15 +2159,26 @@ class FunctionalCallbacks:
             _emission_schemas=tuple(schemas),
         )
 
-    def _finalize(self, callback_state, emissions):
+    def _finalize(self, callback_state, emissions, *, _retained=False):
         self._validate_state(callback_state)
-        outputs = {
-            plan.name: plan.callback.finalize(
-                callback_state[plan.name],
-                emissions[plan.name],
+        outputs = {}
+        for plan in self._plans:
+            if _retained:
+                implementation = _callback_implementation(plan.callback)
+                if type(implementation) is _BoundCadencedRecorder:
+                    outputs[plan.name] = implementation.recorder.finalize(
+                        (), emissions[plan.name]
+                    )
+                    continue
+                if type(implementation) is Raster and emissions[plan.name] is not None:
+                    # Owned host collectors already selected this segment's
+                    # window. Selecting compact rows a second time would
+                    # reinterpret their timeline using the final step count.
+                    outputs[plan.name] = emissions[plan.name]
+                    continue
+            outputs[plan.name] = plan.callback.finalize(
+                callback_state[plan.name], emissions[plan.name]
             )
-            for plan in self._plans
-        }
         for plan in self._plans:
             leaves, spec = torch.utils._pytree.tree_flatten(outputs[plan.name])
             if spec != plan.result_schema.spec:
@@ -1314,13 +2214,35 @@ class FunctionalCallbacks:
         return outputs
 
 
+_CALLBACK_RETENTION_HOOKS = tuple(
+    (name, getattr(FunctionalCallbacks, name))
+    for name in (
+        "_initialize",
+        "_validate_state",
+        "_update",
+        "_stack",
+        "_wrap_compiled_update",
+        "_concatenate",
+        "_has_emissions",
+        "_capture_emission_schemas",
+        "_finalize",
+        "_materialize_state",
+    )
+)
+
+
 __all__ = [
     "APCount",
+    "Active",
+    "ActiveAL",
+    "ActiveALCount",
     "AnomalyDetector",
     "FunctionalCallback",
     "FunctionalCallbackResults",
     "FunctionalCallbackState",
     "FunctionalCallbacks",
+    "LFP",
+    "PopulationCallback",
     "Raster",
     "Recorder",
 ]

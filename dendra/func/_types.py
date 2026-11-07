@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from typing import Literal, NamedTuple
 
 import torch
+
+from ._parameter_queries import ParameterQuery, matching_names
+from ._parameter_queries import parameter_name as _parameter_name
+from ._parameter_queries import select_names
 
 TensorTree = dict[str, object]
 _ParameterSubset = Literal["all", "model", "intra", "extra"]
@@ -14,48 +18,89 @@ _INTRA_PREFIX = "stimulation.intra."
 _EXTRA_PREFIX = "stimulation.extra."
 
 
-def _validate_query(query: str) -> str:
-    if not isinstance(query, str):
-        raise TypeError("parameter query must be a string")
-    if not query:
-        raise ValueError("parameter query must be a non-empty string")
-    return query
+class RandomParameterDraw(NamedTuple):
+    """RAND/NOISE initialization draws and resulting shared stream states."""
+
+    draws: dict[str, torch.Tensor]
+    rng: dict[str, dict[str, torch.Tensor]]
 
 
-def _normalize_queries(queries: str | Iterable[str]) -> tuple[str, ...]:
-    if isinstance(queries, str):
-        queries = (queries,)
-    else:
-        queries = tuple(queries)
-    return tuple(_validate_query(query) for query in queries)
+class RuntimeNoiseDraw(NamedTuple):
+    """Detached NOISE/State SDE draws and resulting shared stream states."""
+
+    draws: dict[str, torch.Tensor]
+    rng: dict[str, dict[str, torch.Tensor]]
+
+
+class StimulationDraw(NamedTuple):
+    """Detached Poisson draws and resulting generator-state bytes.
+
+    Each registration uses an event vector for one invocation, or an
+    invocation-by-event matrix for a repeated evaluation. Rollout packets
+    prepend the timestep axis. Sampling helpers supply the fixed schema
+    bound by the Population or Network's initialization and runtime profiles.
+    """
+
+    draws: dict[str, torch.Tensor]
+    rng: dict[str, torch.Tensor]
 
 
 class InitializationInput(NamedTuple):
-    """Explicit tensor inputs consumed only while constructing initial state.
+    """Population initialization values, separate from runtime inputs.
 
-    ``v_init`` is the fully expanded initial membrane voltage. ``states``
-    contains only insertion-time ``ic`` leaves, keyed by their canonical
-    functional state names. Their
-    shapes, dtypes, and devices must match the corresponding support-local
-    state leaves. ``transforms`` contains the explicitly registered tensor
-    inputs of pure Population initialization transforms. Keeping
-    initialization-only values separate from runtime constants makes batching
-    and differentiation explicit without invalidating prepared transition
-    workspaces.
+    ``v_init`` is the fully expanded initial membrane voltage. ``states`` maps
+    insertion-time initial conditions to canonical state names; shapes, dtypes and
+    devices must match their support-local state. ``transforms`` contains explicit
+    Tensor inputs of registered initialization transforms.
+
+    ``cache`` is a bound Population steady-state snapshot. When native cache policy
+    permits restoration, cached state/materializations replace fresh hooks and
+    produce effective initialized sources. Reseeding, retained samples and cache
+    invalidation follow the model's native initialization policy.
+
+    ``random_draw`` and ``stimulation`` are supported component draw fields. Prefer
+    the separate ``draws=InitializationDraws(...)`` argument for complete replay;
+    it cannot be combined with these fields. Host initialization samples missing
+    draws automatically; pure plan initialization requires explicit stochastic
+    inputs. These fields do not supply runtime stimulation tapes.
     """
 
     v_init: torch.Tensor
     states: dict[str, torch.Tensor] | None = None
     transforms: dict[str, torch.Tensor] | None = None
+    cache: Mapping[str, object] | None = None
+    random_draw: RandomParameterDraw | None = None
+    stimulation: StimulationDraw | None = None
 
 
 class PopulationTensors(NamedTuple):
-    """Explicit tensors extracted from or initialized for one Population."""
+    """Explicit parameter, constant, state and initialization inputs for a Population.
+
+    Native extraction retains raw parameter identities and snapshots state and
+    constants. Fresh initialization can replace effective source entries while
+    preserving their gradients. Use :meth:`independent_parameters` to own separate
+    optimization leaves, or :func:`inspect_sources` to inspect aliases and select
+    deduplicated trainable leaves.
+    """
 
     parameters: dict[str, torch.Tensor]
     constants: dict[str, torch.Tensor]
     state: TensorTree
     initialization: InitializationInput
+
+    @property
+    def trainable_parameters(self) -> dict[str, torch.Tensor]:
+        """Named parameter entries with live ``requires_grad=True`` flags.
+
+        Aliases and gradient-bearing nonleaf expressions remain visible. Use
+        ``dn.func.inspect_sources(tensors).trainable_leaves`` for deduplicated leaf
+        Tensors suitable for a PyTorch optimizer.
+        """
+        return {
+            name: value
+            for name, value in self.parameters.items()
+            if value.requires_grad
+        }
 
     def _parameter_subset(
         self,
@@ -103,77 +148,62 @@ class PopulationTensors(NamedTuple):
 
     def find_parameters(
         self,
-        query: str,
+        query: ParameterQuery,
         *,
         within: _ParameterSubset = "all",
     ) -> dict[str, torch.Tensor]:
-        """Return every parameter whose canonical name contains ``query``.
+        """Find parameters by substring, full-name glob, or regular expression.
 
         Matching is case-sensitive and preserves canonical extraction order.
+        Use ``re:expression`` or a compiled string regex for regex search.
         Use :meth:`parameter_name` when exactly one match is required.
         """
 
-        query = _validate_query(query)
-        return {
-            name: value
-            for name, value in self._parameter_subset(within).items()
-            if query in name
-        }
+        candidates = self._parameter_subset(within)
+        return {name: candidates[name] for name in matching_names(candidates, query)}
 
     def parameter_name(
         self,
-        query: str,
+        query: ParameterQuery,
         *,
         within: _ParameterSubset = "all",
     ) -> str:
-        """Resolve an exact name or unique partial parameter-name match."""
+        """Resolve one exact, partial, glob, or regex parameter-name match."""
 
-        query = _validate_query(query)
         candidates = self._parameter_subset(within)
-        if query in candidates:
-            return query
-        matches = tuple(name for name in candidates if query in name)
-        if len(matches) == 1:
-            return matches[0]
-        if not matches:
-            raise KeyError(
-                f"no parameter matching {query!r} was found within {within!r}"
-            )
-        raise KeyError(
-            f"parameter query {query!r} is ambiguous within {within!r}; "
-            f"matches={list(matches)}"
-        )
+        return _parameter_name(candidates, query, within=within)
 
     def get_parameter(
         self,
-        query: str,
+        query: ParameterQuery,
         *,
         within: _ParameterSubset = "all",
     ) -> torch.Tensor:
-        """Return the Tensor selected by an exact or unique partial name."""
+        """Return the Tensor selected by one exact, partial, glob, or regex match."""
 
         return self.parameters[self.parameter_name(query, within=within)]
 
     def independent_parameters(
         self,
-        trainable: str | Iterable[str] = (),
+        trainable: ParameterQuery | Iterable[ParameterQuery] = (),
         *,
         within: _ParameterSubset = "all",
     ) -> dict[str, torch.Tensor]:
         """Clone the complete parameter tree independently of its Population.
 
-        Entries selected by exact or unique partial names in ``trainable`` are
-        returned as :class:`torch.nn.Parameter` objects. Every other leaf is a
+        Exact or unique partial names select one leaf; full-name globs and
+        ``re:`` or compiled regex selectors can select multiple leaves. Each
+        selector must match. Selected leaves are returned as
+        :class:`torch.nn.Parameter` objects. Every other leaf is a
         detached ordinary Tensor. The returned mapping retains canonical names
-        and can be passed directly to functional preparation and transitions.
+        and parameter aliases, and can be passed directly to functional
+        preparation and transitions. Selecting any alias makes its shared leaf
+        trainable.
         """
 
         # Validate the scope even when no trainable queries were requested.
-        self._parameter_subset(within)
-        trainable_names = {
-            self.parameter_name(query, within=within)
-            for query in _normalize_queries(trainable)
-        }
+        candidates = self._parameter_subset(within)
+        trainable_names = select_names(candidates, trainable, within=within)
         non_differentiable = sorted(
             name
             for name in trainable_names
@@ -187,40 +217,58 @@ class PopulationTensors(NamedTuple):
                 "trainable parameter leaves must use a floating-point or complex "
                 f"dtype; invalid={non_differentiable}"
             )
-        # Functional optimizers should never share storage or autograd history
-        # with the source Population. Also materialize ordinary versioned
-        # tensors when this helper is called from inference mode.
-        with torch.inference_mode(False):
-            independent = {
-                name: value.detach().clone(memory_format=torch.preserve_format)
-                for name, value in self.parameters.items()
-            }
-            for name in trainable_names:
-                independent[name] = torch.nn.Parameter(independent[name])
-        return independent
+        from ._network_parameters import independent_parameters
+
+        return independent_parameters(self.parameters, trainable_names)
 
 
 class StepInput(NamedTuple):
-    """Already assembled inputs for one functional Population step."""
+    """Assembled voltage/current inputs and explicit stochastic draw packets.
+
+    :class:`~dendra.func.Inputs` supplies deterministic frames and :class:`~dendra.func.RuntimeDraws`
+    supplies stochastic values through ``draws=``. This combined packet remains
+    supported with its separate noise and stimulation fields.
+    """
 
     ve: torch.Tensor | None = None
     intra: torch.Tensor | None = None
+    noise: RuntimeNoiseDraw | None = None
+    stimulation: StimulationDraw | None = None
 
 
 class RolloutInput(NamedTuple):
-    """Time-first, already assembled inputs for a functional rollout."""
+    """Time-first voltage/current inputs and explicit stochastic draw/RNG tapes.
+
+    :class:`~dendra.func.Inputs` supplies deterministic tapes and :class:`~dendra.func.RuntimeDraws`
+    supplies stochastic values through ``draws=``. This combined packet remains
+    supported with its separate noise and stimulation fields.
+    """
 
     ve: torch.Tensor | None = None
     intra: torch.Tensor | None = None
+    noise: RuntimeNoiseDraw | None = None
+    stimulation: StimulationDraw | None = None
+
+
+def _index_step_input(ve, intra, noise, stimulation, index) -> StepInput:
+    """Compatibility projection of the shared timestep selection contract."""
+    from ._inputs import _index_runtime_inputs, _legacy_step_input
+
+    return _legacy_step_input(
+        _index_runtime_inputs(ve, intra, noise, stimulation, index)
+    )
 
 
 class FunctionalizationError(RuntimeError):
-    """Raised when a Population cannot yet be lowered without semantic loss."""
+    """Raised when functional execution cannot preserve its declared contract."""
 
 
 __all__ = [
     "FunctionalizationError",
     "InitializationInput",
+    "RandomParameterDraw",
+    "RuntimeNoiseDraw",
+    "StimulationDraw",
     "PopulationTensors",
     "RolloutInput",
     "StepInput",

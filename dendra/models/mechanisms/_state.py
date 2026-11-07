@@ -1,6 +1,9 @@
 import copy
 import hashlib
 import inspect
+import keyword
+import math
+import numbers
 import random
 import textwrap
 from collections.abc import Mapping
@@ -30,7 +33,17 @@ from ._euler_maruyama import build_euler_maruyama
 from ._kinetic import kinetic_to_derivatives
 from ._linearimplicit import build_linearimplicit
 from ._mechanism import classproperty
+from ._noise_workspaces import (
+    capture_noise_workspace,
+    commit_noise_workspace,
+    complete_legacy_noise_workspace_state,
+    current_noise_workspace_values,
+    ensure_noise_workspace_slots,
+    restored_noise_workspace_values,
+    temporary_noise_workspace,
+)
 from ._rosenbrock import build_rosenbrock1
+from ._sde import sample_state_sde_draw, validate_state_sde_draws
 
 
 def _extend_unique(target, values):
@@ -963,6 +976,8 @@ def _reset_runtime_output_validation(module):
     module._assigned_schema_validated = False
     module._advance_schema_validated = False
     module._advance_return_names = ()
+    if hasattr(module, "_voltage_schema_validated"):
+        module._voltage_schema_validated = False
 
 
 def _deferred_resolution_map(module, name):
@@ -1040,14 +1055,18 @@ def _support_visible_value(value, like):
     return value.reshape((1,) * (like.ndim - value.ndim) + tuple(value.shape))
 
 
-def _materialize_derived_buffers(module):
-    """Validate and install one module's initialization-static workspaces."""
+def _stage_derived_buffers(module, *, values=None):
+    """Evaluate and validate one module's initialization-static workspaces."""
 
     expected = set(module._derived_buffers)
     if not expected:
-        return
+        return {}
 
-    values = _evaluate_registered_builder(module, "derive_buffers")
+    if values is None:
+        with temporary_noise_workspace(
+            module, "derived", current_noise_workspace_values(module, "derived")
+        ):
+            values = _evaluate_registered_builder(module, "derive_buffers")
 
     if not isinstance(values, Mapping):
         raise TypeError(
@@ -1103,10 +1122,17 @@ def _materialize_derived_buffers(module):
         # an unwritable checkpoint destination. clone() retains autograd.
         staged[name] = value.clone(memory_format=torch.preserve_format)
 
+    return staged
+
+
+def _materialize_derived_buffers(module, *, values=None):
+    """Publish validated initialization workspaces and their NOISE frame."""
+    staged = _stage_derived_buffers(module, values=values)
     # Install only after the whole mapping has passed validation. Assignment is
     # deliberately out of place so gradients through the builder are retained.
     for name, value in staged.items():
         _install_declared_buffer_value(module, name, value)
+    capture_noise_workspace(module, "derived")
 
 
 def _canonical_timestep_buffer_shape(module, name) -> tuple[int, ...]:
@@ -1138,18 +1164,25 @@ def _timestep_buffer_schema(module, values=None):
     return declarations, realized
 
 
-def _stage_timestep_buffers(module, dt):
+def _stage_timestep_buffers(module, dt, *, values=None):
     """Validate one module's timestep workspaces without installing them."""
 
     expected = set(getattr(module, "_timestep_buffers", ()))
     if not expected:
         return {}
 
-    values = _evaluate_registered_builder(
-        module,
-        "derive_timestep_buffers",
-        dt,
-    )
+    if values is None:
+        restored = restored_noise_workspace_values(module, dt)
+        if restored is not None:
+            return restored
+        with temporary_noise_workspace(
+            module, "timestep", current_noise_workspace_values(module, "timestep")
+        ):
+            values = _evaluate_registered_builder(
+                module,
+                "derive_timestep_buffers",
+                dt,
+            )
 
     if not isinstance(values, Mapping):
         raise TypeError(
@@ -1214,14 +1247,16 @@ def _stage_timestep_buffers(module, dt):
     return staged
 
 
-def _install_timestep_buffers(module, staged):
+def _install_timestep_buffers(module, staged, *, dt=None, update_schema=True):
     """Commit a previously validated timestep-workspace mapping."""
 
     if not staged:
         return
     for name, value in staged.items():
         module._buffers[name] = value
-    module._timestep_buffer_schema = _timestep_buffer_schema(module, staged)
+    if update_schema:
+        module._timestep_buffer_schema = _timestep_buffer_schema(module, staged)
+    commit_noise_workspace(module, dt=dt)
 
 
 # Integration-method registry -------------------------------------------------
@@ -1304,10 +1339,18 @@ def build_integration_func(
     method,
     eliminate=None,
     diffusion=None,
+    inputs=(),
     **method_kwargs,
 ):
     """Build the integration function for a State subclass."""
     method = _canonical_method_name(method)
+    if method == "euler_heun":
+        # Its predictor/corrector recomputes ASSIGNED algebra at each stage.
+        # Read-only INPUT values remain explicit stage inputs, outside that
+        # authored returned-output schema.
+        method_kwargs["inputs"] = tuple(inputs)
+    else:
+        assigned = (*assigned, *inputs)
     try:
         builder = _INTEGRATION_BUILDERS[method]
     except KeyError as exc:
@@ -1458,6 +1501,10 @@ class State(Parameterized):
     _assigned = ()
     _assigned_declarations = []
 
+    _inputs = ()
+    _input_defaults = {}
+    _input_declarations = []
+
     _derived_buffers = set()
     _derived_buffer_specs = {}
     _derived_buffer_declarations = []
@@ -1520,6 +1567,7 @@ class State(Parameterized):
         new_carry_specs = {}
         new_derivative = set()
         new_assigned = []
+        new_inputs = {}
         new_derived_buffers = set()
         new_derived_buffer_specs = {}
         new_timestep_buffers = set()
@@ -1555,6 +1603,8 @@ class State(Parameterized):
                 new_diffusion.update(base._diffusion)
             if "_assigned" in base.__dict__:
                 _extend_unique(new_assigned, base._assigned)
+            if "_input_defaults" in base.__dict__:
+                new_inputs.update(base._input_defaults)
             if "_derived_buffers" in base.__dict__:
                 new_derived_buffers.update(base._derived_buffers)
                 inherited_specs = {
@@ -1621,6 +1671,10 @@ class State(Parameterized):
             cls, "state.assigned", State._assigned_declarations
         ):
             _extend_unique(new_assigned, a_list)
+        for declaration in consume_class_values(
+            cls, "state.inputs", State._input_declarations
+        ):
+            new_inputs.update(declaration)
         for declaration in consume_class_values(
             cls,
             "state.derived_buffers",
@@ -1702,6 +1756,7 @@ class State(Parameterized):
         execution_slots = _parameterized_workspace_slots(cls) | {
             "_name",
             "_sde_rng_names",
+            "_sde_draw_state_names",
             "celsius",
             "diam",
             "dt",
@@ -1711,6 +1766,24 @@ class State(Parameterized):
             "_solve",
         }
         execution_slots.update(f"{name}_dW_rng" for name in new_state)
+        input_class_slots = {
+            name
+            for name in new_inputs
+            if any(name in base.__dict__ for base in cls.__mro__)
+        }
+        overlap = set(new_inputs) & (
+            state_names
+            | carry_names
+            | assigned_names
+            | workspace_buffers
+            | execution_slots
+            | input_class_slots
+        )
+        if overlap:
+            raise ValueError(
+                "State INPUT names conflict with declared state, buffers, "
+                f"parameters, methods, or reserved slots: {sorted(overlap)}"
+            )
         class_slots = {
             name
             for name in workspace_buffers
@@ -1756,6 +1829,8 @@ class State(Parameterized):
         cls._kinetic = new_kinetic
         cls._diffusion = new_diffusion
         cls._assigned = tuple(new_assigned)
+        cls._inputs = tuple(new_inputs)
+        cls._input_defaults = new_inputs
         cls._derived_buffers = new_derived_buffers
         cls._derived_buffer_specs = new_derived_buffer_specs
         cls._timestep_buffers = new_timestep_buffers
@@ -1876,6 +1951,7 @@ class State(Parameterized):
         self._advance_return_names = ()
 
         self._timestep_buffer_schema = _timestep_buffer_schema(self)
+        ensure_noise_workspace_slots(self)
 
         # Integration-method configuration is fixed at State-subclass definition
         # time.  Copy it onto the instance for introspection and to keep generated
@@ -1895,12 +1971,18 @@ class State(Parameterized):
             self.method,
             eliminate=cinfo,
             diffusion=self._diffusion,
+            inputs=self._inputs,
             **self.method_kwargs,
         )
         self._solve = MethodType(ifunc, self)
 
         self._sde_rng_names = ()
+        self._sde_draw_state_names = ()
         if self.method in {"euler_maruyama", "euler_heun"}:
+            eliminated_sde_states = dict(cinfo or ())
+            self._sde_draw_state_names = tuple(
+                name for name in self._state if name not in eliminated_sde_states
+            )
             self._sde_rng_names = tuple(f"{state}_dW_rng" for state in self._state)
             for rng_name in self._sde_rng_names:
                 if not hasattr(self, rng_name):
@@ -1940,6 +2022,8 @@ class State(Parameterized):
     ):
         """Resolve fresh deferred layouts once from incoming checkpoint tensors."""
 
+        self.__dict__.pop("_noise_workspace_restored_dt", None)
+        state_dict = complete_legacy_noise_workspace_state(self, state_dict, prefix)
         _resolve_deferred_buffers_from_state_dict(self, state_dict, prefix)
         return super()._load_from_state_dict(
             state_dict,
@@ -1997,7 +2081,7 @@ class State(Parameterized):
                 f"unknown states {sorted(unknown_seeds)}"
             )
 
-        visible_values = {}
+        visible_values = self._input_value_frame(v)
         for name, value in (*tuple(seeds.items()), *tuple(overrides.items())):
             value = torch.as_tensor(value, device=v.device, dtype=v.dtype)
             try:
@@ -2105,6 +2189,51 @@ class State(Parameterized):
             Names of state variables advanced by the integrator.
         """
         declare_class_value("state.state", args, State._state_declarations)
+
+    @staticmethod
+    def INPUT(*names, default=0.0):
+        """Declare read-only tensor inputs supplied by Population bindings.
+
+        Inputs are ephemeral values in State hook frames; they allocate no
+        buffers and cannot be returned as state updates. Unbound inputs use a
+        finite scalar default, broadcast to the local voltage shape. During
+        initialization inputs use these defaults; bindings are evaluated only
+        when the consumer State advances.
+        """
+        if not isinstance(default, numbers.Real) or not math.isfinite(default):
+            raise ValueError("State INPUT default must be a finite real scalar.")
+        if not names or any(
+            not isinstance(name, str)
+            or not name.isidentifier()
+            or keyword.iskeyword(name)
+            or name.startswith("_")
+            for name in names
+        ):
+            raise ValueError("State INPUT names must be public Python identifiers.")
+        declare_class_value(
+            "state.inputs",
+            {name: float(default) for name in names},
+            State._input_declarations,
+        )
+
+    def _input_value_frame(self, v, supplied=None):
+        """Build call-local input tensors without retaining source aliases."""
+        supplied = {} if supplied is None else supplied
+        unknown = set(supplied) - set(self._inputs)
+        if unknown:
+            raise KeyError(f"Undeclared State INPUT values: {sorted(unknown)}")
+        frame = {}
+        for name in self._inputs:
+            if name in supplied:
+                value = supplied[name]
+                if value.device != v.device:
+                    raise ValueError(
+                        f"State INPUT {name!r} must use the consumer device."
+                    )
+                frame[name] = torch.broadcast_to(value, v.shape)
+            else:
+                frame[name] = torch.full_like(v, self._input_defaults[name])
+        return frame
 
     @staticmethod
     def CARRY(*args, dtype=None, shape="local"):
@@ -2224,13 +2353,13 @@ class State(Parameterized):
 
     @staticmethod
     def DIFFUSION(*args):
-        """Declare diffusion coefficients for Euler-Maruyama state SDEs.
+        """Declare diffusion coefficients for State SDEs.
 
         Each declaration has the form ``"x = sigma"`` and represents the
         multiplicative noise coefficient. ``State.METHOD("euler_maruyama")``
         interprets this as an Itô SDE. ``State.METHOD("euler_heun")`` interprets
-        it as a Stratonovich SDE. Voltage-equation noise is intentionally handled
-        by future stochastic voltage/cable integrators.
+        it as a Stratonovich SDE. Stochastic voltage/cable equations are
+        currently unsupported.
         """
         declare_class_value("state.diffusion", args, State._diffusion_declarations)
 
@@ -2308,19 +2437,52 @@ class State(Parameterized):
             self._assigned_schema_validated = True
         return outputs
 
-    def advance(self, v, dt, values):
-        """Return the next declared state from a read-only current-value frame."""
-        if self.method == "euler_heun":
-            return self._solve(v, dt, values)
+    def advance(self, v, dt, values, *, draws=None):
+        """Return the next declared state from a read-only current-value frame.
+
+        The default implementation runs the generated solver for this State's
+        equations. An override replaces that transition and must return every
+        declared STATE tensor, plus any optional replacements for this State's
+        CARRY. Runtime outputs preserve their exact shape, dtype, and device.
+        Other bundles and the owning Mechanism advance from the same incoming
+        snapshot; their new values are not visible during this calculation.
+
+        For Euler-Maruyama and Euler-Heun, ``draws`` supplies a mapping from
+        non-eliminated state names to standard-normal tensors with the exact
+        shape, dtype, and device of the corresponding current state. Base draws
+        are detached; drift, diffusion coefficients, and timestep retain their
+        gradients. Omitting ``draws`` samples the State's Native RNG streams.
+        """
         assigned = self._derive_assigned_values(v, values)
+        if self.method in {"euler_maruyama", "euler_heun"}:
+            if draws is None:
+                # Native one-step replay supplies validated call-local inputs.
+                # The explicit argument retains precedence over that binding.
+                draws = getattr(self, "_native_sde_draws", None)
+            if draws is None:
+                draws = {
+                    name: self._sde_randn_like(name, values[name])
+                    for name in self._sde_draw_state_names
+                }
+            else:
+                validate_state_sde_draws(draws, self._sde_draw_state_names, values)
+            if self.method == "euler_heun":
+                return self._solve(v, dt, values, draws, assigned)
+            return self._solve(dt, **{**values, **assigned}, __draws=draws)
+        if draws is not None:
+            raise ValueError("Explicit State draws require an SDE integration method")
         # A State ASSIGNED name may intentionally shadow a parent Mechanism
         # input with the same spelling. The freshly evaluated State value owns
         # the solver slot; merging first also avoids duplicate-keyword errors.
         return self._solve(dt, **{**values, **assigned})
 
-    def _derive_advance_values(self, v, dt, values):
+    def _derive_advance_values(self, v, dt, values, *, draws=None):
         """Evaluate State advance and validate custom output structure once."""
-        outputs = self.advance(v, dt, values)
+        outputs = (
+            self.advance(v, dt, values)
+            if draws is None
+            else self.advance(v, dt, values, draws=draws)
+        )
         if (
             not torch.compiler.is_compiling()
             and self._has_authored_advance
@@ -2343,10 +2505,9 @@ class State(Parameterized):
         """Detached standard-normal increment for State SDE solvers."""
         rng_name = f"{state_name}_dW_rng"
         rng = getattr(self, rng_name)
-        if isinstance(rng, RNGModule):
-            rng.init(like.device)
-        with torch.no_grad():
-            return rng.randn(tuple(like.shape), device=like.device, dtype=like.dtype)
+        return sample_state_sde_draw(
+            rng, tuple(like.shape), device=like.device, dtype=like.dtype
+        )
 
     def init_rng(self):
         super().init_rng()
@@ -2370,7 +2531,8 @@ class State(Parameterized):
         support-visible ``celsius`` and local ``diam`` inputs, and any
         support-local Ion/Material/current aliases installed by the owning
         Mechanism for this ordered initialization phase.
-        Returned values must be Tensors broadcastable to the local voltage
+        Returned values must be Tensors with the declared dtype/device and
+        shapes broadcastable to each output's local or structural storage
         shape. The hook must not mutate module state or consume implicit RNG.
 
         """

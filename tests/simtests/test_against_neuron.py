@@ -5,7 +5,6 @@ import pytest
 import torch
 
 import dendra as dn
-from dendra.models.io import apply_d_lambda
 from dendra.models.mod import hh
 from dendra.units import nA
 
@@ -15,6 +14,7 @@ h = neuron.h
 
 def sim_and_rec_neuron(d_lambda):
     h.load_file("import3d.hoc")
+    h.load_file("stdlib.hoc")
 
     class Cell:
         def __init__(self, importer):
@@ -29,7 +29,12 @@ def sim_and_rec_neuron(d_lambda):
     importer = h.Import3d_GUI(reader, 0)
 
     cell = Cell(importer)
-    apply_d_lambda(cell.all, d_lambda, 100.0)
+    h.define_shape()
+    for sec in cell.all:
+        wavelength = float(h.lambda_f(100.0, sec=sec))
+        sec.nseg = max(
+            1, int((float(sec.L) / (d_lambda * wavelength) + 0.9) / 2) * 2 + 1
+        )
 
     for sec in cell.all:
         sec.insert("hh")
@@ -79,7 +84,9 @@ def test_against_neuron(d_lambda):
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
     with dn.ctx(DTYPE="float64"):
-        cell = dn.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
+        cell = dn.Tree.from_asc(
+            asc_file, root="soma[0]", d_lambda=d_lambda, celsius=6.3
+        )
     cell.insert(hh)
     cell.soma.inject(dn.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)
@@ -104,7 +111,9 @@ def test_against_neuron_longrun(d_lambda):
     asc_file = str(Path(__file__).parent / "111200A.asc")
 
     with dn.ctx(DTYPE="float64"):
-        cell = dn.Tree.from_asc(asc_file, d_lambda=d_lambda, celsius=6.3)
+        cell = dn.Tree.from_asc(
+            asc_file, root="soma[0]", d_lambda=d_lambda, celsius=6.3
+        )
     cell.insert(hh)
     cell.soma.inject(dn.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
     r_ind = cell.find("soma", loc=0.5, as_list=True)
@@ -134,7 +143,12 @@ def test_against_neuron_cuda(d_lambda, threads, N):
     integrator = dn.dhs(threads=threads)
 
     cell = dn.Tree.from_asc(
-        asc_file, N=N, d_lambda=d_lambda, celsius=6.3, integrator=integrator
+        asc_file,
+        root="soma[0]",
+        N=N,
+        d_lambda=d_lambda,
+        celsius=6.3,
+        integrator=integrator,
     )
     cell.insert(hh)
     cell.soma.inject(dn.mono_rect(amp=5 * nA, delay=1.0, pw=1.0))
