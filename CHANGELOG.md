@@ -1,3 +1,11 @@
+## v0.28.1
+
+- Fix functional lowering, compiled connection parameter checks, and native
+  runtime draw sampling on Python 3.13 and 3.14.
+- Fix functional state extraction from independently initialized Populations
+  with generated current adapters when purity diagnostics are enabled on
+  Python 3.11.
+
 ## v0.28.0 (2026-11-06)
 
 ### Simulate and train connected models

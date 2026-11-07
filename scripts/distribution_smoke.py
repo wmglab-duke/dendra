@@ -105,6 +105,46 @@ def check_cpu_simulation(dn) -> None:
     print("CPU cable simulation and conductance gradient succeeded.")
 
 
+def check_functional_cpu_simulation(dn) -> None:
+    """Lower and capture a connected model using the installed distribution."""
+    import torch
+
+    from dendra.models.mod import expsyn, pas
+
+    dt = 0.025
+
+    def initialized_network():
+        cell = dn.SingleCompartment(N=1, C=1, v_init=-65.0, dtype=torch.float64)
+        cell.insert(pas, g=0.001, e=-70.0)
+        cell.insert(expsyn.rename("exc"), tau=2.0, e=0.0)
+        source = dn.NetStim(N=1, start=0.0, interval=1.0, noise=0.0, seed=17)
+        network = dn.Network({"cell": cell}, netstim=source)
+        network.connect_one_to_one(
+            source[:], cell[:, :1], cell.mech.exc, weight=0.001, delay=dt
+        )
+        network.eval()
+        network.initialize(dt)
+        return network
+
+    with dn.ctx(JIT=0, DEVICE="cpu"):
+        network = initialized_network()
+        draws = dn.func.sample_runtime_draws(network)
+        with dn.ctx(CHECK_PURITY=True):
+            plan, tensors = dn.func.make_functional(network, dt=dt)
+        reference = initialized_network()
+        plan.extract(reference)
+        compiled = torch.compile(plan.prepare_and_step, backend="eager", fullgraph=True)
+        state, _ = compiled(
+            tensors.parameters, tensors.constants, tensors.state, draws=draws
+        )
+        reference.step(draws=draws)
+        torch.testing.assert_close(
+            state["populations"]["cell"]["integrator"]["v"],
+            reference.populations["cell"].v,
+        )
+    print("Compiled functional Network step matches native draw replay.")
+
+
 def check_descriptor_gradient(analysis) -> None:
     """Check a stable synthetic crossing branch against the hard descriptor."""
     import torch
@@ -192,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
     check_native_source_data()
     check_optional_solvers(args.expect_solvers)
     check_cpu_simulation(dn)
+    check_functional_cpu_simulation(dn)
     check_descriptor_gradient(analysis)
     check_cli(installed)
     print("Installed distribution smoke checks passed.")

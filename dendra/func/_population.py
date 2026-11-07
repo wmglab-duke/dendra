@@ -8,6 +8,7 @@ import dis
 import hashlib
 import inspect
 import math
+import sys
 import types
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
@@ -208,9 +209,11 @@ _CLASS_STATE_METADATA_NAMES = frozenset(
         "__classcell__",
         "__dict__",
         "__doc__",
+        "__firstlineno__",
         "__module__",
         "__qualname__",
         "__slotnames__",  # copyreg lazily memoizes inherited slots during deepcopy
+        "__static_attributes__",
         "__weakref__",
     }
 )
@@ -6153,6 +6156,26 @@ def _initialization_callable_dependency_signature(
                 ) from exc
             closure_signature = (("unsupported-inspection", type(exc).__name__),)
         else:
+            if sys.version_info < (3, 12):
+                # Python 3.11 treats attribute names in co_names as possible
+                # globals. Retain only names actually loaded from that scope.
+                global_names = {
+                    instruction.argval
+                    for instruction in dis.get_instructions(target)
+                    if instruction.opname == "LOAD_GLOBAL"
+                }
+                closure = closure._replace(
+                    globals={
+                        name: item
+                        for name, item in closure.globals.items()
+                        if name in global_names
+                    },
+                    builtins={
+                        name: item
+                        for name, item in closure.builtins.items()
+                        if name in global_names
+                    },
+                )
             super_dependencies = (
                 _initialization_super_dependencies(
                     target, owner, receiver_name, closure
@@ -9112,6 +9135,24 @@ def _parameter_buffer_alias_conflicts(population) -> tuple[tuple, ...]:
     return tuple(conflicts)
 
 
+def _is_canonical_integrator_type(integrator_type, implementation):
+    # Public factories create direct subclasses that prefill __init__ defaults.
+    # Python 3.13+ adds source and static attribute metadata to the class body.
+    return integrator_type is implementation or (
+        integrator_type.__module__ == "dendra.models.integrators"
+        and integrator_type.__qualname__ == implementation.__qualname__
+        and integrator_type.__bases__ == (implementation,)
+        and set(vars(integrator_type))
+        <= {
+            "__module__",
+            "__init__",
+            "__doc__",
+            "__firstlineno__",
+            "__static_attributes__",
+        }
+    )
+
+
 def _resolve_functional_integrator_spec(integrator, operator_kind):
     """Resolve an audited exact implementation or configuration-only wrapper."""
     if integrator is None:
@@ -9138,19 +9179,7 @@ def _resolve_functional_integrator_spec(integrator, operator_kind):
 
     integrator_type = type(integrator)
     implementation = spec.implementation
-    if integrator_type is implementation:
-        recognized_type = True
-    else:
-        # Public factories use ``partial_class`` to create one direct subclass
-        # which changes only __init__ argument defaults. Arbitrary subclasses
-        # remain outside the audited numerical contract.
-        recognized_type = (
-            integrator_type.__module__ == "dendra.models.integrators"
-            and integrator_type.__qualname__ == implementation.__qualname__
-            and integrator_type.__bases__ == (implementation,)
-            and set(integrator_type.__dict__) <= {"__module__", "__init__", "__doc__"}
-        )
-    if not recognized_type:
+    if not _is_canonical_integrator_type(integrator_type, implementation):
         return None
     standards = _STANDARD_EXPLICIT_INTEGRATOR_HOOKS.get(implementation, {})
     if any(

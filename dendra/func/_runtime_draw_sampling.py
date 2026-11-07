@@ -20,21 +20,17 @@ def _native_integrator(population):
     from ._population import (
         _FUNCTIONAL_INTEGRATOR_HOOKS,
         _STANDARD_INTEGRATOR_FRESH_INITIALIZATION,
+        _is_canonical_integrator_type,
         _resolve_functional_integrator_spec,
     )
 
     integrator = population.integrator
+    integrator_type = type(integrator)
     implementation = next(
         (
             candidate
             for candidate in _STANDARD_INTEGRATOR_FRESH_INITIALIZATION
-            if type(integrator) is candidate
-            or (
-                type(integrator).__module__ == "dendra.models.integrators"
-                and type(integrator).__qualname__ == candidate.__qualname__
-                and type(integrator).__bases__ == (candidate,)
-                and set(vars(type(integrator))) <= {"__module__", "__init__", "__doc__"}
-            )
+            if _is_canonical_integrator_type(integrator_type, candidate)
         ),
         None,
     )
