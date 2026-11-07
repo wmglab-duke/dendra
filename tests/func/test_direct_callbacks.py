@@ -170,7 +170,10 @@ def test_eager_population_callbacks_use_the_captured_step(raw):
 def test_direct_callbacks_preserve_atomic_pulse_clock_and_separate_host_cache(
     stimulus_kind, execution
 ):
-    functional, tensors, parameters, prepared, _ = _pulse_case(stimulus_kind)
+    from tests.func.test_runner_stimulation_clock import DT as pulse_dt
+    from tests.func.test_runner_stimulation_clock import _source_case
+
+    functional, tensors, parameters, prepared, amplitude = _pulse_case(stimulus_kind)
     callbacks = functional.make_callbacks({"trace": dn.func.Recorder(["v", "t"])})
     kernel = functional.compile_rollout_chunk(
         PULSE_STEPS, backend="aot_eager", execution=execution
@@ -188,10 +191,22 @@ def test_direct_callbacks_preserve_atomic_pulse_clock_and_separate_host_cache(
         recorded_host, _ = dn.func.run(
             bound, tensors.state, steps=PULSE_STEPS, callbacks=callbacks
         )
+        native, native_extra, _ = _source_case(stimulus_kind)
+        native.run(steps=PULSE_STEPS, dt=pulse_dt, extra=native_extra)
     _close(actual, expected)
     _close(ordinary, expected)
     _close(recorded_host, host)
-    assert not torch.equal(host["integrator"]["v"], ordinary["integrator"]["v"])
+    _close(host, functional.extract(native).state)
+    _close(host, ordinary)
+    with torch.enable_grad():
+        accepted = tensors.state
+        for _ in range(PULSE_STEPS):
+            accepted, _ = functional.step(parameters, prepared, accepted)
+        gradient = torch.autograd.grad(
+            accepted["integrator"]["v"].square().mean(), amplitude
+        )[0]
+    assert not torch.equal(host["integrator"]["v"], accepted["integrator"]["v"])
+    assert torch.isfinite(gradient).all() and torch.count_nonzero(gradient) > 0
     _close(auxiliary["callbacks"]["trace"]["v"][-1], ordinary["integrator"]["v"])
     kernels = kernel._callback_chunks[callbacks]
     assert set(kernels) == {(PULSE_STEPS, False), (PULSE_STEPS, True)}

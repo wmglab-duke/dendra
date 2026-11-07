@@ -242,6 +242,9 @@ def test_population_scan_optional_drive_views_preserve_forward_and_all_source_gr
 def test_population_scan_keeps_distinct_atomic_and_recurrent_bound_waveform_clocks(
     kind,
 ):
+    from tests.func.test_runner_stimulation_clock import DT as pulse_dt
+    from tests.func.test_runner_stimulation_clock import _source_case
+
     functional, tensors, parameters, prepared, amplitude = pulse_case(kind)
     callbacks = functional.make_callbacks({"trace": dn.func.Recorder(("v", "t"))})
     chunk = functional.compile_rollout_chunk(
@@ -272,9 +275,18 @@ def test_population_scan_keeps_distinct_atomic_and_recurrent_bound_waveform_cloc
         callbacks=callbacks,
     )
     _close((actual, actual_aux), (expected, expected_aux), rtol=2e-5, atol=2e-5)
-    assert not torch.equal(
-        wanted_atomic["integrator"]["v"], expected["integrator"]["v"]
+    native, native_extra, native_waveform = _source_case(kind)
+    recorder = dn.Recorder(("v", "t"))
+    native.run(
+        steps=PULSE_STEPS,
+        dt=pulse_dt,
+        extra=native_extra,
+        callbacks=[recorder],
     )
+    native_trace = {name: recorder.stack(name) for name in ("v", "t")}
+    _close(actual, functional.extract(native).state, rtol=2e-5, atol=2e-5)
+    _close(dict(actual_aux["callbacks"]["trace"]), native_trace, rtol=2e-5, atol=2e-5)
+    _close(wanted_atomic, expected, rtol=2e-5, atol=2e-5)
     torch.testing.assert_close(
         actual_aux["callbacks"]["trace"]["t"],
         expected_aux["callbacks"]["trace"]["t"],
@@ -289,8 +301,23 @@ def test_population_scan_keeps_distinct_atomic_and_recurrent_bound_waveform_cloc
     gradient = torch.autograd.grad(
         actual_aux["callbacks"]["trace"]["v"].square().mean(), amplitude
     )[0]
-    assert torch.count_nonzero(reference_gradient) > 0
+    native_gradient = torch.autograd.grad(
+        native_trace["v"].square().mean(), native_waveform.amp
+    )[0]
+    assert torch.count_nonzero(reference_gradient) == 0
     torch.testing.assert_close(gradient, reference_gradient, rtol=2e-5, atol=1e-8)
+    torch.testing.assert_close(gradient, native_gradient, rtol=2e-5, atol=1e-8)
+    accepted = tensors.state
+    frames = [accepted["integrator"]["v"]]
+    for _ in range(PULSE_STEPS):
+        accepted, _ = functional.step(parameters, prepared, accepted)
+        frames.append(accepted["integrator"]["v"])
+    manual_gradient = torch.autograd.grad(
+        torch.stack(frames).square().mean(), amplitude
+    )[0]
+    assert not torch.equal(expected["integrator"]["v"], accepted["integrator"]["v"])
+    assert torch.isfinite(manual_gradient).all()
+    assert torch.count_nonzero(manual_gradient) > 0
 
 
 def test_population_scan_explicit_noise_and_poisson_tapes_replay_and_detach_draws():

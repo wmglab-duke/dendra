@@ -268,6 +268,7 @@ class CompiledPopulationChunk:
                 operands.noise,
                 operands.stimulation,
                 operands.draws,
+                operands.sampling_times,
             )
             if kernel is not None:
                 final, auxiliary, _carries, _emitted = kernel(
@@ -280,6 +281,7 @@ class CompiledPopulationChunk:
                     operands.noise,
                     operands.stimulation,
                     operands.draws,
+                    operands.sampling_times,
                 )
                 self._record_execution("compiled_while_loop", grad_enabled=False)
                 return final, auxiliary

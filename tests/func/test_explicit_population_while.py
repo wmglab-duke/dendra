@@ -217,33 +217,98 @@ def test_bound_while_waveforms_use_native_clock_and_reuse_the_effective_child(
     from tests.func.test_runner_stimulation_clock import DT as CLOCK_DT
     from tests.func.test_runner_stimulation_clock import STEPS
     from tests.func.test_runner_stimulation_clock import _case as clock_case
+    from tests.func.test_runner_stimulation_clock import _source_case
 
     functional, tensors, parameters, prepared, _amplitude = clock_case(stimulus_kind)
     kernel = functional.compile_rollout_chunk(STEPS, execution="while", backend="eager")
-    executions = []
+    admissions, executions = [], []
     kernel_for = _PopulationWhileExecutor.kernel_for
 
     def observe(executor, *args, **kwargs):
-        if executor._functional is functional:
-            executions.append(executor)
-        return kernel_for(executor, *args, **kwargs)
+        selected, reason = kernel_for(executor, *args, **kwargs)
+        if executor._functional is not functional or executor._plans:
+            return selected, reason
+        assert len(args) == 10
+        admissions.append((executor, args[-1]))
+        if selected is None:
+            return selected, reason
+
+        def invoke(*operands, **options):
+            assert len(operands) == 10
+            executions.append((executor, operands[-1]))
+            assert operands[-1] is args[-1]
+            return selected(*operands, **options)
+
+        return invoke, reason
 
     monkeypatch.setattr(_PopulationWhileExecutor, "kernel_for", observe)
     with torch.no_grad():
-        expected = tensors.state
-        for _ in range(STEPS + 1):
-            expected, _ = functional.step(parameters, prepared, expected)
+        # A direct atomic chunk retains whole-tape assembly. Its host child
+        # without an invocation tape retains accepted-step clock sampling.
+        atomic, _ = kernel(parameters, prepared, tensors.state)
+        atomic_reference, _ = functional.rollout(
+            parameters, prepared, tensors.state, steps=STEPS
+        )
+        _close(atomic, atomic_reference)
+        stepped = tensors.state
+        for _ in range(STEPS):
+            stepped, _ = functional.step(parameters, prepared, stepped)
+        accepted, _ = kernel._runner_chunk(STEPS)(parameters, prepared, tensors.state)
+        _close(accepted, stepped)
+        stepped, _ = functional.step(parameters, prepared, stepped)
+
+        native, extra, _ = _source_case(stimulus_kind)
+        recorder = dn.Recorder(("v", "t"))
+        native.run(steps=STEPS + 1, dt=CLOCK_DT, extra=extra, callbacks=[recorder])
+        expected = functional.extract(native).state
         actual, auxiliary = dn.func.run(
             kernel.bind(parameters, prepared), tensors.state, steps=STEPS + 1
         )
-    torch.testing.assert_close(actual["integrator"]["v"], expected["integrator"]["v"])
-    torch.testing.assert_close(actual["clock"]["t"], expected["clock"]["t"])
+        repeated, _ = dn.func.run(
+            kernel.bind(parameters, prepared), tensors.state, steps=STEPS + 1
+        )
+        callbacks = functional.make_callbacks({"trace": dn.func.Recorder(("v", "t"))})
+        recorded, recorded_auxiliary = dn.func.run(
+            kernel.bind(parameters, prepared),
+            tensors.state,
+            steps=STEPS + 1,
+            callbacks=callbacks,
+        )
+    _close(actual, expected)
+    _close(repeated, actual)
+    _close(recorded, actual)
+    for name in ("v", "t"):
+        torch.testing.assert_close(
+            recorded_auxiliary["callbacks"]["trace"][name], recorder.stack(name)
+        )
+    assert not torch.equal(actual["integrator"]["v"], stepped["integrator"]["v"])
     assert actual["clock"]["t"].item() > tensors.state["clock"]["t"].item() + CLOCK_DT
     assert "callbacks" not in auxiliary
     assert "continuation" not in auxiliary
-    full = [executor for executor in executions if executor._steps == STEPS]
+    full = [
+        executor
+        for executor, tape in admissions
+        if executor._steps == STEPS and executor._stepwise_stimulation
+    ]
     assert full and all(executor is full[0] for executor in full)
     assert full[0]._stepwise_stimulation
+    sampling_times = (
+        1000.0 + torch.arange(STEPS + 1, dtype=torch.float64) * CLOCK_DT
+    ).to(tensors.state["clock"]["t"])
+    host_admissions = [
+        (executor, tape) for executor, tape in admissions if tape is not None
+    ]
+    assert len(host_admissions) == 4
+    for executor, tape in host_admissions:
+        torch.testing.assert_close(
+            tape,
+            sampling_times[:STEPS] if executor._steps == STEPS else sampling_times[-1:],
+        )
+    host_executions = [
+        (executor, tape) for executor, tape in executions if tape is not None
+    ]
+    assert len(host_executions) == 2
+    assert any(executor is full[0] and tape is None for executor, tape in executions)
     assert kernel.execution_report().steps == 1
 
 
