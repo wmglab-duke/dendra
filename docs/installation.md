@@ -59,12 +59,13 @@ python -m pip check
 python -m dendra doctor
 ```
 
-The doctor reports the installed Dendra, Python and PyTorch versions. It also
-checks CUDA devices, compiler and toolkit discovery, and the optional NetCon
-CUDA extension. For a CUDA deployment, require a working CUDA runtime with
-`python -m dendra doctor --require-cuda`. See the {ref}`GPU deployment guide
-<gpu-deployment>` for the native-extension probe and fallback policies.
+The doctor reports the installed Dendra, Python and PyTorch versions. It
+also reports CUDA devices, toolchain discovery, and the optional NetCon
+extension's build and cache status. For CUDA, see the
+{ref}`deployment checks <gpu-deployment>`. To check the optional
+`dendra-solvers` backends, use the commands below.
 
+(native-implicit-solvers)=
 ## Native CPU and MPS implicit solvers
 
 The optional `solvers` extra requires
@@ -79,7 +80,7 @@ newer, an available Apple GPU, and float32 tensors. Select `device="mps"` and
 `dtype=torch.float32` before constructing or compiling the model. Cable solvers
 can fall back to PyTorch on MPS. DHS on MPS requires the native backend.
 Scalar SPD solving is currently unsupported on MPS. Choose Thomas or PCR for
-scalar cables. See {doc}`testing` for a backend availability check and MPS tests.
+scalar cables.
 
 To add native solvers to an existing Dendra environment, install a prebuilt
 wheel.
@@ -97,7 +98,7 @@ to attempt a local build with a C++ toolchain. See the
 [`dendra-solvers` package page](https://pypi.org/project/dendra-solvers/) for
 source-build instructions.
 
-Check that the installed native extension loads.
+Check that the installed CPU extension loads.
 
 ```sh
 python - <<'PY'
@@ -108,6 +109,16 @@ print("dendra-solvers:", version("dendra-solvers"))
 print("CPU solver extension:", solver_ext.__file__)
 PY
 ```
+
+On Apple Silicon, check whether PyTorch can use MPS and whether the native
+Metal solver backend is available.
+
+```sh
+python -c "import torch; print('PyTorch MPS:', torch.backends.mps.is_available())"
+python -c "import dendra_solvers; print('Native MPS:', dendra_solvers.is_mps_available())"
+```
+
+See {doc}`testing` for CPU and MPS solver integration tests.
 
 ## Install from a source checkout
 

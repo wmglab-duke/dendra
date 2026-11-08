@@ -191,5 +191,45 @@ def public_api_signature(app, what, name, obj, options, signature, return_annota
     return signature, return_annotation
 
 
+_viewcode_backlink = re.compile(
+    r'(?P<start><div class="viewcode-block" id="(?P<object>[\w.]+)">\s*'
+    r'<a class="viewcode-back" href="(?P<path>[^"#]+)#)(?P<anchor>[\w.]+)"'
+)
+
+
+def repair_viewcode_backlinks(app, pagename, _templatename, context, _doctree):
+    """Resolve source backlinks for modules with documented re-exports."""
+    if not pagename.startswith("_modules/dendra/"):
+        return
+    body = context.get("body", "")
+    if "viewcode-back" not in body:
+        return
+
+    # Viewcode uses one reference prefix per source module. A re-export can
+    # give other objects in that module a prefix absent from the API reference.
+    module = pagename.removeprefix("_modules/").replace("/", ".")
+    anchors = {
+        anchor: docname
+        for _, _, _, docname, anchor, _ in app.env.get_domain("py").get_objects()
+    }
+
+    def points_to(anchor, path):
+        docname = anchors.get(anchor)
+        return (
+            docname is not None
+            and app.builder.get_relative_uri(pagename, docname) == path
+        )
+
+    def repair(match):
+        canonical = f"{module}.{match['object']}"
+        path = match["path"]
+        if not points_to(match["anchor"], path) and points_to(canonical, path):
+            return f'{match["start"]}{canonical}"'
+        return match[0]
+
+    context["body"] = _viewcode_backlink.sub(repair, body)
+
+
 def setup(app):
     app.connect("autodoc-process-signature", public_api_signature)
+    app.connect("html-page-context", repair_viewcode_backlinks)

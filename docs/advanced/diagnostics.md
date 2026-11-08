@@ -8,10 +8,15 @@ arbitrary user code is correct for every input.
 
 ## Check the installation
 
-`dn.doctor()` reports the installed runtime and solver capabilities. Include
-that report, a minimal example, and the device/dtype when reporting a problem.
-See {doc}`../installation` and {doc}`../gpu-deployment` for installation and
-accelerator checks.
+Run `python -m pip check` to check installed dependencies and
+`python -m dendra doctor` to report runtime versions and CUDA deployment
+details. Use the {ref}`native CPU and MPS solver checks <native-implicit-solvers>`
+to verify the optional solver package. See the
+{doc}`CUDA deployment guide <../gpu-deployment>` for the CUDA runtime and
+NetCon extension probes.
+
+When reporting a problem, include a minimal example, the device and dtype it
+uses, and the output from the relevant checks.
 
 ## Validate custom pure code
 

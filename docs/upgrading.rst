@@ -13,6 +13,7 @@ Dendra requires PyTorch 2.14 or newer. Choose a PyTorch build appropriate for
 your CPU or accelerator; see :doc:`installation`. The optional
 ``dendra[solvers]`` extra requires ``dendra-solvers>=0.5.1``. Upgrade that
 package alongside Dendra if you install the solver backend separately.
+Dendra Models 0.3.0 requires Dendra 0.28.1 or newer with the solver extra.
 
 Recording and callback results
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

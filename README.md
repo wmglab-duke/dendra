@@ -27,7 +27,7 @@ from simulation and recording to training and custom model components.
 Dendra requires Python 3.11 or newer and PyTorch 2.14 or newer. On Windows, we
 recommend using WSL2.
 
-Install Dendra with the recommended native CPU solvers:
+Install Dendra with the recommended native CPU and Apple Metal solvers:
 
 ```bash
 python -m pip install --upgrade pip
@@ -36,16 +36,17 @@ python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
 
 The `solvers` extra installs
 [`dendra-solvers`](https://pypi.org/project/dendra-solvers/), which provides
-native CPU solvers for block and tree models. If a compatible solver wheel is
-unavailable, install the base package:
+native CPU solvers for block and tree models and native Metal solvers for
+supported MPS models. If a compatible solver wheel is unavailable, install the
+base package:
 
 ```bash
 python -m pip install dendra
 ```
 
-The base package retains Dendra's PyTorch CPU solver for unbranched cables and
-all GPU solvers. To select a particular CPU, CUDA, or ROCm build, install
-PyTorch first using its
+The base package includes a PyTorch CPU solver for unbranched cables and
+Dendra's CUDA/Triton solvers. To select a particular CPU, CUDA, or ROCm build,
+install PyTorch first using its
 [installation selector](https://pytorch.org/get-started/locally/), then install
 Dendra.
 
@@ -64,8 +65,10 @@ python -m dendra doctor
 
 The [installation guide](https://wmglab-duke.github.io/dendra/installation.html)
 explains solver-wheel support, source installations, upgrades, and Jupyter
-setup. For CUDA deployment checks, see the
-[GPU deployment guide](https://wmglab-duke.github.io/dendra/gpu-deployment.html).
+setup. For accelerator checks, see
+[CUDA deployment](https://wmglab-duke.github.io/dendra/gpu-deployment.html)
+or the
+[native MPS solver requirements](https://wmglab-duke.github.io/dendra/installation.html#native-cpu-and-mps-implicit-solvers).
 
 ## Development
 

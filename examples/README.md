@@ -1,14 +1,21 @@
 # Examples
 
 Runnable Python examples for building models, simulating networks, recording
-responses and fitting parameters. They are grouped by task; each folder has a
-guide to its scripts.
+responses and fitting parameters. Each folder groups scripts by task.
 
-Start with [`functional_api_overview.py`](getting_started/functional_api_overview.py)
-for a small Population and Network, recording, reproducible inputs and gradients:
+From the repository root, run a
+[single compartment](getting_started/native_single_compartment.py) and record
+its response to a current pulse.
 
 ```bash
-python examples/getting_started/functional_api_overview.py --backend eager
+python examples/getting_started/native_single_compartment.py
+```
+
+For a first run with `dn.compile`, choose the inference section of the
+[functional overview](getting_started/functional_api_overview.py).
+
+```bash
+python examples/getting_started/functional_api_overview.py --section inference --backend eager
 ```
 
 Run commands from the repository root with Dendra installed in your environment.
@@ -23,7 +30,7 @@ backend, such as `MPLBACKEND=Agg`.
 
 | Task | Folder | A useful starting point |
 | --- | --- | --- |
-| Run Populations and Networks; choose execution modes and simulation length | [Getting started](getting_started/README.md) | [API overview](getting_started/functional_api_overview.py) |
+| Run a model and record voltage | [Getting started](getting_started/README.md) | [Single compartment](getting_started/native_single_compartment.py) |
 | Connect cells, deliver events and run recurrent networks | [Networks](networks/README.md) | [Compile a Network](networks/functional_network_compile.py) |
 | Supply currents, extracellular stimulation and event schedules | [Inputs](inputs/README.md) | [Shared deterministic inputs](inputs/shared_runtime_inputs.py) |
 | Record voltage, LFP, spikes and activity; write HDF5 output | [Callbacks](callbacks/README.md) | [Recorder storage](callbacks/functional_recorder_storage.py) |

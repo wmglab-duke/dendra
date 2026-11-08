@@ -1,11 +1,14 @@
 # Getting started
 
-Start here to run an ordinary Dendra model with `dn.compile`, record its
-response, and differentiate a simulation. The examples also show how to take
-explicit control of parameters, state and continuation when an application
-needs it.
+Run a passive compartment with `model.run` and record the voltage response
+to a current pulse. From the repository root, run the following command.
 
-Run from the repository root:
+```bash
+python examples/getting_started/native_single_compartment.py
+```
+
+Use the inference section to try `dn.compile`. The second command below
+runs a separate example that differentiates a recorded response.
 
 ```bash
 python examples/getting_started/functional_api_overview.py --section inference --backend eager
@@ -18,6 +21,7 @@ optimized kernels; their first call includes compilation.
 
 | Example | What it helps you do |
 | --- | --- |
+| [native_single_compartment.py](native_single_compartment.py) | Run one compartment on CPU and record its voltage and time. |
 | [functional_api_overview.py](functional_api_overview.py) | Explore inference, training, explicit state, random draws, extracellular inputs and function transforms in small independent sections. |
 | [functional_compiled_runner.py](functional_compiled_runner.py) | Compile one HH model, choose scan or while inference, and try recording, training, chunking and activation checkpointing. |
 | [functional_execution_modes.py](functional_execution_modes.py) | Compare direct functional execution, compiled execution and differentiation on the same model. |
