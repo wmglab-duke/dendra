@@ -12,6 +12,23 @@ training, reproducible simulation, and checkpoint continuation. Start with
 Compilation and execution
 -------------------------
 
+Compile an initialized model with either a timestep count (``steps=``) or an
+elapsed time in milliseconds (``duration=``). Use the solver timestep for
+``dt``. A Network runner uses the timestep set by ``network.initialize(dt)``.
+
+.. code-block:: python
+
+   import dendra as dn
+
+   program = dn.compile(model, dt=0.025, steps=400)
+   state, auxiliary = program()  # Same as dn.func.run(program).
+   state, auxiliary = dn.func.run(program, auxiliary["continuation"], steps=200)
+
+A call without state starts from the runner's configured initialization.
+Pass the continuation to resume with the same simulation state, effective
+sources, and callback carry. When callbacks are configured, their results
+are in ``auxiliary["callbacks"]``.
+
 .. autofunction:: dendra.func.compile
 
 .. autofunction:: dendra.func.run
@@ -43,6 +60,9 @@ replay, automatic sampling, and variable extracellular stimulation.
 
 .. autoclass:: dendra.func.VarInput
    :members:
+
+   Use ``extra=dn.VarInput()`` when compiling to supply extracellular
+   stimulation at call time.
 
 .. autoclass:: dendra.func.RuntimeDraws
    :members:
@@ -135,6 +155,8 @@ results, storage, and continuation.
 
 .. autoclass:: dendra.func.AnomalyDetector
    :members:
+
+   Construct with ``dn.func.AnomalyDetector()``.
 
 Diagnostics
 -----------

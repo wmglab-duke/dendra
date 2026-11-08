@@ -1,10 +1,8 @@
 API reference
 =============
 
-Dendra is commonly imported as ``import dendra as dn``. Top-level conveniences
-such as ``dn.Population``, ``dn.Network``, ``dn.NetStim``, ``dn.Recorder``,
-``dn.compile`` and ``dn.VarInput`` refer to the objects documented below.
-The :doc:`guides <advanced>` show complete workflows.
+The examples use ``import dendra as dn``. The :doc:`guides <advanced>` show how
+to use these APIs in complete simulation and training workflows.
 
 .. toctree::
    :hidden:
@@ -19,14 +17,18 @@ The :doc:`guides <advanced>` show complete workflows.
 Models and connectivity
 -----------------------
 
-:doc:`Build populations and networks <api/models-and-connectivity>` and choose
-the regions, morphologies, and integrators they use.
+:doc:`Build and connect models <api/models-and-connectivity>` with
+:class:`dn.Population <dendra.models.core.Population>`,
+:class:`dn.Network <dendra.models.networks.Network>`, and event sources such as
+:class:`dn.NetStim <dendra.models.networks.NetStim>`.
 
 Functional execution and training
 ---------------------------------
 
-:doc:`Compile a model or set up a training loop <api/functional-execution-and-training>`
-with control over trainable parameters, simulation inputs, and continuation.
+:doc:`Run and train models <api/functional-execution-and-training>` with
+:func:`dn.compile <dendra.func.compile>`. Set ``extra=`` to
+:class:`dn.VarInput() <dendra.func.VarInput>` at compile time to vary
+extracellular stimulation between calls.
 
 Mechanisms and stimulation
 --------------------------
@@ -37,8 +39,9 @@ with mechanisms, material processes, waveforms, and extracellular fields.
 Recording and analysis
 ----------------------
 
-:doc:`Record simulation outputs and measure activity <api/recording-and-analysis>`
-using callbacks, trace measurements, and threshold searches.
+:doc:`Record and analyze responses <api/recording-and-analysis>` with
+:class:`dn.Recorder <dendra.models.callbacks.Recorder>`, activity callbacks,
+trace measurements, and threshold searches.
 
 Execution settings and utilities
 --------------------------------

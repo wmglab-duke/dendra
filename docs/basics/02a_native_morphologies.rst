@@ -3,28 +3,75 @@
 02a. Native section morphologies
 ================================
 
-Dendra can define a branched cable directly, without first constructing
-NEURON ``Section`` objects.  A :class:`dendra.Morphology` is an editable
-section-level declaration; :meth:`~dendra.Morphology.compile` turns it into an
-immutable :class:`dendra.CompartmentGraph`; and
-:meth:`dendra.Tree.from_morphology` constructs a general branched simulation
-model from that snapshot. If the compiled graph is one unbranched material
-path, :meth:`dendra.Cable.from_morphology` uses the faster tridiagonal cable
-backend without approximating the canonical geometry.
+Use :class:`~dendra.models.morphology.Morphology` to define a cell's sections
+and how they connect. :meth:`Tree.from_morphology <dendra.models.tree.Tree.from_morphology>`
+builds a branched simulation model from that declaration. For a single
+unbranched path, use
+:meth:`Cable.from_morphology <dendra.models.core.Cable.from_morphology>`.
 
-Use :meth:`dendra.Morphology.from_swc` and
-:meth:`dendra.Morphology.from_asc` to load an editable native declaration before
-compiling it or constructing a model. For direct model construction,
-:meth:`dendra.Tree.from_swc` and :meth:`dendra.Tree.from_asc` load the same native
-declarations, apply native d-lambda discretization, and construct a Tree.
-:meth:`dendra.Tree.from_NEURON` instead captures an existing NEURON model with
-its authored ``nseg`` values. All of these paths produce a scalar
-compartment-resistor graph for simulation in Dendra.
+Build and run a branched cell
+-----------------------------
+
+Attach two dendrites to one end of a soma, put Hodgkin–Huxley channels on the
+soma and a passive leak on both dendrites, and record the response to a
+current pulse. The example runs on CPU and uses the tree solver from the
+:doc:`solvers extra <../installation>`.
+
+.. code-block:: python
+
+   import dendra as dn
+   from dendra.units import ms, nA, um
+
+   with dn.ctx(DEVICE="cpu", JIT=0):
+       morphology = dn.Morphology(rhoa=100.0, cm=1.0)
+       soma = morphology.section("soma", L=20 * um, diam=20 * um)
+       apical = morphology.section(
+           "apical", L=100 * um, diam=2 * um, nseg=3, labels="dendrites"
+       )
+       basal = morphology.section(
+           "basal", L=80 * um, diam=2 * um, nseg=3, labels="dendrites"
+       )
+       for branch in (apical, basal):
+           branch.connect(soma.at(1.0), child_end=0)
+
+       cell = dn.Tree.from_morphology(morphology, celsius=6.3, v_init=-65.0)
+       cell.soma.insert(dn.mod.hh)
+       cell.dendrites.insert(dn.mod.pas, g=0.001, e=-65.0)
+       cell.soma.inject(dn.mono_rect(amp=0.1 * nA, delay=1 * ms, pw=1 * ms))
+
+       recorder = dn.Recorder(("t", "v"), region=cell.soma)
+       cell.initialize()
+       cell.run(dt=0.025 * ms, duration=5 * ms, callbacks=[recorder])
+
+   time = recorder.numpy("t")
+   voltage = recorder.numpy("v")[:, 0, 0]
+   print(f"{time.size} samples, soma peak {voltage.max():.1f} mV")
+
+Section dimensions are in µm, resistivity ``rhoa`` is in Ω·cm, and specific
+capacitance ``cm`` is in µF/cm². The soma uses one compartment and each
+dendrite uses three. Both dendrites share the label ``dendrites``, which
+selects all six dendritic compartments through ``cell.dendrites``.
+
+The pulse starts at 1 ms and lasts 1 ms. ``0.1 * nA`` expresses its amplitude
+in Dendra's absolute-current unit, mA. The soma depolarizes from −65 mV to a
+peak near −62 mV. The Recorder returns 201 samples, including the initial
+voltage, with time in ms and voltage in mV.
+
+* For dimensions, tapered sections, and compartment counts, see
+  `Declare sections`_ and `Choose direct or d-lambda discretization`_.
+* For branch junctions and physical placement, see `Connect sections`_ and
+  `Coordinates and electrical connections`_.
+* To start from a reconstruction, see `Load SWC and Neurolucida ASC`_ or
+  `Capture an existing NEURON model`_.
+* For solver compatibility and geometry checks, see
+  `Compile and construct a Tree or Cable`_ and `Runtime contract validation`_.
 
 Declare sections
 ----------------
 
-The native morphology API uses Dendra's ordinary numerical unit conventions:
+The remaining examples use a separate morphology to show tapered sections,
+region labels, and other section options. The units are the same as in the
+branched cell above.
 
 .. list-table::
    :widths: 35 25 40
@@ -84,11 +131,11 @@ used to make the length convention explicit:
        labels={"dendrite"},
    )
 
-Every section has a unique non-empty name and an explicit positive integer
-``nseg``.  A stylized section supplies both ``L`` and scalar ``diam``.  A pt3d
-section supplies at least two ``(x, y, z, diameter)`` points and derives its
-length from centerline arclength; it cannot also supply ``L`` or ``diam``.
-Section-level ``rhoa`` and ``cm`` override the morphology defaults.
+Give each section a unique, nonempty name. Choose a positive integer ``nseg``
+for its compartment count, which defaults to one. For a uniform cylinder,
+give both ``L`` and scalar ``diam``. To specify a pt3d centerline instead, give
+at least two ``(x, y, z, diameter)`` points. Dendra computes its length along
+the centerline. Section-level ``rhoa`` and ``cm`` override the morphology defaults.
 
 Consecutive pt3d controls may share xyz only when their diameters differ. This
 is an abrupt diameter discontinuity, represented by the same zero-length
@@ -109,7 +156,7 @@ Choose direct or d-lambda discretization
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Every Section always has one explicit positive integer ``nseg``. For a
-read-only estimate, :meth:`~dendra.Section.lambda_f` returns that Section's AC
+read-only estimate, :meth:`~dendra.models.morphology.Section.lambda_f` returns that Section's AC
 space constant in µm using its current geometry, ``rhoa``, and ``cm``:
 
 .. code-block:: python
@@ -129,7 +176,7 @@ area, volume, and axial resistance. A same-coordinate diameter step has zero
 centerline interval and therefore contributes zero electrotonic length to this
 estimate, although compilation still retains its exact annular membrane area.
 
-Use :meth:`~dendra.Morphology.apply_d_lambda` to select and assign counts for
+Use :meth:`~dendra.models.morphology.Morphology.apply_d_lambda` to select and assign counts for
 every current Section:
 
 .. code-block:: python
@@ -187,7 +234,7 @@ Morphology returns an empty dictionary after validating its arguments.
 Section names and region labels
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The first argument to :meth:`~dendra.Morphology.section` is the Section's
+The first argument to :meth:`~dendra.models.morphology.Morphology.section` is the Section's
 unique authored ``name``. It is the Section's identity for connectivity and
 compiled provenance; every material compartment produced from it records that
 value in ``CompartmentMetadata.section_name``. Section names are automatically
@@ -203,7 +250,7 @@ sets in addition to their distinct identities:
 Explicit ``labels`` are reusable structural region tags. Each label covers
 every one of the Section's ``nseg`` material compartments, and several Sections
 may share a label. Consequently, after
-:meth:`~dendra.Tree.from_morphology`, ``tree.soma`` selects the uniquely named
+:meth:`~dendra.models.tree.Tree.from_morphology`, ``tree.soma`` selects the uniquely named
 ``soma`` Section while ``tree.dendrite`` is the union of the ``apic`` and
 ``basal`` Sections. Ordinary shared labels are encouraged, but Section names
 are reserved: an explicit label on one Section cannot equal another Section's
@@ -223,12 +270,12 @@ The compiled metadata keeps three related concepts separate:
    The set of structural tags on each material compartment, including its
    Section name. Retained junction nodes have an empty set.
 
-When a :class:`~dendra.Tree` or :class:`~dendra.Cable` is constructed directly
+When a :class:`~dendra.models.tree.Tree` or :class:`~dendra.models.core.Cable` is constructed directly
 from a ``Morphology``, collision-free labels that are non-private Python
 identifiers—not keywords or reserved model attributes—become population-owned
-:class:`~dendra.Slice` attributes. Other labels remain available through
+:class:`~dendra.models.slice.Slice` attributes. Other labels remain available through
 ``compartment_graph.metadata`` and
-:meth:`~dendra.CompartmentGraph.nodes_with_label`, but are not installed as
+:meth:`~dendra.models.morphology.CompartmentGraph.nodes_with_label`, but are not installed as
 attributes. Shared Slice labels follow Section declaration order, with
 compartments in increasing authored Section ``x`` within each Section; reversed
 physical traversal through ``child_end=1`` does not change that public order.
@@ -236,7 +283,7 @@ physical traversal through ``child_end=1`` does not change that public order.
 Load SWC and Neurolucida ASC
 ----------------------------
 
-Use :meth:`~dendra.Morphology.from_swc` when the source is a classic
+Use :meth:`~dendra.models.morphology.Morphology.from_swc` when the source is a classic
 seven-column SWC node tree:
 
 .. code-block:: python
@@ -270,7 +317,7 @@ policy. The loader's positive integer ``nseg`` is a uniform *initial* count for
 the newly declared Sections; it does not apply d-lambda while parsing, and
 geometry samples are not treated as compartments. After inspecting or editing
 the native declaration, either update selected Section counts directly or call
-:meth:`~dendra.Morphology.apply_d_lambda` once to replace all initial counts.
+:meth:`~dendra.models.morphology.Morphology.apply_d_lambda` once to replace all initial counts.
 This separation lets the d-lambda calculation observe any imported-geometry,
 ``rhoa``, or ``cm`` edits made after loading. The importer rejects forests,
 cycles, duplicate IDs, missing parents, non-finite values, non-positive radii,
@@ -289,8 +336,8 @@ acceptable.
 
 SWC cannot reconstruct original Section boundaries, names, labels, ``nseg``,
 ``rhoa``, or ``cm``. Raw imported types remain available through the read-only
-:attr:`~dendra.Morphology.swc_section_types` mapping. Pass it explicitly when
-re-exporting because :meth:`~dendra.Morphology.to_swc` never guesses types from
+:attr:`~dendra.models.morphology.Morphology.swc_section_types` mapping. Pass it explicitly when
+re-exporting because :meth:`~dendra.models.morphology.Morphology.to_swc` never guesses types from
 names or labels:
 
 .. code-block:: python
@@ -302,7 +349,7 @@ names or labels:
 
 Neurolucida ASC is a much broader language containing contours, nested trees,
 spines, markers, colors, arbitrary properties, and repair conventions.
-:meth:`~dendra.Morphology.from_asc` therefore uses NEURON's mature
+:meth:`~dendra.models.morphology.Morphology.from_asc` therefore uses NEURON's mature
 ``Import3d_Neurolucida3`` compatibility reader, then immediately snapshots its
 normalized cable interpretation into native pt3d Sections:
 
@@ -350,8 +397,9 @@ therefore explicit rather than silent.
 Construct a Tree directly from a file
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-When no edits are needed before discretization, use the Tree convenience
-constructors:
+Use :meth:`Tree.from_swc <dendra.models.tree.Tree.from_swc>` or
+:meth:`Tree.from_asc <dendra.models.tree.Tree.from_asc>` to load, discretize,
+and construct a Tree in one call.
 
 .. code-block:: python
 
@@ -369,7 +417,7 @@ constructors:
        "reconstruction.asc", root="soma[0]", d_lambda=0.1, freq=100.0
    )
 
-``Tree.from_asc`` is an alias of :meth:`~dendra.Tree.from_neurolucida`. Each
+``Tree.from_asc`` is an alias of :meth:`~dendra.models.tree.Tree.from_neurolucida`. Each
 constructor loads a native Morphology, calls ``apply_d_lambda``, and constructs
 the model with ``Tree.from_morphology``. Their electrical defaults are
 ``rhoa=35.4`` Ω·cm and ``cm=1.0`` µF/cm²; the standalone Morphology loaders use
@@ -390,7 +438,7 @@ labels. It does not use NEURON's SWC repair heuristics.
 Capture an existing NEURON model
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Use :meth:`~dendra.Tree.from_NEURON` when the source is an existing NEURON
+Use :meth:`~dendra.models.tree.Tree.from_NEURON` when the source is an existing NEURON
 Section tree. Set the NEURON model's geometry, electrical properties, and
 ``nseg`` values before passing its root Section. Dendra captures that grid
 without changing ``nseg`` or applying a discretization policy.
@@ -419,12 +467,12 @@ validated update API rather than direct assignment:
 
    assert morphology.update_section(apic, nseg=11) is apic
 
-:meth:`~dendra.Section.update` is the natural object-oriented form;
-:meth:`~dendra.Morphology.update_section` additionally accepts either a
+:meth:`~dendra.models.morphology.Section.update` is the natural object-oriented form;
+:meth:`~dendra.models.morphology.Morphology.update_section` additionally accepts either a
 Section owned by that Morphology or its exact name. The Section's object
 identity, authored ``name``, owner, declaration order, and existing
 connections are retained. Consequently, previously saved
-:class:`~dendra.SectionLocation` objects continue to refer to the same Section
+:class:`~dendra.models.morphology.SectionLocation` objects continue to refer to the same Section
 and normalized ``x``. A Section from another Morphology, or a copied/forged
 Section object that merely has the same name, is rejected.
 
@@ -435,8 +483,8 @@ and global name/label rules—and changes nothing if validation fails. Passing
 is always added back automatically. Names themselves cannot be updated because
 they are the stable keys for connectivity and compiled provenance.
 
-Every optional keyword on :meth:`~dendra.Section.update` and
-:meth:`~dendra.Morphology.update_section` uses ``None`` to mean *leave the
+Every optional keyword on :meth:`~dendra.models.morphology.Section.update` and
+:meth:`~dendra.models.morphology.Morphology.update_section` uses ``None`` to mean *leave the
 current value unchanged*. It does not mean “inherit the Morphology default
 again.” To apply a current default to an existing Section, pass it
 explicitly—for example, ``soma.update(rhoa=morphology.rhoa)``. Passing
@@ -480,7 +528,7 @@ assigns the requested diameter. Pt3d diameter is linearly interpolated between
 samples, so this operation edits a diameter control point and affects its
 adjacent span or spans—one at a Section endpoint and two at an interior
 control point. It does not target one compiled compartment.
-:meth:`~dendra.SectionLocation.update` returns the canonical owning Section,
+:meth:`~dendra.models.morphology.SectionLocation.update` returns the canonical owning Section,
 not a new SectionLocation or a replacement Section object. Local diameter
 updates are deliberately restricted to pt3d Sections. Convert a stylized
 cylinder to explicit pt3d geometry before introducing a local taper.
@@ -490,7 +538,7 @@ diameter limits. A local update there is therefore rejected as ambiguous; use
 controls.
 
 ``rhoa``, ``cm``, ``nseg``, and ``labels`` remain whole-Section properties and
-are not accepted by :meth:`~dendra.SectionLocation.update`. A value at one
+are not accepted by :meth:`~dendra.models.morphology.SectionLocation.update`. A value at one
 zero-width location would not define an electrical interval. Author piecewise
 base ``rhoa`` with separately connected Sections whose cable spans carry the
 desired scalar values, then compile and construct a new model. Changing a
@@ -524,8 +572,8 @@ does not guess whether an existing value was inherited or supplied explicitly.
 Delete and replace section subtrees
 -----------------------------------
 
-Use :meth:`~dendra.Section.delete` or
-:meth:`~dendra.Morphology.delete_section` to remove authored Sections. The
+Use :meth:`~dendra.models.morphology.Section.delete` or
+:meth:`~dendra.models.morphology.Morphology.delete_section` to remove authored Sections. The
 object-oriented and explicit forms are equivalent:
 
 .. code-block:: python
@@ -610,7 +658,7 @@ axon while retaining its attachment to the soma:
 
 Deleting the sole root, including a complete tree with ``recursive=True``, is
 allowed and leaves an empty editable Morphology. As usual,
-:meth:`~dendra.Morphology.compile` and model construction reject an empty
+:meth:`~dendra.models.morphology.Morphology.compile` and model construction reject an empty
 declaration until a new root is authored. Previously compiled graphs and
 instantiated models are immutable snapshots and are not altered by deletion;
 compile or construct a new model to observe the revised morphology.
@@ -618,7 +666,7 @@ compile or construct a new model to observe the revised morphology.
 Connect complete morphologies
 -----------------------------
 
-Use :func:`dendra.connect_morphologies` when the host cell and the arbor to
+Use :func:`dendra.connect_morphologies <dendra.models.morphology.connect_morphologies>` when the host cell and the arbor to
 attach are already complete Morphology declarations. The parent location may
 be anywhere on the host tree. The child location must be endpoint ``0`` or
 ``1`` of the child tree's root Section; selecting any other Section would give
@@ -715,7 +763,7 @@ of extracellular fields.
 Connect sections
 ----------------
 
-:meth:`dendra.Section.at` identifies a normalized authored location ``x`` in
+:meth:`dendra.Section.at <dendra.models.morphology.Section.at>` identifies a normalized authored location ``x`` in
 the closed interval ``[0, 1]``. A child connects through exactly one of its
 authored endpoints:
 
@@ -778,7 +826,7 @@ Electrical connectivity is independent of the displayed centerline
 coordinates.  Pt3d coordinates are preserved exactly and are not translated
 when a section is connected.  Stylized ``L``/``diam`` sections use a canonical
 local centerline from ``(0, 0, 0)`` to ``(0, 0, L)`` and likewise are not
-translated or rotated by :meth:`~dendra.Morphology.connect`.
+translated or rotated by :meth:`~dendra.models.morphology.Morphology.connect`.
 
 This mirrors the useful separation between NEURON's section connectivity and
 its pt3d placement, but it also means that connected stylized sections may
@@ -790,7 +838,7 @@ Euclidean gap between independently supplied endpoints.
 Visualize and inspect declarations
 ----------------------------------
 
-A native :class:`~dendra.Morphology` can be inspected directly while it is
+A native :class:`~dendra.models.morphology.Morphology` can be inspected directly while it is
 being authored. The visualization methods take a read-only snapshot of the
 current Section declarations and connections; they never construct a
 ``Tree``/``Cable`` or mutate the Morphology. Spatial plots, diameter profiles,
@@ -801,8 +849,8 @@ partially connected Section forest be visualized before it satisfies the
 single-root model contract.
 
 For a low-noise view of what the authored cable envelope looks like, use
-:meth:`~dendra.Morphology.plot_shape` or its rotatable 3-D counterpart
-:meth:`~dendra.Morphology.plot_shape_3d`:
+:meth:`~dendra.models.morphology.Morphology.plot_shape` or its rotatable 3-D counterpart
+:meth:`~dendra.models.morphology.Morphology.plot_shape_3d`:
 
 .. code-block:: python
 
@@ -870,8 +918,8 @@ automatically.
 The shape renderer uses the authored declaration, not ``nseg`` or the compiled
 graph, and never invents placement. Spatially coherent child tubes meet
 naturally. A gapped electrical connection remains visibly gapped and emits one
-warning; use :meth:`~dendra.Morphology.plot` or
-:meth:`~dendra.Morphology.inspect` for the detailed connection diagnostic.
+warning; use :meth:`~dendra.models.morphology.Morphology.plot` or
+:meth:`~dendra.models.morphology.Morphology.inspect` for the detailed connection diagnostic.
 An authored zero-length diameter discontinuity appears as the corresponding
 annular shoulder rather than being smoothed or assigned artificial length.
 Likewise, connected stylized Sections retain their canonical local z-axis and
@@ -879,7 +927,7 @@ may overlap. This is a tapered-cable envelope, not a histological reconstruction
 or a boolean surface union at branch junctions. A distinct spherical-soma
 primitive is currently unsupported.
 
-For a diagnostic orthographic view, :meth:`~dendra.Morphology.plot` draws the
+For a diagnostic orthographic view, :meth:`~dendra.models.morphology.Morphology.plot` draws the
 exact authored centerlines and optional controls. ``view`` is the axis viewed
 along—and therefore omitted from the plot—so ``view="y"`` displays x against
 z:
@@ -899,7 +947,7 @@ z:
    # The methods return ordinary Matplotlib handles and never call show().
    fig.savefig("morphology-xz.png", bbox_inches="tight")
 
-The corresponding :meth:`~dendra.Morphology.plot_3d` view preserves all three
+The corresponding :meth:`~dendra.models.morphology.Morphology.plot_3d` view preserves all three
 spatial axes and is especially useful for checking a bent pt3d centerline or a
 child connected through authored ``child_end=1``:
 
@@ -921,7 +969,7 @@ is not a topology error. For coordinates near binary64's numerical limits,
 the renderer may subtract a common display origin or divide an axis by a
 display scale so Matplotlib can retain the local cable geometry. The figure
 prints every such transform; it never silently changes the Morphology. Use
-:meth:`~dendra.Morphology.plot_topology` for a coordinate-independent
+:meth:`~dendra.models.morphology.Morphology.plot_topology` for a coordinate-independent
 view of the exact compartment connectivity graph:
 
 .. code-block:: python
@@ -1004,11 +1052,11 @@ raster output cannot react to pointer motion; Dendra warns when
 returns ``(Figure, Axes)`` and never calls ``show()``.
 
 For a complete Morphology, this is the exact
-:class:`~dendra.CompartmentGraph` produced by
-:meth:`~dendra.Morphology.compile`. A partially authored forest remains
+:class:`~dendra.models.morphology.CompartmentGraph` produced by
+:meth:`~dendra.models.morphology.Morphology.compile`. A partially authored forest remains
 inspectable: each current connected component is compiled independently with
 the same endpoint-collapse and junction rules. Use
-:meth:`~dendra.Morphology.plot_section_topology` when the desired diagnostic
+:meth:`~dendra.models.morphology.Morphology.plot_section_topology` when the desired diagnostic
 is instead one labelled box per authored Section with ``nseg``, ``rhoa``,
 ``cm``, labels, attachment locations, and spatial-gap status:
 
@@ -1021,7 +1069,7 @@ is instead one labelled box per authored Section with ``nseg``, ``rhoa``,
        annotate_connections=True,
    )
 
-For taper validation, :meth:`~dendra.Morphology.plot_diameter_profile` plots
+For taper validation, :meth:`~dendra.models.morphology.Morphology.plot_diameter_profile` plots
 the piecewise-linear diameter controls independently for selected Sections:
 
 .. code-block:: python
@@ -1042,7 +1090,7 @@ profile useful for checking local controls added with
 diameter step share one horizontal position and therefore appear as a vertical
 profile segment.
 
-:meth:`~dendra.Morphology.inspect` combines the three orthographic views,
+:meth:`~dendra.models.morphology.Morphology.inspect` combines the three orthographic views,
 compartment topology, and diameter profile in one coordinated dashboard:
 
 .. code-block:: python
@@ -1105,8 +1153,8 @@ The shared styling and selection contract is:
   morphology for compilation, or relax the independent SWC export tolerance.
 
 Each call snapshots the declaration at its start. Later calls reflect
-subsequent :meth:`~dendra.Section.update` or
-:meth:`~dendra.SectionLocation.update` edits, while already returned artists,
+subsequent :meth:`~dendra.models.morphology.Section.update` or
+:meth:`~dendra.models.morphology.SectionLocation.update` edits, while already returned artists,
 previously compiled graphs, and existing model instances remain independent.
 
 Export to SWC
@@ -1180,7 +1228,11 @@ original ``Morphology`` declaration exactly.
 Compile and construct a Tree or Cable
 -------------------------------------
 
-Compilation validates the declaration and returns an immutable snapshot:
+:meth:`Morphology.compile <dendra.models.morphology.Morphology.compile>`
+validates the declaration and returns an immutable
+:class:`~dendra.models.morphology.CompartmentGraph`. Use it to inspect the
+discretized geometry, or call ``Tree.from_morphology`` to build a simulation
+model.
 
 .. code-block:: python
 
@@ -1196,19 +1248,19 @@ Compilation validates the declaration and returns an immutable snapshot:
 Adding or updating a Section on ``morphology`` after either call cannot mutate
 ``compartment_graph`` or ``tree``. Compilation and model construction are
 snapshots, not live views of the builder. Re-run
-:meth:`~dendra.Morphology.compile` to obtain a revised graph, or construct a
-new :class:`~dendra.Tree`/:class:`~dendra.Cable` with ``from_morphology`` to use
-the edited declaration in a simulation. ``N`` creates identical copies of the
-same compiled morphology; per-cell topology or geometry variation is not part
-of this first API.
+:meth:`~dendra.models.morphology.Morphology.compile` to obtain a revised graph, or construct a
+new :class:`~dendra.models.tree.Tree`/:class:`~dendra.models.core.Cable` with ``from_morphology`` to use
+the edited declaration in a simulation. ``N`` sets the number of cells sharing
+that compiled morphology.
 
-For an unbranched morphology, construct a generic cable instead:
+The two-section ``policy_morphology`` from the discretization example forms an
+unbranched path, so it can use the tridiagonal Cable solver.
 
 .. code-block:: python
 
-   cable = dn.Cable.from_morphology(morphology, N=128)
+   cable = dn.Cable.from_morphology(policy_morphology, N=128)
 
-``Cable`` is deliberately distinct from :class:`dendra.Axon`. ``Axon`` and its
+``Cable`` is deliberately distinct from :class:`dendra.Axon <dendra.models.core.Axon>`. ``Axon`` and its
 ``Unmyelinated``/``Myelinated`` subclasses use fiber-level parameters and
 specialized geometric relationships; those concepts are not expressive enough
 for an arbitrary tapered pt3d path. ``Cable`` is the geometry-general
@@ -1221,7 +1273,7 @@ A ``Cable`` must contain only material compartments and its undirected
 electrical graph must be one simple path. True branches and retained zero-area
 junction nodes are rejected. A valid path whose canonical rooted node lies in
 its interior is reordered deterministically from one physical end to the other;
-the aligned :attr:`~dendra.Cable.compartment_graph` records that storage order.
+the aligned :attr:`~dendra.models.core.Cable.compartment_graph` records that storage order.
 Section labels remain ordered by increasing authored Section ``x`` regardless
 of physical traversal direction. Graph attachment is factory-only: do not pass
 an arbitrary NetworkX graph to the low-level ``Cable`` constructor. The public
@@ -1231,7 +1283,7 @@ cannot make voltage and material solvers observe different topologies.
 The unbranched voltage kernel consumes exact compiled membrane areas and exact
 center-to-center edge resistances. It does not reconstruct tapered geometry
 from one representative compartment diameter and ``dx``. The same exact-edge
-adapter is used when a ``Cable`` is packed into :func:`dendra.concat_models`,
+adapter is used when a ``Cable`` is packed into :func:`dendra.concat_models <dendra.models.multi.concat_models>`,
 so standalone and packed simulation semantics are identical. Native Cable
 material diffusion retains
 the canonical volumes and ``diff_geom_um`` through the graph/DHS material
@@ -1280,7 +1332,7 @@ in :doc:`../advanced/diagnostics`.
 The canonical compartment graph
 --------------------------------
 
-:class:`dendra.CompartmentGraph` separates immutable topology, binary64
+:class:`dendra.CompartmentGraph <dendra.models.morphology.CompartmentGraph>` separates immutable topology, binary64
 geometry, and provenance:
 
 ``topology.parent_index``
@@ -1294,7 +1346,7 @@ geometry, and provenance:
    ``volume_o_um3``, ``x_um``, ``y_um``, ``z_um``, ``rhoa_ohm_cm``, and
    ``cm_uF_cm2``. Child-indexed edge tuples are ``edge_length_um``,
    ``edge_resistance_ohm``, and ``edge_diff_geom_um``; the root entries are
-   zero. :meth:`dendra.CompartmentGeometry.array` returns a fresh NumPy
+   zero. :meth:`dendra.CompartmentGeometry.array <dendra.models.morphology.CompartmentGeometry.array>` returns a fresh NumPy
    ``float64`` array for a named field. For a material compartment,
    ``diameter_um`` is the arclength mean over that compartment, matching
    NEURON's segment-diameter convention. It is representative metadata rather
@@ -1312,7 +1364,7 @@ area to the lower-x compartment (or the first compartment at ``x=0``) while
 adding no volume, path length, axial resistance, or diffusion distance. Area,
 volume, inverse cross-sectional-area path integrals, axial resistance, and
 diffusion geometry are therefore calculated before a
-:class:`~dendra.Tree` or :class:`~dendra.Cable` deliberately casts model buffers
+:class:`~dendra.models.tree.Tree` or :class:`~dendra.models.core.Cable` deliberately casts model buffers
 to its configured dtype.
 
 NetworkX interoperability
@@ -1332,8 +1384,8 @@ canonical source of truth:
    restored = dn.CompartmentGraph.from_networkx(nx_graph)
    tree = dn.Tree.from_compartment_graph(restored, N=16)
 
-   # Valid only when restored is a material-only unbranched path.
-   cable = dn.Cable.from_compartment_graph(restored, N=16)
+For a material-only unbranched graph, use
+:meth:`Cable.from_compartment_graph <dendra.models.core.Cable.from_compartment_graph>`.
 
 The adapter writes the established Tree node fields ``L``, ``diam``, ``area``,
 ``volume``, ``volume_i``, ``volume_o``, ``Ra``, ``cm``, ``x/y/z`` and the edge
@@ -1350,12 +1402,12 @@ The native morphology API currently supports:
 * one connected scalar resistor tree with one root;
 * explicit per-Section ``nseg`` values, including transactional native
   d-lambda selection from current geometry and electrical properties; and
-* construction of scalar :class:`dendra.Tree` populations, or fast
-  :class:`dendra.Cable` populations for material-only unbranched paths, whose
+* construction of scalar :class:`dendra.Tree <dendra.models.tree.Tree>` populations, or fast
+  :class:`dendra.Cable <dendra.models.core.Cable>` populations for material-only unbranched paths, whose
   ``N`` members share that morphology.
 
 Finite-extracellular/double-cable circuit layers for
-:class:`dendra.ExtCellTree` or :class:`dendra.ExtCellAxon`, a packed block-DHS
+:class:`dendra.ExtCellTree <dendra.models.extcell.ExtCellTree>` or :class:`dendra.ExtCellAxon <dendra.models.extcell.ExtCellAxon>`, a packed block-DHS
 representation, and per-population-member graph variation are currently
 unsupported by the native morphology API.
 

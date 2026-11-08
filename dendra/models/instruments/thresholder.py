@@ -13,68 +13,21 @@ from ._threshold_trials import _threshold_trials
 class Thresholder:
     r"""Compute activation thresholds for a native or compiled Population.
 
-    This helper class wraps a :class:`~dendra.models.Population` together with
-    an activity criterion and computes, for
-    each element in the population, the stimulus amplitude at which an action
-    potential (or some other binary state, as reported by the callback) is first
-    detected.
+    Supply a spatial voltage and a :class:`~dendra.models.stim.Waveform`, or a
+    precomputed spatiotemporal basis. The search scales this stimulus with a
+    separate amplitude for each cell and batch entry. Use :meth:`set_partition`
+    to search separately over groups of compartments.
 
-    The stimulus is assumed to have a fixed spatiotemporal *shape* and an
-    unknown scalar *amplitude* per population element. The shape can be
-    specified in one of two ways:
+    :meth:`calculate_thresholds` brackets the activation threshold between a
+    subthreshold lower bound and an activating upper bound. It narrows the
+    interval until the requested tolerances are met. With
+    ``block_possible=True``, the search uses peak voltage to distinguish a
+    subthreshold response from possible conduction block. Native execution
+    obtains the peak with :class:`~dendra.models.callbacks.Recorder`.
 
-    * By providing ``space`` and ``time`` (space/waveform mode), where
-      ``space`` encodes the spatial distribution of extracellular potential and ``time`` is a
-      :class:`Waveform` describing the temporal profile; or
-    * By providing precomputed spatiotemporal ``bases`` (basis mode), in
-      which case each element's extracellular potential is obtained by
-      scaling the corresponding basis function with that element's amplitude.
-
-    For each element, the thresholder maintains a lower bound ``lb`` and
-    an upper bound ``ub`` on the required amplitude:
-
-    * ``lb`` is guaranteed to be subthreshold (no action potential).
-    * ``ub`` is intended to be suprathreshold (action potential present).
-
-    Threshold computation proceeds in two stages:
-
-    1. **Bound fixing** (:meth:`_fix_bounds`):
-       The initial ``ub`` values are checked, and, if necessary, iteratively
-       adjusted so that they produce a suprathreshold response for each
-       element. If ``block_possible=True`` is passed to
-       :meth:`calculate_thresholds`, the bound-fixing stage uses both the
-       activity callback and a :class:`~dendra.models.callbacks.Recorder` trace to distinguish
-       between purely subthreshold responses and putative conduction block
-       (large depolarisation without a successful spike as reported by the
-       callback). In that case, ``ub`` may be either increased
-       (clearly subthreshold) or decreased (suspected block) using the
-       ``fix_bound_up`` and ``fix_bound_down`` factors. Elements whose
-       bounds cannot be repaired within ``max_tries_bound_fix`` iterations
-       are marked as ignored.
-
-    2. **Bisection search** (:meth:`calculate_thresholds`):
-       Once a valid bracketing interval ``[lb, ub]`` exists, a standard
-       per-element bisection is performed. On each iteration:
-
-       * Candidate amplitudes are chosen as ``stimamp = (lb + ub) / 2``.
-       * The model is simulated once with these amplitudes.
-       * Elements that spike at ``stimamp`` move their upper bound down
-         (``ub = stimamp``); elements that do not spike move their lower
-         bound up (``lb = stimamp``).
-
-       The loop continues independently for each element until both the
-       absolute and/or relative window sizes satisfy the requested
-       tolerances:
-
-       * Absolute window: ``awindow = ub - lb``
-       * Relative window: ``rwindow = (ub - lb) / ub``
-
-       Controlled by ``atol`` and ``rtol`` via :meth:`check_tolerance`.
-
-    All heavy computations are performed in ``torch.no_grad()`` mode and
-    on the same device and dtype as the underlying model. Convenience methods
-    :meth:`float` and :meth:`double` convert native models and internal buffers.
-    A compiled runner has a fixed dtype; compile another runner to change it.
+    The search uses the model's device and dtype without gradient tracking.
+    :meth:`float` and :meth:`double` change the dtype for native models. For a
+    compiled runner, choose the dtype before compiling.
 
     Parameters
     ----------
@@ -115,13 +68,12 @@ class Thresholder:
         Initial lower bound(s) on threshold amplitudes, broadcastable to
         ``model.shape[:-1]``. If ``None``, lower bounds are initialised to zero.
     fix_bound_up : float, optional
-        Multiplicative factor used to increase the upper bound during the
-        bound-fixing stage when a response is still clearly subthreshold,
-        by default ``5.0``.
+        Multiply the upper bound by this factor for a subthreshold response.
+        The default is ``2.0``. The factor must exceed one.
     fix_bound_down : float, optional
-        Multiplicative factor used to decrease the upper bound during the
-        bound-fixing stage in ``block_possible`` mode when a putative block
-        is detected, by default ``0.1``.
+        Multiply the upper bound by this factor when ``block_possible=True``
+        and the response suggests conduction block. The default is ``0.1``.
+        The factor must be between zero and one.
     max_tries_bound_fix : int, optional
         Maximum number of attempts to repair the upper bounds before giving
         up and marking an element as ignored, by default ``10``.
@@ -138,12 +90,16 @@ class Thresholder:
         satisfied).
     chunklength : optional
         Chunk length (in time steps) to use when calling
-        :meth:`~dendra.models.Population.longrun` instead of
-        :meth:`~dendra.models.Population.run` for
+        :meth:`~dendra.models.core.Population.longrun` instead of
+        :meth:`~dendra.models.core.Population.run` for
         long native simulations, by default ``None``. Configure compiled kernel
         width with ``chunk_steps`` in ``dn.compile`` instead.
+    mode : {"arithmetic", "geometric"}, optional
+        Arithmetic mode tests the midpoint of the bounds and is the default.
+        Geometric mode tests their geometric mean and requires strictly
+        positive lower and upper bounds.
     peak : str, optional
-        Compiled callback result used by ``block_possible=True``. Supply a
+        Name of the compiled callback used by ``block_possible=True``. Supply a
         ``Recorder(("v",), max_only=True)`` recording every solver step, or a
         custom pure callback returning a floating-point peak voltage per search
         lane. The Recorder's partition must match the model partition.
@@ -154,7 +110,7 @@ class Thresholder:
 
     Examples
     --------
-    A typical usage pattern is to construct a :class:`Population`, define a
+    Given a :class:`~dendra.models.core.Population`, define a
     spatial field and temporal waveform, and then call
     :meth:`calculate_thresholds`:
 
@@ -162,6 +118,7 @@ class Thresholder:
 
         import numpy as np
         import dendra as dn
+        from dendra.models.instruments import Thresholder
 
         # Assume ``model`` is an existing Population with diameters defined
         model = ...  # type: dendra.models.Population
@@ -198,44 +155,20 @@ class Thresholder:
         # ``thr_ub`` and ``thr_lb`` now contain per-element bounds on the
         # stimulus amplitude required to elicit an action potential.
 
-    In more elaborate workflows, this pattern can be wrapped in an outer loop
-    over random waveforms and field parameters to build distributions of
-    thresholds, or applied in parallel to a detailed "model" and a
-    reduced "student" model to quantify distillation error, et cetera.
-
     Notes
     -----
-    ``model.shape`` denotes the underlying Population payload shape throughout
-    these descriptions. Read it from ``program.functional.shape`` on a compiled
-    runner. Every configured runner callback executes on each amplitude trial.
+    ``model.shape`` means the underlying Population shape. For a compiled
+    runner, read it from ``program.functional.shape``.
 
-    Every amplitude trial starts independently. Native models are initialized
-    before each run. A compiled runner uses its configured snapshot/fresh policy
-    without passing a preceding trial's state or callback carry. Snapshot policy
-    repeats the captured RNG boundary as well as neural state. Fresh policy
-    preserves the runner's initialization and resampling behavior. The hard
-    threshold search does not differentiate through bisection.
+    Each amplitude trial starts independently. Native trials initialize the
+    model. Compiled trials use the runner's snapshot or fresh policy and run
+    every configured callback. Snapshot policy repeats the captured neural
+    and RNG states. Fresh policy follows the runner's resampling settings.
 
-    Compiled activity partitions must be configured before ``dn.compile`` and
-    agree with :meth:`set_partition`; the search does not rebind callbacks.
-
-    Either ``atol`` or ``rtol`` (or both) must be provided. If neither
-    tolerance can be satisfied within ``max_tries_thresh`` iterations,
-    the corresponding thresholds are returned as ``NaN`` and the indices
-    are recorded in :attr:`ignore`.
-
-    Before thresholding starts, the extracellular field is scanned for
-    ``NaN`` values. Without a model partition, any population element whose
-    field contains a ``NaN`` is ignored. With a partition, the check is
-    performed independently for each population-element/partition pair, so
-    only affected partitions are ignored. Ignored field entries are replaced
-    with zero for simulation purposes so that ``NaN`` values do not propagate
-    through the model, and ignored thresholds are returned as ``NaN``.
-
-    When threshold computation fails during the bound-fixing stage, both
-    lower and upper bounds for that element are set to one and the element
-    is marked as ignored. Such elements also return ``NaN`` thresholds from
-    :meth:`calculate_thresholds`.
+    Configure compiled activity partitions before ``dn.compile`` and match
+    them in :meth:`set_partition`. Supply ``atol``, ``rtol``, or both.
+    A NaN in the stimulus excludes the affected cell or partition from the
+    search. Excluded stimulus values are replaced with zero during trials.
     """
 
     def __init__(
@@ -946,8 +879,7 @@ class Thresholder:
         atol=None,
         rtol=None,
     ) -> Tuple[Tensor, Tensor]:
-        """Calculate thresholds. If bases were provided on Thresholder
-        construction, they are used and tstop is ignored.
+        """Search for the upper and lower activation bounds.
 
         Parameters
         ----------
@@ -977,10 +909,13 @@ class Thresholder:
 
         Returns
         -------
-        Tuple[Tensor, Tensor]
-            Upper and lower threshold bounds on CPU. Each has shape
-            ``model.shape[:-1]`` without a model partition, or
+        upper, lower : torch.Tensor
+            Upper and lower threshold bounds, in that order, on CPU. Both
+            have shape ``model.shape[:-1]``, or
             ``(*model.shape[:-1], n_partitions)`` after :meth:`set_partition`.
+            Entries are NaN for cells or partitions excluded by NaN stimulus
+            values, unsuccessful bound fixing, or failure to meet the
+            requested tolerances within the iteration limit.
         """
         tstop, dt = self._trial.horizon(tstop, dt, basis=self.bases is not None)
         self._trial.validate(self, block_possible=block_possible)

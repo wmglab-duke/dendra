@@ -1412,15 +1412,16 @@ class LFP(Callback):
 
     @property
     def lfp(self):
-        """Tensor of recorded LFP values at each time step."""
+        """Return potentials in mV with shape ``(samples, *batch, contacts)`` by default."""
         return torch.stack(self._lfp)
 
     @property
     def t(self):
-        """Tensor of timestamps corresponding to the recorded LFP values."""
+        """Return the sample times in ms, in the same order as :attr:`lfp`."""
         return torch.tensor(self._t)
 
     def numpy(self):
+        """Return the recorded LFP samples as a detached CPU NumPy array."""
         return self.lfp.detach().cpu().numpy()
 
     def reset(self):
@@ -2111,52 +2112,52 @@ class _Active(ThresholdCallback):
 
 
 class Raster(ThresholdCallback):
-    """
-    Callback for recording spike events for raster plot visualization.
+    """Record upward voltage threshold crossings at selected compartments.
 
-    This class detects threshold crossings of membrane potential (spikes) at selected
-    nodes and records their occurrence at each time step. The result can be used
-    to create raster plots that show spiking activity across multiple axons over time.
+    Each retained post-step sample contains one Boolean value per checked
+    compartment. The window selects zero-based step indices from
+    ``int(t_start_check / dt)`` inclusive to ``int(t_end_check / dt)`` exclusive.
 
     Parameters
     ----------
     threshold : float, optional
-        Voltage threshold in mV for spike detection. Default is 0.0.
+        Voltage threshold in mV. The default is 0.0.
     t_start_check : float, optional
-        Time in ms after which to start recording spikes.
-        Default is 0.0 (record from beginning).
-    node_check : list of int, optional
-        Indices of nodes to monitor for spike detection. Default is [5, -5]
-        (check at node 5 from beginning and node 5 from end).
-    dt : float, optional
-        Time step in ms. If None, uses the default from backend. Default is None.
+        Start of the observation window in ms. The default is 0.0.
+    t_end_check : float or None, optional
+        End of the observation window in ms. Omission uses 1e9 ms.
+    node_check : sequence of int, optional
+        Compartment indices to check. The default is ``[5, -5]``. Choose
+        indices that exist in the model, such as ``[0]`` for point cells.
+    dt : float or None, optional
+        Solver timestep in ms. Native execution supplies its timestep. For
+        functional execution, omit this or specify the plan's timestep.
 
     See Also
     --------
-    APCount : Callback for counting total spikes during simulation
-    Active : Callback for detecting if axons fire at any point during simulation
+    APCount : Count threshold crossings at each checked compartment.
+    Active : Test whether any checked compartment crossed the threshold.
 
     Examples
     --------
-    >>> raster = Raster(threshold=20.0)  # Record when v crosses +20 mV
-    >>> dt = 0.005 * ms
-    >>> model.run(ve, dt=dt, callbacks=[raster])
-    >>> spike_data = raster.numpy()  # Get spike data for plotting
-    >>>
-    >>> # Plot raster
-    >>> import matplotlib.pyplot as plt
-    >>> fig, axis = plt.subplots(dpi=200, figsize=(5,5))
-    >>> diams = model.diam.cpu().numpy()
-    >>> raster.plot(diams, dt=dt, ax=axis)
-    >>> plt.show()
+    For an initialized, unbatched Population with at least two cells::
+
+        import numpy as np
+        from dendra import callbacks
+
+        raster = callbacks.Raster(threshold=20.0, node_check=[0])
+        model.run(steps=40, dt=0.025, callbacks=[raster])
+        crossings = raster.stack()
+        ax = raster.plot(np.arange(model.np), "Cell index")
 
     Attributes
     ----------
     record : list of torch.Tensor
-        List of boolean tensors shaped ``(*batch, N, K)``, one per time step,
-        indicating which checked compartments spiked.
+        Retained Boolean rows, each shaped ``(*batch, N, K)``, where ``K`` is
+        the number of checked compartments.
     state_cache : torch.Tensor
-        Boolean tensor tracking membrane potential state relative to threshold.
+        Boolean flags indicating whether each checked compartment was below
+        threshold at the previous observation.
     """
 
     def pre_loop_hook(self, model):
@@ -2194,6 +2195,12 @@ class Raster(ThresholdCallback):
         self.i += 1
 
     def stack(self):
+        """Return a Boolean tensor shaped ``(samples, *batch, N, K)``.
+
+        Only post-step rows inside the observation window are included. An
+        initialized recording with no retained samples has a zero-length
+        leading axis.
+        """
         if (
             isinstance(self.record, list)
             and not self.record
@@ -2205,6 +2212,7 @@ class Raster(ThresholdCallback):
         return torch.stack(self.record)
 
     def numpy(self):
+        """Return :meth:`stack` as a detached CPU NumPy array."""
         return self.stack().detach().cpu().numpy()
 
     def plot(
@@ -2217,30 +2225,32 @@ class Raster(ThresholdCallback):
         node_idx=None,
         axon_idx=None,
     ):
-        """
-        Plot the raster plot of spiking activity.
+        """Plot one checked compartment of an unbatched raster.
 
         Parameters
         ----------
-        var : np.ndarray
-            Array of fiber diameters in μm. Must match the number of axons in the model.
-        varname: str
-            Name of the variable to plot.
+        var : numpy.ndarray
+            Numeric y-coordinates, such as fiber diameters in μm. Supply
+            one value per selected cell, with at least two values in
+            increasing order.
+        varname : str
+            Label for the y-axis.
         dt : float, optional
-            Time step in ms. If None, uses the default from backend. Default is None.
+            Timestep in ms. Omission uses the recording timestep. Plotted
+            times are relative to the first retained row.
         ax : matplotlib.axes.Axes, optional
-            Axes to plot on. If None, creates a new figure and axes. Default is None.
-        cmap : str or matplotlib colormap, optional
-            Colormap for the plot. Default is None (uses default colormap).
+            Axes to draw on. Omission creates a new figure and axes.
+        cmap : str or matplotlib.colors.Colormap, optional
+            Colormap for the y-coordinates. The default is viridis.
         node_idx : int, optional
-            Index of the node to plot. If None, plots all nodes. Default is None.
-        axon_idx : int, optional
-            Index of the axon to plot. If None, plots all axons. Default is None.
+            Index within the checked compartments. The default is 0.
+        axon_idx : slice or sequence of int, optional
+            Selection along the cell axis. Omission selects every cell.
 
         Returns
         -------
-        matplotlib.figure.Figure
-            The figure containing the raster plot.
+        matplotlib.axes.Axes
+            The axes containing the raster plot.
         """
         import matplotlib as mpl
         import matplotlib.pyplot as plt

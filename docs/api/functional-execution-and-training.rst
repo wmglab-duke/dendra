@@ -1,11 +1,14 @@
 Functional execution and training
 =================================
 
-Use ``dn.compile`` to create a reusable Population or Network runner for
-simulation or gradient-based fitting. For direct control over state, inputs,
-and continuation, use the plans and tensor packets in ``dn.func``. The
-parameter and optimization references cover trainable values, random
-distributions, and gradient utilities.
+Execute a compiled program with :func:`dn.func.run <dendra.func.run>`.
+Supply explicit current or voltage tapes with
+:class:`dn.func.Inputs <dendra.func.Inputs>`. To resume a run, pass a
+:class:`dn.func.Continuation <dendra.func.Continuation>`.
+Inspect trainable sources with
+:func:`dn.func.inspect_sources <dendra.func.inspect_sources>` and use
+:meth:`SourceReport.select <dendra.func.SourceReport.select>` to choose subsets
+for optimizer groups.
 
 .. toctree::
    :maxdepth: 1

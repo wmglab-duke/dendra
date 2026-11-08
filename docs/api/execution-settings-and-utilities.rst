@@ -1,9 +1,10 @@
 Execution settings and utilities
 ================================
 
-Advance a model one timestep, configure execution with ``dn.ctx``, or use
-``dn.doctor`` to check your installation. Find the constants, unit conversion
-factors, and numerical utilities used to construct model inputs.
+Use :func:`dn.step <dendra.step>` to advance a Population or Network one
+timestep. Use :class:`dn.ctx <dendra.helpers.ctx>` to set the device or tensor
+dtype for model construction. Use :func:`dn.doctor <dendra.doctor>` to check
+your installation.
 
 .. toctree::
    :maxdepth: 1

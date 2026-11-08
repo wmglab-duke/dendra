@@ -1328,10 +1328,13 @@ class Population(P, Sliceable):
 
     Notes
     -----
-    Insert mechanisms and configure geometry before calling :meth:`initialize`.
-    Use :meth:`run` for a single host chunk or :meth:`longrun` for bounded
-    stimulation preparation. Functional execution uses the same model definition
-    through :func:`dendra.compile` or :func:`dendra.func.make_functional`.
+    Insert mechanisms and configure geometry before calling
+    :meth:`~dendra.models.core.Population.initialize`. Use
+    :meth:`~dendra.models.core.Population.run` to advance the model or
+    :meth:`~dendra.models.core.Population.longrun` to prepare stimulation in
+    chunks. Use the same model definition with
+    :func:`dn.compile <dendra.func.compile>` or
+    :func:`dn.func.make_functional <dendra.func.make_functional>`.
     """
 
     # ---------- repr knobs (safe defaults) ----------
