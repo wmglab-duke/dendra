@@ -1,15 +1,16 @@
 (training-and-parameters)=
 # Train models and select parameters
 
-Use ordinary PyTorch optimizers to fit Dendra models. A training runner retains
-gradients through its accepted solver steps, selected model parameters and
-differentiable inputs. Its parameters are independent of the native model used
-to construct it, so optimization does not silently modify that model.
+Use a PyTorch optimizer to fit a model to a recorded response. Compile with
+`inference=False` to keep gradients and use `trainable=` to choose which
+parameters to optimize. The optimizer updates the compiled program's own
+parameters.
 
 ## Fit a recorded response
 
-This complete example fits a passive conductance to a voltage target. The target
-is illustrative; replace it with your measured response and loss function.
+Fit the passive conductance `g` by comparing a 0.5 ms voltage recording with a
+constant target of −61 mV. For your own fit, supply a measured trace or choose
+a loss that measures the response you want.
 
 ```python
 import torch
@@ -24,29 +25,46 @@ with dn.ctx(DEVICE="cpu", DTYPE=torch.float64, JIT=0, REQUIRE_GRAD=1):
     model.train()
     model.initialize()
     program = dn.compile(
-        model, dt=0.025, steps=20, chunk_steps=4,
-        inference=False, trainable="*g_param",
+        model, dt=0.025, steps=20,
+        inference=False, trainable="leak.g_param",
         callbacks={"trace": dn.Recorder(("v", "t"))},
         backend="eager",
     )
     report = dn.func.inspect_sources(program)
-    print(report)
+    print(report.select("parameters.*.leak.g_param"))
     optimizer = torch.optim.Adam(report.trainable_leaves, lr=1e-6)
+    target_voltage = -61.0  # mV
     for iteration in range(3):
         optimizer.zero_grad(set_to_none=True)
         _, auxiliary = dn.func.run(program)
         voltage = auxiliary["callbacks"]["trace"]["v"]
-        loss = (voltage - (-61.0)).square().mean()
+        loss = (voltage - target_voltage).square().mean()
         loss.backward()
         optimizer.step()
-        print(iteration, loss.item())
+        print(f"Iteration {iteration + 1}, loss {loss.item():.4f}")
 ```
 
-The no-state call starts each iteration from the captured initial snapshot.
-Use `initialization="fresh"` when the initial state must be recomputed from
-updated parameters, or initialize explicit trial continuations as described in
-{doc}`initialization_and_checkpoints`. The `eager` backend keeps this example
-quick to start; omit it to use the default optimizing backend.
+The report confirms that `trainable="leak.g_param"` selected the conductance of
+the mechanism named `leak`. The report groups the full path under `parameters`.
+
+```text
+SourceReport
+  Sources: 1 named path; 1 unique tensor; 0 alias groups
+  Gradients: 1 trainable leaf; 0 nonleaf tensors requiring gradients
+
+parameters (1 path)
+  └─ integrator.mech.mechanisms.leak.g_param  [shape=(), float64, cpu; trainable leaf]
+
+constants (0 paths)
+  (none)
+```
+
+The displayed mean squared error falls from about 2.5997 to 2.5878 mV².
+Each call starts from the same initial state and uses the latest conductance.
+Use `initialization="fresh"` when updated parameters should also change the
+initial state. See {doc}`initialization_and_checkpoints` for other ways to
+start a trial. The `eager` backend keeps startup short. Omitting it selects
+the default optimizing backend.
 
 ## Find the sources you mean to train
 
@@ -56,14 +74,13 @@ quick to start; omit it to use the default optimizing backend.
 constructing an optimizer. `program.trainable_parameters` shows the live
 runner-default subset with gradients enabled.
 
-`dn.func.inspect_sources` describes native models, runners, tensor bundles,
-bindings and continuations. A report lists source paths, aliases, tensor shapes
-and captured trainability. Its `trainable_leaves` contains each eligible Tensor
-object once, making it suitable for an optimizer even when parameters are shared
-between Populations or components.
+`dn.func.inspect_sources` reports names, shapes, and which tensors share a
+parameter or require gradients. Use `report.trainable_leaves` to pass each
+trainable tensor to the optimizer once, even if several Populations or
+components share it.
 
-Report paths include their source domain, such as `parameters.`. Use
-`report.select(...)` to make optimizer groups:
+Report paths begin with `parameters.` or `constants.`. Use
+`report.select(...)` to choose which parameters go in each optimizer group.
 
 ```{literalinclude} ../../examples/training/functional_source_selection.py
 :language: python
@@ -72,12 +89,12 @@ Report paths include their source domain, such as `parameters.`. Use
 :dedent: 4
 ```
 
-This excerpt comes from the complete
+The complete
 {download}`functional_source_selection.py <../../examples/training/functional_source_selection.py>`
-example, which defines the model and selectors and demonstrates both optimizer
-groups and separate optimizers. Selection preserves full alias groups and report
-order. Ensure groups assigned to different optimizers are identity-disjoint when
-they should not update the same Tensor twice.
+example defines the model and shows how to set different learning rates with
+optimizer groups or use separate optimizers. Selection keeps all aliases of
+each selected tensor in the report. When using separate optimizers, check
+that each parameter belongs to only one optimizer if it should get one update.
 
 Reports do not change `requires_grad`. To change trainability, update the
 underlying leaves and inspect again; an existing report retains its captured

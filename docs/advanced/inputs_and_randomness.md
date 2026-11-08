@@ -53,47 +53,75 @@ Mechanism-owned injections retain their mechanism's own current rule.
 
 ## Supply a tensor at each accepted step
 
-An `Inputs` packet has two optional fields: `ve` for extracellular voltage in
-mV, and `intra` for intracellular current in mA. A manual `step` consumes one
-frame; `run` consumes a tape with a leading time dimension. Full-size tapes
-have shape `(steps, *population.shape)`. Supported broadcast dimensions can
-share a drive across cells; full-size tensors make the selection explicit.
+Pass `intra=` to `dn.func.Inputs` for intracellular current in mA or `ve=` for
+extracellular voltage in mV. A manual `step` takes one frame. A `run` takes a
+tape with time on the first axis. A full-size tape has shape
+`(steps, *population.shape)`. Supported broadcast dimensions let you share
+one drive across cells.
 
-This example uses an unstimulated cell and allocates the required tape length
-from the current execution boundary:
+This example applies 0.1 nA to a passive cell for eight steps and records its
+voltage. Allocate the tape from `cell.v` so its dtype and device match the model.
 
 ```python
 cell = make_cell()
-program = dn.compile(cell, dt=DT, steps=8, inference=False, backend="eager")
-trial = dn.func.initialize(program)
-request = {"duration": 0.2}
-steps = dn.func.resolve_steps(program, trial, **request)
-voltage = trial.state["integrator"]["v"]
-current = voltage.new_full((steps, *voltage.shape), 0.1 * nA).requires_grad_()
-inputs = dn.func.Inputs(intra=current)
-state, auxiliary = dn.func.run(program, trial, inputs=inputs, **request)
-state["integrator"]["v"].square().mean().backward()
-assert current.grad is not None
+steps = 8
+current = cell.v.new_full((steps, *cell.v.shape), 0.1 * nA).requires_grad_()
+program = dn.compile(
+    cell, dt=DT, steps=steps, inference=False,
+    callbacks={"trace": dn.Recorder(("v", "t"))}, backend="eager",
+)
+_, auxiliary = dn.func.run(program, inputs=dn.func.Inputs(intra=current))
+voltage = auxiliary["callbacks"]["trace"]["v"]
+print(voltage.shape)  # torch.Size([9, 1, 1])
 ```
 
-`resolve_steps` includes any pending fractional duration without consuming it.
-Keep the original `duration=` on execution so the run publishes the resulting
-remainder. An explicit `steps=` request leaves pending duration unchanged.
-Input tensors remain caller-owned and can receive gradients.
+The voltage rises from its initial value of −65 mV. The tape has eight input
+frames, and the Recorder returns nine voltage samples because it includes the
+initial state.
+
+To continue for a requested duration, use `resolve_steps` to find the tape
+length from the returned continuation.
+
+```python
+continuation = auxiliary["continuation"]
+duration = 0.06  # ms
+count = dn.func.resolve_steps(program, continuation, duration=duration)
+next_current = cell.v.new_full((count, *cell.v.shape), 0.1 * nA)
+_, following = dn.func.run(
+    program, continuation, duration=duration,
+    inputs=dn.func.Inputs(intra=next_current),
+)
+```
+
+With a 0.025 ms timestep this request takes two steps, so the new recording samples
+are at 0.225 and 0.250 ms. The continuation carries the remaining 0.01 ms into
+the next duration request. `resolve_steps` counts complete steps, including
+any time carried in from previous calls. Run with the original `duration=` to
+update that remainder. A `steps=` request leaves it available for a later
+duration request.
+
+To fit a stimulus to a target response, enable gradients on the tape and run
+with `inference=False`, as above. A loss based on the recorded voltage can then
+differentiate with respect to `current`.
+
+```python
+voltage[-1].mean().backward()
+assert current.grad is not None
+```
 
 A Network takes a mapping from Population names to `Inputs`. Allocate each
 Population's tape with its own shape, dtype and device. Populations omitted
 from the mapping use their configured stimulation:
 
 ```python
-network = dn.Network({"left": make_cell(), "right": make_cell()})
+left = make_cell()
+network = dn.Network({"left": left, "right": make_cell()})
 network.train()
 network.initialize(DT)
 net_program = dn.compile(network, dt=DT, steps=8, backend="eager")
 initial = dn.func.initialize(net_program)
 count = dn.func.resolve_steps(net_program, initial, duration=0.2)
-v_left = initial.state["populations"]["left"]["integrator"]["v"]
-left_current = v_left.new_full((count, *v_left.shape), 0.1 * nA)
+left_current = left.v.new_full((count, *left.v.shape), 0.1 * nA)
 net_state, net_auxiliary = dn.func.run(
     net_program, initial, duration=0.2,
     inputs={"left": dn.func.Inputs(intra=left_current)},

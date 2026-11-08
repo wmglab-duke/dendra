@@ -1,15 +1,14 @@
 (recording-and-callbacks)=
 # Recording and online analysis
 
-Use `dn.Recorder` to retain a trajectory, and callbacks such as `APCount` or
-`LFP` to compute observations during simulation. The same configurations work
-with native models and `dn.compile`. In-memory observations can retain
-gradients; HDF5 recording stores detached samples.
+Use `dn.Recorder` to collect voltage, time, or mechanism state. Other callbacks
+measure activity or compute summaries during simulation. In-memory results can
+retain gradients. HDF5 stores detached samples and keeps long recordings off
+the autograd graph.
 
-## Record a compiled simulation
+## Record a native simulation
 
-A compiled runner takes a named callback mapping. Results appear under those
-names in `auxiliary["callbacks"]`:
+Pass a Recorder in `callbacks=[recorder]`, then read each field from the Recorder.
 
 ```python
 import torch
@@ -28,6 +27,31 @@ def make_cell():
         cell.initialize()
         return cell
 
+native = make_cell()
+recorder = dn.Recorder(("v", "t"), dt=2 * DT)
+native.run(steps=8, dt=DT, callbacks=[recorder])
+
+native_voltage = recorder.stack("v")
+native_time = recorder.stack("t")
+assert native_voltage.shape == (5, 2, 1)  # Samples, cells, compartments.
+assert native_time.shape == (5,)
+```
+
+A fresh Recorder samples the initial boundary, then every accepted step by
+default. With `dt=record_dt`, it samples every `int(record_dt / solver_dt)`
+steps. Here the samples are the initial boundary and steps 2, 4, 6 and 8.
+Pass the solver timestep to `run` and the sampling interval to `Recorder`.
+Choose a sampling interval at least as large as the solver timestep. Record
+`"t"` to read the actual sample times in ms. `recorder.numpy("v")` detaches
+the same time-leading data and moves it to CPU for plotting.
+
+## Record a compiled simulation
+
+Use the same Recorder configuration in a named mapping. The compiled runner
+returns the trace under that name in `auxiliary["callbacks"]`. This example uses
+the eager backend to keep startup short.
+
+```python
 model = make_cell()
 program = dn.compile(
     model, dt=DT, steps=8, inference=False, trainable="*g_param",
@@ -37,16 +61,11 @@ program = dn.compile(
 state, auxiliary = dn.func.run(program)
 trace = auxiliary["callbacks"]["trace"]
 voltage, time = trace["v"], trace["t"]
-assert voltage.shape[0] == 5  # Initial boundary, then steps 2, 4, 6 and 8.
+torch.testing.assert_close(voltage, native_voltage)
+torch.testing.assert_close(time, native_time)
 ```
 
-`Recorder(dt=None)` records the initial boundary and every accepted step.
-With `dt=record_dt`, the sampling stride is `int(record_dt / solver_dt)`;
-choose a recording interval at least as large as the solver timestep.
-The recording interval does not change the solver timestep. Use `"t"` to
-obtain the actual sample times, especially with subsampling or continuation.
-
-To continue the simulation and recording phase, pass the returned packet:
+Pass the returned continuation to keep the simulation state and sampling phase.
 
 ```python
 next_state, next_auxiliary = dn.func.run(program, auxiliary["continuation"], steps=4)
@@ -54,25 +73,111 @@ joined = torch.cat((voltage, next_auxiliary["callbacks"]["trace"]["v"]))
 assert joined.shape[0] == 7  # The continuation does not repeat its boundary.
 ```
 
-Each returned trace contains samples collected by that call. Reducers retain
-their accumulated carry. A fresh no-state runner call starts a new recording;
-see {doc}`initialization_and_checkpoints` for explicit fresh initialization.
+Each returned trace contains the samples from that call. Reducers retain their
+accumulated values across continuation. A call without state or callback carry
+starts a fresh recording. See {doc}`initialization_and_checkpoints` for
+initialization and checkpoint workflows.
+
+## Use the same observations in native execution
+
+Prepare a named collection when you want explicit results and sampling carry
+across native calls. Each result maps callback names to observations and
+provides `.state` for the next call.
+
+```python
+native = make_cell()
+callbacks = dn.func.make_callbacks(
+    native, {"trace": dn.Recorder(("v", "t"), dt=2 * DT)}, dt=DT
+)
+first = native.run(steps=4, dt=DT, callbacks=callbacks)
+last = native.longrun(
+    steps=4, chunklength=2, dt=DT,
+    callbacks=callbacks, callback_state=first.state,
+)
+native_trace = torch.cat((first["trace"]["v"], last["trace"]["v"]))
+torch.testing.assert_close(native_trace, voltage)
+```
+
+Prepared collections also work with `step` and `longrun_checkpointed`. The
+checkpointed call returns `(hook_loss, result)` when using a prepared collection.
+Preparation resolves field names and selections for the model and timestep.
+Pass the carry back to the same collection, or transfer it to an independently
+prepared collection with the callback checkpoint methods. Native execution can
+reuse a prepared collection on compatible models.
+
+## Stream long recordings to HDF5
+
+Configure `set_hdf5` before passing the Recorder to execution. Close the writer
+before opening the file. This standalone script writes and reads one recording.
+
+```python
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+import dendra as dn
+from dendra.data import H5Reader
+from dendra.models.mod import pas
+
+
+def record_and_read(path):
+    dt = 0.025
+    with dn.ctx(JIT=0, DEVICE="cpu"):
+        model = dn.SingleCompartment(
+            N=2, C=1, v_init=-65.0, integrator=dn.bwd_euler_sc(imem=False)
+        )
+        model.insert(pas.rename("leak"), g=0.001, e=-55.0)
+        model.eval()
+        model.initialize()
+
+        recorder = dn.Recorder(("v", "t"), dt=2 * dt)
+        recorder.set_hdf5(str(path), cache_every=4)
+        try:
+            model.run(steps=8, dt=dt, callbacks=[recorder])
+        finally:
+            recorder.close()
+
+    with H5Reader(path) as reader:
+        voltage = reader["v"][0][:].compute()
+        time = reader["t"][0][:].compute()
+    return voltage, time
+
+
+if __name__ == "__main__":
+    with TemporaryDirectory() as directory:
+        voltage, time = record_and_read(Path(directory) / "trace.h5")
+        assert voltage.shape == (5, 2, 1)
+        assert time.shape == (5,)
+```
+
+`H5Reader` indexes by field, run number, then time slice. Compute each lazy
+array while the reader is open. Choose a persistent path to keep the file.
+Keep the `if __name__ == "__main__":` guard in scripts because the writer
+starts worker processes. `cache_every` controls the flush interval in solver
+iterations independently of the sampling cadence. A fresh recording counts
+its initial boundary toward the first flush.
+
+Compiled runners and prepared native collections accept the same storage
+configuration. Read their disk-backed samples through `H5Reader`. The returned
+callback state carries the sampling phase for continuation. Use an in-memory
+Recorder when the samples will enter a gradient-based loss. The complete
+{download}`native_callback_storage.py <../../examples/callbacks/native_callback_storage.py>`
+example includes readback and checkpointed execution.
 
 ## Choose fields and Population scopes
 
-Use `"v"` for voltage, `"t"` for time, and mechanism paths such as `"hh.m"`
-for local mechanism state. A Network Recorder uses qualified fields such as
-`"left.v"`; the root `"t"` is the Network clock. `node_indices` selects
-compartments along the recorded field's final axis.
+Use `"v"` for voltage, `"t"` for time, and paths such as `"hh.m"` for mechanism
+state. A Network Recorder uses qualified fields such as `"left.v"`. Its root
+`"t"` is the Network clock. `node_indices` selects compartments along the
+recorded field's final axis.
 
 `region=` accepts a physical `Slice`, including a named component within a
-concatenated MultiPopulation. It selects physical voltage and current fields;
-mechanism-local state currently requires its own field/support selection.
-Region selection cannot be combined with `node_indices`, `max_only` or
-`partition`.
+concatenated MultiPopulation. It selects physical voltage and current fields.
+For mechanism-local state, select the mechanism field and its support.
+Choose either `region` or the index and reduction options
+`node_indices`, `max_only` and `partition`.
 
-For a callback that observes one Population, use `PopulationCallback`. A
-scoped Recorder uses local paths, just as it would for a standalone model:
+Use `PopulationCallback` to run a callback on one named Population. A scoped
+Recorder uses local paths, as it does on a standalone model.
 
 ```python
 network = dn.Network({"left": make_cell(), "right": make_cell()})
@@ -90,103 +195,40 @@ net_state, net_auxiliary = dn.func.run(net_program)
 assert "v" in net_auxiliary["callbacks"]["left_only"]
 ```
 
-Scopes select one exact top-level Population name. They also work with native
-Network callbacks. Use a region inside that Population when selecting a child
-of a concatenated model. After `network.concat()`, a Recorder can select a
-named child region with
+Scopes select an exact top-level Population name in both native and compiled
+Networks. Use a region inside that Population to select a child of a
+concatenated model. After `network.concat()`, a Recorder can select a named
+child region with
 `dn.Recorder(("all_populations.v",), region=network.all_populations.exc.soma)`
-when the model defines an `exc` component with a `soma` region. The complete
+when the model defines an `exc` component with a `soma` region. The
 {download}`functional_network_regions.py <../../examples/callbacks/functional_network_regions.py>`
-example defines and records these concatenated regions.
-
-## Use the same observations in native execution
-
-Prepare a named pure collection once, then keep its returned state between
-native calls. Native `run`, `longrun`, `longrun_checkpointed` and `step`
-support these observations:
-
-```python
-native = make_cell()
-callbacks = dn.func.make_callbacks(
-    native, {"trace": dn.Recorder(("v", "t"), dt=2 * DT)}, dt=DT
-)
-first = native.run(steps=4, dt=DT, callbacks=callbacks)
-last = native.longrun(
-    steps=4, chunklength=2, dt=DT,
-    callbacks=callbacks, callback_state=first.state,
-)
-native_trace = torch.cat((first["trace"]["v"], last["trace"]["v"]))
-assert native_trace.shape[0] == 5
-```
-
-Preparation binds field names and selections and retains its model/timestep
-compatibility requirements. Functional execution uses the collection's exact
-owning plan; native reuse accepts compatible receivers. Carry belongs to its
-prepared collection. Transfer it between independently prepared collections
-with their callback checkpoint methods.
-
-The existing native list interface, `callbacks=[recorder]`, retains its mutable
-callback history and hook behavior. Read those observations from the callback
-object. A named prepared collection instead returns explicit results and carry.
+example defines and records these regions.
 
 ## Online spike analysis and LFP
 
-| Configuration | Result and purpose |
+| Configuration | Result |
 | --- | --- |
-| `dn.callbacks.APCount` | Int32 counts of hard upward threshold crossings. |
-| `dn.callbacks.Raster` | Boolean crossing rows only for timesteps within its observation window. |
-| `dn.callbacks.Active`, `ActiveAL`, `ActiveALCount` | Boolean activity tests: any checked site, a target number of distinct sites, or a target total crossing count including repeats. |
-| `dn.callbacks.AnomalyDetector` | Accumulates whether nonfinite post-step voltage has been observed. |
-| `dn.callbacks.LFP` | Projects absolute transmembrane current through supplied lead fields. |
+| `dn.callbacks.APCount` | Int32 upward threshold-crossing counts per checked compartment. |
+| `dn.callbacks.Raster` | Time-leading Boolean crossing rows for samples within the observation window. |
+| `dn.callbacks.Active`, `ActiveAL`, `ActiveALCount` | Boolean tests for any active site, a target number of distinct active sites, or a target number of crossings including repeats. |
+| `dn.callbacks.AnomalyDetector` | Cumulative Boolean flag per cell for nonfinite post-step voltage. |
+| `dn.callbacks.LFP` | Extracellular potentials in mV, shaped `(samples, *batch, contacts)` by default. |
 
-These threshold counts are not differentiable spike surrogates. They are
-useful for measuring responses; choose a suitable differentiable loss when
-training spike generation. Observation windows and checked nodes are described
-in the {doc}`callback API reference <../api/dendra.models.callbacks>`.
+Use the hard threshold callbacks to measure responses. For training, choose a
+differentiable loss on recorded or reduced model outputs. See the
+{doc}`callback API reference <../api/dendra.models.callbacks>` for observation
+windows and checked nodes.
 
 LFP requires membrane-current output, for example an integrator constructed
-with `imem=True`. Supply one unit-current field per recording contact. In a
-Network, wrap LFP with `PopulationCallback` to choose its source Population.
-The complete {download}`functional_lfp_configuration.py
-<../../examples/callbacks/functional_lfp_configuration.py>` example shows contact and
-batch dimensions, field gradients and continued recordings.
-
-## Stream long recordings to HDF5
-
-Configure storage on `dn.Recorder` before preparing or compiling it:
-
-```python
-from pathlib import Path
-from tempfile import TemporaryDirectory
-
-def write_recording():
-    with TemporaryDirectory() as directory:
-        disk = dn.Recorder(("v", "t"), dt=2 * DT)
-        disk.set_hdf5(str(Path(directory) / "trace.h5"), cache_every=4)
-        stored_program = dn.compile(
-            model, dt=DT, steps=8, callbacks={"trace": disk}, backend="eager"
-        )
-        stored_state, stored_auxiliary = dn.func.run(stored_program)
-        disk.close()
-
-if __name__ == "__main__":
-    write_recording()
-```
-
-HDF5 storage starts worker processes; standalone scripts use the
-`if __name__ == "__main__":` guard shown above. In a notebook, call
-`write_recording()` directly. Use a persistent directory to keep the file. Disk-backed histories are written
-by host execution rather than returned as an in-memory trajectory. Their
-callback carry still supports continuation. Native pure collections use the
-same storage configuration. Stored samples are detached: use in-memory
-observations for gradient-based losses. See the complete
-{download}`native_callback_storage.py <../../examples/callbacks/native_callback_storage.py>`
-example for readback and checkpointed execution.
+with `imem=True`. Supply one reciprocal lead field in mV/mA per contact. In a
+Network, use `PopulationCallback` to select the source Population. The
+{download}`functional_lfp_configuration.py <../../examples/callbacks/functional_lfp_configuration.py>`
+example shows contact and batch dimensions, field gradients and continuation.
 
 ## Write a pure callback
 
-A custom callback stores evolving values in explicit carry. This reducer sums
-post-step mean squared voltage without keeping a trajectory:
+Keep evolving values in carry. This reducer sums the mean squared voltage
+after each accepted step and emits no trajectory.
 
 ```python
 class SquaredVoltageSum(dn.func.FunctionalCallback):
@@ -210,11 +252,11 @@ summary_state, summary_auxiliary = dn.func.run(summary_program)
 summary = summary_auxiliary["callbacks"]["summary"]
 ```
 
-Keep configuration immutable and use tensor operations without hidden state,
-I/O or random sampling. Carry and emissions need stable structures and tensor
-shapes. `initialize` runs once for fresh observations, `update` runs after each
-accepted step, and `finalize` produces each call's result. The same callback
-can run with scan and inference-only while execution when its operations are
-capture-compatible. `checkpoint_configuration` is needed for portable custom
-callback checkpoints; include every setting that affects its interpretation.
-See {class}`dendra.func.FunctionalCallback` for the full authoring contract.
+`initialize` starts the carry, `update` advances it, and `finalize` turns carry
+and any retained emissions into a result for the call. Keep configuration
+immutable. Use deterministic tensor operations with stable carry and emission
+shapes.
+Capture-compatible callbacks work with scan and inference-only while
+execution. For portable checkpoints, include every setting that affects the
+callback's interpretation in `checkpoint_configuration`. See
+{class}`dendra.func.FunctionalCallback` for the authoring contract.
