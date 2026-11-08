@@ -29,7 +29,6 @@ env:
   OMP_NUM_THREADS: "1"
   MKL_NUM_THREADS: "1"
   OPENBLAS_NUM_THREADS: "1"
-  MPLBACKEND: Agg
 
 concurrency:
   group: documentation-${{ github.ref }}
@@ -57,17 +56,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install "torch==2.15.0" --index-url https://download.pytorch.org/whl/cpu
-          python -m pip install --only-binary=dendra-solvers ".[doc,solvers]"
+          python -m pip install --only-binary=dendra-solvers ".[doc,solvers]" ipywidgets
           dendra_models_revision="$(cat docs/dendra-models-revision.txt)"
           python -m pip install --no-deps \
             "dendra-models @ git+https://github.com/wmglab-duke/dendra-models.git@${dendra_models_revision}"
       - name: Build documentation and execute notebooks
         env:
           DENDRA_DOCS_DISABLE_INTERSPHINX: "1"
+          MPLBACKEND: module://matplotlib_inline.backend_inline
+          NEURON_MODULE_OPTIONS: -nogui
         run: >-
           sphinx-build -E -W --keep-going -D nb_execution_mode=force
           -D nb_execution_allow_errors=0 -D nb_execution_raise_on_error=1
           -b html docs docs/_build/html
+      - name: Verify rendered notebook outputs
+        run: python docs/check_notebook_outputs.py docs/_build/html
       - name: Configure GitHub Pages
         if: github.repository == 'wmglab-duke/dendra' && github.event.repository.private == false && github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
         uses: actions/configure-pages@v5
