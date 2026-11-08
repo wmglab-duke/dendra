@@ -19,10 +19,10 @@ sphinx-build -E -W --keep-going \
 python -m http.server --directory docs/_build/html
 ```
 
-This matches the public documentation CI contract: every executable notebook
-is run, and any cell error fails the build. The recorded revisions pin the
-corresponding internal GitLab source commit and filtered public GitHub commit
-used by the internal and public documentation workflows. The multicontact
+This matches the public documentation CI contract. Every executable notebook
+runs, and any cell error fails the build. The recorded revisions pin the
+Dendra Models 0.3.0 source on GitLab and its filtered counterpart on GitHub
+for the internal and public documentation workflows. The multicontact
 animation tutorial also requires the `ffmpeg` executable on `PATH`; install it
 with your operating system's package manager before running the full build.
 
