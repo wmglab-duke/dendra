@@ -1,5 +1,9 @@
-dendra.opt
-==========
+.. _dendra.opt:
+
+Optimizer gradient utilities
+============================
+
+Python module ``dendra.opt``.
 
 Gradient hygiene
 ----------------

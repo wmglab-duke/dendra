@@ -200,9 +200,11 @@ explicit simulation state; it does not rebuild the model's structure.
 
 Construct or move the native model to its execution device before initializing
 and compiling it. CPU and CUDA support float32 and float64; MPS requires float32.
-Spatial cable/tree integrators require a compatible `dendra-solvers` installation.
-Choose a solver supported on the device; see the
-{doc}`integrator reference <../api/dendra.models.integrators>`.
+CPU and MPS unbranched cables can use PyTorch solvers. Install
+`dendra-solvers` for CPU block and tree methods or native MPS tree solvers.
+Dendra includes its CUDA/Triton solvers. See the
+{doc}`installation guide <../installation>` for platform requirements and the
+{doc}`integrator reference <../api/dendra.models.integrators>` for solver choices.
 
 These complete examples show additional model components without requiring a
 different simulation lifecycle:

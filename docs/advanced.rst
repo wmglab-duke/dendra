@@ -3,48 +3,48 @@
 Guides
 ======
 
-Start with a workflow, then use the API reference for detailed signatures and
-contracts. Define an ordinary Population or Network once and choose how to
-execute it.
+Find a workflow for building, running, or training a model. Use the
+:doc:`API reference <dendra>` to look up functions, classes, and their arguments.
 
 The `examples directory <https://github.com/wmglab-duke/dendra/tree/main/examples>`_
 groups runnable scripts by task, with a guide in each folder. Start with
 ``examples/getting_started`` for small Population and Network workflows.
 
-Simulation, training and observations
--------------------------------------
-
 .. toctree::
-   :maxdepth: 1
+   :hidden:
+   :maxdepth: 2
 
-   advanced/functional_execution
-   advanced/inputs_and_randomness
-   advanced/recording_and_callbacks
-   advanced/training_and_parameters
-   advanced/initialization_and_checkpoints
-   advanced/custom_models
+   advanced/run-and-record-simulations
+   advanced/build-models
+   advanced/train-models
+   advanced/performance-and-diagnostics
 
-Building models
----------------
+.. _simulation-training-and-observations:
 
-.. toctree::
-   :maxdepth: 1
+Run and record simulations
+--------------------------
 
-   advanced/mechanisms_and_materials
-   synapse_authoring
-   advanced/model_parameters
-   advanced/connected_networks
-   advanced/synapse_banks
-   advanced/batching_and_devices
-   advanced/model_initialization
+:doc:`Run and record a simulation <advanced/run-and-record-simulations>` with
+explicit inputs, repeatable randomness, and checkpoints you can resume.
 
-Specialized training and diagnostics
-------------------------------------
+.. _building-models:
 
-.. toctree::
-   :maxdepth: 1
+Build models
+------------
 
-   advanced/descriptor_training
-   advanced/threshold_scans
-   advanced/event_based_training
-   advanced/diagnostics
+:doc:`Build a model <advanced/build-models>` by configuring parameters,
+connecting populations, or defining your own mechanisms and synapses.
+
+.. _specialized-training-and-diagnostics:
+
+Train models
+------------
+
+:doc:`Train a model <advanced/train-models>` by selecting trainable parameters
+and fitting them to a target trace or electrophysiological measurement.
+
+Performance and diagnostics
+---------------------------
+
+:doc:`Batch and troubleshoot simulations <advanced/performance-and-diagnostics>`
+using device placement and targeted model checks.

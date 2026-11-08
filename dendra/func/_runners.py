@@ -1641,12 +1641,15 @@ def run(
 ):
     """Execute a compiled runner or an explicit functional boundary.
 
-    The preferred forms are ``run(program, continuation=None, ...)``,
-    ``run(plan_or_kernel, continuation, ...)`` and
-    ``run(bound, state_or_continuation, ...)``. A compiled runner owns its timestep,
-    callbacks, kernel width, initialization policy and checkpoint configuration.
-    An explicit plan/kernel binds the Continuation's sources for that invocation.
-    A raw binding instead owns its sources, which must match a supplied packet.
+    Call ``run(program, ...)`` to start from the runner's configured initial state.
+    Resume a previous run with ``run(program, continuation, ...)`` or
+    ``run(program, state=continuation, ...)``. The runner supplies its configured
+    timestep, callbacks, kernel width, and checkpoint policy.
+
+    For explicit execution, use ``run(plan_or_kernel, continuation, ...)`` or
+    ``run(bound, state_or_continuation, ...)``. A plan or kernel uses the
+    continuation's sources for that call. A raw binding owns its sources, which
+    must match a supplied continuation.
 
     Parameters
     ----------

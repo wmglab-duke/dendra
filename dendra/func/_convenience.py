@@ -864,6 +864,8 @@ def compile(
 ):
     """Create a compiled runner for an initialized Population or Network.
 
+    Supply exactly one of ``steps`` or ``duration`` for the default run length.
+
     Parameters
     ----------
     population : Population or Network
@@ -872,7 +874,7 @@ def compile(
     dt : float
         Positive solver timestep in ms. For a Network it must match initialization.
     steps : int, optional
-        Positive default timestep count. Supply either ``steps`` or ``duration``.
+        Positive default timestep count.
     duration : float, optional
         Non-negative default elapsed time in ms. Fractional time is retained in
         the returned continuation until a complete timestep can be accepted.

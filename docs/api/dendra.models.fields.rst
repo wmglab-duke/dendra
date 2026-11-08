@@ -1,5 +1,9 @@
-dendra.models.fields
+.. _dendra.models.fields:
+
+Extracellular fields
 ====================
+
+Python module ``dendra.models.fields``.
 
 Field normalization and units
 -----------------------------

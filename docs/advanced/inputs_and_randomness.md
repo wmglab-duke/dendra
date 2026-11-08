@@ -106,11 +106,14 @@ execution, gradients and checkpoint continuation with these input lengths.
 
 ## Extracellular fields and call-time contacts
 
-The `extra=` interface combines a unit-current field with a waveform. A field
-contains extracellular voltage per mA; multiplying it by the waveform's mA
-amplitude gives mV. Bind a contact when compiling if its parameters belong to
-the model being optimized. Use `extra=dn.VarInput()` to choose deterministic
-waveforms and contact counts independently on each call:
+For `extra=(field, waveform)`, the product `field * waveform(t)` must be in mV.
+Analytic lead fields are in mV/mA and take waveforms in mA. A precomputed field
+already in mV takes a dimensionless waveform. See {doc}`../units` for other
+field conventions.
+
+Bind a contact when compiling if its parameters belong to the model being
+optimized. Use `extra=dn.VarInput()` to choose deterministic waveforms and
+contact counts on each call.
 
 ```python
 with dn.ctx(JIT=0, DEVICE="cpu", DTYPE=torch.float64):

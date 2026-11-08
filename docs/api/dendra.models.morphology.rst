@@ -1,5 +1,9 @@
-dendra.models.morphology
-========================
+.. _dendra.models.morphology:
+
+Morphology and compartment geometry
+===================================
+
+Python module ``dendra.models.morphology``.
 
 Native morphology declaration
 -----------------------------

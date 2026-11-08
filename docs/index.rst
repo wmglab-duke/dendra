@@ -1,39 +1,43 @@
 Welcome to Dendra!
 ==================
 
-``Dendra`` is a biophysical neuron & network simulator written in `PyTorch <https://github.com/pytorch/pytorch>`_, with an emphasis on effects of extracellular stimulation and event-based networks with synaptic delays. Its key features are:
+Dendra simulates biophysical neurons and networks in PyTorch. Apply
+intracellular currents or extracellular fields, record responses, and fit
+parameters to voltage traces or physiological measurements.
 
-- support for CPU and GPU
-- automatic differentiation, facilitating gradient-based optimization of large numbers of parameters
-- ``jit``-compilation (for speed and memory efficiency) via `torch.compile <https://pytorch.org/docs/stable/generated/torch.compile.html>`_
-- symbolic specification of ODE and kinetic schemes for easy implementation of new mechanisms
-- flexible extracellular stimulation with support for complex 3D fields
-- fully differentiable event-based and continuous network simulation with synaptic delays
-- a simple API, making it easy to use for beginners and experts alike
-- built-in Hodgkin--Huxley and passive membrane mechanisms, plus symbolic APIs for implementing additional models
-- a ``Materials`` interface for generic chemical reaction-diffusion simulations, including support for diffusion in intracellular and extracellular space
+Use built-in Hodgkin–Huxley and passive mechanisms or define your own
+mechanisms and material processes. Connect cells with delayed events or
+continuous signals. When training event-driven networks, you can fit connection
+delays and use surrogate gradients for spike thresholds.
 
+Installation
+------------
 
-``Dendra`` is a research project and is still under development. If you have any questions, suggestions, or feedback, please use the `public issue tracker <https://github.com/wmglab-duke/dendra/issues>`_.
+Use Python 3.11 or newer in an isolated environment. On Windows, we recommend
+using WSL2.
+
+.. code-block:: console
+
+   python -m pip install dendra
+
+See the :ref:`installation guide <installation>` for PyTorch build selection,
+optional native CPU and Apple Metal solvers, and installation checks.
 
 Getting started
 ---------------
 
-``Dendra`` allows you to simulate the effects of stimulation on large numbers of biophysical neuron models on CPU or GPU:
+Stimulate one Hodgkin–Huxley compartment with a current pulse, then plot its
+membrane voltage. The call to ``model.run`` advances the model in place.
 
 .. code-block:: python
 
    import matplotlib.pyplot as plt
-   import numpy as np
 
    import dendra as dn
    from dendra.models.mod import hh
    from dendra.units import ms, nA
 
-   # Stimulate one built-in Hodgkin--Huxley compartment.
-   model = dn.SingleCompartment(
-       N=1, C=1, celsius=6.3, cm=1.0, v_init=-65.0
-   )
+   model = dn.SingleCompartment(N=1, C=1, celsius=6.3, cm=1.0, v_init=-65.0)
    model.diam.fill_(20.0)
    model.dx.fill_(20.0)
    model.insert(hh)
@@ -41,57 +45,39 @@ Getting started
        dn.mono_rect(amp=0.1 * nA, delay=1.0 * ms, pw=1.0 * ms)
    )
 
-   recorder = dn.Recorder(["v"], node_indices=[0])
    dt = 0.01 * ms
+   duration = 10.0 * ms
+   recorder = dn.Recorder(["t", "v"], node_indices=[0])
    model.initialize()
-   model.run(
-       tstop=10.0 * ms,
-       dt=dt,
-       callbacks=[recorder],
-       progressbar=False,
-   )
+   model.run(duration=duration, dt=dt, callbacks=[recorder], progressbar=False)
 
-   voltage = recorder.numpy("v")[:, 0, 0]
-   time = dt * np.arange(len(voltage))
-   plt.plot(time, voltage)
+   plt.plot(recorder.numpy("t"), recorder.numpy("v")[:, 0, 0])
    plt.xlabel("Time (ms)")
    plt.ylabel("Membrane potential (mV)")
    plt.show()
 
+To run the same model through a reusable function, reset it to its initial
+state and compile it. The ``eager`` backend keeps this first call short.
 
-Installation
-------------
+.. code-block:: python
 
-Dendra targets Python 3.11 or newer and PyTorch 2.14 or newer.
+   model.initialize()
+   program = dn.compile(model, dt=dt, duration=duration, backend="eager")
+   state, _ = program()
 
-On Windows, run these commands inside WSL2 because the required NEURON package does not publish native Windows wheels on PyPI.
-
-A typical PyPI setup is:
-
-1. Create and activate an isolated environment (optional): ``conda create -n dendra python=3.12 && conda activate dendra``.
-2. If you need a particular CPU, CUDA, or ROCm build, install PyTorch first using its `installation selector <https://pytorch.org/get-started/locally/>`_.
-3. Install Dendra with the recommended native CPU solvers: ``python -m pip install --only-binary=dendra-solvers 'dendra[solvers]'``.
-
-If ``dendra-solvers`` cannot be installed, retry with ``python -m pip install dendra``. CPU unbranched cables can then use Dendra's built-in PyTorch solver; CPU block and tree methods require the optional package. GPU solvers are included with Dendra.
-
-See :ref:`installation` for source installations, supported solver wheels,
-verification, and optional extras. The :ref:`GPU deployment guide
-<gpu-deployment>` covers CUDA diagnostics and the optional native-extension
-probe.
-
+Continue with :ref:`basics` for stimulation, recording, and model construction.
+The :ref:`functional execution guide <functional-execution>` shows how to
+record outputs and continue a compiled run.
 
 Feedback and Contributions
 --------------------------
 
-We welcome issues and pull requests through `wmglab-duke/dendra <https://github.com/wmglab-duke/dendra>`_. When reporting a bug, include your OS, Python/PyTorch versions, install method, and a minimal reproducible script. For feature requests, please describe the workflow you are trying to support. The repository's `contribution guide <https://github.com/wmglab-duke/dendra/blob/main/CONTRIBUTING.md>`_ describes setup, testing, and submission. Internal contributors continue to use GitLab merge requests.
-
-Contribution tips:
-
-- Use a fresh branch and keep changes focused.
-- Install development extras and CPU solvers (``python -m pip install --editable '.[dev,solvers]'``) for the full CPU test suite and coverage checks. Use ``.[dev]`` for development without native CPU solvers.
-- Follow the existing style conventions; install both hook stages with ``pre-commit install`` and ``pre-commit install --hook-type commit-msg``.
-- Documentation updates are appreciated—adding docstrings or short narrative sections to accompany new code is ideal.
-
+Report issues and open pull requests on
+`GitHub <https://github.com/wmglab-duke/dendra>`_. For a bug report, include
+your OS, Python and PyTorch versions, installation method, and a minimal
+script. See the
+`contribution guide <https://github.com/wmglab-duke/dendra/blob/main/CONTRIBUTING.md>`_
+for development setup and testing.
 
 Citation
 --------

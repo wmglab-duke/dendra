@@ -1,291 +1,103 @@
 (installation)=
 # Installation
 
-> 💡 We recommend using a dedicated environment (e.g., `conda`) for Dendra.
-> Dendra targets Python 3.11+; the examples below use Python 3.12.
-
-```{important}
-On Windows, use the Windows Subsystem for Linux (WSL2) and follow the Linux
-commands below. Dendra's required NEURON dependency does not publish native
-Windows wheels on PyPI, so the standard Dendra PyPI installation is not
-supported in native PowerShell or Command Prompt.
+```{note}
+On Windows, we recommend Windows Subsystem for Linux (WSL2). The shell commands
+below use Linux syntax.
 ```
 
 ## Requirements
 
-- Python 3.11 or newer
-- Pip
+Use Python 3.11 or newer with pip. A dedicated environment keeps Dendra's
+dependencies separate from other projects.
 
-Dendra requires PyTorch 2.14 or newer and NEURON. Both are declared package
-dependencies and are installed automatically. Git is needed only for source
-and development installations.
+```sh
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+```
 
-## Install from PyPI
-
-1. Create and activate an environment (optional but recommended):
-
-   ```sh
-   python -m venv .venv
-   source .venv/bin/activate
-   ```
-
-   Conda users can instead run
-   `conda create -n dendra python=3.12 && conda activate dendra`.
-
-2. Install Dendra with the recommended native CPU and Apple Metal solvers:
-
-   ```sh
-   python -m pip install --upgrade pip
-   python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
-   ```
-
-   The `solvers` extra installs
-   [`dendra-solvers`](https://pypi.org/project/dendra-solvers/), which provides
-   native CPU solvers and the Apple Metal backend for supported implicit
-   solvers on MPS.
-
-3. If no compatible `dendra-solvers` distribution is available for your
-   platform, install the base package instead:
-
-   ```sh
-   python -m pip install dendra
-   ```
-
-   The base package retains Dendra's PyTorch CPU solver for unbranched cables
-   and its CUDA/Triton solvers. CPU block and tree methods, and native MPS
-   tree methods, require `dendra-solvers`.
+With Conda, use
+`conda create -n dendra python=3.12 && conda activate dendra`.
+Source and development installations also require Git.
 
 (choose-pytorch-build)=
 ## Choose a PyTorch build
 
-Pip installs a compatible PyTorch release automatically. If you need a
-particular CPU, CUDA, or ROCm build, install it before Dendra using the command
-from the [PyTorch installation selector](https://pytorch.org/get-started/locally/).
-Dendra requires PyTorch 2.14 or newer.
+Skip this step to let pip install PyTorch automatically. For a specific CPU,
+CUDA, or ROCm build, install PyTorch 2.14 or newer using the
+[PyTorch installation selector](https://pytorch.org/get-started/locally/).
 
-For example, a CPU-only installation on Linux or WSL2 uses PyTorch's CPU wheel
-index:
+For a CPU-only build on Linux or WSL2, use PyTorch's CPU wheel index.
 
 ```sh
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-After installing the selected build, install Dendra without carrying the
-PyTorch index into that command:
+Use the PyTorch index only for the PyTorch installation.
+
+## Install from PyPI
+
+Install Dendra with the recommended native CPU and Apple Metal solvers.
 
 ```sh
 python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
 ```
 
-On Windows hosts, run this inside WSL2.
-
-## Native CPU and MPS implicit solvers
-
-The quick start includes [`dendra-solvers`](https://pypi.org/project/dendra-solvers/)
-through the optional `solvers` extra, which requires version 0.5.1 or newer.
-The base installation (`python -m pip install dendra`) does not download or
-build it, so an unavailable solver wheel or failed solver build does not
-prevent you from installing Dendra.
-
-Without this package, CPU unbranched cable integration falls back to Dendra's
-PyTorch parallel cyclic reduction (PCR) solver. CPU block and tree methods
-require `dendra-solvers`. CUDA/Triton solvers are included with Dendra and do
-not depend on this package.
-
-On Apple Silicon, an MPS-enabled `dendra-solvers` installation supplies native
-Metal Thomas/PCR cable solvers and scalar, block and packed DHS tree solvers.
-These kernels require macOS 14 or newer, an available Apple GPU and float32
-model tensors. Select `device="mps"` and `dtype=torch.float32` before
-constructing or compiling the model. Cable solvers can use PyTorch fallbacks
-without the native backend; DHS tree solvers require it. Scalar SPD solving
-is currently unsupported on MPS; select Thomas or PCR instead. See
-{doc}`testing` for a backend availability check and MPS tests.
-
-To add prebuilt native solvers to an existing installation:
+If pip reports that a compatible solver wheel is unavailable, install the
+base package. Pip installs the required PyTorch and NEURON dependencies in
+either case.
 
 ```sh
-python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
+python -m pip install dendra
 ```
-
-Or add the package to an existing Dendra installation, allowing only prebuilt
-wheels:
-
-```sh
-python -m pip install --only-binary=dendra-solvers "dendra-solvers>=0.5.1"
-```
-
-The wheel-only command fails if there is no compatible wheel, leaving your
-existing Dendra installation usable. To attempt a local source build when a
-wheel is unavailable, omit `--only-binary=dendra-solvers`; this requires a
-working C++ build environment and can still fail. Use the base installation in
-that case.
-
-Prebuilt solver wheels are available for:
-
-- Linux x86-64 and ARM64 on glibc 2.24 or newer.
-- Windows x86-64.
-- macOS 14 or newer on Apple Silicon.
-
-When a matching wheel is available, pip selects it automatically, so installing
-the native solvers does not require a C++ compiler. For other platforms or
-custom PyTorch builds, see the source-build instructions on the
-[`dendra-solvers` package page](https://pypi.org/project/dendra-solvers/).
-The standalone Windows solver wheel supports CPU kernels, but it does not
-remove Dendra's WSL2 requirement because NEURON remains a required dependency
-of the full Dendra package.
-
-## Install from a source checkout
-
-To install an unreleased revision, clone the public repository and install from
-its root:
-
-```sh
-git clone https://github.com/wmglab-duke/dendra.git
-cd dendra
-python -m pip install --upgrade pip
-python -m pip install ".[solvers]"
-```
-
-Use `python -m pip install .` if the optional native solvers are unavailable.
-For an editable development environment, follow the
-[contribution guide](https://github.com/wmglab-duke/dendra/blob/main/CONTRIBUTING.md).
-
-## Optional extras
-
-- Interactive Jupyter plots: `python -m pip install "dendra[jupyter]"`. See the
-  {ref}`interactive Jupyter setup <interactive-jupyter>` below.
-
-- For a fast prose-only documentation preview, install the documentation dependencies with
-  `python -m pip install ".[doc]"`, then run
-  `sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html`.
-  The repository's `docs/README.md` gives the full CI-equivalent workflow,
-  which installs the companion models and executes every notebook.
-
-- For an editable development installation with lint, test, and CPU-solver
-  dependencies, follow the repository's `CONTRIBUTING.md` file.
-
-## Upgrade
-
-Upgrade Dendra while retaining the recommended solver extra with:
-
-```sh
-python -m pip install --upgrade --only-binary=dendra-solvers "dendra[solvers]"
-```
-
-### Compiler compatibility
-
-For recognized affected PyTorch implementations, Dendra applies a compiler
-repair when it first constructs a compiled program. This avoids unnecessary
-compilation retries while retaining guards for scalar values. The repair adds
-a process-wide compatibility marker to compiler cache keys, preserving any
-user-supplied cache tag and leaving PyTorch's compiler settings unchanged.
-The first repaired compilation creates fresh artifacts; later processes can
-reuse those artifacts. Fixed or unrecognized implementations retain PyTorch's
-behavior.
-
-### Optional TorchInductor cache isolation
-
-Importing Dendra leaves TorchInductor's cache behavior at PyTorch's defaults.
-Dendra's cache-directory, precompiled-header, compile-thread, and CPU ISA cache
-overrides are all opt-in. To enable them with per-process cache isolation, set
-the following environment variable before starting Python:
-
-```sh
-export DENDRA_CONFIGURE_TORCHINDUCTOR_CACHE=1
-python your_simulation.py
-```
-
-With this option enabled, the default cache policy is `process`. Set
-`DENDRA_INDUCTOR_CACHE_POLICY=shared` to retain a shared cache, or `off` to
-disable configuration even when the import gate is enabled. Dendra must be
-imported before PyTorch so the cache settings take effect reliably:
-
-```python
-import dendra as dn
-import torch
-```
-
-(interactive-jupyter)=
-### Interactive Jupyter figures
-
-The optional `ipympl` package has two cooperating parts: a Python backend in
-the notebook kernel and a prebuilt `jupyter-matplotlib` extension in the
-environment running the Jupyter server.
-
-When the server and kernel use the same environment:
-
-1. Install the extra in that environment:
-
-   ```sh
-   python -m pip install "dendra[jupyter]"
-   ```
-
-2. Save your notebooks and stop the **entire Jupyter server**. Restarting only
-   the kernel is insufficient after the first installation because the
-   already-running Lab frontend has not discovered the new extension. Relaunch
-   Jupyter from the activated environment, for example:
-
-   ```sh
-   python -m jupyter lab
-   ```
-
-3. Open or hard-refresh the Lab page, start a fresh kernel, and select the
-   backend before creating figures:
-
-   ```ipython
-   %matplotlib widget
-   ```
-
-If the server and kernel use **separate environments**, install Dendra and
-ipympl in the kernel environment, then install a compatible—preferably the
-same—ipympl release in the environment that launches the per-user Jupyter
-server. Restart both. On a managed JupyterHub, server-side installation may
-require an administrator. For JupyterLab 3/4 and Notebook 7, ipympl ships a
-prebuilt extension: do not run `jupyter lab build` or manually install a Lab
-extension.
-
-To verify the server side, run `jupyter labextension list` with the executable
-that launches Jupyter. It should report both `jupyter-matplotlib` and
-`@jupyter-widgets/jupyterlab-manager` as `enabled` and `OK`. In the kernel,
-`import sys, ipympl; print(sys.executable, ipympl.__version__)` identifies the
-Python environment and backend version.
-
-The browser error `Failed to load model class 'MPLCanvasModel' from module
-'jupyter-matplotlib'` means the kernel backend is active but the current Lab
-page did not load a compatible frontend module. In a shared environment,
-restart the whole server and open a fresh page. In a split environment, verify
-the server-side installation before restarting.
 
 ## Verify the install
-
-First ask pip to check the complete dependency set and run Dendra's deployment
-diagnostics:
 
 ```sh
 python -m pip check
 python -m dendra doctor
 ```
 
-The doctor command reports the PyTorch device, CUDA readiness, compiler and
-toolkit discovery, and Dendra's optional NetCon CUDA extension. For a GPU
-deployment that must provide CUDA, run
-`python -m dendra doctor --require-cuda`. The {ref}`GPU deployment guide
-<gpu-deployment>` explains the complete native-extension probe and fallback
-policies.
+The doctor reports the installed Dendra, Python and PyTorch versions. It also
+checks CUDA devices, compiler and toolkit discovery, and the optional NetCon
+CUDA extension. For a CUDA deployment, require a working CUDA runtime with
+`python -m dendra doctor --require-cuda`. See the {ref}`GPU deployment guide
+<gpu-deployment>` for the native-extension probe and fallback policies.
 
-You can also verify the import and published version directly:
+## Native CPU and MPS implicit solvers
+
+The optional `solvers` extra requires
+[`dendra-solvers`](https://pypi.org/project/dendra-solvers/) 0.5.1 or newer.
+CPU block and tree methods use this package. The base package uses Dendra's
+PyTorch parallel cyclic reduction (PCR) solver for unbranched CPU cables.
+Dendra includes its CUDA/Triton solvers separately from the optional package.
+
+On Apple Silicon, the native Metal backend supplies Thomas and PCR cable
+solvers and scalar, block and packed DHS tree solvers. It requires macOS 14 or
+newer, an available Apple GPU, and float32 tensors. Select `device="mps"` and
+`dtype=torch.float32` before constructing or compiling the model. Cable solvers
+can fall back to PyTorch on MPS. DHS on MPS requires the native backend.
+Scalar SPD solving is currently unsupported on MPS. Choose Thomas or PCR for
+scalar cables. See {doc}`testing` for a backend availability check and MPS tests.
+
+To add native solvers to an existing Dendra environment, install a prebuilt
+wheel.
 
 ```sh
-python - <<'PY'
-from importlib.metadata import version
-import dendra as dn
-
-print("Dendra:", version("dendra"), dn.__file__)
-PY
+python -m pip install --only-binary=dendra-solvers "dendra-solvers>=0.5.1"
 ```
 
-If you installed the optional CPU solvers, verify that their native extension
-loads too:
+Prebuilt wheels are available for Linux x86-64 and ARM64 with glibc 2.24 or
+newer, Windows x86-64, and macOS 14 or newer on Apple Silicon. Inside WSL2, pip
+selects the Linux wheel.
+
+If a compatible wheel is unavailable, you can omit `--only-binary=dendra-solvers`
+to attempt a local build with a C++ toolchain. See the
+[`dendra-solvers` package page](https://pypi.org/project/dendra-solvers/) for
+source-build instructions.
+
+Check that the installed native extension loads.
 
 ```sh
 python - <<'PY'
@@ -295,4 +107,107 @@ import dendra_solvers._ext as solver_ext
 print("dendra-solvers:", version("dendra-solvers"))
 print("CPU solver extension:", solver_ext.__file__)
 PY
+```
+
+## Install from a source checkout
+
+To install from source, clone the public repository and install from its root.
+
+```sh
+git clone https://github.com/wmglab-duke/dendra.git
+cd dendra
+python -m pip install ".[solvers]"
+```
+
+Use `python -m pip install .` if you need the base package. For an editable
+development installation with lint and test dependencies, follow the
+[contribution guide](https://github.com/wmglab-duke/dendra/blob/main/CONTRIBUTING.md).
+
+## Optional extras
+
+- For interactive plots, see {ref}`interactive Jupyter setup <interactive-jupyter>`.
+- For a prose-only documentation preview from a source checkout, install
+  `python -m pip install ".[doc]"` and run
+  `sphinx-build -W --keep-going -D nb_execution_mode=off -b html docs docs/_build/html`.
+  The repository's `docs/README.md` gives the full workflow with companion
+  models and notebook execution.
+
+(interactive-jupyter)=
+### Interactive Jupyter figures
+
+The `ipympl` package supplies a backend for the notebook kernel and a prebuilt
+`jupyter-matplotlib` extension for the Jupyter server. If the server and
+kernel share an environment, use these steps.
+
+1. Install the extra in that environment.
+
+   ```sh
+   python -m pip install "dendra[jupyter]"
+   ```
+
+2. Save your notebooks and restart the Jupyter server from that environment.
+   The server discovers the extension when it starts.
+
+   ```sh
+   python -m jupyter lab
+   ```
+
+3. Refresh the page, start a fresh kernel, and select the backend before
+   creating figures.
+
+   ```ipython
+   %matplotlib widget
+   ```
+
+If the server and kernel use separate environments, install Dendra and ipympl
+in the kernel environment. Install ipympl in the server environment, using the
+same version where possible, then restart both. A managed JupyterHub may
+require an administrator to install the server extension. JupyterLab 3 and 4
+and Notebook 7 can use the prebuilt extension directly.
+
+To check the server, run `jupyter labextension list` with the executable that
+launches Jupyter. Both `jupyter-matplotlib` and
+`@jupyter-widgets/jupyterlab-manager` should show `enabled` and `OK`. In the
+kernel, run `import sys, ipympl; print(sys.executable, ipympl.__version__)` to
+identify the Python environment and backend version.
+
+The error `Failed to load model class 'MPLCanvasModel' from module
+'jupyter-matplotlib'` means the browser could not load a compatible extension.
+Check the server environment, restart the server, and open a fresh page.
+
+## Upgrade
+
+To upgrade Dendra with the solver extra, run the following command.
+
+```sh
+python -m pip install --upgrade --only-binary=dendra-solvers "dendra[solvers]"
+```
+
+### Compiler compatibility
+
+On affected PyTorch builds, Dendra applies a compatibility repair when it
+creates the first compiled program. The repair avoids redundant compilation
+retries and retains scalar guards. The first repaired compilation creates
+fresh cache artifacts that later processes can reuse. The repair preserves
+your compiler settings and any existing cache tag.
+
+### Optional TorchInductor cache isolation
+
+Dendra uses PyTorch's cache defaults unless you enable its TorchInductor
+configuration. To use an isolated cache per process, set this environment
+variable before starting Python.
+
+```sh
+export DENDRA_CONFIGURE_TORCHINDUCTOR_CACHE=1
+python your_simulation.py
+```
+
+The option also enables Dendra's precompiled-header, compile-thread and CPU
+instruction-set settings. Set `DENDRA_INDUCTOR_CACHE_POLICY=shared` to reuse a
+shared cache, or `off` to disable configuration. Import Dendra before PyTorch
+when using these settings.
+
+```python
+import dendra as dn
+import torch
 ```

@@ -1,9 +1,13 @@
-dendra.models.mod
-=================
+.. _dendra.models.mod:
+
+Built-in mechanisms
+===================
 
 .. py:module:: dendra.mod
 
-Built-in mechanisms. Distributed ``hh`` and ``pas`` use conductance density in
+Use ``dendra.mod`` or import from ``dendra.models.mod``.
+
+Distributed ``hh`` and ``pas`` use conductance density in
 S/cm² and return current density in mA/cm². Point-process ``alphasynapse``,
 ``alphasynapse_d``, ``expsyn``, and ``exp2syn`` use conductance in µS and return
 lumped current in nA before Dendra's area normalization. For the event-driven

@@ -1,5 +1,9 @@
-dendra.models.slice
-===================
+.. _dendra.models.slice:
+
+Slices and synapse slots
+========================
+
+Python module ``dendra.models.slice``.
 
 The user-facing semantics, including indexing, mutation, labels, batching,
 rebuilds, and repeated-index behavior, are defined in :doc:`../slices`.

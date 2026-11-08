@@ -1,5 +1,7 @@
-dendra.models.analysis
-======================
+.. _dendra.models.analysis:
+
+Model measurements and descriptors
+==================================
 
 ``dendra.models.analysis`` contains hard measurement functions and
 graph-connected macroscopic descriptors. The training guide explains how to

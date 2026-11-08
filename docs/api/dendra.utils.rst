@@ -1,5 +1,9 @@
-dendra.utils
-============
+.. _dendra.utils:
+
+Interpolation and utilities
+===========================
+
+Python module ``dendra.utils``.
 
 Interpolation
 -------------

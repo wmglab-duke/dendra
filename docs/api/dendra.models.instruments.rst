@@ -1,5 +1,9 @@
-dendra.models.instruments
-=========================
+.. _dendra.models.instruments:
+
+Activation threshold searches
+=============================
+
+Python module ``dendra.models.instruments``.
 
 ``Thresholder`` accepts native Populations and Population runners returned by
 ``dn.compile``. See :doc:`../advanced/functional_execution` and the runnable
