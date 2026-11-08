@@ -28,15 +28,21 @@ def test_jupyter_extra_declares_the_interactive_matplotlib_backend():
 
 def test_jupyter_install_docs_cover_shared_and_split_environments():
     text = (ROOT / "docs" / "installation.md").read_text(encoding="utf-8")
-    prose = " ".join(text.split())
+    section = text.split("(interactive-jupyter)=", 1)[1].split("\n## ", 1)[0]
+    shared, split = " ".join(section.split()).split(
+        "If the server and kernel use separate environments", 1
+    )
 
-    assert "server and kernel use the same environment" in prose
-    assert "server and kernel use **separate environments**" in prose
-    assert "stop the **entire Jupyter server**" in prose
-    assert "Restarting only the kernel is insufficient" in prose
-    assert "do not run `jupyter lab build`" in prose
-    assert "jupyter labextension list" in prose
-    assert "Failed to load model class 'MPLCanvasModel'" in prose
+    assert 'python -m pip install "dendra[jupyter]"' in shared
+    assert "restart the Jupyter server" in shared
+    assert shared.index("python -m jupyter lab") < shared.index("%matplotlib widget")
+    assert "install Dendra and ipympl in the kernel environment" in split
+    assert "Install ipympl in the server environment" in split
+    assert "restart both" in split
+    assert "prebuilt extension" in split
+    assert "jupyter lab build" not in split
+    assert "jupyter labextension list" in split
+    assert "Failed to load model class 'MPLCanvasModel'" in split
 
 
 def test_doctor_console_script_and_module_entrypoint_are_packaged():
