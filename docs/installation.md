@@ -21,6 +21,21 @@ With Conda, use
 `conda create -n dendra python=3.12 && conda activate dendra`.
 Source and development installations also require Git.
 
+(hardware-support)=
+## Hardware support
+
+| Hardware | PyTorch device | Solver setup |
+| --- | --- | --- |
+| CPU | `cpu` | The base package supports unbranched cables. Use the `solvers` extra for native block and tree solvers. |
+| GPU | `cuda` | Dendra includes Triton solvers tested with NVIDIA CUDA. See {ref}`CUDA deployment <gpu-deployment>`. |
+| Apple Silicon | `mps` | Use `torch.float32`. The `solvers` extra enables native Metal solvers. See {ref}`apple-silicon`. |
+
+AMD GPU compatibility with ROCm is unverified. PyTorch's ROCm build also uses
+[`device="cuda"`](https://docs.pytorch.org/docs/stable/notes/hip.html), and
+[Triton can target AMD GPUs](https://github.com/triton-lang/triton#compatibility).
+The optional native NetCon extension and `dendra doctor --require-cuda` target
+NVIDIA CUDA.
+
 (choose-pytorch-build)=
 ## Choose a PyTorch build
 
@@ -62,8 +77,8 @@ python -m dendra doctor
 The doctor reports the installed Dendra, Python and PyTorch versions. It
 also reports CUDA devices, toolchain discovery, and the optional NetCon
 extension's build and cache status. For CUDA, see the
-{ref}`deployment checks <gpu-deployment>`. To check the optional
-`dendra-solvers` backends, use the commands below.
+{ref}`deployment checks <gpu-deployment>`. See the checks below for the
+{ref}`native CPU extension <native-implicit-solvers>` and {ref}`apple-silicon`.
 
 (native-implicit-solvers)=
 ## Native CPU and MPS implicit solvers
@@ -72,15 +87,7 @@ The optional `solvers` extra requires
 [`dendra-solvers`](https://pypi.org/project/dendra-solvers/) 0.5.1 or newer.
 CPU block and tree methods use this package. The base package uses Dendra's
 PyTorch parallel cyclic reduction (PCR) solver for unbranched CPU cables.
-Dendra includes its CUDA/Triton solvers separately from the optional package.
-
-On Apple Silicon, the native Metal backend supplies Thomas and PCR cable
-solvers and scalar, block and packed DHS tree solvers. It requires macOS 14 or
-newer, an available Apple GPU, and float32 tensors. Select `device="mps"` and
-`dtype=torch.float32` before constructing or compiling the model. Cable solvers
-can fall back to PyTorch on MPS. DHS on MPS requires the native backend.
-Scalar SPD solving is currently unsupported on MPS. Choose Thomas or PCR for
-scalar cables.
+For Metal solver requirements and device selection, see {ref}`apple-silicon`.
 
 To add native solvers to an existing Dendra environment, install a prebuilt
 wheel.
@@ -110,8 +117,27 @@ print("CPU solver extension:", solver_ext.__file__)
 PY
 ```
 
-On Apple Silicon, check whether PyTorch can use MPS and whether the native
-Metal solver backend is available.
+(apple-silicon)=
+## Apple Silicon (MPS)
+
+On Apple Silicon, PyTorch's MPS backend runs simulations on the Apple GPU.
+Select `device="mps"` and `dtype=torch.float32` when constructing the model.
+
+```python
+import torch
+import dendra as dn
+
+model = dn.SingleCompartment(N=1, C=1, device="mps", dtype=torch.float32)
+```
+
+The native Metal backend supplies Thomas and PCR cable solvers and scalar,
+block, and packed DHS tree solvers. It requires macOS 14 or newer, an
+available MPS device, and the `solvers` extra. Cable solvers can fall back to
+PyTorch on MPS. DHS on MPS requires the native backend. For scalar cables on
+MPS, choose Thomas or PCR.
+
+Check whether PyTorch can use MPS and whether the native Metal solver backend
+is available.
 
 ```sh
 python -c "import torch; print('PyTorch MPS:', torch.backends.mps.is_available())"

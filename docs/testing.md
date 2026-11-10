@@ -130,7 +130,7 @@ python -c "import torch, triton; assert torch.cuda.is_available()"
 python -m pytest tests -W error -m cuda
 ```
 
-See the [GPU deployment guide](gpu-deployment.md) for environment diagnostics
+See the [CUDA deployment guide](gpu-deployment.md) for environment diagnostics
 and the optional native-extension probe.
 
 ### Check native CUDA kernels with Compute Sanitizer

@@ -9,8 +9,10 @@
 [![Code style: Ruff](https://img.shields.io/badge/code%20style-Ruff-D7FF64.svg?logo=ruff&logoColor=261230)](https://docs.astral.sh/ruff/)
 
 Dendra is a differentiable biophysical neuron and network simulator built on
-PyTorch. It supports CPU and GPU execution, extracellular fields, event-based
-networks, and macroscopic descriptors for gradient-based model training.
+PyTorch. Run simulations on CPUs, GPUs (tested with NVIDIA CUDA), or Apple
+Silicon (Metal via PyTorch MPS). Dendra supports extracellular fields,
+event-based networks, and macroscopic descriptors for gradient-based model
+training.
 
 ## Documentation
 
@@ -45,10 +47,9 @@ python -m pip install dendra
 ```
 
 The base package includes a PyTorch CPU solver for unbranched cables and
-Dendra's CUDA/Triton solvers. To select a particular CPU, CUDA, or ROCm build,
-install PyTorch first using its
-[installation selector](https://pytorch.org/get-started/locally/), then install
-Dendra.
+Dendra's Triton GPU solvers. To select a particular build, install PyTorch
+using its [installation selector](https://pytorch.org/get-started/locally/)
+before installing Dendra. AMD GPU compatibility with ROCm is unverified.
 
 For interactive Matplotlib figures in Jupyter, install the Jupyter extra:
 
@@ -65,10 +66,10 @@ python -m dendra doctor
 
 The [installation guide](https://wmglab-duke.github.io/dendra/installation.html)
 explains solver-wheel support, source installations, upgrades, and Jupyter
-setup. For accelerator checks, see
+setup. See [Apple Silicon setup](https://wmglab-duke.github.io/dendra/installation.html#apple-silicon)
+for MPS device selection and Metal solver checks, or
 [CUDA deployment](https://wmglab-duke.github.io/dendra/gpu-deployment.html)
-or the
-[native MPS solver requirements](https://wmglab-duke.github.io/dendra/installation.html#native-cpu-and-mps-implicit-solvers).
+for NVIDIA runtime checks.
 
 ## Development
 

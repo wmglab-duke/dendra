@@ -5,6 +5,10 @@ Dendra simulates biophysical neurons and networks in PyTorch. Apply
 intracellular currents or extracellular fields, record responses, and fit
 parameters to voltage traces or physiological measurements.
 
+Run simulations on CPUs, GPUs (tested with NVIDIA CUDA), or Apple Silicon
+(Metal via PyTorch MPS). See :ref:`hardware-support` for device selection and
+solver setup.
+
 Use built-in Hodgkin–Huxley and passive mechanisms or define your own
 mechanisms and material processes. Connect cells with delayed events or
 continuous signals. When training event-driven networks, you can fit connection

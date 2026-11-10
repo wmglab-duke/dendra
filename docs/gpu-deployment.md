@@ -1,5 +1,5 @@
 (gpu-deployment)=
-# GPU deployment
+# CUDA deployment
 
 The Dendra package includes its CUDA/Triton solvers. CUDA availability
 depends on your PyTorch build and NVIDIA driver. If you need a particular
@@ -7,7 +7,7 @@ CUDA build of PyTorch, install it before Dendra as described in
 {ref}`choose-pytorch-build`.
 
 For Apple Silicon, see the {ref}`native MPS solver requirements and checks
-<native-implicit-solvers>` in the installation guide.
+<apple-silicon>` in the installation guide.
 
 ## Inspect the deployment
 
