@@ -9,6 +9,8 @@ from typing import NamedTuple
 
 import torch
 
+from dendra.models.core import _time_tensor_to
+
 
 class NetStimState(NamedTuple):
     next_stoch_time: torch.Tensor
@@ -38,7 +40,17 @@ def broadcast_netstim_time(t, shape, *, device, dtype):
     batch item, including when its shape could also broadcast over generators.
     Hidden vmap dimensions remain hidden from this shape policy.
     """
-    t = torch.as_tensor(t, device=device, dtype=dtype)
+    if (
+        isinstance(t, torch.Tensor)
+        and t.dtype == torch.float64
+        and t.device.type == "cpu"
+        and device is not None
+        and torch.device(device).type == "mps"
+    ):
+        # Inductor can transfer a combined cast and copy before narrowing.
+        t = _time_tensor_to(t, device=device, dtype=dtype)
+    else:
+        t = torch.as_tensor(t, device=device, dtype=dtype)
     if tuple(t.shape) == shape:
         return t
     if len(shape) > 1 and tuple(t.shape) == shape[:-1]:

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 import dendra as dn
+from dendra.models.mod import expsyn, pas
 from tests.func.test_inputs_backends import _snapshot
 from tests.func.test_lowering_api import DT, G, _network
 from tests.func.test_runtime_extra_backends import _environment
@@ -155,6 +156,47 @@ def _training_case(device, backend):
         assert report.strategy == "compiled_scan" and report.callbacks
         torch.testing.assert_close(functional.extract(), original)
         torch.testing.assert_close(inputs, frozen_inputs)
+
+
+@pytest.mark.mps
+@pytest.mark.slow
+@pytest.mark.parametrize("execution", ("scan", "while"))
+def test_mps_inductor_netstim_drives_expsyn(execution, mps_device):
+    dt, steps = 0.125, 8
+    with _environment(mps_device):
+        cell = dn.SingleCompartment(N=1, C=1, v_init=-65.0)
+        cell.insert(pas, g=0.001, e=-65.0)
+        cell.insert(expsyn.rename("exc"), e=0.0, tau=2.0)
+        stimulus = dn.NetStim(
+            N=1, start=dt, interval=2 * dt, noise=0, max_spikes=2, seed=0
+        )
+        network = dn.Network({"cell": cell}, netstim=stimulus).eval()
+        network.connect_one_to_one(
+            stimulus[0], cell[0, 0], cell.mech.exc, weight=0.01, delay=dt
+        )
+        network.initialize(dt)
+        program = dn.compile(
+            network, dt=dt, steps=steps, execution=execution, backend="inductor"
+        )
+        with torch.inference_mode():
+            state, _ = program()
+            initial_voltage = cell.v.clone()
+            network.run(steps=steps)
+
+        voltage = state["populations"]["cell"]["integrator"]["v"]
+        assert voltage.device.type == mps_device and voltage.dtype is torch.float32
+        assert not torch.equal(cell.v, initial_voltage)
+        torch.testing.assert_close(voltage, cell.v, rtol=3e-5, atol=2e-5)
+        assert stimulus.spike_counts.item() == 2
+        torch.testing.assert_close(
+            state["netstim"]["spike_counts"], stimulus.spike_counts
+        )
+        torch.testing.assert_close(state["clock"]["t"], network.t)
+        assert state["clock"]["t"].device.type == "cpu"
+        assert state["clock"]["t"].dtype is torch.float64
+        assert program.execution_report().strategy == (
+            "compiled_scan" if execution == "scan" else "compiled_while_loop"
+        )
 
 
 @pytest.mark.cpu
