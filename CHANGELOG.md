@@ -1,3 +1,8 @@
+## v0.28.2 (2026-11-10)
+
+- Fix an Apple Silicon (MPS) Inductor error when running compiled Networks
+  with NetStim event sources in scan or while mode.
+
 ## v0.28.1 (2026-11-07)
 
 - Fix functional lowering, compiled connection parameter checks, and native
