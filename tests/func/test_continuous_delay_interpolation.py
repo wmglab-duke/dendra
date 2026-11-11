@@ -140,6 +140,44 @@ def test_linear_integer_delay_preserves_zero_delivery_presence_in_eval():
     assert connection.delivery_mask[:, 0].nonzero().flatten().tolist() == [2]
 
 
+def test_continuous_delay_learns_fractional_target_from_integer_initialization():
+    initial_delay = 2 * DT
+    target_fraction = 0.5
+    target_delay = initial_delay + target_fraction * DT
+    delay = Bounded(initial_delay, requires_grad=True)
+    network = _network(delay)
+    connection = next(iter(network.continuous_synapses.values()))
+    assert connection.delay_ms().item() == initial_delay
+
+    drives = torch.tensor([1.0, 0.0, 0.0, 0.0], dtype=DTYPE).reshape(-1, 1, 1)
+    impulse = WEIGHT * drives[0].tanh()
+    optimizer = torch.optim.SGD([delay.rho], lr=0.75 * DT**2)
+
+    def late_fraction():
+        network.initialize(DT)
+        for drive in drives:
+            network.pre.mech.drive.gate = drive
+            network.step()
+        return network.post.mech.graded_syn.g_pre / impulse
+
+    for iteration in range(10):
+        optimizer.zero_grad()
+        fraction = late_fraction()
+        # The second sample is zero but marks this slot present via its lower
+        # tap. Only the first sample's upper tap can provide a delay gradient.
+        if iteration == 0:
+            assert fraction.item() == 0.0
+        loss = 0.5 * (fraction - target_fraction).square().sum()
+        loss.backward()
+        optimizer.step()
+        if iteration == 0:
+            assert initial_delay < delay.rho.item() < target_delay
+
+    assert delay.rho.item() == pytest.approx(target_delay, abs=1e-7)
+    with torch.no_grad():
+        assert late_fraction().item() == pytest.approx(target_fraction, abs=1e-6)
+
+
 def test_roundoff_correction_preserves_right_hand_delay_gradient():
     dt = torch.tensor(DT, dtype=DTYPE)
     knot = 2 * dt
