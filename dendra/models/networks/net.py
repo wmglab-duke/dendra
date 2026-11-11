@@ -5,6 +5,8 @@ import math
 import os
 from collections.abc import Mapping
 from contextlib import nullcontext
+from inspect import signature
+from itertools import chain
 from typing import Dict, Literal, NamedTuple, Optional
 
 import torch
@@ -1399,6 +1401,8 @@ class Network(RNGMixin):
         self.continuous_targets = {}
         self.dt = None
         self.built = False
+        self._built_max_delay_ms = None
+        self._synaptic_diff_configs = {}
         self._mode_requires_initialize = False
         self._detached_materializations_pending = False
 
@@ -1633,6 +1637,15 @@ class Network(RNGMixin):
     def __setstate__(self, state):
         """Restore owner references after the complete module graph is copied."""
         super().__setstate__(state)
+        self.__dict__.setdefault("_synaptic_diff_configs", {})
+        if "_built_max_delay_ms" not in state:
+            connections = chain(
+                self.synapses.values(), self.continuous_synapses.values()
+            )
+            connection = next(connections, None)
+            self._built_max_delay_ms = (
+                None if connection is None else connection.max_delay
+            )
         self._bind_runtime_clocks()
 
     def _bind_runtime_clocks(self):
@@ -2066,6 +2079,9 @@ class Network(RNGMixin):
                     "recreate those connections first."
                 )
 
+        event_config = self._synaptic_diff_configs.get("event")
+        if event_config is not None:
+            self._apply_netstim_diff_config(netstim, event_config)
         netstim.name = "netstim"
         if self.dt is not None and hasattr(netstim, "set_dt"):
             netstim.set_dt(float(self.dt))
@@ -3623,6 +3639,52 @@ class Network(RNGMixin):
         self._continuous_synapse_step_items = schedule.continuous_synapses
         self._continuous_target_step_items = schedule.continuous_targets
 
+    def _resolve_build_delay_cap(self, dt, max_delay_ms, force_rebuild):
+        if (
+            self.built
+            and max_delay_ms is not None
+            and not force_rebuild
+            and max_delay_ms != self._built_max_delay_ms
+        ):
+            raise ValueError(
+                f"Network was built with max_delay_ms={self._built_max_delay_ms!r}. "
+                f"Pass force_rebuild=True to use max_delay_ms={max_delay_ms!r}."
+            )
+        continuous_config = self._synaptic_diff_configs.get("continuous", {})
+        if continuous_config.get("diff_delays", False) and self.continuous_synapse_spec:
+            if max_delay_ms is None:
+                max_delay_ms = self._built_max_delay_ms
+            if ContinuousCon._validate_linear_delay_cap(max_delay_ms) < dt:
+                raise ValueError(
+                    "Differentiable continuous delays require max_delay_ms >= dt."
+                )
+        return max_delay_ms
+
+    def _replace_built_connections(self, dt, max_delay_ms):
+        """Construct and configure replacement projections before retiring live ones."""
+        synapses, continuous = self.synapses, self.continuous_synapses
+        targets = self.continuous_targets
+        previous_dt, was_built = self.dt, self.built
+        self.dt, self.built = dt, False
+        self.synapses = torch.nn.ModuleDict()
+        self.continuous_synapses = torch.nn.ModuleDict()
+        self.continuous_targets = {}
+        try:
+            self.build_synapses(dt, max_delay_ms=max_delay_ms)
+            self.build_continuous_synapses(dt, max_delay_ms=max_delay_ms)
+            for kind, config in self._synaptic_diff_configs.items():
+                self._apply_connection_diff_config(kind, config)
+        except Exception:
+            self.synapses, self.continuous_synapses = synapses, continuous
+            self.continuous_targets = targets
+            self.dt, self.built = previous_dt, was_built
+            raise
+        synapses.clear()
+        synapses.update(self.synapses)
+        continuous.clear()
+        continuous.update(self.continuous_synapses)
+        self.synapses, self.continuous_synapses = synapses, continuous
+
     def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """
         Build synaptic modules for the current wiring spec.
@@ -3630,9 +3692,13 @@ class Network(RNGMixin):
         Parameters
         ----------
         dt : float
-            Simulation timestep (ms) used for NetCon buffers.
+            Simulation timestep (ms) used for connection buffers.
         max_delay_ms : float, optional
-            Maximum delay allowed for NetCons. Default is None (no cap).
+            Maximum delay allowed for connections. Default is None (no cap).
+            Specifying a different cap on a built Network requires
+            `force_rebuild=True`.
+            A rebuild with continuous delay interpolation enabled reuses the
+            previous cap if omitted.
         force_rebuild : bool, optional
             If True, rebuild even if dt has not changed. Default is False.
 
@@ -3642,22 +3708,19 @@ class Network(RNGMixin):
             Self, for chaining.
         """
         dt_f = _validate_time_scalar(dt, name="dt", positive=True)
+        max_delay_ms = self._resolve_build_delay_cap(dt_f, max_delay_ms, force_rebuild)
         self._refresh_compile_config_from_ctx()
         current_sig = self._device_signature()
         devices_changed = current_sig != getattr(self, "_device_sig", None)
         dt_changed = self.dt is not None and self.dt != dt_f
 
         if not self.built or self.dt != dt_f or force_rebuild or devices_changed:
-            self.dt = dt_f
+            self._replace_built_connections(dt_f, max_delay_ms)
             if dt_changed:
                 # A step count anchored to the previous dt cannot be reused with
                 # a new timestep. Preserve the current absolute time and re-anchor.
                 self._reset_runtime_clock(float(self.t))
-            self.synapses.clear()
-            self.continuous_synapses.clear()
-            self.continuous_targets = {}
-            self.build_synapses(dt_f, max_delay_ms=max_delay_ms)
-            self.build_continuous_synapses(dt_f, max_delay_ms=max_delay_ms)
+            self._built_max_delay_ms = max_delay_ms
             self.built = True
             self._device_sig = self._device_signature()
         self._refresh_step_schedule()
@@ -3697,8 +3760,11 @@ class Network(RNGMixin):
             booleans and non-finite values are rejected. Default is 0.0.
         max_delay_ms : float, optional
             Maximum allowed synaptic delay. Default is None.
+            Specifying a different cap on a built Network requires
+            `force_rebuild=True`. A rebuild with continuous delay interpolation
+            enabled reuses the previous cap if omitted.
         force_rebuild : bool, optional
-            If True, rebuild NetCons even if already built. Default is False.
+            If True, rebuild connections even if already built. Default is False.
         draws : dendra.func.InitializationDraws, optional
             Replay explicit Population, connection and NetStim initialization
             draws without automatic sampling. The packet's RNG boundaries
@@ -3710,6 +3776,8 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
+        dt_f = _validate_time_scalar(dt, name="dt", positive=True)
+        max_delay_ms = self._resolve_build_delay_cap(dt_f, max_delay_ms, force_rebuild)
         if draws is not None:
             from dendra.func._native_initialization_draws import initialize_native
 
@@ -3717,7 +3785,7 @@ class Network(RNGMixin):
                 self,
                 draws=draws,
                 options={
-                    "dt": dt,
+                    "dt": dt_f,
                     "reinit_weights": reinit_weights,
                     "reinit_delays": reinit_delays,
                     "t": t,
@@ -3725,7 +3793,6 @@ class Network(RNGMixin):
                     "force_rebuild": force_rebuild,
                 },
             )
-        dt_f = _validate_time_scalar(dt, name="dt", positive=True)
         t_f = _validate_time_scalar(t, name="t", positive=None)
         self._refresh_compile_config_from_ctx()
 
@@ -5066,6 +5133,10 @@ class Network(RNGMixin):
             netcon_delay_backend=self.netcon_delay_backend,
             netcon_train_backend=self.netcon_train_backend,
         )
+        new_net._built_max_delay_ms = self._built_max_delay_ms
+        new_net._synaptic_diff_configs = {
+            kind: config.copy() for kind, config in self._synaptic_diff_configs.items()
+        }
         target_slot_mappings = {}
 
         def remapped_endpoint(population_name):
@@ -5343,29 +5414,68 @@ class Network(RNGMixin):
         if syn_cache is not None:
             self._syn_cache = syn_cache
 
-    def set_synaptic_diff_config(self, **kwargs):
-        """Configure differentiation for existing event connections and NetStim schedules.
+    def _apply_connection_diff_config(self, kind, config):
+        if kind == "continuous":
+            for syn in self.continuous_synapses.values():
+                syn._validate_diff_config(**config)
+            for syn in self.continuous_synapses.values():
+                syn.set_diff_config(**config)
+        else:
+            for syn in self.synapses.values():
+                syn.set_diff_config(**config)
+
+    @staticmethod
+    def _apply_netstim_diff_config(netstim, config):
+        if netstim is not None and hasattr(netstim, "set_diff_config"):
+            netstim.set_diff_config(
+                diff_scheduled_times=config.get("diff_scheduled_times", True),
+                sched_width=config.get("sched_width", 1.0),
+            )
+
+    def set_synaptic_diff_config(
+        self, *, kind: Literal["event", "continuous"] = "event", **kwargs
+    ):
+        """Configure differentiation for event or continuous connections.
 
         Parameters
         ----------
+        kind : {"event", "continuous"}, optional
+            Select event connections and NetStim schedules (default), or
+            continuous connections. Supply a finite `max_delay_ms` when
+            building or initializing with continuous delay interpolation.
         **kwargs
-            Keyword arguments forwarded to :meth:`NetCon.set_diff_config`. Only
-            ``diff_scheduled_times`` and ``sched_width`` are forwarded to an attached
-            NetStim; omitted values for those controls use True and 1.0 respectively.
+            Arguments forwarded to :meth:`NetCon.set_diff_config` or
+            :meth:`ContinuousCon.set_diff_config`. In event scope, an attached
+            NetStim receives ``diff_scheduled_times`` and ``sched_width``, which
+            default to True and 1.0 respectively.
 
         Notes
         -----
+        Settings apply immediately to built connections and are retained for
+        future builds. Configure before initialization to use these settings
+        when restoring a steady-state cache.
+
         This changes connection differentiation controls, not the Network's
         training/evaluation mode.
         """
-        for syn in self.synapses.values():
-            syn.set_diff_config(**kwargs)
-        if self.netstim is not None and hasattr(self.netstim, "set_diff_config"):
-            # Propagate only the scheduled-time pieces NetStim understands.
-            self.netstim.set_diff_config(
-                diff_scheduled_times=kwargs.get("diff_scheduled_times", True),
-                sched_width=kwargs.get("sched_width", 1.0),
-            )
+        if kind not in ("event", "continuous"):
+            raise ValueError("kind must be 'event' or 'continuous'.")
+        if kind == "continuous":
+            ContinuousCon._validate_diff_options(**kwargs)
+        else:
+            signature(NetCon.set_diff_config).bind(None, **kwargs)
+        if self.built:
+            self._apply_connection_diff_config(kind, kwargs)
+        if kind == "event":
+            self._apply_netstim_diff_config(self.netstim, kwargs)
+            previous = self._synaptic_diff_configs.get(kind, {})
+            # NetCon retains its backend override when the setter omits it.
+            if (
+                kwargs.get("train_delay_backend") is None
+                and "train_delay_backend" in previous
+            ):
+                kwargs["train_delay_backend"] = previous["train_delay_backend"]
+        self._synaptic_diff_configs[kind] = kwargs
 
     # load utilities
     def _rebuild_loaded_population_workspaces(self, readiness):

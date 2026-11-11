@@ -1,4 +1,5 @@
 import hashlib
+import math
 import warnings
 from numbers import Real
 from typing import Any, Dict, Literal
@@ -33,8 +34,10 @@ from ._continuous_cache import (
 from ._continuous_delivery import (
     continuous_clear,
     continuous_counters,
+    continuous_delay_taps,
     continuous_due,
     continuous_enqueue,
+    continuous_enqueue_linear,
     continuous_project,
     gather_continuous_source,
 )
@@ -414,16 +417,20 @@ class ContinuousCon(Referency):
     """Continuous analog projection between a presynaptic variable and a postsynaptic mechanism.
 
     ``ContinuousCon`` is the analog counterpart of :class:`NetCon`: it gathers a
-    presynaptic variable, applies optional weighting and integer delay, scatters
-    the resulting values into the target synapse's local shape, and calls
+    presynaptic variable, applies optional weighting and delay, scatters the
+    resulting values into the target synapse's local shape, and calls
     ``syn.continuous_receive(...)``.  It performs no thresholding and no event
     detection.
 
-    The hot path is specialized at construction / delay-rebuild time.  Static
+    Delays are rounded to integer steps by default. Use :meth:`set_diff_config`
+    to opt into differentiable two-tap interpolation. The integer hot path is
+    specialized at construction / delay-rebuild time. Static
     delay masks, selected post indices, flat delay-buffer offsets, and dispatch
     mode are precomputed once so ``advance()`` does not repeatedly build masks or
     check for empty delayed subsets.
     """
+
+    _diff_delays = False
 
     def __init__(
         self,
@@ -618,12 +625,48 @@ class ContinuousCon(Referency):
     # Delay metadata / specialization
     # ------------------------------------------------------------------
 
-    def _compute_max_delay_steps(self):
+    def _compute_max_delay_steps(self, *, diff_delays=None):
+        if diff_delays is None:
+            diff_delays = self._diff_delays
+        if diff_delays:
+            return self._linear_delay_depth()
         if self.max_delay is not None:
             return max(1, int(self.max_delay / self.dt.item()) + 1)
         if self.delay_steps.numel() == 0:
             return 1
         return max(1, int(self.delay_steps.max().item()) + 1)
+
+    @staticmethod
+    def _validate_linear_delay_cap(limit):
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, Real)
+            or not math.isfinite(limit)
+        ):
+            raise ValueError(
+                "Differentiable continuous delays require a finite max_delay_ms."
+            )
+        return float(limit)
+
+    def _linear_delay_depth(self):
+        limit = self._validate_linear_delay_cap(self.max_delay)
+        cap = self.dt.new_tensor([limit])
+        max_steps = (cap / self.dt).item()
+        if not math.isfinite(max_steps) or max_steps < 1:
+            raise ValueError(
+                "Differentiable continuous delays require max_delay_ms >= dt."
+            )
+        # Use the runtime rounding at the cap and reserve the upper tap.
+        lower, _ = self._linear_delay_taps(cap)
+        return int(lower.item()) + 2
+
+    def _linear_delay_taps(self, delays=None):
+        return continuous_delay_taps(
+            self.delay_ms() if delays is None else delays,
+            self.dt,
+            max_delay=self.max_delay,
+            dtype=self.dtype,
+        )
 
     def _rebuild_delay_metadata(self):
         """Precompute masks/indices/offsets used by the continuous hot path."""
@@ -732,6 +775,8 @@ class ContinuousCon(Referency):
     def _configure_advance_impl(self):
         if not getattr(self, "_has_connections", False):
             self.advance = self._advance_empty
+        elif self._diff_delays:
+            self.advance = self._advance_interpolated
         elif self._all_zero_delay:
             self.advance = self._advance_all_immediate
         elif self._all_nonzero_delay:
@@ -745,12 +790,16 @@ class ContinuousCon(Referency):
             else:
                 self.advance = self._advance_mixed
 
-    def _rebuild_delay_buffers(self):
+    def _rebuild_delay_buffers(self, *, depth=None):
         with torch.no_grad():
             delay_values = self.delay_ms()
+            if depth is None and self._diff_delays:
+                self._linear_delay_taps(delay_values)
             delay_steps = (delay_values / self.dt.to(self.dtype)).round().long()
             self.delay_steps = delay_steps.flatten().to(self.device)
-            self.max_delay_steps = self._compute_max_delay_steps()
+            self.max_delay_steps = (
+                self._compute_max_delay_steps() if depth is None else depth
+            )
             self._delivery_numel = int(self.max_delay_steps * self._syn_numel)
             self.delivery_buffer = torch.zeros(
                 (self.max_delay_steps, self._syn_numel),
@@ -765,6 +814,45 @@ class ContinuousCon(Referency):
             self._rebuild_delay_metadata()
             self._align_buffer_devices()
             self._configure_advance_impl()
+
+    @staticmethod
+    def _validate_diff_options(diff_delays=False, taps=2):
+        if not isinstance(diff_delays, bool):
+            raise TypeError("ContinuousCon diff_delays must be a bool.")
+        if taps != 2:
+            raise ValueError("ContinuousCon supports only two-tap delay interpolation.")
+
+    def _validate_diff_config(self, diff_delays=False, taps=2):
+        self._validate_diff_options(diff_delays, taps)
+        depth = self._compute_max_delay_steps(diff_delays=diff_delays)
+        if diff_delays:
+            with torch.no_grad():
+                self._linear_delay_taps()
+        if (diff_delays != self._diff_delays or depth != self.max_delay_steps) and bool(
+            self.delivery_mask.any()
+        ):
+            raise RuntimeError(
+                "Cannot change continuous delay interpolation while deliveries are "
+                "pending. "
+                "Initialize the connection before changing its delay configuration."
+            )
+        return depth
+
+    def set_diff_config(self, diff_delays: bool = False, taps: int = 2):
+        """Configure the delay interpolation used in training and evaluation.
+
+        With ``diff_delays=True``, each finite delay must be between one
+        timestep and ``max_delay_ms``. Two-tap linear interpolation schedules
+        each weighted sample into its adjacent timestep slots. Delays use
+        integer routing by default. Change modes before any deliveries are
+        pending.
+        """
+        depth = self._validate_diff_config(diff_delays, taps)
+        if diff_delays != self._diff_delays or depth != self.max_delay_steps:
+            self._diff_delays = diff_delays
+            self._rebuild_delay_buffers(depth=depth)
+            self.current_time_step = self.current_time_step.remainder(depth)
+            self._resize_state_cache_history(depth)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -815,6 +903,9 @@ class ContinuousCon(Referency):
                 raise ValueError(
                     f"ContinuousCon {name} must preserve the initialized connection shape."
                 )
+        if self._diff_delays:
+            with torch.no_grad():
+                self._linear_delay_taps(delays)
 
     def initialize(
         self, reinit_weights=True, reinit_delays=True, clear_deliveries=True
@@ -827,6 +918,9 @@ class ContinuousCon(Referency):
         self.delay_ms.init(reinit=reinit_delays)
         if reinit_delays:
             self._rebuild_delay_buffers()
+        elif self._diff_delays:
+            with torch.no_grad():
+                self._linear_delay_taps()
         if hasattr(self, "t"):
             self.global_step.copy_(
                 continuous_initial_step(
@@ -867,6 +961,7 @@ class ContinuousCon(Referency):
             )
         else:
             self.state_cache_pre_value_history.zero_()
+        self._state_cache_uses_delivery_depth = horizon_steps is None
         self._state_cache_recording_enabled = True
         return self
 
@@ -879,6 +974,23 @@ class ContinuousCon(Referency):
             )
         return self
 
+    def _resize_state_cache_history(self, depth):
+        if not (
+            getattr(self, "_state_cache_recording_enabled", False)
+            and getattr(self, "_state_cache_uses_delivery_depth", False)
+        ):
+            return
+        history = self.state_cache_pre_value_history
+        previous_depth = history.shape[0]
+        if previous_depth == depth:
+            return
+        step = _cache_current_slot(self.global_step)
+        ages = torch.arange(1, min(previous_depth, depth) + 1, device=history.device)
+        recent = history.index_select(0, (step - ages).remainder(previous_depth))
+        resized = history.new_zeros((depth, self._n_conn))
+        resized.index_copy_(0, (step - ages).remainder(depth), recent)
+        self._set_buffer("state_cache_pre_value_history", resized)
+
     def _record_pre_value_for_state_cache(self, x: torch.Tensor):
         if not getattr(self, "_state_cache_recording_enabled", False):
             return
@@ -887,7 +999,7 @@ class ContinuousCon(Referency):
             or self.state_cache_pre_value_history.numel() == 0
         ):
             return
-        slot = int(self.current_time_step.detach().cpu().reshape(-1)[0].item())
+        slot = _cache_current_slot(self.global_step)
         slot %= int(self.state_cache_pre_value_history.shape[0])
         self.state_cache_pre_value_history[slot].copy_(
             x.detach().to(self.device, self.dtype)
@@ -902,14 +1014,26 @@ class ContinuousCon(Referency):
             self.weight(),
             depth=int(self.max_delay_steps),
             width=self._syn_numel,
-            delay_steps=self.delay_steps,
-            post_idx=self.post_idx,
+            routes=self._continuous_cache_routes(),
             transform=self.transform
             if apply_transform and self._has_transform
             else None,
         )
         self.delivery_buffer.copy_(queue)
         self.delivery_mask.copy_(presence)
+
+    def _continuous_cache_routes(self):
+        delay_steps, fraction = self.delay_steps, None
+        if self._diff_delays:
+            with torch.no_grad():
+                delay_steps, fraction = self._linear_delay_taps()
+        return continuous_cache_routes(
+            delay_steps,
+            self.post_idx,
+            depth=int(self.max_delay_steps),
+            width=self._syn_numel,
+            fraction=fraction,
+        )
 
     def n_connections(self):
         """Return the number of directed continuous connections as a Python integer."""
@@ -935,7 +1059,8 @@ class ContinuousCon(Referency):
             and getattr(self, "_state_cache_recording_enabled", False)
         ):
             cache["pre_value_history"] = _ring_rows_to_age_rows(
-                self.state_cache_pre_value_history.detach(), cur_slot
+                self.state_cache_pre_value_history.detach(),
+                _cache_current_slot(self.global_step),
             )
             cache["history_layout"] = "age"
             cache["value_layout"] = "raw"
@@ -955,7 +1080,7 @@ class ContinuousCon(Referency):
     def initialize_from_state_cache(
         self, state_cache, *, dt=None, rebuild_delays: bool = True
     ):
-        """Restore detached cached traffic using current weights and integer delays.
+        """Restore detached cached traffic using current weights and delays.
 
         Network initialization has already refreshed expanded weights and delay
         storage. Direct callers retain the default delay rebuild policy.
@@ -976,19 +1101,13 @@ class ContinuousCon(Referency):
             depth=int(self.max_delay_steps),
             width=self._syn_numel,
         )
-        routes = continuous_cache_routes(
-            self.delay_steps,
-            self.post_idx,
-            depth=int(self.max_delay_steps),
-            width=self._syn_numel,
-        )
         state = restore_continuous_cache(
             self.state_dict_for_checkpoint(),
             cache,
             self.weight(),
             dt=self.dt,
             t=self.t if hasattr(self, "t") else 0.0,
-            routes=routes,
+            routes=self._continuous_cache_routes(),
             transform=self.transform if self._has_transform else None,
         )
         for name, value in state.items():
@@ -1077,13 +1196,17 @@ class ContinuousCon(Referency):
 
     def checkpoint_topology_signature(self):
         """Return immutable structure needed to validate fresh-object replay."""
-        return {
+        signature = {
             "kind": "continuous",
             "n_connections": int(self._n_conn),
             "synapse_numel": int(self._syn_numel),
             "max_delay_steps": int(self.max_delay_steps),
             "topology": _topology_tensor_digest(self.pre_idx, self.post_idx),
         }
+        if self._diff_delays:
+            signature["diff_delays"] = True
+            signature["max_delay_ms"] = float(self.max_delay)
+        return signature
 
     # ------------------------------------------------------------------
     # Hot-path helpers
@@ -1215,6 +1338,25 @@ class ContinuousCon(Referency):
         self._deliver(delayed_delivery, delayed_mask)
         weighted = self._weighted_pre_value()
         self._schedule_all_delayed_mixed(cur_idx, weighted)
+        self._advance_counters()
+
+    def _advance_interpolated(self):
+        delay_steps, fraction = self._linear_delay_taps()
+        cur_idx, delayed_delivery, delayed_mask = self._read_and_clear_current_row()
+        self._deliver(delayed_delivery, delayed_mask)
+        weighted = self._weighted_pre_value()
+        self.delivery_buffer, self.delivery_mask = continuous_enqueue_linear(
+            self.delivery_buffer,
+            self.delivery_mask,
+            cur_idx,
+            weighted,
+            post_idx=self.post_idx,
+            delay_steps=delay_steps,
+            fraction=fraction,
+            depth=self.max_delay_steps,
+            width=self._syn_numel,
+            _inplace=True,
+        )
         self._advance_counters()
 
     def _advance_mixed_uniform(self):
@@ -3685,7 +3827,7 @@ class NetCon(Referency):
     def set_diff_config(
         self,
         diff_weights: bool = True,
-        diff_delays: bool = True,
+        diff_delays: bool = False,
         diff_spiking: bool = True,
         taps: int = 2,
         sigma: float = 0.35,  # used for taps=3 (in steps),
@@ -3709,11 +3851,11 @@ class NetCon(Referency):
             is detached before being used to compute deliveries, freezing its
             contribution during training.
         diff_delays : bool, optional
-            If True (default), delays are interpreted as continuous values in
+            If True, delays are interpreted as continuous values in
             milliseconds and used with a soft, differentiable interpolation
             scheme over time steps (2-tap linear or 3-tap Gaussian, see
-            ``taps`` and ``sigma``). If False, delays are rounded to integer
-            steps and used as hard delay lines.
+            ``taps`` and ``sigma``). If False (default), delays are rounded to
+            integer steps and used as hard delay lines.
         diff_spiking : bool, optional
             If True (default), pre-synaptic spiking is computed via a surrogate
             gradient function (see :func:`update_active_diff`), allowing

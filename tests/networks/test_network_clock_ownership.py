@@ -259,6 +259,137 @@ def test_copy_reinitialization_uses_own_absolute_clock_and_preserves_source(
     _assert_clocks(copied)
 
 
+@pytest.mark.parametrize("entrypoint", ("build", "initialize"))
+@pytest.mark.parametrize("initial_cap", (None, 4 * DT))
+def test_built_network_requires_forced_rebuild_to_change_max_delay(
+    entrypoint, initial_cap
+):
+    network = _network(initialize=False)
+    network.initialize(DT, max_delay_ms=initial_cap)
+    _schedule(network, 0.0)
+    network.step()
+    before = _clone(network.state_dict_for_checkpoint())
+    old_event = next(iter(network.synapses.values()))
+    old_continuous = next(iter(network.continuous_synapses.values()))
+    reconfigure = getattr(network, entrypoint)
+    new_cap = 6 * DT
+
+    with pytest.raises(ValueError, match="force_rebuild"):
+        reconfigure(DT, max_delay_ms=new_cap)
+    with pytest.raises(ValueError, match="force_rebuild"):
+        reconfigure(2 * DT, max_delay_ms=new_cap)
+
+    _equal(network.state_dict_for_checkpoint(), before)
+    reconfigure(DT)
+    reconfigure(DT, max_delay_ms=initial_cap)
+    assert next(iter(network.synapses.values())) is old_event
+    assert next(iter(network.continuous_synapses.values())) is old_continuous
+    assert old_event.max_delay == old_continuous.max_delay == initial_cap
+
+    reconfigure(DT, max_delay_ms=new_cap, force_rebuild=True)
+
+    event = next(iter(network.synapses.values()))
+    continuous = next(iter(network.continuous_synapses.values()))
+    assert event is not old_event
+    assert continuous is not old_continuous
+    assert event.max_delay == continuous.max_delay == new_cap
+    assert event.max_delay_steps == continuous.max_delay_steps == 7
+
+
+def test_prebuild_synaptic_diff_config_survives_rebuild():
+    network = _network(training=True, initialize=False)
+    network.set_synaptic_diff_config(
+        diff_weights=False,
+        diff_delays=True,
+        diff_spiking=False,
+        diff_scheduled_times=False,
+        sched_width=0.75,
+    )
+    network.set_synaptic_diff_config(kind="continuous", diff_delays=True)
+    assert not network.built
+    assert network.netstim.diff_scheduled_times is False
+    assert network.netstim.sched_width == 0.75
+    replacement = dn.NetStim(N=1, seed=812)
+    network.attach_netstim(replacement, replace=True)
+    assert replacement.diff_scheduled_times is False
+    assert replacement.sched_width == 0.75
+
+    network.initialize(DT, max_delay_ms=6 * DT)
+    old_event = next(iter(network.synapses.values()))
+    old_continuous = next(iter(network.continuous_synapses.values()))
+    assert old_event.train_flags is not None
+    assert old_event.train_flags[:3] == (False, True, False)
+    assert old_event.train_flags[-2:] == (False, 0.75)
+    assert old_continuous._diff_delays
+    network.step()
+
+    network.initialize(DT, force_rebuild=True)
+    event = next(iter(network.synapses.values()))
+    continuous = next(iter(network.continuous_synapses.values()))
+    assert event is not old_event
+    assert continuous is not old_continuous
+    assert event.train_flags == old_event.train_flags
+    assert continuous._diff_delays
+    assert network.netstim.diff_scheduled_times is False
+    assert network.netstim.sched_width == 0.75
+    network.step()
+
+
+def test_failed_continuous_delay_rebuild_preserves_live_queues():
+    network = _network(initialize=False)
+    with pytest.raises(ValueError, match="two-tap"):
+        network.set_synaptic_diff_config(kind="continuous", diff_delays=True, taps=3)
+    network.set_synaptic_diff_config(kind="continuous", diff_delays=True)
+    with pytest.raises(ValueError, match="max_delay_ms >= dt"):
+        network.initialize(DT, max_delay_ms=0.5 * DT, t=5.0)
+    assert network.dt is None and network.t.item() == 0.0
+
+    network.initialize(DT, max_delay_ms=6 * DT)
+    network.step()
+    before = _clone(network.state_dict_for_checkpoint())
+    connection = next(iter(network.continuous_synapses.values()))
+    assert connection.delivery_mask.any()
+
+    with pytest.raises(ValueError, match="max_delay_ms"):
+        network.build(DT, max_delay_ms=1.5 * DT, force_rebuild=True)
+
+    assert network.built
+    assert next(iter(network.continuous_synapses.values())) is connection
+    _equal(network.state_dict_for_checkpoint(), before)
+    network.step()
+
+
+def test_continuous_diff_config_can_change_after_wiring_is_invalidated():
+    network = _network(initialize=False)
+    cap = 6 * DT
+    network.initialize(DT, max_delay_ms=cap)
+    network.step()
+    old_continuous = next(iter(network.continuous_synapses.values()))
+    assert old_continuous.delivery_mask.any()
+    cell = network.cell
+    network.connect_continuous_one_to_one(
+        cell[:],
+        cell[:],
+        cell.mech.analog,
+        delay=3 * DT,
+        transform=_release,
+        input="g_pre",
+        allow_autapses=True,
+        allow_multapses=True,
+    )
+    assert not network.built
+
+    network.set_synaptic_diff_config(kind="continuous", diff_delays=True)
+
+    assert not old_continuous._diff_delays
+    assert old_continuous.delivery_mask.any()
+    network.initialize(DT, max_delay_ms=cap)
+    continuous = next(iter(network.continuous_synapses.values()))
+    assert continuous is not old_continuous
+    assert continuous.n_connections() == 2
+    assert continuous._diff_delays
+
+
 def test_copied_network_checkpoint_restores_clock_ownership_and_exact_continuation():
     source, oracle = _network(start=3.25), _network(start=3.25)
     _schedule(source, 3.25)

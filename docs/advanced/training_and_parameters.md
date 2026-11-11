@@ -162,12 +162,27 @@ example.
 Network training uses the model's synaptic differentiation settings. Configure
 `network.set_synaptic_diff_config(...)` before compiling to select weight,
 delay, spike and scheduled-time differentiation. Event detection is hard in the
-forward simulation; enabled surrogate rules define its training gradients.
-Continuous connections accept deterministic functions or modules, including
-trainable transform parameters. Their weights and delays participate in source
-inspection and optimizer selection. Continuous-connection delays are rounded
-to solver steps; event-connection interpolation policies provide differentiable
-fractional-delay behavior.
+forward simulation, with optional surrogate gradients for training.
+
+Set `diff_delays=True` to enable delay interpolation for either connection
+type. Event connections support two-tap linear and three-tap Gaussian-like
+interpolation during training.
+
+Continuous connections support two-tap linear interpolation in training and
+evaluation. Configure the Network before initialization so the same settings
+also apply when restoring a steady-state cache. Pass a finite `max_delay_ms`:
+
+```python
+network.set_synaptic_diff_config(kind="continuous", diff_delays=True, taps=2)
+network.initialize(dt, max_delay_ms=5.0)
+```
+
+Set each continuous `delay=` in milliseconds between `dt` and
+`max_delay_ms`. A trainable source such as
+`Bounded(initial_delay, min_val=dt, max_val=5.0, requires_grad=True)`
+keeps optimizer updates in range. Select its raw parameter with the same
+source inspection and optimizer selection tools as connection weights and
+trainable transforms.
 
 Input current/voltage tapes, waveform parameters and extracellular field tensors
 can also receive gradients. Keep them as differentiable Tensor inputs rather than

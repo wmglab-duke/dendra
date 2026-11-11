@@ -8,6 +8,7 @@ import torch
 
 from ._cache_translation import _round_half_up_time_indices
 from ._connection_initialization import continuous_initial_state
+from ._event_delivery import _enqueue_interpolated_values
 
 
 def _resample_continuous_time_rows(rows, old_dt, new_dt, *, n_limit):
@@ -181,13 +182,22 @@ class _ContinuousCacheRoutes(NamedTuple):
     delay_steps: torch.Tensor
     post_idx: torch.Tensor
     last_age: int
+    fraction: torch.Tensor | None
 
 
-def continuous_cache_routes(delay_steps, post_idx, *, depth, width):
-    """Retain compact frozen topology and a static pending-history bound."""
+def continuous_cache_routes(delay_steps, post_idx, *, depth, width, fraction=None):
+    """Retain routing and a static pending-history bound.
+
+    Fractional routes use validated lower offsets and upper-tap fractions. The
+    allocated depth bounds the replay even when delays are mapped or compiled.
+    """
     del width
+    if fraction is not None:
+        return _ContinuousCacheRoutes(delay_steps, post_idx, int(depth) - 1, fraction)
     last_age = int(delay_steps.detach().max().cpu()) if delay_steps.numel() else 0
-    return _ContinuousCacheRoutes(delay_steps, post_idx, min(int(depth) - 1, last_age))
+    return _ContinuousCacheRoutes(
+        delay_steps, post_idx, min(int(depth) - 1, last_age), None
+    )
 
 
 def continuous_history_delivery(
@@ -209,32 +219,46 @@ def continuous_history_delivery(
             "Cached ContinuousCon pre-value history has incompatible shape: "
             f"{tuple(history.shape)} vs (*, {weights.numel()})."
         )
-    flat = history.new_zeros((depth * width,))
-    presence = torch.zeros((depth * width,), device=history.device, dtype=torch.bool)
+    # Slot zero absorbs inactive taps; real destinations start at one.
+    flat = history.new_zeros((depth * width + 1,))
+    presence = torch.zeros_like(flat, dtype=torch.bool)
     if routes is None:
         routes = continuous_cache_routes(
             delay_steps, post_idx, depth=depth, width=width
         )
     max_age = min(history.shape[0], depth, routes.last_age + 1)
-    for age in range(1, max_age):
-        remaining = routes.delay_steps - age
-        active = remaining >= 0
-        # The leading sentinel absorbs inactive edges. Shift real indices so
-        # out-of-capacity active destinations still fail rather than disappear.
-        destination = torch.where(active, remaining * width + routes.post_idx + 1, 0)
+    if routes.fraction is None:
+        ages = range(1, max_age)
+        taps = ((routes.delay_steps, None),)
+    else:
+        # Match live enqueue order for colliding floating-point contributions.
+        ages = range(max_age - 1, 0, -1)
+        fraction = routes.fraction.detach()
+        taps = ((routes.delay_steps, 1 - fraction), (routes.delay_steps + 1, fraction))
+    for age in ages:
         row = history[age]
         if transform is not None:
             # Apply a memoryless transform to the complete edge row before
             # selecting pending edges, matching ordinary native restoration.
             row = transform(row).detach()
-        values = torch.where(active, row * weights, 0)
-        flat = torch.cat((flat.new_zeros((1,)), flat)).index_add(
-            0, destination, values
-        )[1:]
-        presence = torch.cat((presence.new_zeros((1,)), presence)).scatter_add(
-            0, destination, active
-        )[1:]
-    return flat.reshape(depth, width).detach(), presence.reshape(depth, width)
+        weighted = row * weights
+        for offsets, coefficient in taps:
+            remaining = offsets - age
+            active = remaining >= 0
+            values = weighted
+            if coefficient is not None:
+                active = active & (coefficient > 0)
+                values = values * coefficient
+            destination = torch.where(
+                active, remaining * width + routes.post_idx + 1, 0
+            )
+            values = torch.where(active, values, 0)
+            if coefficient is None:
+                flat = flat.index_add(0, destination, values)
+            else:
+                flat = _enqueue_interpolated_values(flat, destination, values)
+            presence = presence.scatter_add(0, destination, active)
+    return flat[1:].reshape(depth, width).detach(), presence[1:].reshape(depth, width)
 
 
 def restore_continuous_cache(state, cache, weights, *, dt, t, routes, transform=None):

@@ -182,7 +182,6 @@ def _connection_owner(functional, collection, name, plan):
         "_nan_mask",
         "_apply_masking",
         "_diff_spiking",
-        "_diff_delays",
         "_taps",
         "_sigma",
         "_tau",
@@ -191,6 +190,10 @@ def _connection_owner(functional, collection, name, plan):
         "input",
         "reduce",
     )
+    if collection == "synapses":
+        fields += ("_diff_delays",)
+    elif plan._diff_delays:
+        fields += ("_diff_delays", "_max_delay")
     binding = functional._bindings[collection, name]
     return {
         "name": str.__str__(name),

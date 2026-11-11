@@ -196,6 +196,29 @@ def test_partial_concat_reapplies_continuous_connections_and_metadata():
         assert int(connection.post_idx.max()) < connection._syn_numel
 
 
+def test_concat_preserves_synaptic_differentiation_and_continuous_delay_capacity():
+    populations = _populations_with_continuous_synapses()
+    pre, post = populations["a"], populations["b"]
+    post.insert(expsyn, e=0.0, tau=1.0)
+    network = dn.Network(populations)
+    network.connect_one_to_one(pre[:], post[:], post.mech.expsyn, delay=DT)
+    network.connect_continuous_one_to_one(
+        pre[:], post[:], post.mech.concat_graded_b, delay=2.25 * DT
+    )
+    network.set_synaptic_diff_config(diff_weights=False, diff_spiking=False)
+    network.set_synaptic_diff_config(kind="continuous", diff_delays=True)
+    max_delay = 6 * DT
+    network.initialize(DT, max_delay_ms=max_delay)
+
+    concatenated = network.concat(ab=["a", "b"]).initialize(DT)
+    event = next(iter(concatenated.synapses.values()))
+    continuous = next(iter(concatenated.continuous_synapses.values()))
+    assert event.train_flags == next(iter(network.synapses.values())).train_flags
+    assert event.max_delay == continuous.max_delay == max_delay
+    concatenated.step()
+    assert continuous.delivery_mask.any(dim=1).nonzero().flatten().tolist() == [2, 3]
+
+
 def test_mixed_scalar_concat_batch_preserves_shared_event_synapse_slots():
     populations = {
         "single": dn.SingleCompartment(N=1, C=1, dtype=DTYPE),

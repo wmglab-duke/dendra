@@ -14,7 +14,9 @@ DTYPE = torch.float64
 pytestmark = pytest.mark.cpu
 
 
-def _connection(delays=(0.0, 0.1, 0.0, 0.2), *, transform=None, batch=None):
+def _connection(
+    delays=(0.0, 0.1, 0.0, 0.2), *, transform=None, batch=None, max_delay_ms=None
+):
     with dn.ctx(JIT=0, REQUIRE_GRAD=1):
         pre = dn.SingleCompartment(N=2, C=1, dtype=DTYPE)
         post = dn.SingleCompartment(N=2, C=1, dtype=DTYPE)
@@ -32,7 +34,7 @@ def _connection(delays=(0.0, 0.1, 0.0, 0.2), *, transform=None, batch=None):
         if batch is not None:
             net.batch(batch)
         net.train()
-        net.initialize(DT)
+        net.initialize(DT, max_delay_ms=max_delay_ms)
     return net, next(iter(net.continuous_synapses.values()))
 
 
@@ -316,9 +318,23 @@ def test_cold_extraction_and_commit_reject_incompatible_metadata(mutation):
     _close(target.state_dict_for_checkpoint(), before)
 
 
-@pytest.mark.parametrize("hook", ("_pre_value", "get_pre_var"))
-def test_lowering_rejects_custom_source_callbacks_without_invoking_them(hook):
-    _, native = _connection()
+@pytest.mark.parametrize(
+    ("hook", "lowered"),
+    (
+        ("_pre_value", False),
+        ("get_pre_var", False),
+        ("_linear_delay_taps", False),
+        ("_linear_delay_taps", True),
+    ),
+)
+def test_lowering_rejects_custom_source_callbacks_without_invoking_them(hook, lowered):
+    if hook == "_linear_delay_taps":
+        _, native = _connection(delays=(1.25 * DT,) * 4, max_delay_ms=3 * DT)
+        native.set_diff_config(diff_delays=True)
+    else:
+        _, native = _connection()
+    if lowered:
+        plan, tensors = dn.func.make_functional_continuous_con(native)
     calls = []
 
     def forbidden(*args):
@@ -326,8 +342,11 @@ def test_lowering_rejects_custom_source_callbacks_without_invoking_them(hook):
         raise AssertionError("must not evaluate custom source")
 
     setattr(native, hook, forbidden)
-    with pytest.raises(dn.func.FunctionalizationError, match="canonical"):
-        dn.func.make_functional_continuous_con(native)
+    with pytest.raises(dn.func.FunctionalizationError, match="canonical|hooks changed"):
+        if lowered:
+            plan.read_due(tensors.state)
+        else:
+            dn.func.make_functional_continuous_con(native)
     assert not calls
 
 

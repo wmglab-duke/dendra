@@ -1381,7 +1381,12 @@ class FunctionalNetwork:
 
     def _connection_values(self, collection, name, values):
         projection = getattr(self, collection)[name]
-        if collection == "continuous_synapses" or not projection._diff_delays:
+        if collection == "continuous_synapses" and projection._diff_delays:
+            return {
+                **values,
+                "delay_taps": projection._delay_taps(values["delays"]),
+            }
+        if not projection._diff_delays:
             steps = (values["delays"] / projection._dt).round().long()
             if collection == "synapses":
                 steps = steps.clamp_min(1)
@@ -2045,11 +2050,13 @@ class FunctionalNetwork:
                 stimulus,
                 **({"_binding_frame": True} if _binding_frame else {}),
             )
+            connection = prepared["connections"]["continuous_synapses"][name]
             queue, payload, mask = plan._advance_values(
-                prepared["connections"]["continuous_synapses"][name]["weights"],
+                connection["weights"],
                 queue,
                 source,
                 transform_parameters=value["transform_parameters"],
+                delay_taps=connection.get("delay_taps"),
             )
             if plan.has_connections and not plan.receive_before_source:
                 indices = (

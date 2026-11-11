@@ -1061,9 +1061,10 @@ def _initialize_components(
                     t=time,
                 )
             for name, cache in inputs.cache.continuous_synapses.items():
+                values = connections["continuous_synapses"][name]
                 continuous[name] = functional.continuous_synapses[name].restore_cache(
                     {
-                        "weights": connections["continuous_synapses"][name]["weights"],
+                        "weights": values["weights"],
                         "transform_parameters": effective["continuous_synapses"][name][
                             "transform_parameters"
                         ],
@@ -1071,6 +1072,7 @@ def _initialize_components(
                     continuous[name],
                     cache,
                     t=time,
+                    delays=values["delays"],
                 )
         initialized_state = {
             **(

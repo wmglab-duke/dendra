@@ -3,6 +3,17 @@
 Upgrading Dendra
 ================
 
+Connection configuration
+------------------------
+
+Delay interpolation defaults to off for both event and continuous
+connections. If an existing call relied on the event default, pass
+``diff_delays=True`` to ``set_synaptic_diff_config()`` or
+``NetCon.set_diff_config()`` to retain interpolation during training.
+
+To supply a different ``max_delay_ms`` to an already-built Network, pass
+``force_rebuild=True`` to ``build()`` or ``initialize()``.
+
 Dendra 0.28: upgrading from 0.27.x
 ----------------------------------
 

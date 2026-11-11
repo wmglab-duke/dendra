@@ -8,7 +8,17 @@ from torch.utils import _pytree as pytree
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
-from dendra.models.networks._continuous_cache import ContinuousCache
+from dendra.models.mod import graded_syn, pas
+from dendra.models.networks._continuous_cache import (
+    ContinuousCache,
+    continuous_cache_routes,
+    continuous_history_delivery,
+)
+from dendra.models.networks._continuous_delivery import (
+    continuous_clear,
+    continuous_enqueue_linear,
+)
+from dendra.models.parametric import Bounded
 from tests.func.test_continuous_con import _clone
 from tests.func.test_network import _close
 from tests.networks.test_state_cache_translation import (
@@ -140,6 +150,163 @@ def test_continuous_cache_native_and_pure_restoration_match_current_parameters_a
         torch.testing.assert_close(payload, native.syn.g_pre)
         _close(actual, native.state_dict_for_checkpoint())
     _close((cache, tensors.state), frozen)
+
+
+def test_fractional_cache_replays_current_delays_through_upper_tap_capacity():
+    cap = 4.75 * OLD_DT
+    delays = OLD_DT * torch.tensor([2.0, 4.5, 1.5, 3.0], dtype=DTYPE)
+    network, native = _build_continuous_connection(
+        OLD_DT, delays=delays, max_delay_ms=cap, transform=_RowTransform(3.0)
+    )
+    native.set_diff_config(diff_delays=True)
+    native.enable_state_cache_recording()
+    _run_continuous_prefix(network, native)
+    cache = native.state_cache()
+    slot = native.current_time_step.item()
+    expected = native.delivery_buffer.roll(-slot, dims=0)
+    expected_mask = native.delivery_mask.roll(-slot, dims=0)
+    assert expected_mask[-2].any()
+
+    _, connection = _build_continuous_connection(
+        OLD_DT,
+        delays=torch.full_like(delays, 2.5 * OLD_DT),
+        max_delay_ms=cap,
+        transform=_RowTransform(3.0),
+    )
+    connection.set_diff_config(diff_delays=True)
+    plan, tensors = dn.func.make_functional_continuous_con(connection)
+    restore = torch.compile(plan.restore_cache, backend="aot_eager", fullgraph=True)
+    actual = restore(
+        _parameters(tensors),
+        tensors.state,
+        plan.normalize_cache(cache),
+        t=network.t,
+        delays=delays.requires_grad_(),
+    )
+    native.initialize_from_state_cache(cache)
+    _close(actual, native.state_dict_for_checkpoint())
+    torch.testing.assert_close(actual["delivery_buffer"], expected)
+    torch.testing.assert_close(actual["delivery_mask"], expected_mask)
+    assert not any(value.requires_grad for value in actual.values())
+
+
+@pytest.mark.parametrize(
+    ("lower_offsets", "samples", "pending_row"),
+    (
+        ((1, 1, 1), ((1e8, 0.0, 0.0), (-1e8, 2.0, 0.0)), 0),
+        ((2, 1, 2), ((0.0, 0.0, 0.0), (1e8, 2.0, -1e8)), 1),
+    ),
+)
+def test_fractional_cache_preserves_live_accumulation_order(
+    lower_offsets, samples, pending_row
+):
+    depth = 4
+    samples = torch.tensor(samples, dtype=torch.float32)
+    offsets = torch.tensor(lower_offsets)
+    post_idx = torch.zeros_like(offsets)
+    fraction = torch.full_like(samples[0], 0.5)
+    queue = samples.new_zeros((depth, 1))
+    mask = torch.zeros_like(queue, dtype=torch.bool)
+    for index, sample in enumerate(samples):
+        slot = torch.tensor([index])
+        queue, mask = continuous_clear(queue, mask, slot)
+        queue, mask = continuous_enqueue_linear(
+            queue,
+            mask,
+            slot,
+            sample,
+            post_idx=post_idx,
+            delay_steps=offsets,
+            fraction=fraction,
+            depth=depth,
+            width=1,
+        )
+
+    routes = continuous_cache_routes(
+        offsets, post_idx, depth=depth, width=1, fraction=fraction
+    )
+    replayed, presence = continuous_history_delivery(
+        torch.cat((torch.zeros_like(samples[:1]), samples.flip(0))),
+        torch.ones_like(fraction),
+        depth=depth,
+        width=1,
+        routes=routes,
+    )
+    assert replayed[pending_row, 0].item() == 1.0
+    torch.testing.assert_close(replayed, queue.roll(-len(samples), dims=0))
+    torch.testing.assert_close(presence, mask.roll(-len(samples), dims=0))
+
+
+def test_network_initialization_applies_prebuild_interpolation_to_warm_cache():
+    cap = 4.75 * OLD_DT
+    weight = 0.01
+
+    def make_network(delay):
+        pre = dn.SingleCompartment(N=1, C=1)
+        post = dn.SingleCompartment(N=1, C=1)
+        for population in (pre, post):
+            population.insert(pas, g=0.001, e=-65.0)
+        post.insert(graded_syn, e=-10.0)
+        network = dn.Network({"pre": pre, "post": post})
+        network.connect_continuous_one_to_one(
+            pre[:],
+            post[:],
+            post.mech.graded_syn,
+            input="g_pre",
+            weight=weight,
+            delay=delay,
+        )
+        return network.eval()
+
+    warm = make_network(OLD_DT)
+    warm.initialize(OLD_DT, max_delay_ms=cap)
+    warm._enable_synapse_state_cache_recording()
+    with torch.no_grad():
+        for value in (0.1, 0.2, 0.3, 0.4):
+            warm.pre.v.fill_(value)
+            warm.step()
+    warm.cache_state()
+
+    restored = make_network(2.5 * OLD_DT)
+    restored.load_state_cache(warm._state_cache, warm._syn_cache)
+    restored.set_synaptic_diff_config(kind="continuous", diff_delays=True)
+    restored.initialize(OLD_DT, max_delay_ms=cap)
+    connection = next(iter(restored.continuous_synapses.values()))
+    # Half of each sample is due after two steps and the other half after three.
+    expected = weight * torch.tensor([0.25, 0.35, 0.2, 0.0, 0.0, 0.0], dtype=DTYPE)
+    torch.testing.assert_close(connection.delivery_buffer[:, 0], expected)
+    assert connection.delivery_mask[:, 0].nonzero().flatten().tolist() == [0, 1, 2]
+
+
+@pytest.mark.parametrize("horizon", (None, 4))
+def test_recorded_history_keeps_its_ages_when_interpolation_resizes_delivery(horizon):
+    delay = Bounded(0.0, requires_grad=False)
+    network, connection = _build_continuous_connection(
+        OLD_DT, delays=delay, max_delay_ms=4.75 * OLD_DT
+    )
+    connection.global_step.fill_(-3)
+    connection.enable_state_cache_recording(horizon_steps=horizon)
+    with torch.no_grad():
+        for value in (1, 2):
+            network.pre.v.fill_(value)
+            connection.advance()
+        delay.set(2.5 * OLD_DT)
+        connection.delay_ms.init(reinit=True)
+        connection.set_diff_config(diff_delays=True)
+        history = connection.state_cache()["pre_value_history"]
+        expected_horizon = connection.max_delay_steps if horizon is None else horizon
+        assert history.shape[0] == expected_horizon
+        torch.testing.assert_close(history[1:3, 0], history.new_tensor([2.0, 1.0]))
+
+        for value in range(3, 11):
+            network.pre.v.fill_(value)
+            connection.syn.reset_continuous_inputs()
+            connection.advance()
+        slot = connection.current_time_step.item()
+        expected = connection.delivery_buffer.roll(-slot, dims=0)
+        cache = connection.state_cache()
+        connection.initialize_from_state_cache(cache)
+    torch.testing.assert_close(connection.delivery_buffer, expected)
 
 
 @pytest.mark.parametrize("legacy_mask", (False, True))
@@ -314,7 +481,11 @@ def test_continuous_cache_rejects_invalid_data_without_mutating_inputs(invalid):
 
 @pytest.mark.parametrize(
     "hook",
-    ("initialize_from_state_cache", "_materialize_delivery_from_pre_value_history"),
+    (
+        "initialize_from_state_cache",
+        "_materialize_delivery_from_pre_value_history",
+        "_continuous_cache_routes",
+    ),
 )
 def test_continuous_cache_restoration_rejects_overridden_native_cache_hooks(hook):
     network, connection = _target()

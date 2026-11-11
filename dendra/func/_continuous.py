@@ -21,8 +21,10 @@ from dendra.models.networks._continuous_cache import (
 from dendra.models.networks._continuous_delivery import (
     continuous_clear,
     continuous_counters,
+    continuous_delay_taps,
     continuous_due,
     continuous_enqueue,
+    continuous_enqueue_linear,
     continuous_project,
     gather_continuous_source,
 )
@@ -47,6 +49,10 @@ _SOURCE_METHODS = {
     name: getattr(ContinuousCon, name)
     for name in ("_pre_value", "_weighted_pre_value", "_deliver")
 }
+_LINEAR_SOURCE_METHODS = {
+    **_SOURCE_METHODS,
+    "_linear_delay_taps": ContinuousCon._linear_delay_taps,
+}
 _INITIALIZATION_METHODS = {
     name: getattr(ContinuousCon, name)
     for name in ("initialize", "zero", "detach", "_configure_advance_impl")
@@ -56,6 +62,7 @@ _CACHE_METHODS = {
     for name in (
         "initialize_from_state_cache",
         "_materialize_delivery_from_pre_value_history",
+        "_continuous_cache_routes",
     )
 }
 
@@ -78,6 +85,7 @@ def _eligible(con):
         ContinuousCon._advance_all_immediate,
         ContinuousCon._advance_all_delayed_uniform,
         ContinuousCon._advance_all_delayed_mixed,
+        ContinuousCon._advance_interpolated,
         ContinuousCon._advance_mixed_uniform,
         ContinuousCon._advance_mixed,
     )
@@ -88,7 +96,8 @@ def _eligible(con):
         raise FunctionalizationError(
             "ContinuousCon needs its canonical advance adapter."
         )
-    for name, expected in _SOURCE_METHODS.items():
+    methods = _LINEAR_SOURCE_METHODS if con._diff_delays else _SOURCE_METHODS
+    for name, expected in methods.items():
         method = getattr(con, name)
         if getattr(method, "__func__", None) is not expected:
             raise FunctionalizationError(
@@ -110,12 +119,14 @@ def _eligible(con):
 
 
 class FunctionalContinuousCon:
-    """Frozen zero/integer-delay routing with explicit values and presence masks.
+    """Analog transport with explicit values and presence masks.
 
     ``advance(weights, state, source_values)`` returns ``(next_state, payload,
-    mask)``. Source values have the complete presynaptic stored tensor shape;
-    weights have one target-dtype value per edge. Transform values are explicit
-    in ``transform_parameters`` using ordinary module parameter/buffer names.
+    mask)``. Source values have the complete presynaptic stored tensor shape.
+    Weights and interpolated delays have one target-dtype value per edge. Use
+    ``extract_delays()`` and pass the effective milliseconds via ``delays=`` for
+    an interpolated projection. Transform values are explicit in
+    ``transform_parameters`` using ordinary module parameter/buffer names.
     Stateless functions and modules use their same native callable; static
     Python configuration is frozen, while explicit tensor values may change.
 
@@ -127,12 +138,12 @@ class FunctionalContinuousCon:
     false and do not call the receiver. Reset each target once before visiting
     its projections in native order. No method advances a Population clock.
 
-    Delay quantization, capacity, routing, input, reduction, and source schemas
-    are fixed. Native reinitialization or configuration changes require lowering
-    again. Runtime queue snapshots preserve enqueue-time values and gradients;
-    extraction creates independent detached carry. ``commit_state_`` transfers
-    runtime carry only; align weights/transform parameters separately before
-    native continuation. Detached steady-state caches remain a separate API.
+    Delay policy, capacity, topology, input, reduction, and source schemas are
+    fixed. Native reinitialization or configuration changes require lowering
+    again. Runtime queue snapshots preserve enqueue-time values and gradients.
+    Extraction creates independent detached carry. ``commit_state_`` transfers
+    runtime carry only. Align parameters separately before native continuation.
+    Detached steady-state caches remain a separate API.
     """
 
     def __init__(self, con):
@@ -152,16 +163,23 @@ class FunctionalContinuousCon:
         self.shape = tuple(con.syn.shape_f)
         self.device, self.dtype = torch.device(con.device), con.dtype
         self.input, self.reduce = con.input, con.reduce
+        self._diff_delays = bool(con._diff_delays)
+        self._max_delay = float(con.max_delay) if self._diff_delays else None
         self.has_connections = bool(con._has_connections)
         self.receive_before_source = bool(con._all_nonzero_delay)
         self._all_immediate = bool(con._all_zero_delay)
         self._depth, self._width = int(con.max_delay_steps), math.prod(self.shape)
         self._connections = int(con._n_conn)
         self._pre_idx, self._post_idx = _snapshot(con.pre_idx), _snapshot(con.post_idx)
-        self._delay_steps, self._dt = _snapshot(con.delay_steps), _snapshot(con.dt)
+        self._delay_steps = None if self._diff_delays else _snapshot(con.delay_steps)
+        self._dt = _snapshot(con.dt)
         self._cache_dt = float(con.dt.detach().cpu())
-        self._cache_routes = continuous_cache_routes(
-            self._delay_steps, self._post_idx, depth=self._depth, width=self._width
+        self._cache_routes = (
+            None
+            if self._diff_delays
+            else continuous_cache_routes(
+                self._delay_steps, self._post_idx, depth=self._depth, width=self._width
+            )
         )
         self._zero_idx = _snapshot(con.zero_con_idx)
         self._nonzero_idx = _snapshot(con.nonzero_con_idx)
@@ -214,6 +232,8 @@ class FunctionalContinuousCon:
             or con.pre_dtype != self.source_dtype
             or bool(con.training) != self._training
             or con.max_delay_steps != self._depth
+            or bool(con._diff_delays) != self._diff_delays
+            or (self._diff_delays and con.max_delay != self._max_delay)
             or tuple(con.syn.shape_f) != self.shape
             or con._n_conn != self._connections
             or getattr(con.advance, "__func__", None) is not self._advance
@@ -222,7 +242,8 @@ class FunctionalContinuousCon:
             raise FunctionalizationError(
                 "The source ContinuousCon configuration changed; initialize and lower again."
             )
-        for name, expected in _SOURCE_METHODS.items():
+        methods = _LINEAR_SOURCE_METHODS if self._diff_delays else _SOURCE_METHODS
+        for name, expected in methods.items():
             if name in con.__dict__ or getattr(type(con), name) is not expected:
                 raise FunctionalizationError(
                     "ContinuousCon source/delivery hooks changed."
@@ -239,6 +260,7 @@ class FunctionalContinuousCon:
     def _validate_compatible(self, con):
         _eligible(con)
         source = _source_tensor(con)
+        delays = _effective_tensor(con.delay_ms, "delay")
         if (
             bool(con.training) != self._training
             or tuple(source.shape) != self.source_shape
@@ -251,14 +273,20 @@ class FunctionalContinuousCon:
             or con.input != self.input
             or con.reduce != self.reduce
             or con.max_delay_steps != self._depth
+            or bool(con._diff_delays) != self._diff_delays
+            or (self._diff_delays and con.max_delay != self._max_delay)
             or con._n_conn != self._connections
             or not torch.equal(con.pre_idx, self._pre_idx)
             or not torch.equal(con.post_idx, self._post_idx)
-            or not torch.equal(con.delay_steps, self._delay_steps)
             or not torch.equal(con.dt, self._dt)
-            or not torch.equal(
-                (_effective_tensor(con.delay_ms, "delay") / con.dt).round().long(),
-                self._delay_steps,
+            or (
+                not self._diff_delays
+                and (
+                    not torch.equal(con.delay_steps, self._delay_steps)
+                    or not torch.equal(
+                        (delays / con.dt).round().long(), self._delay_steps
+                    )
+                )
             )
         ):
             raise FunctionalizationError(
@@ -272,7 +300,7 @@ class FunctionalContinuousCon:
             label="effective weights",
         )
         self._validate_tensor(
-            _effective_tensor(con.delay_ms, "delay"),
+            delays,
             shape=(self._connections,),
             dtype=self.dtype,
             device=self.device,
@@ -282,11 +310,13 @@ class FunctionalContinuousCon:
         self._validate_state(con.state_dict_for_checkpoint())
         if (
             self._depth < 1
-            or bool((self._delay_steps < 0).any())
+            or (self._delay_steps is not None and bool((self._delay_steps < 0).any()))
             or bool(((self._pre_idx < 0) | (self._pre_idx >= source.numel())).any())
             or bool(((self._post_idx < 0) | (self._post_idx >= self._width)).any())
         ):
             raise FunctionalizationError("ContinuousCon has invalid routing or delays.")
+        if self._diff_delays:
+            self._delay_taps(delays.detach())
 
     def extract(self, con=None):
         """Extract independent parameter leaves and detached runtime carry."""
@@ -303,6 +333,36 @@ class FunctionalContinuousCon:
                 for name, value in con.state_dict_for_checkpoint().items()
             },
             self._transform_parameters(con),
+        )
+
+    def extract_delays(self, con=None):
+        """Return independent effective milliseconds, or None for fixed delays."""
+        if torch.compiler.is_compiling():
+            raise FunctionalizationError(
+                "Extract ContinuousCon delays outside torch.compile."
+            )
+        con = self._source if con is None else con
+        self._validate_compatible(con)
+        if self._diff_delays:
+            return _snapshot(_effective_tensor(con.delay_ms, "delay"), parameter=True)
+        return None
+
+    def _delay_taps(self, delays):
+        if not self._diff_delays:
+            if delays is not None:
+                raise ValueError(
+                    "Fixed-delay ContinuousCon plans do not accept explicit delays"
+                )
+            return None
+        self._validate_tensor(
+            delays,
+            shape=(self._connections,),
+            dtype=self.dtype,
+            device=self.device,
+            label="delays",
+        )
+        return continuous_delay_taps(
+            delays, self._dt, max_delay=self._max_delay, dtype=self.dtype
         )
 
     def initial_state(self, state, *, t):
@@ -341,13 +401,13 @@ class FunctionalContinuousCon:
             width=self._width,
         )
 
-    def restore_cache(self, parameters, state, cache, *, t):
-        """Restore detached traffic with current explicit weights/transform.
+    def restore_cache(self, parameters, state, cache, *, t, delays=None):
+        """Restore detached traffic with current weights, delays, and transform.
 
         ``parameters`` contains ``weights`` and ``transform_parameters`` as in
-        the low-level ContinuousCon projection API. Historical observations and
-        materialized runtime carry are detached, matching native steady-state
-        restoration.
+        the low-level ContinuousCon projection API. Pass effective ``delays``
+        for interpolated plans. Historical observations and materialized
+        runtime carry are detached, matching native steady-state restoration.
         """
         self._validate_source()
         self._validate_state(state)
@@ -375,6 +435,17 @@ class FunctionalContinuousCon:
             label="weights",
         )
         self._validate_transform_parameters(transform)
+        taps = self._delay_taps(delays)
+        routes = self._cache_routes
+        if taps is not None:
+            offsets, fraction = taps
+            routes = continuous_cache_routes(
+                offsets,
+                self._post_idx,
+                depth=self._depth,
+                width=self._width,
+                fraction=fraction,
+            )
         if not isinstance(cache, ContinuousCache):
             cache = self.normalize_cache(cache)
         validate_continuous_cache(
@@ -392,6 +463,7 @@ class FunctionalContinuousCon:
             _has_empty_cache_vmap_axis(value)
             for value in (
                 weights,
+                delays,
                 cache.raw_history,
                 cache.transformed_history,
                 *(() if transform is None else transform.values()),
@@ -403,7 +475,7 @@ class FunctionalContinuousCon:
             weights,
             dt=self._dt,
             t=t,
-            routes=self._cache_routes,
+            routes=routes,
             transform=(
                 None
                 if empty
@@ -427,7 +499,9 @@ class FunctionalContinuousCon:
             due.mask.reshape(self.shape),
         )
 
-    def advance(self, weights, state, source_values, *, transform_parameters=None):
+    def advance(
+        self, weights, state, source_values, *, transform_parameters=None, delays=None
+    ):
         """Project explicit source values and return next carry, payload, and mask."""
         self._validate_source()
         self._validate_state(state)
@@ -447,11 +521,21 @@ class FunctionalContinuousCon:
         )
         self._validate_transform_parameters(transform_parameters)
         return self._advance_values(
-            weights, state, source_values, transform_parameters=transform_parameters
+            weights,
+            state,
+            source_values,
+            transform_parameters=transform_parameters,
+            delay_taps=self._delay_taps(delays),
         )
 
     def _advance_values(
-        self, weights, state, source_values, *, transform_parameters=None
+        self,
+        weights,
+        state,
+        source_values,
+        *,
+        transform_parameters=None,
+        delay_taps=None,
     ):
         """Execute validated projection tensors without inspecting live source modules."""
         queue, presence = state["delivery_buffer"], state["delivery_mask"]
@@ -481,17 +565,31 @@ class FunctionalContinuousCon:
                         width=self._width,
                     )
                     mask = mask | self._zero_mask
-                queue, presence = continuous_enqueue(
-                    queue,
-                    presence,
-                    slot,
-                    weighted,
-                    post_idx=self._post_nonzero,
-                    delay_steps=self._delay_nonzero,
-                    depth=self._depth,
-                    width=self._width,
-                    connection_idx=self._nonzero_idx,
-                )
+                if self._diff_delays:
+                    offsets, fraction = delay_taps
+                    queue, presence = continuous_enqueue_linear(
+                        queue,
+                        presence,
+                        slot,
+                        weighted,
+                        post_idx=self._post_idx,
+                        delay_steps=offsets,
+                        fraction=fraction,
+                        depth=self._depth,
+                        width=self._width,
+                    )
+                else:
+                    queue, presence = continuous_enqueue(
+                        queue,
+                        presence,
+                        slot,
+                        weighted,
+                        post_idx=self._post_nonzero,
+                        delay_steps=self._delay_nonzero,
+                        depth=self._depth,
+                        width=self._width,
+                        connection_idx=self._nonzero_idx,
+                    )
         slot, global_step = continuous_counters(
             slot, global_step, depth=self._depth, all_immediate=self._all_immediate
         )
@@ -527,9 +625,10 @@ def make_functional_continuous_con(con):
     """Return an explicit continuous projection and independent Tensor snapshot.
 
     ``con`` must be an initialized compatible ContinuousCon. Returns
-    ``(FunctionalContinuousCon, ContinuousConTensors)``. Routing, delay quantization
-    and stateless transform configuration are fixed; transform Tensor parameters
-    remain explicit. Network lowering constructs these projections automatically.
+    ``(FunctionalContinuousCon, ContinuousConTensors)``. Topology, delay policy,
+    and stateless transform configuration are fixed. Transform Tensor parameters
+    and interpolated delay values remain explicit. Network lowering constructs
+    these projections automatically.
     """
     plan = FunctionalContinuousCon(con)
     return plan, plan.extract()
