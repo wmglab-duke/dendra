@@ -202,7 +202,7 @@ def _retained_parent_inventory(functional):
         len(preparation_population.populations),
         sum(
             name.startswith("population.populations.")
-            for name in functional._base_mapping
+            for name in functional._transition_slot_names
         ),
         sum(
             name.startswith("population.populations.")

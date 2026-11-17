@@ -8,6 +8,8 @@ import random
 import textwrap
 from collections.abc import Mapping
 from dataclasses import dataclass
+from itertools import repeat
+from operator import is_
 from types import MappingProxyType, MethodType
 
 import numpy as np
@@ -23,7 +25,7 @@ from dendra.models._class_declarations import (
 )
 from dendra.models.parametric import Parameterized, cacheable
 from dendra.models.rng import RNGModule
-from dendra.utils.tensor_ops import _logical_tensor_bytes
+from dendra.utils.tensor_ops import _logical_tensor_bytes, _logical_tensor_bytes_equal
 
 from ._bufferimplicit import build_bufferimplicit
 from ._cnexp import build_cnexp
@@ -137,9 +139,7 @@ def _registered_tensors_unchanged(module, snapshot):
             # +0.0/-0.0 mutation that can affect reciprocal expressions.
             if value.numel() == 0:
                 continue
-            value_bytes = _logical_tensor_bytes(value)
-            fallback_bytes = _logical_tensor_bytes(fallback)
-            if not torch.equal(value_bytes, fallback_bytes):
+            if not _logical_tensor_bytes_equal(value, fallback):
                 return False
     return True
 
@@ -150,6 +150,17 @@ def _clone_registered_tensor(value):
     if value.layout == torch.strided:
         return value.clone(memory_format=torch.preserve_format)
     return value.clone()
+
+
+def _is_flat_integer_sequence(value):
+    """Recognize long index sequences that need no per-element isolation."""
+    kind = type(value)
+    return (
+        (kind is list or kind is tuple)
+        and len(value) >= 64
+        # Identity excludes int subclasses, which can carry authored state.
+        and all(map(is_, map(type, value), repeat(int)))
+    )
 
 
 def _seed_isolated_deepcopy_memo(value, memo, seen):
@@ -186,8 +197,13 @@ def _seed_isolated_deepcopy_memo(value, memo, seen):
             _seed_isolated_deepcopy_memo(item, memo, seen)
         return
     if isinstance(value, (tuple, list, set, frozenset)):
-        for item in value:
-            _seed_isolated_deepcopy_memo(item, memo, seen)
+        if _is_flat_integer_sequence(value):
+            # Memoize one independent list per original so aliases are preserved.
+            # Exact tuples of these scalars are immutable and can be shared.
+            memo[identity] = value.copy() if type(value) is list else value
+        else:
+            for item in value:
+                _seed_isolated_deepcopy_memo(item, memo, seen)
         return
     if isinstance(value, torch.nn.Module):
         for item in vars(value).values():
@@ -383,9 +399,25 @@ def _tensor_argument_unchanged(value, snapshot):
             return False
     if value.numel() == 0:
         return True
-    value_bytes = _logical_tensor_bytes(value)
-    fallback_bytes = _logical_tensor_bytes(fallback)
-    return torch.equal(value_bytes, fallback_bytes)
+    return _logical_tensor_bytes_equal(value, fallback)
+
+
+def _tensor_signature_metadata(value):
+    try:
+        version = value._version
+    except RuntimeError:
+        version = None
+    return (
+        id(value),
+        version,
+        tuple(value.shape),
+        value.dtype,
+        value.device,
+        value.layout,
+        tuple(value.stride()) if value.layout == torch.strided else None,
+        value.storage_offset() if value.layout == torch.strided else None,
+        value.requires_grad,
+    )
 
 
 def _shared_value_signature(value, seen):
@@ -407,23 +439,10 @@ def _shared_value_signature(value, seen):
             payload = b""
         else:
             payload = _logical_tensor_bytes(detached).numpy().tobytes()
-        digest = hashlib.sha256(payload).hexdigest()
-        try:
-            version = value._version
-        except RuntimeError:
-            version = None
         return (
             "Tensor",
-            id(value),
-            version,
-            tuple(value.shape),
-            value.dtype,
-            value.device,
-            value.layout,
-            tuple(value.stride()) if value.layout == torch.strided else None,
-            value.storage_offset() if value.layout == torch.strided else None,
-            value.requires_grad,
-            digest,
+            *_tensor_signature_metadata(value),
+            hashlib.sha256(payload).hexdigest(),
         )
     if isinstance(value, np.generic):
         scalar = np.asarray(value)
@@ -448,11 +467,13 @@ def _shared_value_signature(value, seen):
         return "reference", identity
     seen.add(identity)
     if isinstance(value, (tuple, list)):
-        return (
-            type(value).__name__,
-            identity,
-            tuple(_shared_value_signature(item, seen) for item in value),
-        )
+        # The recursive signature of each accepted scalar is the scalar itself.
+        # Capture the sequence's values so in-place edits remain detectable.
+        if _is_flat_integer_sequence(value):
+            contents = tuple(value)
+        else:
+            contents = tuple(_shared_value_signature(item, seen) for item in value)
+        return type(value).__name__, identity, contents
     if isinstance(value, (set, frozenset)):
         items = [_shared_value_signature(item, seen) for item in value]
         return type(value).__name__, identity, tuple(sorted(items, key=repr))
@@ -711,7 +732,46 @@ _MODULE_INTERNAL_STATE = {
 }
 
 
-def _python_instance_state_snapshot(module):
+@dataclass(frozen=True, eq=False)
+class _CudaInstanceTensorSignature:
+    metadata: tuple
+    bits: torch.Tensor
+
+    def __eq__(self, other):
+        return (
+            type(other) is _CudaInstanceTensorSignature
+            and self.metadata == other.metadata
+            and torch.equal(self.bits, other.bits)
+        )
+
+
+def _cuda_instance_tensor_signature(value, *, capture_tensor_values):
+    """Keep direct, contiguous CUDA float32 instance audits on device."""
+    if not (
+        type(value) is torch.Tensor
+        and value.is_cuda
+        and value.layout == torch.strided
+        and not value.is_nested
+        and value.dtype == torch.float32
+        and value.numel() > 0
+        and value.is_contiguous()
+        # Degenerate expanded views may be contiguous despite a zero stride.
+        and (value.ndim == 0 or value.stride(-1) == 1)
+        and not value.is_neg()
+        and not torch.compiler.is_compiling()
+        and not torch._C._are_functorch_transforms_active()
+    ):
+        return None
+    flat = value.detach().reshape(-1)
+    if flat.stride(0) != 1:
+        return None
+    bits = flat.view(torch.int32)
+    if capture_tensor_values:
+        bits = bits.clone()
+    return _CudaInstanceTensorSignature(_tensor_signature_metadata(value), bits)
+
+
+def _python_instance_state_snapshot(module, *, capture_tensor_values=True):
     """Fingerprint unregistered Python state throughout a builder module."""
 
     snapshot = {
@@ -727,7 +787,12 @@ def _python_instance_state_snapshot(module):
                 continue
             if name == "_cache" and isinstance(owner, cacheable):
                 continue
-            snapshot[f"{label}.{name}"] = _shared_value_signature(value, set())
+            signature = _cuda_instance_tensor_signature(
+                value, capture_tensor_values=capture_tensor_values
+            )
+            if signature is None:
+                signature = _shared_value_signature(value, set())
+            snapshot[f"{label}.{name}"] = signature
     return snapshot
 
 
@@ -773,7 +838,9 @@ class _IsolatedBuilderCall(torch.nn.Module):
                     )
                 )
             )
-            python_state_after = _python_instance_state_snapshot(self.candidate)
+            python_state_after = _python_instance_state_snapshot(
+                self.candidate, capture_tensor_values=False
+            )
             self.python_instance_state_changed = {
                 key
                 for key in python_state_before.keys() | python_state_after.keys()
@@ -1480,7 +1547,17 @@ class State(Parameterized):
     derivative of a state ``x`` therefore has units ``unit(x)/ms``; an SDE
     diffusion coefficient has units ``unit(x)/sqrt(ms)``. Voltage arguments are
     in mV, ``self.celsius`` is in °C, and compartment diameters are in µm.
+
+    Compiled flat placements with shared ordered columns provide a read-only
+    :class:`SupportSpec` in ``self.key``. It describes the source shape,
+    columns, and participating rows. ``materialized_flat_indices()`` returns
+    the original flat slot order as a tensor when needed. Set
+    ``supports_compact_selector = False`` on a state class whose hooks
+    require the original selector object. Direct construction without
+    compiled support and other placements retain their original key.
     """
+
+    supports_compact_selector = True
 
     _carry = ()
     _carry_specs = {}

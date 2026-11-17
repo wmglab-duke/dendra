@@ -886,6 +886,49 @@ def test_derived_buffer_builder_supports_and_guards_inference_tensors():
         assert torch.isnan(nan_workspace.workspace).all()
 
 
+@pytest.mark.parametrize(
+    "device_type",
+    (
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="CUDA is unavailable"
+                ),
+            ],
+        ),
+    ),
+)
+def test_inference_purity_checks_compare_bits_on_the_tensor_device(
+    device_type, monkeypatch
+):
+    from dendra.models.mechanisms import _state
+
+    original = torch.Tensor.copy_
+    comparison_devices = []
+
+    def record_comparison_device(target, value, *args, **kwargs):
+        comparison_devices.append(target.device)
+        return original(target, value, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", record_comparison_device)
+    with torch.inference_mode():
+        value = torch.tensor([[0.0, float("nan")], [1.0, 2.0]], device=device_type).T
+        module = torch.nn.Module()
+        module.register_buffer("value", value)
+        registered_snapshot = _state._registered_tensor_snapshot(module)
+        argument_snapshot = _state._tensor_argument_snapshot(value)
+        assert _state._registered_tensors_unchanged(module, registered_snapshot)
+        assert _state._tensor_argument_unchanged(value, argument_snapshot)
+
+        value[0, 0] = -0.0
+        assert not _state._registered_tensors_unchanged(module, registered_snapshot)
+        assert not _state._tensor_argument_unchanged(value, argument_snapshot)
+        assert comparison_devices == [value.device] * 8
+
+
 def test_derived_buffer_expanded_views_are_independent_checkpoint_destinations():
     class ExpandedDerivedBuffer(Mechanism):
         Mechanism.DERIVED_BUFFER("workspace")

@@ -3,6 +3,8 @@
 from typing import NamedTuple
 
 import torch
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
+from torch.utils.weak import WeakIdKeyDictionary
 
 from ._connection_initialization import event_initial_step
 from ._pending_calendar import (
@@ -22,6 +24,93 @@ class EventCache(NamedTuple):
     source_has_spiked: torch.Tensor | None = None
     pending: CalendarState | None = None
     event_pending: CalendarState | None = None
+
+
+class _SparseGateHistory(NamedTuple):
+    ages: torch.Tensor
+    connections: torch.Tensor
+    values: torch.Tensor
+    age_counts: tuple[int, ...]
+
+
+# A recipe owns its small tensors and never references the source history.
+# Weak keys let clearing or replacing a history release the memoized recipe.
+_sparse_gate_histories = WeakIdKeyDictionary()
+
+
+def _can_prepare_sparse_history(gates):
+    # Keep the existing scatter/rounding behavior for other devices, CPU
+    # half precision, transformed inputs and authored tensor subclasses.
+    return (
+        not torch.compiler.is_compiling()
+        and not torch._C._are_functorch_transforms_active()
+        and type(gates) is torch.Tensor
+        and gates.device.type == "cpu"
+        and gates.dtype in (torch.float32, torch.float64)
+        and gates.layout == torch.strided
+        and not torch.is_inference(gates)
+        and not torch.is_inference_mode_enabled()
+        and get_proxy_mode() is None
+    )
+
+
+def _prepare_sparse_history(gates):
+    version = gates._version
+    cached = _sparse_gate_histories.get(gates)
+    if cached is not None and cached[0] == version:
+        return cached[1]
+
+    history = gates.detach()[1:]
+    count = int(history.count_nonzero())
+    # Avoid expanding dense histories into coordinate arrays. A sparse entry
+    # uses two long indices in addition to the gate value.
+    recipe = None
+    if count * (16 + gates.element_size()) < gates.numel() * gates.element_size():
+        ages, connections = history.nonzero(as_tuple=True)
+        _, age_counts = ages.unique_consecutive(return_counts=True)
+        recipe = _SparseGateHistory(
+            ages + 1,
+            connections,
+            history[ages, connections],
+            tuple(age_counts.tolist()),
+        )
+    _sparse_gate_histories[gates] = (version, recipe)
+    return recipe
+
+
+def _prepare_history_snapshot(source, snapshot, source_version):
+    if source._version != source_version:
+        return
+    cached = _sparse_gate_histories.get(source)
+    if cached is not None and cached[0] == source_version:
+        recipe = cached[1]
+    else:
+        recipe = _prepare_sparse_history(snapshot)
+        _sparse_gate_histories[source] = (source_version, recipe)
+    _sparse_gate_histories[snapshot] = (snapshot._version, recipe)
+
+
+def _restore_sparse_gate_history(
+    template, history, weights, delay_steps, post_idx, width
+):
+    padded = template.new_zeros((template.numel() + 1,))
+    edges = history.connections
+    remaining = delay_steps.index_select(0, edges) - history.ages
+    active = remaining >= 0
+    indices = torch.where(
+        active, remaining * width + post_idx.index_select(0, edges), padded.numel() - 1
+    )
+    values = torch.where(
+        active, weights.detach().index_select(0, edges) * history.values, 0
+    )
+    # nonzero traverses age first, then connection index. Keep the original
+    # per-age scatter boundary and use one privately owned output ring.
+    start = 0
+    for count in history.age_counts:
+        end = start + count
+        padded.scatter_add_(0, indices[start:end], values[start:end])
+        start = end
+    return padded[:-1].reshape_as(template)
 
 
 def clone_event_cache(cache):
@@ -281,9 +370,22 @@ def normalize_event_cache(
         if runtime == "bitpacked_history":
             pending = calendar("sparse_calendar", dtype)
     elif "gate_history" in values:
-        gates = _dilate_history_age_rows(
-            tensor(values["gate_history"]), old_dt, dt, n_limit=depth
+        source = values["gate_history"]
+        prepare_snapshot = (
+            runtime == "dense"
+            and old_dt == dt
+            and _can_prepare_sparse_history(source)
+            and source.dtype == dtype
+            and source.device == device
+            and source.ndim == 2
+            and source.shape[0] == depth
         )
+        if prepare_snapshot:
+            source_version = source._version
+            gates = tensor(source)
+            _prepare_history_snapshot(source, gates, source_version)
+        else:
+            gates = _dilate_history_age_rows(tensor(source), old_dt, dt, n_limit=depth)
     elif runtime == "sparse_calendar":
         pending = calendar("sparse_calendar", dtype)
         if track_events:
@@ -541,6 +643,11 @@ def restore_event_cache(
         metadata=metadata,
         binary_history=binary_history,
     )
+    sparse_history = (
+        _prepare_sparse_history(cache.gate_history)
+        if runtime == "dense" and _can_prepare_sparse_history(cache.gate_history)
+        else None
+    )
     cache = EventCache(
         *(
             (
@@ -577,7 +684,16 @@ def restore_event_cache(
             )
     if gates is not None and (gates.ndim != 2 or gates.shape[1] != weights.numel()):
         raise ValueError("Cached NetCon gate history has incompatible shape")
-    if packed is not None or gates is not None:
+    if sparse_history is not None:
+        result["delivery_buffer"] = _restore_sparse_gate_history(
+            state["delivery_buffer"],
+            sparse_history,
+            weights,
+            delay_steps,
+            post_idx,
+            width,
+        )
+    elif packed is not None or gates is not None:
         result["delivery_buffer"] = torch.zeros_like(state["delivery_buffer"])
         if runtime in {"source_history", "bitpacked_history"}:
             if (

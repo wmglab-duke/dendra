@@ -22,6 +22,7 @@ from dendra.models.networks._event_cache import (
 )
 from dendra.models.networks._event_delivery import (
     connection_event_counts,
+    delay_interpolation,
     dense_due,
     dense_fixed_delay_transition,
     dense_interpolated_delay_transition,
@@ -345,6 +346,7 @@ class FunctionalNetCon:
         self.source_device = torch.device(netcon.pre_device)
         self.source_dtype = netcon.pre_dtype
         self._depth = int(netcon.max_delay_steps)
+        self._delay_upper_bound_ms = getattr(netcon, "delay_upper_bound_ms", None)
         self._width = math.prod(self.shape)
         self._connections = int(netcon._n_conn)
         self._pre_idx = _snapshot(netcon.pre_idx)
@@ -591,6 +593,8 @@ class FunctionalNetCon:
             or source.pre_device != self.source_device
             or source.pre_dtype != self.source_dtype
             or source.max_delay_steps != self._depth
+            or getattr(source, "delay_upper_bound_ms", None)
+            != self._delay_upper_bound_ms
             or source._n_conn != self._connections
             or source._syn_numel != self._width
             or tuple(source.syn.shape_f) != self.shape
@@ -679,6 +683,8 @@ class FunctionalNetCon:
             or netcon.pre_device != self.source_device
             or netcon.pre_dtype != self.source_dtype
             or int(netcon.max_delay_steps) != self._depth
+            or getattr(netcon, "delay_upper_bound_ms", None)
+            != self._delay_upper_bound_ms
             or int(netcon._n_conn) != self._connections
             or int(netcon._syn_numel) != self._width
             or not torch.equal(netcon.pre_idx, self._pre_idx)
@@ -721,13 +727,15 @@ class FunctionalNetCon:
             device=self.device,
             label="effective weights",
         )
+        delays = _effective_tensor(netcon.delay_ms, "delay")
         self._validate_tensor(
-            _effective_tensor(netcon.delay_ms, "delay"),
+            delays,
             shape=(self._connections,),
             dtype=self.dtype,
             device=self.device,
             label="effective delays",
         )
+        self._validate_delay_bound(delays)
         self._schedule.validate_compatible(netcon)
         if bool(torch.any(self._schedule.indices >= self._connections)):
             raise FunctionalizationError(
@@ -866,7 +874,7 @@ class FunctionalNetCon:
         self.check_overflow(result)
         return result
 
-    def _validate_projection_parameters(self, weights, delays):
+    def _validate_projection_parameters(self, weights, delays, delay_taps=None):
         self._validate_tensor(
             weights,
             shape=(self._connections,),
@@ -875,17 +883,114 @@ class FunctionalNetCon:
             label="weights",
         )
         if self._diff_delays:
-            self._validate_tensor(
-                delays,
-                shape=(self._connections,),
-                dtype=self.dtype,
-                device=self.device,
-                label="delays",
-            )
+            if delay_taps is None:
+                self._validate_tensor(
+                    delays,
+                    shape=(self._connections,),
+                    dtype=self.dtype,
+                    device=self.device,
+                    label="delays",
+                )
+                self._validate_delay_bound(delays)
         elif delays is not None:
             raise ValueError("Fixed-delay NetCon plans do not accept explicit delays")
 
-    def read_due(self, state, *, weights=None, delays=None):
+    def _delay_taps(self, delays):
+        return delay_interpolation(
+            delays, self._dt, dtype=self.dtype, taps=self._taps, sigma=self._sigma
+        )
+
+    def _fused_delay_taps(self, delay_taps):
+        """Build the opaque enqueue's slot-relative addresses for eligible rings."""
+        if (
+            self._runtime != "dense"
+            or self._track_events
+            or not self._diff_delays
+            or self._taps != 2
+            or self.device.type != "cpu"
+            or self.dtype not in (torch.float32, torch.float64)
+            or not self._depth
+            or not self._width
+        ):
+            return None
+        offsets, fraction = delay_taps
+        post_idx = self._post_idx
+        if (
+            post_idx.shape != offsets.shape
+            or post_idx.dtype != offsets.dtype
+            or post_idx.device != offsets.device
+            or not bool(((post_idx >= 0) & (post_idx < self._width)).all())
+            # The tensor path adds the slot before wrapping. Do not change its
+            # behavior if that addition could overflow on unbounded delays.
+            or not bool(
+                (offsets <= torch.iinfo(torch.long).max - self._depth + 1).all()
+            )
+        ):
+            return None
+        lower = offsets.remainder(self._depth) * self._width + post_idx
+        upper = (lower + self._width).remainder(self._depth * self._width)
+        return offsets, fraction, lower, upper
+
+    def _can_save_source_gates(self, source_values):
+        return (
+            self._skip_thresholding
+            and not self._schedule.events
+            and not self._track_events
+            and source_values.numel() < self._connections
+            and source_values.dtype == self.dtype
+            and source_values.device == self.device
+            and self._pre_idx.device == self.device
+            and self._pre_idx.dtype == torch.long
+        )
+
+    def _advance_fused_two_tap(self, state, weights, gates, taps, *, pre_idx=None):
+        # Only the CPU scan host prepares this private packet. Resolve lazy
+        # negative views before the C++ kernel reads the input data pointers.
+        _, fraction, lower, upper = taps
+        slot = state["current_time_step"]
+        native = torch.ops.dendra_native
+        args = (
+            state["delivery_buffer"],
+            slot.resolve_neg().contiguous(),
+            weights.resolve_neg().contiguous(),
+            gates.resolve_neg().contiguous(),
+            fraction.resolve_neg().contiguous(),
+            lower.contiguous(),
+            upper.contiguous(),
+        )
+        if pre_idx is None:
+            queue = native.ordered_two_tap_enqueue.default(*args)
+        else:
+            queue = native.ordered_two_tap_enqueue_from_source.default(
+                *args, pre_idx.contiguous()
+            )
+        return {
+            **state,
+            "delivery_buffer": queue,
+            "current_time_step": (slot + 1).remainder(self._depth),
+            "global_step": state["global_step"] + 1,
+        }
+
+    def _validate_delay_bound(self, delays):
+        bound = self._delay_upper_bound_ms
+        if bound is None or delays is None:
+            return
+        valid = (torch.isfinite(delays) & (delays >= 0) & (delays <= bound)).all()
+        message = (
+            f"NetCon delays must be finite and within delay_upper_bound_ms={bound}"
+        )
+        if torch.compiler.is_compiling():
+            torch._assert_async(valid, message)
+        elif torch._C._are_functorch_transforms_active():
+            # Check all physical lanes before asserting on the tensor.
+            functorch = torch._C._functorch
+            while functorch.is_functorch_wrapped_tensor(valid):
+                valid = functorch.get_unwrapped(valid)
+            torch._assert_async(valid.all(), message)
+        elif not bool(valid):
+            raise FunctionalizationError(message)
+
+    def read_due(self, state, *, weights=None, delays=None, _prepared_delay_taps=None):
         """Return ``(delivery_state, payload)`` for one separate receive call.
 
         This publishes due tracked events in the returned state without clearing
@@ -899,7 +1004,7 @@ class FunctionalNetCon:
         self._validate_source()
         self._validate_state(state)
         if self._runtime in _HISTORY_RUNTIMES:
-            self._validate_projection_parameters(weights, delays)
+            self._validate_projection_parameters(weights, delays, _prepared_delay_taps)
             metadata = self._history_metadata
             payload = source_history_project(
                 state[self._history_name],
@@ -924,6 +1029,7 @@ class FunctionalNetCon:
                 dt=self._dt,
                 taps=self._taps,
                 sigma=self._sigma,
+                delay_taps=_prepared_delay_taps,
             )
             result = dict(state)
             if self._runtime == "bitpacked_history":
@@ -1040,7 +1146,16 @@ class FunctionalNetCon:
             )
         return result
 
-    def advance(self, weights, state, source_values, *, delays=None, schedule=None):
+    def advance(
+        self,
+        weights,
+        state,
+        source_values,
+        *,
+        delays=None,
+        schedule=None,
+        _prepared_delay_taps=None,
+    ):
         """Observe the source, update transport history, and return next carry.
 
         Pass the state from :meth:`read_due` after delivering its payload and
@@ -1048,13 +1163,12 @@ class FunctionalNetCon:
         through explicit weights, source values, pending payloads, and schedule
         amplitudes. Triangular scheduling also differentiates explicit times.
         Interpolated-delay plans require explicit ``delays``; fixed-delay plans
-        reject it. Delay values use the native fixed ring and are not scanned
-        for a range on each step.
+        reject it. Network rollouts check declared delay bounds before stepping.
         """
         self._validate_source()
         self._validate_state(state)
         self._schedule.validate(schedule)
-        self._validate_projection_parameters(weights, delays)
+        self._validate_projection_parameters(weights, delays, _prepared_delay_taps)
         self._validate_tensor(
             source_values,
             shape=self.source_shape,
@@ -1107,6 +1221,15 @@ class FunctionalNetCon:
             )
             result["global_step"] = state["global_step"] + 1
             return result
+        fused = _prepared_delay_taps is not None and len(_prepared_delay_taps) == 4
+        if fused and self._can_save_source_gates(source_values):
+            return self._advance_fused_two_tap(
+                state,
+                weights,
+                source_values.reshape(-1),
+                _prepared_delay_taps,
+                pre_idx=self._pre_idx,
+            )
         event_queue = state.get("event_queue")
         selected = gather_source_gates(source_values, self._pre_idx)
         result = dict(state)
@@ -1139,6 +1262,10 @@ class FunctionalNetCon:
             )
             result["global_step"] = state["global_step"] + 1
             return result
+        if fused:
+            return self._advance_fused_two_tap(
+                result, weights, combined, _prepared_delay_taps
+            )
         if self._diff_delays:
             updated = dense_interpolated_delay_transition(
                 state["delivery_buffer"],
@@ -1153,6 +1280,7 @@ class FunctionalNetCon:
                 width=self._width,
                 taps=self._taps,
                 sigma=self._sigma,
+                delay_taps=_prepared_delay_taps,
             )
         else:
             updated = dense_fixed_delay_transition(

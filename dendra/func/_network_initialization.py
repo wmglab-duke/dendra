@@ -1037,7 +1037,7 @@ def _initialize_components(
                 effective_constants, (collection, name), connection_constants
             )
         connections = functional._materialize_connections(
-            effective, effective_constants
+            effective, effective_constants, prepare_event_taps=False
         )
         synapses = {
             name: plan.initial_state(state["synapses"][name], t=time)

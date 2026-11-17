@@ -745,3 +745,24 @@ def test_concatenated_fixed_tables_evaluate_supplied_constants(mechanism):
         actual[family]["tabulated"][field], baseline[family]["tabulated"][field]
     )
     _close(tensors, before)
+
+
+def test_prepared_table_constant_is_bound_without_reshaping():
+    class RankGuard(torch.Tensor):
+        @property
+        def ndim(self):
+            raise AssertionError("prepared table constants retain their shape")
+
+    population = _population(_FixedTableLeak)
+    plan, tensors = dn.func.make_functional(population, dt=DT)
+    prepared = plan._prepare_values(tensors.parameters, tensors.constants)
+    constant = next(
+        entry for entry in plan._prepared_buffers if entry.kind == "constant"
+    )
+    value = prepared["mechanisms"][constant.key].as_subclass(RankGuard)
+    prepared["mechanisms"][constant.key] = value
+
+    mapping, *_ = plan._read_only_mapping(
+        tensors.parameters, prepared, isolate_read_only=False
+    )
+    assert mapping[f"population.{constant.key}"] is value

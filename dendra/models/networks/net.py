@@ -67,7 +67,12 @@ from ..stim.waveform._poisson import (
 )
 from ._connection_sampling import clone_connection_sampling_rng
 from ._population_cache import restore_population_cache_values
-from .netcon import ContinuousCon, NetCon
+from .netcon import (
+    ContinuousCon,
+    NetCon,
+    _event_delay_tap_scope,
+    _validate_delay_upper_bound_ms,
+)
 from .netstim import NetStim
 
 ConnRule = Literal[
@@ -79,6 +84,11 @@ ConnRule = Literal[
     "fixed_indegree",
     "fixed_outdegree",
 ]
+
+
+def _event_spec_delay_upper_bound(spec):
+    # Older serialized wiring declarations have no delay bound.
+    return spec[8] if len(spec) > 8 else None
 
 
 def to_flat_idx_torch(shape, idx, device):
@@ -1703,13 +1713,25 @@ class Network(RNGMixin):
         """In-place alias of :meth:`detach` that returns ``None``."""
         self.detach()
 
+    def _validate_live_event_delay_bounds(self):
+        for connection in self.synapses.values():
+            if (
+                getattr(connection, "delay_upper_bound_ms", None) is not None
+                and connection.train_flags is not None
+                and connection.train_flags[1]
+            ):
+                with torch.no_grad():
+                    connection._validate_delay_bound(connection.delay_ms())
+
     def _refresh_detached_materializations(self, dt, *, grad_enabled=None):
+        if not self.training:
+            return
         if not (
-            self.training
-            and torch.is_grad_enabled()
+            torch.is_grad_enabled()
             and not torch.is_inference_mode_enabled()
             and grad_enabled is not False
         ):
+            self._validate_live_event_delay_bounds()
             return
         connections = tuple(
             dict.fromkeys((*self.synapses.values(), *self.continuous_synapses.values()))
@@ -1740,6 +1762,7 @@ class Network(RNGMixin):
         try:
             _refresh_detached_population_materializations(self.populations, dt)
             if not refresh:
+                self._validate_live_event_delay_bounds()
                 return
             values = {
                 materializer: materializer._derive_detached_values()
@@ -2735,6 +2758,8 @@ class Network(RNGMixin):
         delay=0.0,
         pre_var=None,
         shape_context=None,
+        *,
+        delay_upper_bound_ms=None,
     ):
         """
         Append a finalized connection spec.
@@ -2783,6 +2808,7 @@ class Network(RNGMixin):
                     dtype=target_pop.dtype(),
                 ),
                 n_delay,
+                delay_upper_bound_ms,
             )
         )
         # A materialized NetCon set no longer represents the wiring spec after
@@ -3021,6 +3047,7 @@ class Network(RNGMixin):
         threshold=0.0,
         weight=1.0,
         delay=0.0,
+        delay_upper_bound_ms: float | None = None,
         pre_var=None,
         auto_expand=False,
         allow_autapses: Optional[bool] = None,
@@ -3041,6 +3068,13 @@ class Network(RNGMixin):
         Built-in point-process ``expsyn`` and ``exp2syn`` targets expect a bare
         numerical value in µS, so ``weight=0.05`` means 0.05 µS and must not be
         multiplied by :data:`dendra.units.uS`.
+
+        Supply ``delay_upper_bound_ms`` to declare a finite non-negative upper
+        bound on all physical delays from this call, including after delay
+        parameters change. For a projection built from multiple calls, the
+        largest bound can size the delivery queue when every call supplies
+        one. A network-wide ``max_delay_ms`` remains the ceiling and is the
+        fallback for projections with unspecified bounds.
         """
         if isinstance(target, SynapseSlots):
             return self.connect_to_slots(
@@ -3051,11 +3085,14 @@ class Network(RNGMixin):
                 threshold=threshold,
                 weight=weight,
                 delay=delay,
+                delay_upper_bound_ms=delay_upper_bound_ms,
                 pre_var=pre_var,
                 auto_expand=auto_expand,
                 allow_autapses=allow_autapses,
                 allow_multapses=allow_multapses,
             )
+
+        delay_upper_bound_ms = _validate_delay_upper_bound_ms(delay_upper_bound_ms)
 
         source, target, source_model, target_model = self._normalize_endpoint(
             source,
@@ -3140,6 +3177,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             shape_context=shape_context,
         )
@@ -3156,6 +3194,7 @@ class Network(RNGMixin):
         threshold=0.0,
         weight=1.0,
         delay=0.0,
+        delay_upper_bound_ms: float | None = None,
         pre_var=None,
         auto_expand=False,
         allow_autapses: Optional[bool] = None,
@@ -3166,8 +3205,10 @@ class Network(RNGMixin):
         ``target`` may be a ``SynapseSlots`` object, or a population/slice plus
         ``synapse`` and ``slots``/``local_index``.  This is the public API for
         banked point processes with multiple colocated local slots. Threshold,
-        weight, and delay follow :meth:`connect`'s unit contract.
+        weight, delay, and its upper bound follow :meth:`connect`'s contract.
         """
+        delay_upper_bound_ms = _validate_delay_upper_bound_ms(delay_upper_bound_ms)
+
         if local_index is not None:
             if slots is not None:
                 raise ValueError("Provide either slots or local_index, not both.")
@@ -3255,6 +3296,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             shape_context=shape_context,
         )
@@ -3270,6 +3312,7 @@ class Network(RNGMixin):
         threshold=0.0,
         weight=1.0,
         delay=0.0,
+        delay_upper_bound_ms: float | None = None,
         pre_var=None,
         allow_autapses=False,
         allow_multapses=False,
@@ -3288,6 +3331,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             allow_autapses=allow_autapses,
             allow_multapses=allow_multapses,
@@ -3304,6 +3348,8 @@ class Network(RNGMixin):
         pre_var=None,
         allow_autapses=False,
         allow_multapses=False,
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Connect source to target one-to-one.
@@ -3322,6 +3368,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             allow_autapses=allow_autapses,
             allow_multapses=allow_multapses,
@@ -3339,6 +3386,8 @@ class Network(RNGMixin):
         auto_expand=False,
         allow_autapses=False,
         allow_multapses=False,
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Connect source to target densely, i.e. all-to-all between selections.
@@ -3355,6 +3404,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             auto_expand=auto_expand,
             allow_autapses=allow_autapses,
@@ -3375,6 +3425,8 @@ class Network(RNGMixin):
         allow_autapses=False,
         allow_multapses=False,
         strategy="bernoulli",
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Connect source to target probabilistically.
@@ -3408,6 +3460,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             auto_expand=auto_expand,
             allow_autapses=allow_autapses,
@@ -3427,6 +3480,8 @@ class Network(RNGMixin):
         auto_expand=False,
         allow_autapses=False,
         allow_multapses=False,
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Connect exactly ``n`` random pre-post pairs.
@@ -3444,6 +3499,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             auto_expand=auto_expand,
             allow_autapses=allow_autapses,
@@ -3459,7 +3515,8 @@ class Network(RNGMixin):
         dt : float
             Simulation timestep (ms) for delivery buffers.
         max_delay_ms : float, optional
-            Optional ceiling on allowable synaptic delay; passed to NetCon.
+            Network-wide ceiling and fallback for projections with unspecified
+            delay bounds.
         """
         for (pre_name, post_name, synapse, pre_var), specs in self.synapse_spec.items():
             pre_var = (
@@ -3499,6 +3556,22 @@ class Network(RNGMixin):
             )
             pre_idx_for_var = self._pre_idx_for_pre_var(pre, pre_idx, pre_var)
 
+            bounds = [_event_spec_delay_upper_bound(spec) for spec in specs]
+            largest_bound = max(
+                (bound for bound in bounds if bound is not None), default=None
+            )
+            if (
+                largest_bound is not None
+                and max_delay_ms is not None
+                and largest_bound > max_delay_ms
+            ):
+                raise ValueError(
+                    f"delay_upper_bound_ms={largest_bound!r} for projection "
+                    f"{pre_name}:{pre_var}->{post_name}:{synapse.name} exceeds "
+                    f"max_delay_ms={max_delay_ms!r}."
+                )
+            delay_upper_bound_ms = largest_bound if None not in bounds else None
+
             syn = NetCon(
                 pre=pre,
                 pre_idx=pre_idx_for_var,
@@ -3511,6 +3584,7 @@ class Network(RNGMixin):
                 dt=dt,
                 pre_var=pre_var,
                 max_delay=max_delay_ms,
+                delay_upper_bound_ms=delay_upper_bound_ms,
                 track_events=self.track_netcon_events,
                 delay_backend=self.netcon_delay_backend,
                 train_delay_backend=self.netcon_train_backend,
@@ -3694,7 +3768,8 @@ class Network(RNGMixin):
         dt : float
             Simulation timestep (ms) used for connection buffers.
         max_delay_ms : float, optional
-            Maximum delay allowed for connections. Default is None (no cap).
+            Network-wide delay ceiling. Default is None (no cap). Event
+            connections may declare tighter bounds with :meth:`connect`.
             Specifying a different cap on a built Network requires
             `force_rebuild=True`.
             A rebuild with continuous delay interpolation enabled reuses the
@@ -3759,7 +3834,8 @@ class Network(RNGMixin):
             Starting simulation time (ms). Finite negative values are allowed;
             booleans and non-finite values are rejected. Default is 0.0.
         max_delay_ms : float, optional
-            Maximum allowed synaptic delay. Default is None.
+            Network-wide delay ceiling. Default is None. Event connections
+            may declare tighter bounds with :meth:`connect`.
             Specifying a different cap on a built Network requires
             `force_rebuild=True`. A rebuild with continuous delay interpolation
             enabled reuses the previous cap if omitted.
@@ -4374,7 +4450,11 @@ class Network(RNGMixin):
         }
         tstart = self.t.item()
 
-        with _native_callback_storage(observer) as observer, ctx:
+        with (
+            _native_callback_storage(observer) as observer,
+            ctx,
+            _event_delay_tap_scope(self.training and n_steps > 1),
+        ):
             if n_steps:
                 self._refresh_detached_materializations(dt_f)
             if duration_remainder is not None:
@@ -4648,7 +4728,11 @@ class Network(RNGMixin):
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
-        with _native_callback_storage(observer) as observer, ctx:
+        with (
+            _native_callback_storage(observer) as observer,
+            ctx,
+            _event_delay_tap_scope(self.training and n_steps > 1),
+        ):
             if n_steps:
                 self._refresh_detached_materializations(dt_f)
             if duration_remainder is not None:
@@ -4868,6 +4952,7 @@ class Network(RNGMixin):
                     weight,
                     delay,
                     pre_var=pre_var,
+                    delay_upper_bound_ms=_event_spec_delay_upper_bound(data),
                 )
         for k, v in _continuous_synapse_spec.items():
             (
@@ -5212,6 +5297,7 @@ class Network(RNGMixin):
                     weight,
                     delay,
                     pre_var=pre_var,
+                    delay_upper_bound_ms=_event_spec_delay_upper_bound(data),
                 )
 
         for k, v in self.continuous_synapse_spec.items():
@@ -6272,6 +6358,7 @@ class Network(RNGMixin):
                     if pbar is not None:
                         pbar.set_description(f"{t_chunk[0].item():.1f} ms")
 
+                    @_event_delay_tap_scope(self.training and len(t_chunk) > 1)
                     def _run_chunk(
                         state_in,
                         observed_state_in=None,

@@ -93,6 +93,16 @@ coefficients rather than evolving history. See the
 {doc}`mechanism API reference <../api/dendra.models.mechanisms>` for exact
 input/output and initialization contracts.
 
+For flat regional placements that select the same ordered columns in each
+participating cell, Dendra provides a compact read-only
+`SupportSpec` in `State.key`. The spec stores the source shape, ordered
+`column_indices`, and the participating rows. Use
+`materialized_flat_indices(device=...)` when a hook needs the full indices
+in the original flat slot order. Bare state or mechanism construction and
+other placements keep their original key. If a state hook expects the
+original Python list, set `supports_compact_selector = False` on its
+`State` class. This also applies to subclasses unless they override it.
+
 ## Current equations, units and purity
 
 An affine current can supply `(G, J)` through its named coefficient hook,

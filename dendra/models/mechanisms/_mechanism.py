@@ -52,7 +52,7 @@ from ._state import (
     _unresolved_deferred_buffer_names,
     _validate_runtime_outputs,
 )
-from ._support import SupportMap, SupportSpec
+from ._support import SupportKind, SupportMap, SupportSpec
 from ._symbolic import (
     affine_hook_name,
     build_affine_coefficients,
@@ -1119,6 +1119,12 @@ class Mechanism(Parameterized):
         self.preserves_multiplicity = bool(preserves_multiplicity)
         self.force_packed_support = bool(force_packed_support)
 
+        compiled_flat_selector = (
+            support_spec is not None
+            and type(key) is list
+            and not self.is_composable
+            and self.key.ndim == 1
+        )
         if support_spec is None:
             if torch.is_tensor(diameters) and diameters.ndim >= self.base_ndim:
                 source_core_shape = tuple(diameters.shape[-self.base_ndim :])
@@ -1161,11 +1167,26 @@ class Mechanism(Parameterized):
         self.write_material = self._write_material
         self.source_material = self._source_material
 
+        # Reuse the structural spec in states for compiled flat placements.
+        # Direct construction and states needing the legacy selector keep
+        # their original key. The runtime tensor key is unchanged.
+        compact_states = (
+            tuple(state for state in self._state if state.supports_compact_selector)
+            if compiled_flat_selector
+            else ()
+        )
+        state_key = (
+            support_spec
+            if compact_states
+            and support_spec is not None
+            and support_spec.kind is SupportKind.SHARED_COLUMNS
+            else key
+        )
         states = [
             state(
                 self.get(celsius),
                 self.get(diameters),
-                key,
+                state_key if state in compact_states else key,
                 shape,
                 shape_f,
                 additional_parameters=additional_parameters,
@@ -1176,6 +1197,9 @@ class Mechanism(Parameterized):
 
         self.DE: dict[str, State] = torch.nn.ModuleDict(
             {state._name: state for state in states}
+        )
+        self._compact_selector_states = tuple(
+            state._name for state in states if type(state) in compact_states
         )
 
         # Insertion-time ``ic`` is the sole high-priority state override.
@@ -1436,7 +1460,8 @@ class Mechanism(Parameterized):
 
         if self.support_spec is None:
             return None
-        preserves_population_axis = self.support_spec.preserves_population_axis
+        previous_spec = self.support_spec
+        preserves_population_axis = previous_spec.preserves_population_axis
         key = self.key
         if (
             key is not None
@@ -1460,6 +1485,19 @@ class Mechanism(Parameterized):
             self.support_spec = self.support_spec.with_population_axis()
         self.support_map = SupportMap(self.support_spec)
         self._support_key_values_valid = True
+
+        compact_states = getattr(self, "_compact_selector_states", ())
+        if compact_states:
+            if self.support_spec.kind is SupportKind.SHARED_COLUMNS:
+                state_key = self.support_spec
+            elif self.support_spec != previous_spec:
+                # A standalone state-dict load may replace a same-shaped
+                # selector with a placement that no longer shares columns.
+                state_key = key.detach().cpu().tolist() if torch.is_tensor(key) else key
+            else:
+                return self.support_spec
+            for name in compact_states:
+                self.DE[name].key = state_key
         return self.support_spec
 
     def get(self, tensor):

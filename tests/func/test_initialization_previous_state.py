@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from types import MethodType
+
 import pytest
 import torch
 
 import dendra as dn
+from dendra.func._population import make_functional
 from dendra.models.mechanisms import Mechanism, State
 from tests.func.test_functional_initialization import (
     _assert_tensor_snapshot,
@@ -100,6 +103,40 @@ def test_partial_state_uses_captured_previous_state_without_replacing_ic(check_p
     )
     torch.testing.assert_close(actual.state["mechanisms"][PROBE]["x"], inputs.states[X])
     torch.testing.assert_close(actual.state["mechanisms"][PROBE]["y"], inputs.states[Y])
+
+
+@pytest.mark.parametrize("check_purity", (False, True))
+def test_previous_state_is_captured_before_authored_preparation_cache_hook(
+    check_purity,
+):
+    def clear_jit_cache(integrator):
+        integrator.cache_clears += 1
+        # The first clear configures the execution clone. The second clear
+        # configures that same private clone for preparation after capture.
+        if integrator.cache_clears == 2:
+            with torch.no_grad():
+                integrator.mech.mechanisms[PROBE].x.add_(0.5)
+        return type(integrator).clear_jit_cache(integrator)
+
+    model = _model()
+    native_x = model.mech.mechanisms[PROBE].x
+    expected_x = native_x.detach().clone()
+    model.integrator.cache_clears = 0
+    model.integrator.clear_jit_cache = MethodType(clear_jit_cache, model.integrator)
+
+    with dn.ctx(CHECK_PURITY=check_purity):
+        functional, tensors = make_functional(
+            model, dt=0.025, _defer_execution_storage=True
+        )
+        initialized = functional.initialize(
+            tensors.parameters, tensors.constants, tensors.initialization, state={}
+        )
+
+    preparation_x = functional._preparation.population.mech.mechanisms[PROBE].x
+    torch.testing.assert_close(preparation_x, expected_x + 0.5, rtol=0, atol=0)
+    torch.testing.assert_close(native_x, expected_x, rtol=0, atol=0)
+    voltage = initialized.state["integrator"]["v"]
+    torch.testing.assert_close(voltage, torch.full_like(voltage, -53.0), rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("check_purity", (False, True))

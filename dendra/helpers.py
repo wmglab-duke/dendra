@@ -88,12 +88,11 @@ class ctx(contextlib.ContextDecorator):
       ``.data``, NumPy/DLPack aliases, or raw storage can bypass mutation-version
       tracking; ``"strict"`` can diagnose frozen-contract corruption, but such
       writes remain unsupported for mutable workspace inputs.
-    - ``NATIVE_EXTENSION_POLICY`` (str): policy for optional native accelerator
-      extensions. ``"fallback"`` (default) silently uses the correct portable
-      implementation when a native extension cannot load or launch, ``"warn"``
-      emits a warning before falling back, and ``"require"`` raises instead of
-      permitting a silent performance-path change. The policy is enforced only
-      when a native accelerator path is eligible; CPU execution is unaffected.
+    - ``NATIVE_EXTENSION_POLICY`` (str): policy for optional native extensions.
+      ``"fallback"`` (default) uses the portable implementation when a native
+      extension is unavailable, ``"warn"`` emits a warning before using it, and
+      ``"require"`` raises. The policy applies when execution is eligible for
+      the extension.
     - ``TF32`` is available but typically not toggled here.
 
     Example

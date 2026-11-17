@@ -135,7 +135,10 @@ class SourceBinding:
             for binding in population_plan._geometry_bindings
             for path in binding.module_paths
         )
-        if self.slot in explicit_slots and self.slot in population_plan._base_mapping:
+        if (
+            self.slot in explicit_slots
+            and self.slot in population_plan._transition_slot_names
+        ):
             self._kind = "mapping"
             return
         raise FunctionalizationError(

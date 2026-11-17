@@ -1,10 +1,14 @@
 import hashlib
 import math
 import warnings
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache
 from numbers import Real
 from typing import Any, Dict, Literal
 
 import torch
+from torch.fx.experimental.proxy_tensor import get_proxy_mode
 
 from ...helpers import current_native_extension_policy
 from ...utils.tensor_ops import _logical_tensor_bytes
@@ -52,6 +56,7 @@ from ._event_delivery import (
     _enqueue_dense_values,
     _fixed_delay_indices,
     connection_event_counts,
+    delay_interpolation,
     dense_due,
     dense_fixed_delay_transition,
     dense_interpolated_delay_transition,
@@ -78,6 +83,85 @@ from ._tensor_schedules import netcon_tensor_schedule, resolve_schedule_values
 from .netstim import NetStim
 from .spiking import threshold_transition
 from .utils import make_getattr
+
+_event_delay_tap_cache = ContextVar("_event_delay_tap_cache", default=None)
+
+
+@contextmanager
+def _event_delay_tap_scope(enabled):
+    """Own differentiable delay materializations for one native rollout."""
+    token = _event_delay_tap_cache.set({} if enabled else None)
+    try:
+        yield
+    finally:
+        if enabled:
+            _event_delay_tap_cache.get().clear()
+        _event_delay_tap_cache.reset(token)
+
+
+@lru_cache(maxsize=None)
+def _cpu_two_tap_enqueue_for_policy(policy):
+    from ._two_tap_enqueue import get_cpu_two_tap_enqueue
+
+    try:
+        return get_cpu_two_tap_enqueue()
+    except Exception as error:
+        message = f"NetCon native CPU two-tap enqueue is unavailable. Cause: {error!r}."
+        if policy == "require":
+            raise RuntimeError(
+                f"{message} PyTorch fallback is disabled by "
+                "NATIVE_EXTENSION_POLICY='require'."
+            ) from error
+        if policy == "warn":
+            warnings.warn(
+                f"{message} Falling back to PyTorch.", RuntimeWarning, stacklevel=3
+            )
+        return None
+
+
+def _supports_cpu_two_tap_enqueue(queue, slot, weights, gates):
+    return (
+        not torch.compiler.is_compiling()
+        and _event_delay_tap_cache.get() is not None
+        and type(queue) is torch.Tensor
+        and queue.layout == torch.strided
+        and queue.ndim == 2
+        and queue.numel() > 0
+        and queue.device.type == "cpu"
+        and queue.dtype in (torch.float32, torch.float64)
+        and torch.autograd.forward_ad._current_level < 0
+        and not torch._C._are_functorch_transforms_active()
+        and not torch.is_autocast_enabled("cpu")
+        and get_proxy_mode() is None
+        and torch._C._len_torch_dispatch_stack() == 0
+        and torch._C._len_torch_function_stack() == 0
+        and type(slot) is torch.Tensor
+        and slot.device == queue.device
+        and slot.dtype == torch.long
+        and slot.numel() == 1
+        and slot.is_contiguous()
+        and type(weights) in (torch.Tensor, torch.nn.Parameter)
+        and type(gates) is torch.Tensor
+        and weights.ndim == 1
+        and gates.shape == weights.shape
+        and weights.dtype == gates.dtype == queue.dtype
+        and weights.device == gates.device == queue.device
+        and weights.is_contiguous()
+        and gates.is_contiguous()
+        and not weights.is_neg()
+        and not gates.is_neg()
+    )
+
+
+def _validate_delay_upper_bound_ms(bound: float | None) -> float | None:
+    if bound is None:
+        return None
+    if isinstance(bound, bool) or not isinstance(bound, Real):
+        raise TypeError("delay_upper_bound_ms must be a real scalar or None.")
+    bound = float(bound)
+    if not math.isfinite(bound) or bound < 0:
+        raise ValueError("delay_upper_bound_ms must be finite and non-negative.")
+    return bound
 
 
 def _handle_native_bitpack_failure(operation: str, exc: BaseException | None) -> bool:
@@ -1676,6 +1760,8 @@ class NetCon(Referency):
         dtype=None,
         pre_device=None,
         pre_dtype=None,
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Parameters
@@ -1733,9 +1819,13 @@ class NetCon(Referency):
             Name of the attribute on ``pre`` to use as the spiking variable when
             ``pre`` is not a :class:`NetStim`. Defaults to ``"v"``.
         max_delay : float, optional
-            Optional maximum delay (ms). If provided, the internal delay buffer
-            depth is set to ``int(max_delay / dt) + 1``; otherwise it is inferred
-            from the maximum delay in ``delay``.
+            Legacy delay buffer limit (ms). If provided, the legacy depth is
+            ``int(max_delay / dt) + 1``; otherwise it is inferred from ``delay``.
+        delay_upper_bound_ms : float, optional
+            Upper bound on physical delays over all parameter values used during
+            simulation. Allows sizing buffers for hard routing and two-tap delay
+            interpolation, including the next-step minimum and upper tap.
+            Three-tap differentiation retains the legacy buffer depth.
         track_events : bool, optional
             If True, allocate and maintain the historical ``event_queue`` used
             for per-connection delivery introspection. If False (default), skip
@@ -1797,6 +1887,13 @@ class NetCon(Referency):
 
         self.dt = torch.tensor(dt, device=self.device, dtype=self.dtype)
         self.max_delay = max_delay
+        self.delay_upper_bound_ms = _validate_delay_upper_bound_ms(delay_upper_bound_ms)
+        if (
+            self.delay_upper_bound_ms is not None
+            and max_delay is not None
+            and self.delay_upper_bound_ms > max_delay
+        ):
+            raise ValueError("delay_upper_bound_ms exceeds max_delay.")
         self.track_events = bool(track_events)
         if delay_backend not in ("dense", "sparse_calendar", "bitpacked_history"):
             raise ValueError(
@@ -1820,6 +1917,7 @@ class NetCon(Referency):
 
         self.delay_ms = delay
         delay = delay.init().w
+        self._validate_delay_bound(delay)
 
         if pre_var is None:
             pre_var = "v"
@@ -2594,27 +2692,33 @@ class NetCon(Referency):
         return self
 
     def _compute_max_delay_steps(self):
-        """
-        Compute the depth (in steps) of the internal delay line.
-
-        If ``max_delay`` is provided at construction, this method simply
-        computes ``int(max_delay / dt) + 1``. Otherwise it uses the maximum
-        integer delay in ``self.delay_steps`` if present, defaulting to 1
-        when no delays exist.
-
-        Returns
-        -------
-        int
-            Maximum number of steps in the delay buffer.
-        """
+        """Size the ring in steps, reserving every tap allowed by the bound."""
+        bound = getattr(self, "delay_upper_bound_ms", None)
+        flags = getattr(self, "train_flags", None)
+        # The three-tap transition can route its first tap into the just-cleared
+        # row. It arrives a full ring later, so that mode keeps its legacy depth.
+        if bound is not None and not (flags and flags[1] and flags[3] == 3):
+            bound_steps = (self.dt.new_tensor(bound) / self.dt).item()
+            if not math.isfinite(bound_steps):
+                raise ValueError("delay_upper_bound_ms must be representable in steps.")
+            # Use the delivery dtype and round up conservatively. Reserve the
+            # next-step minimum, the upper interpolation tap, and row zero.
+            return max(1, math.ceil(bound_steps)) + 2
         if self.max_delay is not None:
             return int(self.max_delay / self.dt.item()) + 1
-        else:
-            return (
-                int(self.delay_steps.max().item()) + 1
-                if len(self.delay_steps) > 0
-                else 1
-            )
+        return int(self.delay_steps.max().item()) + 1 if len(self.delay_steps) else 1
+
+    def _validate_delay_bound(self, delays: torch.Tensor) -> None:
+        bound = getattr(self, "delay_upper_bound_ms", None)
+        if bound is None:
+            return
+        with torch.no_grad():
+            valid = (torch.isfinite(delays) & (delays >= 0) & (delays <= bound)).all()
+            if not bool(valid):
+                raise ValueError(
+                    "NetCon delays must be finite, non-negative, and at most "
+                    f"delay_upper_bound_ms={bound!r} ms."
+                )
 
     def _rebuild_dense_delay_metadata(self):
         """Precompute integer-delay routing metadata for inference.
@@ -3473,6 +3577,90 @@ class NetCon(Referency):
             self._ensure_source_history_conn_source_pos(),
         )
 
+    def _rollout_delay_taps(
+        self, delays, *, dtype, taps, sigma, flat_destinations=False
+    ):
+        if torch.compiler.is_compiling():
+            return None
+        cache = _event_delay_tap_cache.get()
+        if (
+            cache is None
+            or type(delays) not in (torch.Tensor, torch.nn.Parameter)
+            or type(self.dt) is not torch.Tensor
+            or type(taps) is not int
+            or type(sigma) not in (float, int)
+            or torch.is_inference(delays)
+            or torch.is_inference(self.dt)
+            or torch.autograd.forward_ad._current_level >= 0
+            or torch._C._are_functorch_transforms_active()
+        ):
+            return None
+
+        key = id(self)
+        dt = self.dt
+        post_idx = self.post_idx if flat_destinations else None
+        if flat_destinations and (
+            type(post_idx) is not torch.Tensor or torch.is_inference(post_idx)
+        ):
+            return None
+        device_type = delays.device.type
+        autocast_dtype = (
+            torch.get_autocast_dtype(device_type)
+            if torch.is_autocast_enabled(device_type)
+            else None
+        )
+        signature = (
+            delays._version,
+            dt._version,
+            delays.requires_grad,
+            dt.requires_grad,
+            delays.is_leaf,
+            dt.is_leaf,
+            dtype,
+            taps,
+            sigma,
+            torch.is_grad_enabled(),
+            torch.is_inference_mode_enabled(),
+            autocast_dtype,
+            None
+            if post_idx is None
+            else (post_idx._version, self.max_delay_steps, self._syn_numel),
+        )
+        entry = cache.get(key)
+        if entry is not None:
+            old_delays, old_dt, old_post_idx, old_signature, prepared = entry
+            if (
+                delays is old_delays
+                and dt is old_dt
+                and post_idx is old_post_idx
+                and signature == old_signature
+            ):
+                return prepared
+
+        prepared = delay_interpolation(delays, dt, dtype=dtype, taps=taps, sigma=sigma)
+        if flat_destinations:
+            offsets, _ = prepared
+            depth, width = self.max_delay_steps, self._syn_numel
+            if (
+                post_idx.shape == offsets.shape
+                and post_idx.dtype == torch.long
+                and post_idx.device == offsets.device
+                and bool(((post_idx >= 0) & (post_idx < width)).all())
+            ):
+                lower = offsets.remainder(depth) * width + post_idx
+                upper = (lower + width).remainder(depth * width)
+                prepared = (*prepared, lower.contiguous(), upper.contiguous())
+        cache[key] = delays, dt, post_idx, signature, prepared
+
+        if prepared[1].requires_grad:
+            # Callbacks can differentiate a prefix and then continue the model.
+            # Its materialization may have been consumed, even if inputs match.
+            def invalidate(_grad):
+                cache.pop(key, None)
+
+            prepared[1].register_hook(invalidate)
+        return prepared
+
     def _source_history_build_delivery_from_history(
         self,
         cur_idx: torch.Tensor,
@@ -3489,6 +3677,12 @@ class NetCon(Referency):
         if not diff_weights:
             wvals = wvals.detach()
         floating = self._source_history_diff_spiking_enabled()
+        delays = self.delay_ms().to(self.dtype) if diff_delays else None
+        delay_taps = (
+            self._rollout_delay_taps(delays, dtype=wvals.dtype, taps=taps, sigma=sigma)
+            if diff_delays
+            else None
+        )
         return source_history_project(
             self.source_gate_history if floating else self.spike_history_packed,
             cur_idx,
@@ -3502,10 +3696,11 @@ class NetCon(Referency):
             word_idx=self.bitpack_conn_word_idx,
             bit_mask=self.bitpack_conn_bit_mask,
             delay_steps=self.inference_delay_steps,
-            delays=self.delay_ms().to(self.dtype) if diff_delays else None,
+            delays=delays,
             dt=self.dt,
             taps=taps,
             sigma=sigma,
+            delay_taps=delay_taps,
             _owned_output=True,
         )
 
@@ -3714,14 +3909,14 @@ class NetCon(Referency):
         post_payload = self.post_idx.index_select(0, active)
         self._append_sparse_payloads(future_slots, post_payload, values)
 
-    def _rebuild_delay_buffers(self):
+    def _rebuild_delay_buffers(self, *, update_delay_steps=True):
         """
         Rebuild delay-related buffers from the current delay parameters.
 
         This is called by :meth:`initialize` when ``reinit_delays=True``.
         It:
 
-        * recomputes integer delay steps from ``delay_ms()`` and ``dt``,
+        * recomputes integer delay steps from ``delay_ms()`` and ``dt`` if requested,
         * recomputes ``max_delay_steps``,
         * reallocates the delivery buffer and, when event tracking is enabled,
           the event queue to match the new depth, and
@@ -3729,8 +3924,11 @@ class NetCon(Referency):
           :meth:`_align_buffer_devices`.
         """
         with torch.no_grad():
-            delay_steps = (self.delay_ms() / self.dt.to(self.dtype)).round().long()
-            self.delay_steps.copy_(delay_steps.flatten().to(self.device))
+            if update_delay_steps:
+                delays = self.delay_ms()
+                self._validate_delay_bound(delays)
+                delay_steps = (delays / self.dt.to(self.dtype)).round().long()
+                self.delay_steps.copy_(delay_steps.flatten().to(self.device))
 
             self.max_delay_steps = self._compute_max_delay_steps()
             self._rebuild_dense_delay_metadata()
@@ -3928,6 +4126,17 @@ class NetCon(Referency):
         )
         try:
             self._validate_strict_source_history_policy()
+            if (
+                getattr(self, "delay_upper_bound_ms", None) is not None
+                and self._compute_max_delay_steps() != self.max_delay_steps
+            ):
+                if self._event_delivery_initialized:
+                    # Switching between legacy and bounded depths cannot reuse
+                    # existing pending deliveries. Let initialize own the reset.
+                    self._mode_requires_initialize = True
+                    self.advance = self._advance_requires_mode_initialize
+                else:
+                    self._rebuild_delay_buffers(update_delay_steps=False)
             if self._mode_requires_initialize:
                 # Validate strict source-history policy now, but do not replace
                 # the fail-closed advance sentinel or reshape live pending
@@ -4698,7 +4907,14 @@ class NetCon(Referency):
             )
             self.global_step = (self.global_step + 1).detach()
 
-    def advance_diff(self):
+    def advance_compiled(self):
+        """Use the native two-tap kernel for eligible standard training steps."""
+        advance = self.advance
+        if getattr(advance, "__func__", None) is NetCon.advance_diff:
+            return advance(_fuse_enqueue=True)
+        return advance()
+
+    def advance_diff(self, *, _fuse_enqueue=False):
         """
         Advance the connection state by one time step (differentiable path).
 
@@ -4818,19 +5034,47 @@ class NetCon(Referency):
             self.current_time_step = transition.slot.detach()
             self.global_step = transition.global_step.detach()
             return
+        queue = self.delivery_buffer
+        delays = self.delay_ms()
+        enqueue = None
+        if (
+            _fuse_enqueue
+            and taps == 2
+            and queue.shape == (self.max_delay_steps, self._syn_numel)
+            and _supports_cpu_two_tap_enqueue(queue, cur_idx, wvals, gate)
+        ):
+            enqueue = _cpu_two_tap_enqueue_for_policy(current_native_extension_policy())
+        delay_taps = self._rollout_delay_taps(
+            delays,
+            dtype=queue.dtype,
+            taps=taps,
+            sigma=sigma,
+            flat_destinations=enqueue is not None,
+        )
+        if enqueue is not None and delay_taps is not None and len(delay_taps) == 4:
+            _, fraction, lower, upper = delay_taps
+            self.delivery_buffer = enqueue(
+                queue, cur_idx, wvals, gate, fraction, lower, upper
+            )
+            self.current_time_step = (
+                (cur_idx + 1).remainder(self.max_delay_steps).detach()
+            )
+            self.global_step = (gs + 1).detach()
+            return
         transition = dense_interpolated_delay_transition(
             self.delivery_buffer,
             cur_idx,
             gs,
             wvals,
             gate,
-            self.delay_ms(),
+            delays,
             self.dt,
             post_idx=self.post_idx,
             depth=self.max_delay_steps,
             width=self._syn_numel,
             taps=taps,
             sigma=sigma,
+            delay_taps=delay_taps,
             _clone_once=True,
         )
         self.delivery_buffer = transition.queue
@@ -5179,7 +5423,7 @@ class NetCon(Referency):
 
     def _advance_requires_mode_initialize(self):
         raise RuntimeError(
-            "NetCon train/eval mode changed across incompatible runtime layouts. "
+            "NetCon configuration changed across incompatible runtime layouts. "
             "Call initialize() before advancing this connection."
         )
 
@@ -5338,6 +5582,7 @@ class NetCon(Referency):
                 raise ValueError(
                     f"NetCon {name} must preserve the initialized connection shape."
                 )
+        self._validate_delay_bound(delays)
         if self.training and self.train_flags is not None and self.train_flags[1]:
             with torch.no_grad():
                 steps = delays.to(dtype=self.dtype) / self.dt.to(
@@ -5409,6 +5654,14 @@ class NetCon(Referency):
         * This method is invoked automatically by higher-level simulation
           loops in Dendra (e.g., :class:`dendra.models.networks.Network.initialize`).
         """
+        resize_for_bound = (
+            getattr(self, "delay_upper_bound_ms", None) is not None
+            and self._compute_max_delay_steps() != self.max_delay_steps
+        )
+        if resize_for_bound and not clear_deliveries:
+            raise ValueError(
+                "Changing NetCon delay capacity requires clear_deliveries=True."
+            )
         self._event_delivery_initialized = False
         if self.training:
             if self._use_source_history_training_runtime():
@@ -5436,8 +5689,14 @@ class NetCon(Referency):
         self.zero(clear_delivery_buffers=clear_deliveries)
         self.weight.init(reinit=reinit_weights)
         self.delay_ms.init(reinit=reinit_delays)
-        if reinit_delays:
-            self._rebuild_delay_buffers()
+        if (
+            not reinit_delays
+            and getattr(self, "delay_upper_bound_ms", None) is not None
+        ):
+            with torch.no_grad():
+                self._validate_delay_bound(self.delay_ms())
+        if reinit_delays or resize_for_bound:
+            self._rebuild_delay_buffers(update_delay_steps=reinit_delays)
             if self.training:
                 if self._use_source_history_training_runtime():
                     self._ensure_source_history_training_storage(clear=True)

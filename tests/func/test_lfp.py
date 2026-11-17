@@ -295,10 +295,10 @@ def test_cpp_lfp_matches_eager_and_scan_preserves_field_gradients(
     packed_callback_keys = []
     original_from_tree = _PackedCarryLayout.from_tree.__func__
 
-    def observe_layout(cls, tree):
+    def observe_layout(cls, tree, **options):
         if isinstance(tree, tuple) and len(tree) == 2 and isinstance(tree[1], dict):
             packed_callback_keys.append(tuple(tree[1]))
-        return original_from_tree(cls, tree)
+        return original_from_tree(cls, tree, **options)
 
     monkeypatch.setattr(_PackedCarryLayout, "from_tree", classmethod(observe_layout))
     model = _model(batch=(2,))

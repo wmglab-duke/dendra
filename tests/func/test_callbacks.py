@@ -613,6 +613,57 @@ def test_functional_recorder_selection_matches_imperative_recorder():
     torch.testing.assert_close(results["indices_ignored"]["v"], expected_max)
 
 
+@pytest.mark.parametrize("node_indices", (None, (3, 1, 3)))
+def test_functional_recorder_reductions_match_trace_gradients_and_checkpoints(
+    node_indices,
+):
+    _model, functional, tensors = _functional_case()
+    voltage = tensors.state["integrator"]["v"].detach().clone().requires_grad_()
+    state = _replace_voltage(tensors.state, voltage)
+    configurations = {
+        "trace": FunctionalRecorder(["v"], node_indices=node_indices),
+        "sum": FunctionalRecorder(["v"], node_indices=node_indices, reduction="sum"),
+        "mean": FunctionalRecorder(["v"], node_indices=node_indices, reduction="mean"),
+    }
+    callbacks = functional.make_callbacks(configurations)
+    prepared = functional.prepare(tensors.parameters, tensors.constants)
+    _final, auxiliary = functional.rollout(
+        tensors.parameters, prepared, state, steps=4, callbacks=callbacks
+    )
+    observed = auxiliary["callbacks"]
+    trace = observed["trace"]["v"]
+    for name, expected in (("sum", trace.sum(dim=-1)), ("mean", trace.mean(dim=-1))):
+        compact = observed[name]["v"]
+        assert compact.shape == trace.shape[:-1]
+        torch.testing.assert_close(compact, expected, rtol=0, atol=0)
+        actual_grad = torch.autograd.grad(
+            compact.square().sum(), voltage, retain_graph=True
+        )[0]
+        expected_grad = torch.autograd.grad(
+            expected.square().sum(), voltage, retain_graph=True
+        )[0]
+        torch.testing.assert_close(actual_grad, expected_grad)
+        assert actual_grad.abs().sum() > 0
+
+    checkpoint = callbacks.export_state(observed.state)
+    entries = {
+        item["name"]: item["callback"]["fields"]
+        for item in checkpoint["configuration"]["callbacks"]
+    }
+    assert "reduction" not in entries["trace"]
+    assert entries["sum"]["reduction"] == "sum"
+    assert entries["mean"]["reduction"] == "mean"
+    restored = callbacks.restore_state(checkpoint)
+    assert restored["sum"] == observed.state["sum"]
+
+    configurations["sum"] = FunctionalRecorder(
+        ["v"], node_indices=node_indices, reduction="mean"
+    )
+    incompatible = functional.make_callbacks(configurations)
+    with pytest.raises(dn.func.FunctionalizationError, match="configuration"):
+        incompatible.restore_state(checkpoint)
+
+
 def test_functional_recorder_zero_step_lifecycle_matches_runner_families():
     _source, functional, tensors = _functional_case()
     callbacks = functional.make_callbacks({"trace": FunctionalRecorder(["v"])})

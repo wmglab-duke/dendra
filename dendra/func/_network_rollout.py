@@ -15,6 +15,8 @@ from ._callbacks import (
     _collect_callback_emissions,
     _concatenate_callback_parts,
     _host_callback_parts,
+    _is_builtin_callback,
+    _owned_callback_hooks,
     _update_callback_values,
 )
 from ._execution import (
@@ -26,7 +28,7 @@ from ._execution import (
 )
 from ._inputs import Inputs, _population_inputs, _RuntimeInputs
 from ._netstim import NetStimDraw, NetStimOutputs
-from ._network import _schema, _tensor_paths, _validate_tree
+from ._network import FunctionalNetwork, _schema, _tensor_paths, _validate_tree
 from ._network_bindings import _canonicalize_mapping_tree
 from ._network_draws import _legacy_population_noise
 from ._recording import _host_recording, _recording_span, _require_recording_host
@@ -40,6 +42,7 @@ from ._runners import (
     _runtime_extra_checkpoint_binding,
     _validate_chunklength,
 )
+from ._state_projection import _plain_projection_context, _plain_state_tree
 from ._stimulation_clock import _accepted_bank_clock, _sampling_time_tape
 from ._stimuli import StimulusTensors
 from ._tensor_contracts import _tensor_tree_binding
@@ -601,7 +604,61 @@ class CompiledNetworkChunk:
             detached_state_paths=detached,
         )
 
-    def _values(self, parameters, prepared, state, tape, callbacks, callback_state):
+    def _prepare_scan_enqueue(self, parameters, prepared, state, tape):
+        """Select optional enqueue lowering at the owned CPU scan boundary."""
+        if (
+            self._execution != "scan"
+            or self._functional.device.type != "cpu"
+            or not torch.is_grad_enabled()
+            or torch.is_inference_mode_enabled()
+            or torch.is_autocast_enabled("cpu")
+            or not _plain_projection_context(check_saved_tensors=False)
+        ):
+            return prepared
+        from ._scan_inductor import _uses_local_scan_inductor
+
+        if not _uses_local_scan_inductor(self._options):
+            return prepared
+        leaves = tuple(
+            value for _, value in _tensor_paths((parameters, prepared, state, tape))
+        )
+        if not _plain_state_tree(leaves, allow_parameters=True):
+            return prepared
+
+        connections = prepared["connections"]
+        synapses = connections["synapses"]
+        fused = {}
+        for name, projection in self._functional.synapses.items():
+            delay_taps = synapses[name].get("delay_taps")
+            if delay_taps is not None:
+                taps = projection._fused_delay_taps(delay_taps)
+                if taps is not None:
+                    fused[name] = {**synapses[name], "delay_taps": taps}
+        if not fused:
+            return prepared
+
+        from dendra.helpers import current_native_extension_policy
+        from dendra.models.networks.netcon import _cpu_two_tap_enqueue_for_policy
+
+        if _cpu_two_tap_enqueue_for_policy(current_native_extension_policy()) is None:
+            return prepared
+        return {
+            **prepared,
+            "connections": {**connections, "synapses": {**synapses, **fused}},
+        }
+
+    def _values(
+        self,
+        parameters,
+        prepared,
+        state,
+        tape,
+        callbacks,
+        callback_state,
+        *,
+        host_carry=None,
+        retain_carry=False,
+    ):
         transform = torch._C._are_functorch_transforms_active()
         forward_ad = torch.autograd.forward_ad._current_level >= 0
         disabled = self._options.get("disable", False)
@@ -664,8 +721,15 @@ class CompiledNetworkChunk:
             "auxiliary": _auxiliary(self._functional, state, scan=True),
         }
         carries = {} if callback_state is None else callback_state.carries
+        carry_options = (
+            {}
+            if host_carry is None
+            else {"host_carry": host_carry, "retain_carry": retain_carry}
+        )
         try:
-            loop, carries, emitted = kernel(parameters, prepared, loop, carries, tape)
+            loop, carries, emitted = kernel(
+                parameters, prepared, loop, carries, tape, **carry_options
+            )
         except Exception as error:
             if self._execution == "while":
                 raise FunctionalizationError(
@@ -732,6 +796,7 @@ class CompiledNetworkChunk:
             values = functional._validate_prepared(prepared, parameters)
             with nullcontext() if functional.training else torch.no_grad():
                 tape = _with_sampling_times(functional, tape, state, self.steps)
+                values = self._prepare_scan_enqueue(parameters, values, state, tape)
                 state, auxiliary, callback_state, emitted = self._values(
                     parameters, values, state, tape, callbacks, callback_state
                 )
@@ -754,6 +819,26 @@ def _restore_report_on_error(chunk):
         if chunk is not None:
             chunk._report_state.report = previous
         raise
+
+
+def _can_share_scan_preparation(chunk, callbacks, callback_state, operands):
+    """Admit owned scan boundaries whose operands stay live across host spans."""
+    if (
+        chunk._options.get("disable", False)
+        or not isinstance(chunk._options.get("backend", "inductor"), str)
+        or not _plain_projection_context()
+    ):
+        return False
+    if callbacks is not None:
+        if not _owned_callback_hooks(callbacks) or not all(
+            _is_builtin_callback(plan.callback) for plan in callbacks._plans
+        ):
+            return False
+        operands = (*operands, callback_state.carries)
+    # Network packets can contain named tuples, for example event schedules.
+    # Inspect the tensor leaves without stripping their names or identities.
+    leaves = tuple(value for _, value in _tensor_paths(operands))
+    return _plain_state_tree(leaves, allow_parameters=True)
 
 
 @_host_recording
@@ -805,15 +890,15 @@ def run(
     )
     if checkpoint_every is None:
         chunklength = _recording_span(callbacks, chunklength)
-    automatic_draws = (
-        draws is None
-        and (
-            functional.netstim is not None
-            or any(
-                plan._runtime_draw_plan.has_noise or plan._poisson_plan is not None
-                for plan in functional.populations.values()
-            )
+    needs_draws = draws is None and (
+        functional.netstim is not None
+        or any(
+            plan._runtime_draw_plan.has_noise or plan._poisson_plan is not None
+            for plan in functional.populations.values()
         )
+    )
+    automatic_draws = (
+        needs_draws
         and tape.get("netstim") is None
         and not any(
             values.noise is not None
@@ -898,6 +983,47 @@ def run(
         or functional.populations[name].extra.enabled
     )
 
+    # Automatic/legacy samplers and runtime stimulus providers can execute
+    # authored code between spans. Keep their validation boundaries, as well
+    # as those of checkpoint replay, where preparation uses replay operands.
+    owned_scan = (
+        steps > min(horizon, kernel_width)
+        and compiled_chunk is not None
+        and compiled_chunk._execution == "scan"
+        and not checkpoint_active
+        and not extra_plans
+        and not _recording_sessions
+        and (
+            "draws" in tape or (not needs_draws and _owned_runtime_sampling(functional))
+        )
+        and _can_share_scan_preparation(
+            compiled_chunk,
+            callbacks,
+            callback_state,
+            (parameters, constants, state, tape),
+        )
+    )
+    share_preparation = owned_scan and steps > horizon
+    host_carry = None
+    if (
+        owned_scan
+        and functional.training
+        and torch.is_grad_enabled()
+        and functional.device.type == "cpu"
+        and type(functional) is FunctionalNetwork
+        and all(
+            getattr(getattr(functional, name), "__func__", None) is original
+            for name, original in _OWNED_SCAN_HOST_CHECKS
+        )
+    ):
+        from ._scan_inductor import _uses_local_scan_inductor
+        from ._scan_tree import _ScanHostCarry
+
+        if _uses_local_scan_inductor(compiled_chunk._options):
+            host_carry = _ScanHostCarry()
+    shared_values = None
+    event_taps = None
+
     def span(
         parameters_in,
         constants_in,
@@ -909,6 +1035,7 @@ def run(
         span_steps,
         span_start,
     ):
+        nonlocal event_taps, shared_values
         if binding is not None and (
             _binding((public_parameters, public_constants)) != binding
             or _binding((public_inputs, tape)) != tape_binding
@@ -924,10 +1051,29 @@ def run(
             raise FunctionalizationError(
                 "Network runtime extra tensors changed after checkpoint forward"
             )
-        functional._validate_source()
-        functional._validate_parameters(parameters_in)
+        values = shared_values
+        if values is None:
+            functional._validate_source()
+            functional._validate_parameters(parameters_in)
         functional._validate_state(state_in)
-        values = functional._prepare_values(parameters_in, constants_in)
+        if values is None:
+            values = functional._prepare_values(
+                parameters_in, constants_in, event_taps=event_taps
+            )
+            if event_taps is None and not checkpoint_active and not share_preparation:
+                event_taps = {
+                    name: value["delay_taps"]
+                    for name, value in values["connections"]["synapses"].items()
+                    if "delay_taps" in value
+                }
+            if compiled_chunk is not None:
+                values = compiled_chunk._prepare_scan_enqueue(
+                    parameters_in, values, state_in, tape_in
+                )
+            if share_preparation:
+                # Keep the differentiable preparation graph local to this
+                # invocation. A later invocation gets fresh parameter values.
+                shared_values = values
         emitted_parts = (
             _host_callback_parts(callbacks, callback_in, [])
             if callbacks is not None
@@ -1015,8 +1161,22 @@ def run(
                 )
             else:
                 kernel = compiled_chunk._runner_chunk(stop - start)
+                carry_options = (
+                    {}
+                    if host_carry is None
+                    else {
+                        "host_carry": host_carry,
+                        "retain_carry": span_start + stop < steps,
+                    }
+                )
                 state_in, auxiliary_in, callback_in, emitted = kernel._values(
-                    parameters_in, values, state_in, selected, callbacks, callback_in
+                    parameters_in,
+                    values,
+                    state_in,
+                    selected,
+                    callbacks,
+                    callback_in,
+                    **carry_options,
                 )
             functional.check_overflow(state_in)
             if callbacks is not None:
@@ -1174,3 +1334,8 @@ def run(
 __all__ = ["NetworkRolloutInput", "CompiledNetworkChunk"]
 
 _OWNED_NETSTIM_DRAW_TAPE = sample_draw_tape
+
+_OWNED_SCAN_HOST_CHECKS = tuple(
+    (name, getattr(FunctionalNetwork, name))
+    for name in ("_validate_state", "_binding_frame_admitted", "check_overflow")
+)

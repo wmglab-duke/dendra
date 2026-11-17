@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 from torch.utils import _pytree as pytree
 
 import dendra as dn
+from dendra.models.mod import expsyn
+from dendra.models.networks import _event_cache
 from tests.networks.test_state_cache_translation import (
     EVENT_DELAYS,
     EVENT_WEIGHTS,
@@ -404,3 +408,219 @@ def test_cache_restore_rejects_overridden_native_cache_adapter():
         dn.func.FunctionalizationError, match="canonical initialize_from_state_cache"
     ):
         plan.normalize_cache(cache)
+
+
+def _ordered_dense_cache(dtype=torch.float64):
+    dt = 0.125
+    post = dn.Population(N=1, C=1, v_init=-65.0, dtype=dtype)
+    post.insert(expsyn.rename("ordered_cache_syn"), e=0.0, tau=1.0)
+    stim = dn.NetStim(N=4, dtype=dtype)
+    network = dn.Network(
+        {"post": post},
+        netstim=stim,
+        netcon_delay_backend="dense",
+        netcon_train_backend="dense",
+    )
+    network.connect_dense(
+        stim[:],
+        post[:],
+        post.mech.ordered_cache_syn,
+        threshold=None,
+        weight=torch.ones(4, dtype=dtype),
+        delay=torch.tensor([3, 2, 2, 3], dtype=dtype) * dt,
+    )
+    network.build(dt, max_delay_ms=2.0)
+    network.init_synapses()
+    connection = next(iter(network.synapses.values()))
+    connection.train()
+    connection.set_diff_config(
+        diff_weights=True,
+        diff_delays=True,
+        diff_spiking=False,
+        diff_scheduled_times=False,
+        train_delay_backend="dense",
+    )
+    connection.initialize(reinit_weights=False, reinit_delays=False)
+    connection.weight.w = torch.ones_like(connection.weight.w)
+    connection.delay_ms.w = connection.delay_ms.w.new_tensor([3, 2, 2, 3]) * dt
+
+    history = connection.weight.w.new_zeros(connection.max_delay_steps, 4)
+    large = 2.0 / torch.finfo(dtype).eps
+    history[0, 0] = 100.0
+    history[1, 1:3] = history.new_tensor([large, 1.0])
+    history[2, [0, 3]] = history.new_tensor([-large, 1.0])
+    history[-1, 0] = 200.0
+    cache = {
+        "backend": "dense",
+        "dt": dt,
+        "backend_state": {"gate_history": history, "history_layout": "age"},
+    }
+    return connection, cache, dt
+
+
+def _ordered_pending_reference(cache, weights, delays, post_idx, dt, template):
+    history = cache["backend_state"]["gate_history"]
+    delay_steps = (delays / dt).round().long().clamp_min(1)
+    flat = template.new_zeros(template.numel() + 1)
+    width = template.shape[1]
+    for age in range(1, history.shape[0]):
+        remaining = delay_steps - age
+        active = (remaining >= 0) & (history[age] != 0)
+        index = torch.where(active, remaining * width + post_idx, flat.numel() - 1)
+        values = torch.where(active, weights * history[age], 0)
+        if values.dtype in (torch.float16, torch.bfloat16):
+            flat = flat.index_put((index,), values, accumulate=True)
+        else:
+            flat = flat.scatter_add(0, index, values)
+    return flat[:-1].reshape_as(template)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+def test_dense_cache_accumulation_order_with_refreshed_parameters(dtype, monkeypatch):
+    restore_sparse = Mock(wraps=_event_cache._restore_sparse_gate_history)
+    monkeypatch.setattr(_event_cache, "_restore_sparse_gate_history", restore_sparse)
+    connection, cache, dt = _ordered_dense_cache(dtype)
+    plan, tensors = dn.func.make_functional_netcon(connection)
+    normalized = plan.normalize_cache(cache)
+    saved_cache = pytree.tree_map_only(torch.Tensor, torch.clone, (cache, normalized))
+    initial = plan.initial_state(tensors.state, t=0.0)
+    weights = tensors.weights.detach()
+    delays = tensors.delays.detach()
+    updates = [
+        (weights, delays),
+        (weights * 2, delays + dt * delays.new_tensor([0, 0, 0, -1])),
+    ]
+
+    expected = []
+    for weights, delays in updates:
+        pending = _ordered_pending_reference(
+            cache, weights, delays, connection.post_idx, dt, initial["delivery_buffer"]
+        )
+        restored = plan.restore_cache(
+            {
+                "weights": weights.clone().requires_grad_(),
+                "delays": delays.clone().requires_grad_(),
+            },
+            initial,
+            normalized,
+            t=0.0,
+        )["delivery_buffer"]
+        _equal(restored, pending)
+        assert not restored.requires_grad
+        expected.append(pending)
+
+    assert expected[0][1, 0] == 1.0
+    assert expected[1][0, 0] == 2.0
+    for (weights, delays), pending in zip(updates, expected, strict=True):
+        connection.weight.w = weights
+        connection.delay_ms.w = delays
+        connection.initialize_from_state_cache(cache)
+        _equal(connection.delivery_buffer, pending)
+    _equal((cache, normalized), saved_cache)
+    recipes = [call.args[1] for call in restore_sparse.call_args_list]
+    assert len(recipes) == 4
+    assert recipes[0] is recipes[1]
+    assert recipes[2] is recipes[3]
+
+
+def test_dense_cache_reloads_edited_gate_history():
+    connection, cache, dt = _ordered_dense_cache()
+    plan, tensors = dn.func.make_functional_netcon(connection)
+    normalized = plan.normalize_cache(cache)
+    initial = plan.initial_state(tensors.state, t=0.0)
+    parameters = {"weights": tensors.weights, "delays": tensors.delays}
+
+    def functional():
+        return plan.restore_cache(parameters, initial, normalized, t=0.0)[
+            "delivery_buffer"
+        ]
+
+    before = functional()
+    connection.initialize_from_state_cache(cache, rebuild_delays=False)
+    _equal(connection.delivery_buffer, before)
+    for history in (
+        cache["backend_state"]["gate_history"],
+        normalized.gate_history,
+    ):
+        history[1, 0] = 4.0
+        history[2, 3] = 0.0
+
+    expected = _ordered_pending_reference(
+        cache,
+        tensors.weights,
+        tensors.delays,
+        connection.post_idx,
+        dt,
+        initial["delivery_buffer"],
+    )
+    assert not torch.equal(before, expected)
+    _equal(functional(), expected)
+    connection.initialize_from_state_cache(cache, rebuild_delays=False)
+    _equal(connection.delivery_buffer, expected)
+
+
+def test_dense_event_cache_remains_compilable_and_mappable(monkeypatch):
+    restore_sparse = Mock(side_effect=AssertionError("Expected the tensor-only path"))
+    monkeypatch.setattr(_event_cache, "_restore_sparse_gate_history", restore_sparse)
+    connection, cache, dt = _ordered_dense_cache()
+    plan, tensors = dn.func.make_functional_netcon(connection)
+    normalized = plan.normalize_cache(cache)
+    initial = plan.initial_state(tensors.state, t=0.0)
+
+    def restore(weights, delays, history):
+        return plan.restore_cache(
+            {"weights": weights, "delays": delays},
+            initial,
+            normalized._replace(gate_history=history),
+            t=0.0,
+        )["delivery_buffer"]
+
+    expected = _ordered_pending_reference(
+        cache,
+        tensors.weights,
+        tensors.delays,
+        connection.post_idx,
+        dt,
+        initial["delivery_buffer"],
+    )
+    compiled = torch.compile(restore, backend="aot_eager", fullgraph=True)
+    _equal(compiled(tensors.weights, tensors.delays, normalized.gate_history), expected)
+    batched_history = torch.stack(
+        (normalized.gate_history, normalized.gate_history * -0.5)
+    )
+    actual = torch.vmap(restore, in_dims=(None, None, 0))(
+        tensors.weights, tensors.delays, batched_history
+    )
+    _equal(actual, torch.stack((expected, expected * -0.5)))
+    restore_sparse.assert_not_called()
+
+
+@pytest.mark.parametrize("dtype", (torch.float16, torch.bfloat16, torch.float64))
+def test_event_cache_uses_dense_restore_for_low_precision_or_dense_history(
+    dtype, monkeypatch
+):
+    restore_sparse = Mock(side_effect=AssertionError("Expected dense restoration"))
+    monkeypatch.setattr(_event_cache, "_restore_sparse_gate_history", restore_sparse)
+    connection, cache, dt = _ordered_dense_cache(dtype)
+    if dtype == torch.float64:
+        cache["backend_state"]["gate_history"].fill_(1.0)
+    plan, tensors = dn.func.make_functional_netcon(connection)
+    initial = plan.initial_state(tensors.state, t=0.0)
+    expected = _ordered_pending_reference(
+        cache,
+        tensors.weights,
+        tensors.delays,
+        connection.post_idx,
+        dt,
+        initial["delivery_buffer"],
+    )
+    actual = plan.restore_cache(
+        {"weights": tensors.weights, "delays": tensors.delays},
+        initial,
+        plan.normalize_cache(cache),
+        t=0.0,
+    )
+    _equal(actual["delivery_buffer"], expected)
+    connection.initialize_from_state_cache(cache, rebuild_delays=False)
+    _equal(connection.delivery_buffer, expected)
+    restore_sparse.assert_not_called()

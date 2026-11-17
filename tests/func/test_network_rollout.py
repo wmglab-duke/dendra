@@ -764,6 +764,76 @@ def test_cached_network_chunk_consumes_fresh_preparations_after_backward():
     assert not torch.equal(*voltages)
 
 
+def test_host_network_scan_prepares_once_and_keeps_inputs_fresh(monkeypatch):
+    model = _stim_network()
+    functional, tensors = dn.func.make_functional_network(model)
+    steps = 9
+    draws = functional.sample_runtime_draws(tensors.state, steps=steps)
+    callbacks = functional.make_callbacks({"trace": dn.func.Recorder("cell.v")})
+    chunk = functional.compile_rollout_chunk(3, execution="scan", backend="aot_eager")
+    validate_source = functional._validate_source
+    prepare_values = functional._prepare_values
+    counts = []
+    voltages = []
+
+    def run(parameters):
+        return functional.run(
+            parameters,
+            tensors.constants,
+            tensors.state,
+            steps=steps,
+            draws=draws,
+            chunklength=chunk.steps,
+            callbacks=callbacks,
+            compiled_chunk=chunk,
+        )
+
+    for scale in (0.7, 1.3):
+        parameters = _clone(tensors.parameters, detached=True)
+        (projection,) = parameters["synapses"].values()
+        weight = (scale * projection[_RAW_WEIGHT]).requires_grad_()
+        projection[_RAW_WEIGHT] = weight
+        expected, expected_aux = functional.prepare_and_rollout(
+            parameters,
+            tensors.constants,
+            tensors.state,
+            steps=steps,
+            draws=draws,
+            callbacks=callbacks,
+        )
+        calls = {"prepare": 0, "validate": 0}
+
+        def prepare(*args, **kwargs):
+            calls["prepare"] += 1
+            return prepare_values(*args, **kwargs)
+
+        def validate():
+            calls["validate"] += 1
+            validate_source()
+
+        with monkeypatch.context() as patch:
+            patch.setattr(functional, "_prepare_values", prepare)
+            patch.setattr(functional, "_validate_source", validate)
+            actual, actual_aux = run(parameters)
+        counts.append(calls)
+        _close(actual, expected)
+        voltage = actual_aux["callbacks"]["trace"]["cell.v"]
+        reference = expected_aux["callbacks"]["trace"]["cell.v"]
+        torch.testing.assert_close(voltage, reference)
+        (gradient,) = torch.autograd.grad(voltage.square().sum(), weight)
+        (expected_gradient,) = torch.autograd.grad(reference.square().sum(), weight)
+        torch.testing.assert_close(gradient, expected_gradient)
+        assert gradient.abs().sum() > 0
+        voltages.append(voltage)
+
+    assert counts == [{"prepare": 1, "validate": 2}] * 2
+    assert not torch.equal(*voltages)
+    name = next(iter(model.synapses))
+    model.synapses[name] = torch.nn.Identity()
+    with pytest.raises(dn.func.FunctionalizationError, match="bindings changed"):
+        run(tensors.parameters)
+
+
 def test_eval_network_scan_accepts_inference_owned_carry_and_recordings():
     model = _mixed_network()
     model.eval()
