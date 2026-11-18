@@ -1,3 +1,38 @@
+## v0.29.0 (2026-11-17)
+
+### Upgrading
+
+- Event delay interpolation now defaults to off. Pass `diff_delays=True` to
+  `set_synaptic_diff_config()` or `NetCon.set_diff_config()` to retain it.
+- Changing `max_delay_ms` on an already-built Network requires
+  `force_rebuild=True` on `build()` or `initialize()`.
+- Eligible flat regional placements now pass a compact, read-only
+  `SupportSpec` as `State.key`. Call `materialized_flat_indices()` for the
+  ordered indices, or set `supports_compact_selector=False` on a State class
+  whose hooks expect a Python list. See the [upgrade guide](docs/upgrading.rst).
+
+### Simulation and training
+
+- Train continuous connection delays with two-tap interpolation in native and
+  functional Networks, including cached starts. Use `delay_upper_bound_ms`
+  to shorten event queues for fully bounded fixed-delay and two-tap projections.
+- Speed up event delivery by reusing differentiable delay taps, restoring sparse
+  histories into an owned queue on eager CPU, and using an optional ordered
+  two-tap enqueue kernel with autograd on eligible native CPU JIT paths.
+- Reduce compiled Population setup memory by sharing eligible topology, state,
+  ion, and scratch storage, and deferring workspaces and tensors bound by later
+  calls. Eligible fresh inference runners defer copying the editable restart
+  snapshot. Mutable state remains independent across calls.
+- Reduce copying in CPU Inductor training scans by reusing eligible prepared
+  values and carried state across chunks and optimizing delay-queue operations
+  and reverse scans.
+- Speed up native initialization by refreshing only mechanisms with known
+  dependencies on changed parameters and keeping eligible CUDA purity checks
+  on-device. Avoid repeated CUDA history-flag reads in homogeneous
+  Dufort–Frankel stepping.
+- Use `reduction="sum"` or `reduction="mean"` on `dn.func.Recorder` to reduce
+  differentiably over the final compartment or support axis after selection.
+
 ## v0.28.2 (2026-11-10)
 
 - Fix an Apple Silicon (MPS) Inductor error when running compiled Networks

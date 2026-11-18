@@ -5,6 +5,8 @@ import math
 import os
 from collections.abc import Mapping
 from contextlib import nullcontext
+from inspect import signature
+from itertools import chain
 from typing import Dict, Literal, NamedTuple, Optional
 
 import torch
@@ -65,7 +67,12 @@ from ..stim.waveform._poisson import (
 )
 from ._connection_sampling import clone_connection_sampling_rng
 from ._population_cache import restore_population_cache_values
-from .netcon import ContinuousCon, NetCon
+from .netcon import (
+    ContinuousCon,
+    NetCon,
+    _event_delay_tap_scope,
+    _validate_delay_upper_bound_ms,
+)
 from .netstim import NetStim
 
 ConnRule = Literal[
@@ -77,6 +84,11 @@ ConnRule = Literal[
     "fixed_indegree",
     "fixed_outdegree",
 ]
+
+
+def _event_spec_delay_upper_bound(spec):
+    # Older serialized wiring declarations have no delay bound.
+    return spec[8] if len(spec) > 8 else None
 
 
 def to_flat_idx_torch(shape, idx, device):
@@ -1399,6 +1411,8 @@ class Network(RNGMixin):
         self.continuous_targets = {}
         self.dt = None
         self.built = False
+        self._built_max_delay_ms = None
+        self._synaptic_diff_configs = {}
         self._mode_requires_initialize = False
         self._detached_materializations_pending = False
 
@@ -1633,6 +1647,15 @@ class Network(RNGMixin):
     def __setstate__(self, state):
         """Restore owner references after the complete module graph is copied."""
         super().__setstate__(state)
+        self.__dict__.setdefault("_synaptic_diff_configs", {})
+        if "_built_max_delay_ms" not in state:
+            connections = chain(
+                self.synapses.values(), self.continuous_synapses.values()
+            )
+            connection = next(connections, None)
+            self._built_max_delay_ms = (
+                None if connection is None else connection.max_delay
+            )
         self._bind_runtime_clocks()
 
     def _bind_runtime_clocks(self):
@@ -1690,13 +1713,25 @@ class Network(RNGMixin):
         """In-place alias of :meth:`detach` that returns ``None``."""
         self.detach()
 
+    def _validate_live_event_delay_bounds(self):
+        for connection in self.synapses.values():
+            if (
+                getattr(connection, "delay_upper_bound_ms", None) is not None
+                and connection.train_flags is not None
+                and connection.train_flags[1]
+            ):
+                with torch.no_grad():
+                    connection._validate_delay_bound(connection.delay_ms())
+
     def _refresh_detached_materializations(self, dt, *, grad_enabled=None):
+        if not self.training:
+            return
         if not (
-            self.training
-            and torch.is_grad_enabled()
+            torch.is_grad_enabled()
             and not torch.is_inference_mode_enabled()
             and grad_enabled is not False
         ):
+            self._validate_live_event_delay_bounds()
             return
         connections = tuple(
             dict.fromkeys((*self.synapses.values(), *self.continuous_synapses.values()))
@@ -1727,6 +1762,7 @@ class Network(RNGMixin):
         try:
             _refresh_detached_population_materializations(self.populations, dt)
             if not refresh:
+                self._validate_live_event_delay_bounds()
                 return
             values = {
                 materializer: materializer._derive_detached_values()
@@ -2066,6 +2102,9 @@ class Network(RNGMixin):
                     "recreate those connections first."
                 )
 
+        event_config = self._synaptic_diff_configs.get("event")
+        if event_config is not None:
+            self._apply_netstim_diff_config(netstim, event_config)
         netstim.name = "netstim"
         if self.dt is not None and hasattr(netstim, "set_dt"):
             netstim.set_dt(float(self.dt))
@@ -2719,6 +2758,8 @@ class Network(RNGMixin):
         delay=0.0,
         pre_var=None,
         shape_context=None,
+        *,
+        delay_upper_bound_ms=None,
     ):
         """
         Append a finalized connection spec.
@@ -2767,6 +2808,7 @@ class Network(RNGMixin):
                     dtype=target_pop.dtype(),
                 ),
                 n_delay,
+                delay_upper_bound_ms,
             )
         )
         # A materialized NetCon set no longer represents the wiring spec after
@@ -3005,6 +3047,7 @@ class Network(RNGMixin):
         threshold=0.0,
         weight=1.0,
         delay=0.0,
+        delay_upper_bound_ms: float | None = None,
         pre_var=None,
         auto_expand=False,
         allow_autapses: Optional[bool] = None,
@@ -3025,6 +3068,13 @@ class Network(RNGMixin):
         Built-in point-process ``expsyn`` and ``exp2syn`` targets expect a bare
         numerical value in µS, so ``weight=0.05`` means 0.05 µS and must not be
         multiplied by :data:`dendra.units.uS`.
+
+        Supply ``delay_upper_bound_ms`` to declare a finite non-negative upper
+        bound on all physical delays from this call, including after delay
+        parameters change. For a projection built from multiple calls, the
+        largest bound can size the delivery queue when every call supplies
+        one. A network-wide ``max_delay_ms`` remains the ceiling and is the
+        fallback for projections with unspecified bounds.
         """
         if isinstance(target, SynapseSlots):
             return self.connect_to_slots(
@@ -3035,11 +3085,14 @@ class Network(RNGMixin):
                 threshold=threshold,
                 weight=weight,
                 delay=delay,
+                delay_upper_bound_ms=delay_upper_bound_ms,
                 pre_var=pre_var,
                 auto_expand=auto_expand,
                 allow_autapses=allow_autapses,
                 allow_multapses=allow_multapses,
             )
+
+        delay_upper_bound_ms = _validate_delay_upper_bound_ms(delay_upper_bound_ms)
 
         source, target, source_model, target_model = self._normalize_endpoint(
             source,
@@ -3124,6 +3177,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             shape_context=shape_context,
         )
@@ -3140,6 +3194,7 @@ class Network(RNGMixin):
         threshold=0.0,
         weight=1.0,
         delay=0.0,
+        delay_upper_bound_ms: float | None = None,
         pre_var=None,
         auto_expand=False,
         allow_autapses: Optional[bool] = None,
@@ -3150,8 +3205,10 @@ class Network(RNGMixin):
         ``target`` may be a ``SynapseSlots`` object, or a population/slice plus
         ``synapse`` and ``slots``/``local_index``.  This is the public API for
         banked point processes with multiple colocated local slots. Threshold,
-        weight, and delay follow :meth:`connect`'s unit contract.
+        weight, delay, and its upper bound follow :meth:`connect`'s contract.
         """
+        delay_upper_bound_ms = _validate_delay_upper_bound_ms(delay_upper_bound_ms)
+
         if local_index is not None:
             if slots is not None:
                 raise ValueError("Provide either slots or local_index, not both.")
@@ -3239,6 +3296,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             shape_context=shape_context,
         )
@@ -3254,6 +3312,7 @@ class Network(RNGMixin):
         threshold=0.0,
         weight=1.0,
         delay=0.0,
+        delay_upper_bound_ms: float | None = None,
         pre_var=None,
         allow_autapses=False,
         allow_multapses=False,
@@ -3272,6 +3331,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             allow_autapses=allow_autapses,
             allow_multapses=allow_multapses,
@@ -3288,6 +3348,8 @@ class Network(RNGMixin):
         pre_var=None,
         allow_autapses=False,
         allow_multapses=False,
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Connect source to target one-to-one.
@@ -3306,6 +3368,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             allow_autapses=allow_autapses,
             allow_multapses=allow_multapses,
@@ -3323,6 +3386,8 @@ class Network(RNGMixin):
         auto_expand=False,
         allow_autapses=False,
         allow_multapses=False,
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Connect source to target densely, i.e. all-to-all between selections.
@@ -3339,6 +3404,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             auto_expand=auto_expand,
             allow_autapses=allow_autapses,
@@ -3359,6 +3425,8 @@ class Network(RNGMixin):
         allow_autapses=False,
         allow_multapses=False,
         strategy="bernoulli",
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Connect source to target probabilistically.
@@ -3392,6 +3460,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             auto_expand=auto_expand,
             allow_autapses=allow_autapses,
@@ -3411,6 +3480,8 @@ class Network(RNGMixin):
         auto_expand=False,
         allow_autapses=False,
         allow_multapses=False,
+        *,
+        delay_upper_bound_ms: float | None = None,
     ):
         """
         Connect exactly ``n`` random pre-post pairs.
@@ -3428,6 +3499,7 @@ class Network(RNGMixin):
             threshold=threshold,
             weight=weight,
             delay=delay,
+            delay_upper_bound_ms=delay_upper_bound_ms,
             pre_var=pre_var,
             auto_expand=auto_expand,
             allow_autapses=allow_autapses,
@@ -3443,7 +3515,8 @@ class Network(RNGMixin):
         dt : float
             Simulation timestep (ms) for delivery buffers.
         max_delay_ms : float, optional
-            Optional ceiling on allowable synaptic delay; passed to NetCon.
+            Network-wide ceiling and fallback for projections with unspecified
+            delay bounds.
         """
         for (pre_name, post_name, synapse, pre_var), specs in self.synapse_spec.items():
             pre_var = (
@@ -3483,6 +3556,22 @@ class Network(RNGMixin):
             )
             pre_idx_for_var = self._pre_idx_for_pre_var(pre, pre_idx, pre_var)
 
+            bounds = [_event_spec_delay_upper_bound(spec) for spec in specs]
+            largest_bound = max(
+                (bound for bound in bounds if bound is not None), default=None
+            )
+            if (
+                largest_bound is not None
+                and max_delay_ms is not None
+                and largest_bound > max_delay_ms
+            ):
+                raise ValueError(
+                    f"delay_upper_bound_ms={largest_bound!r} for projection "
+                    f"{pre_name}:{pre_var}->{post_name}:{synapse.name} exceeds "
+                    f"max_delay_ms={max_delay_ms!r}."
+                )
+            delay_upper_bound_ms = largest_bound if None not in bounds else None
+
             syn = NetCon(
                 pre=pre,
                 pre_idx=pre_idx_for_var,
@@ -3495,6 +3584,7 @@ class Network(RNGMixin):
                 dt=dt,
                 pre_var=pre_var,
                 max_delay=max_delay_ms,
+                delay_upper_bound_ms=delay_upper_bound_ms,
                 track_events=self.track_netcon_events,
                 delay_backend=self.netcon_delay_backend,
                 train_delay_backend=self.netcon_train_backend,
@@ -3623,6 +3713,52 @@ class Network(RNGMixin):
         self._continuous_synapse_step_items = schedule.continuous_synapses
         self._continuous_target_step_items = schedule.continuous_targets
 
+    def _resolve_build_delay_cap(self, dt, max_delay_ms, force_rebuild):
+        if (
+            self.built
+            and max_delay_ms is not None
+            and not force_rebuild
+            and max_delay_ms != self._built_max_delay_ms
+        ):
+            raise ValueError(
+                f"Network was built with max_delay_ms={self._built_max_delay_ms!r}. "
+                f"Pass force_rebuild=True to use max_delay_ms={max_delay_ms!r}."
+            )
+        continuous_config = self._synaptic_diff_configs.get("continuous", {})
+        if continuous_config.get("diff_delays", False) and self.continuous_synapse_spec:
+            if max_delay_ms is None:
+                max_delay_ms = self._built_max_delay_ms
+            if ContinuousCon._validate_linear_delay_cap(max_delay_ms) < dt:
+                raise ValueError(
+                    "Differentiable continuous delays require max_delay_ms >= dt."
+                )
+        return max_delay_ms
+
+    def _replace_built_connections(self, dt, max_delay_ms):
+        """Construct and configure replacement projections before retiring live ones."""
+        synapses, continuous = self.synapses, self.continuous_synapses
+        targets = self.continuous_targets
+        previous_dt, was_built = self.dt, self.built
+        self.dt, self.built = dt, False
+        self.synapses = torch.nn.ModuleDict()
+        self.continuous_synapses = torch.nn.ModuleDict()
+        self.continuous_targets = {}
+        try:
+            self.build_synapses(dt, max_delay_ms=max_delay_ms)
+            self.build_continuous_synapses(dt, max_delay_ms=max_delay_ms)
+            for kind, config in self._synaptic_diff_configs.items():
+                self._apply_connection_diff_config(kind, config)
+        except Exception:
+            self.synapses, self.continuous_synapses = synapses, continuous
+            self.continuous_targets = targets
+            self.dt, self.built = previous_dt, was_built
+            raise
+        synapses.clear()
+        synapses.update(self.synapses)
+        continuous.clear()
+        continuous.update(self.continuous_synapses)
+        self.synapses, self.continuous_synapses = synapses, continuous
+
     def build(self, dt, max_delay_ms=None, force_rebuild=False):
         """
         Build synaptic modules for the current wiring spec.
@@ -3630,9 +3766,14 @@ class Network(RNGMixin):
         Parameters
         ----------
         dt : float
-            Simulation timestep (ms) used for NetCon buffers.
+            Simulation timestep (ms) used for connection buffers.
         max_delay_ms : float, optional
-            Maximum delay allowed for NetCons. Default is None (no cap).
+            Network-wide delay ceiling. Default is None (no cap). Event
+            connections may declare tighter bounds with :meth:`connect`.
+            Specifying a different cap on a built Network requires
+            `force_rebuild=True`.
+            A rebuild with continuous delay interpolation enabled reuses the
+            previous cap if omitted.
         force_rebuild : bool, optional
             If True, rebuild even if dt has not changed. Default is False.
 
@@ -3642,22 +3783,19 @@ class Network(RNGMixin):
             Self, for chaining.
         """
         dt_f = _validate_time_scalar(dt, name="dt", positive=True)
+        max_delay_ms = self._resolve_build_delay_cap(dt_f, max_delay_ms, force_rebuild)
         self._refresh_compile_config_from_ctx()
         current_sig = self._device_signature()
         devices_changed = current_sig != getattr(self, "_device_sig", None)
         dt_changed = self.dt is not None and self.dt != dt_f
 
         if not self.built or self.dt != dt_f or force_rebuild or devices_changed:
-            self.dt = dt_f
+            self._replace_built_connections(dt_f, max_delay_ms)
             if dt_changed:
                 # A step count anchored to the previous dt cannot be reused with
                 # a new timestep. Preserve the current absolute time and re-anchor.
                 self._reset_runtime_clock(float(self.t))
-            self.synapses.clear()
-            self.continuous_synapses.clear()
-            self.continuous_targets = {}
-            self.build_synapses(dt_f, max_delay_ms=max_delay_ms)
-            self.build_continuous_synapses(dt_f, max_delay_ms=max_delay_ms)
+            self._built_max_delay_ms = max_delay_ms
             self.built = True
             self._device_sig = self._device_signature()
         self._refresh_step_schedule()
@@ -3696,9 +3834,13 @@ class Network(RNGMixin):
             Starting simulation time (ms). Finite negative values are allowed;
             booleans and non-finite values are rejected. Default is 0.0.
         max_delay_ms : float, optional
-            Maximum allowed synaptic delay. Default is None.
+            Network-wide delay ceiling. Default is None. Event connections
+            may declare tighter bounds with :meth:`connect`.
+            Specifying a different cap on a built Network requires
+            `force_rebuild=True`. A rebuild with continuous delay interpolation
+            enabled reuses the previous cap if omitted.
         force_rebuild : bool, optional
-            If True, rebuild NetCons even if already built. Default is False.
+            If True, rebuild connections even if already built. Default is False.
         draws : dendra.func.InitializationDraws, optional
             Replay explicit Population, connection and NetStim initialization
             draws without automatic sampling. The packet's RNG boundaries
@@ -3710,6 +3852,8 @@ class Network(RNGMixin):
         Network
             Self, for chaining.
         """
+        dt_f = _validate_time_scalar(dt, name="dt", positive=True)
+        max_delay_ms = self._resolve_build_delay_cap(dt_f, max_delay_ms, force_rebuild)
         if draws is not None:
             from dendra.func._native_initialization_draws import initialize_native
 
@@ -3717,7 +3861,7 @@ class Network(RNGMixin):
                 self,
                 draws=draws,
                 options={
-                    "dt": dt,
+                    "dt": dt_f,
                     "reinit_weights": reinit_weights,
                     "reinit_delays": reinit_delays,
                     "t": t,
@@ -3725,7 +3869,6 @@ class Network(RNGMixin):
                     "force_rebuild": force_rebuild,
                 },
             )
-        dt_f = _validate_time_scalar(dt, name="dt", positive=True)
         t_f = _validate_time_scalar(t, name="t", positive=None)
         self._refresh_compile_config_from_ctx()
 
@@ -4307,7 +4450,11 @@ class Network(RNGMixin):
         }
         tstart = self.t.item()
 
-        with _native_callback_storage(observer) as observer, ctx:
+        with (
+            _native_callback_storage(observer) as observer,
+            ctx,
+            _event_delay_tap_scope(self.training and n_steps > 1),
+        ):
             if n_steps:
                 self._refresh_detached_materializations(dt_f)
             if duration_remainder is not None:
@@ -4581,7 +4728,11 @@ class Network(RNGMixin):
         initial_time = self.t.double().detach().clone()
         tstart = self.t.item()
 
-        with _native_callback_storage(observer) as observer, ctx:
+        with (
+            _native_callback_storage(observer) as observer,
+            ctx,
+            _event_delay_tap_scope(self.training and n_steps > 1),
+        ):
             if n_steps:
                 self._refresh_detached_materializations(dt_f)
             if duration_remainder is not None:
@@ -4801,6 +4952,7 @@ class Network(RNGMixin):
                     weight,
                     delay,
                     pre_var=pre_var,
+                    delay_upper_bound_ms=_event_spec_delay_upper_bound(data),
                 )
         for k, v in _continuous_synapse_spec.items():
             (
@@ -5066,6 +5218,10 @@ class Network(RNGMixin):
             netcon_delay_backend=self.netcon_delay_backend,
             netcon_train_backend=self.netcon_train_backend,
         )
+        new_net._built_max_delay_ms = self._built_max_delay_ms
+        new_net._synaptic_diff_configs = {
+            kind: config.copy() for kind, config in self._synaptic_diff_configs.items()
+        }
         target_slot_mappings = {}
 
         def remapped_endpoint(population_name):
@@ -5141,6 +5297,7 @@ class Network(RNGMixin):
                     weight,
                     delay,
                     pre_var=pre_var,
+                    delay_upper_bound_ms=_event_spec_delay_upper_bound(data),
                 )
 
         for k, v in self.continuous_synapse_spec.items():
@@ -5343,29 +5500,68 @@ class Network(RNGMixin):
         if syn_cache is not None:
             self._syn_cache = syn_cache
 
-    def set_synaptic_diff_config(self, **kwargs):
-        """Configure differentiation for existing event connections and NetStim schedules.
+    def _apply_connection_diff_config(self, kind, config):
+        if kind == "continuous":
+            for syn in self.continuous_synapses.values():
+                syn._validate_diff_config(**config)
+            for syn in self.continuous_synapses.values():
+                syn.set_diff_config(**config)
+        else:
+            for syn in self.synapses.values():
+                syn.set_diff_config(**config)
+
+    @staticmethod
+    def _apply_netstim_diff_config(netstim, config):
+        if netstim is not None and hasattr(netstim, "set_diff_config"):
+            netstim.set_diff_config(
+                diff_scheduled_times=config.get("diff_scheduled_times", True),
+                sched_width=config.get("sched_width", 1.0),
+            )
+
+    def set_synaptic_diff_config(
+        self, *, kind: Literal["event", "continuous"] = "event", **kwargs
+    ):
+        """Configure differentiation for event or continuous connections.
 
         Parameters
         ----------
+        kind : {"event", "continuous"}, optional
+            Select event connections and NetStim schedules (default), or
+            continuous connections. Supply a finite `max_delay_ms` when
+            building or initializing with continuous delay interpolation.
         **kwargs
-            Keyword arguments forwarded to :meth:`NetCon.set_diff_config`. Only
-            ``diff_scheduled_times`` and ``sched_width`` are forwarded to an attached
-            NetStim; omitted values for those controls use True and 1.0 respectively.
+            Arguments forwarded to :meth:`NetCon.set_diff_config` or
+            :meth:`ContinuousCon.set_diff_config`. In event scope, an attached
+            NetStim receives ``diff_scheduled_times`` and ``sched_width``, which
+            default to True and 1.0 respectively.
 
         Notes
         -----
+        Settings apply immediately to built connections and are retained for
+        future builds. Configure before initialization to use these settings
+        when restoring a steady-state cache.
+
         This changes connection differentiation controls, not the Network's
         training/evaluation mode.
         """
-        for syn in self.synapses.values():
-            syn.set_diff_config(**kwargs)
-        if self.netstim is not None and hasattr(self.netstim, "set_diff_config"):
-            # Propagate only the scheduled-time pieces NetStim understands.
-            self.netstim.set_diff_config(
-                diff_scheduled_times=kwargs.get("diff_scheduled_times", True),
-                sched_width=kwargs.get("sched_width", 1.0),
-            )
+        if kind not in ("event", "continuous"):
+            raise ValueError("kind must be 'event' or 'continuous'.")
+        if kind == "continuous":
+            ContinuousCon._validate_diff_options(**kwargs)
+        else:
+            signature(NetCon.set_diff_config).bind(None, **kwargs)
+        if self.built:
+            self._apply_connection_diff_config(kind, kwargs)
+        if kind == "event":
+            self._apply_netstim_diff_config(self.netstim, kwargs)
+            previous = self._synaptic_diff_configs.get(kind, {})
+            # NetCon retains its backend override when the setter omits it.
+            if (
+                kwargs.get("train_delay_backend") is None
+                and "train_delay_backend" in previous
+            ):
+                kwargs["train_delay_backend"] = previous["train_delay_backend"]
+        self._synaptic_diff_configs[kind] = kwargs
 
     # load utilities
     def _rebuild_loaded_population_workspaces(self, readiness):
@@ -6162,6 +6358,7 @@ class Network(RNGMixin):
                     if pbar is not None:
                         pbar.set_description(f"{t_chunk[0].item():.1f} ms")
 
+                    @_event_delay_tap_scope(self.training and len(t_chunk) > 1)
                     def _run_chunk(
                         state_in,
                         observed_state_in=None,

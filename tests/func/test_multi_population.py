@@ -534,7 +534,7 @@ def test_mixed_multi_matches_packed_imperative_step_and_rollout_every_leaf():
     for adapter in functional._preparation.component_physical_preparations:
         assert not _unregistered_module_alias_paths(adapter)
     for mapping in (
-        functional._base_mapping,
+        functional._transition_slot_names,
         functional._preparation_base_mapping,
     ):
         assert not any(name.startswith("population.populations.") for name in mapping)

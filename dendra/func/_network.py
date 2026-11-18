@@ -1379,9 +1379,22 @@ class FunctionalNetwork:
             },
         }
 
-    def _connection_values(self, collection, name, values):
+    def _connection_values(
+        self, collection, name, values, *, event_taps=None, prepare_event_taps=True
+    ):
         projection = getattr(self, collection)[name]
-        if collection == "continuous_synapses" or not projection._diff_delays:
+        if collection == "synapses":
+            projection._validate_delay_bound(values["delays"])
+            if prepare_event_taps and projection._diff_delays:
+                if event_taps is None:
+                    event_taps = projection._delay_taps(values["delays"])
+                return {"weights": values["weights"], "delay_taps": event_taps}
+        if collection == "continuous_synapses" and projection._diff_delays:
+            return {
+                **values,
+                "delay_taps": projection._delay_taps(values["delays"]),
+            }
+        if not projection._diff_delays:
             steps = (values["delays"] / projection._dt).round().long()
             if collection == "synapses":
                 steps = steps.clamp_min(1)
@@ -1434,7 +1447,9 @@ class FunctionalNetwork:
             return prepared["netstim"]["constants"][rest[0]]
         raise FunctionalizationError("Prepared shared constant binding is invalid")
 
-    def _materialize_connections(self, parameters, constants):
+    def _materialize_connections(
+        self, parameters, constants, *, event_taps=None, prepare_event_taps=True
+    ):
         constants = self._bind_parameter_constants(parameters, constants)
         return {
             collection: {
@@ -1444,6 +1459,8 @@ class FunctionalNetwork:
                     plan.materialize(
                         parameters[collection][name], constants[collection][name]
                     ),
+                    event_taps=None if event_taps is None else event_taps.get(name),
+                    prepare_event_taps=prepare_event_taps,
                 )
                 for (kind, name), plan in self._connection_parameter_plans.items()
                 if kind == collection
@@ -1511,7 +1528,7 @@ class FunctionalNetwork:
             reinit_delays=reinit_delays,
         )
 
-    def _prepare_values(self, parameters, constants):
+    def _prepare_values(self, parameters, constants, *, event_taps=None):
         constants = self._bind_parameter_constants(parameters, constants)
         return {
             "populations": {
@@ -1528,7 +1545,9 @@ class FunctionalNetwork:
                 ),
                 "constants": self._netstim_constants(constants),
             },
-            "connections": self._materialize_connections(parameters, constants),
+            "connections": self._materialize_connections(
+                parameters, constants, event_taps=event_taps
+            ),
         }
 
     def _validate_prepared(self, prepared, parameters):
@@ -2045,11 +2064,13 @@ class FunctionalNetwork:
                 stimulus,
                 **({"_binding_frame": True} if _binding_frame else {}),
             )
+            connection = prepared["connections"]["continuous_synapses"][name]
             queue, payload, mask = plan._advance_values(
-                prepared["connections"]["continuous_synapses"][name]["weights"],
+                connection["weights"],
                 queue,
                 source,
                 transform_parameters=value["transform_parameters"],
+                delay_taps=connection.get("delay_taps"),
             )
             if plan.has_connections and not plan.receive_before_source:
                 indices = (
@@ -2074,10 +2095,11 @@ class FunctionalNetwork:
         for name, plan in self.synapses.items():
             value = parameters["synapses"][name]
             effective = prepared["connections"]["synapses"][name]
+            delay_taps = effective.get("delay_taps")
             queue, payload = plan.read_due(
                 state["synapses"][name],
                 weights=effective["weights"],
-                delays=effective["delays"],
+                _prepared_delay_taps=delay_taps,
             )
             post, target = self._targets["synapses", name]
             receiver = self.populations[post]
@@ -2108,8 +2130,8 @@ class FunctionalNetwork:
                 effective["weights"],
                 queue,
                 source,
-                delays=effective["delays"],
                 schedule=value["schedule"],
+                _prepared_delay_taps=delay_taps,
             )
         aux = {}
         for name, plan in self.populations.items():

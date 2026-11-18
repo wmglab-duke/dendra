@@ -3,6 +3,29 @@
 Upgrading Dendra
 ================
 
+Upgrading from 0.28.x to 0.29
+-----------------------------
+
+Connection delays
+~~~~~~~~~~~~~~~~~
+
+Delay interpolation defaults to off for both event and continuous
+connections. If an existing call relied on the event default, pass
+``diff_delays=True`` to ``set_synaptic_diff_config()`` or
+``NetCon.set_diff_config()`` to retain interpolation during training.
+
+To supply a different ``max_delay_ms`` to an already-built Network, pass
+``force_rebuild=True`` to ``build()`` or ``initialize()``.
+
+State compartment selectors
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Eligible flat regional placements now pass a read-only ``SupportSpec`` as
+``State.key``. Use ``materialized_flat_indices(device=...)`` to recover the
+original flat slot order. Set ``supports_compact_selector = False`` on a
+``State`` class whose hooks expect a Python list. Subclasses inherit the
+setting unless they override it. See :doc:`advanced/custom_models`.
+
 Dendra 0.28: upgrading from 0.27.x
 ----------------------------------
 

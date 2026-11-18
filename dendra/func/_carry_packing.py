@@ -1,10 +1,9 @@
 """Owned tensor-tree packing for inference and training loop boundaries.
 
-Only static schema metadata is retained. Each pack is a fresh one-dimensional
-Tensor for one dtype/device group. Unpacked leaves are private read-only views;
-public leaves are materialized outside the compiled boundary.
-Terminal training packs also separate returned carry from AD's saved
-intermediate tensors, without changing values or detaching their gradients.
+Only static schema metadata is retained. Leaves share an owned flat pack by
+dtype and device unless they require a dedicated group. Scan can carry a
+qualified dedicated group as a shaped tensor when the transition returns fresh
+storage. Public leaves are materialized outside the compiled boundary.
 """
 
 from __future__ import annotations
@@ -29,15 +28,17 @@ class _PackedCarryLayout:
     leaves: tuple[_PackedLeaf | None, ...]
     groups: tuple[tuple[torch.dtype, torch.device], ...]
     indices: tuple[tuple[int, ...], ...]
+    direct_groups: frozenset[int] = frozenset()
 
     @classmethod
-    def from_tree(cls, tree):
+    def from_tree(cls, tree, *, large_leaf_bytes=None):
         values, spec = pytree.tree_flatten(tree)
-        return cls.from_leaves(values, spec)
+        return cls.from_leaves(values, spec, large_leaf_bytes=large_leaf_bytes)
 
     @classmethod
-    def from_leaves(cls, values, spec):
+    def from_leaves(cls, values, spec, *, large_leaf_bytes=None):
         groups = []
+        shared_groups = {}
         group_indices = []
         sizes = []
         leaves = []
@@ -50,12 +51,19 @@ class _PackedCarryLayout:
                     "packed loop carry requires strided Tensor or None leaves"
                 )
             key = (value.dtype, value.device)
-            if key not in groups:
+            numel = value.numel()
+            dedicated = (
+                large_leaf_bytes is not None
+                and numel * value.element_size() >= large_leaf_bytes
+            )
+            group = None if dedicated else shared_groups.get(key)
+            if group is None:
+                group = len(groups)
                 groups.append(key)
                 group_indices.append([])
                 sizes.append(0)
-            group = groups.index(key)
-            numel = value.numel()
+                if not dedicated:
+                    shared_groups[key] = group
             leaves.append(_PackedLeaf(group, sizes[group], numel, tuple(value.shape)))
             group_indices[group].append(index)
             sizes[group] += numel
@@ -70,7 +78,7 @@ class _PackedCarryLayout:
         values, spec = pytree.tree_flatten(tree)
         return self.pack_leaves(values, spec)
 
-    def pack_leaves(self, values, spec):
+    def pack_leaves(self, values, spec, *, retained=None):
         if spec != self.spec:
             raise ValueError("packed loop carry changed its tensor-tree structure")
         if any(
@@ -79,7 +87,13 @@ class _PackedCarryLayout:
         ):
             raise ValueError("packed loop carry changed a static None leaf")
         packs = []
-        for indices in self.indices:
+        for group, indices in enumerate(self.indices):
+            if retained is not None and group in retained:
+                packs.append(retained[group])
+                continue
+            if group in self.direct_groups:
+                packs.append(values[indices[0]])
+                continue
             pieces = [values[index].reshape(-1) for index in indices]
             if len(indices) == 1 and self.leaves[indices[0]].numel:
                 # Inductor can elide a one-input cat and return a tape slice
@@ -91,13 +105,31 @@ class _PackedCarryLayout:
             packs.append(torch.cat(pieces, dim=0))
         return tuple(packs)
 
+    def scan_inputs(self, packed):
+        # Each dedicated pack already owns its storage. Convert the private
+        # prefix to the logical shape once at the chunk boundary.
+        if not self.direct_groups:
+            return packed
+        values = list(packed)
+        with torch.inference_mode(False):
+            for group in self.direct_groups:
+                leaf = self.leaves[self.indices[group][0]]
+                values[group] = packed[group].narrow(0, 0, leaf.numel).view(leaf.shape)
+        return tuple(values)
+
     def unpack(self, packs):
         if len(packs) != len(self.groups):
             raise ValueError("packed loop carry changed its dtype/device groups")
         values = [
             None
             if leaf is None
-            else packs[leaf.group].narrow(0, leaf.offset, leaf.numel).view(leaf.shape)
+            else (
+                packs[leaf.group]
+                if leaf.group in self.direct_groups
+                else packs[leaf.group]
+                .narrow(0, leaf.offset, leaf.numel)
+                .view(leaf.shape)
+            )
             for leaf in self.leaves
         ]
         return pytree.tree_unflatten(values, self.spec)

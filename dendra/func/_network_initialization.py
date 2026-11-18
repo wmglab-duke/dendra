@@ -1037,7 +1037,7 @@ def _initialize_components(
                 effective_constants, (collection, name), connection_constants
             )
         connections = functional._materialize_connections(
-            effective, effective_constants
+            effective, effective_constants, prepare_event_taps=False
         )
         synapses = {
             name: plan.initial_state(state["synapses"][name], t=time)
@@ -1061,9 +1061,10 @@ def _initialize_components(
                     t=time,
                 )
             for name, cache in inputs.cache.continuous_synapses.items():
+                values = connections["continuous_synapses"][name]
                 continuous[name] = functional.continuous_synapses[name].restore_cache(
                     {
-                        "weights": connections["continuous_synapses"][name]["weights"],
+                        "weights": values["weights"],
                         "transform_parameters": effective["continuous_synapses"][name][
                             "transform_parameters"
                         ],
@@ -1071,6 +1072,7 @@ def _initialize_components(
                     continuous[name],
                     cache,
                     t=time,
+                    delays=values["delays"],
                 )
         initialized_state = {
             **(

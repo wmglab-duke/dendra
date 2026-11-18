@@ -7,6 +7,8 @@ ownership rules across those adapters.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
+
 import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
@@ -15,6 +17,7 @@ from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._carry_packing import _PackedCarryLayout
 from ._hop_inputs import (
+    _dense_zero_offset,
     _input_usage,
     _isolate_dense_lifted_inputs,
     _LiftedViewIsolation,
@@ -25,12 +28,143 @@ from ._scan_compat import (
     _capture_saved_tensor_identity,
     install_scan_compatibility,
 )
-from ._scan_executor import _executor_key
-from ._scan_inductor import _compile_scan
+from ._scan_executor import _ALIASES, _ALLOCATIONS, _executor_key
+from ._scan_inductor import _compile_scan, _uses_local_scan_inductor
 from ._state_projection import _plain_projection_context, _plain_state_tree
 from ._tensor_contracts import _clone_contiguous_tree as _clone_tree
 from ._tensor_contracts import capture_schema as _schema
 from ._tree_paths import _get_path
+
+_CPU_TRAINING_SCAN_LARGE_LEAF_BYTES = 1 << 20
+
+
+def _operator_schema(node):
+    if (
+        isinstance(node, torch.fx.Node)
+        and node.op == "call_function"
+        and isinstance(node.target, torch._ops.OpOverload)
+    ):
+        return node.target._schema
+    return None
+
+
+def _fresh_result(node):
+    schema = _operator_schema(node)
+    return (
+        schema is not None
+        and not schema.is_mutable
+        and len(schema.returns) == 1
+        and schema.returns[0].alias_info is None
+    )
+
+
+def _logical_carry_reads(source):
+    pending = [source]
+    seen = set()
+    while pending:
+        node = pending.pop()
+        if node in seen:
+            continue
+        seen.add(node)
+        for user in node.users:
+            if user.op == "output":
+                continue
+            schema = _operator_schema(user)
+            if (
+                schema is None
+                or schema.is_mutable
+                or user.target
+                in (
+                    torch.ops.aten.as_strided_copy.default,
+                    torch.ops.aten._unsafe_view.default,
+                    torch.ops.aten.lift.default,
+                )
+            ):
+                return False
+            if any(value.alias_info is not None for value in schema.returns):
+                if id(user.target) not in _ALIASES:
+                    return False
+                pending.append(user)
+    return True
+
+
+def _returns_alias(result, returned):
+    # Fake tensor storage keys are unreliable for pre-dispatch view capture.
+    # Follow returned view/unknown chains until a schema promises fresh storage.
+    pending = [node for node in returned if isinstance(node, torch.fx.Node)]
+    seen = set()
+    while pending:
+        node = pending.pop()
+        if node is result:
+            return True
+        if node in seen:
+            continue
+        seen.add(node)
+        if not (
+            _fresh_result(node)
+            and (
+                node.target.namespace not in ("aten", "prims", "prim")
+                or id(node.target) in _ALLOCATIONS
+            )
+        ):
+            pending.extend(node.all_input_nodes)
+    return False
+
+
+def _direct_carry_layout(graph, layout, parameters, prepared):
+    """Use shaped private carry for large, layout-preserving opaque results."""
+    if not isinstance(graph, torch.fx.GraphModule):
+        return layout
+    out_spec = getattr(graph, "_out_spec", None)
+    if out_spec is None or out_spec.num_children != 2:
+        return layout
+    if out_spec.children()[0] != layout.spec:
+        return layout
+    nodes = list(graph.graph.nodes)
+    returned = nodes[-1].args[0]
+    if not isinstance(returned, (list, tuple)) or len(returned) != out_spec.num_leaves:
+        return layout
+    outputs = returned[: len(layout.leaves)]
+    placeholders = [node for node in nodes if node.op == "placeholder"]
+    start = len(pytree.tree_leaves((parameters, prepared)))
+    inputs = placeholders[start : start + len(layout.leaves)]
+    if len(outputs) != len(inputs) or len(inputs) != len(layout.leaves):
+        return layout
+    emissions = returned[len(layout.leaves) :]
+    groups = []
+    # The dedicated pack already has offset zero and the authored logical
+    # strides. Keep shared packs and their observable view layouts intact.
+    for group, indices in enumerate(layout.indices):
+        if len(indices) != 1:
+            continue
+        index = indices[0]
+        source, result = inputs[index], outputs[index]
+        original = source.meta.get("val")
+        if (
+            not torch.is_tensor(original)
+            or original.device.type != "cpu"
+            or original.numel() * original.element_size()
+            < _CPU_TRAINING_SCAN_LARGE_LEAF_BYTES
+            or not _dense_zero_offset(original)
+            or not _fresh_result(result)
+            or result.target.namespace in ("aten", "prims", "prim")
+        ):
+            continue
+        value = result.meta.get("val")
+        if (
+            torch.is_tensor(value)
+            and value.device == original.device
+            and value.dtype == original.dtype
+            and value.shape == original.shape
+            and value.stride() == original.stride()
+            and _dense_zero_offset(value)
+            and _logical_carry_reads(source)
+            and not _returns_alias(
+                result, (*outputs[:index], *outputs[index + 1 :], *emissions)
+            )
+        ):
+            groups.append(group)
+    return replace(layout, direct_groups=frozenset(groups)) if groups else layout
 
 
 def _capture_tensor_step(body, arguments, *, grad_enabled, tracer=None):
@@ -66,8 +200,8 @@ def _packed_tensor_scan(
         updated, emitted = graph(
             parameters, prepared, state, carries, invariant_carries, sample
         )
-        # The terminal pack owns storage separately from AD's saved state
-        # intermediates. No private carry views become public sibling aliases.
+        # Unproven updates get a fresh pack. A qualified private carry
+        # result already has the next operand's shape and independent storage.
         return layout.pack(updated), emitted
 
     return scan(combine, initial, samples)
@@ -104,6 +238,22 @@ def _tensor_samples(tapes, steps, device):
     if not tensors:
         tensors.append(torch.arange(steps, dtype=torch.int64, device=device))
     return tuple(tensors), (spec, tuple(positions))
+
+
+@dataclass(frozen=True)
+class _PrivateScanCarry:
+    owner: object
+    layout: _PackedCarryLayout
+    program: tuple
+    packed: tuple
+    leaves: tuple
+
+
+@dataclass
+class _ScanHostCarry:
+    # Invocation-local storage for the next private host chunk.
+
+    chunk: _PrivateScanCarry | None = None
 
 
 class _CompiledTensorTreeScan:
@@ -155,6 +305,19 @@ class _CompiledTensorTreeScan:
     def _samples(self, tapes):
         return _tensor_samples(tapes, self._steps, self._device)
 
+    def _carry_layout(self, state, mutable, *, grad_enabled):
+        # Packing large leaves together can make Inductor traverse their entire
+        # combined adjoint with per-element range masks on every reverse step.
+        # Separate large leaves while keeping the small loop operands grouped.
+        cutoff = None
+        if (
+            grad_enabled
+            and self._device.type == "cpu"
+            and _uses_local_scan_inductor(self._options)
+        ):
+            cutoff = _CPU_TRAINING_SCAN_LARGE_LEAF_BYTES
+        return _PackedCarryLayout.from_tree((state, mutable), large_leaf_bytes=cutoff)
+
     def _pack(self, state, carries, *, grad_enabled):
         # Own recurrent storage before both the cache key and Dynamo's input
         # guards. Public continuations can change offsets, aliases, leafness or
@@ -163,9 +326,47 @@ class _CompiledTensorTreeScan:
         with torch.inference_mode(False), torch.set_grad_enabled(grad_enabled):
             state = self._clone_state(state)
             mutable, invariant = self._callback_carry.split(carries)
-            layout = _PackedCarryLayout.from_tree((state, mutable))
+            layout = self._carry_layout(state, mutable, grad_enabled=grad_enabled)
             initial = layout.pack((state, mutable))
         return layout, initial, invariant
+
+    def _resume_pack(self, state, carries, carry, *, grad_enabled):
+        if carry.owner is not self:
+            return None
+        layout = carry.layout
+        mutable, invariant = self._callback_carry.split(carries)
+        values, spec = pytree.tree_flatten((state, mutable))
+        if spec != layout.spec:
+            return None
+        retained = {
+            group: carry.packed[group]
+            for group, indices in enumerate(layout.indices)
+            if all(values[index] is carry.leaves[index] for index in indices)
+        }
+        if not retained:
+            return None
+
+        # Host static/detached fields and synthetic auxiliary inputs retain
+        # their ordinary boundary semantics. Rebuild only their changed packs.
+        state_count = spec.children()[0].num_leaves
+        with torch.inference_mode(False), torch.set_grad_enabled(grad_enabled):
+            for index, leaf in enumerate(layout.leaves):
+                value = values[index]
+                if leaf is None:
+                    if value is not None:
+                        return None
+                    continue
+                if leaf.group in retained:
+                    continue
+                if (
+                    not torch.is_tensor(value)
+                    or value.shape != leaf.shape
+                    or (value.dtype, value.device) != layout.groups[leaf.group]
+                ):
+                    return None
+                if index < state_count or leaf.group in layout.direct_groups:
+                    values[index] = value.clone(memory_format=torch.contiguous_format)
+            return layout.pack_leaves(values, spec, retained=retained), invariant
 
     def _capture(
         self,
@@ -193,7 +394,7 @@ class _CompiledTensorTreeScan:
                 (parameters, prepared, state, carries, samples)
             )
         mutable, invariant = partition.split(carries)
-        layout = _PackedCarryLayout.from_tree((state, mutable))
+        layout = self._carry_layout(state, mutable, grad_enabled=grad_enabled)
         # Use the exact logical views that the scan body receives. Authored
         # programs may depend on visible strides for ordinary tensor views.
         state, mutable = layout.unpack(layout.pack((state, mutable)))
@@ -223,6 +424,14 @@ class _CompiledTensorTreeScan:
         parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
             graph, (parameters, prepared, state, mutable, invariant, sample)
         )
+        if (
+            grad_enabled
+            and self._device.type == "cpu"
+            and _uses_local_scan_inductor(self._options)
+        ):
+            layout = _direct_carry_layout(graph, layout, parameters, prepared)
+            if executor_signature is not None:
+                executor_signature = (layout, *executor_signature[1:])
         isolate_views = _LiftedViewIsolation.from_usage(
             (
                 parameter_use,
@@ -266,58 +475,127 @@ class _CompiledTensorTreeScan:
                 self._executors[executor_key] = compiled, graph
         return compiled, layout, isolate_views
 
-    def __call__(self, parameters, prepared, state, carries, input_tape):
+    @staticmethod
+    def _resumed_signature(layout, schema, program):
+        if not layout.direct_groups:
+            return layout, schema, *program
+        spec, metadata = schema
+        offset = sum(child.num_leaves for child in spec.children()[:2])
+        rows = list(metadata)
+        for group in layout.direct_groups:
+            leaf = layout.leaves[layout.indices[group][0]]
+            # Use the ordinary owned pack key without materializing its
+            # padded storage. The executor still receives the shaped tensor.
+            row = rows[offset + group]
+            rows[offset + group] = (
+                (leaf.numel + 1,),
+                row[1],
+                row[2],
+                (1,),
+                0,
+                row[5],
+                not row[5],
+                *row[7:],
+            )
+        return (
+            replace(layout, direct_groups=frozenset()),
+            (spec, tuple(rows)),
+            *program,
+        )
+
+    def __call__(
+        self,
+        parameters,
+        prepared,
+        state,
+        carries,
+        input_tape,
+        *,
+        host_carry=None,
+        retain_carry=False,
+    ):
         input_tape = _own_runtime_draw_packets(input_tape)
         samples, sample_layout = self._samples(input_tape)
         grad_enabled = torch.is_grad_enabled()
-        layout, initial, invariant = self._pack(
-            state, carries, grad_enabled=grad_enabled
-        )
-        signature = (
-            layout,
-            _schema((parameters, prepared, initial, invariant, samples)),
-            sample_layout,
-            MEMBRANE_ASSEMBLY.value,
-            grad_enabled,
-        )
-        if signature not in self._kernels:
-            pool = _plain_projection_context(
-                check_saved_tensors=False
-            ) and _plain_state_tree(
-                (parameters, prepared, state, carries, samples), allow_parameters=True
-            )
-            with torch.inference_mode(False), torch.no_grad():
-                self._kernels[signature] = self._capture(
-                    parameters,
-                    prepared,
-                    state,
-                    carries,
-                    samples,
-                    sample_layout,
-                    grad_enabled=grad_enabled,
-                    executor_signature=signature if pool else None,
+        program = (sample_layout, MEMBRANE_ASSEMBLY.value, grad_enabled)
+        entry = None
+        if host_carry is not None:
+            previous, host_carry.chunk = host_carry.chunk, None
+            if previous is not None and previous.program == program:
+                resumed = self._resume_pack(
+                    state, carries, previous, grad_enabled=grad_enabled
                 )
-        compiled, layout, isolate_views = self._kernels[signature]
+                if resumed is not None:
+                    initial, invariant = resumed
+                    signature = self._resumed_signature(
+                        previous.layout,
+                        _schema((parameters, prepared, initial, invariant, samples)),
+                        program,
+                    )
+                    cached = self._kernels.get(signature)
+                    if cached is not None and cached[1] == previous.layout:
+                        entry = cached
+        if entry is None:
+            layout, initial, invariant = self._pack(
+                state, carries, grad_enabled=grad_enabled
+            )
+            signature = (
+                layout,
+                _schema((parameters, prepared, initial, invariant, samples)),
+                *program,
+            )
+            if signature not in self._kernels:
+                pool = _plain_projection_context(
+                    check_saved_tensors=False
+                ) and _plain_state_tree(
+                    (parameters, prepared, state, carries, samples),
+                    allow_parameters=True,
+                )
+                with torch.inference_mode(False), torch.no_grad():
+                    self._kernels[signature] = self._capture(
+                        parameters,
+                        prepared,
+                        state,
+                        carries,
+                        samples,
+                        sample_layout,
+                        grad_enabled=grad_enabled,
+                        executor_signature=signature if pool else None,
+                    )
+            entry = self._kernels[signature]
+            initial = entry[1].scan_inputs(initial)
+        compiled, layout, isolate_views = entry
         parameters, prepared, invariant, samples = isolate_views(
             (parameters, prepared, invariant, samples)
         )
-        packed, emitted = compiled(
-            parameters,
-            prepared,
-            initial,
-            invariant,
-            samples,
-        )
+        packed, emitted = compiled(parameters, prepared, initial, invariant, samples)
+        if retain_carry:
+            # Wrap the private packs themselves to preserve the first-order
+            # boundary without cloning every logical leaf on this host hop.
+            packed, emitted = guard_scan_outputs((packed, emitted))
+
         final, updated = layout.unpack(packed)
-        # Equivalent logical leaves must never escape as duplicate moved C++
-        # HOP output handles. Keep these ownership clones outside compilation.
-        final = self._clone_state(final)
-        updated = _clone_tree(self._callback_carry.restore_invariants(updated, carries))
+        if retain_carry:
+            host_carry.chunk = _PrivateScanCarry(
+                self,
+                layout,
+                program,
+                packed,
+                tuple(pytree.tree_leaves((final, updated))),
+            )
+        else:
+            # Public leaves may not expose the internal packed storage or share
+            # aliases with their siblings.
+            final = self._clone_state(final)
+        updated = self._callback_carry.restore_invariants(updated, carries)
+        if not retain_carry:
+            updated = _clone_tree(updated)
         for path in self._static_state_paths:
             final = _replace_path(final, path, _get_path(state, path).clone())
         for path in self._detached_state_paths:
             final = _replace_path(final, path, _get_path(final, path).detach())
-        return guard_scan_outputs((final, updated, emitted))
+        result = final, updated, emitted
+        return result if retain_carry else guard_scan_outputs(result)
 
 
 __all__ = []

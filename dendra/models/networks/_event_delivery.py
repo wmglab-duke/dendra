@@ -199,6 +199,12 @@ def dense_fixed_delay_transition(
     )
 
 
+def linear_delay_taps(positions):
+    """Return the lower index and upper-tap fraction for positions in steps."""
+    lower = positions.floor()
+    return lower.to(torch.long), positions - lower
+
+
 def delay_interpolation(delays, dt, *, dtype, taps, sigma):
     """Return native delay offsets and linear or soft tap coefficients.
 
@@ -208,10 +214,9 @@ def delay_interpolation(delays, dt, *, dtype, taps, sigma):
     while retaining their separate weighting and accumulation order.
     """
     lam = (delays.to(dtype) / dt.to(dtype).reshape(1)).clamp_min(1.0)
-    lower = torch.floor(lam)
-    lower_index = lower.to(torch.long)
     if taps == 2:
-        return lower_index, lam - lower
+        return linear_delay_taps(lam)
+    lower_index = lam.floor().to(torch.long)
     offsets = torch.stack([lower_index - 1, lower_index, lower_index + 1], dim=-1)
     centers = offsets.to(dtype)
     fractions = torch.softmax(
@@ -235,6 +240,7 @@ def dense_interpolated_delay_transition(
     width,
     taps,
     sigma,
+    delay_taps=None,
     _clone_once=False,
 ):
     """Enqueue physical delays with native two- or three-tap interpolation.
@@ -244,7 +250,8 @@ def dense_interpolated_delay_transition(
     then split between adjacent steps (two taps) or normalized Gaussian
     weights centered on ``floor(position) + [-1, 0, 1]`` (three taps).
     ``sigma`` is measured in timesteps and retains the native ``1e-6``
-    denominator offset.
+    denominator offset. The optional delay_taps argument supplies the offsets
+    and differentiable fractions computed for an entire rollout.
 
     Today's row must be delivered before this transition clears it. Tap
     destinations wrap modulo ``depth``, including the native three-tap
@@ -260,9 +267,11 @@ def dense_interpolated_delay_transition(
     mutated. Fractional delays do not define integer event counts, so the
     returned ``event_queue`` is always ``None``.
     """
-    offsets, fractions = delay_interpolation(
-        delays, dt, dtype=queue.dtype, taps=taps, sigma=sigma
-    )
+    if delay_taps is None:
+        delay_taps = delay_interpolation(
+            delays, dt, dtype=queue.dtype, taps=taps, sigma=sigma
+        )
+    offsets, fractions = delay_taps
     weighted_gates = weights * connection_gates
     output = (
         queue.clone(memory_format=torch.contiguous_format) if _clone_once else queue

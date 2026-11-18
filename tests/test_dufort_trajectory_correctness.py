@@ -464,3 +464,70 @@ def test_dufort_timestep_change_restarts_with_exactly_one_new_dt():
     torch.testing.assert_close(model.v, expected, rtol=0.0, atol=1.0e-9)
     torch.testing.assert_close(model.v_prev, before, rtol=0.0, atol=0.0)
     assert bool(model._df_history_valid)
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize(
+    "mode", [torch.no_grad, torch.inference_mode], ids=["no_grad", "inference"]
+)
+def test_cuda_dufort_warmed_native_steps_do_not_read_a_scalar(mode, monkeypatch):
+    with mode(), dn.ctx(DEVICE="cuda", JIT=0, RUNTIME_CONTRACT_VALIDATION="versioned"):
+        model = _new_cable(_ExplicitAffineLeak, "homogeneous")
+        dt = model.v.new_tensor(DT)
+        integrator = model.integrator
+        integrator._initialize(model, dt)
+        original_all = torch.all
+        reads = 0
+
+        def watch_history(*args, **kwargs):
+            nonlocal reads
+            value = args[0] if args else kwargs.get("input")
+            if value is model._df_history_valid:
+                reads += 1
+            return original_all(*args, **kwargs)
+
+        monkeypatch.setattr(torch, "all", watch_history)
+        integrator.step(model, dt)
+        assert reads == 1
+        assert not model._df_history_valid.is_inference()
+        for _ in range(3):
+            integrator.step(model, dt)
+        assert reads == 1
+
+        # A callback or application can still invalidate the history.
+        model._df_history_valid.fill_(False)
+        integrator.step(model, dt)
+        assert reads == 2
+        integrator.step(model, dt)
+        assert reads == 2
+
+
+@pytest.mark.cuda
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+@pytest.mark.parametrize("jit", [0, 1])
+def test_cuda_dufort_history_cache_preserves_native_lifecycle(jit):
+    def trajectory(validation):
+        with (
+            torch.inference_mode(),
+            dn.ctx(DEVICE="cuda", JIT=jit, RUNTIME_CONTRACT_VALIDATION=validation),
+        ):
+            model = _new_cable(_ExplicitAffineLeak, "homogeneous")
+            model.batch(2)
+            model.initialize()
+            model.longrun(steps=3, chunklength=2, dt=DT, progressbar=False)
+            checkpoint = _clone_nested(model.state_dict_for_checkpoint())
+            model.initialize()
+            model.restore_dict_from_checkpoint(checkpoint)
+            resumed = _run_trajectory(model, steps=2)
+
+            # In-place changes matter even when only one lane is invalid.
+            model._df_history_valid[0] = False
+            restarted = _run_trajectory(model, steps=2)
+            changed_dt = _run_trajectory(model, steps=2, dt=2 * DT)
+            return resumed, restarted, changed_dt, model.v_prev, model._df_history_dt
+
+    for actual, expected in zip(
+        trajectory("versioned"), trajectory("strict"), strict=True
+    ):
+        torch.testing.assert_close(actual, expected, rtol=0.0, atol=0.0)

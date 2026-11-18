@@ -1601,10 +1601,27 @@ def test_transition_audit_rejects_write_to_undeclared_registered_buffer():
 
 
 @pytest.mark.parametrize("mutation", ["data", "detach"])
-def test_transition_parameter_writes_are_bitwise_audited_and_contained(mutation):
+@pytest.mark.parametrize("defer_storage", [False, True])
+def test_transition_parameter_writes_are_bitwise_audited_and_contained(
+    mutation,
+    defer_storage,
+):
     model = _model(_TimestepAccumulator)
-    functional = dn.func.FunctionalPopulation(model, dt=DT)
-    tensors = functional.extract(model)
+    if defer_storage:
+        runner = dn.compile(
+            model,
+            dt=DT,
+            steps=4,
+            execution="scan",
+            backend="eager",
+            inference=True,
+        )
+        functional = runner._functional
+        assert functional._deferred_transition_slots
+        tensors = functional.extract(model)
+    else:
+        functional = dn.func.FunctionalPopulation(model, dt=DT)
+        tensors = functional.extract(model)
     owner = functional._transition.population.mech._TimestepAccumulator
     parameter_snapshot = _mapping_snapshot(tensors.parameters)
 

@@ -64,6 +64,10 @@ from dendra.models._execution_horizons import (
     execution_step_budget,
     native_horizon_request,
 )
+from dendra.models._initialization_dependencies import (
+    _initialization_parameter_dependents,
+    _scoped_initialization_population,
+)
 from dendra.models._runtime_inputs import (
     native_input_sources,
     normalize_input_frame,
@@ -3212,7 +3216,7 @@ class Population(P, Sliceable):
             make_contiguous()
 
     def _deterministically_rematerialize_initialization_parameters(
-        self, *, preserve_state=False
+        self, *, preserve_state=False, affected_mechanisms=None
     ):
         # Parameter wrappers may cache resolved raw leaves in eval mode. A raw
         # output is a new generation even though initialization itself remains
@@ -3222,8 +3226,9 @@ class Population(P, Sliceable):
             if callable(clear_cache):
                 clear_cache()
 
-        self._rematerialize_parameter_owner(self, replay_random=preserve_state)
-        self._refresh_parameter_views_for_initialization()
+        if affected_mechanisms is None:
+            self._rematerialize_parameter_owner(self, replay_random=preserve_state)
+            self._refresh_parameter_views_for_initialization()
 
         handler = getattr(self, "mech", None)
         if handler is None:
@@ -3242,7 +3247,11 @@ class Population(P, Sliceable):
 
         mechanisms = tuple(getattr(handler, "mechanisms", {}).values())
         processes = tuple(getattr(handler, "material_processes", {}).values())
-        owners = (*mechanisms, *processes)
+        owners = (
+            (*mechanisms, *processes)
+            if affected_mechanisms is None
+            else affected_mechanisms
+        )
         for owner in owners:
             self._rematerialize_parameter_owner(owner, replay_random=preserve_state)
             for state in getattr(owner, "DE", {}).values():
@@ -3342,11 +3351,30 @@ class Population(P, Sliceable):
         writes_parameters = any(
             reference.startswith("parameters.") for reference in action.writes
         )
+        affected = None
+        if (
+            not torch.compiler.is_compiling()
+            and _scoped_initialization_population.get() is self
+            and all(ref.startswith("parameters.") for ref in action.writes)
+            and (
+                phase == "post"
+                or all(ref.startswith("parameters.") for ref in action.reads)
+            )
+        ):
+            handler = self.mech
+            affected = _initialization_parameter_dependents(
+                self, tuple(handler.mechanisms.items()), targets
+            )
         try:
             for target, value in zip(targets, staged, strict=True):
                 target.copy_(value)
             if writes_parameters:
-                self._deterministically_rematerialize_initialization_parameters()
+                if affected is None:
+                    self._deterministically_rematerialize_initialization_parameters()
+                else:
+                    self._deterministically_rematerialize_initialization_parameters(
+                        affected_mechanisms=affected
+                    )
         except Exception:
             for target, snapshot in zip(targets, snapshots, strict=True):
                 target.copy_(snapshot)
@@ -5350,15 +5378,50 @@ class Population(P, Sliceable):
             self.populate_parameter_buffers(random_generation=random_generation)
         self._refresh_parameter_views_for_initialization()
         self.integrator.init_v(self)
-        self.pre_initialize()
-        self.integrator.mech.initialize(
-            self.v,
-            self.celsius,
-            self.diam,
-            populate=populate_parameter_buffers,
-            random_generation=random_generation,
+        allow_scoped_refresh = (
+            populate_parameter_buffers
+            and (self.pre_initialize_hooks or self.post_initialize_hooks)
+            and (
+                not torch.is_grad_enabled()
+                or not any(parameter.requires_grad for parameter in self.parameters())
+            )
+            and not torch.compiler.is_compiling()
+            and not torch._C._are_functorch_transforms_active()
+            and type(self.mech) is MechanismHandler
+            and not (self.mech.material_processes or self.mech._input_bindings)
+            and getattr(self._derive_parameter_buffers, "__func__", None)
+            is P._derive_parameter_buffers
+            and getattr(self._install_parameter_buffers, "__func__", None)
+            in (P._install_parameter_buffers, Cable._install_parameter_buffers)
+            and getattr(self.make_contiguous, "__func__", None) is P.make_contiguous
+            and getattr(self._rematerialize_parameter_owner, "__func__", None)
+            is Population._rematerialize_parameter_owner.__func__
+            and all(
+                getattr(getattr(self.mech, name), "__func__", None)
+                is getattr(MechanismHandler, name)
+                for name in ("initialize", "populate", "ion_init", "material_init")
+            )
+            and all(
+                getattr(getattr(self, name), "__func__", None)
+                is getattr(Population, name)
+                for name in (
+                    "pre_initialize",
+                    "post_initialize",
+                    "_run_initialization_hooks",
+                    "_execute_initialization_transform",
+                    "_deterministically_rematerialize_initialization_parameters",
+                    "_refresh_parameter_views_for_initialization",
+                )
+            )
+            and all(
+                type(hook) is _InitializationTransformHook
+                for hooks in (self.pre_initialize_hooks, self.post_initialize_hooks)
+                for hook in hooks
+            )
         )
-        self.post_initialize()
+        self._initialize_with_hooks(
+            populate_parameter_buffers, random_generation, allow_scoped_refresh
+        )
         self.t = torch.zeros_like(self.t).detach()
         self._clear_duration_remainder()
         self.initialized = True
@@ -5372,6 +5435,26 @@ class Population(P, Sliceable):
         if boundary is not None:
             boundary.finish(cached=False)
         return self
+
+    def _initialize_with_hooks(self, populate, random_generation, allow_scoped_refresh):
+        token = (
+            _scoped_initialization_population.set(self)
+            if allow_scoped_refresh
+            else None
+        )
+        try:
+            self.pre_initialize()
+            self.integrator.mech.initialize(
+                self.v,
+                self.celsius,
+                self.diam,
+                populate=populate,
+                random_generation=random_generation,
+            )
+            self.post_initialize()
+        finally:
+            if token is not None:
+                _scoped_initialization_population.reset(token)
 
     def initialize_(self, *args, **kwargs):
         """

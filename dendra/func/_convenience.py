@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
+from threading import Lock
 from types import MappingProxyType
 
 import torch
@@ -45,7 +46,7 @@ from ._runtime_extra import (
     _MISSING_RUNTIME_EXTRA,
     VarInput,
 )
-from ._snapshot import _snapshot_frames
+from ._snapshot import _copy_runner_state, _snapshot_frames
 from ._stimulation_clock import _accepted_bank_clock, _sampling_time_tape
 from ._types import FunctionalizationError
 
@@ -56,6 +57,16 @@ _OWNED_NOISE_TAPE = FunctionalPopulation.sample_noise_draw_tape
 _OWNED_STIMULATION_TAPE = FunctionalPopulation.sample_stimulation_draw_tape
 _OWNED_MISSING_DRAWS = FunctionalPopulation._sample_missing_runtime_draws
 _OWNED_RUNTIME_DRAW_SAMPLER = FunctionalPopulation.sample_runtime_draws
+_RESTART_SNAPSHOT_LOCK = Lock()
+
+
+@torch.compiler.assume_constant_result
+def _materialize_restart_snapshot(runner):
+    # Publish the same versioned host frame when first read during tracing.
+    with _RESTART_SNAPSHOT_LOCK:
+        if runner._restart_state_deferred:
+            runner._initial_state = _copy_runner_state(runner._initial_state)
+            runner._restart_state_deferred = False
 
 
 def _initialization_writes_parameters(functional):
@@ -167,10 +178,21 @@ class CompiledRunner:
         # convenience constructor is called inside inference_mode().
         with torch.inference_mode(False), torch.no_grad():
             self._functional, tensors = make_functional(
-                population, dt=dt, extra=None if self._runtime_extra else extra
+                population,
+                dt=dt,
+                extra=None if self._runtime_extra else extra,
+                _defer_execution_storage=inference,
+            )
+            self._restart_state_deferred = (
+                inference
+                and initialization == "fresh"
+                and self._functional._can_defer_restart_snapshot(tensors.state)
             )
             self._parameters, self._constants, self._initial_state = _snapshot_frames(
-                self._functional, tensors, trainable=trainable
+                self._functional,
+                tensors,
+                trainable=trainable,
+                defer_state=self._restart_state_deferred,
             )
             self._initialization_inputs = pytree.tree_map_only(
                 torch.Tensor,
@@ -193,6 +215,8 @@ class CompiledRunner:
                 if not configured_callbacks
                 else self._functional.make_callbacks(configured_callbacks)
             )
+            if inference:
+                self._functional._defer_rebound_storage()
         keywords = _inference_compile_options(
             self._functional, inference, backend, options, compile_options
         )
@@ -210,6 +234,8 @@ class CompiledRunner:
         Fresh-policy calls ignore this snapshot unless it is explicitly passed
         as state, which always bypasses initialization.
         """
+        if self._restart_state_deferred:
+            _materialize_restart_snapshot(self)
         return self._initial_state
 
     @property

@@ -361,6 +361,10 @@ class Recorder(_PreparedCallback):
         Record the maximum over the final compartment/support axis.
     node_indices : sequence of int, optional
         Select entries on that final axis when max_only is False.
+    reduction : {"sum", "mean"}, optional
+        Reduce the final axis after any node selection. Each emission
+        retains the other axes and remains differentiable.
+        Mutually exclusive with max_only.
     partition : sequence of int, optional
         With max_only, reduce contiguous final-axis groups separately. Positive
         lengths must cover that axis completely.
@@ -391,6 +395,7 @@ class Recorder(_PreparedCallback):
         "dn.func.Recorder must be bound with functional.make_callbacks(...)"
     )
     _host_storage = None
+    reduction = None
     _checkpoint_fields = (
         "states",
         "paths",
@@ -409,6 +414,7 @@ class Recorder(_PreparedCallback):
         partition=None,
         *,
         region=None,
+        reduction=None,
     ) -> None:
         if isinstance(states, str):
             states = (states,)
@@ -420,12 +426,19 @@ class Recorder(_PreparedCallback):
             raise TypeError("functional Recorder states must be non-empty strings")
         if len(states) != len(set(states)):
             raise ValueError("functional Recorder state names must be unique")
+        if reduction not in (None, "sum", "mean"):
+            raise ValueError("functional Recorder reduction must be 'sum' or 'mean'")
+        if reduction is not None and max_only:
+            raise ValueError(
+                "functional Recorder reduction cannot be combined with max_only"
+            )
         self.states = states
         self.max_only = bool(max_only)
         self.node_indices = node_indices
         self.dt = dt
         self.partition = partition
         self.region = region
+        self.reduction = reduction
 
     def _bind(self, functional: FunctionalPopulation):
         if self._prepared:
@@ -503,6 +516,18 @@ class Recorder(_PreparedCallback):
                     "dn.func.Recorder node selection and maximum reduction "
                     f"require a non-scalar state; {state_name!r} is scalar"
                 )
+            if self.reduction and not schema.shape:
+                raise FunctionalizationError(
+                    f"dn.func.Recorder {self.reduction} requires a non-scalar state; "
+                    f"{state_name!r} is scalar"
+                )
+            if self.reduction == "mean" and not (
+                schema.dtype.is_floating_point or schema.dtype.is_complex
+            ):
+                raise FunctionalizationError(
+                    f"dn.func.Recorder mean requires floating or complex state; "
+                    f"{state_name!r} has dtype {schema.dtype}"
+                )
             selected_schemas.append(schema)
 
         node_indices = None
@@ -552,6 +577,13 @@ class Recorder(_PreparedCallback):
                 "node_indices": node_indices,
                 "partition": partition,
                 "region": region,
+                # Preserve the existing portable descriptor for unreduced recordings.
+                "_checkpoint_fields": (
+                    self._checkpoint_fields
+                    if self.reduction is None
+                    else (*self._checkpoint_fields, "reduction")
+                ),
+                "reduction": self.reduction,
                 "_host_storage": self._host_storage,
             },
         )
@@ -582,6 +614,10 @@ class Recorder(_PreparedCallback):
                     )
             elif self.node_indices is not None:
                 value = torch.index_select(value, -1, self.node_indices)
+            if self.reduction == "sum":
+                value = value.sum(dim=-1)
+            elif self.reduction == "mean":
+                value = value.mean(dim=-1)
             output[name] = value
         return output
 
@@ -1599,22 +1635,24 @@ class _CallbackCollector:
         return self._callbacks._concatenate(self.parts, borrow_single=borrow_single)
 
 
+def _owned_callback_hooks(callbacks):
+    if type(callbacks) is not FunctionalCallbacks:
+        return False
+    for name, original in _CALLBACK_RETENTION_HOOKS:
+        method = getattr(callbacks, name)
+        if getattr(method, "__func__", method) is not original:
+            return False
+    return True
+
+
 def _host_callback_parts(callbacks, callback_state, parts, *, storage=None):
     """Opt owned host collections into retention without changing atomic calls."""
-    if type(callbacks) is not FunctionalCallbacks:
+    if not _owned_callback_hooks(callbacks):
         if storage and getattr(callbacks, "_storage", None):
             raise FunctionalizationError(
                 "HDF5 recording requires the standard host callback collector"
             )
         return parts
-    for name, original in _CALLBACK_RETENTION_HOOKS:
-        method = getattr(callbacks, name)
-        if getattr(method, "__func__", method) is not original:
-            if storage and callbacks._storage:
-                raise FunctionalizationError(
-                    "HDF5 recording requires the standard host callback collector"
-                )
-            return parts
     selections = []
     for plan in callbacks._plans:
         implementation = _callback_implementation(plan.callback)

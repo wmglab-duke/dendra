@@ -5,11 +5,14 @@ from __future__ import annotations
 import builtins
 import copy
 import dis
+import gc
 import hashlib
 import inspect
 import math
 import sys
 import types
+import weakref
+from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -45,7 +48,7 @@ from dendra.models.integrators.cable import (
     _cylindrical_membrane_area,
     _layered_edge_conductance,
 )
-from dendra.models.integrators.core import _FunctionalIntegratorSpec
+from dendra.models.integrators.core import Integrator, _FunctionalIntegratorSpec
 from dendra.models.integrators.explicit import (
     SymmetricConv1D,
     _dufort_frankel,
@@ -101,7 +104,7 @@ from dendra.models.mechanisms._state_slots import (
     read_local_bindings,
     shared_field_slots,
 )
-from dendra.models.mechanisms._support import SupportKind
+from dendra.models.mechanisms._support import SupportKind, SupportMap, SupportSpec
 from dendra.models.mechanisms._support_registry import SupportEntry, SupportRegistry
 from dendra.models.mechanisms._symbolic import build_numerical_equation
 from dendra.models.multi import (
@@ -109,16 +112,20 @@ from dendra.models.multi import (
     _PackedMaterialGeometry,
     _PackedMaterialInitial,
 )
+from dendra.models.parametric import (
+    Bounded,
+)
 from dendra.models.parametric import Functional as ParameterFunctional
 from dendra.models.parametric import (
     Parameterized,
+    Referency,
     _ReplicaRangeExpander,
     cacheable,
     staticproperty,
 )
 from dendra.models.stim.waveform.core import Waveform
 from dendra.models.tree import Tree
-from dendra.utils.tensor_ops import _logical_tensor_bytes
+from dendra.utils.tensor_ops import _logical_tensor_bytes, _logical_tensor_bytes_equal
 
 from ._binding import _BINDING_UNSET
 from ._draws import RuntimeDraws, _has_runtime_stimulation, _with_runtime_draws
@@ -439,6 +446,17 @@ _STANDARD_MATERIAL_FUNCTIONAL_HOOKS = {
     for contract in _MATERIAL_PROCESS_CONTRACTS
 }
 _STANDARD_MATERIAL_RESOLVER = inspect.getattr_static(MechanismHandler, "_get_material")
+_STANDARD_LOCAL_MIRROR_BINDER = inspect.getattr_static(
+    MechanismHandler, "_bind_mechanism_field"
+)
+_STANDARD_MECHANISM_GET = inspect.getattr_static(Mechanism, "get")
+_STANDARD_LOCAL_SUPPORT_GATHER = (SupportEntry.gather, SupportMap.gather)
+_STANDARD_PREPARATION_PARAMETER_DERIVATION = Parameterized._derive_parameter_buffers
+_STANDARD_PREPARATION_BOUNDED_SOURCES = {
+    name: inspect.getattr_static(Bounded, name)
+    for name in ("_compute", "_apply_upper", "_upper_mode")
+}
+_STANDARD_PREPARATION_TIMESTEP_RESET = MechanismHandler._reset_initialization_timestep
 _STANDARD_MATERIAL_SPATIAL_HOOKS = {
     family: {
         name: value
@@ -580,6 +598,7 @@ _POPULATION_EXECUTION_HOOK_NAMES = (
     "_stochastic_shape",
     "_has_random_parameters_resampled_on_initialize",
     "_run_initialization_hooks",
+    "_initialize_with_hooks",
     "_initialization_transform_argument",
     "_initialization_transform_numpy_rng_equal",
     "_evaluate_initialization_transform",
@@ -1161,7 +1180,7 @@ def _audit_tensor_digest(value: torch.Tensor) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _audit_tensor_binding(value: torch.Tensor) -> tuple:
+def _audit_tensor_binding(value: torch.Tensor, *, include_payload=True) -> tuple:
     """Capture identity, schema, version, and bitwise logical value."""
     try:
         version = value._version
@@ -1176,7 +1195,7 @@ def _audit_tensor_binding(value: torch.Tensor) -> tuple:
         value.dtype,
         value.device,
         value.requires_grad,
-        _audit_tensor_digest(value),
+        _audit_tensor_digest(value) if include_payload else None,
     )
 
 
@@ -1271,7 +1290,7 @@ def _binding_capture_modes():
     return (id(mode), namespace["device"])
 
 
-def _binding_capture_plain_graph(module):
+def _binding_capture_plain_graph(module, *, allow_instance_dict_descriptor=False):
     """Qualify inert registration reads without invoking authored traversal."""
     if (
         _BINDING_NAMED_MODULES.__code__ is not _BINDING_NAMED_MODULES_CODE
@@ -1322,6 +1341,13 @@ def _binding_capture_plain_graph(module):
                         members[name] = namespace[name]
             if any(
                 members.get(name, _BINDING_MISSING) is not expected
+                and not (
+                    allow_instance_dict_descriptor
+                    and name == "__dict__"
+                    and type(members.get(name)) is types.GetSetDescriptorType
+                    and members[name].__name__ == "__dict__"
+                    and any(members[name].__objclass__ is base for base in mro)
+                )
                 for name, expected in policy.items()
             ):
                 return False
@@ -1363,8 +1389,27 @@ def _binding_capture_plain_graph(module):
     return True
 
 
-def _registered_tensor_bindings(module: torch.nn.Module) -> dict[tuple, tuple]:
+def _registered_tensor_bindings(
+    module: torch.nn.Module, *, deferred_slots=()
+) -> dict[tuple, tuple]:
     """Snapshot every registered parameter/buffer slot, including aliases."""
+    metadata_only_ids = set()
+    if deferred_slots:
+        metadata_only_ids.update(
+            id(value)
+            for name, value in _module_tensor_slots(module)
+            if name in deferred_slots
+            and (type(value) is torch.Tensor or type(value) is torch.nn.Parameter)
+            and value.device.type == "meta"
+        )
+
+    def capture(value):
+        if id(value) in metadata_only_ids:
+            # These registered placeholders have no payload. The actual
+            # functional call bindings are fingerprinted independently.
+            return _audit_tensor_binding(value, include_payload=False)
+        return _audit_tensor_binding(value)
+
     mode = _binding_capture_modes()
     reuse = mode is not None and _binding_capture_plain_graph(module)
     bindings, memo = {}, {}
@@ -1380,10 +1425,10 @@ def _registered_tensor_bindings(module: torch.nn.Module) -> dict[tuple, tuple]:
                 if reuse:
                     identity = id(value)
                     if identity not in memo:
-                        memo[identity] = (value, _audit_tensor_binding(value))
+                        memo[identity] = (value, capture(value))
                     bindings[key] = memo[identity][1]
                 else:
-                    bindings[key] = _audit_tensor_binding(value)
+                    bindings[key] = capture(value)
     return bindings
 
 
@@ -1983,8 +2028,14 @@ def _functional_probe_restore_scope(functional, classes, snapshot):
 def _deepcopy_execution_module(module: torch.nn.Module) -> torch.nn.Module:
     """Deep-copy a module while detaching authored non-leaf tensor caches."""
     memo = {}
+
+    def remember_tensor(value):
+        identity = id(value)
+        if identity not in memo:
+            memo[identity] = _clone_tensor(value)
+
     for _name, value in module.named_buffers(remove_duplicate=False):
-        memo.setdefault(id(value), _clone_tensor(value))
+        remember_tensor(value)
     handler = getattr(module, "mech", None)
     if handler is not None:
         # A child of an initialized MultiPopulation is configuration-only:
@@ -1997,7 +2048,7 @@ def _deepcopy_execution_module(module: torch.nn.Module) -> torch.nn.Module:
         ):
             for value in values:
                 if torch.is_tensor(value):
-                    memo.setdefault(id(value), _clone_tensor(value))
+                    remember_tensor(value)
 
     # Parameterized modules also retain a few ergonomic Python-side mappings
     # (for example ``range_p``) whose values can be differentiable views of
@@ -2012,7 +2063,7 @@ def _deepcopy_execution_module(module: torch.nn.Module) -> torch.nn.Module:
     def memoize_unregistered_tensors(value):
         if torch.is_tensor(value):
             if not isinstance(value, torch.nn.Parameter):
-                memo.setdefault(id(value), _clone_tensor(value))
+                remember_tensor(value)
             return
         if isinstance(value, Mapping):
             if id(value) in visited_containers:
@@ -2110,7 +2161,10 @@ def _rebind_population_time_references(population: Population) -> None:
 
 def _clone_execution_population(population: Population) -> Population:
     """Copy a model without retaining live autograd scratch or buffer aliases."""
-    cloned = _deepcopy_execution_module(population)
+    return _configure_execution_population(_deepcopy_execution_module(population))
+
+
+def _configure_execution_population(cloned):
     from ._mechanism_injections import configure_mechanism_injection_execution
 
     configure_mechanism_injection_execution(cloned)
@@ -2128,6 +2182,29 @@ def _clone_execution_population(population: Population) -> Population:
         for method_name in cloned.mech._SYNC_METHODS:
             cloned.mech.__dict__.pop(method_name, None)
     return cloned
+
+
+def _can_share_preparation_state(population):
+    """Borrow carry only when the remaining configuration uses owned hooks."""
+    from ._mechanism_injections import mechanism_injection_owners
+
+    integrator = population.integrator
+    if inspect.getattr_static(
+        integrator, "clear_jit_cache"
+    ) is not Integrator.clear_jit_cache or mechanism_injection_owners(population):
+        return False
+    handler = population.mech
+    return all(
+        inspect.getattr_static(owner, "setreference") is Referency.setreference
+        and type(owner).__setattr__ is torch.nn.Module.__setattr__
+        for collection in (handler.mechanisms, handler.material_processes)
+        for owner in collection.values()
+    ) and all(
+        type(module).__setattr__ is torch.nn.Module.__setattr__
+        and inspect.getattr_static(type(module), "_cache", None) is None
+        for module in population.modules()
+        if isinstance(module, cacheable)
+    )
 
 
 def _strip_packed_component_runtime_aliases(population: MultiPopulation) -> None:
@@ -2175,6 +2252,762 @@ def _module_tensor_slots(module: torch.nn.Module):
         for name, value in owner._buffers.items():
             if value is not None:
                 yield f"{prefix}{name}", value
+
+
+def _deferred_slot_values(module, rebound_names):
+    """Describe metadata replacements for slots filled by every functional call."""
+    deferred = []
+    retained_ids = set()
+    for path, owner in module.named_modules():
+        prefix = f"{path}." if path else ""
+        for registry in (owner._parameters, owner._buffers):
+            for name, value in registry.items():
+                if value is None:
+                    continue
+                if f"{prefix}{name}" in rebound_names:
+                    deferred.append((f"{prefix}{name}", registry, name, value))
+                else:
+                    retained_ids.add(id(value))
+
+    placeholders = {}
+    for path, registry, name, value in deferred:
+        identity = id(value)
+        if identity in retained_ids:
+            # Keep aliases to any slot whose saved value is still live.
+            continue
+        if identity not in placeholders:
+            kind = type(value)
+            if kind is not torch.Tensor and kind is not torch.nn.Parameter:
+                continue
+            if (
+                value.device.type == "meta"
+                or value.layout != torch.strided
+                or value.is_nested
+                or value.is_quantized
+                or value.is_conj()
+                or value.is_neg()
+                or value.storage_offset() != 0
+                or vars(value)
+            ):
+                continue
+            placeholder = torch.empty_strided(
+                value.shape,
+                value.stride(),
+                dtype=value.dtype,
+                device="meta",
+                requires_grad=value.requires_grad,
+            )
+            if kind is torch.nn.Parameter:
+                placeholder = torch.nn.Parameter(
+                    placeholder, requires_grad=value.requires_grad
+                )
+            placeholders[identity] = placeholder
+        yield path, registry, name, value, placeholders[identity]
+
+
+@contextmanager
+def _temporary_slot_values(bindings):
+    """Borrow or redirect slot values on an unpublished private module."""
+    saved = []
+    try:
+        for registry, name, value in bindings:
+            saved.append((registry, name, registry[name]))
+            registry[name] = value
+        yield
+    finally:
+        for registry, name, value in reversed(saved):
+            registry[name] = value
+
+
+_COPY_HOOK_NAMES = (
+    "__deepcopy__",
+    "__getstate__",
+    "__setstate__",
+    "__reduce__",
+    "__reduce_ex__",
+    "__getnewargs__",
+    "__getnewargs_ex__",
+    "__getattr__",
+    "__getattribute__",
+)
+_COPY_HOOK_OWNERS = (
+    object,
+    torch.nn.Module,
+    cacheable,
+    Parameterized,
+    MechanismHandler,
+    Population,
+    Cable,
+    MultiPopulation,
+    Integrator,
+    _dhs_multi,
+    _dufort_frankel_homogeneous,
+    SupportKind,
+    SupportMap,
+    SupportSpec,
+    SupportEntry,
+    SupportRegistry,
+    torch.nn.modules.module._WrappedHook,
+    torch._ops.OpOverload,
+    torch._ops.OpOverloadPacket,
+    torch.FunctionSchema,
+)
+_MODULE_SETSTATE = inspect.getattr_static(torch.nn.Module, "__setstate__")
+_STORAGE_DEFERRED_COPY_HOOKS = {
+    name: tuple(
+        inspect.getattr_static(owner, name, None) for owner in _COPY_HOOK_OWNERS
+    )
+    for name in _COPY_HOOK_NAMES
+}
+
+
+_COPY_GRAPH_LEAF_TYPES = frozenset(
+    id(kind)
+    for kind in (
+        str,
+        int,
+        float,
+        bool,
+        complex,
+        bytes,
+        type(None),
+        torch.device,
+        torch.dtype,
+        types.FunctionType,
+        types.BuiltinFunctionType,
+        types.CodeType,
+        weakref.ReferenceType,
+    )
+)
+_COPY_GRAPH_CONTAINER_TYPES = frozenset(
+    id(kind)
+    for kind in (dict, OrderedDict, tuple, list, set, frozenset, types.MethodType)
+)
+
+
+def _execution_copy_objects(root, *, skip=()):
+    """Walk the Python owners and values visited by execution copies."""
+    pending = [root]
+    visited = set(skip)
+    while pending:
+        value = pending.pop()
+        kind = type(value)
+        if isinstance(value, type) or id(kind) in _COPY_GRAPH_LEAF_TYPES:
+            continue
+        if id(value) in visited:
+            continue
+        visited.add(id(value))
+        yield value
+        if kind is torch.Tensor or kind is torch.nn.Parameter:
+            if vars(value):
+                pending.append(vars(value))
+            continue
+        if isinstance(value, torch.Tensor) or kind is types.ModuleType:
+            continue
+        pending.extend(gc.get_referents(value))
+
+
+def _dynamo_generation_setstate():
+    """Recognize Dynamo's stock wrapper around the original Module hook."""
+    mutation_guard = sys.modules.get("torch._dynamo.mutation_guard")
+    if mutation_guard is None:
+        return None
+    hook = inspect.getattr_static(torch.nn.Module, "__setstate__", None)
+    if type(hook) is not types.FunctionType or hook.__globals__ is not vars(
+        mutation_guard
+    ):
+        return None
+    install = vars(mutation_guard).get("install_generation_tagging_init")
+    code = hook.__code__
+    if (
+        type(install) is not types.FunctionType
+        or code.co_name != "patched_setstate"
+        or code.co_freevars != ("setstate",)
+        or not any(code is value for value in install.__code__.co_consts)
+    ):
+        return None
+    # Dynamo can also wrap an authored replacement. Keep its storage concrete.
+    try:
+        original = hook.__closure__[0].cell_contents
+    except ValueError:
+        return None
+    return hook if original is _MODULE_SETSTATE else None
+
+
+def _supports_early_storage_deferral(population):
+    """Keep real values available to authored copy/serialization hooks."""
+    allowed_hooks = _STORAGE_DEFERRED_COPY_HOOKS
+    dynamo_setstate = _dynamo_generation_setstate()
+    if dynamo_setstate is not None:
+        allowed_hooks = dict(allowed_hooks)
+        allowed_hooks["__setstate__"] = (
+            dynamo_setstate,
+            *allowed_hooks["__setstate__"],
+        )
+    for value in _execution_copy_objects(population):
+        kind = type(value)
+        if kind is torch.Tensor or kind is torch.nn.Parameter:
+            continue
+        if isinstance(value, torch.Tensor) or kind is types.ModuleType:
+            return False
+        if id(kind) not in _COPY_GRAPH_CONTAINER_TYPES:
+            for name, methods in allowed_hooks.items():
+                hook = inspect.getattr_static(value, name, None)
+                if not any(hook is method for method in methods):
+                    return False
+    return True
+
+
+def _defer_module_slot_storage(module, rebound):
+    deferred = []
+    for path, registry, name, _original, placeholder in _deferred_slot_values(
+        module, rebound
+    ):
+        registry[name] = placeholder
+        deferred.append(path)
+    return frozenset(deferred)
+
+
+def _clone_population_with_deferred_slots(population, rebound, original_values=None):
+    """Clone an execution owner while keeping authored Python aliases concrete."""
+    replacements = tuple(
+        (path, registry, name, original, placeholder)
+        for path, registry, name, original, placeholder in _deferred_slot_values(
+            population, rebound
+        )
+        # Native deepcopy uses non-leaf status to rebuild cache ownership.
+        if original.is_leaf
+    )
+    with _temporary_slot_values(
+        (registry, name, placeholder)
+        for _path, registry, name, _original, placeholder in replacements
+    ):
+        cloned = _clone_execution_population(population)
+    originals = dict(original_values or ())
+    originals.update((path, original) for path, _, _, original, _ in replacements)
+    return cloned, {
+        name: originals[name]
+        for name, tensor in _module_tensor_slots(cloned)
+        if name in originals and tensor.device.type == "meta"
+    }
+
+
+@contextmanager
+def _borrow_deferred_values(population, originals):
+    """Expose real values to native setup on an unpublished execution copy."""
+    bindings = []
+    for path, original in originals.items():
+        owner_path, _, name = path.rpartition(".")
+        owner = population.get_submodule(owner_path)
+        registry = owner._parameters if name in owner._parameters else owner._buffers
+        bindings.append((registry, name, original))
+    with _temporary_slot_values(bindings):
+        yield
+
+
+def _clone_initialization_population(transition, rebound, original_values):
+    """Copy the initializer's fixed configuration and validate its carry layout."""
+    rebound = {name.removeprefix("population.") for name in rebound}
+    initialization, originals = _clone_population_with_deferred_slots(
+        transition.population, rebound, original_values
+    )
+    # State-layout admission inspects native checkpoint values. Borrow the
+    # configured tensors for that inspection without owning duplicate storage.
+    with _borrow_deferred_values(initialization, originals):
+        layout = _state_layout(initialization)
+        explicit = _initialization_state_layout(initialization, layout)
+    deferred = set(originals) | _defer_module_slot_storage(
+        initialization, rebound.difference(originals)
+    )
+    return (
+        initialization,
+        layout,
+        explicit,
+        frozenset(f"population.{path}" for path in deferred),
+    )
+
+
+def _capture_slot_templates(slots, *, share_owned_storage=False, mutable_slots=()):
+    """Capture value templates and canonical names for exact Tensor aliases.
+
+    A private preparation module can supply its own read-only template
+    storage. Its invocation receives cloned tensors through functional_call.
+    Transition slots that may be written keep independent fallback storage.
+    Repeated slots still need separate keys for binding and restoration.
+    """
+    templates = {}
+    canonical_names = {}
+    names_by_identity = {}
+    for name, value in slots:
+        kind = type(value)
+        ordinary = kind is torch.Tensor or kind is torch.nn.Parameter
+        can_alias = ordinary and name not in mutable_slots
+        canonical = names_by_identity.get(id(value), name) if can_alias else name
+        if name == canonical:
+            if can_alias:
+                names_by_identity[id(value)] = name
+            templates[name] = (
+                value.detach()
+                if share_owned_storage and can_alias and value.is_contiguous()
+                else _clone_tensor(value)
+            )
+        else:
+            templates[name] = templates[canonical]
+        canonical_names[name] = canonical
+    return templates, canonical_names
+
+
+def _capture_preparation_templates(preparation):
+    return _capture_slot_templates(
+        (
+            (name, value)
+            for name, value in _module_tensor_slots(preparation)
+            if not name.startswith("component_physical_preparations.")
+        ),
+        share_owned_storage=True,
+    )
+
+
+def _clone_slot_templates(templates, canonical_names):
+    """Give one invocation private, differentiable storage for each alias group."""
+    copies = {
+        name: templates[name].clone()
+        for name, canonical in canonical_names.items()
+        if name == canonical
+    }
+    return {name: copies[canonical] for name, canonical in canonical_names.items()}
+
+
+def _is_dense_slot_template(value):
+    """Qualify an ordinary storage seed for private fallback reuse."""
+    return (
+        type(value) is torch.Tensor
+        and not vars(value)
+        and not value.is_nested
+        and value.layout == torch.strided
+        and not value.is_meta
+        and not value.is_quantized
+        and not value.is_inference()
+        and value.is_contiguous()
+        and value.storage_offset() == 0
+        and not value.is_conj()
+        and not value.is_neg()
+    )
+
+
+def _share_read_only_fallback_templates(
+    templates, canonical_names, preparation_templates, mutable_slots
+):
+    """Borrow private preparation storage for matching read-only alias groups."""
+    if _binding_capture_modes() is None:
+        return
+
+    preparation_slots = {}
+    slots_by_storage = {}
+    for name, value in preparation_templates.items():
+        if (
+            type(value) is torch.Tensor
+            and not value.is_nested
+            and value.layout == torch.strided
+            and not value.is_meta
+        ):
+            storage = torch.Tensor.untyped_storage(value)
+            address = storage.data_ptr()
+            if address:
+                key = (value.device, address)
+                preparation_slots[name] = (key, storage.nbytes())
+                slots_by_storage.setdefault(key, []).append(name)
+
+    fallback_groups = {}
+    for name, canonical in canonical_names.items():
+        fallback_groups.setdefault(canonical, []).append(name)
+
+    for canonical, names in fallback_groups.items():
+        if canonical not in preparation_slots:
+            continue
+        source = preparation_templates[canonical]
+        seed = templates[canonical]
+        key, size = preparation_slots[canonical]
+        if any(
+            name in mutable_slots
+            or canonical_names.get(name, canonical) != canonical
+            or preparation_templates[name] is not source
+            for name in slots_by_storage[key]
+        ) or any(preparation_templates.get(name) is not source for name in names):
+            continue
+        if not (_is_dense_slot_template(seed) and _is_dense_slot_template(source)):
+            continue
+        if (
+            seed.device == source.device
+            and seed.dtype == source.dtype
+            and seed.shape == source.shape
+            and seed.stride() == source.stride()
+            and size
+            == seed.untyped_storage().nbytes()
+            == seed.numel() * seed.element_size()
+            and _logical_tensor_bytes_equal(seed, source)
+        ):
+            shared = source.detach()
+            for name in names:
+                templates[name] = shared
+
+
+def _execution_tensor_storage(value):
+    if (
+        type(value) in (torch.Tensor, torch.nn.Parameter)
+        and not value.is_nested
+        and value.layout == torch.strided
+        and not value.is_meta
+    ):
+        address = torch.Tensor.untyped_storage(value).data_ptr()
+        if address:
+            return value.device, address
+    return None
+
+
+def _topology_storage_groups(module):
+    """Collect exact registered aliases and storage retained by Python owners."""
+    groups = {}
+    for name, value in _module_tensor_slots(module):
+        if type(value) not in (torch.Tensor, torch.nn.Parameter):
+            return None
+        storage = _execution_tensor_storage(value)
+        if storage is not None:
+            groups.setdefault(storage, {})[name] = value
+    registries = {
+        id(registry)
+        for owner in module.modules()
+        for registry in (owner._buffers, owner._parameters)
+    }
+    retained = set()
+    for value in _execution_copy_objects(module, skip=registries):
+        if isinstance(value, torch.Tensor):
+            if type(value) not in (torch.Tensor, torch.nn.Parameter):
+                return None
+            storage = _execution_tensor_storage(value)
+            if storage is not None:
+                retained.add(storage)
+    return groups, retained
+
+
+def _share_private_topology_storage(
+    transition, initialization, topology_slots, mutable_slots, *, native=None
+):
+    """Share exact backing and return the rebound target registrations."""
+    eligible = set(topology_slots).difference(mutable_slots)
+    if not eligible or _binding_capture_modes() is None:
+        return {}
+    source_frame = _topology_storage_groups(transition)
+    target_frame = _topology_storage_groups(initialization)
+    if source_frame is None or target_frame is None:
+        return {}
+    source_groups, source_retained = source_frame
+    target_groups, target_retained = target_frame
+    if native is not None:
+        native_frame = _topology_storage_groups(native)
+        if native_frame is None:
+            return {}
+        native_groups, native_retained = native_frame
+        source_retained.update(native_groups)
+        source_retained.update(native_retained)
+        target_retained.update(native_groups)
+        target_retained.update(native_retained)
+    source_by_names = {
+        frozenset(names): values
+        for key, values in source_groups.items()
+        if key not in source_retained and (names := set(values)).issubset(eligible)
+    }
+    bindings = {}
+    for key, values in target_groups.items():
+        sources = source_by_names.get(frozenset(values))
+        if sources is None or key in target_retained:
+            continue
+        seed = next(iter(values.values()))
+        source = next(iter(sources.values()))
+        if not (_is_dense_slot_template(seed) and _is_dense_slot_template(source)):
+            continue
+        if any(value is not seed for value in values.values()) or any(
+            value is not source for value in sources.values()
+        ):
+            continue
+        if (
+            not seed.requires_grad
+            and not source.requires_grad
+            and seed.device == source.device
+            and seed.dtype == source.dtype
+            and seed.shape == source.shape
+            and seed.stride() == source.stride()
+            and seed.untyped_storage().nbytes()
+            == source.untyped_storage().nbytes()
+            == seed.numel() * seed.element_size()
+            and _logical_tensor_bytes_equal(seed, source)
+        ):
+            shared = source.detach()
+            for name in values:
+                path, _, buffer_name = name.rpartition(".")
+                owner = initialization.get_submodule(path)
+                owner._buffers[buffer_name] = shared
+                bindings[name] = shared
+    return bindings
+
+
+def _private_seed_slots_unreachable_by_authored_code(facade, slots):
+    """Exclude owners that authored mechanisms can reach outside their frame."""
+    handler = facade.population.mech
+    authored = (*handler.mechanisms.values(), *handler.material_processes.values())
+    accessed = {
+        id(value)
+        for value in _execution_copy_objects(authored)
+        if isinstance(value, torch.nn.Module)
+    }
+    owners = dict(facade.named_modules(remove_duplicate=False))
+    if any(
+        owner._forward_pre_hooks or owner._forward_hooks for owner in owners.values()
+    ):
+        return set()
+    return {
+        name
+        for name in slots
+        if id(owners.get(name.rpartition(".")[0])) not in accessed
+    }
+
+
+def _share_preparation_read_only_storage(
+    preparation, transition, initialization, fallback, slots, mutable_slots, *, native
+):
+    """Share read-only backing while preserving each call's input bindings."""
+    if (
+        _binding_capture_modes() is None
+        or torch.nn.modules.module._global_forward_pre_hooks
+        or torch.nn.modules.module._global_forward_hooks
+    ):
+        return
+    eligible = slots.intersection(fallback).difference(mutable_slots)
+    targets = (transition,) if initialization is None else (transition, initialization)
+    # An authored hook can return a fallback unchanged. Validate all owners
+    # before lending its storage to any of their concrete registrations.
+    for facade in (preparation, *targets):
+        if not eligible:
+            return
+        eligible = _private_seed_slots_unreachable_by_authored_code(facade, eligible)
+    for facade in targets:
+        _share_private_topology_storage(
+            preparation, facade, eligible, mutable_slots, native=native
+        )
+
+
+def _defer_preparation_slot_storage(preparation, names, templates, aliases):
+    """Replace only complete, exclusively registered preparation alias groups."""
+    if not names:
+        return frozenset()
+    frame = _topology_storage_groups(preparation)
+    if frame is None:
+        return frozenset()
+    groups, retained = frame
+    deferred = []
+    template_groups = {}
+    for name, canonical in aliases.items():
+        template_groups.setdefault(canonical, set()).add(name)
+    for storage, values in groups.items():
+        if storage in retained or not values.keys() <= names:
+            continue
+        name, source = next(iter(values.items()))
+        if not _is_dense_slot_template(source) or source.requires_grad:
+            continue
+        canonical = aliases.get(name)
+        if template_groups.get(canonical) != values.keys() or any(
+            value is not source or _execution_tensor_storage(templates[slot]) != storage
+            for slot, value in values.items()
+        ):
+            continue
+        placeholder = torch.empty_strided(
+            source.shape, source.stride(), dtype=source.dtype, device="meta"
+        )
+        for slot in values:
+            owner_path, _, field = slot.rpartition(".")
+            preparation.get_submodule(owner_path)._buffers[field] = placeholder
+            templates[slot] = placeholder
+            deferred.append(slot)
+    return frozenset(deferred)
+
+
+def _state_shadow_storage_groups(facade):
+    """Find concrete write-local State aliases with no other storage owners."""
+    paths = {id(module): path for path, module in facade.named_modules()}
+    owners = {}
+    groups = {}
+    for mechanism in facade.population.mech.mechanisms.values():
+        names = set(mechanism._advance_output_names()).intersection(
+            mechanism._runtime_shared_local_names()
+        )
+        for state in mechanism.DE.values():
+            path = paths.get(id(state))
+            if path is None or any(
+                inspect.getattr_static(type(state), name)
+                is not inspect.getattr_static(State, name)
+                for name in ("__getattribute__", "__setattr__", "__delattr__")
+            ):
+                continue
+            attributes = vars(state)
+            shadows = {
+                name: attributes[name]
+                for name in names.intersection(attributes)
+                if _is_dense_slot_template(attributes[name])
+                and not attributes[name].requires_grad
+            }
+            if not shadows:
+                continue
+            owners[id(attributes)] = {
+                name: value for name, value in attributes.items() if name not in shadows
+            }
+            for name, value in shadows.items():
+                storage = _execution_tensor_storage(value)
+                if storage is not None:
+                    groups.setdefault(storage, {})[f"{path}.{name}"] = (
+                        attributes,
+                        name,
+                        value,
+                    )
+    if not groups:
+        return {}
+    retained = set()
+    for value in _execution_copy_objects((facade, tuple(owners.values())), skip=owners):
+        if isinstance(value, torch.Tensor):
+            if type(value) not in (torch.Tensor, torch.nn.Parameter):
+                return {}
+            storage = _execution_tensor_storage(value)
+            if storage is not None:
+                retained.add(storage)
+    return {
+        tuple(sorted(entries)): entries
+        for storage, entries in groups.items()
+        if storage not in retained
+    }
+
+
+def _share_private_state_shadow_storage(transition, initialization, *, separate):
+    """Keep one setup-time value per isolated exact State alias group."""
+    if _binding_capture_modes() is None:
+        return {}, {}
+    templates = {}
+    aliases = {}
+    sources = _state_shadow_storage_groups(transition)
+    targets = _state_shadow_storage_groups(initialization)
+    matching = sources.keys() & targets.keys()
+    if not matching:
+        return templates, aliases
+    separate_storage = {
+        storage
+        for value in _execution_copy_objects(separate)
+        if isinstance(value, torch.Tensor)
+        if (storage := _execution_tensor_storage(value)) is not None
+    }
+    for names in sorted(matching):
+        source_group = sources[names]
+        target_group = targets[names]
+        canonical = names[0]
+        source = source_group[canonical][2]
+        target = target_group[canonical][2]
+        if (
+            _execution_tensor_storage(source) not in separate_storage
+            and _execution_tensor_storage(target) not in separate_storage
+            and all(entry[2] is source for entry in source_group.values())
+            and all(entry[2] is target for entry in target_group.values())
+            and source.device == target.device
+            and source.dtype == target.dtype
+            and source.shape == target.shape
+            and source.stride() == target.stride()
+            and source.untyped_storage().nbytes()
+            == target.untyped_storage().nbytes()
+            == source.numel() * source.element_size()
+            and _logical_tensor_bytes_equal(source, target)
+        ):
+            shared = source.detach()
+            for attributes, name, _value in target_group.values():
+                attributes[name] = shared
+            templates[canonical] = source
+            aliases.update(dict.fromkeys(names, canonical))
+    return templates, aliases
+
+
+def _private_conductance_scratch(population):
+    """Find concrete aggregation buffers with no authored or retained aliases."""
+    handler = population.mech
+    scratch = vars(handler).get("_buf_g")
+    if (
+        type(handler) is not MechanismHandler
+        or type(scratch) is not list
+        or not scratch
+        or any(
+            not _is_dense_slot_template(value) or value.requires_grad
+            for value in scratch
+        )
+    ):
+        return None
+    storage = {_execution_tensor_storage(value) for value in scratch}
+    if None in storage or len(storage) != len(scratch):
+        return None
+    # An authored current or state update can reach scratch through a plain
+    # Python reference to its parent, even if it never registers the buffer.
+    authored_owners = (
+        *handler.mechanisms.values(),
+        *handler.material_processes.values(),
+    )
+    owners = {id(population), id(population.integrator), id(handler), id(scratch)}
+    if any(
+        id(value) in owners
+        or (
+            isinstance(value, torch.nn.Module)
+            and type(value).__getattribute__ is not object.__getattribute__
+        )
+        for value in _execution_copy_objects(authored_owners)
+    ):
+        return None
+    if any(
+        _execution_tensor_storage(value) in storage
+        for value in _execution_copy_objects(population, skip=(id(scratch),))
+    ):
+        return None
+    return scratch
+
+
+def _share_private_conductance_scratch(native, transition, *other_populations):
+    """Share the call-local facades' unused concrete conductance snapshots."""
+    if (
+        _binding_capture_modes() is None
+        or torch.nn.modules.module._global_forward_pre_hooks
+        or torch.nn.modules.module._global_forward_hooks
+    ):
+        return
+    source = _private_conductance_scratch(transition)
+    if source is None:
+        return
+    native_storage = {
+        storage
+        for value in _execution_copy_objects(native)
+        if (storage := _execution_tensor_storage(value)) is not None
+    }
+    if any(_execution_tensor_storage(value) in native_storage for value in source):
+        return
+    for population in other_populations:
+        target = _private_conductance_scratch(population)
+        if target is None or len(target) != len(source):
+            continue
+        for index, (old, value) in enumerate(zip(target, source, strict=True)):
+            if (
+                _execution_tensor_storage(old) not in native_storage
+                and old.device == value.device
+                and old.dtype == value.dtype
+                and old.shape == value.shape
+                and old.stride() == value.stride()
+                and old.untyped_storage().nbytes()
+                == value.untyped_storage().nbytes()
+                == value.numel() * value.element_size()
+                and _logical_tensor_bytes_equal(old, value)
+            ):
+                # Native i()/idf() rebind each slot before their first write.
+                # Independent lists and handles keep those rebindings local.
+                target[index] = value.detach()
 
 
 def _parameter_alias_paths(module: torch.nn.Module) -> dict[str, tuple[str, ...]]:
@@ -3951,7 +4784,9 @@ def _append_registered_prepared_constants(
             )
 
 
-def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ...]:
+def _prepared_buffer_layout(
+    population: Population, *, include_parametrized_values=True
+) -> tuple[_PreparedBuffer, ...]:
     effective = []
     derived = []
     timestep = []
@@ -3975,7 +4810,7 @@ def _prepared_buffer_layout(population: Population) -> tuple[_PreparedBuffer, ..
                 )
             )
         registry = module._modules.get("parametrizations")
-        if registry is not None:
+        if include_parametrized_values and registry is not None:
             for name in registry:
                 value = getattr(module, name)
                 effective.append(
@@ -4329,6 +5164,127 @@ def _local_synchronization_slots(population: Population) -> tuple[str, ...]:
     return tuple(sorted(slots))
 
 
+def _synchronized_local_mirror_slots(population):
+    """Identify slots replaced by the canonical shared-field entry prelude."""
+    handler = population.mech
+    if (
+        type(handler) is not MechanismHandler
+        or not all(
+            _handler_initialization_hook_is_standard(handler, name)
+            for name in ("_sync_celsius", "read_from_ions", "read_from_materials")
+        )
+        or inspect.getattr_static(handler, "_bind_mechanism_field")
+        is not _STANDARD_LOCAL_MIRROR_BINDER
+        or inspect.getattr_static(handler, "_get_material")
+        is not _STANDARD_MATERIAL_RESOLVER
+        or any(
+            inspect.getattr_static(process, "get") is not _STANDARD_MECHANISM_GET
+            or type(process.support_map) not in (SupportMap, type(None))
+            for process in handler.material_processes.values()
+        )
+    ):
+        return ()
+
+    ion_reads = handler._ion_read_support_plan
+    material_reads = handler._material_read_support_plan
+    supports = (
+        *(entry for _owner, entry in handler._mechanism_support_entry_plan),
+        *(entry for _ion, _field, entry, _targets in ion_reads),
+        *(entry for _material, _field, entry, _targets in material_reads),
+    )
+    if (
+        any(
+            type(entry) is not SupportEntry or type(entry.support_map) is not SupportMap
+            for entry in supports
+        )
+        or (SupportEntry.gather, SupportMap.gather) != _STANDARD_LOCAL_SUPPORT_GATHER
+    ):
+        return ()
+
+    targets = [
+        (field, mechanism)
+        for _ion, field, _entry, mechanisms in ion_reads
+        for mechanism in mechanisms
+    ]
+    targets.extend(
+        (field, mechanism)
+        for _material, field, _entry, bindings in material_reads
+        for mechanism, _clone in bindings
+    )
+    # Functional binding visits all registered owners before the sync prelude.
+    # Keep concrete values when binding or sync can invoke authored getters.
+    owner_types = {
+        type(owner)
+        for owner in (
+            *population.modules(),
+            *(entry.representative for entry in supports),
+        )
+    }
+    if any(
+        inspect.getattr_static(kind, "__getattribute__") is not object.__getattribute__
+        or inspect.getattr_static(kind, "__getattr__", None)
+        is not torch.nn.Module.__getattr__
+        or any(
+            inspect.getattr_static(kind, name, None) is not None
+            for name in ("DE", "key", "_buffers", "_parameters", "_modules")
+        )
+        for kind in owner_types
+    ):
+        return ()
+    paths = {id(owner): path for path, owner in population.named_modules()}
+    return tuple(
+        sorted(
+            {
+                f"population.{paths[id(owner)]}.{field}"
+                for field, mechanism in targets
+                for owner in (mechanism, *mechanism.DE.values())
+                if id(owner) in paths and field in owner._buffers
+            }
+        )
+    )
+
+
+def _rebound_ion_mirror_groups(preparation, carry_routes, mirror_seeds):
+    """Find whole storage groups for non-current Ion fields and their local reads."""
+    frame = _topology_storage_groups(preparation)
+    if frame is None:
+        return set()
+    groups, retained = frame
+    paths = {id(owner): path for path, owner in preparation.named_modules()}
+    handler = preparation.population.mech
+    reads = {}
+    for ion_name, field, _support, mechanisms in handler._ion_read_support_plan:
+        if field == f"i{ion_name}":
+            continue
+        slots = reads.setdefault((ion_name, field), set())
+        for mechanism in mechanisms:
+            for owner in (mechanism, *mechanism.DE.values()):
+                if id(owner) in paths:
+                    slots.add(f"{paths[id(owner)]}.{field}")
+
+    eligible = set()
+    for (ion_name, field), readers in reads.items():
+        ion = handler.ions[ion_name]
+        if type(ion) is not Ion or id(ion) not in paths:
+            continue
+        canonical = f"{paths[id(ion)]}.{field}"
+        if canonical not in carry_routes.get(("ions", ion_name, field), ()):
+            continue
+        storage = _execution_tensor_storage(ion._buffers.get(field))
+        if storage is None or storage in retained:
+            continue
+        names = groups.get(storage, {}).keys()
+        mirrors = names - {canonical}
+        if (
+            canonical in names
+            and mirrors
+            and mirrors <= readers
+            and mirrors <= mirror_seeds.keys()
+        ):
+            eligible.update(names)
+    return eligible
+
+
 def _ephemeral_assigned_slots(population: Population) -> tuple[str, ...]:
     """Return registered Mechanism ASSIGNED slots rebuilt during evaluation."""
 
@@ -4652,8 +5608,11 @@ class _PopulationPreparation(torch.nn.Module):
         if not self.audit_builder_inputs:
             return None
         module = self if module is None else module
+        deferred = getattr(self, "_deferred_slots", ())
         return {
-            name: _audit_tensor_binding(value)
+            name: _audit_tensor_binding(
+                value, include_payload=name not in deferred or not value.is_meta
+            )
             for name, value in _module_tensor_slots(module)
         }
 
@@ -4661,11 +5620,9 @@ class _PopulationPreparation(torch.nn.Module):
         if bindings is None:
             return
         module = self if module is None else module
-        current = dict(_module_tensor_slots(module))
+        current = self._registered_input_bindings(module)
         changed = [
-            name
-            for name, binding in bindings.items()
-            if name not in current or _audit_tensor_binding(current[name]) != binding
+            name for name, binding in bindings.items() if current.get(name) != binding
         ]
         if set(current) != set(bindings):
             changed.extend(sorted(set(current) ^ set(bindings)))
@@ -4680,11 +5637,9 @@ class _PopulationPreparation(torch.nn.Module):
         if bindings is None:
             return
         registered, positional = bindings
-        current = dict(_module_tensor_slots(self))
+        current = self._registered_input_bindings()
         changed = [
-            name
-            for name, binding in registered.items()
-            if name not in current or _audit_tensor_binding(current[name]) != binding
+            name for name, binding in registered.items() if current.get(name) != binding
         ]
         changed.extend(
             f"positional:{name}"
@@ -5005,6 +5960,96 @@ class _PopulationPreparation(torch.nn.Module):
         if self.local_geometry_bindings:
             result = (*result, tuple(local_geometry))
         return (*result, random_outputs) if random_inputs is not None else result
+
+
+def _preparation_rebound_geometry_slots(preparation, geometry_constants):
+    """Prove that the preparation prelude reads only explicit root inputs."""
+    from dendra.models._initialization_dependencies import (
+        _has_plain_sources,
+        _parameter_names,
+    )
+
+    population = preparation.population
+    handler = population.mech
+    root_fields = _parameter_names(population)
+    root_reads = root_fields | {
+        "parametrizations",
+        "additional_parameters",
+        "in_graph_parametrizations",
+        "random_parameters",
+        "runtime_noises",
+    }
+    if (
+        type(preparation) is not _PopulationPreparation
+        or type(handler) is not MechanismHandler
+        or handler.material_processes
+        or not _binding_capture_plain_graph(
+            preparation, allow_instance_dict_descriptor=True
+        )
+        or torch.nn.modules.module._global_forward_pre_hooks
+        or torch.nn.modules.module._global_forward_hooks
+        or any(
+            _module_autograd_hook_signature(owner) for owner in preparation.modules()
+        )
+        or inspect.getattr_static(population, "_derive_parameter_buffers")
+        is not _STANDARD_PREPARATION_PARAMETER_DERIVATION
+        or inspect.getattr_static(handler, "_reset_initialization_timestep")
+        is not _STANDARD_PREPARATION_TIMESTEP_RESET
+        or not _handler_initialization_hook_is_standard(handler, "_sync_celsius")
+        or any(
+            inspect.getattr_static(type(population), name, None) is not None
+            for name in root_reads
+        )
+        or not _has_plain_sources(population, root_fields)
+        or any(
+            inspect.getattr_static(source, method, None) is not canonical
+            for field in root_fields
+            if (source := population._modules.get(f"{field}_param")) is not None
+            for method, canonical in _STANDARD_PREPARATION_BOUNDED_SOURCES.items()
+        )
+        or (SupportEntry.gather, SupportMap.gather) != _STANDARD_LOCAL_SUPPORT_GATHER
+    ):
+        return None
+    # The timestep reset and temperature sync access State registries and
+    # support keys before local diameters are installed. Keep those phases
+    # on their ordinary framework routes.
+    supports = (
+        *(entry for _owner, entry in handler._mechanism_support_entry_plan),
+        *(
+            binding.support_entry
+            for binding in preparation.geometry_bindings
+            if binding.support_entry is not None
+        ),
+    )
+    owners = (*population.modules(), *(entry.representative for entry in supports))
+    if any(
+        type(entry) is not SupportEntry or type(entry.support_map) is not SupportMap
+        for entry in supports
+    ) or any(
+        type(owner).__getattribute__ is not object.__getattribute__
+        or type(owner).__getattr__ is not torch.nn.Module.__getattr__
+        or inspect.getattr_static(type(owner), "DE", None) is not None
+        or inspect.getattr_static(type(owner), "key", None) is not None
+        or type(inspect.getattr_static(owner, "runtime_noises", {}))
+        not in (dict, OrderedDict)
+        or any(
+            type(inspect.getattr_static(owner, name, ()))
+            not in (tuple, list, set, frozenset)
+            for name in ("_derived_buffers", "_timestep_buffers")
+        )
+        for owner in owners
+    ):
+        return None
+    return {
+        f"population.{path + '.' if path else ''}{binding.buffer_name}"
+        for binding in preparation.geometry_bindings
+        for path in binding.module_paths
+        if (path or binding.constant_name in geometry_constants)
+        and binding.buffer_name
+        not in inspect.getattr_static(
+            _module_at(population, path), "_timestep_buffers", ()
+        )
+    }
 
 
 class _ComponentPhysicalPreparation(_PopulationPreparation):
@@ -10304,6 +11349,29 @@ def _support_key_modules(population):
             yield f"integrator.mech.{collection_name}.{name}", module
 
 
+def _private_topology_slots(population):
+    """Select physical geometry owners and declared placement buffers."""
+    geometry_owners = (
+        ("population", population),
+        ("population.integrator", population.integrator),
+        ("population.integrator.mech", population.mech),
+    )
+    return {
+        f"{path}.{name}" for path, owner in geometry_owners for name in owner._buffers
+    } | {f"population.{path}.key" for path, _module in _support_key_modules(population)}
+
+
+def _private_ion_initialization_slots(population):
+    """Select the registered initialization seeds of canonical ions."""
+    return {
+        f"population.integrator.mech.ions.{name}.{buffer_name}"
+        for name, ion in population.mech.ions.items()
+        if type(ion) is Ion
+        for field in ion.fields
+        if (buffer_name := f"_initial_{field}") in ion._buffers
+    }
+
+
 def _support_key_runtime_binding(population) -> tuple:
     """Capture a cheap trace-time guard for every live tensor selector."""
 
@@ -11378,6 +12446,7 @@ class FunctionalPopulation:
         _bind_owned_cache=True,
         _retain_initialization_materializations=False,
         _network_stimulation_rng_scope=False,
+        _defer_execution_storage=False,
     ):
         self._network_stimulation_rng_scope = _network_stimulation_rng_scope
         subclass_failures = _population_subclass_failures(population)
@@ -11820,17 +12889,6 @@ class FunctionalPopulation:
             for name, failures in self._continuous_receiver_failures.items()
             if not failures
         }
-        self._receiver_state_indices = {
-            name: (
-                receiver._state_indices
-                if receiver._copy_indices is None
-                else receiver._copy_indices
-            )
-            for name, receiver in {
-                **self._receivers,
-                **self._continuous_receivers,
-            }.items()
-        }
         self._continuous_receiver_inputs = {
             name: tuple(execution_population.mech.mechanisms[name]._continuous_inputs)
             for name in self._continuous_receivers
@@ -11881,16 +12939,24 @@ class FunctionalPopulation:
             reference=execution_population,
             context="Source Population",
         )
-        self._base_mapping = {
-            name: _clone_tensor(value)
-            for name, value in _module_tensor_slots(self._transition)
-        }
+        self._mutable_mapping_slots = frozenset(
+            f"population.{module_path + '.' if module_path else ''}{buffer_name}"
+            for leaf in self._state_layout
+            for module_path, buffer_name in leaf.mapping_slots
+        ) | frozenset(
+            (
+                *_local_synchronization_slots(execution_population),
+                *_ephemeral_assigned_slots(execution_population),
+            )
+        )
+        transition_slots = tuple(_module_tensor_slots(self._transition))
+        self._transition_slot_names = frozenset(name for name, _ in transition_slots)
         self._point_area_factors = _point_area_factor_layout(execution_population)
         missing_point_factor_slots = sorted(
             f"population.{entry.module_path}.{entry.buffer_name}"
             for entry in self._point_area_factors
             if f"population.{entry.module_path}.{entry.buffer_name}"
-            not in self._base_mapping
+            not in self._transition_slot_names
         )
         if missing_point_factor_slots:
             raise FunctionalizationError(
@@ -11910,18 +12976,8 @@ class FunctionalPopulation:
         self._mechanism_dt_slots = _mechanism_dt_slots(execution_population)
         self._mechanism_celsius_slots = tuple(
             name
-            for name in self._base_mapping
+            for name, _ in transition_slots
             if name == "population.celsius" or name.endswith(".celsius")
-        )
-        self._mutable_mapping_slots = frozenset(
-            f"population.{module_path + '.' if module_path else ''}{buffer_name}"
-            for leaf in self._state_layout
-            for module_path, buffer_name in leaf.mapping_slots
-        ) | frozenset(
-            (
-                *_local_synchronization_slots(execution_population),
-                *_ephemeral_assigned_slots(execution_population),
-            )
         )
         # Direct construction remains supported for internal tests and
         # extensions. Until lowering accepts the purity contract (by trust or
@@ -11932,7 +12988,110 @@ class FunctionalPopulation:
         # this clone carries only the packed owner.  This avoids deep-copying
         # every discarded child mechanism/integrator/state tree a second time
         # merely to construct the parent preparation skeleton.
-        preparation_population = _clone_execution_population(execution_population)
+        self._transition_geometry_slots = tuple(
+            tuple(
+                f"population.{path + '.' if path else ''}{binding.buffer_name}"
+                for path in binding.module_paths
+            )
+            for binding in self._geometry_bindings
+        )
+        self._transition_state_slots = tuple(
+            self._state_binding_slots(leaf) for leaf in self._state_layout
+        )
+        self._point_area_factor_slots = tuple(
+            f"population.{entry.module_path}.{entry.buffer_name}"
+            for entry in self._point_area_factors
+        )
+        self._transition_integrator_slots = {
+            name: f"population.integrator.{name}"
+            for name in self._integrator_workspace_names
+        }
+        parameter_aliases = _parameter_alias_paths(population)
+        self._deferred_initializer_slots = frozenset()
+        self._deferred_transition_slots = frozenset()
+        self._state_shadow_templates = {}
+        self._state_shadow_aliases = {}
+        self._deferred_local_mirror_seeds = {}
+        defer_early = _defer_execution_storage and _supports_early_storage_deferral(
+            execution_population
+        )
+        self._defer_execution_storage_early = defer_early
+        transition_originals = {}
+        initialization_state_template = None
+        if defer_early:
+            # Plan from declarations before authored preparation can touch its
+            # private owner. The numerical preparation still checks its exact
+            # outputs and verifies that every deferred slot is rebound.
+            root_names = _parameter_materialization_output_names(execution_population)
+            root_names.update(execution_population.in_graph_parametrizations)
+            root_names.update(execution_population.random_parameters)
+            root_slots = (
+                f"population.{name}"
+                for name in root_names
+                if f"population.{name}" in self._transition_slot_names
+            )
+            # Packed raw parameter routing is finalized by the component plans.
+            raw_slots = (
+                ()
+                if _is_multi(population)
+                else tuple(
+                    tuple(f"population.{path}" for path in paths)
+                    for paths in parameter_aliases.values()
+                )
+            )
+            prepared_slots = self._prepared_transition_slots(
+                _prepared_buffer_layout(
+                    execution_population, include_parametrized_values=False
+                )
+            )
+            early_rebound = self._rebound_transition_slots(
+                root_slots, raw_slots, prepared_slots
+            )
+            transition_population, transition_originals = (
+                _clone_population_with_deferred_slots(
+                    execution_population,
+                    {name.removeprefix("population.") for name in early_rebound},
+                )
+            )
+            self._deferred_transition_slots = frozenset(
+                f"population.{name}" for name in transition_originals
+            )
+            self._bind_transition_population(
+                transition_population, solver, transition_originals
+            )
+            transition_slots = tuple(_module_tensor_slots(self._transition))
+            if {name for name, _ in transition_slots} != self._transition_slot_names:
+                raise FunctionalizationError(
+                    "The cloned transition lost its registered binding layout."
+                )
+            if not self._initialization_failures:
+                initialization_state_template = (
+                    self._capture_initialization_state_template(
+                        execution_population,
+                        share_owned_storage=_can_share_preparation_state(
+                            execution_population
+                        ),
+                    )
+                )
+            for module in execution_population.modules():
+                if isinstance(module, cacheable):
+                    cacheable.clear_cache(module)
+            preparation_population = _configure_execution_population(
+                execution_population
+            )
+        else:
+            preparation_population = _clone_execution_population(execution_population)
+        self._receiver_state_indices = {
+            name: (
+                receiver._state_indices
+                if receiver._copy_indices is None
+                else receiver._copy_indices
+            )
+            for name, receiver in {
+                **self._receivers,
+                **self._continuous_receivers,
+            }.items()
+        }
         self._preparation = _PopulationPreparation(
             preparation_population,
             dt_tensor,
@@ -11947,20 +13106,9 @@ class FunctionalPopulation:
                 "Preparation and transition geometry plans do not match."
             )
         self._prepared_buffers = self._preparation.layout
-        self._prepared_constant_aliases = {}
-        for entry in self._prepared_buffers:
-            if entry.kind != "constant":
-                continue
-            constant = next(
-                item
-                for item in self._parametrization_constants
-                if entry.key in item.aliases
-            )
-            self._prepared_constant_aliases[entry.key] = tuple(
-                f"population.{alias}"
-                for alias in constant.aliases
-                if f"population.{alias}" in self._base_mapping
-            )
+        self._transition_prepared_slots = self._prepared_transition_slots(
+            self._prepared_buffers
+        )
         live_constant_slots = {
             entry.key for entry in self._prepared_buffers if entry.kind == "constant"
         }
@@ -12030,15 +13178,16 @@ class FunctionalPopulation:
                 population,
                 candidates=_multi_component_candidates,
             )
-        self._preparation_base_mapping = {
-            name: _clone_tensor(value)
-            for name, value in _module_tensor_slots(self._preparation)
-            if not name.startswith("component_physical_preparations.")
-        }
+        self._preparation_base_mapping, self._preparation_slot_aliases = (
+            _capture_preparation_templates(self._preparation)
+        )
         if self._topology_kind in {"multi_point", "multi_scalar", "multi_block"}:
             leaked_component_runtime = sorted(
                 name
-                for mapping in (self._base_mapping, self._preparation_base_mapping)
+                for mapping in (
+                    self._transition_slot_names,
+                    self._preparation_base_mapping,
+                )
                 for name in mapping
                 if name.startswith("population.populations.")
             )
@@ -12069,15 +13218,41 @@ class FunctionalPopulation:
             else all_population_parameters
         )
         self._population_parameter_names = tuple(population_parameters)
-        parameter_aliases = _parameter_alias_paths(population)
         self._transition_parameter_slots = {
             name: tuple(
                 slot
                 for path in parameter_aliases[name]
-                if (slot := f"population.{path}") in self._base_mapping
+                if (slot := f"population.{path}") in self._transition_slot_names
             )
             for name in self._population_parameter_names
         }
+        self._transition_population_slots = {
+            name: slot
+            for name in self._preparation.population_parameter_names
+            if (slot := f"population.{name}") in self._transition_slot_names
+        }
+        rebound = self._rebound_transition_slots(
+            self._transition_population_slots.values(),
+            self._transition_parameter_slots.values(),
+            self._transition_prepared_slots,
+        )
+        if not self._deferred_transition_slots.issubset(rebound):
+            raise FunctionalizationError(
+                "The prepared binding layout lost a deferred transition slot."
+            )
+
+        # Preserve the registered layout independently of the values that
+        # explicit routes replace. Subclass clones can have custom dispatch.
+        fallbacks = []
+        for name, value in transition_slots:
+            kind = type(value)
+            if name in rebound and (kind is torch.Tensor or kind is torch.nn.Parameter):
+                continue
+            fallbacks.append((name, value))
+        self._base_mapping, self._base_slot_aliases = _capture_slot_templates(
+            fallbacks,
+            mutable_slots=self._mutable_mapping_slots,
+        )
         self._preparation_parameter_slots = {
             name: tuple(
                 slot
@@ -12233,11 +13408,25 @@ class FunctionalPopulation:
                 )
         self._initialization = None
         self._initialization_state_template = None
+        rebound = self._transition_slot_names.difference(self._base_mapping)
         if not self._initialization_failures:
-            initialization_population = _clone_execution_population(
-                execution_population
-            )
-            initialization_layout = _state_layout(initialization_population)
+            if defer_early:
+                (
+                    initialization_population,
+                    initialization_layout,
+                    explicit_layout,
+                    self._deferred_initializer_slots,
+                ) = _clone_initialization_population(
+                    self._transition, rebound, transition_originals
+                )
+            else:
+                initialization_population = _clone_execution_population(
+                    execution_population
+                )
+                initialization_layout = _state_layout(initialization_population)
+                explicit_layout = _initialization_state_layout(
+                    initialization_population, initialization_layout
+                )
             if _state_layout_signature(initialization_layout) != (
                 self._state_layout_signature
             ):
@@ -12248,39 +13437,22 @@ class FunctionalPopulation:
             initialization = _PopulationInitialization(
                 initialization_population,
                 initialization_layout,
-                _initialization_state_layout(
-                    initialization_population,
-                    initialization_layout,
-                ),
+                explicit_layout,
             )
             initialization_slots = {
                 name for name, _value in _module_tensor_slots(initialization)
             }
-            transition_slots = set(self._base_mapping)
-            if initialization_slots != transition_slots:
+            if initialization_slots != self._transition_slot_names:
                 raise FunctionalizationError(
                     "Functional initialization and transition tensor bindings do "
                     "not match."
                 )
-            state_template = {}
-            for leaf in self._state_layout:
-                value = _buffer_at(
-                    execution_population,
-                    leaf.module_path,
-                    leaf.buffer_name,
-                )
-                if leaf.public_path in {
-                    ("clock", "t"),
-                    ("control", "duration_remainder"),
-                }:
-                    value = torch.zeros_like(value)
-                _put_path(
-                    state_template,
-                    leaf.public_path,
-                    _clone_tensor(value),
-                )
             self._initialization = initialization
-            self._initialization_state_template = state_template
+            self._initialization_state_template = (
+                self._capture_initialization_state_template(execution_population)
+                if initialization_state_template is None
+                else initialization_state_template
+            )
         self._structured_step_graphs = {}
         self._structured_capture_errors = {}
         self._structured_capture_error = None
@@ -12300,27 +13472,145 @@ class FunctionalPopulation:
                 )
             except (KeyError, TypeError, ValueError, RuntimeError) as error:
                 self._owned_cache_error = str(error)
-        if self._noise_plan is not None:
-            # SDE draws are call-local inputs on the owned transition. Install
-            # their temporary bindings after capturing the persistent tensor
-            # contract and creating the separate initialization program.
-            self._noise_plan.install(self._transition.population)
-        if self._transition.dufort_voltage_step:
-            from ._dufort import DufortCurrentPrograms
+        with _borrow_deferred_values(self._transition.population, transition_originals):
+            if self._noise_plan is not None:
+                # SDE draws are call-local inputs on the owned transition. Install
+                # their temporary bindings after capturing the persistent tensor
+                # contract and creating the separate initialization program.
+                self._noise_plan.install(self._transition.population)
+            if self._transition.dufort_voltage_step:
+                from ._dufort import DufortCurrentPrograms
 
-            object.__setattr__(
-                self._transition,
-                "_dufort_current_programs",
-                DufortCurrentPrograms(
-                    self._transition.population.mech,
-                    self._transition.population.v,
-                    clock_owner=self._transition.population,
-                ),
-            )
+                object.__setattr__(
+                    self._transition,
+                    "_dufort_current_programs",
+                    DufortCurrentPrograms(
+                        self._transition.population.mech,
+                        self._transition.population.v,
+                        clock_owner=self._transition.population,
+                    ),
+                )
 
         from ._population_draws import PopulationRuntimeDrawPlan
 
         self._runtime_draw_plan = PopulationRuntimeDrawPlan(self)
+        if defer_early:
+            # Packed raw routes can add slots after component planning.
+            self._deferred_transition_slots |= _defer_module_slot_storage(
+                self._transition, rebound.difference(self._deferred_transition_slots)
+            )
+
+    def _prepared_transition_slots(self, buffers):
+        prepared_slots = []
+        for entry in buffers:
+            if entry.kind == "constant":
+                constant = next(
+                    item
+                    for item in self._parametrization_constants
+                    if entry.key in item.aliases
+                )
+                slots = tuple(
+                    f"population.{alias}"
+                    for alias in constant.aliases
+                    if f"population.{alias}" in self._transition_slot_names
+                )
+            elif entry.kind == "torch_parameter":
+                # Bind the original/transform leaves through the raw parameter
+                # slots. Binding the property would run right_inverse.
+                slots = ()
+            else:
+                slots = (f"population.{entry.module_path}.{entry.buffer_name}",)
+            prepared_slots.append(slots)
+        return tuple(prepared_slots)
+
+    def _rebound_transition_slots(
+        self, population_slots, parameter_slots, prepared_slots
+    ):
+        rebound = set(population_slots)
+        for slots in (
+            *parameter_slots,
+            *self._transition_geometry_slots,
+        ):
+            rebound.update(slots)
+        # The root temperature supplies the local temperature bindings. Its
+        # fallback is needed if neither parameter nor geometry routes fill it.
+        root_temperature = "population.celsius"
+        root_temperature_bound = root_temperature in rebound
+        rebound.update(
+            self._mechanism_celsius_slots,
+            self._point_area_factor_slots,
+            self._transition_integrator_slots.values(),
+            self._mechanism_dt_slots,
+        )
+        for slots in (*prepared_slots, *self._transition_state_slots):
+            if slots is not None:
+                rebound.update(slots)
+        if not root_temperature_bound:
+            rebound.discard(root_temperature)
+
+        return rebound
+
+    def _bind_transition_population(self, population, solver, originals):
+        # Grouping inspects physical state layout and storage in native setup.
+        with _borrow_deferred_values(population, originals):
+            self._transition = _PopulationTransition(
+                population, solver, self._state_layout
+            )
+        self._noise_workspace_configuration = _PopulationNoiseWorkspaceConfiguration(
+            population, self._state_layout
+        )
+        self._receivers = {
+            name: _PopulationReceive(population, name, self._state_layout)
+            for name in self._receivers
+        }
+        self._continuous_receivers = {
+            name: _PopulationReceive(
+                population, name, self._state_layout, continuous=True
+            )
+            for name in self._continuous_receivers
+        }
+
+    def _capture_initialization_state_template(
+        self, execution_population, *, share_owned_storage=False
+    ):
+        state_template = {}
+        for leaf in self._state_layout:
+            value = _buffer_at(
+                execution_population,
+                leaf.module_path,
+                leaf.buffer_name,
+            )
+            if leaf.public_path in {
+                ("clock", "t"),
+                ("control", "duration_remainder"),
+            }:
+                value = _clone_tensor(torch.zeros_like(value))
+            elif (
+                share_owned_storage
+                and type(value) in (torch.Tensor, torch.nn.Parameter)
+                and value.is_contiguous()
+                and value.storage_offset() == 0
+                and not value.is_conj()
+                and not value.is_neg()
+            ):
+                # This staging model becomes the private preparation owner.
+                # Preparation and initialization both bind call-local copies.
+                value = value.detach()
+            else:
+                value = _clone_tensor(value)
+            _put_path(state_template, leaf.public_path, value)
+        return state_template
+
+    def _can_defer_restart_snapshot(self, state):
+        # Only share a backing frame when fresh initialization cannot return
+        # carry from it through stochastic streams or retained workspaces.
+        return (
+            self._initialization_state_template is not None
+            and self._random_plan is None
+            and self._poisson_plan is None
+            and not self._initialization_state_layout
+            and "noise_workspaces" not in state
+        )
 
     def _build_multi_component_plans(
         self,
@@ -12684,6 +13974,189 @@ class FunctionalPopulation:
             return False
         self._structured_step_graphs[signature] = graph
         return True
+
+    def _defer_rebound_storage(self):
+        """Release redundant execution storage after lowering and its audits."""
+        rebound = self._transition_slot_names.difference(self._base_mapping)
+        if not self._deferred_transition_slots:
+            self._deferred_transition_slots = _defer_module_slot_storage(
+                self._transition, rebound
+            )
+        if self._initialization is not None and not self._deferred_initializer_slots:
+            self._deferred_initializer_slots = _defer_module_slot_storage(
+                self._initialization, rebound
+            )
+        if self._defer_execution_storage_early:
+            # Preparation always clones these templates before binding its
+            # invocation. Read-only fallback bindings can keep the same seed.
+            _share_read_only_fallback_templates(
+                self._base_mapping,
+                self._base_slot_aliases,
+                self._preparation_base_mapping,
+                self._mutable_mapping_slots,
+            )
+        population = self._transition.population
+        topology_slots = _private_topology_slots(population).intersection(
+            self._base_mapping
+        )
+        if self._initialization is not None:
+            _share_private_topology_storage(
+                self._transition,
+                self._initialization,
+                topology_slots,
+                self._mutable_mapping_slots,
+                native=self._population,
+            )
+            (
+                self._state_shadow_templates,
+                self._state_shadow_aliases,
+            ) = _share_private_state_shadow_storage(
+                self._transition,
+                self._initialization,
+                separate=(self._population, self._preparation),
+            )
+        _share_preparation_read_only_storage(
+            self._preparation,
+            self._transition,
+            self._initialization,
+            self._base_mapping,
+            topology_slots | _private_ion_initialization_slots(population),
+            self._mutable_mapping_slots,
+            native=self._population,
+        )
+        private_populations = [self._preparation.population]
+        if self._initialization is not None:
+            private_populations.append(self._initialization.population)
+        _share_private_conductance_scratch(
+            self._population, self._transition.population, *private_populations
+        )
+        self._defer_local_mirror_storage()
+        self._share_rebound_ion_mirror_storage()
+        self._defer_preparation_inputs()
+
+    def _defer_preparation_inputs(self):
+        """Release preparation copies replaced by explicit geometry and solver inputs."""
+        if _binding_capture_modes() is None:
+            return
+        preparation = self._preparation
+        geometry = _preparation_rebound_geometry_slots(
+            preparation, self._geometry_constant_names
+        )
+        if geometry is None:
+            return
+        # Solver coefficients are produced by the separate integrator used
+        # in _prepare_values. Only defer the preparation copies when authored
+        # workspace code cannot reach that old physical owner.
+        workspace = _private_seed_slots_unreachable_by_authored_code(
+            preparation,
+            {
+                self._transition_integrator_slots[name]
+                for name in self._integrator_workspace_names
+            },
+        )
+        preparation._deferred_slots = _defer_preparation_slot_storage(
+            preparation,
+            geometry | workspace,
+            self._preparation_base_mapping,
+            self._preparation_slot_aliases,
+        )
+
+    def _bind_state_shadows(self, mapping):
+        # Authored hooks can read these plain attributes or return them as
+        # carry. Keep the setup-time value and give each invocation its own
+        # aliases so a returned tensor cannot mutate either private facade.
+        if self._state_shadow_aliases:
+            mapping.update(
+                _clone_slot_templates(
+                    self._state_shadow_templates, self._state_shadow_aliases
+                )
+            )
+
+    def _defer_local_mirror_storage(self):
+        """Keep metadata for synchronized calls and borrow real isolated seeds."""
+        if _binding_capture_modes() is None:
+            return
+        # Receive snapshots incoming public carry before its sync prelude.
+        # Anything in that layout must remain a concrete binding.
+        carry_slots = {
+            f"population.{path + '.' if path else ''}{name}"
+            for leaf in self._state_layout
+            for path, name in (
+                (leaf.module_path, leaf.buffer_name),
+                *leaf.mapping_slots,
+            )
+        }
+        registered = dict(_module_tensor_slots(self._transition))
+        owned_seeds = {}
+        for name in _synchronized_local_mirror_slots(self._transition.population):
+            if name in carry_slots or name not in self._mutable_mapping_slots:
+                continue
+            seed = self._base_mapping.get(name)
+            source = registered.get(name)
+            if not (_is_dense_slot_template(seed) and _is_dense_slot_template(source)):
+                continue
+            if (
+                seed.device == source.device
+                and seed.dtype == source.dtype
+                and seed.shape == source.shape
+                and seed.stride() == source.stride()
+                and _logical_tensor_bytes_equal(seed, source)
+            ):
+                # Early copy admission establishes private ownership of the
+                # registered source. Other copy paths retain one already-owned
+                # baseline per exact registered alias for isolated calls.
+                self._deferred_local_mirror_seeds[name] = (
+                    source.detach()
+                    if self._defer_execution_storage_early
+                    else owned_seeds.setdefault(id(source), seed)
+                )
+                self._base_mapping[name] = torch.empty_strided(
+                    seed.shape, seed.stride(), dtype=seed.dtype, device="meta"
+                )
+
+    def _share_rebound_ion_mirror_storage(self):
+        """Consolidate concrete seeds whose execution slots always get rebound."""
+        seeds = self._deferred_local_mirror_seeds
+        if not seeds or not self._defer_execution_storage_early:
+            return
+        carry_routes = {
+            leaf.public_path: tuple(
+                slot for slot in slots if slot not in self._base_mapping
+            )
+            for leaf, slots in zip(
+                self._state_layout, self._transition_state_slots, strict=True
+            )
+            if slots and leaf.public_path[0] == "ions"
+        }
+        eligible = _rebound_ion_mirror_groups(self._preparation, carry_routes, seeds)
+        # State mapping rebinds the canonical Ion field. Each mirror either
+        # synchronizes on entry or receives an isolated clone of its seed.
+        # Keep these slots classified as mutable for binding and diagnostics.
+        other_mutable = self._mutable_mapping_slots.difference(eligible)
+        rebound = _share_private_topology_storage(
+            self._preparation,
+            self._transition,
+            eligible,
+            other_mutable,
+            native=self._population,
+        )
+        for name in seeds.keys() & rebound.keys():
+            seeds[name] = rebound[name].detach()
+        if self._initialization is not None:
+            _share_private_topology_storage(
+                self._preparation,
+                self._initialization,
+                eligible,
+                other_mutable,
+                native=self._population,
+            )
+
+    def _can_use_deferred_local_mirrors(self, facade):
+        return (
+            bool(self._deferred_local_mirror_seeds)
+            and not facade._forward_pre_hooks
+            and not torch.nn.modules.module._global_forward_pre_hooks
+        )
 
     def prewarm_structured_rollout(self, *, ve: bool = False, intra: bool = False):
         """Prewarm bounded-graph inference for one optional-drive signature.
@@ -13902,7 +15375,7 @@ class FunctionalPopulation:
         parametrization_constants,
         *,
         preparation=None,
-        base_mapping=None,
+        preparation_templates=None,
         for_initialization=False,
         use_snapshot_offsets=True,
         material_area=None,
@@ -13913,13 +15386,16 @@ class FunctionalPopulation:
         root_random_values=None,
     ):
         preparation = self._preparation if preparation is None else preparation
-        base_mapping = (
-            self._preparation_base_mapping if base_mapping is None else base_mapping
-        )
         # Authored workspace builders execute against differentiable private
         # copies. Invalid writes cannot escape into caller tensors or poison
-        # the retained preparation skeleton.
-        mapping = {name: value.clone() for name, value in base_mapping.items()}
+        # the retained preparation skeleton. Alias routes are captured
+        # before execution rather than inferred from traced tensor identities.
+        if preparation_templates is None:
+            preparation_templates = (
+                self._preparation_base_mapping,
+                self._preparation_slot_aliases,
+            )
+        mapping = _clone_slot_templates(*preparation_templates)
         from ._noise_workspaces import noise_workspace_preparation_mapping
 
         mapping.update(
@@ -14320,6 +15796,7 @@ class FunctionalPopulation:
                 mapping.update(
                     self._poisson_plan.initialization_mapping(stimulation_draw)
                 )
+            self._bind_state_shadows(mapping)
             outputs = self._initialization_outputs(
                 self._initialization, mapping, pre_state
             )
@@ -14763,6 +16240,7 @@ class FunctionalPopulation:
                     mapping[f"population.{leaf.module_path}.{leaf.buffer_name}"] = (
                         _get_path(state, leaf.public_path).clone()
                     )
+        self._bind_state_shadows(mapping)
         outputs = functional_call(
             configuration,
             mapping,
@@ -14846,10 +16324,12 @@ class FunctionalPopulation:
                 for path, value in state.get("runtime_noise", {}).items()
             }
         )
+        # Runtime noise can rebind individual slots. Keep the existing
+        # independent copies for this material workspace override.
         prepared = self._prepare_values(
             parameters,
             constants,
-            preparation_base_mapping=mapping,
+            preparation_templates=(mapping, {name: name for name in mapping}),
             use_snapshot_offsets=False,
         )
         workspace = {}
@@ -14873,7 +16353,7 @@ class FunctionalPopulation:
         constants,
         *,
         preparation=None,
-        preparation_base_mapping=None,
+        preparation_templates=None,
         for_initialization=False,
         use_snapshot_offsets=True,
         _snapshot_baseline_capture=None,
@@ -14967,7 +16447,7 @@ class FunctionalPopulation:
                 parameters,
                 constants,
                 preparation=preparation,
-                preparation_base_mapping=preparation_base_mapping,
+                preparation_templates=preparation_templates,
                 for_initialization=for_initialization,
                 use_snapshot_offsets=use_snapshot_offsets,
                 _snapshot_baseline_capture=_snapshot_baseline_capture,
@@ -15002,7 +16482,7 @@ class FunctionalPopulation:
                 dt,
                 self._preparation_constants(constants),
                 preparation=preparation,
-                base_mapping=preparation_base_mapping,
+                preparation_templates=preparation_templates,
                 for_initialization=for_initialization,
                 use_snapshot_offsets=(
                     use_snapshot_offsets
@@ -15319,7 +16799,7 @@ class FunctionalPopulation:
         constants,
         *,
         preparation=None,
-        preparation_base_mapping=None,
+        preparation_templates=None,
         for_initialization=False,
         use_snapshot_offsets=True,
         _snapshot_baseline_capture=None,
@@ -15633,7 +17113,7 @@ class FunctionalPopulation:
                 dt,
                 self._preparation_constants(constants),
                 preparation=preparation,
-                base_mapping=preparation_base_mapping,
+                preparation_templates=preparation_templates,
                 for_initialization=for_initialization,
                 use_snapshot_offsets=(
                     use_snapshot_offsets
@@ -15962,6 +17442,7 @@ class FunctionalPopulation:
         *,
         isolate_read_only: bool | None = None,
         mechanism_dt=None,
+        synchronize_local_mirrors=False,
     ):
         if isolate_read_only is None:
             isolate_read_only = not self._lowering_audit_complete
@@ -15969,17 +17450,22 @@ class FunctionalPopulation:
         def read_only(value):
             return value.clone() if isolate_read_only else value
 
-        mapping = {name: read_only(value) for name, value in self._base_mapping.items()}
+        seeds = self._deferred_local_mirror_seeds
+        if isolate_read_only:
+            templates = {**self._base_mapping, **seeds} if seeds else self._base_mapping
+            mapping = _clone_slot_templates(templates, self._base_slot_aliases)
+        else:
+            mapping = dict(self._base_mapping)
+            if seeds and not synchronize_local_mirrors:
+                mapping.update({name: seed.clone() for name, seed in seeds.items()})
         prefix = "population."
         for name in self._population_parameter_names:
             value = read_only(parameters[name])
             for slot in self._transition_parameter_slots[name]:
                 mapping[slot] = value
 
-        for name, value in prepared["population"].items():
-            slot = f"{prefix}{name}"
-            if slot in self._base_mapping:
-                mapping[slot] = read_only(value)
+        for name, slot in self._transition_population_slots.items():
+            mapping[slot] = read_only(prepared["population"][name])
         geometry = {
             name: read_only(value) for name, value in prepared["geometry"].items()
         }
@@ -15989,17 +17475,15 @@ class FunctionalPopulation:
             read_only(value) for value in prepared.get("local_geometry", ())
         )
         local_index = 0
-        for binding in self._geometry_bindings:
+        for binding, slots in zip(
+            self._geometry_bindings, self._transition_geometry_slots, strict=True
+        ):
             if not _cache_local_geometry(binding):
                 value = geometry[binding.constant_name]
             else:
                 value = local_geometry[local_index]
                 local_index += 1
-            for module_path in binding.module_paths:
-                slot = (
-                    f"{prefix}{module_path + '.' if module_path else ''}"
-                    f"{binding.buffer_name}"
-                )
+            for slot in slots:
                 mapping[slot] = value
 
         # The handler intentionally synchronizes every local temperature view
@@ -16014,18 +17498,14 @@ class FunctionalPopulation:
         mechanism_dt = dt if mechanism_dt is None else read_only(mechanism_dt)
         for slot in self._mechanism_dt_slots:
             mapping[slot] = mechanism_dt
-        for entry in self._prepared_buffers:
+        for entry, slots in zip(
+            self._prepared_buffers, self._transition_prepared_slots, strict=True
+        ):
             value = read_only(prepared["mechanisms"][entry.key])
-            if entry.kind == "torch_parameter":
-                # Native getters consume the same explicit original/transform
-                # leaves. Binding the property itself would run right_inverse.
-                continue
-            if entry.kind == "constant":
-                for slot in self._prepared_constant_aliases[entry.key]:
-                    mapping[slot] = value
+            if not slots:
                 continue
             visible_rank = self._prepared_buffer_visible_ranks[entry.key]
-            if value.ndim < visible_rank:
+            if entry.kind != "constant" and value.ndim < visible_rank:
                 # A hidden zero-sized vmap lane on a logical scalar effective
                 # parameter is selected at lane zero when authored code first
                 # combines it with an unbatched spatial field. Preserve the
@@ -16037,17 +17517,16 @@ class FunctionalPopulation:
                 value = value.reshape(
                     (1,) * (visible_rank - value.ndim) + tuple(value.shape)
                 )
-            mapping[f"{prefix}{entry.module_path}.{entry.buffer_name}"] = value
+            for slot in slots:
+                mapping[slot] = value
 
-        for entry in self._point_area_factors:
-            mapping[f"{prefix}{entry.module_path}.{entry.buffer_name}"] = read_only(
-                prepared["mechanisms"][entry.key]
-            )
+        for entry, slot in zip(
+            self._point_area_factors, self._point_area_factor_slots, strict=True
+        ):
+            mapping[slot] = read_only(prepared["mechanisms"][entry.key])
 
-        for name in self._integrator_workspace_names:
-            mapping[f"{prefix}integrator.{name}"] = read_only(
-                prepared["integrator"][name]
-            )
+        for name, slot in self._transition_integrator_slots.items():
+            mapping[slot] = read_only(prepared["integrator"][name])
 
         return mapping, dt, celsius
 
@@ -16059,37 +17538,53 @@ class FunctionalPopulation:
         *,
         isolate_read_only: bool | None = None,
         mechanism_dt=None,
+        synchronize_local_mirrors=False,
     ):
         mapping, dt, celsius = self._read_only_mapping(
             parameters,
             prepared,
             isolate_read_only=isolate_read_only,
             mechanism_dt=mechanism_dt,
+            synchronize_local_mirrors=synchronize_local_mirrors,
         )
         return self._state_mapping(mapping, dt, celsius, state)
 
-    def _receiver_mapping(self, parameters, prepared, state, indices):
+    def _receiver_mapping(
+        self, parameters, prepared, state, indices, *, synchronize_local_mirrors=False
+    ):
         # The Network's first receive already owns every logical state leaf.
         # Subsequent transactions copy the current and previously updated
         # targets, preserving their version boundaries and view normalization.
-        mapping, dt, celsius = self._read_only_mapping(parameters, prepared)
+        mapping, dt, celsius = self._read_only_mapping(
+            parameters, prepared, synchronize_local_mirrors=synchronize_local_mirrors
+        )
         return self._state_mapping(
             mapping, dt, celsius, state, receiver_indices=indices
         )
 
+    def _state_binding_slots(self, leaf):
+        if (
+            leaf.public_path[0] == "noise_workspaces"
+            and ".buffer." in leaf.public_path[2]
+        ):
+            # Bind the prepared workspace with its current parameter graph.
+            # Carry retains provenance to select reuse or rematerialization.
+            return None
+        # Positional carry such as duration_remainder need not have a
+        # registered buffer slot.
+        return tuple(
+            slot
+            for path, name in leaf.mapping_slots
+            if (slot := f"population.{path + '.' if path else ''}{name}")
+            in self._transition_slot_names
+        )
+
     def _state_mapping(self, mapping, dt, celsius, state, *, receiver_indices=None):
-        prefix = "population."
         state_positionals = {}
-        for index, leaf in enumerate(self._state_layout):
-            if (
-                leaf.public_path[0] == "noise_workspaces"
-                and ".buffer." in leaf.public_path[2]
-            ):
-                # Preparation preserves cache detachment and independently
-                # retained Population materializations. Its numerical workspace
-                # value owns the current parameter graph; carried provenance
-                # selects whether timestep preparation can be reused or must
-                # be rebuilt from a later configuration realization.
+        for index, (leaf, slots) in enumerate(
+            zip(self._state_layout, self._transition_state_slots, strict=True)
+        ):
+            if slots is None:
                 continue
             # Authored accepted-step code may legally update declared carry in
             # place. Give the private execution skeleton one
@@ -16100,14 +17595,8 @@ class FunctionalPopulation:
             if receiver_indices is None or index in receiver_indices:
                 value = value.clone()
             state_positionals[leaf.public_path] = value
-            for module_path, buffer_name in leaf.mapping_slots:
-                path = f"{module_path}." if module_path else ""
-                key = f"{prefix}{path}{buffer_name}"
-                # The duration carry deliberately is a plain host-side
-                # attribute, not a registered module buffer. It is already an
-                # explicit transition input.
-                if key in self._base_mapping:
-                    mapping[key] = value
+            for slot in slots:
+                mapping[slot] = value
         if self._poisson_plan is not None and "stimulation" in state:
             mapping.update(self._poisson_plan.state_mapping(state["stimulation"]))
         return (
@@ -16174,7 +17663,9 @@ class FunctionalPopulation:
                     )
                     facade._audit_noise_workspaces = True
                     python_state = _transition_python_state_snapshot(facade)
-                    registered = _registered_tensor_bindings(facade)
+                    registered = _registered_tensor_bindings(
+                        facade, deferred_slots=self._deferred_transition_slots
+                    )
                     repeated = []
                     for weight in (0.0, 0.25, 0.25):
                         mapping, dt, _celsius, v, t, remainder = self._mapping(
@@ -16225,7 +17716,10 @@ class FunctionalPopulation:
                                 or _audit_tensor_binding(mapping[name]) != binding
                                 for name, binding in read_only.items()
                             )
-                            or _registered_tensor_bindings(facade) != registered
+                            or _registered_tensor_bindings(
+                                facade, deferred_slots=self._deferred_transition_slots
+                            )
+                            != registered
                             or _transition_python_state_snapshot(facade) != python_state
                         ):
                             raise FunctionalizationError(
@@ -16302,8 +17796,13 @@ class FunctionalPopulation:
                 transition_python_state = _transition_python_state_snapshot(
                     audit_transition
                 )
-                preparation_registered = _registered_tensor_bindings(audit_preparation)
-                transition_registered = _registered_tensor_bindings(audit_transition)
+                deferred_preparation = getattr(audit_preparation, "_deferred_slots", ())
+                preparation_registered = _registered_tensor_bindings(
+                    audit_preparation, deferred_slots=deferred_preparation
+                )
+                transition_registered = _registered_tensor_bindings(
+                    audit_transition, deferred_slots=self._deferred_transition_slots
+                )
 
                 # The lowering audit must be unable to mutate the explicit
                 # tensors returned to the caller, even if authored code
@@ -16322,19 +17821,17 @@ class FunctionalPopulation:
                     lambda value: value.detach().clone(),
                     tensors.state,
                 )
-                audit_preparation_base_mapping = {
-                    name: _clone_tensor(value)
-                    for name, value in _module_tensor_slots(audit_preparation)
-                    if not name.startswith("component_physical_preparations.")
-                }
+                preparation_templates = _capture_preparation_templates(
+                    audit_preparation
+                )
                 prepared = self._prepare_values(
                     parameters,
                     constants,
                     preparation=audit_preparation,
-                    preparation_base_mapping=audit_preparation_base_mapping,
+                    preparation_templates=preparation_templates,
                 )
                 current_preparation_registered = _registered_tensor_bindings(
-                    audit_preparation
+                    audit_preparation, deferred_slots=deferred_preparation
                 )
                 mutated_registered.update(
                     f"preparation:{key}"
@@ -16423,7 +17920,7 @@ class FunctionalPopulation:
                     )
 
                     current_transition_registered = _registered_tensor_bindings(
-                        audit_transition
+                        audit_transition, deferred_slots=self._deferred_transition_slots
                     )
                     mutated_registered.update(
                         f"transition:{key}"
@@ -16550,14 +18047,16 @@ class FunctionalPopulation:
 
         def registered_bindings():
             bindings = {}
-            for prefix, module in (
-                ("", audit_initialization),
-                ("preparation:", audit_preparation),
+            for prefix, module, deferred in (
+                ("", audit_initialization, self._deferred_initializer_slots),
+                ("preparation:", audit_preparation, ()),
             ):
                 if module is not None:
                     bindings.update(
                         (f"{prefix}{name}", value)
-                        for name, value in _registered_tensor_bindings(module).items()
+                        for name, value in _registered_tensor_bindings(
+                            module, deferred_slots=deferred
+                        ).items()
                     )
             return bindings
 
@@ -16591,11 +18090,9 @@ class FunctionalPopulation:
                     audit_preparation, "component_physical_preparations", ()
                 ):
                     component.audit_builder_inputs = True
-                preparation_base_mapping = {
-                    name: _clone_tensor(value)
-                    for name, value in _module_tensor_slots(audit_preparation)
-                    if not name.startswith("component_physical_preparations.")
-                }
+                preparation_templates = _capture_preparation_templates(
+                    audit_preparation
+                )
                 registered = registered_bindings()
                 python_state = python_bindings()
                 parameter_names = tuple(tensors.parameters)
@@ -16744,7 +18241,7 @@ class FunctionalPopulation:
                                 initialized_parameters,
                                 constants,
                                 preparation=audit_preparation,
-                                preparation_base_mapping=preparation_base_mapping,
+                                preparation_templates=preparation_templates,
                                 for_initialization=True,
                             )
                         finally:
@@ -17230,6 +18727,9 @@ class FunctionalPopulation:
             parameters,
             prepared,
             state,
+            synchronize_local_mirrors=(
+                noise is None and self._can_use_deferred_local_mirrors(self._transition)
+            ),
         )
         noise_values = None
         if noise is not None:
@@ -17272,6 +18772,7 @@ class FunctionalPopulation:
             noise_values.update(
                 {name: torch.stack(values) for name, values in schedule_values.items()}
             )
+        self._bind_state_shadows(mapping)
         outputs = functional_call(
             self._transition,
             mapping,
@@ -17586,13 +19087,24 @@ class FunctionalPopulation:
         *,
         _binding_indices=None,
     ):
+        receiver = self._continuous_receivers[target]
+        synchronized = self._can_use_deferred_local_mirrors(receiver)
         mapping, dt, _celsius, v, t, remainder = (
-            self._mapping(parameters, prepared, state)
+            self._mapping(
+                parameters, prepared, state, synchronize_local_mirrors=synchronized
+            )
             if _binding_indices is None
-            else self._receiver_mapping(parameters, prepared, state, _binding_indices)
+            else self._receiver_mapping(
+                parameters,
+                prepared,
+                state,
+                _binding_indices,
+                synchronize_local_mirrors=synchronized,
+            )
         )
+        self._bind_state_shadows(mapping)
         outputs = functional_call(
-            self._continuous_receivers[target],
+            receiver,
             mapping,
             (v, t, remainder, dt, payload, input, reduce, mask, scratch[target][input]),
             tie_weights=False,
@@ -17618,13 +19130,24 @@ class FunctionalPopulation:
     def _receive_values(
         self, parameters, prepared, state, target, payload, *, _binding_indices=None
     ):
+        receiver = self._receivers[target]
+        synchronized = self._can_use_deferred_local_mirrors(receiver)
         mapping, dt, _celsius, v, t, duration_remainder = (
-            self._mapping(parameters, prepared, state)
+            self._mapping(
+                parameters, prepared, state, synchronize_local_mirrors=synchronized
+            )
             if _binding_indices is None
-            else self._receiver_mapping(parameters, prepared, state, _binding_indices)
+            else self._receiver_mapping(
+                parameters,
+                prepared,
+                state,
+                _binding_indices,
+                synchronize_local_mirrors=synchronized,
+            )
         )
+        self._bind_state_shadows(mapping)
         outputs = functional_call(
-            self._receivers[target],
+            receiver,
             mapping,
             (v, t, duration_remainder, dt, payload),
             tie_weights=False,
@@ -18650,6 +20173,7 @@ def make_functional(
     _bind_owned_cache=True,
     _retain_initialization_materializations=False,
     _network_stimulation_rng_scope=False,
+    _defer_execution_storage=False,
 ) -> tuple[FunctionalPopulation, PopulationTensors]:
     """Lower an initialized Population into a pure transition."""
     if isinstance(dt, bool):
@@ -18707,6 +20231,7 @@ def make_functional(
                     _retain_initialization_materializations
                 ),
                 _network_stimulation_rng_scope=_network_stimulation_rng_scope,
+                _defer_execution_storage=_defer_execution_storage,
             )
             construction_rng = (
                 _global_rng_changes(rng_state, device) if check_purity else ()

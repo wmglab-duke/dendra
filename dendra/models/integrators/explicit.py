@@ -3,6 +3,8 @@ from typing import Optional, Tuple
 import torch
 from torch.nn import functional as F
 
+from dendra.helpers import current_runtime_contract_validation
+
 from .core import (
     Integrator,
     _broadcast_to_shape,
@@ -667,7 +669,21 @@ class _dufort_frankel_homogeneous(Integrator):
         if ve is None:
             if self.conv:
                 ve = self.ve_zero
-        if bool(torch.all(model._df_history_valid).item()):
+        history = model._df_history_valid
+        cache_history = (
+            history.device.type == "cuda"
+            and type(history) is torch.Tensor
+            and history.layout == torch.strided
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+            and not torch._C._are_functorch_transforms_active()
+            and current_runtime_contract_validation() != "strict"
+        )
+        stamp = getattr(self, "_native_history_stamp", None) if cache_history else None
+        known_ready = (
+            stamp is not None and history is stamp[0] and history._version == stamp[1]
+        )
+        if known_ready or bool(torch.all(history).item()):
             v_new, v_prev_new, i_membrane = self._call_kernel(
                 "_step_conv" if self.conv else "_step",
                 model.v,
@@ -696,9 +712,29 @@ class _dufort_frankel_homogeneous(Integrator):
             )
         model.v = v_new
         model.v_prev = v_prev_new
-        model._df_history_valid = torch.ones_like(model._df_history_valid)
+        if cache_history and torch.is_inference_mode_enabled():
+            # A native step knows this replacement is all true. Keep the
+            # boolean bookkeeping tensor versioned so normal in-place writes
+            # still invalidate that knowledge inside inference_mode.
+            with torch.inference_mode(False), torch.no_grad():
+                history = torch.ones_like(model._df_history_valid)
+        else:
+            history = torch.ones_like(model._df_history_valid)
+        model._df_history_valid = history
+        self._native_history_stamp = (
+            (history, history._version)
+            if cache_history
+            and type(history) is torch.Tensor
+            and not history.is_inference()
+            else None
+        )
         if self.imem:
             model.i_membrane = i_membrane
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        state.pop("_native_history_stamp", None)
+        return state
 
     def _initial_current_frame(self, v, *, call_local_currents):
         if call_local_currents:
@@ -978,6 +1014,7 @@ class _dufort_frankel_homogeneous(Integrator):
         model.v_prev = v0.clone()
         model._df_history_valid = torch.zeros_like(model._df_history_valid)
         model._df_history_dt = torch.full_like(model._df_history_dt, torch.nan)
+        self._native_history_stamp = None
         if self.imem:
             model.i_membrane = torch.zeros_like(model.v).detach()
 

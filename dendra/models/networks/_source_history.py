@@ -96,6 +96,7 @@ def source_history_project(
     dt=None,
     taps=2,
     sigma=0.35,
+    delay_taps=None,
     _owned_output=False,
     _scratch=None,
 ):
@@ -104,7 +105,8 @@ def source_history_project(
     Supply ``source_pos`` for floating history or packed word/mask metadata.
     Fixed reads use ``delay_steps``. Differentiable physical delays use the
     native two-tap linear or three-tap soft interpolation within fixed capacity.
-    No history, parameter, or pointer is changed by default. The private
+    The optional delay_taps argument supplies the offsets and differentiable
+    fractions prepared for a rollout. No history, parameter, or pointer is changed by default. The private
     owned-output path accumulates into its freshly allocated payload. Native
     inference can instead donate ``_scratch`` to clear and reuse its existing
     dense output row, including after a partially failed optimized launch.
@@ -120,10 +122,12 @@ def source_history_project(
             history, rows, word_idx, bit_mask, dtype=weights.dtype
         )
 
-    if delays is not None:
-        offsets, interpolation = delay_interpolation(
+    if delay_taps is None and delays is not None:
+        delay_taps = delay_interpolation(
             delays, dt, dtype=weights.dtype, taps=taps, sigma=sigma
         )
+    if delay_taps is not None:
+        offsets, interpolation = delay_taps
         if taps == 2:
             alpha = interpolation
             row0 = (slot - offsets).remainder(depth)

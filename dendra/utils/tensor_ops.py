@@ -17,8 +17,10 @@ ArrayLike1D = Union[
 ]
 
 
-def _logical_tensor_bytes(value: torch.Tensor) -> torch.Tensor:
-    """Materialize a tensor's logical value as dense CPU bytes.
+def _logical_tensor_bytes(
+    value: torch.Tensor, *, device: torch.device | str = "cpu"
+) -> torch.Tensor:
+    """Materialize a tensor's logical value as dense bytes on the requested device.
 
     PyTorch may regard a size-one expanded tensor as contiguous even when its
     final stride is zero. Calling ``contiguous()`` is then a no-op, and viewing
@@ -31,14 +33,23 @@ def _logical_tensor_bytes(value: torch.Tensor) -> torch.Tensor:
     if detached.layout != torch.strided:
         detached = detached.to_dense()
     if detached.numel() == 0:
-        return torch.empty(0, device="cpu", dtype=torch.uint8)
+        return torch.empty(0, device=device, dtype=torch.uint8)
     dense = torch.empty(
         tuple(detached.shape),
-        device="cpu",
+        device=device,
         dtype=detached.dtype,
     )
     dense.copy_(detached)
     return dense.reshape(-1).view(torch.uint8)
+
+
+def _logical_tensor_bytes_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
+    """Compare logical values bitwise without moving CUDA tensor payloads to CPU."""
+    device = left.device if left.is_cuda and left.device == right.device else "cpu"
+    return torch.equal(
+        _logical_tensor_bytes(left, device=device),
+        _logical_tensor_bytes(right, device=device),
+    )
 
 
 def cartesian_product(

@@ -83,6 +83,7 @@ namespaces = false  # to disable scanning PEP 420 namespaces (true by default)
 
 [tool.setuptools.package-data]
 "dendra.models.networks" = [
+    "_two_tap_enqueue_cpu.cpp",
     "netcon_bitpack_kernel.cpp",
     "netcon_bitpack_kernel.cu",
 ]
