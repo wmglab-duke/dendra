@@ -38,7 +38,7 @@ still raise an error.
 Nonlinear Population scan training requires strict convergence and a symbolic
 Jacobian. If a training step reaches the iteration limit, allow more iterations
 or use a smaller timestep. See :doc:`advanced/mechanisms_and_materials` for
-solver options.
+solver options and how the compiled runner selects a Newton forward policy.
 
 Dendra 0.28: upgrading from 0.27.x
 ----------------------------------

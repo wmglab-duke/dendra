@@ -7,6 +7,7 @@ ownership rules across those adapters.
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 
 import torch
@@ -303,6 +304,7 @@ class _CompiledTensorTreeScan:
         clone_state=None,
         capture_examples=None,
         solver_failures=False,
+        derivimplicit_forward="inline",
     ):
         install_scan_compatibility()
         if type(steps) is not int or steps < 1:
@@ -317,6 +319,7 @@ class _CompiledTensorTreeScan:
         self._clone_state = _clone_tree if clone_state is None else clone_state
         self._capture_examples = capture_examples
         self._solver_failures = solver_failures
+        self._derivimplicit_forward = derivimplicit_forward
         self._kernels = {}
         self._executors = {}
 
@@ -435,11 +438,24 @@ class _CompiledTensorTreeScan:
             return (next_state, next_carries), _clone_tree(emitted or {})
 
         failures = _SolverFailureCapture() if self._solver_failures else None
-        graph = _capture_tensor_step(
-            failures.wrap(authored) if failures is not None else authored,
-            (parameters, prepared, state, mutable, invariant, sample),
-            grad_enabled=grad_enabled,
-        )
+        forward_capture = nullcontext(())
+        if (
+            grad_enabled
+            and self._derivimplicit_forward == "separate"
+            and not self._options.get("disable", False)
+        ):
+            from ..models.mechanisms._derivimplicit_forward import (
+                _capture_forward_programs,
+            )
+
+            forward_capture = _capture_forward_programs(self._options.get("backend"))
+        with forward_capture as programs:
+            graph = _capture_tensor_step(
+                failures.wrap(authored) if failures is not None else authored,
+                (parameters, prepared, state, mutable, invariant, sample),
+                grad_enabled=grad_enabled,
+            )
+        forward_programs = tuple(programs)
         parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
             graph, (parameters, prepared, state, mutable, invariant, sample)
         )
@@ -476,7 +492,12 @@ class _CompiledTensorTreeScan:
                 failures.initial(device) if check_failures else (),
             )
 
-        executor_key = _executor_key(graph, executor_signature, self._options)
+        # A pooled executor could refer to another capture's opaque program.
+        executor_key = (
+            None
+            if forward_programs
+            else _executor_key(graph, executor_signature, self._options)
+        )
         existing = (
             self._executors.get(executor_key) if executor_key is not None else None
         )
@@ -505,8 +526,8 @@ class _CompiledTensorTreeScan:
                 failures.check(failure)
                 return packed, emitted
 
-            return execute_checked, layout, isolate_views
-        return compiled, layout, isolate_views
+            return execute_checked, layout, isolate_views, forward_programs
+        return compiled, layout, isolate_views, forward_programs
 
     @staticmethod
     def _resumed_signature(layout, schema, program):
@@ -597,7 +618,7 @@ class _CompiledTensorTreeScan:
                     )
             entry = self._kernels[signature]
             initial = entry[1].scan_inputs(initial)
-        compiled, layout, isolate_views = entry
+        compiled, layout, isolate_views, forward_programs = entry
         parameters, prepared, invariant, samples = isolate_views(
             (parameters, prepared, invariant, samples)
         )
@@ -605,7 +626,9 @@ class _CompiledTensorTreeScan:
         if retain_carry:
             # Wrap the private packs themselves to preserve the first-order
             # boundary without cloning every logical leaf on this host hop.
-            packed, emitted = guard_scan_outputs((packed, emitted))
+            packed, emitted = guard_scan_outputs(
+                (packed, emitted), forward_programs=forward_programs
+            )
 
         final, updated = layout.unpack(packed)
         if retain_carry:
@@ -628,7 +651,11 @@ class _CompiledTensorTreeScan:
         for path in self._detached_state_paths:
             final = _replace_path(final, path, _get_path(final, path).detach())
         result = final, updated, emitted
-        return result if retain_carry else guard_scan_outputs(result)
+        return (
+            result
+            if retain_carry
+            else guard_scan_outputs(result, forward_programs=forward_programs)
+        )
 
 
 __all__ = []

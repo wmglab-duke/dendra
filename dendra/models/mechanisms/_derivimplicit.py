@@ -1,6 +1,7 @@
 import math
 from collections.abc import Callable
 from enum import IntEnum
+from textwrap import indent
 
 import torch
 
@@ -583,6 +584,8 @@ def derivimplicit_step(
     return_status: bool = False,
     _analytic_jacobian: bool = True,
     _solver=None,
+    _make_evaluators=None,
+    _coefficients=(),
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Solve one backward-Euler step for independent state vectors.
 
@@ -636,19 +639,28 @@ def derivimplicit_step(
                 "Captured nonlinear derivimplicit training requires an analytic "
                 "Jacobian and strict convergence (allow_inexact=False)"
             )
-        with torch.no_grad():
-            x, status = _solve_derivimplicit(
-                x_t,
-                dt_ms,
-                f,
-                t_ms,
-                jac,
-                jac_fn,
-                **options,
-                create_graph=False,
-                detach_newton=True,
-                loop=None,
+        root_and_status = None
+        if _make_evaluators is not None and t_ms is None and not line_search:
+            from ._derivimplicit_forward import _try_separate_newton
+
+            root_and_status = _try_separate_newton(
+                x_t, dt_ms, _make_evaluators, _coefficients, options
             )
+        if root_and_status is None:
+            with torch.no_grad():
+                root_and_status = _solve_derivimplicit(
+                    x_t,
+                    dt_ms,
+                    f,
+                    t_ms,
+                    jac,
+                    jac_fn,
+                    **options,
+                    create_graph=False,
+                    detach_newton=True,
+                    loop=None,
+                )
+        x, status = root_and_status
         x, status = _attach_implicit_gradient(x, status, x_t, dt_ms, f, t_ms, jac_fn)
     else:
         if (
@@ -725,11 +737,11 @@ def _solve_system_jac_call(options):
     )
 
 
-def _solve_system_jac_fn_call(options, *, analytic):
+def _solve_system_jac_fn_call(options, *, analytic, forward_operands=""):
     return (
         "x = derivimplicit_step(x, dt, f, jac_fn=jac_fn, "
         + _derivimplicit_option_call_args(options)
-        + f", _analytic_jacobian={analytic!r}, _solver=self)"
+        + f", _analytic_jacobian={analytic!r}, _solver=self{forward_operands})"
     )
 
 
@@ -1030,9 +1042,30 @@ def build_derivimplicit(
                     ]
                 ),
             )
+            forward_operands = ""
+            if jac_analytic and len(states_to_solve) > 1 and not options["line_search"]:
+                names = set(extract_vars(f_str + jac_fn_str, set()))
+                captures = [v for v in assigned_list_sorted + local_vars if v in names]
+                arguments = ", ".join(captures)
+                operands = f"({arguments},)" if arguments else "()"
+                factory = "_newton_evaluators"
+                while factory in vars_set or factory in states:
+                    factory += "_"
+                definitions = indent(f_str + jac_fn_str, "    ")
+                f_str = (
+                    f"\n    def {factory}({arguments}):{definitions}"
+                    "        return f, jac_fn\n"
+                    f"    f, jac_fn = {factory}({arguments})"
+                )
+                jac_fn_str = ""
+                forward_operands = (
+                    f", _make_evaluators={factory}, _coefficients={operands}"
+                )
             jac_init_str = "jac = None"
             assemble_jacobian_str = ""
-            solve_call = _solve_system_jac_fn_call(options, analytic=jac_analytic)
+            solve_call = _solve_system_jac_fn_call(
+                options, analytic=jac_analytic, forward_operands=forward_operands
+            )
     else:
         # Fallback: no analytic Jacobian available; let solver use autograd Jacobian.
         jac_fn_str = "jac_fn = None"
