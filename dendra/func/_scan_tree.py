@@ -13,6 +13,7 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
+from .._solver_failures import _advance_solver_failure, _SolverFailureCapture
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._carry_packing import _PackedCarryLayout
@@ -186,7 +187,14 @@ def _capture_tensor_step(body, arguments, *, grad_enabled, tracer=None):
 
 
 def _packed_tensor_scan(
-    graph, layout, parameters, prepared, initial, invariant_carries, samples
+    graph,
+    layout,
+    parameters,
+    prepared,
+    initial,
+    invariant_carries,
+    samples,
+    initial_failure=(),
 ):
     """Execute the shared HOP boundary on fresh dtype/device carry groups."""
     from torch._higher_order_ops.scan import scan
@@ -195,15 +203,23 @@ def _packed_tensor_scan(
         (parameters, prepared, invariant_carries, samples)
     )
 
-    def combine(packed, sample):
+    def combine(carry, sample):
+        packed = carry[0] if initial_failure else carry
         state, carries = layout.unpack(packed)
         updated, emitted = graph(
             parameters, prepared, state, carries, invariant_carries, sample
         )
         # Unproven updates get a fresh pack. A qualified private carry
         # result already has the next operand's shape and independent storage.
-        return layout.pack(updated), emitted
+        packed = layout.pack(updated)
+        if initial_failure:
+            emitted, event = emitted
+            return (packed, _advance_solver_failure(carry[1], event)), emitted
+        return packed, emitted
 
+    if initial_failure:
+        (packed, failure), emitted = scan(combine, (initial, initial_failure), samples)
+        return packed, emitted, failure
     return scan(combine, initial, samples)
 
 
@@ -286,6 +302,7 @@ class _CompiledTensorTreeScan:
         detached_state_paths=(),
         clone_state=None,
         capture_examples=None,
+        solver_failures=False,
     ):
         install_scan_compatibility()
         if type(steps) is not int or steps < 1:
@@ -299,6 +316,7 @@ class _CompiledTensorTreeScan:
         self._detached_state_paths = tuple(tuple(path) for path in detached_state_paths)
         self._clone_state = _clone_tree if clone_state is None else clone_state
         self._capture_examples = capture_examples
+        self._solver_failures = solver_failures
         self._kernels = {}
         self._executors = {}
 
@@ -416,8 +434,9 @@ class _CompiledTensorTreeScan:
             next_carries, _ = partition.split(next_carries)
             return (next_state, next_carries), _clone_tree(emitted or {})
 
+        failures = _SolverFailureCapture() if self._solver_failures else None
         graph = _capture_tensor_step(
-            authored,
+            failures.wrap(authored) if failures is not None else authored,
             (parameters, prepared, state, mutable, invariant, sample),
             grad_enabled=grad_enabled,
         )
@@ -442,6 +461,9 @@ class _CompiledTensorTreeScan:
             captured_inputs=isinstance(graph, torch.fx.GraphModule),
         )
 
+        check_failures = failures is not None and failures.active
+        device = self._device
+
         def execute(parameters, prepared, initial, invariant, samples):
             return _packed_tensor_scan(
                 graph,
@@ -451,6 +473,7 @@ class _CompiledTensorTreeScan:
                 initial,
                 invariant,
                 samples,
+                failures.initial(device) if check_failures else (),
             )
 
         executor_key = _executor_key(graph, executor_signature, self._options)
@@ -473,6 +496,16 @@ class _CompiledTensorTreeScan:
             )
             if executor_key is not None:
                 self._executors[executor_key] = compiled, graph
+        if check_failures:
+
+            def execute_checked(parameters, prepared, initial, invariant, samples):
+                packed, emitted, failure = compiled(
+                    parameters, prepared, initial, invariant, samples
+                )
+                failures.check(failure)
+                return packed, emitted
+
+            return execute_checked, layout, isolate_views
         return compiled, layout, isolate_views
 
     @staticmethod

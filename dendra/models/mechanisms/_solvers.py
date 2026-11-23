@@ -127,3 +127,56 @@ def _solve_linear_small(A: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 
     # Fallback for larger systems
     return torch.linalg.solve(A, b.unsqueeze(-1)).squeeze(-1)
+
+
+def _solve_dense_masked(A, b, valid, eye):
+    safe_A = torch.where(valid[..., None, None], A, eye)
+    safe_b = torch.where(valid[..., None], b, 0.0)
+    solution, info = torch.linalg.solve_ex(
+        safe_A, safe_b.unsqueeze(-1), check_errors=False
+    )
+    return solution.squeeze(-1), info
+
+
+def _solve_linear_checked(
+    A: torch.Tensor, b: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Solve batched systems and return a validity mask over their batch shape.
+
+    Failed systems return zero corrections. In a differentiable solve, probe
+    with detached inputs before solving again with invalid systems replaced
+    by identity and zero. Otherwise singular solves can produce NaN gradients
+    even when their results are masked out.
+    """
+    n = A.shape[-1]
+    differentiable = torch.autograd.forward_ad._current_level >= 0 or (
+        torch.is_grad_enabled() and (A.requires_grad or b.requires_grad)
+    )
+    if n == 1:
+        pivot = A[..., 0, 0]
+        rhs = b[..., 0]
+        solution = rhs.detach() / pivot.detach() if differentiable else rhs / pivot
+        valid = torch.isfinite(pivot) & torch.isfinite(rhs) & torch.isfinite(solution)
+        if differentiable:
+            safe_rhs = torch.where(valid, rhs, 0.0)
+            safe_pivot = torch.where(valid, pivot, 1.0)
+            solution = safe_rhs / safe_pivot
+        else:
+            solution = torch.where(valid, solution, 0.0)
+        return solution.unsqueeze(-1), valid
+
+    output_dtype = b.dtype
+    if A.dtype in (torch.float16, torch.bfloat16):
+        # Dense LU requires at least single-precision inputs.
+        A, b = A.float(), b.float()
+    eye = torch.eye(n, dtype=A.dtype, device=A.device)
+    finite_inputs = torch.isfinite(A).all(dim=(-2, -1)) & torch.isfinite(b).all(dim=-1)
+    probe_A = A.detach() if differentiable else A
+    probe_b = b.detach() if differentiable else b
+    solution, info = _solve_dense_masked(probe_A, probe_b, finite_inputs, eye)
+    solution = solution.to(output_dtype)
+    valid = finite_inputs & (info == 0) & torch.isfinite(solution).all(dim=-1)
+    if differentiable:
+        solution, _ = _solve_dense_masked(A, b, valid, eye)
+        return solution.to(output_dtype), valid
+    return torch.where(valid[..., None], solution, 0.0), valid

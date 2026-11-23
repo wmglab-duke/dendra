@@ -384,6 +384,7 @@ def differentiate_rhs_2torch_checked(
     # Finite-difference fallback controls
     fd_scheme: str = "central",  # "central" | "forward" | "backward"
     fd_eps: float = 1e-6,  # constant epsilon (keeps dependency detection meaningful)
+    allow_finite_difference: bool = True,
 ) -> tuple[str, bool, bool]:
     """
     Input:
@@ -397,6 +398,8 @@ def differentiate_rhs_2torch_checked(
         df_dy_str: PyTorch-valid expression string for ∂f/∂wrt if ok=True else ""
         ok: True if expression is torch-safe per _validate_torch_expression
         depends_on_any_state: True if the returned derivative expr depends on any of state_vars
+
+    Set ``allow_finite_difference=False`` to require a symbolic derivative.
     """
     if isinstance(fd_eps, bool) or not isinstance(fd_eps, Real):
         raise TypeError("fd_eps must be a positive, finite real number")
@@ -486,8 +489,11 @@ def differentiate_rhs_2torch_checked(
             return df_str, True, depends
 
     except Exception:
-        # fall through to finite-difference
+        # fall through to finite-difference when requested
         pass
+
+    if not allow_finite_difference:
+        return "", False, False
 
     # ---- 2) Finite-difference fallback (still returns a torch-valid string) ----
     try:

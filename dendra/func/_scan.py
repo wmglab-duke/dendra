@@ -13,6 +13,7 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
+from .._solver_failures import _advance_solver_failure, _SolverFailureCapture
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._callback_recurrence import _transition_sample_values
@@ -165,6 +166,7 @@ class _CompiledScanPopulationChunk:
                 static_state_paths=(("control", "duration_remainder"),),
                 clone_state=functional._clone_state_tree,
                 capture_examples=_detach,
+                solver_failures=True,
             )
         final, updated, emitted = self._training(
             parameters,
@@ -330,12 +332,14 @@ class _CompiledScanPopulationChunk:
 
         # Inference does not differentiate this captured graph. Training's
         # authored AD boundaries belong to the shared tensor-tree engine.
+        failures = _SolverFailureCapture()
         graph = _capture_tensor_step(
-            authored,
+            failures.wrap(authored),
             (parameters, prepared, state, carries, invariant_carries, sample),
             grad_enabled=False,
             tracer=make_fx,
         )
+        check_failures = failures.active
         parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
             graph, (parameters, prepared, state, carries, invariant_carries, sample)
         )
@@ -434,23 +438,26 @@ class _CompiledScanPopulationChunk:
                     spec,
                 )
 
+            def advance(carry, sample):
+                updated, emitted = graph(
+                    parameters, prepared, carry[0], carry[1], invariant_carries, sample
+                )
+                if check_failures:
+                    emitted, event = emitted
+                    updated = (*updated, _advance_solver_failure(carry[2], event))
+                return updated, emitted
+
+            carry = (state, carries)
+            if check_failures:
+                carry = (*carry, failures.initial(functional.device))
             if block == 1:
 
                 def combine(carry, sample):
-                    sample = unpack_sample(sample)
-                    state, carries = carry
-                    return graph(
-                        parameters, prepared, state, carries, invariant_carries, sample
-                    )
+                    return advance(carry, unpack_sample(sample))
 
-                (final, updated), emitted = scan(
-                    combine,
-                    (state, carries),
-                    flat_samples,
-                )
+                carry, emitted = scan(combine, carry, flat_samples)
             else:
                 full_steps = (steps // block) * block
-                carry = (state, carries)
 
                 def combine(carry, samples):
                     emissions = []
@@ -460,9 +467,7 @@ class _CompiledScanPopulationChunk:
                                 torch.Tensor, lambda value: value[offset], samples
                             )
                         )
-                        carry, emission = graph(
-                            parameters, prepared, *carry, invariant_carries, sample
-                        )
+                        carry, emission = advance(carry, sample)
                         emissions.append(emission)
                     # Each stack owns its storage, including when callbacks
                     # emit state views or the same Tensor in several leaves.
@@ -506,9 +511,7 @@ class _CompiledScanPopulationChunk:
                             torch.Tensor, lambda value: value[index], flat_samples
                         )
                     )
-                    carry, emission = graph(
-                        parameters, prepared, *carry, invariant_carries, sample
-                    )
+                    carry, emission = advance(carry, sample)
                     tail.append(emission)
                 if tail:
                     tail = _stack_steps(tail)
@@ -523,7 +526,7 @@ class _CompiledScanPopulationChunk:
                     carry = _clone(carry)
                 elif phase_emissions:
                     tail = None
-                final, updated = carry
+            final, updated = carry[:2]
             # Scan's AD wrapper marks every floating output differentiable.
             # Timesteps never change host scheduling carry, which must remain
             # gradient-free for duration validation and exact resumed runs.
@@ -532,15 +535,17 @@ class _CompiledScanPopulationChunk:
             ].clone()
             auxiliary = {"v": final["integrator"]["v"]}
             if phase_emissions:
-                return final, updated, emitted, tail
-            if plans is None:
-                return final, auxiliary
-            return (
-                final,
-                auxiliary,
-                updated,
-                {plan.name: emitted.get(plan.name) for plan in plans},
-            )
+                result = (final, updated, emitted, tail)
+            elif plans is None:
+                result = (final, auxiliary)
+            else:
+                result = (
+                    final,
+                    auxiliary,
+                    updated,
+                    {plan.name: emitted.get(plan.name) for plan in plans},
+                )
+            return (result, carry[2]) if check_failures else result
 
         compiled = _compile_scan(
             execute,
@@ -607,6 +612,9 @@ class _CompiledScanPopulationChunk:
                 draws,
                 sampling_times,
             )
+            if check_failures:
+                result, failure = result
+                failures.check(failure)
             if not phase_emissions and not callback_carry.invariant_names:
                 return result
             if phase_emissions:

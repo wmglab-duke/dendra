@@ -24,6 +24,7 @@ from test_runners import (
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
 from dendra.func import _scan_compat
+from dendra.models.mechanisms import Mechanism, State
 
 pytestmark = [
     pytest.mark.filterwarnings(
@@ -45,6 +46,130 @@ def _known_compiler_warnings():
             module=r"torch\.jit\._script",
         )
         yield
+
+
+class _AffineRelaxationState(State):
+    State.STATE("x")
+    State.GLOBAL(rate=2.0, source=1.0)
+    State.DERIVATIVE("x' = source - rate*x")
+    State.METHOD("derivimplicit")
+
+    def state_defaults(self, v, values):
+        return {"x": torch.full_like(v, 0.5)}
+
+
+class _AffineRelaxation(Mechanism):
+    Mechanism.STATE_BUNDLE(_AffineRelaxationState)
+
+
+class _CoupledReactionState(State):
+    State.STATE("u", "w")
+    State.GLOBAL(rate=1.25)
+    State.DERIVATIVE("u' = -rate*u*w", "w' = rate*u*w")
+    State.METHOD("derivimplicit")
+
+    def state_defaults(self, v, values):
+        return {"u": torch.full_like(v, 0.75), "w": torch.full_like(v, 0.25)}
+
+
+class _CoupledReaction(Mechanism):
+    Mechanism.STATE_BUNDLE(_CoupledReactionState)
+
+
+@pytest.mark.cpu
+def test_compiled_affine_derivimplicit_preserves_equilibrium_gradients():
+    dt, steps = 0.1, 4
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1, DEVICE="cpu", DTYPE=torch.float64, IMEM=False):
+        model = dn.SingleCompartment(N=2, C=1, dtype=torch.float64).train()
+        model.insert(_AffineRelaxation)
+        model.initialize()
+        program = dn.compile(
+            model,
+            dt=dt,
+            steps=steps,
+            execution="scan",
+            backend="eager",
+            inference=False,
+            trainable=("*rate_param", "*source_param"),
+        )
+        state, _ = program()
+
+    actual = state["mechanisms"][_AffineRelaxation.__name__]["x"]
+    torch.testing.assert_close(actual, torch.full_like(actual, 0.5), rtol=0, atol=0)
+    parameters = {
+        name.rsplit(".", 1)[-1]: value
+        for name, value in program.named_parameters.items()
+        if value.requires_grad
+    }
+    rate, source = parameters["rate_param"], parameters["source_param"]
+    rate_vjp, source_vjp = torch.autograd.grad(actual.sum(), (rate, source))
+
+    # At equilibrium the backward Euler recurrence retains this fraction of x0.
+    retained = (1 + dt * 2.0) ** -steps
+    source_derivative = actual.numel() * (1 - retained) / 2.0
+    torch.testing.assert_close(
+        rate_vjp, torch.full_like(rate, -0.5 * source_derivative)
+    )
+    torch.testing.assert_close(source_vjp, torch.full_like(source, source_derivative))
+
+
+@pytest.mark.cpu
+def test_compiled_nonlinear_derivimplicit_matches_coupled_backward_euler():
+    dt, steps = 0.1, 4
+    name = _CoupledReaction.__name__
+    with dn.ctx(JIT=0, REQUIRE_GRAD=1, DEVICE="cpu", DTYPE=torch.float64, IMEM=False):
+        model = dn.SingleCompartment(N=2, C=1, dtype=torch.float64).train()
+        model.insert(_CoupledReaction)
+        model.initialize()
+        program = dn.compile(
+            model,
+            dt=dt,
+            steps=steps,
+            execution="scan",
+            backend="eager",
+            inference=False,
+            trainable="*rate_param",
+        )
+        initial = program.initial_state
+        mechanisms = initial["mechanisms"]
+        reference = mechanisms[name]["u"]
+        u = reference.new_tensor([[0.75], [0.25]], requires_grad=True)
+        w = reference.new_tensor([[0.3], [0.0]], requires_grad=True)
+        incoming = {**initial, "mechanisms": {**mechanisms, name: {"u": u, "w": w}}}
+        (rate,) = program.trainable_parameters.values()
+
+        state, _ = program(incoming)
+        actual = (state["mechanisms"][name]["u"], state["mechanisms"][name]["w"])
+
+        # u+w is conserved by backward Euler, so each step reduces to a quadratic.
+        total = u + w
+        scale = dt * rate
+        linear = 1 + scale * total
+        expected_u = u
+        for _ in range(steps):
+            root = (linear.square() - 4 * scale * expected_u).sqrt()
+            expected_u = 2 * expected_u / (linear + root)
+        expected = (expected_u, total - expected_u)
+        cotangents = (u.new_tensor([[0.8], [-0.2]]), w.new_tensor([[-0.1], [0.7]]))
+        actual_vjp = torch.autograd.grad(actual, (u, w, rate), cotangents)
+        expected_vjp = torch.autograd.grad(expected, (u, w, rate), cotangents)
+        torch.testing.assert_close(actual, expected, rtol=1e-7, atol=1e-8)
+        torch.testing.assert_close(actual_vjp, expected_vjp, rtol=1e-7, atol=1e-8)
+
+        # In the second lane, u+w=0 and 4*dt*rate*u>1 give a negative discriminant.
+        failed_inputs = {
+            "u": u.new_tensor([[0.75], [3.0]], requires_grad=True),
+            "w": w.new_tensor([[0.3], [-3.0]], requires_grad=True),
+        }
+        failed = {**initial, "mechanisms": {**mechanisms, name: failed_inputs}}
+        with pytest.raises(
+            RuntimeError, match=r"derivimplicit.*chunk step 0, batch index \(1, 0\)"
+        ):
+            program(failed)
+        replay, _ = program(incoming)
+        torch.testing.assert_close(
+            replay["mechanisms"][name], state["mechanisms"][name]
+        )
 
 
 def _assert_gradients(actual, expected):

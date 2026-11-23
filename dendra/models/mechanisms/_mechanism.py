@@ -1208,6 +1208,7 @@ class Mechanism(Parameterized):
 
         self.register_buffer("diam", self.get(diameters))
         for state in self.DE.values():
+            state._solver_failure_label = f"{self.name}.{state._name}"
             for state_name in state._state:
                 self.register_buffer(state_name, torch.zeros(shape))
                 # getattr(self, state_name).requires_grad_(True)

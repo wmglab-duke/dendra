@@ -278,6 +278,7 @@ class _PopulationWhileExecutor:
                 project_state=getattr(functional, "_project_state_tree", None),
                 tracer=make_fx,
                 compiler=_compile_while,
+                solver_failures=True,
             )
             if stepwise:
                 self._stepwise_engine = engine

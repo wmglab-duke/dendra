@@ -2480,6 +2480,16 @@ class State(Parameterized):
             or::
 
                 State.METHOD("cnexp", pade=True)
+
+            ``derivimplicit`` checks the backward-Euler residual of each batch
+            member. With default options, it solves symbolically affine
+            equations directly and uses Newton iteration otherwise. The default
+            tolerance accounts for dtype and state scale after an update. An
+            explicit ``tol`` is absolute.
+            Set ``allow_inexact=True`` to accept finite iterates on stagnation
+            or iteration exhaustion. Singular and nonfinite solves still fail.
+            Nonlinear scan training requires a symbolic Jacobian and strict
+            convergence and differentiates the accepted root to first order.
         """
         if method is not None:
             method = _canonical_method_name(method)
