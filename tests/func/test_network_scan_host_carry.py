@@ -98,11 +98,12 @@ def test_host_scan_retains_packed_carry_and_publishes_owned_resume(
                 execute,
                 layout,
                 isolate_views,
+                forward_programs,
             ) in engine._kernels.copy().items():
                 patch.setitem(
                     engine._kernels,
                     signature,
-                    (observe(execute), layout, isolate_views),
+                    (observe(execute), layout, isolate_views, forward_programs),
                 )
             prefix, prefix_aux = run(0, split, state)
         assert len(transitions) == split // width
