@@ -31,7 +31,6 @@ class _FunctionalAssignedState(State):
 class _FunctionalAdvanceState(State):
     State.STATE("b")
     State.CARRY("memory")
-    State.DERIVATIVE("b' = 0.0 * b")
 
     def state_defaults(self, v, values):
         del values
@@ -124,6 +123,24 @@ def _assert_tree_close(actual, expected):
         strict=True,
     ):
         torch.testing.assert_close(actual_value, expected_value)
+
+
+def test_functional_advance_without_derivative_preserves_timestep_gradient():
+    model = _model(_FunctionalStateMechanism)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    dt = torch.tensor(2 * DT, dtype=DTYPE, requires_grad=True)
+
+    state, _ = functional.prepare_and_step(
+        tensors.parameters, {**tensors.constants, "dt": dt}, tensors.state
+    )
+
+    mechanism = state["mechanisms"]["_FunctionalStateMechanism"]
+    torch.testing.assert_close(mechanism["a"], torch.full_like(mechanism["a"], DT))
+    torch.testing.assert_close(
+        mechanism["b"], torch.full_like(mechanism["b"], 1 + 2 * DT)
+    )
+    (gradient,) = torch.autograd.grad(mechanism["b"].mean(), dt)
+    torch.testing.assert_close(gradient, torch.ones_like(dt))
 
 
 @pytest.mark.parametrize(

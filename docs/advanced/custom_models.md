@@ -78,12 +78,16 @@ with dn.ctx(JIT=0, DEVICE="cpu", DTYPE=torch.float64, REQUIRE_GRAD=1):
     assert torch.isfinite(state["integrator"]["v"]).all()
 ```
 
-`State.advance` normally executes the declared State equations. Override it
-only when supplying a custom solver-state transition. `Mechanism.advance`
-runs once per accepted step and returns a partial mapping of direct carry
-and owned writable shared fields; omitted carry is retained. The two hooks
-read the same incoming snapshot. A Mechanism hook cannot assume that a nested
-State has already advanced.
+`State.advance` normally executes the declared State equations. If your
+override computes the entire deterministic transition, declare the state
+variables with `State.STATE` and return their updated values from `advance`.
+The `DERIVATIVE` and `KINETIC` declarations are optional for that bundle.
+Delegating to `super().advance(...)` requires declared equations.
+
+`Mechanism.advance` runs once per accepted step and returns a partial mapping
+of direct carry and owned writable shared fields. Omitted carry is retained.
+The two hooks read the same incoming snapshot. A Mechanism hook cannot assume
+that a nested State has already advanced.
 
 During initialization, State defaults provide fallback values, insertion-time
 `ic` overrides those defaults, and authored `initial_values` hooks may overlay

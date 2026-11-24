@@ -1540,6 +1540,8 @@ class State(Parameterized):
     - ``assigned_values(self, v, values)``: compute ephemeral ``ASSIGNED`` values
       needed by the generated solver.
     - ``advance(self, v, dt, values)``: return the next declared state/carry.
+      A deterministic bundle that defines its entire transition in this hook
+      can declare ``STATE`` without ``DERIVATIVE`` or ``KINETIC`` equations.
 
     Notes
     -----
@@ -2041,21 +2043,27 @@ class State(Parameterized):
         else:
             self.method_kwargs.setdefault("pade", False)
 
-        ifunc = build_integration_func(
-            self._state,
-            self._assigned,
-            _derivative,
-            self.method,
-            eliminate=cinfo,
-            diffusion=self._diffusion,
-            inputs=self._inputs,
-            **self.method_kwargs,
-        )
-        self._solve = MethodType(ifunc, self)
+        is_sde = self.method in {"euler_maruyama", "euler_heun"}
+        if self._has_authored_advance and not (
+            _derivative or self._kinetic or self._diffusion or is_sde
+        ):
+            self._solve = None
+        else:
+            ifunc = build_integration_func(
+                self._state,
+                self._assigned,
+                _derivative,
+                self.method,
+                eliminate=cinfo,
+                diffusion=self._diffusion,
+                inputs=self._inputs,
+                **self.method_kwargs,
+            )
+            self._solve = MethodType(ifunc, self)
 
         self._sde_rng_names = ()
         self._sde_draw_state_names = ()
-        if self.method in {"euler_maruyama", "euler_heun"}:
+        if is_sde:
             eliminated_sde_states = dict(cinfo or ())
             self._sde_draw_state_names = tuple(
                 name for name in self._state if name not in eliminated_sde_states
@@ -2533,6 +2541,9 @@ class State(Parameterized):
         CARRY. Runtime outputs preserve their exact shape, dtype, and device.
         Other bundles and the owning Mechanism advance from the same incoming
         snapshot; their new values are not visible during this calculation.
+        A deterministic override can implement the entire transition without
+        declaring equations. Delegating to this default implementation requires
+        a generated solver.
 
         For Euler-Maruyama and Euler-Heun, ``draws`` supplies a mapping from
         non-eliminated state names to standard-normal tensors with the exact
@@ -2540,6 +2551,11 @@ class State(Parameterized):
         are detached; drift, diffusion coefficients, and timestep retain their
         gradients. Omitting ``draws`` samples the State's Native RNG streams.
         """
+        if self._solve is None:
+            raise RuntimeError(
+                f"{type(self).__qualname__} has no generated State solver. "
+                "Declare DERIVATIVE or KINETIC equations to use State.advance."
+            )
         assigned = self._derive_assigned_values(v, values)
         if self.method in {"euler_maruyama", "euler_heun"}:
             if draws is None:
