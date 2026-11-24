@@ -68,7 +68,8 @@ def test_gitlab_compiler_partition_gate_leaves_full_coverage_required():
     )[0]
     release = text.split("\nrelease_bump:\n", 1)[1].split("\npages:\n", 1)[0]
     assert 'COMPAT_SHARD: ["1", "2", "3", "4"]' in shards
-    assert "timeout: 90 minutes" in shards
+    assert "timeout: 2 hours" in shards
+    assert 'RUNNER_SCRIPT_TIMEOUT: "1h55m"' in shards
     assert "python -m pytest -q -p scripts.ci_shard" in shards
     assert "--ci-shard-total=4" in shards
     assert "--ci-shard-durations=scripts/ci_durations.json" in shards
