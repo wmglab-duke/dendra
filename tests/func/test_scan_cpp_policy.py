@@ -148,9 +148,8 @@ def test_population_inference_capture_selects_cpp_from_immutable_device(
         extra=SimpleNamespace(enabled=False),
         _clone_state_tree=lambda state: state,
     )
-    chunk = object.__new__(_scan._CompiledScanPopulationChunk)
-    chunk._functional, chunk._steps, chunk._options = functional, 1, {}
-    chunk._plans, chunk._stepwise = None, False
+    monkeypatch.setattr(_scan, "install_scan_compatibility", lambda: None)
+    chunk = _scan._CompiledScanPopulationChunk(functional, steps=1, compile_options={})
 
     # Retain the authored callable without executing it or allocating on the
     # plan's device; these tests inspect compiler selection, not numerical work.
