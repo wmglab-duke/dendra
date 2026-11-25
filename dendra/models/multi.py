@@ -577,6 +577,17 @@ def _assess_type_and_make_integrator(populations, threads=16, write_back=True):
     """
     if not populations:
         raise ValueError("At least one population is required.")
+    if any(
+        getattr(
+            getattr(population, "integrator", None), "_tree_contraction_options", None
+        )
+        is not None
+        for population in populations.values()
+    ):
+        raise TypeError(
+            "tree_contraction requires a scalar Tree. Select dn.dhs() for "
+            "components before automatically packing them into a MultiPopulation."
+        )
     if _validate_block_populations(populations):
         return dhs_bt_multi(threads=threads, write_back=write_back)
     capabilities = {_multi_solver_capability(pop) for pop in populations.values()}

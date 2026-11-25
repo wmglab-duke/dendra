@@ -10804,7 +10804,9 @@ def _functionalization_failures(
             )
             is None
         ):
-            failures.append("scalar Tree functionalization requires exactly dhs")
+            failures.append(
+                "scalar Tree functionalization requires dhs or tree_contraction"
+            )
 
     handler = getattr(population, "mech", None)
     if handler is not None:
@@ -12197,6 +12199,7 @@ def _structure_signature(population) -> tuple:
             type(population.integrator).__qualname__,
             getattr(population.integrator, "method", None),
             getattr(population.integrator, "threads", None),
+            getattr(population.integrator, "_tree_contraction_options", None),
             getattr(population.integrator, "write_back", None),
             bool(population.integrator.imem),
             tuple(population.integrator.v_vars),

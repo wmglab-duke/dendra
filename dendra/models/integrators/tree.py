@@ -1,4 +1,5 @@
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import partial
 from types import GetSetDescriptorType
@@ -19,7 +20,7 @@ from .core import (
     _flatten_to_solve,
     _population_runtime_modes_plain,
 )
-from .triton import dhs_solve_cuda, dhs_solve_multi_cuda
+from .triton import TRITON_AVAILABLE, dhs_solve_cuda, dhs_solve_multi_cuda
 
 try:
     import dendra_solvers
@@ -180,6 +181,12 @@ def _cuda_solver_binding(previous, function, threads):
 def _functional_dhs_plan_solve(d_mem, a_geom, rhs, parent, order, layers, *, plan):
     """Use the functional transition's immutable, independently owned plan."""
     return dendra_solvers.dhs_solve_plan(d_mem, a_geom, rhs, plan)
+
+
+def _tree_contraction_plan_solve(
+    d_mem, a_geom, rhs, parent, order, layers, *, solve, plan
+):
+    return solve(d_mem, a_geom, rhs, plan)
 
 
 def _functional_dhs_multi_plan_solve(d_mem, a_geom, rhs, *metadata, plan):
@@ -714,13 +721,41 @@ class _dhs(Integrator):
         ("edge_conductance", "edge"),
     )
     _FUNCTIONAL_OPERATOR_KIND = "scalar_tree"
-    _FUNCTIONAL_CRITICAL_METHODS = ("_select_solver", "_refresh_cpu_topology_plan")
+    _FUNCTIONAL_CRITICAL_METHODS = (
+        "_select_solver",
+        "_refresh_cpu_topology_plan",
+        "_make_tree_contraction_solver",
+        "_refresh_tree_contraction_solver",
+        "_contraction_parent_buffer",
+    )
 
-    def __init__(self, model, mech, imem=None, threads=16):
+    def __init__(
+        self, model, mech, imem=None, threads=16, *, _tree_contraction_options=None
+    ):
         threads = _validate_dhs_threads(threads)
+        if _tree_contraction_options is not None:
+            from ..extcell import ExtCellTree
+            from ..tree import Tree
+
+            if not isinstance(model, Tree) or isinstance(model, ExtCellTree):
+                raise TypeError("tree_contraction requires a scalar Tree")
+            explicit_imem = _tree_contraction_options[1]
+            if explicit_imem is not None:
+                # Population.build forwards its context-derived imem flag.
+                # Apply the explicit factory setting to both current owners.
+                imem = explicit_imem
+                if model.imem != imem:
+                    model.imem = imem
+                    if "i_membrane" not in model._buffers:
+                        del model.i_membrane
+                    model.register_buffer(
+                        "i_membrane", torch.zeros_like(model.v) if imem else None
+                    )
 
         super().__init__(model, mech, imem)
         self.threads = threads
+        self._tree_contraction_options = _tree_contraction_options
+        self._tree_contraction_plan_source = ()
 
         N = model.shape[-1]
         B = int(np.prod(model.shape[:-1]))
@@ -803,6 +838,78 @@ class _dhs(Integrator):
                 f"DHS integrator is not implemented for device type {device.type}."
             )
 
+    def _make_tree_contraction_solver(self, parent_host, device):
+        plan_class = getattr(dendra_solvers, "TreeContractionPlan", None)
+        if plan_class is None:
+            raise ImportError(
+                "tree_contraction requires dendra-solvers>=0.6.0. "
+                'Install with `python -m pip install "dendra[solvers]"`.'
+            )
+        if device.type == "cuda":
+            if not TRITON_AVAILABLE:
+                raise ImportError("tree_contraction execution on CUDA requires Triton")
+            from .triton.tree_contraction import prepare, solve
+        elif device.type == "mps":
+            solve = getattr(dendra_solvers, "tree_contraction_solve_plan", None)
+            if not callable(solve) or not _mps_solver_available(dendra_solvers):
+                raise ImportError(
+                    "tree_contraction requires an MPS-enabled dendra-solvers "
+                    "installation and an available Apple GPU"
+                )
+            prepare = plan_class.prepare
+        else:
+            raise NotImplementedError("tree_contraction requires a CUDA or MPS device")
+        plan = plan_class(
+            parent_host,
+            max_segment_interior_nodes=self._tree_contraction_options[0],
+        )
+        prepare(plan, device)
+        return partial(_tree_contraction_plan_solve, solve=solve, plan=plan)
+
+    def _contraction_parent_buffer(self, parent_host, device):
+        # Workspace refreshes can be frequent during training. Compare topology
+        # on CPU to retain a prepared GPU plan without synchronizing the device.
+        previous = self._tree_contraction_plan_source
+        if previous:
+            parent, version, _, previous_host = previous
+            if (
+                parent is self._buffers["parent_idx"]
+                and parent.device == device
+                and parent._version == version
+                and torch.equal(previous_host, parent_host)
+            ):
+                return parent
+        with torch.inference_mode(False):
+            return parent_host.to(dtype=torch.int64, device=device)
+
+    def _refresh_tree_contraction_solver(self, *, parent_host=None):
+        """Guard the owned plan with the registered parent identity and version."""
+        parent = self._buffers["parent_idx"]
+        device = self.cm_dt.device
+        try:
+            version = parent._version
+        except RuntimeError:
+            version = None
+        previous = self._tree_contraction_plan_source
+        if previous and previous[0] is parent and previous[1:3] == (version, device):
+            return
+        self._tree_contraction_plan_source = ()
+        if getattr(self, "_solve", None) is not None:
+            self._solve = None
+            self.clear_jit_cache()
+        if parent_host is None:
+            parent_host = parent.cpu()
+        self._solve = self._make_tree_contraction_solver(parent_host, device)
+        if version is not None:
+            self._tree_contraction_plan_source = (parent, version, device, parent_host)
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        if getattr(self, "_tree_contraction_options", None) is not None:
+            state["_solve"] = None
+            state["_tree_contraction_plan_source"] = ()
+        return state
+
     def _functional_solver(self):
         """Return the transform-compatible facade for the selected DHS kernel.
 
@@ -811,6 +918,10 @@ class _dhs(Integrator):
         contracts needed by functional Population lowering. CUDA uses a
         separate split-context facade over its existing Triton solve kernel.
         """
+        if getattr(self, "_tree_contraction_options", None) is not None:
+            # The execution Population clone owns this copy of the topology.
+            self._refresh_tree_contraction_solver()
+            return self._solve
         solver = self._solve
         if (
             isinstance(solver, partial)
@@ -945,19 +1056,31 @@ class _dhs(Integrator):
         self.base_shape = model.shape
 
         device = model.device()
+        use_contraction = getattr(self, "_tree_contraction_options", None) is not None
+        if use_contraction:
+            if device.type == "cuda":
+                if model.dtype() not in (torch.float32, torch.float64):
+                    raise TypeError("CUDA tree_contraction requires float32 or float64")
+            elif device.type == "mps":
+                if model.dtype() != torch.float32:
+                    raise TypeError("MPS tree_contraction requires float32")
+            else:
+                raise NotImplementedError("tree_contraction requires a CUDA or MPS device")
         self.to(device)
 
-        self._select_solver(device)
+        if not use_contraction:
+            self._select_solver(device)
 
         graph = _compiled_tree_graph_view(model)
         if not isinstance(graph, list):
             graph = [graph]
 
-        parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(
-            graph, dtype_axial=model.dtype()
-        )
-        parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
-        order, layer_ptr = build_dhs_layers(depth, self.threads)
+        with torch.device("cpu") if use_contraction else nullcontext():
+            parent_idx_t, a_geom_t, node_order = graph_to_parent_and_axial(
+                graph, dtype_axial=model.dtype()
+            )
+            parent_idx, _, depth = build_morphology(parent_idx_t.tolist())
+            order, layer_ptr = build_dhs_layers(depth, self.threads)
 
         install_topology(
             "solver_order",
@@ -971,9 +1094,13 @@ class _dhs(Integrator):
             "layer_ptr", layer_ptr.to(dtype=torch.int64, device=device)
         )  # (L+1,)
         install_topology("order", order.to(dtype=torch.int64, device=device))
-        install_topology(
-            "parent_idx", parent_idx.to(dtype=torch.int64, device=device)
-        )  # (N,)
+        if use_contraction:
+            # Contraction plans must track public topology writes even if the
+            # integrator was initialized in inference mode.
+            parent_idx = self._contraction_parent_buffer(parent_idx_t, device)
+        else:
+            parent_idx = parent_idx.to(dtype=torch.int64, device=device)
+        install_topology("parent_idx", parent_idx)  # (N,)
         if getattr(model, "_canonical_edge_resistance_ohm", None) is not None:
             # The canonical model buffer is the numerical source of truth for
             # both unbranched solvers. In particular, ``float32 -> float64``
@@ -1054,11 +1181,16 @@ class _dhs(Integrator):
             edge_conductance=edge_conductance,
         )
         self._install_prepared_workspace(workspace)
-        self._refresh_cpu_topology_plan()
+        if use_contraction:
+            self._refresh_tree_contraction_solver(parent_host=parent_idx_t)
+        else:
+            self._refresh_cpu_topology_plan()
         self._topology_initialization_contract = topology_contract
 
     def step(self, model, dt, ve=None, intra=None):
-        if self._cpu_plan_available:
+        if getattr(self, "_tree_contraction_options", None) is not None:
+            self._refresh_tree_contraction_solver()
+        elif self._cpu_plan_available:
             self._refresh_cpu_topology_plan()
         v_new, i_membrane = self._call_kernel(
             "_step", model.v, dt, model.celsius, ve, intra

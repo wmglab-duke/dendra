@@ -1,4 +1,5 @@
 from functools import partial, partialmethod
+from numbers import Integral
 from typing import Any, Type
 
 from .explicit import (
@@ -62,6 +63,40 @@ dhs_multi = make_partial_integrator(_dhs_multi)
 dhs_bt = make_partial_integrator(_dhs_bt)
 dhs_bt_multi = make_partial_integrator(_dhs_bt_multi)
 
+
+def tree_contraction(max_segment_interior_nodes=16, *, imem=None):
+    """Configure a scalar Tree integrator that solves by tree contraction.
+
+    Pass the returned factory as ``integrator=dn.tree_contraction()`` when
+    constructing a Tree. The solver supports float32 and float64 on CUDA and
+    float32 on Apple MPS.
+
+    ``max_segment_interior_nodes`` is a positive integer counting only the
+    interior nodes of each chain segment. Pass ``None`` to skip chain
+    condensation and use fine-grained contraction.
+
+    Set ``imem`` to accumulate membrane currents each step, or leave it as
+    ``None`` to inherit the current Dendra context.
+    """
+    if max_segment_interior_nodes is not None:
+        if isinstance(max_segment_interior_nodes, bool) or not isinstance(
+            max_segment_interior_nodes, Integral
+        ):
+            raise TypeError(
+                "max_segment_interior_nodes must be a positive integer or None"
+            )
+        if max_segment_interior_nodes <= 0:
+            raise ValueError("max_segment_interior_nodes must be positive")
+        max_segment_interior_nodes = int(max_segment_interior_nodes)
+    return partial_class(
+        _dhs,
+        _tree_contraction_options=(
+            max_segment_interior_nodes,
+            None if imem is None else bool(imem),
+        ),
+    )
+
+
 df = dufort_frankel
 dfh = dufort_frankel_homogeneous
 
@@ -82,6 +117,7 @@ __all__ = [
     "dhs_multi",
     "dhs_bt",
     "dhs_bt_multi",
+    "tree_contraction",
     "df",
     "dfh",
     "scnv",
