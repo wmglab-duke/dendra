@@ -14,6 +14,7 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
+from dendra._solver_failures import _advance_solver_failure, _SolverFailureCapture
 from dendra.helpers import MEMBRANE_ASSEMBLY
 
 from ._callback_carry import _CallbackCarryPartition
@@ -98,6 +99,7 @@ class _CompiledTensorTreeWhile:
         project_state=None,
         tracer=None,
         compiler=None,
+        solver_failures=False,
     ):
         if type(steps) is not int or steps < 1:
             raise ValueError("compiled tensor-tree loops require a positive step count")
@@ -109,6 +111,7 @@ class _CompiledTensorTreeWhile:
         self._project_state = project_state
         self._tracer = make_fx if tracer is None else tracer
         self._compiler = _compile_while if compiler is None else compiler
+        self._solver_failures = solver_failures
         self._kernels = {}
         self._layouts = {}
         self._executors = {}
@@ -297,7 +300,9 @@ class _CompiledTensorTreeWhile:
             next_recurrent, _ = partition.split(next_carries)
             return (next_state, next_recurrent), emitted or {}
 
-        graph = self._tracer(authored)(
+        failure_capture = _SolverFailureCapture() if self._solver_failures else None
+        traced = authored if failure_capture is None else failure_capture.wrap(authored)
+        graph = self._tracer(traced)(
             parameters,
             prepared,
             state,
@@ -338,7 +343,8 @@ class _CompiledTensorTreeWhile:
         )
         if hasattr(graph, "_out_spec"):
             output_values = pytree.tree_unflatten(list(output_values), graph._out_spec)
-        emission_values = output_values[1]
+        check_failure = failure_capture is not None and failure_capture.active
+        emission_values = output_values[1][0] if check_failure else output_values[1]
         emission_leaves, emission_spec = pytree.tree_flatten(emission_values)
         shapes = tuple(
             (tuple(value.shape), value.dtype, value.device) for value in emission_leaves
@@ -370,7 +376,7 @@ class _CompiledTensorTreeWhile:
                 for shape, dtype, device in shapes
             )
 
-            def apply_step(counters, offset, current, current_carries):
+            def apply_step(counters, offset, current, current_carries, failure):
                 selectors = tuple((counter + offset).reshape(1) for counter in counters)
                 selected = tuple(
                     value.index_select(0, selectors[device]).squeeze(0)
@@ -379,43 +385,51 @@ class _CompiledTensorTreeWhile:
                 (next_state, next_carries), emitted = graph(
                     parameters, prepared, current, current_carries, invariant, selected
                 )
+                if check_failure:
+                    emitted, event = emitted
+                    failure = _advance_solver_failure(failure, event)
                 leaves, _ = pytree.tree_flatten(emitted)
                 for buffer, value, device in zip(
                     buffers, leaves, emission_devices, strict=True
                 ):
                     buffer.index_copy_(0, selectors[device], value.unsqueeze(0))
-                return next_state, next_carries
+                return next_state, next_carries, failure
 
-            def condition(counters, packed):
+            def condition(counters, packed, failure):
                 return counters[0] < full_steps
 
-            def advance(counters, packed):
+            def advance(counters, packed, failure):
                 current, current_carries = layout.unpack(packed)
                 for offset in range(block):
-                    current, current_carries = apply_step(
-                        counters, offset, current, current_carries
+                    current, current_carries, failure = apply_step(
+                        counters, offset, current, current_carries, failure
                     )
                 return (
                     tuple(counter + block for counter in counters),
                     layout.pack((current, current_carries)),
+                    failure,
                 )
 
             counters = tuple(
                 torch.zeros((), dtype=torch.long, device=d) for d in devices
             )
             packed = initial
+            # Solver diagnostics belong to this invocation outside packed state
+            # and callback histories.
+            failure = failure_capture.initial(devices[0]) if check_failure else ()
             if full_steps:
-                counters, packed = torch.while_loop(
-                    condition, advance, (counters, packed)
+                counters, packed, failure = torch.while_loop(
+                    condition, advance, (counters, packed, failure)
                 )
             if steps != full_steps:
                 final, final_carries = layout.unpack(packed)
                 for offset in range(steps - full_steps):
-                    final, final_carries = apply_step(
-                        counters, offset, final, final_carries
+                    final, final_carries, failure = apply_step(
+                        counters, offset, final, final_carries, failure
                     )
                 packed = layout.pack((final, final_carries))
-            return packed, pytree.tree_unflatten(list(buffers), emission_spec)
+            emitted = pytree.tree_unflatten(list(buffers), emission_spec)
+            return (packed, emitted, failure) if check_failure else (packed, emitted)
 
         program_key = _executor_key(graph, executor_signature, self._options)
         executor_key = (owned_samples, program_key) if program_key is not None else None
@@ -443,13 +457,18 @@ class _CompiledTensorTreeWhile:
             parameters, prepared, invariant, samples = isolate_views(
                 (parameters, prepared, invariant, samples)
             )
-            packed, emitted = compiled(
+            result = compiled(
                 parameters,
                 prepared,
                 initial,
                 invariant,
                 samples,
             )
+            if check_failure:
+                packed, emitted, failure = result
+                failure_capture.check(failure)
+            else:
+                packed, emitted = result
             final, updated = layout.unpack(packed)
             final = clone_state(final)
             updated = partition.restore_invariants(updated, carries)

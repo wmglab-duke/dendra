@@ -31,7 +31,6 @@ class _FunctionalAssignedState(State):
 class _FunctionalAdvanceState(State):
     State.STATE("b")
     State.CARRY("memory")
-    State.DERIVATIVE("b' = 0.0 * b")
 
     def state_defaults(self, v, values):
         del values
@@ -124,6 +123,86 @@ def _assert_tree_close(actual, expected):
         strict=True,
     ):
         torch.testing.assert_close(actual_value, expected_value)
+
+
+def test_functional_advance_without_derivative_preserves_timestep_gradient():
+    model = _model(_FunctionalStateMechanism)
+    functional, tensors = dn.func.make_functional(model, dt=DT)
+    dt = torch.tensor(2 * DT, dtype=DTYPE, requires_grad=True)
+
+    state, _ = functional.prepare_and_step(
+        tensors.parameters, {**tensors.constants, "dt": dt}, tensors.state
+    )
+
+    mechanism = state["mechanisms"]["_FunctionalStateMechanism"]
+    torch.testing.assert_close(mechanism["a"], torch.full_like(mechanism["a"], DT))
+    torch.testing.assert_close(
+        mechanism["b"], torch.full_like(mechanism["b"], 1 + 2 * DT)
+    )
+    (gradient,) = torch.autograd.grad(mechanism["b"].mean(), dt)
+    torch.testing.assert_close(gradient, torch.ones_like(dt))
+
+
+def test_cnexp_declared_fields_take_precedence_over_sympy_names():
+    class SymbolState(State):
+        State.STATE("S")
+        State.ASSIGNED("E")
+        State.RANGE(tau=0.4)
+        State.DERIVATIVE("S' = (E - S) / tau")
+
+        def state_defaults(self, v, values):
+            return {"S": torch.zeros_like(v)}
+
+        def assigned_values(self, v, values):
+            return {"E": -0.01 * v}
+
+    class SymbolMechanism(Mechanism):
+        Mechanism.STATE_BUNDLE(SymbolState)
+
+    with dn.ctx(DEVICE="cpu", JIT=0, REQUIRE_GRAD=1):
+        model = dn.SingleCompartment(
+            N=1,
+            C=2,
+            v_init=torch.tensor([-65.0, -55.0], dtype=DTYPE),
+            dtype=DTYPE,
+            integrator=dn.bwd_euler_sc(imem=False),
+        )
+        model.insert(SymbolMechanism, ic={"S": 0.2})
+        model.initialize()
+        model.train()
+        mechanism = model.mech.SymbolMechanism
+        initial = torch.full_like(model.v, 0.2)
+        target = -0.01 * model.v
+        torch.testing.assert_close(mechanism.S, initial)
+
+        functional, tensors = dn.func.make_functional(model, dt=DT)
+        (functional_tau,) = (
+            value
+            for name, value in tensors.parameters.items()
+            if name.endswith(".tau_param")
+        )
+        initialized = functional.initialize(
+            tensors.parameters, tensors.constants, tensors.initialization
+        )
+        torch.testing.assert_close(
+            initialized.state["mechanisms"]["SymbolMechanism"]["S"], initial
+        )
+        state, _ = functional.prepare_and_step(
+            tensors.parameters, tensors.constants, initialized.state
+        )
+        functional_S = state["mechanisms"]["SymbolMechanism"]["S"]
+
+        model.step(DT)
+        tau = mechanism.DE["SymbolState"].tau_param
+        expected = target + (initial - target) * torch.exp(-DT / tau)
+        torch.testing.assert_close(mechanism.S, expected)
+        torch.testing.assert_close(functional_S, expected)
+
+        (expected_gradient,) = torch.autograd.grad(expected.sum(), tau)
+        (ordinary_gradient,) = torch.autograd.grad(mechanism.S.sum(), tau)
+        (functional_gradient,) = torch.autograd.grad(functional_S.sum(), functional_tau)
+        torch.testing.assert_close(ordinary_gradient, expected_gradient)
+        torch.testing.assert_close(functional_gradient, expected_gradient)
 
 
 @pytest.mark.parametrize(

@@ -26,6 +26,20 @@ original flat slot order. Set ``supports_compact_selector = False`` on a
 ``State`` class whose hooks expect a Python list. Subclasses inherit the
 setting unless they override it. See :doc:`advanced/custom_models`.
 
+Backward-Euler state solves
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``State.METHOD("derivimplicit")`` requires each batch member to satisfy the
+backward-Euler residual tolerance. If an existing model deliberately accepted
+finite inexact steps, set ``allow_inexact=True`` to keep accepting them when
+Newton stagnates or reaches its iteration limit. Singular and nonfinite solves
+still raise an error.
+
+Nonlinear Population scan training requires strict convergence and a symbolic
+Jacobian. If a training step reaches the iteration limit, allow more iterations
+or use a smaller timestep. See :doc:`advanced/mechanisms_and_materials` for
+solver options and how the compiled runner selects a Newton forward policy.
+
 Dendra 0.28: upgrading from 0.27.x
 ----------------------------------
 

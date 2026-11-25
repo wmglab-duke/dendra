@@ -10,7 +10,7 @@ import torch
 from torch.utils import _pytree as pytree
 
 from ._binding import BoundPopulation
-from ._compiled import CompiledPopulationChunk
+from ._compiled import CompiledPopulationChunk, _validate_derivimplicit_forward
 from ._continuation import _complete_continuation, _resolve_continuation
 from ._draws import _with_runtime_draws
 from ._initialization import _initialize_fresh, _runner_sources
@@ -123,6 +123,7 @@ class CompiledRunner:
         initialization="snapshot",
         checkpoint_every=None,
         trainable=(),
+        derivimplicit_forward: str = "auto",
         backend="inductor",
         options=None,
         **compile_options,
@@ -133,6 +134,19 @@ class CompiledRunner:
             raise ValueError("execution must be 'scan' or 'while'")
         if not isinstance(inference, bool):
             raise TypeError("inference must be a bool")
+        _validate_derivimplicit_forward(derivimplicit_forward, execution)
+        if derivimplicit_forward == "separate":
+            from dendra.models.core import Population
+
+            if (
+                inference
+                or not isinstance(population, Population)
+                or not population.training
+            ):
+                raise ValueError(
+                    "derivimplicit_forward='separate' requires a Population in "
+                    "training mode and inference=False."
+                )
         if initialization not in ("snapshot", "fresh"):
             raise ValueError("initialization must be 'snapshot' or 'fresh'")
         if checkpoint_every is not None:
@@ -220,6 +234,8 @@ class CompiledRunner:
         keywords = _inference_compile_options(
             self._functional, inference, backend, options, compile_options
         )
+        if derivimplicit_forward != "auto":
+            keywords["derivimplicit_forward"] = derivimplicit_forward
         self._kernel = self._functional.compile_rollout_chunk(
             self._chunk_steps,
             execution="default" if execution == "while" else "scan",
@@ -884,6 +900,7 @@ def compile(
     checkpoint_every=None,
     trainable=(),
     pending_capacity=None,
+    derivimplicit_forward: str = "auto",
     backend="inductor",
     options=None,
     **compile_options,
@@ -935,6 +952,14 @@ def compile(
         Network pending-event calendar capacities. A full calendar raises before
         publishing a result. Lower again with more capacity from the pre-call native
         boundary; calendar tensor shapes belong to that plan.
+    derivimplicit_forward : {"auto", "inline", "separate"}, default "auto"
+        Compilation policy for coupled nonlinear ``derivimplicit`` forward
+        solves with analytic Jacobians and line search disabled. ``"auto"`` uses
+        separate compilation for CUDA Population training scans using Inductor
+        with CUDA Graphs disabled. Other execution paths use inline solves.
+        ``"inline"`` keeps the forward solve in the scan body.
+        ``"separate"`` requires a Population in training mode, ``inference=False``,
+        and ``execution="scan"``. Disabling compilation bypasses the separate solve.
     backend : str or callable, default "inductor"
         Backend passed to ``torch.compile``.
     options : dict, optional
@@ -963,13 +988,20 @@ def compile(
 
     runner_type = CompiledRunner
     runner_keywords = {}
+    _validate_derivimplicit_forward(derivimplicit_forward, execution)
     if isinstance(population, Network):
+        if derivimplicit_forward == "separate":
+            raise ValueError(
+                "derivimplicit_forward='separate' is only available for Population training."
+            )
         from ._network_compile import CompiledNetworkRunner
 
         runner_type = CompiledNetworkRunner
         runner_keywords["pending_capacity"] = pending_capacity
     elif pending_capacity is not None:
         raise ValueError("pending_capacity applies only to Network compilation")
+    elif derivimplicit_forward != "auto":
+        runner_keywords["derivimplicit_forward"] = derivimplicit_forward
     return runner_type(
         population,
         dt=dt,

@@ -279,7 +279,9 @@ def _check_cpp_pack(callbacks):
             case.carries,
             None,
         )
-        ((compiled, _layout, _isolate_views),) = kernel._training._kernels.values()
+        (entry,) = kernel._training._kernels.values()
+        compiled, _layout, _isolate_views, programs = entry
+        assert not programs
         assert callable(compiled.get_compiler_config)
         assert callable(compiled._dendra_scan_donation_diagnostics)
         assert callable(compiled.__wrapped__)

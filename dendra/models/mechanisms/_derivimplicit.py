@@ -1,17 +1,33 @@
-from typing import Callable, Optional
+import math
+from collections.abc import Callable
+from enum import IntEnum
+from textwrap import indent
 
 import torch
 
+from dendra._solver_failures import _capturing_solver_checks, _record_solver_check
 from dendra.helpers import DEBUG, logger
 from dendra.utils.dynamic_compilation import compile_generated_function
 
+from ._linearimplicit import (
+    _AffineAnalysisError,
+    _analyze_affine_system,
+    _compile_affine_solver,
+    _rhs_string,
+)
 from ._solve_utils import (
     add_underscore_to_states,
     extract_vars,
     match_derivative_to_states,
+    modify_operations,
 )
-from ._solvers import _solve_linear_small
-from .ode import differentiate_rhs_2torch_checked
+from ._solvers import _solve_linear_checked
+from .ode import (
+    _nmodl_preprocess,
+    _validate_torch_expression,
+    differentiate_rhs_2torch_checked,
+)
+from .ops import all_ops
 
 # -- helpers --
 
@@ -43,13 +59,14 @@ def _normalize_derivimplicit_options(options):
     ``create_graph=None`` means use the historical policy ``self.training``.
     """
     out = {
-        "tol": 1e-8,
+        "tol": None,
         "max_iter": 25,
         "damping": 1.0,
         "line_search": False,
         "max_ls_steps": 10,
         "ls_decay": 0.5,
         "jacobian_regularization": 0.0,
+        "allow_inexact": False,
         "detach_newton": None,
         "create_graph": None,
     }
@@ -74,11 +91,13 @@ def _normalize_derivimplicit_options(options):
 
     out["max_iter"] = int(out["max_iter"])
     out["max_ls_steps"] = int(out["max_ls_steps"])
-    out["tol"] = float(out["tol"])
+    if out["tol"] is not None:
+        out["tol"] = float(out["tol"])
     out["damping"] = float(out["damping"])
     out["ls_decay"] = float(out["ls_decay"])
     out["jacobian_regularization"] = float(out["jacobian_regularization"])
     out["line_search"] = bool(out["line_search"])
+    out["allow_inexact"] = bool(out["allow_inexact"])
 
     for nullable_bool in ("detach_newton", "create_graph"):
         value = out[nullable_bool]
@@ -89,13 +108,16 @@ def _normalize_derivimplicit_options(options):
         raise ValueError("derivimplicit max_iter must be non-negative.")
     if out["max_ls_steps"] < 0:
         raise ValueError("derivimplicit max_ls_steps must be non-negative.")
-    if out["damping"] <= 0.0:
+    if not math.isfinite(out["damping"]) or out["damping"] <= 0.0:
         raise ValueError("derivimplicit damping must be positive.")
     if not (0.0 < out["ls_decay"] < 1.0):
         raise ValueError("derivimplicit ls_decay must be in the open interval (0, 1).")
-    if out["tol"] < 0.0:
+    if out["tol"] is not None and (not math.isfinite(out["tol"]) or out["tol"] < 0.0):
         raise ValueError("derivimplicit tol must be non-negative.")
-    if out["jacobian_regularization"] < 0.0:
+    if (
+        not math.isfinite(out["jacobian_regularization"])
+        or out["jacobian_regularization"] < 0.0
+    ):
         raise ValueError("derivimplicit jacobian_regularization must be non-negative.")
 
     return out
@@ -120,6 +142,7 @@ def _derivimplicit_option_call_args(options):
         f"max_ls_steps={options['max_ls_steps']!r}, "
         f"ls_decay={options['ls_decay']!r}, "
         f"jacobian_regularization={options['jacobian_regularization']!r}, "
+        f"allow_inexact={options['allow_inexact']!r}, "
         f"detach_newton={detach_expr}, "
         f"create_graph={create_expr}"
     )
@@ -131,6 +154,13 @@ def _broadcast_dt(dt_ms: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     if dt.ndim == 0:
         return dt
     return dt.expand(x.shape[:-1])
+
+
+def _end_time(t_ms, dt, x):
+    if t_ms is None:
+        return None
+    time = torch.as_tensor(t_ms, dtype=x.dtype, device=x.device)
+    return (time.expand(x.shape[:-1]) if time.ndim else time) + dt
 
 
 def _get_while_loop():
@@ -159,9 +189,9 @@ def _broadcast_jac(
 
 
 def _autograd_batch_jacobian(
-    f: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
+    f: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
     x: torch.Tensor,
-    t_next: Optional[torch.Tensor],
+    t_next: torch.Tensor | None,
     *,
     create_graph: bool,
 ) -> torch.Tensor:
@@ -204,333 +234,344 @@ def _get_dynamo_disable():
 
 _disable = _get_dynamo_disable()
 
-# core machinery
+
+class DerivimplicitStatus(IntEnum):
+    CONVERGED = 0
+    NONFINITE_RESIDUAL = 1
+    LINEAR_SOLVE_FAILED = 2
+    STAGNATED = 3
+    ITERATION_LIMIT = 4
 
 
-@_disable
-def _derivimplicit_step_eager(
-    x_t: torch.Tensor,
-    dt_ms: torch.Tensor,
-    f: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
-    t_ms: Optional[torch.Tensor],
-    jac: Optional[torch.Tensor],
-    jac_fn: Optional[Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]],
-    *,
-    tol: float,
-    max_iter: int,
-    damping: float,
-    line_search: bool,
-    max_ls_steps: int,
-    ls_decay: float,
-    jacobian_regularization: float,
-    create_graph: bool,
-    detach_newton: bool,
-) -> torch.Tensor:
-    if x_t.ndim < 1:
-        raise ValueError("x_t must have at least 1 dimension (state dim).")
+_CONVERGED = DerivimplicitStatus.CONVERGED.value
+_NONFINITE = DerivimplicitStatus.NONFINITE_RESIDUAL.value
+_LINEAR_FAILURE = DerivimplicitStatus.LINEAR_SOLVE_FAILED.value
+_STAGNATED = DerivimplicitStatus.STAGNATED.value
+_ITERATION_LIMIT = DerivimplicitStatus.ITERATION_LIMIT.value
+_ABSOLUTE_TOLERANCE = 1e-8
+_ROUNDOFF_FACTOR = 4.0
 
-    if (jac is not None) and (jac_fn is not None):
-        raise ValueError(
-            "Provide at most one of `jac` or `jac_fn` (or neither to use autograd Jacobian)."
+
+def _residual_bound(x, x_old, scaled_rhs, absolute_tol, relative_tol):
+    if relative_tol is None:
+        return absolute_tol
+    scale = torch.maximum(torch.maximum(x.abs(), x_old.abs()), scaled_rhs.abs())
+    return absolute_tol + relative_tol * scale
+
+
+def _residual_status(x, x_old, scaled_rhs, absolute_tol, relative_tol):
+    residual = x - x_old - scaled_rhs
+    bound = _residual_bound(x, x_old, scaled_rhs, absolute_tol, relative_tol)
+    within_tol = (residual.abs() <= bound).all(dim=-1)
+    status = torch.where(within_tol, _CONVERGED, _ITERATION_LIMIT)
+    status = torch.where(torch.isfinite(residual).all(dim=-1), status, _NONFINITE)
+    return residual, status
+
+
+def _eager_while_loop(cond, body, carried):
+    while cond(*carried).item():
+        carried = body(*carried)
+    return carried
+
+
+def _iterate_newton(loop, cond, body, carried, limit):
+    if loop is not None:
+        return loop(cond, body, carried)
+    # This recurrence is captured inside a differentiable scan. The body
+    # freezes settled members, so the fixed bound needs no scalar tensor read.
+    for _ in range(limit):
+        carried = body(*carried)
+    return carried
+
+
+def _newton_step_sizes(
+    x, dx, residual, active, evaluate_residual, loop, damping, max_ls_steps, ls_decay
+):
+    """Choose the first improving trial per member, or the final decayed step."""
+    initial_norm = residual.abs().amax(dim=-1)
+    zero = 0 if loop is None else torch.zeros((), device=x.device, dtype=torch.int64)
+    alpha = damping.clone()
+    selected = torch.zeros_like(initial_norm)
+
+    def cond(it, alpha, selected, pending):
+        return (it < max_ls_steps) & pending.any()
+
+    def body(it, alpha, selected, pending):
+        trial_residual = evaluate_residual(x + alpha * dx)
+        improvement = trial_residual.abs().amax(dim=-1) < initial_norm
+        accept = pending & improvement
+        return (
+            it + 1,
+            alpha * ls_decay,
+            torch.where(accept, alpha, selected),
+            pending & ~accept,
         )
 
-    *batch_shape, n = x_t.shape
-    dt = _broadcast_dt(dt_ms, x_t)
-
-    t_next = None
-    if t_ms is not None:
-        t_ms_t = torch.as_tensor(t_ms, dtype=x_t.dtype, device=x_t.device)
-        if t_ms_t.ndim == 0:
-            t_next = t_ms_t + dt
-        else:
-            t_next = t_ms_t.expand(batch_shape) + dt
-
-    eye = torch.eye(n, device=x_t.device, dtype=x_t.dtype).expand((*batch_shape, n, n))
-    dt_vec = dt[..., None] if dt.ndim > 0 else dt
-    dt_mat = dt[..., None, None] if dt.ndim > 0 else dt
-
-    def eval_f(x: torch.Tensor) -> torch.Tensor:
-        return f(x, t_next)
-
-    def residual(x: torch.Tensor) -> torch.Tensor:
-        # Do NOT detach x_t here: in the backprop mode, you may want grads wrt x_t/params.
-        return x - x_t - dt_vec * eval_f(x)
-
-    def inf_norm_global(v: torch.Tensor) -> torch.Tensor:
-        # Match your original behavior: global max over all state-vectors in the batch.
-        # Equivalent to torch.amax(torch.abs(v)) for your usage.
-        return torch.amax(torch.abs(v))
-
-    # Initial guess
-    x = x_t.clone()
-
-    if (
-        jac is not None
-        and (not line_search)
-        and damping == 1.0
-        and jacobian_regularization == 0.0
-        and max_iter > 0
-    ):
-        # One Newton step is exact for affine RHS
-        r = residual(x)
-        if inf_norm_global(r).detach().item() < tol:
-            return x.detach() if detach_newton else x
-        Jf0 = _broadcast_jac(jac, batch_shape, n, like=x_t)
-        J = eye - dt_mat * Jf0
-        dx = _solve_linear_small(J, -r)
-        return x + dx
-
-    for _ in range(max_iter):
-        # Detach strategy:
-        # - detach_newton=True  -> inference-style: keep Newton from building a big graph
-        # - detach_newton=False -> differentiable unrolled Newton
-        if detach_newton:
-            x_var = x.detach()
-            # only need requires_grad for autograd Jacobian
-            if (jac is None) and (jac_fn is None):
-                x_var.requires_grad_(True)
-        else:
-            x_var = x  # keep graph
-
-        r = residual(x_var)
-        r0 = inf_norm_global(r)
-
-        if r0.detach().item() < tol:
-            return x_var.detach() if detach_newton else x_var
-
-        # Build df/dx (Jacobian of f)
-        if jac is not None:
-            Jf = _broadcast_jac(jac, batch_shape, n, like=x_t)
-        elif jac_fn is not None:
-            Jf = _broadcast_jac(jac_fn(x_var, t_next), batch_shape, n, like=x_t)
-        else:
-            # Autograd Jacobian (heavy; prefer analytic jac/jac_fn in practice)
-            if x_var.ndim == 1:
-                Jf = torch.autograd.functional.jacobian(
-                    lambda z: f(z, t_next),
-                    x_var,
-                    create_graph=create_graph,
-                )
-            else:
-                Jf = _autograd_batch_jacobian(
-                    f,
-                    x_var,
-                    t_next,
-                    create_graph=create_graph,
-                )
-
-        # Residual Jacobian: J = I - dt * df/dx
-        J = eye - dt_mat * Jf
-        if jacobian_regularization != 0.0:
-            J = J + jacobian_regularization * eye
-
-        dx = _solve_linear_small(J, -r)
-
-        if line_search:
-            # NOTE: line search introduces non-smooth branching in the forward.
-            # This is usually OK in practice, but if you want fully smooth grads,
-            # consider disabling line_search in training mode.
-            alpha = damping
-            accepted = False
-            for _ls in range(max_ls_steps):
-                x_trial = x_var + alpha * dx
-                r_trial = residual(x_trial)
-                if inf_norm_global(r_trial).detach().item() < r0.detach().item():
-                    x = x_trial.detach() if detach_newton else x_trial
-                    accepted = True
-                    break
-                alpha *= ls_decay
-
-            if not accepted:
-                x = (
-                    (x_var + alpha * dx).detach()
-                    if detach_newton
-                    else (x_var + alpha * dx)
-                )
-        else:
-            x = (
-                (x_var + damping * dx).detach()
-                if detach_newton
-                else (x_var + damping * dx)
-            )
-
-    return x
-
-
-def _derivimplicit_step_while_loop(
-    x_t: torch.Tensor,
-    dt_ms: torch.Tensor,
-    f: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
-    t_ms: Optional[torch.Tensor],
-    jac: Optional[torch.Tensor],
-    jac_fn: Optional[Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]],
-    *,
-    tol: float,
-    max_iter: int,
-    damping: float,
-    line_search: bool,
-    max_ls_steps: int,
-    ls_decay: float,
-    jacobian_regularization: float,
-) -> torch.Tensor:
-    if x_t.ndim < 1:
-        raise ValueError("x_t must have at least 1 dimension (state dim).")
-
-    if (jac is None) == (jac_fn is None):
-        raise ValueError(
-            "Provide exactly one of `jac` or `jac_fn` for while_loop path."
-        )
-
-    *batch_shape, n = x_t.shape
-    device, dtype = x_t.device, x_t.dtype
-
-    dt = _broadcast_dt(dt_ms, x_t)
-
-    t_next = None
-    if t_ms is not None:
-        t_ms_t = torch.as_tensor(t_ms, dtype=dtype, device=device)
-        if t_ms_t.ndim == 0:
-            t_next = t_ms_t + dt
-        else:
-            t_next = t_ms_t.expand(batch_shape) + dt
-
-    # ``torch.while_loop`` rejects aliased captured inputs.  Expanded/view
-    # tensors are fine in eager mode but ``eye``, ``dt_vec``, and ``dt_mat``
-    # otherwise share storage with another captured value during HOP tracing.
-    eye = torch.eye(n, device=device, dtype=dtype).expand((*batch_shape, n, n)).clone()
-    dt_vec = (dt[..., None] if dt.ndim > 0 else dt).clone()
-    dt_mat = (dt[..., None, None] if dt.ndim > 0 else dt).clone()
-
-    tol_t = torch.as_tensor(tol, device=device, dtype=dtype)
-    max_iter_t = torch.as_tensor(max_iter, device=device, dtype=torch.int64)
-    damping_t = torch.as_tensor(damping, device=device, dtype=dtype)
-    ls_decay_t = torch.as_tensor(ls_decay, device=device, dtype=dtype)
-    max_ls_steps_t = torch.as_tensor(max_ls_steps, device=device, dtype=torch.int64)
-
-    # Clone to avoid aliasing restrictions in higher-order op tracing.
-    # (HOPs are strict about “outputs cannot alias inputs”).
-    x0 = x_t.detach().clone()
-
-    def eval_f(x: torch.Tensor) -> torch.Tensor:
-        return f(x, t_next)
-
-    def residual(x: torch.Tensor) -> torch.Tensor:
-        return x - x_t.detach() - dt_vec * eval_f(x)
-
-    if (
-        jac is not None
-        and (not line_search)
-        and damping == 1.0
-        and jacobian_regularization == 0.0
-        and max_iter > 0
-    ):
-        # One Newton step is exact for affine RHS
-        r = residual(x0)
-        Jf0 = _broadcast_jac(jac, batch_shape, n, like=x_t)
-        J = eye - dt_mat * Jf0
-        dx = _solve_linear_small(J, -r)
-        should_step = torch.amax(r.abs()) >= tol_t
-        return torch.where(should_step, x0 + dx, x0)
-
-    # If constant jac, precompute J outside the loop
-    use_const_jac = jac is not None
-    if use_const_jac:
-        Jf0 = _broadcast_jac(jac, batch_shape, n, like=x_t)
-        J_const = eye - dt_mat * Jf0
-        if jacobian_regularization != 0.0:
-            J_const = (
-                J_const
-                + torch.as_tensor(jacobian_regularization, device=device, dtype=dtype)
-                * eye
-            )
-
-    r0 = residual(x0)
-    r0_per = r0.abs().amax(dim=-1)
-    r0_g = torch.amax(r0_per)
-    it0 = torch.zeros((), device=device, dtype=torch.int64)
-
-    while_loop = _get_while_loop()
-
-    def cond_fn(it, x, r, r_g, r_per):
-        return (it < max_iter_t) & (r_g >= tol_t)
-
-    def body_fn(it, x, r, r_g, r_per):
-        active = r_per >= tol_t
-
-        if use_const_jac:
-            J = J_const
-        else:
-            Jf = _broadcast_jac(jac_fn(x, t_next), batch_shape, n, like=x_t)
-            J = eye - dt_mat * Jf
-            if jacobian_regularization != 0.0:
-                J = (
-                    J
-                    + torch.as_tensor(
-                        jacobian_regularization, device=device, dtype=dtype
-                    )
-                    * eye
-                )
-
-        r_eff = torch.where(active[..., None], r, torch.zeros_like(r))
-        J_eff = torch.where(active[..., None, None], J, eye)
-
-        dx = _solve_linear_small(J_eff, -r_eff)
-
-        if not line_search:
-            x_new = torch.where(active[..., None], x + damping_t * dx, x)
-        else:
-            # Structured backtracking (first alpha that improves global residual)
-            ls_it0 = torch.zeros((), device=device, dtype=torch.int64)
-            alpha0 = damping_t
-            accepted0 = torch.zeros((), device=device, dtype=torch.bool)
-            alpha_acc0 = torch.zeros((), device=device, dtype=dtype)
-
-            def ls_cond(ls_it, alpha, accepted, alpha_acc):
-                return (ls_it < max_ls_steps_t) & (~accepted)
-
-            def ls_body(ls_it, alpha, accepted, alpha_acc):
-                x_trial = x + alpha * dx
-                r_trial = residual(x_trial)
-                r_trial_g = torch.amax(r_trial.abs())
-
-                accept = r_trial_g < r_g
-                take = accept & (~accepted)
-
-                alpha_acc = torch.where(take, alpha, alpha_acc)
-                accepted = accepted | accept
-                alpha = torch.where(accept, alpha, alpha * ls_decay_t)
-                return ls_it + 1, alpha, accepted, alpha_acc
-
-            ls_it_f, alpha_f, accepted_f, alpha_acc_f = while_loop(
-                ls_cond, ls_body, (ls_it0, alpha0, accepted0, alpha_acc0)
-            )
-
-            alpha_sel = torch.where(accepted_f, alpha_acc_f, alpha_f)
-            x_step = x + alpha_sel * dx
-            x_new = torch.where(active[..., None], x_step, x)
-
-        r_new = residual(x_new)
-        r_new_per = r_new.abs().amax(dim=-1)
-        r_new_g = torch.amax(r_new_per)
-        return it + 1, x_new, r_new, r_new_g, r_new_per
-
-    it_f, x_f, r_f, r_g_f, r_per_f = while_loop(
-        cond_fn, body_fn, (it0, x0, r0, r0_g, r0_per)
+    _, remaining_alpha, selected, pending = _iterate_newton(
+        loop, cond, body, (zero, alpha, selected, active.clone()), max_ls_steps
     )
-    return x_f
+    return torch.where(pending, remaining_alpha, selected)[..., None]
+
+
+def _solve_derivimplicit(
+    x_t,
+    dt_ms,
+    f,
+    t_ms,
+    jac,
+    jac_fn,
+    *,
+    tol,
+    max_iter,
+    damping,
+    line_search,
+    max_ls_steps,
+    ls_decay,
+    jacobian_regularization,
+    create_graph,
+    detach_newton,
+    loop,
+):
+    *batch_shape, n = x_t.shape
+    x_old = x_t.detach() if detach_newton else x_t
+    x0 = x_old.clone()
+    dt = _broadcast_dt(dt_ms, x_t)
+    t_next = _end_time(t_ms, dt, x_t)
+
+    dt_vec = dt[..., None] if dt.ndim else dt
+    dt_mat = dt[..., None, None] if dt.ndim else dt
+    if loop is not None and loop is not _eager_while_loop:
+        # Higher-order control flow rejects aliased captured inputs.
+        dt_vec = dt_vec.clone()
+        dt_mat = dt_mat.clone()
+
+    eye = torch.eye(n, device=x_t.device, dtype=x_t.dtype)
+    affine_step = (
+        jac is not None
+        and not line_search
+        and damping == 1.0
+        and jacobian_regularization == 0.0
+    )
+    # Carry tensor scalars into structured control flow, including under
+    # Dynamo's dynamic-shape tracing where Python floats can become SymFloats.
+    damping_t = x_t.new_tensor(damping)
+    decay_t = x_t.new_tensor(ls_decay) if line_search else None
+    regularization = (
+        x_t.new_tensor(jacobian_regularization) if jacobian_regularization else None
+    )
+    absolute_tol = x_t.new_tensor(_ABSOLUTE_TOLERANCE if tol is None else tol)
+    relative_tol = (
+        x_t.new_tensor(_ROUNDOFF_FACTOR * torch.finfo(x_t.dtype).eps)
+        if tol is None
+        else None
+    )
+
+    def evaluate_residual(x):
+        return x - x_old - dt_vec * f(x, t_next)
+
+    def evaluate(x, rel_tol):
+        return _residual_status(x, x_old, dt_vec * f(x, t_next), absolute_tol, rel_tol)
+
+    def residual_jacobian(x):
+        if jac_fn is not None:
+            Jf = jac_fn(x, t_next)
+        elif x.ndim == 1:
+            Jf = torch.autograd.functional.jacobian(
+                lambda z: f(z, t_next), x, create_graph=create_graph
+            )
+        else:
+            Jf = _autograd_batch_jacobian(f, x, t_next, create_graph=create_graph)
+        return form_system(Jf)
+
+    def form_system(Jf):
+        J = eye - dt_mat * _broadcast_jac(Jf, batch_shape, n, like=x_t)
+        if regularization is not None:
+            J = J + regularization * eye
+        return J
+
+    J_const = form_system(jac) if jac is not None else None
+
+    def update(x, r, status, J):
+        active = status == _ITERATION_LIMIT
+        # Even an already accepted affine root needs an invertible system.
+        # Keep its state when the initial residual is within tolerance.
+        check_system = active | (status == _CONVERGED) if affine_step else active
+        J_eff = torch.where(check_system[..., None, None], J, eye)
+        r_eff = torch.where(active[..., None], r, 0.0)
+        dx, solved = _solve_linear_checked(J_eff, -r_eff)
+        step = active & solved
+        alpha = (
+            _newton_step_sizes(
+                x,
+                dx,
+                r,
+                step,
+                evaluate_residual,
+                loop,
+                damping_t,
+                max_ls_steps,
+                decay_t,
+            )
+            if line_search
+            else damping_t
+        )
+        trial = x + alpha * dx
+        r_trial, trial_status = evaluate(trial, relative_tol)
+        stalled = (trial_status == _ITERATION_LIMIT) & (trial == x).all(dim=-1)
+        trial_status = torch.where(stalled, _STAGNATED, trial_status)
+        next_status = torch.where(step, trial_status, status)
+        next_status = torch.where(check_system & ~solved, _LINEAR_FAILURE, next_status)
+        take = step & (trial_status != _NONFINITE)
+        x_next = torch.where(take[..., None], trial, x)
+        r_next = torch.where(take[..., None], r_trial, r)
+        return x_next, r_next, next_status
+
+    # Roundoff tolerance applies to a computed step. Applying it to the
+    # initial guess could erase a small but representable change every step.
+    r0, status0 = evaluate(x0, None)
+    if affine_step:
+        x, _, status = update(x0, r0, status0, J_const)
+        return x, status
+
+    def cond(it, x, r, status):
+        return (it < max_iter) & (status == _ITERATION_LIMIT).any()
+
+    def body(it, x, r, status):
+        J = J_const if J_const is not None else residual_jacobian(x)
+        x_next, r_next, next_status = update(x, r, status, J)
+        if detach_newton and loop is _eager_while_loop:
+            x_next, r_next = x_next.detach(), r_next.detach()
+        return it + 1, x_next, r_next, next_status
+
+    it0 = 0 if loop is None else torch.zeros((), device=x_t.device, dtype=torch.int64)
+    _, x, _, status = _iterate_newton(
+        loop, cond, body, (it0, x0, r0, status0), max_iter
+    )
+    return x, status
+
+
+_solve_derivimplicit_eager = _disable(_solve_derivimplicit)
+
+
+def _attach_implicit_gradient(root, status, x_old, dt_ms, f, t_ms, jac_fn):
+    """Attach the first-order backward-Euler sensitivity at the accepted root."""
+    root = root.detach()
+    dt = _broadcast_dt(dt_ms, root)
+    t_next = _end_time(t_ms, dt, root)
+    dt_vec = dt[..., None] if dt.ndim else dt
+    n = root.shape[-1]
+    eye = torch.eye(n, dtype=root.dtype, device=root.device)
+
+    accepted = status == _CONVERGED
+    with torch.no_grad():
+        jac = _broadcast_jac(jac_fn(root, t_next), root.shape[:-1], n, like=root)
+        dt_mat = dt[..., None, None] if dt.ndim else dt
+        # Differentiate the equation itself. Damping and regularization in
+        # the forward iteration only determine how it finds the root.
+        matrix = eye - dt_mat * jac
+        matrix = torch.where(accepted[..., None, None], matrix, eye)
+
+    source = x_old - root + dt_vec * f(root, t_next)
+    source = torch.where(accepted[..., None], source, 0.0)
+    # The primal RHS is zero, but its derivative is the negative parameter
+    # derivative of the residual at the fixed root. Autograd differentiates
+    # the linear solve by applying the transposed residual Jacobian inverse.
+    correction, solved = _solve_linear_checked(
+        matrix.detach(), source - source.detach()
+    )
+    status = torch.where(accepted & ~solved, _LINEAR_FAILURE, status)
+    return root + correction, status
+
+
+_CONVERGENCE_ERROR = (
+    "derivimplicit failed to converge: a batch member hit a singular or "
+    "nonfinite solve, stagnation, or the iteration limit"
+)
+
+
+@torch.library.custom_op(
+    "dendra_derivimplicit::require_converged",
+    mutates_args=(),
+    tags=torch.Tag.cudagraph_unsafe,
+)
+def _require_converged(accepted: torch.Tensor) -> torch.Tensor:
+    # A CUDA device assertion invalidates the context. Keep this host check
+    # capturable as an operator for accelerator rollouts.
+    if not accepted.item():
+        raise RuntimeError(_CONVERGENCE_ERROR)
+    return accepted.clone()
+
+
+@_require_converged.register_fake
+def _(accepted):
+    return torch.empty_like(accepted)
+
+
+def _all_solver_members(accepted):
+    if (
+        not torch.compiler.is_compiling()
+        and torch._C._are_functorch_transforms_active()
+    ):
+        functorch = torch._C._functorch
+        while functorch.is_functorch_wrapped_tensor(accepted):
+            accepted = functorch.get_unwrapped(accepted)
+    return accepted.all()
+
+
+def _check_step(accepted, *states, previous, solver):
+    if not torch.compiler.is_compiling() and _record_solver_check(accepted, solver):
+        # A rejected candidate may be nonfinite. Keep the prior values in
+        # failed members while the remaining tensor steps finish the chunk.
+        return tuple(
+            torch.where(
+                accepted.reshape(accepted.shape + (1,) * (state.ndim - accepted.ndim)),
+                state,
+                old,
+            )
+            for state, old in zip(states, previous, strict=True)
+        )
+    accepted = _all_solver_members(accepted)
+    if accepted.device.type == "cpu":
+        torch._assert_async(accepted, _CONVERGENCE_ERROR)
+        return states
+    # Make the step's result depend on the check so unused diagnostics cannot
+    # be pruned from a compiled graph.
+    checked = _require_converged(accepted)
+    return tuple(torch.where(checked, state, 0.0) for state in states)
+
+
+def _check_convergence(x, x_old, status, allow_inexact, solver):
+    accepted = status == _CONVERGED
+    if allow_inexact:
+        accepted = accepted | (status == _ITERATION_LIMIT) | (status == _STAGNATED)
+    return _check_step(accepted, x, previous=(x_old,), solver=solver)[0]
+
+
+def _guard_eager_status_backward(x, status):
+    # Masking a lane's output cannot prevent 0 * inf in the backward of its
+    # authored RHS or Jacobian, particularly for shared parameters.
+    valid = _all_solver_members((status != _NONFINITE) & (status != _LINEAR_FAILURE))
+
+    def check(gradient):
+        if not valid.item():
+            raise RuntimeError(
+                "derivimplicit backward requires finite residuals and successful "
+                "linear solves in every lane when return_status=True"
+            )
+        return gradient
+
+    x.register_hook(check)
 
 
 def derivimplicit_step(
     x_t: torch.Tensor,
     dt_ms: torch.Tensor,
-    f: Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor],
-    t_ms: Optional[torch.Tensor] = None,
-    jac: Optional[torch.Tensor] = None,
-    jac_fn: Optional[
-        Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]
-    ] = None,
+    f: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor],
+    t_ms: torch.Tensor | None = None,
+    jac: torch.Tensor | None = None,
+    jac_fn: Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor] | None = None,
     *,
-    tol: float = 1e-8,
+    tol: float | None = None,
     max_iter: int = 25,
     damping: float = 1.0,
     line_search: bool = False,
@@ -539,51 +580,118 @@ def derivimplicit_step(
     jacobian_regularization: float = 0.0,
     create_graph: bool = False,
     detach_newton: bool = True,
-) -> torch.Tensor:
-    """
-    - Inference path (compile-friendly): while_loop if detach_newton=True, create_graph=False, and (jac xor jac_fn) provided.
-    - Training/backprop path: eager Newton in torch._dynamo.disable region (supports autograd).
-    """
-    # Any request for grads through the solver should avoid while_loop/cond (no training support).
-    want_backprop = create_graph or (not detach_newton)
+    allow_inexact: bool = False,
+    return_status: bool = False,
+    _analytic_jacobian: bool = True,
+    _solver=None,
+    _make_evaluators=None,
+    _coefficients=(),
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    """Solve one backward-Euler step for independent state vectors.
 
-    # Also: while_loop path requires an explicit Jacobian source
-    has_explicit_jac = (jac is not None) ^ (jac_fn is not None)
+    With ``tol=None``, use an absolute tolerance of 1e-8 at the initial guess
+    and add a dtype- and scale-dependent allowance after each correction. An
+    explicit ``tol`` is absolute throughout. An iteration budget of zero
+    returns the incoming state as a successful no-op.
 
-    if want_backprop or (not has_explicit_jac):
-        return _derivimplicit_step_eager(
+    Failed steps raise unless ``return_status=True``, which returns the last
+    retained state and an integer ``DerivimplicitStatus`` per batch member.
+    Eager reverse-mode differentiation of a status-returning step raises if
+    any lane reports a nonfinite residual or a failed linear solve. Retry on
+    valid inputs to differentiate that step.
+    ``allow_inexact=True`` permits finite iterates on stagnation or exhaustion.
+    Population scan captures with an analytic Jacobian and strict convergence
+    use first-order implicit gradients at the accepted root.
+    """
+    if x_t.ndim < 1 or x_t.shape[-1] == 0:
+        raise ValueError("x_t must have at least 1 dimension (nonempty state dim).")
+    if jac is not None and jac_fn is not None:
+        raise ValueError(
+            "Provide at most one of `jac` or `jac_fn` (or neither to use autograd Jacobian)."
+        )
+    if max_iter < 0:
+        raise ValueError("derivimplicit max_iter must be non-negative.")
+
+    if max_iter == 0:
+        x = x_t.detach().clone() if detach_newton else x_t.clone()
+        if return_status:
+            return x, x.new_zeros(x.shape[:-1], dtype=torch.int64)
+        return x
+
+    options = {
+        "tol": tol,
+        "max_iter": max_iter,
+        "damping": damping,
+        "line_search": line_search,
+        "max_ls_steps": max_ls_steps,
+        "ls_decay": ls_decay,
+        "jacobian_regularization": jacobian_regularization,
+    }
+    compiling = torch.compiler.is_compiling()
+    capturing = not compiling and _capturing_solver_checks()
+    grad_enabled = torch.is_grad_enabled()
+    captured_nonlinear = (
+        capturing and grad_enabled and jac is None and not detach_newton
+    )
+    if captured_nonlinear:
+        if jac_fn is None or not _analytic_jacobian or allow_inexact:
+            raise RuntimeError(
+                "Captured nonlinear derivimplicit training requires an analytic "
+                "Jacobian and strict convergence (allow_inexact=False)"
+            )
+        root_and_status = None
+        if _make_evaluators is not None and t_ms is None and not line_search:
+            from ._derivimplicit_forward import _try_separate_newton
+
+            root_and_status = _try_separate_newton(
+                x_t, dt_ms, _make_evaluators, _coefficients, options
+            )
+        if root_and_status is None:
+            with torch.no_grad():
+                root_and_status = _solve_derivimplicit(
+                    x_t,
+                    dt_ms,
+                    f,
+                    t_ms,
+                    jac,
+                    jac_fn,
+                    **options,
+                    create_graph=False,
+                    detach_newton=True,
+                    loop=None,
+                )
+        x, status = root_and_status
+        x, status = _attach_implicit_gradient(x, status, x_t, dt_ms, f, t_ms, jac_fn)
+    else:
+        if (
+            capturing
+            and not grad_enabled
+            and (jac is not None or (jac_fn is not None and _analytic_jacobian))
+        ):
+            # A training-mode State may still execute an inference chunk.
+            # Its analytic primal needs structured control flow in the trace.
+            create_graph = False
+            detach_newton = True
+        eager = create_graph or not detach_newton or (jac is None and jac_fn is None)
+        solve = _solve_derivimplicit_eager if eager else _solve_derivimplicit
+        loop = _eager_while_loop if eager else _get_while_loop()
+        x, status = solve(
             x_t,
             dt_ms,
             f,
             t_ms,
             jac,
             jac_fn,
-            tol=tol,
-            max_iter=max_iter,
-            damping=damping,
-            line_search=line_search,
-            max_ls_steps=max_ls_steps,
-            ls_decay=ls_decay,
-            jacobian_regularization=jacobian_regularization,
+            **options,
             create_graph=create_graph,
             detach_newton=detach_newton,
+            loop=loop,
         )
-
-    return _derivimplicit_step_while_loop(
-        x_t,
-        dt_ms,
-        f,
-        t_ms,
-        jac,
-        jac_fn,
-        tol=tol,
-        max_iter=max_iter,
-        damping=damping,
-        line_search=line_search,
-        max_ls_steps=max_ls_steps,
-        ls_decay=ls_decay,
-        jacobian_regularization=jacobian_regularization,
-    )
+    if return_status:
+        if not compiling and not capturing and x.requires_grad:
+            _guard_eager_status_backward(x, status)
+        return x, status
+    return _check_convergence(x, x_t, status, allow_inexact, _solver)
 
 
 derivimplicit_template = """
@@ -625,15 +733,15 @@ def _solve_system_jac_call(options):
     return (
         "x = derivimplicit_step(x, dt, f, jac=jac, "
         + _derivimplicit_option_call_args(options)
-        + ")"
+        + ", _solver=self)"
     )
 
 
-def _solve_system_jac_fn_call(options):
+def _solve_system_jac_fn_call(options, *, analytic, forward_operands=""):
     return (
         "x = derivimplicit_step(x, dt, f, jac_fn=jac_fn, "
         + _derivimplicit_option_call_args(options)
-        + ")"
+        + f", _analytic_jacobian={analytic!r}, _solver=self{forward_operands})"
     )
 
 
@@ -641,7 +749,146 @@ def _solve_system_autograd_call(options):
     return (
         "x = derivimplicit_step(x, dt, f, "
         + _derivimplicit_option_call_args(options)
-        + ")"
+        + ", _solver=self)"
+    )
+
+
+def _affine_residual_accepted(x, x_old, scaled_initial_rhs, scaled_rhs):
+    """Check the authored equation, including its domain at the incoming state."""
+    residual = (x - x_old - scaled_rhs).abs()
+    bound = _residual_bound(
+        x,
+        x_old,
+        scaled_rhs,
+        _ABSOLUTE_TOLERANCE,
+        _ROUNDOFF_FACTOR * torch.finfo(x_old.dtype).eps,
+    )
+    return (
+        (residual <= bound)
+        & (residual < math.inf)
+        & (scaled_initial_rhs.abs() < math.inf)
+    )
+
+
+def _solve_affine_diagonal(x, pivot, scaled_initial_rhs, scaled_bias):
+    # Solve for the state directly to avoid cancellation on stiff decay.
+    # Solve for an increment when the pivot rounds to one or when assembling
+    # the direct RHS would overflow even though the correction may be finite.
+    use_increment = pivot == 1.0
+    numerator = x
+    if scaled_bias is not None:
+        numerator = x + scaled_bias
+        use_increment = use_increment | torch.isinf(numerator)
+    rhs = torch.where(use_increment, scaled_initial_rhs, numerator)
+    solution = rhs / pivot
+    return torch.where(use_increment, x + solution, solution).to(x)
+
+
+def _render_checked_affine_body(analysis, rhs, eliminate):
+    states = analysis["states_to_solve"]
+    matrix, bias = analysis["A"], analysis["b"]
+    state_args = ", ".join(states)
+    updated = ", ".join(f"_{state}" for state in states)
+    n = len(states)
+    rhs_tuple = ", ".join(f"({expr})" for expr in rhs)
+    lines = [
+        "if dt.ndim:",
+        "    dt = dt.expand(__ref.shape)",
+        f"def __rhs({state_args}):",
+    ]
+    lines.extend(f"    {assignment}" for assignment in eliminate.values())
+    lines.append(f"    return ({rhs_tuple},)")
+    numerators = [
+        s if b == "0" else f"({s} + dt * ({b}))"
+        for s, b in zip(states, bias, strict=True)
+    ]
+    diagonal = all(
+        entry == "0"
+        for i, row in enumerate(matrix)
+        for j, entry in enumerate(row)
+        if i != j
+    )
+    if diagonal:
+        lines.append(f"__initial_rhs = __rhs({state_args})")
+        for i, s in enumerate(states):
+            scaled_bias = "None" if bias[i] == "0" else f"dt * ({bias[i]})"
+            lines.extend(
+                [
+                    f"__scaled_initial_{i} = dt * __initial_rhs[{i}]",
+                    f"__pivot_{i} = 1.0 - dt * ({matrix[i][i]})",
+                    f"_{s} = _solve_affine_diagonal({s}, __pivot_{i}, __scaled_initial_{i}, {scaled_bias})",
+                ]
+            )
+        checks = [f"(__pivot_{i}.abs() < torch.inf)" for i in range(n)]
+    else:
+        lines.extend(
+            [
+                f"__x = torch.stack([{state_args}], dim=-1)",
+                "__A = __x.new_zeros((*__x.shape, __x.shape[-1]))",
+            ]
+        )
+        lines.extend(
+            f"__A[..., {i}, {j}] = ({entry})"
+            for i, row in enumerate(matrix)
+            for j, entry in enumerate(row)
+            if entry != "0"
+        )
+        lines.extend(
+            [
+                f"__b = torch.stack([{', '.join(f'{v}.to(__ref)' for v in numerators)}], dim=-1)",
+                "__system = torch.eye(__x.shape[-1], dtype=__x.dtype, device=__x.device) - dt[..., None, None] * __A",
+                "__next, __solved = _solve_linear_checked(__system, __b)",
+                f"{updated} = torch.unbind(__next, dim=-1)",
+            ]
+        )
+        checks = ["__solved"]
+
+    lines.append("with torch.no_grad():")
+    if not diagonal:
+        lines.append(f"    __initial_rhs = __rhs({state_args})")
+        lines.extend(
+            f"    __scaled_initial_{i} = dt * __initial_rhs[{i}]" for i in range(n)
+        )
+    lines.append(f"    __final_rhs = __rhs({updated})")
+    checks.extend(
+        f"_affine_residual_accepted(_{s}, {s}, __scaled_initial_{i}, dt * __final_rhs[{i}])"
+        for i, s in enumerate(states)
+    )
+    lines.append(f"    __accepted = {' & '.join(checks)}")
+    targets = updated + ("," if n == 1 else "")
+    lines.append(
+        f"{targets} = _check_step(__accepted, {updated}, previous=({state_args},), solver=self)"
+    )
+    return "\n    ".join(lines)
+
+
+def _try_build_checked_affine(states, assigned, derivative, eliminate):
+    try:
+        analysis = _analyze_affine_system(states, assigned, derivative, eliminate)
+    except _AffineAnalysisError:
+        return None
+    by_state = match_derivative_to_states(derivative, states)
+    rhs = [
+        modify_operations(_nmodl_preprocess(_rhs_string(by_state[s])))
+        for s in analysis["states_to_solve"]
+    ]
+    ops = all_ops()
+    if not all(_validate_torch_expression(expr, allowed_callables=ops) for expr in rhs):
+        return None
+    body = _render_checked_affine_body(analysis, rhs, eliminate)
+    return _compile_affine_solver(
+        states,
+        assigned,
+        eliminate,
+        analysis,
+        body,
+        filename_prefix="dendra.derivimplicit.affine.solve",
+        extra_ns={
+            "_affine_residual_accepted": _affine_residual_accepted,
+            "_check_step": _check_step,
+            "_solve_affine_diagonal": _solve_affine_diagonal,
+            "_solve_linear_checked": _solve_linear_checked,
+        },
     )
 
 
@@ -663,6 +910,12 @@ def build_derivimplicit(
     states_to_solve = [s for s in states if s not in eliminate]
     if not states_to_solve:
         raise ValueError("derivimplicit requires at least one non-eliminated state.")
+
+    if not pade and options == _normalize_derivimplicit_options({}):
+        derivative = tuple(derivative)
+        affine = _try_build_checked_affine(states, assigned, derivative, eliminate)
+        if affine is not None:
+            return affine
 
     # Deterministic signature: states first (in given order), then assigned (sorted)
     assigned_list = list(assigned)
@@ -727,6 +980,7 @@ def build_derivimplicit(
     # ---- differentiate to build jacobian expressions ----
     rhs_derivatives = {}
     jac_ok = True
+    jac_analytic = True
     jac_state_independent = True
 
     # Small cache to avoid repeated sympy work inside a single build call
@@ -736,19 +990,25 @@ def build_derivimplicit(
         rhs = derivative[s]
         for swrt in states_to_solve:
             key = (rhs, swrt, tuple(states_to_solve), tuple(vars_list))
-            if key in diff_cache:
-                df, ok, depends = diff_cache[key]
-            else:
+            if key not in diff_cache:
                 df, ok, depends = differentiate_rhs_2torch_checked(
                     rhs,
                     vars_list,
                     swrt,
                     state_vars=states_to_solve,
+                    allow_finite_difference=False,
                 )
-                diff_cache[key] = (df, ok, depends)
+                analytic = ok
+                if not analytic:
+                    df, ok, depends = differentiate_rhs_2torch_checked(
+                        rhs, vars_list, swrt, state_vars=states_to_solve
+                    )
+                diff_cache[key] = (df, ok, depends, analytic)
+            df, ok, depends, analytic = diff_cache[key]
 
             rhs_derivatives[(s, swrt)] = df
             jac_ok = jac_ok and ok
+            jac_analytic = jac_analytic and analytic
             jac_state_independent = jac_state_independent and (not depends)
 
             if not jac_ok:
@@ -782,9 +1042,30 @@ def build_derivimplicit(
                     ]
                 ),
             )
+            forward_operands = ""
+            if jac_analytic and len(states_to_solve) > 1 and not options["line_search"]:
+                names = set(extract_vars(f_str + jac_fn_str, set()))
+                captures = [v for v in assigned_list_sorted + local_vars if v in names]
+                arguments = ", ".join(captures)
+                operands = f"({arguments},)" if arguments else "()"
+                factory = "_newton_evaluators"
+                while factory in vars_set or factory in states:
+                    factory += "_"
+                definitions = indent(f_str + jac_fn_str, "    ")
+                f_str = (
+                    f"\n    def {factory}({arguments}):{definitions}"
+                    "        return f, jac_fn\n"
+                    f"    f, jac_fn = {factory}({arguments})"
+                )
+                jac_fn_str = ""
+                forward_operands = (
+                    f", _make_evaluators={factory}, _coefficients={operands}"
+                )
             jac_init_str = "jac = None"
             assemble_jacobian_str = ""
-            solve_call = _solve_system_jac_fn_call(options)
+            solve_call = _solve_system_jac_fn_call(
+                options, analytic=jac_analytic, forward_operands=forward_operands
+            )
     else:
         # Fallback: no analytic Jacobian available; let solver use autograd Jacobian.
         jac_fn_str = "jac_fn = None"

@@ -514,6 +514,38 @@ def _render_body(states_to_solve, A, b, options):
     return _render_ngeneric(states_to_solve, A, b, options)
 
 
+def _compile_affine_solver(
+    states, assigned, eliminate, analysis, body, *, filename_prefix, extra_ns=None
+):
+    states_and_assigned = ", ".join(
+        _unique_preserve_order(list(states) + sorted(assigned))
+    )
+    locals_str = "\n    ".join(f"{v} = self.{v}" for v in analysis["local_vars"])
+    eliminate_solves = [
+        add_underscore_to_states(eliminate[s], states) for s in states if s in eliminate
+    ]
+    returns = "{" + ", ".join(f"'{s}' : _{s}" for s in states) + "}"
+    solve_src = linearimplicit_template.format(
+        states_and_assigned=states_and_assigned,
+        locals=locals_str,
+        reference_state=analysis["states_to_solve"][0],
+        body=body,
+        eliminate="\n    ".join(eliminate_solves),
+        returns=returns,
+    )
+
+    if DEBUG:
+        logger.debug(f"Function:\n{solve_src}")
+
+    return compile_generated_function(
+        solve_src,
+        func_name="solve",
+        filename_prefix=filename_prefix,
+        global_ns=globals(),
+        extra_ns=extra_ns,
+    )
+
+
 # -- public builder -----------------------------------------------------------
 
 
@@ -555,41 +587,14 @@ def build_linearimplicit(
             )
         raise ValueError(str(exc)) from exc
 
-    states_to_solve = analysis["states_to_solve"]
-    local_vars = analysis["local_vars"]
-    A = analysis["A"]
-    b = analysis["b"]
-
-    assigned_list_sorted = sorted(list(assigned))
-    states_and_assigned = ", ".join(
-        _unique_preserve_order(list(states) + assigned_list_sorted)
+    body = _render_body(
+        analysis["states_to_solve"], analysis["A"], analysis["b"], options
     )
-    locals_str = "\n    ".join([f"{v} = self.{v}" for v in local_vars])
-
-    body = _render_body(states_to_solve, A, b, options)
-
-    eliminate_solves = []
-    returns = []
-    for s in states:
-        if s in eliminate:
-            eliminate_solves.append(add_underscore_to_states(eliminate[s], states))
-        returns.append(f"'{s}' : _{s}")
-
-    solve_src = linearimplicit_template.format(
-        states_and_assigned=states_and_assigned,
-        locals=locals_str,
-        reference_state=states_to_solve[0],
-        body=body,
-        eliminate="\n    ".join(eliminate_solves),
-        returns="{" + ", ".join(returns) + "}",
-    )
-
-    if DEBUG:
-        logger.debug(f"Function:\n{solve_src}")
-
-    return compile_generated_function(
-        solve_src,
-        func_name="solve",
+    return _compile_affine_solver(
+        states,
+        assigned,
+        eliminate,
+        analysis,
+        body,
         filename_prefix="dendra.linearimplicit.solve",
-        global_ns=globals(),
     )

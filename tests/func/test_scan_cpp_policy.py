@@ -207,7 +207,7 @@ def test_shared_scan_capture_selects_cpp_from_original_mode_and_immutable_device
     # availability. Only the immutable device hint chooses the wrapper policy.
     samples, sample_layout = engine._samples({"drive": torch.zeros(1)})
     with torch.no_grad():
-        compiled, _layout, _isolate_views = engine._capture(
+        compiled, _layout, _isolate_views, programs = engine._capture(
             {"scale": torch.tensor(0.7, requires_grad=True)},
             {},
             {"v": torch.zeros(1)},
@@ -217,6 +217,7 @@ def test_shared_scan_capture_selects_cpp_from_original_mode_and_immutable_device
             grad_enabled=original_grad_enabled,
         )
     assert compiled is marker
+    assert not programs
     assert captured["prefer"] is (device == "cpu" and not original_grad_enabled)
     assert captured["pre_dispatch"] is original_grad_enabled
 

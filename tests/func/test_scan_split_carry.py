@@ -129,7 +129,7 @@ def test_large_inductor_training_carry_keeps_gradients_and_owned_continuations()
     torch.testing.assert_close(storage, reference_storage, rtol=0, atol=0)
     assert storage._version == original_version
 
-    _, layout, _ = next(iter(scan._kernels.values()))
+    _, layout, _, _ = next(iter(scan._kernels.values()))
     assert sum(len(indices) == 1 for indices in layout.indices) == 3
 
 

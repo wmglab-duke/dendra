@@ -213,7 +213,7 @@ test_coverage:
 test_functional_compatibility_shards:
   extends: .full_test_rules
   stage: test
-  timeout: 90 minutes
+  timeout: 2 hours
   parallel:
     matrix:
       - TORCH_SPEC: "torch==2.14.0"
@@ -226,6 +226,8 @@ test_functional_compatibility_shards:
         TORCH_LABEL: rolling
         COMPAT_SHARD: ["1", "2", "3", "4"]
   variables:
+    # Reserve time for artifacts after a slow compiler test run.
+    RUNNER_SCRIPT_TIMEOUT: "1h55m"
     OMP_NUM_THREADS: "1"
     MKL_NUM_THREADS: "1"
     OPENBLAS_NUM_THREADS: "1"

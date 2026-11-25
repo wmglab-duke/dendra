@@ -19916,7 +19916,12 @@ class FunctionalPopulation:
         return BoundPopulation(self, parameters, prepared, constants=constants)
 
     def compile_rollout_chunk(
-        self, steps: int, *, execution: str = "default", **compile_options
+        self,
+        steps: int,
+        *,
+        execution: str = "default",
+        derivimplicit_forward: str = "auto",
+        **compile_options,
     ):
         """Create a fixed-width compiled Population kernel.
 
@@ -19928,6 +19933,15 @@ class FunctionalPopulation:
             Scan supports first-order training; while is inference-only. Unrolled
             execution expands the fixed-width recurrence. Default selects inference
             looping when supported and otherwise retains the differentiable recurrence.
+        derivimplicit_forward : {"auto", "inline", "separate"}, default "auto"
+            Compilation policy for coupled nonlinear ``derivimplicit`` forward
+            solves with analytic Jacobians and line search disabled. ``"auto"``
+            uses separate compilation for CUDA Population training scans with
+            Inductor and CUDA Graphs disabled. Other execution paths use inline
+            solves. ``"inline"`` keeps the forward solve in the scan body.
+            ``"separate"`` requires ``execution="scan"`` and applies to training
+            calls with gradient recording enabled.
+            Disabling compilation bypasses the separate solve.
         **compile_options
             Options for ``torch.compile``, including ``backend``, ``fullgraph`` and
             ``disable``.
@@ -19953,6 +19967,7 @@ class FunctionalPopulation:
             steps=steps,
             compile_options=compile_options,
             execution=execution,
+            derivimplicit_forward=derivimplicit_forward,
         )
 
     def commit_state_(self, population: Population, state) -> Population:

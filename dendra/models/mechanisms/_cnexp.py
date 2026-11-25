@@ -135,15 +135,17 @@ def _linear_exact_step(state, rate, source, coefficient, dt):
 def convert(deriv, state, states, assigned, use_pade_approx=False):
     """Emit a CNEXP assignment with unbound parameters read through ``self``."""
 
-    exclude = set([state]) | set(states) | set(assigned)
-    v = extract_vars(deriv, exclude)
+    fields = {state, *states, *assigned}
+    parameters = extract_vars(deriv, fields)
+    # Bind declared solver inputs explicitly so their names take precedence over
+    # SymPy globals such as S and E. Only parameters are emitted through self.
     f = integrate2torch(
         deriv,
         "dt",
-        v,
+        [*sorted(fields), *parameters],
         use_pade_approx=use_pade_approx,
         stable_linear=True,
-        parameter_names=v,
+        parameter_names=parameters,
     )
     if DEBUG:
         logger.debug(f"Integrated function:\n{f}")
