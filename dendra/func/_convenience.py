@@ -80,6 +80,31 @@ def _initialization_writes_parameters(functional):
     )
 
 
+def _cuda_graph_compile_options(options, compile_options):
+    """Preserve Inductor mode options while selecting a single capture owner."""
+    keywords = dict(compile_options)
+    mode = keywords.pop("mode", None)
+    if mode is not None:
+        if options is not None:
+            raise ValueError("Specify either mode or options for Inductor")
+        options = torch._inductor.list_mode_options(
+            mode, dynamic=keywords.get("dynamic", False)
+        )
+    selected = (
+        {}
+        if options is None
+        else {key.replace("-", "_"): value for key, value in dict(options).items()}
+    )
+    if selected.get("cpp_wrapper") or selected.get("fx_wrapper"):
+        raise ValueError("cuda_graphs=True requires the Inductor Python wrapper")
+    if selected.get("use_aoti"):
+        raise ValueError("cuda_graphs=True requires ordinary Inductor compilation")
+    selected.update(
+        {"cpp_wrapper": False, "fx_wrapper": False, "triton.cudagraphs": False}
+    )
+    return selected, keywords
+
+
 class CompiledRunner:
     """Compiled Population execution with explicit inputs and continuations.
 
@@ -100,6 +125,9 @@ class CompiledRunner:
     activations while retaining full-run gradients and requested recordings.
     Independent training forwards own their preparation graphs; safe snapshot
     inference may reuse preparation.
+
+    ``cuda_graphs=True`` captures the numerical chunk of an eligible CUDA scan
+    with explicit CUDA Graphs. It supports inference and first-order training.
 
     ``extra=VarInput()`` requires call-local ``extra=`` on every invocation;
     ``extra=None`` selects zero drive. Waveform types and contact counts may vary.
@@ -123,6 +151,7 @@ class CompiledRunner:
         initialization="snapshot",
         checkpoint_every=None,
         trainable=(),
+        cuda_graphs: bool = False,
         derivimplicit_forward: str = "auto",
         backend="inductor",
         options=None,
@@ -134,7 +163,35 @@ class CompiledRunner:
             raise ValueError("execution must be 'scan' or 'while'")
         if not isinstance(inference, bool):
             raise TypeError("inference must be a bool")
+        if not isinstance(cuda_graphs, bool):
+            raise TypeError("cuda_graphs must be a bool")
         _validate_derivimplicit_forward(derivimplicit_forward, execution)
+        if cuda_graphs:
+            from dendra.models.core import Population
+
+            if (
+                not isinstance(population, Population)
+                or population.device().type != "cuda"
+            ):
+                raise ValueError("cuda_graphs=True requires a CUDA Population")
+            if execution != "scan":
+                raise ValueError("cuda_graphs=True requires execution='scan'")
+            if backend != "inductor":
+                raise ValueError("cuda_graphs=True requires backend='inductor'")
+            if compile_options.get("disable") or not compile_options.get(
+                "fullgraph", True
+            ):
+                raise ValueError("cuda_graphs=True requires full-graph compilation")
+            if checkpoint_every is not None:
+                raise ValueError("cuda_graphs=True does not support checkpoint_every")
+            if derivimplicit_forward == "separate":
+                raise ValueError(
+                    "cuda_graphs=True requires inline derivimplicit forward"
+                )
+            derivimplicit_forward = "inline"
+            options, compile_options = _cuda_graph_compile_options(
+                options, compile_options
+            )
         if derivimplicit_forward == "separate":
             from dendra.models.core import Population
 
@@ -241,6 +298,8 @@ class CompiledRunner:
             execution="default" if execution == "while" else "scan",
             **keywords,
         )
+        if cuda_graphs:
+            self._kernel._enable_cuda_graphs()
         self._prepared = None
 
     @property
@@ -900,6 +959,7 @@ def compile(
     checkpoint_every=None,
     trainable=(),
     pending_capacity=None,
+    cuda_graphs: bool = False,
     derivimplicit_forward: str = "auto",
     backend="inductor",
     options=None,
@@ -952,6 +1012,11 @@ def compile(
         Network pending-event calendar capacities. A full calendar raises before
         publishing a result. Lower again with more capacity from the pre-call native
         boundary; calendar tensor shapes belong to that plan.
+    cuda_graphs : bool, default False
+        Explicitly capture and replay numerical chunks of CUDA Population scans
+        for inference or first-order training. Requires full-graph Inductor with
+        its Python wrapper and ``checkpoint_every=None``. The runner manages
+        capture and disables Inductor's own CUDA graph option for these chunks.
     derivimplicit_forward : {"auto", "inline", "separate"}, default "auto"
         Compilation policy for coupled nonlinear ``derivimplicit`` forward
         solves with analytic Jacobians and line search disabled. ``"auto"`` uses
@@ -988,8 +1053,12 @@ def compile(
 
     runner_type = CompiledRunner
     runner_keywords = {}
+    if not isinstance(cuda_graphs, bool):
+        raise TypeError("cuda_graphs must be a bool")
     _validate_derivimplicit_forward(derivimplicit_forward, execution)
     if isinstance(population, Network):
+        if cuda_graphs:
+            raise ValueError("cuda_graphs=True requires a CUDA Population")
         if derivimplicit_forward == "separate":
             raise ValueError(
                 "derivimplicit_forward='separate' is only available for Population training."
@@ -1000,8 +1069,11 @@ def compile(
         runner_keywords["pending_capacity"] = pending_capacity
     elif pending_capacity is not None:
         raise ValueError("pending_capacity applies only to Network compilation")
-    elif derivimplicit_forward != "auto":
-        runner_keywords["derivimplicit_forward"] = derivimplicit_forward
+    else:
+        if cuda_graphs:
+            runner_keywords["cuda_graphs"] = True
+        if derivimplicit_forward != "auto":
+            runner_keywords["derivimplicit_forward"] = derivimplicit_forward
     return runner_type(
         population,
         dt=dt,

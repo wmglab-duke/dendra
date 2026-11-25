@@ -96,6 +96,10 @@ class _CompiledScanPopulationChunk:
         self._kernels = {}
         self._training = None
         self._assemblies = {}
+        self._cuda_graphs = False
+
+    def enable_cuda_graphs(self):
+        self._cuda_graphs = True
 
     def _training_values(
         self,
@@ -192,6 +196,7 @@ class _CompiledScanPopulationChunk:
                 clone_state=functional._clone_state_tree,
                 capture_examples=_detach,
                 solver_failures=True,
+                cuda_graphs=self._cuda_graphs,
                 derivimplicit_forward=_resolve_derivimplicit_forward(
                     self._derivimplicit_forward,
                     device=functional.device,
@@ -583,6 +588,13 @@ class _CompiledScanPopulationChunk:
             self._options,
             prefer_cpp_wrapper=functional.device.type == "cpu",
         )
+        graph_duration = None
+        if self._cuda_graphs:
+            from ._cuda_graph import _CudaGraphCall, _host_duration_passthrough
+
+            compiled = _CudaGraphCall(compiled, functional.device)
+            if _host_duration_passthrough(plans):
+                graph_duration = torch.zeros_like(state["control"]["duration_remainder"])
 
         @wraps(compiled)
         def materialize(
@@ -631,6 +643,9 @@ class _CompiledScanPopulationChunk:
             with torch.inference_mode(False), torch.no_grad():
                 state = functional._clone_state_tree(state)
                 recurrent = _clone(recurrent)
+            if graph_duration is not None:
+                duration = state["control"]["duration_remainder"]
+                state["control"]["duration_remainder"] = graph_duration
             result = compiled(
                 parameters,
                 prepared,
@@ -646,6 +661,8 @@ class _CompiledScanPopulationChunk:
             if check_failures:
                 result, failure = result
                 failures.check(failure)
+            if graph_duration is not None:
+                result[0]["control"]["duration_remainder"] = duration
             if not phase_emissions and not callback_carry.invariant_names:
                 return result
             if phase_emissions:

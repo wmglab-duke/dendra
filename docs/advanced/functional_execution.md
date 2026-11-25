@@ -159,6 +159,37 @@ the samples requested for the full run.
 
 Create a new program after changing model structure or connectivity.
 
+## Replay CUDA Population chunks
+
+For an initialized CUDA Population, set `cuda_graphs=True` to capture and
+replay the numerical chunks of the default Inductor scan. The runner still
+handles preparation, continuation, and callback results through the same
+public interface.
+
+```python
+program = dn.compile(
+    cuda_model, dt=0.025, steps=32, cuda_graphs=True,
+    callbacks={"trace": dn.Recorder("v")},
+)
+program.warm()
+state, auxiliary = program()
+```
+
+Capture supports inference and first-order training. Use `inference=False`
+for training and call backward as usual. Each training graph owns its saved
+activations until backward releases them. While the graph is in use, another
+call to the same chunk runs through the ordinary compiled scan.
+
+CUDA tensor values can change between replays. Each compiled scan executor
+caches a capture for one tensor signature and stream. A call with a different
+layout, gradient mask, stream, or frozen host value can use the ordinary
+compiled scan. The runner manages capture and sets Inductor's
+`triton.cudagraphs` option to `False` for its compiled chunks.
+
+Use full-graph Inductor with the Python wrapper and the default
+`checkpoint_every=None`. Network runners and `execution="while"` use the
+default `cuda_graphs=False`.
+
 ## Use ordinary connection and scheduling APIs
 
 Choose the connection interface that matches the signal you want to deliver.

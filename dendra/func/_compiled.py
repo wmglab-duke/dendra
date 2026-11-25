@@ -105,6 +105,7 @@ class CompiledPopulationChunk:
         self._callback_chunks = weakref.WeakKeyDictionary()
         self._model_while = None
         self._model_while_enabled = False
+        self._cuda_graphs = False
         if (
             execution == "default"
             and (
@@ -195,10 +196,17 @@ class CompiledPopulationChunk:
                 _stepwise_stimulation=stepwise_stimulation,
                 _report_state=self._report_state,
             )
+            if self._cuda_graphs:
+                self._runner_chunks[steps]._enable_cuda_graphs()
         chunk = self._runner_chunks[steps]
         if self._model_while_enabled:
             chunk._enable_model_while()
         return chunk
+
+    def _enable_cuda_graphs(self):
+        """Enable stream capture for the scan executors owned by this runner."""
+        self._cuda_graphs = True
+        self._compiled.enable_cuda_graphs()
 
     def _model_while_executor(self):
         """Lazily reuse the shared loop with no callback carries or emissions."""
@@ -402,6 +410,7 @@ class CompiledPopulationChunk:
                 derivimplicit_forward=self._derivimplicit_forward,
                 report_state=self._report_state,
                 stepwise_stimulation=stepwise_stimulation,
+                cuda_graphs=self._cuda_graphs,
             )
         return kernels[key]
 
@@ -598,6 +607,7 @@ class _CompiledCallbackPopulationChunk:
         derivimplicit_forward="inline",
         report_state,
         stepwise_stimulation=True,
+        cuda_graphs=False,
     ):
         self._execution = execution
         self._steps = steps
@@ -633,6 +643,8 @@ class _CompiledCallbackPopulationChunk:
                 stepwise_stimulation=stepwise_stimulation,
                 derivimplicit_forward=derivimplicit_forward,
             )
+            if cuda_graphs:
+                self._compiled.enable_cuda_graphs()
         else:
             self._compiled = compile_owned(
                 isolate_compilation_callable(self._lowered.__call__), **compile_options
