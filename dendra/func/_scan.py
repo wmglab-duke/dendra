@@ -13,6 +13,7 @@ import torch
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.utils import _pytree as pytree
 
+from .._solver_failures import _advance_solver_failure, _SolverFailureCapture
 from ..helpers import MEMBRANE_ASSEMBLY
 from ._callback_carry import _CallbackCarryPartition
 from ._callback_recurrence import _transition_sample_values
@@ -27,9 +28,14 @@ from ._hop_inputs import (
 )
 from ._inputs import _RuntimeInputs
 from ._scan_compat import install_scan_compatibility
-from ._scan_inductor import _compile_scan
+from ._scan_inductor import (
+    _compile_scan,
+    _local_scan_cuda_graphs_enabled,
+    _uses_local_scan_inductor,
+)
 from ._scan_tree import _capture_tensor_step, _CompiledTensorTreeScan, _tensor_samples
 from ._tensor_contracts import _clone_contiguous_tree as _clone
+from ._types import FunctionalizationError
 
 # Bound the inference graph independently of the horizon, while amortizing the
 # scan loop boundary over several accepted timesteps. Keep training's audited
@@ -49,6 +55,21 @@ def _stack_steps(steps):
     )
 
 
+def _resolve_derivimplicit_forward(policy, *, device, training, compile_options):
+    if compile_options.get("disable", False):
+        return "inline"
+    if policy != "auto":
+        return policy
+    if (
+        training
+        and torch.device(device).type == "cuda"
+        and _uses_local_scan_inductor(compile_options)
+        and not _local_scan_cuda_graphs_enabled(compile_options)
+    ):
+        return "separate"
+    return "inline"
+
+
 class _CompiledScanPopulationChunk:
     """Lazy scan capture and compilation for an immutable execution plan."""
 
@@ -60,6 +81,7 @@ class _CompiledScanPopulationChunk:
         compile_options,
         stepwise_stimulation=False,
         plans=None,
+        derivimplicit_forward: str = "auto",
     ):
         install_scan_compatibility()
         self._functional = functional
@@ -67,10 +89,17 @@ class _CompiledScanPopulationChunk:
         self._options = compile_options
         self._stepwise = stepwise_stimulation
         self._plans = plans
+        self._derivimplicit_forward = (
+            "inline" if compile_options.get("disable", False) else derivimplicit_forward
+        )
         # Only static graphs/callables belong here, never example operands.
         self._kernels = {}
         self._training = None
         self._assemblies = {}
+        self._cuda_graphs = False
+
+    def enable_cuda_graphs(self):
+        self._cuda_graphs = True
 
     def _training_values(
         self,
@@ -132,6 +161,7 @@ class _CompiledScanPopulationChunk:
 
         if self._training is None:
             stepwise_stimulation = self._stepwise
+            population = getattr(functional, "_population", None)
 
             def body(parameters, prepared, state, carries, sample):
                 next_state, auxiliary = _transition_sample_values(
@@ -165,6 +195,14 @@ class _CompiledScanPopulationChunk:
                 static_state_paths=(("control", "duration_remainder"),),
                 clone_state=functional._clone_state_tree,
                 capture_examples=_detach,
+                solver_failures=True,
+                cuda_graphs=self._cuda_graphs,
+                derivimplicit_forward=_resolve_derivimplicit_forward(
+                    self._derivimplicit_forward,
+                    device=functional.device,
+                    training=getattr(population, "training", False),
+                    compile_options=self._options,
+                ),
             )
         final, updated, emitted = self._training(
             parameters,
@@ -330,12 +368,14 @@ class _CompiledScanPopulationChunk:
 
         # Inference does not differentiate this captured graph. Training's
         # authored AD boundaries belong to the shared tensor-tree engine.
+        failures = _SolverFailureCapture()
         graph = _capture_tensor_step(
-            authored,
+            failures.wrap(authored),
             (parameters, prepared, state, carries, invariant_carries, sample),
             grad_enabled=False,
             tracer=make_fx,
         )
+        check_failures = failures.active
         parameter_use, prepared_use, _, _, invariant_use, sample_use = _input_usage(
             graph, (parameters, prepared, state, carries, invariant_carries, sample)
         )
@@ -434,23 +474,26 @@ class _CompiledScanPopulationChunk:
                     spec,
                 )
 
+            def advance(carry, sample):
+                updated, emitted = graph(
+                    parameters, prepared, carry[0], carry[1], invariant_carries, sample
+                )
+                if check_failures:
+                    emitted, event = emitted
+                    updated = (*updated, _advance_solver_failure(carry[2], event))
+                return updated, emitted
+
+            carry = (state, carries)
+            if check_failures:
+                carry = (*carry, failures.initial(functional.device))
             if block == 1:
 
                 def combine(carry, sample):
-                    sample = unpack_sample(sample)
-                    state, carries = carry
-                    return graph(
-                        parameters, prepared, state, carries, invariant_carries, sample
-                    )
+                    return advance(carry, unpack_sample(sample))
 
-                (final, updated), emitted = scan(
-                    combine,
-                    (state, carries),
-                    flat_samples,
-                )
+                carry, emitted = scan(combine, carry, flat_samples)
             else:
                 full_steps = (steps // block) * block
-                carry = (state, carries)
 
                 def combine(carry, samples):
                     emissions = []
@@ -460,9 +503,7 @@ class _CompiledScanPopulationChunk:
                                 torch.Tensor, lambda value: value[offset], samples
                             )
                         )
-                        carry, emission = graph(
-                            parameters, prepared, *carry, invariant_carries, sample
-                        )
+                        carry, emission = advance(carry, sample)
                         emissions.append(emission)
                     # Each stack owns its storage, including when callbacks
                     # emit state views or the same Tensor in several leaves.
@@ -506,9 +547,7 @@ class _CompiledScanPopulationChunk:
                             torch.Tensor, lambda value: value[index], flat_samples
                         )
                     )
-                    carry, emission = graph(
-                        parameters, prepared, *carry, invariant_carries, sample
-                    )
+                    carry, emission = advance(carry, sample)
                     tail.append(emission)
                 if tail:
                     tail = _stack_steps(tail)
@@ -523,7 +562,7 @@ class _CompiledScanPopulationChunk:
                     carry = _clone(carry)
                 elif phase_emissions:
                     tail = None
-                final, updated = carry
+            final, updated = carry[:2]
             # Scan's AD wrapper marks every floating output differentiable.
             # Timesteps never change host scheduling carry, which must remain
             # gradient-free for duration validation and exact resumed runs.
@@ -532,21 +571,30 @@ class _CompiledScanPopulationChunk:
             ].clone()
             auxiliary = {"v": final["integrator"]["v"]}
             if phase_emissions:
-                return final, updated, emitted, tail
-            if plans is None:
-                return final, auxiliary
-            return (
-                final,
-                auxiliary,
-                updated,
-                {plan.name: emitted.get(plan.name) for plan in plans},
-            )
+                result = (final, updated, emitted, tail)
+            elif plans is None:
+                result = (final, auxiliary)
+            else:
+                result = (
+                    final,
+                    auxiliary,
+                    updated,
+                    {plan.name: emitted.get(plan.name) for plan in plans},
+                )
+            return (result, carry[2]) if check_failures else result
 
         compiled = _compile_scan(
             execute,
             self._options,
             prefer_cpp_wrapper=functional.device.type == "cpu",
         )
+        graph_duration = None
+        if self._cuda_graphs:
+            from ._cuda_graph import _CudaGraphCall, _host_duration_passthrough
+
+            compiled = _CudaGraphCall(compiled, functional.device)
+            if _host_duration_passthrough(plans):
+                graph_duration = torch.zeros_like(state["control"]["duration_remainder"])
 
         @wraps(compiled)
         def materialize(
@@ -595,6 +643,9 @@ class _CompiledScanPopulationChunk:
             with torch.inference_mode(False), torch.no_grad():
                 state = functional._clone_state_tree(state)
                 recurrent = _clone(recurrent)
+            if graph_duration is not None:
+                duration = state["control"]["duration_remainder"]
+                state["control"]["duration_remainder"] = graph_duration
             result = compiled(
                 parameters,
                 prepared,
@@ -607,6 +658,11 @@ class _CompiledScanPopulationChunk:
                 draws,
                 sampling_times,
             )
+            if check_failures:
+                result, failure = result
+                failures.check(failure)
+            if graph_duration is not None:
+                result[0]["control"]["duration_remainder"] = duration
             if not phase_emissions and not callback_carry.invariant_names:
                 return result
             if phase_emissions:
@@ -657,7 +713,16 @@ class _CompiledScanPopulationChunk:
         sampling_times=None,
     ):
         carries = {} if carries is None else carries
-        if torch.is_grad_enabled():
+        grad_enabled = torch.is_grad_enabled()
+        if (
+            self._derivimplicit_forward == "separate"
+            and grad_enabled
+            and not self._functional._population.training
+        ):
+            raise FunctionalizationError(
+                "derivimplicit_forward='separate' requires a Population in training mode."
+            )
+        if grad_enabled:
             result = self._training_values(
                 parameters,
                 prepared,

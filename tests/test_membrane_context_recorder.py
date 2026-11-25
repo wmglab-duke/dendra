@@ -101,7 +101,7 @@ def test_scan_graph_cache_is_partitioned_by_policy_without_executing_scan(monkey
             }
             return layout.pack((final, carries)), {}
 
-        return execute, layout, lambda operands: operands
+        return execute, layout, lambda operands: operands, ()
 
     monkeypatch.setattr(scan_tree_module._CompiledTensorTreeScan, "_capture", capture)
     functional = SimpleNamespace(

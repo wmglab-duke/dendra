@@ -10,7 +10,10 @@ from ._types import FunctionalizationError
 
 class _FirstOrderScanBoundary(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, *values):
+    def forward(ctx, programs, *values):
+        # A pending backward may replay an opaque forward op after its runner
+        # and compiled chunk have been released.
+        ctx.forward_programs = programs
         ctx.set_materialize_grads(False)
         return values
 
@@ -24,10 +27,10 @@ class _FirstOrderScanBoundary(torch.autograd.Function):
                 "execution='scan' supports first-order reverse-mode gradients only; "
                 "use fmodel.rollout for create_graph=True or higher derivatives"
             )
-        return grad_values
+        return None, *grad_values
 
 
-def guard_scan_outputs(tree: Any) -> Any:
+def guard_scan_outputs(tree: Any, *, forward_programs=()) -> Any:
     """Wrap differentiable result leaves after the compiled callable returns.
 
     Keep this boundary outside torch.compile: tracing its backward would resolve
@@ -51,7 +54,9 @@ def guard_scan_outputs(tree: Any) -> Any:
             "execution='scan' already owns its compiled boundary and cannot be "
             "wrapped in another torch.compile while gradients are enabled"
         )
-    guarded = _FirstOrderScanBoundary.apply(*(leaves[index] for index in indices))
+    guarded = _FirstOrderScanBoundary.apply(
+        forward_programs, *(leaves[index] for index in indices)
+    )
     for index, value in zip(indices, guarded, strict=True):
         leaves[index] = value
     return pytree.tree_unflatten(leaves, spec)

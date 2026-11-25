@@ -32,6 +32,15 @@ if TYPE_CHECKING:
     from ._population import FunctionalPopulation
 
 
+def _validate_derivimplicit_forward(mode: str, execution: str) -> None:
+    if not isinstance(mode, str) or mode not in ("auto", "inline", "separate"):
+        raise ValueError(
+            "derivimplicit_forward must be 'auto', 'inline', or 'separate'."
+        )
+    if mode == "separate" and execution != "scan":
+        raise ValueError("derivimplicit_forward='separate' requires execution='scan'.")
+
+
 class CompiledPopulationChunk:
     """Fixed-width compiled Population execution with explicit sources and state.
 
@@ -54,6 +63,7 @@ class CompiledPopulationChunk:
         steps: int,
         compile_options: dict,
         execution: str = "default",
+        derivimplicit_forward: str = "auto",
         _stepwise_stimulation: bool = False,
         _report_state: _ExecutionReportState | None = None,
     ):
@@ -61,7 +71,9 @@ class CompiledPopulationChunk:
             raise ValueError(
                 "execution must be 'default', 'unrolled', 'scan', or 'while'"
             )
+        _validate_derivimplicit_forward(derivimplicit_forward, execution)
         self._execution = execution
+        self._derivimplicit_forward = derivimplicit_forward
         self._capabilities = _capabilities(execution)
         self._report_state = (
             _ExecutionReportState() if _report_state is None else _report_state
@@ -93,6 +105,7 @@ class CompiledPopulationChunk:
         self._callback_chunks = weakref.WeakKeyDictionary()
         self._model_while = None
         self._model_while_enabled = False
+        self._cuda_graphs = False
         if (
             execution == "default"
             and (
@@ -111,6 +124,7 @@ class CompiledPopulationChunk:
                 steps=steps,
                 compile_options=options,
                 stepwise_stimulation=_stepwise_stimulation,
+                derivimplicit_forward=derivimplicit_forward,
             )
         elif execution in ("default", "while"):
             from ._while_inductor import _STANDARD_COMPILER, _compile_while
@@ -178,13 +192,21 @@ class CompiledPopulationChunk:
                 steps=steps,
                 compile_options=self._compile_options,
                 execution=self._execution,
+                derivimplicit_forward=self._derivimplicit_forward,
                 _stepwise_stimulation=stepwise_stimulation,
                 _report_state=self._report_state,
             )
+            if self._cuda_graphs:
+                self._runner_chunks[steps]._enable_cuda_graphs()
         chunk = self._runner_chunks[steps]
         if self._model_while_enabled:
             chunk._enable_model_while()
         return chunk
+
+    def _enable_cuda_graphs(self):
+        """Enable stream capture for the scan executors owned by this runner."""
+        self._cuda_graphs = True
+        self._compiled.enable_cuda_graphs()
 
     def _model_while_executor(self):
         """Lazily reuse the shared loop with no callback carries or emissions."""
@@ -385,8 +407,10 @@ class CompiledPopulationChunk:
                 plans=callbacks._plans,
                 compile_options=self._compile_options,
                 execution=self._execution,
+                derivimplicit_forward=self._derivimplicit_forward,
                 report_state=self._report_state,
                 stepwise_stimulation=stepwise_stimulation,
+                cuda_graphs=self._cuda_graphs,
             )
         return kernels[key]
 
@@ -580,8 +604,10 @@ class _CompiledCallbackPopulationChunk:
         plans,
         compile_options,
         execution="default",
+        derivimplicit_forward="inline",
         report_state,
         stepwise_stimulation=True,
+        cuda_graphs=False,
     ):
         self._execution = execution
         self._steps = steps
@@ -615,7 +641,10 @@ class _CompiledCallbackPopulationChunk:
                 plans=plans,
                 compile_options=compile_options,
                 stepwise_stimulation=stepwise_stimulation,
+                derivimplicit_forward=derivimplicit_forward,
             )
+            if cuda_graphs:
+                self._compiled.enable_cuda_graphs()
         else:
             self._compiled = compile_owned(
                 isolate_compilation_callable(self._lowered.__call__), **compile_options

@@ -1,6 +1,8 @@
-"""Blocked Population inference owns recurrent leaves before backend guards."""
+"""Compiled Population inference carry ownership and solver checks."""
 
 from __future__ import annotations
+
+from dataclasses import replace
 
 import pytest
 import torch
@@ -8,6 +10,7 @@ from torch.utils import _pytree as pytree
 
 import dendra as dn
 from dendra._bootstrap import torch_compiler_warning_context
+from dendra.models.mechanisms import Mechanism, State
 from tests.func.test_lowering_api import DT, _close, _population
 from tests.func.test_poisson_invocation_execution import _case
 from tests.func.test_poisson_stimulation import _close as _poisson_close
@@ -22,6 +25,83 @@ def _environment():
         dn.ctx(JIT=0, REQUIRE_GRAD=1, DTYPE=torch.float64, DEVICE="cpu", IMEM=False),
     ):
         yield
+
+
+class _ImplicitGrowthState(State):
+    State.STATE("x")
+    State.DERIVATIVE("x' = x*x")
+    State.METHOD("derivimplicit")
+
+    def state_defaults(self, v, values):
+        return {"x": torch.full_like(v, 0.125)}
+
+
+class _ImplicitGrowth(Mechanism):
+    Mechanism.STATE_BUNDLE(_ImplicitGrowthState)
+
+
+@pytest.mark.parametrize("execution", ["scan", "while"])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda",
+            marks=[
+                pytest.mark.cuda,
+                pytest.mark.skipif(
+                    not torch.cuda.is_available(), reason="requires CUDA"
+                ),
+            ],
+        ),
+    ],
+)
+def test_compiled_inference_reports_derivimplicit_failure_within_chunk(
+    execution, device
+):
+    with dn.ctx(DEVICE=device):
+        model = dn.SingleCompartment(N=2, C=1, dtype=torch.float64).eval()
+        model.insert(_ImplicitGrowth)
+        model.initialize()
+        dt, steps = 0.1, 4
+        program = dn.compile(
+            model, dt=dt, steps=steps, execution=execution, backend="eager"
+        )
+
+        state, auxiliary = program()
+        mechanism_states = state["mechanisms"]
+        name = _ImplicitGrowth.__name__
+        actual = mechanism_states[name]["x"]
+        expected = torch.full_like(actual, 0.125)
+        for _ in range(steps):
+            expected = 2 * expected / (1 + (1 - 4 * dt * expected).sqrt())
+        torch.testing.assert_close(actual, expected)
+
+        # The second lane has a first-step root above 2.5, so its next step has
+        # no real backward Euler root.
+        failed_input = actual.clone()
+        failed_input[1, 0] = 2.0
+        incoming = replace(
+            auxiliary["continuation"],
+            state={
+                **state,
+                "mechanisms": {**mechanism_states, name: {"x": failed_input}},
+            },
+        )
+        frozen = _clone(incoming.state)
+        with pytest.raises(RuntimeError, match="(?i)derivimplicit") as failure:
+            program(incoming)
+
+        _close(incoming.state, frozen)
+        prefix, _ = program(incoming, steps=1)
+        expected_prefix = 2 * failed_input / (1 + (1 - 4 * dt * failed_input).sqrt())
+        torch.testing.assert_close(prefix["mechanisms"][name]["x"], expected_prefix)
+        assert expected_prefix[1, 0] > 2.5
+
+        message = str(failure.value)
+        assert name in message
+        assert "chunk step 1" in message
+        assert "batch index (1, 0)" in message
 
 
 def _clone(tree):

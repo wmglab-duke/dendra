@@ -403,6 +403,17 @@ def test_finite_difference_rejects_nonpositive_or_nonfinite_epsilon(fd_eps):
         differentiate_rhs_2torch_checked("x' = x**2", ["x"], "x", fd_eps=fd_eps)
 
 
+def test_symbolic_derivative_can_decline_finite_difference_fallback():
+    assert differentiate_rhs_2torch_checked(
+        "x' = custom(x)",
+        ["x"],
+        "x",
+        state_vars=["x"],
+        extra_user_functions={"custom": "custom"},
+        allow_finite_difference=False,
+    ) == ("", False, False)
+
+
 def test_finite_difference_rejects_boolean_epsilon_and_unknown_scheme():
     with pytest.raises(TypeError, match="positive, finite real"):
         differentiate_rhs_2torch_checked("x' = x**2", ["x"], "x", fd_eps=True)

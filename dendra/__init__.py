@@ -118,6 +118,7 @@ from .models.integrators import (
     rk2,
     rk4,
     scnv,
+    tree_contraction,
 )
 from .models.mod import load_mechanisms
 from .models.stim.waveform import *
@@ -226,6 +227,7 @@ __all__ = [
     "bwd_euler_ub",
     "bwd_euler_bt",
     "dhs",
+    "tree_contraction",
     "df",
     "dfh",
     "scnv",

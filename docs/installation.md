@@ -54,6 +54,7 @@ Use the PyTorch index only for the PyTorch installation.
 ## Install from PyPI
 
 Install Dendra with the recommended native CPU and Apple Metal solvers.
+This extra also provides the topology planner used by CUDA tree contraction.
 
 ```sh
 python -m pip install --only-binary=dendra-solvers "dendra[solvers]"
@@ -66,6 +67,12 @@ either case.
 ```sh
 python -m pip install dendra
 ```
+
+For a scalar tree on CUDA or Apple MPS, select the contraction solver during
+construction with `dn.Tree.from_graph(graph, integrator=dn.tree_contraction())`.
+It supports float32 and float64 on CUDA and float32 on MPS. The factory
+defaults to 16 interior nodes per segment. Set
+`max_segment_interior_nodes=None` for fine-grained contraction.
 
 ## Verify the install
 

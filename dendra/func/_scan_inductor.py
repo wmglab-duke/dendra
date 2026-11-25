@@ -322,27 +322,16 @@ def _uses_local_scan_inductor(options):
     )
 
 
-def _compile_scan(function, compile_options, *, prefer_cpp_wrapper=False):
-    """Use the local lowering only when ordinary Inductor was selected.
-
-    Custom backends, the configured non-Inductor default, disabled compilation,
-    and AOTInductor keep their original routes. The incoming option dictionary
-    is not modified, including its nested ``options`` dictionary.
-    """
-    function = isolate_compilation_callable(function)
+def _prepare_local_scan_inductor(compile_options):
     options = dict(compile_options)
-    if options.get("options") is not None:
-        options["options"] = dict(options["options"])
-    if not _uses_local_scan_inductor(options):
-        return compile_owned(function, **options)
-    inductor_options = dict(options.get("options") or {})
+    supplied_options = options.pop("options", None)
     mode = options.pop("mode", None)
-    if mode is not None and options.get("options") is not None:
+    if mode is not None and supplied_options is not None:
         raise RuntimeError(
             "Either mode or options can be specified, but both can't be "
             "specified at the same time."
         )
-    options.pop("options", None)
+    inductor_options = dict(supplied_options or {})
     # These options belong to torch.compile, not to Inductor's config parser.
     # Forward them through its outer boundary exactly as for the normal backend.
     outer_options = {}
@@ -357,6 +346,30 @@ def _compile_scan(function, compile_options, *, prefer_cpp_wrapper=False):
         options.get("dynamic"),
         options.get("name"),
     )
+    return options, backend
+
+
+def _local_scan_cuda_graphs_enabled(compile_options):
+    from torch._inductor import config
+
+    _, backend = _prepare_local_scan_inductor(compile_options)
+    return backend.config.get("triton.cudagraphs", config.triton.cudagraphs)
+
+
+def _compile_scan(function, compile_options, *, prefer_cpp_wrapper=False):
+    """Use the local lowering only when ordinary Inductor was selected.
+
+    Custom backends, the configured non-Inductor default, disabled compilation,
+    and AOTInductor keep their original routes. The incoming option dictionary
+    is not modified, including its nested ``options`` dictionary.
+    """
+    function = isolate_compilation_callable(function)
+    if not _uses_local_scan_inductor(compile_options):
+        options = dict(compile_options)
+        if options.get("options") is not None:
+            options["options"] = dict(options["options"])
+        return compile_owned(function, **options)
+    options, backend = _prepare_local_scan_inductor(compile_options)
     if prefer_cpp_wrapper:
         from torch._inductor import config
 

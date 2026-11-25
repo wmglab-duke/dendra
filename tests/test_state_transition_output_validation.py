@@ -7,6 +7,7 @@ from types import MethodType
 import pytest
 import torch
 
+import dendra as dn
 from dendra.models.mechanisms import Mechanism, State
 from dendra.models.mechanisms import _state as state_impl
 
@@ -208,6 +209,47 @@ def test_imperative_state_advance_validates_before_atomic_commit(
     torch.testing.assert_close(mechanism.x, before[0])
     torch.testing.assert_close(mechanism.y, before[1])
     torch.testing.assert_close(state.memory, before[2])
+
+
+def test_native_authored_advance_without_derivatives():
+    class DiscreteState(State):
+        State.STATE("x", "y")
+
+        def state_defaults(self, v, values):
+            return {"x": torch.zeros_like(v), "y": torch.ones_like(v)}
+
+        def advance(self, v, dt, values):
+            x = values["x"] + dt
+            return {"x": x, "y": values["y"] + x}
+
+    class DiscreteMechanism(Mechanism):
+        Mechanism.STATE_BUNDLE(DiscreteState)
+
+    with dn.ctx(DEVICE="cpu", JIT=0):
+        model = dn.SingleCompartment(N=2, C=1, dtype=DTYPE)
+        model.insert(DiscreteMechanism.rename("discrete"))
+        model.initialize()
+        model.step(0.25)
+        model.step(0.125)
+
+    mechanism = model.mech.discrete
+    torch.testing.assert_close(mechanism.x, torch.full_like(model.v, 0.375))
+    torch.testing.assert_close(mechanism.y, torch.full_like(model.v, 1.625))
+
+
+def test_authored_advance_can_delegate_to_generated_solver():
+    class DelegatingState(_AssignedState):
+        def advance(self, v, dt, values):
+            solved = super().advance(v, dt, values)
+            return {"value": solved["value"] + 0.5}
+
+    class DelegatingMechanism(Mechanism):
+        Mechanism.STATE_BUNDLE(DelegatingState)
+
+    mechanism, voltage = _mechanism(DelegatingMechanism)
+    mechanism._advance_states(voltage, voltage.new_tensor(0.25))
+
+    torch.testing.assert_close(mechanism.value, torch.full_like(voltage, 0.75))
 
 
 def test_state_advance_requires_state_but_allows_optional_carry():

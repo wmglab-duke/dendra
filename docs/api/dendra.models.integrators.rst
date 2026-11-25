@@ -37,6 +37,7 @@ Implicit methods
 .. autofunction:: dendra.models.integrators.dhs_multi
 .. autofunction:: dendra.models.integrators.dhs_bt
 .. autofunction:: dendra.models.integrators.dhs_bt_multi
+.. autofunction:: dendra.models.integrators.tree_contraction
 
 Imposed voltage
 ---------------
