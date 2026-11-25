@@ -62,7 +62,7 @@ def test_tree_contraction_rejects_automatic_packing():
     with dn.ctx(DEVICE="cpu", DTYPE=torch.float32, JIT=0):
         model = _model(dn.tree_contraction())
         with pytest.raises(TypeError, match="tree_contraction requires a scalar Tree"):
-            dn.MultiPopulation(cell=model)
+            dn.concat_models({"cell": model})
 
 
 @pytest.mark.cpu
