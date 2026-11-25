@@ -1,4 +1,4 @@
-## v0.30.0 (unreleased)
+## v0.30.0 (2026-11-25)
 
 ### Upgrading
 
