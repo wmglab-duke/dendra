@@ -1,3 +1,20 @@
+## v0.30.0 (unreleased)
+
+### Upgrading
+
+- Implicit mechanism solves now report convergence failures. See the
+  [upgrade guide](docs/upgrading.rst).
+
+### Simulation and training
+
+- Select `dn.tree_contraction()` for scalar trees on CUDA and Apple MPS.
+  Bounded and fine-grained schedules support prescribed extracellular
+  potentials. Install the `solvers` extra for the topology planner.
+- Set `cuda_graphs=True` in `dn.compile` to replay fixed CUDA Population scan
+  chunks for inference and first-order training.
+- Eligible coupled `derivimplicit` solves can compile their forward pass
+  separately during CUDA training.
+
 ## v0.29.0 (2026-11-17)
 
 ### Upgrading
