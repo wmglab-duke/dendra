@@ -1,3 +1,10 @@
+## v0.30.1 (2026-11-25)
+
+### Packaging
+
+- Validate the wheel and source archive against the solver dependency declared
+  in `pyproject.toml`.
+
 ## v0.30.0 (2026-11-25)
 
 ### Upgrading

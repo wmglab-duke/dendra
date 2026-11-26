@@ -22,10 +22,9 @@ NATIVE_SOURCES = (
     "dendra/models/networks/netcon_bitpack_kernel.cu",
 )
 TORCH_REQUIREMENT = "torch>=2.14.0"
-SOLVER_REQUIREMENT = 'dendra-solvers>=0.5.1;extra=="solvers"'
 
 
-def source_version(root: Path) -> str:
+def source_version(root: Path, configured: dict) -> str:
     """Read the literal version without importing the simulation runtime."""
     tree = ast.parse((root / "dendra/__init__.py").read_text(encoding="utf-8"))
     versions = [
@@ -39,7 +38,6 @@ def source_version(root: Path) -> str:
     ]
     if len(versions) != 1 or not isinstance(versions[0], str):
         raise ValueError("Expected one literal dendra.__version__ assignment.")
-    configured = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
     if configured["project"]["name"] != "dendra":
         raise ValueError("The configured project name is not dendra.")
     if configured["tool"]["commitizen"]["version"] != versions[0]:
@@ -47,11 +45,8 @@ def source_version(root: Path) -> str:
     return versions[0]
 
 
-def source_licenses(root: Path) -> tuple[str, dict[str, bytes]]:
+def source_licenses(root: Path, project: dict) -> tuple[str, dict[str, bytes]]:
     """Read the declared expression and expanded license-file inventory."""
-    project = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))[
-        "project"
-    ]
     expression = project["license"]
     if not isinstance(expression, str) or not expression.strip():
         raise ValueError("The configured project license must be an expression.")
@@ -72,6 +67,7 @@ def check_metadata(
     version: str,
     artifact: Path,
     *,
+    solver_requirement: str,
     license_expression: str,
     license_files: dict[str, bytes],
 ) -> None:
@@ -96,9 +92,9 @@ def check_metadata(
         for item in dependencies
         if item.startswith("dendra-solvers")
     ]
-    if solver_dependencies != [SOLVER_REQUIREMENT]:
+    if solver_dependencies != [solver_requirement]:
         raise ValueError(
-            f"{artifact.name}: expected optional dependency {SOLVER_REQUIREMENT}."
+            f"{artifact.name}: expected optional dependency {solver_requirement}."
         )
     if metadata.get_all("License-Expression", []) != [license_expression]:
         raise ValueError(
@@ -160,10 +156,19 @@ def check_package_contents(
 
 
 def check_distributions(directory: Path, root: Path, ref: str = "") -> str:
-    version = source_version(root)
+    configured = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    version = source_version(root, configured)
     if ref.startswith("refs/tags/") and ref != f"refs/tags/v{version}":
         raise ValueError(f"Release tag {ref} must be refs/tags/v{version}.")
-    license_expression, license_files = source_licenses(root)
+    project = configured["project"]
+    solvers = [
+        requirement.replace(" ", "")
+        for requirement in project.get("optional-dependencies", {}).get("solvers", ())
+    ]
+    if len(solvers) != 1 or not solvers[0].startswith("dendra-solvers>="):
+        raise ValueError("The solvers extra must declare one dendra-solvers minimum.")
+    solver_requirement = solvers[0] + ';extra=="solvers"'
+    license_expression, license_files = source_licenses(root, project)
 
     wheel = directory / f"dendra-{version}-py3-none-any.whl"
     sdist = directory / f"dendra-{version}.tar.gz"
@@ -187,6 +192,7 @@ def check_distributions(directory: Path, root: Path, ref: str = "") -> str:
         wheel_contents[f"{dist_info}/METADATA"],
         version,
         wheel,
+        solver_requirement=solver_requirement,
         license_expression=license_expression,
         license_files=license_files,
     )
@@ -217,6 +223,7 @@ def check_distributions(directory: Path, root: Path, ref: str = "") -> str:
         sdist_contents["PKG-INFO"],
         version,
         sdist,
+        solver_requirement=solver_requirement,
         license_expression=license_expression,
         license_files=license_files,
     )
