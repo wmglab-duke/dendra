@@ -35,6 +35,7 @@ class DistributionChecks(unittest.TestCase):
                 f'license = "{LICENSE_EXPRESSION}"\n'
                 'license-files = ["LICENSE.md", "THIRD_PARTY_NOTICES.md", '
                 '"LICENSES/PyTorch.txt"]\n'
+                '[project.optional-dependencies]\nsolvers = ["dendra-solvers>=0.5.1"]\n'
                 '[tool.commitizen]\nversion = "0.27.0"\n'
             ).encode(),
             "THIRD_PARTY_NOTICES.md": (
@@ -178,6 +179,14 @@ class DistributionChecks(unittest.TestCase):
 
     def test_accept_equivalent_optional_solver_marker_quotes(self):
         metadata = self.metadata.replace(b'extra == "solvers"', b"extra == 'solvers'")
+        self.build_archives(metadata=metadata, sdist_changes={"PKG-INFO": metadata})
+        self.assertEqual(check_distributions(self.dist, self.root), "0.27.0")
+
+    def test_accept_updated_solver_floor_from_source(self):
+        config = self.source["pyproject.toml"].replace(b">=0.5.1", b">=0.6.0")
+        self.source["pyproject.toml"] = config
+        (self.root / "pyproject.toml").write_bytes(config)
+        metadata = self.metadata.replace(b">=0.5.1", b">=0.6.0")
         self.build_archives(metadata=metadata, sdist_changes={"PKG-INFO": metadata})
         self.assertEqual(check_distributions(self.dist, self.root), "0.27.0")
 
